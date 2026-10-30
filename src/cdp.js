@@ -7,10 +7,12 @@ import { supportsDOM, runDOM, resetDOM } from './dom.js';
 import { supportsInput, runInput } from './input.js';
 import { createWebDriver } from './webdriver.js';
 import { supportsRuntime, runRuntime, resetRuntime } from './runtime.js';
+import { primitiveRemoteValue, describeRemoteValue, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
 
 const timestamp = () => performance.now() / 1000;
+const protocolErrors = new WeakSet();
 class ProtocolError extends Error {
-  constructor(message, code = -32602) { super(message); this.code = code; }
+  constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
 }
 
 export function targetInfo(page) {
@@ -204,9 +206,9 @@ class Session {
     throw new ProtocolError('Cannot find context with specified id');
   }
   valueContext(value) {
-    const document = value?.nodeType === 9 ? value : value?.ownerDocument;
+    const document = ownerDocumentOf(value);
     for (const page of this.page.frames?.frames.values() ?? []) {
-      if (document === page.dom.window.document || value === page.dom.window) return page.executionContextId;
+      if (document && document === page.dom.window.document || value === page.dom.window) return page.executionContextId;
     }
     return this.page.executionContextId;
   }
@@ -216,21 +218,18 @@ class Session {
     });
   }
   remote(value, byValue = false, group, contextId = this.valueContext(value)) {
-    if (value === undefined) return { type: 'undefined' };
-    if (value === null) return { type: 'object', subtype: 'null', value: null };
-    const htmlDDA = typeof value === 'undefined'; // Actual undefined returned above; this is [[IsHTMLDDA]].
-    const type = htmlDDA ? 'function' : typeof value;
-    if (type === 'number' && (!Number.isFinite(value) || Object.is(value, -0))) return { type, unserializableValue: Object.is(value, -0) ? '-0' : String(value), description: String(value) };
-    if (type === 'bigint') return { type, unserializableValue: `${value}n`, description: `${value}n` };
-    if (['string', 'number', 'boolean'].includes(type)) return { type, value };
-    if (type === 'symbol') return { type, description: String(value) };
-    if (byValue) return { type, value: type === 'function' ? {} : JSON.parse(JSON.stringify(value)) };
+    const primitive = primitiveRemoteValue(value);
+    if (primitive) return primitive;
+    const metadata = describeRemoteValue(value);
+    if (byValue) {
+      if (typeof value === 'symbol') throw new ProtocolError("Object couldn't be returned by value", -32000);
+      try { return { type: metadata.type, value: metadata.type === 'function' ? {} : JSON.parse(JSON.stringify(value)) }; }
+      catch { throw new ProtocolError('Internal error', -32603); }
+    }
     const objectId = randomUUID();
-    const page = this.executionPage(contextId);
+    this.executionPage(contextId);
     this.objects.set(objectId, { value, group, contextId });
-    const subtype = !htmlDDA && value.nodeType ? 'node' : Array.isArray(value) ? 'array' : value instanceof page.dom.window.Promise ? 'promise' : undefined;
-    return { type, ...(subtype ? { subtype } : {}), className: value.constructor?.name ?? 'Object',
-      description: htmlDDA ? 'function () { [native code] }' : value.nodeName ?? value.constructor?.name ?? type, objectId };
+    return { ...metadata, objectId };
   }
   object(id) {
     if (!this.objects.has(id)) throw new ProtocolError('Cannot find object with given id');
@@ -249,10 +248,9 @@ class Session {
     }
     return arg.value;
   }
-  exception(error, contextId = this.page.executionContextId) {
-    return { exceptionId: 1, text: error.message ?? String(error), lineNumber: 0, columnNumber: 0,
-      executionContextId: contextId,
-      exception: { type: 'object', subtype: 'error', className: error.name ?? 'Error', description: error.stack ?? String(error) } };
+  exception(error, contextId = this.page.executionContextId, group) {
+    return exceptionDetailsFor(error, { executionContextId: contextId,
+      remote: value => this.remote(value, false, group, contextId) });
   }
   async run(method, params) {
     const page = this.page;
@@ -333,30 +331,32 @@ class Session {
       }
       case 'Runtime.evaluate':
       case 'Runtime.callFunctionOn': {
-        let target = page;
+        let target = page, value;
         try {
           const contextId = params.contextId ?? params.executionContextId ?? this.objects.get(params.objectId)?.contextId;
           target = this.executionPage(contextId);
-          let value = method === 'Runtime.evaluate' ? target.evaluate(params.expression) : target.callFunction(
+          value = method === 'Runtime.evaluate' ? target.evaluate(params.expression) : target.callFunction(
             params.functionDeclaration,
             params.objectId ? this.object(params.objectId) : target.dom.window,
             (params.arguments ?? []).map(arg => this.argument(arg)),
           );
           if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), target.timeout);
-          return { result: this.remote(value, params.returnByValue, params.objectGroup, target.executionContextId) };
         } catch (error) {
-          if (error instanceof ProtocolError) throw error;
-          return { result: { type: 'undefined' }, exceptionDetails: this.exception(error, target.executionContextId) };
+          if (protocolErrors.has(error)) throw error;
+          return { result: this.remote(error, params.returnByValue, params.objectGroup, target.executionContextId),
+            exceptionDetails: this.exception(error, target.executionContextId, params.objectGroup) };
         }
+        return { result: this.remote(value, params.returnByValue, params.objectGroup, target.executionContextId) };
       }
       case 'Runtime.getProperties': {
         const object = this.object(params.objectId);
         const contextId = this.objects.get(params.objectId).contextId;
+        const group = this.objects.get(params.objectId).group;
         const result = Object.getOwnPropertyNames(object).map(name => {
           const descriptor = Object.getOwnPropertyDescriptor(object, name);
           return { name, configurable: !!descriptor.configurable, enumerable: !!descriptor.enumerable,
-            isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, undefined, contextId), writable: !!descriptor.writable } : {}),
-            ...(descriptor.get ? { get: this.remote(descriptor.get, false, undefined, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, undefined, contextId) } : {}) };
+            isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, group, contextId), writable: !!descriptor.writable } : {}),
+            ...(descriptor.get ? { get: this.remote(descriptor.get, false, group, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, group, contextId) } : {}) };
         });
         return { result, internalProperties: [] };
       }
@@ -519,7 +519,7 @@ class Connection {
         ? await session.run(method, params) : await this.run(method, params, session);
       this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
     } catch (error) {
-      this.send({ id: message?.id ?? null, error: { code: error.code ?? -32602, message: error.message }, ...(message?.sessionId ? { sessionId: message.sessionId } : {}) });
+      this.send({ id: message?.id ?? null, error: protocolErrorFields(error), ...(message?.sessionId ? { sessionId: message.sessionId } : {}) });
     }
   }
   async run(method, params, parent) {

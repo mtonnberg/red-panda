@@ -105,16 +105,16 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Surface | Supported |
 | --- | --- |
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
-| HTML / JS | Classic scripts, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
+| HTML / JS | Parser-blocking and dynamic classic scripts, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Forms / workers | Validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
-| Web APIs | Real HTMLDDA collections, geometry matrices/points/quads, constructed/adopted stylesheets and scoped CSS cascade |
+| Web APIs | Real HTMLDDA collections, geometry matrices/points/quads, constructed/adopted stylesheets, scoped CSS cascade, streams/codecs/compression, resize/performance observers and trusted error reporting |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
-| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads |
-| CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
+| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; by-reference serialization preserves thrown primitives/Symbols without calling authored getters |
+| CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, nested frame/shadow keyboard focus, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
 | Rendering | Text-only CLI dumps, CDP screenshots/PDF streams and MCP screenshots, with real font rasterization and selectable PDF text |
 | Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64 |
@@ -131,13 +131,23 @@ simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
 semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
 CSS painting, canvas, service/shared workers, complete frame behavior and process
-isolation remain absent. Frame POST
-navigation, advanced shadow CSS, flattened shadow/frame input and full
+isolation remain absent. Large-document parser slicing, frame POST
+navigation, advanced shadow CSS, flattened shadow/frame pointer/Tab input and full
 CSS behavior remain unfinished. Utility-world IDs share their owning frame's
 JS realm. Some configuration commands still
 only acknowledge requests. Markdown and structured metadata are subsets, not byte-identical
 Lightpanda output. `done` does not track every future timer. Documents are decoded
 as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly.
+
+`navigator.sendBeacon` validates calls with resource loading disabled. Enable
+actual POST delivery with `--load-resources beacon`; enabled beacons share a
+64 KiB in-flight body budget per document. Streams use real Node primitives with
+realm adapters. Performance entries report observed transport/lifecycle data;
+unavailable DNS/TLS/header-phase/wire-byte fields remain zero or empty.
+
+`Runtime.queryObjects` remains unsupported: experimental heap implementations
+crashed during context lifecycle checks and are excluded from normal builds and
+tests. See the [evidence and limitations](docs/reference/runtime-query-contract.md).
 No speed or memory parity is claimed.
 
 ES modules use Node's experimental VM-module API in the actual page realm. The
@@ -165,19 +175,21 @@ Header overrides reach asynchronous XMLHttpRequest too, including cookies,
 redirects and CDP events. XHR enforces basic CORS/preflight rules and rejects
 synchronous use, redirects needing another preflight and opaque-origin redirect
 taint. Page `fetch` also enforces CORS and filters response headers; opaque
-responses hide status, headers and bodies. Progress is buffered; there is no
-preflight/cache implementation. Streaming uploads and blob URL resolution are
-unsupported, and invalid compression can fail before response headers become
+responses hide status, headers and bodies. Progress is buffered; preflight
+caching, the browser HTTP cache and streaming uploads remain unsupported.
+Blob URLs resolve through the document/context registry. Invalid compression can fail before response headers become
 available. These bounds apply to the implemented subset, not full network parity.
 
 Dedicated workers use actual isolated threads and are terminated when their
-document is disposed. SharedWorker, nested workers, blob worker URLs and
-MessagePort transfer remain unsupported. Keyboard Tab traversal currently covers
+document is disposed. Blob worker URLs and transferred MessagePorts are supported;
+SharedWorker, nested workers and Blob/File message cloning remain unsupported.
+Keyboard Tab traversal currently covers
 the light DOM; it does not traverse frame or shadow trees. CLI fetch/serve enable
 no optional resources by default; MCP defaults to stylesheet loading. Repeated
-`--load-resources stylesheet|iframe|worker` enables the implemented subsets;
-`none` clears them. Direct Browser embedding retains its unrestricted resource
-default unless `loadResources` is supplied. Frame realms are real, and CDP
+`--load-resources stylesheet|iframe|worker|beacon` enables the implemented subsets;
+`none` clears them. Direct Browser embedding enables stylesheets, iframes and
+workers unless `loadResources` is supplied; beacons require explicit enablement.
+Frame realms are real, and CDP
 routes evaluation, navigation, handles and selected Runtime methods to them;
 cross-origin Window access restrictions and full frame history/input remain
 unfinished.

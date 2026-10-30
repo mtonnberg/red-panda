@@ -1,6 +1,9 @@
 // Independent surrogate geometry for a headless DOM. This intentionally models
 // the reference's measured simple boxes; it is not a CSS layout renderer.
 import { getStyleRevision } from './styles.js';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
 const hiddenTags = new Set(['head', 'style', 'script', 'template', 'meta', 'link', 'title', 'base']);
 const blockTags = new Set(['html', 'body', 'div', 'p', 'main', 'section', 'article', 'aside', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'blockquote']);
@@ -32,13 +35,16 @@ export function createLayout(window, options = {}) {
   function snapshot() {
     const document = window.document;
     const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
-    const stack = [document], tokens = [width, height, getStyleRevision(window)];
-    while (stack.length) {
+    const stack = [document], shadowRoots = [], tokens = [width, height, getStyleRevision(window)];
+    while (stack.length || shadowRoots.length) {
+      if (!stack.length) stack.push(shadowRoots.shift());
       const node = stack.pop();
       if (!identities.has(node)) identities.set(node, nextIdentity++);
       order.set(node, nodes.length); nodes.push(node);
       tokens.push(identities.get(node), node.nodeType, node.nodeValue);
       if (node.attributes) tokens.push([...node.attributes].flatMap(attribute => [attribute.name, attribute.value]));
+      const shadow = implForWrapper(node)?._shadowRoot;
+      if (shadow) shadowRoots.push(wrapperForImpl(shadow));
       for (let index = node.childNodes.length - 1; index >= 0; index--) stack.push(node.childNodes[index]);
     }
     for (const sheet of document.styleSheets) {
@@ -53,7 +59,8 @@ export function createLayout(window, options = {}) {
     };
     function isHidden(node) {
       if (hidden.has(node)) return hidden.get(node);
-      const ancestorHidden = node.parentNode && hidden.get(node.parentNode);
+      const parent = node.parentNode ?? node.host;
+      const ancestorHidden = parent && hidden.get(parent);
       const ownHidden = node.nodeType === 1 && (hiddenTags.has(node.localName) || node.hidden || style(node).display === 'none');
       const result = Boolean(ancestorHidden || ownHidden);
       hidden.set(node, result); return result;
@@ -86,7 +93,8 @@ export function createLayout(window, options = {}) {
     function position(node) {
       if (positions.has(node)) return positions.get(node);
       if (isHidden(node)) { positions.set(node, ZERO); return ZERO; }
-      const parentX = node.parentNode ? positions.get(node.parentNode).x : 0;
+      const parent = node.parentNode ?? node.host;
+      const parentX = parent ? positions.get(parent).x : 0;
       let x = parentX;
       for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) x += size(sibling).advance ?? size(sibling).width;
       const value = rectValue(x, order.get(node) * 5, size(node).width, size(node).height);
@@ -136,6 +144,9 @@ export function createLayout(window, options = {}) {
     const state = snapshot();
     return state.nodes.filter(node => {
       if (node.nodeType !== 1) return false;
+      // Document hit testing retargets shadow content to its host. Shadow
+      // rectangles remain available to privileged geometry/observer consumers.
+      if (node.getRootNode() !== window.document) return false;
       const record = state.record(node), { rendered } = record, box = viewportRect(record.rect);
       const declaration = state.style(node);
       return rendered && declaration.visibility !== 'hidden' && declaration.visibility !== 'collapse' && declaration.pointerEvents !== 'none' &&

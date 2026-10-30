@@ -20,6 +20,19 @@ function setup(t) {
 }
 const basic = rect => Object.fromEntries(['x', 'y', 'width', 'height'].map(key => [key, rect[key]]));
 
+test('shadow descendants have live surrogate boxes and inherit host visibility without leaking through document hit tests', t => {
+  const dom = new JSDOM('<div id=host></div>'); t.after(() => dom.window.close());
+  const window = dom.window, host = window.document.querySelector('#host'), shadow = host.attachShadow({ mode: 'closed' });
+  shadow.innerHTML = '<span style="width:60px;height:20px">Shadow target</span>';
+  const layout = installLayout({}, window), target = shadow.firstElementChild;
+  assert.equal(target.getBoundingClientRect().width, 60); assert.equal(target.getBoundingClientRect().height, 20);
+  assert.equal(layout.rects(target).length, 1);
+  const box = layout.rect(target); assert.ok(!window.document.elementsFromPoint(box.x, box.y).includes(target));
+  host.style.display = 'none'; assert.equal(layout.rect(target).width, 0); assert.equal(layout.rects(target).length, 0);
+  host.style.display = ''; target.style.width = '90px'; assert.equal(layout.rect(target).width, 90);
+  host.remove(); assert.equal(layout.rects(target).length, 0);
+});
+
 test('surrogate geometry matches captured native WebAPI, CDP quads and box regions', t => {
   const f = setup(t);
   for (const [selector, record] of Object.entries(observed.geometry)) {

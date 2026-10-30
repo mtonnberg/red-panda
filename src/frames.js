@@ -138,7 +138,7 @@ class FramePage extends EventEmitter {
   current() { if (this.closed || this.documentAbort.signal.aborted || this.record.page !== this) throw stale(); }
   evaluate(expression) {
     this.current();
-    try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout ?? 10000, 2000) }); }
+    try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout ?? 10000, 2000), displayErrors: false }); }
     finally { if (!this.closed) this.reconcileURL(); }
   }
   callFunction(declaration, thisArg, args = []) {

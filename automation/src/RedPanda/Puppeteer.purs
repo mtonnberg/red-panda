@@ -3,7 +3,7 @@ module RedPanda.Puppeteer
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText
   , withNavigation, goBack, goForward, reload, pageUrl
-  , childFrame, evaluateFrameString, gotoFrame
+  , childFrame, evaluateFrameString, gotoFrame, focusFrame
   , screenshot, pdf, byteLength, signature
   , evaluateOnNewDocument, removePreload
   , setExtraHTTPHeaders, setUserAgent
@@ -58,6 +58,7 @@ foreign import pageUrlImpl :: Page -> Effect String
 foreign import childFrameImpl :: Page -> Int -> Async Frame
 foreign import evaluateFrameStringImpl :: Frame -> String -> Async String
 foreign import gotoFrameImpl :: Frame -> String -> Async Int
+foreign import focusFrameImpl :: Frame -> String -> Async Unit
 foreign import screenshotImpl :: Page -> Boolean -> Async ByteArray
 foreign import pdfImpl :: Page -> Async ByteArray
 foreign import byteLength :: ByteArray -> Int
@@ -133,6 +134,9 @@ evaluateFrameString frame expression = fromAsync $ evaluateFrameStringImpl frame
 
 gotoFrame :: Frame -> String -> Aff Int
 gotoFrame frame url = fromAsync $ gotoFrameImpl frame url
+
+focusFrame :: Frame -> String -> Aff Unit
+focusFrame frame selector = fromAsync $ focusFrameImpl frame selector
 
 screenshot :: Page -> Boolean -> Aff ByteArray
 screenshot page fullPage = fromAsync $ screenshotImpl page fullPage

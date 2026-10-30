@@ -1,5 +1,6 @@
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
+import { createInternalMutationObserver } from './mutations.js';
 
 // This adapter intentionally targets the pinned jsdom dependency. Its deferred
 // resource queue lets module evaluation begin before the real DOMContentLoaded.
@@ -254,7 +255,7 @@ export function installModuleScripts(page, window) {
         execute(script, Promise.resolve(module));
       } catch (error) { report(error, script); }
     }
-    observer = new window.MutationObserver(records => {
+    observer = createInternalMutationObserver(window, records => {
       if (!active()) return;
       for (const record of records) {
         if (record.type === 'attributes') {

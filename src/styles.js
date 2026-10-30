@@ -1,3 +1,4 @@
+import { enhanceDeclaration, parseStyleSheet, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -9,6 +10,11 @@ const DocumentInterface = require('jsdom/lib/jsdom/living/generated/Document.js'
 const ShadowInterface = require('jsdom/lib/jsdom/living/generated/ShadowRoot.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const { getComputedOrUsedColor } = require('jsdom/lib/jsdom/living/helpers/colors.js');
+const HTMLElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
+const SVGElementImpl = require('jsdom/lib/jsdom/living/nodes/SVGElement-impl.js').implementation;
+const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
+const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
+const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
 const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js'));
 const RECORDS = new WeakMap();
 const SHEETS = new WeakMap();
@@ -42,9 +48,58 @@ function rootOf(element) { return element.getRootNode(); }
 function ownerDocument(root) { return root.nodeType === 9 ? root : root.ownerDocument; }
 function notSupported(record, message) { return new record.window.DOMException(message, 'NotSupportedError'); }
 
+// jsdom creates inline declarations before applying parsed attributes. Adapt the
+// owned declaration at creation so setAttribute and parser-created style values
+// follow exactly the same tokenization as later JS cssText assignments.
+for (const Interface of [HTMLElementImpl, SVGElementImpl]) {
+  const initialize = Interface.prototype._initElementCSSInlineStyle;
+  Interface.prototype._initElementCSSInlineStyle = function () {
+    initialize.call(this);
+    const record = recordFor(wrapperForImpl(this._ownerDocument));
+    if (record) enhanceDeclaration(this._style, record.window);
+  };
+}
+// Dynamic form state does not necessarily mutate attributes or jsdom's tree
+// version. Track it independently so shared ancestor results and layout remain
+// live for :checked, :valid and selectors such as :has(input:checked).
+for (const name of ['HTMLInputElement', 'HTMLOptionElement', 'HTMLSelectElement', 'HTMLTextAreaElement']) {
+  const prototype = require(`jsdom/lib/jsdom/living/nodes/${name}-impl.js`).implementation.prototype;
+  const changed = element => { const record = recordFor(wrapperForImpl(element._ownerDocument)); if (record) record.stateRevision++; };
+  for (const property of ['checked', 'selected', 'selectedIndex', 'value', 'valueAsNumber', 'valueAsDate']) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+    if (descriptor?.set) Object.defineProperty(prototype, property, { ...descriptor, set(value) { const result = descriptor.set.call(this, value); changed(this); return result; } });
+  }
+  for (const method of ['_formReset', 'setCustomValidity']) {
+    const original = prototype[method];
+    if (typeof original === 'function') prototype[method] = function (...args) { const result = original.apply(this, args); changed(this); return result; };
+  }
+}
+
+const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
+StyleElementImpl.prototype._updateAStyleBlock = function () {
+  const record = recordFor(wrapperForImpl(this._ownerDocument));
+  if (!record) return updateStyleBlock.call(this);
+  if (this.sheet) removeStylesheet(this.sheet, this);
+  if (!this.isConnected || !this._ownerDocument._defaultView) return;
+  const type = this.getAttributeNS(null, 'type');
+  if (type !== null && type !== '' && type.toLowerCase() !== 'text/css') return;
+  const element = wrapperForImpl(this);
+  const parsed = parse(record, element.textContent);
+  // Keep jsdom's existing import loader for parser-compatible imported sheets.
+  // Its requests, ownership and load/error events remain managed by the Page.
+  if (Array.from(parsed.cssRules).some(rule => rule.type === 3)) {
+    updateStyleBlock.call(this);
+    if (this.sheet) { upgradeSheet(record, this.sheet); this.sheet.ownerNode = element; return; }
+    record.unsupported.add('Imports in stylesheets requiring CSS syntax recovery');
+  }
+  const sheet = upgradeSheet(record, parsed); sheet.ownerNode = element;
+  this.sheet = sheet;
+  this._ownerDocument.styleSheets._add(sheet); invalidateStyleCache(this);
+};
+
 function declaration(style) {
-  if (style instanceof CSSStyleDeclaration) return style;
-  const result = new CSSStyleDeclaration();
+  if (style instanceof CSSStyleDeclaration) return enhanceDeclaration(style);
+  const result = enhanceDeclaration(new CSSStyleDeclaration());
   const listed = new Set(Array.from({ length: style.length ?? 0 }, (_, index) => style[index]));
   const names = new Set(listed);
   for (const key of Object.keys(style)) {
@@ -64,19 +119,35 @@ function normalizeRules(rules, sheet, parent = null) {
       rule.style = declaration(rule.style);
       Object.defineProperty(rule.style, 'parentRule', { configurable: true, value: rule });
     }
-    if (rule.cssRules) normalizeRules(rule.cssRules, sheet, rule);
+    if (rule.cssRules) {
+      rule.cssRules = asRuleList(rule.cssRules); normalizeRules(rule.cssRules, sheet, rule);
+      if ([4, 12].includes(rule.type)) {
+        const record = SHEETS.get(sheet)?.record;
+        if (record) Object.defineProperties(rule, {
+          insertRule: { configurable: true, value(text, index = 0) {
+            if (this !== rule) throw new record.window.TypeError('Illegal grouping rule invocation');
+            if (!arguments.length) throw new record.window.TypeError('insertRule requires a CSS rule');
+            index = Number(index) >>> 0;
+            if (index > rule.cssRules.length) throw new record.window.DOMException('Rule index is outside the grouping rule', 'IndexSizeError');
+            const parsed = parse(record, text).cssRules;
+            if (parsed.length !== 1 || parsed[0].type === 3) throw new record.window.DOMException('Expected one nested CSS rule', 'SyntaxError');
+            normalizeRules(parsed, sheet, rule); spliceRules(rule.cssRules, index, 0, parsed[0]); return index;
+          } },
+          deleteRule: { configurable: true, value(index) {
+            if (this !== rule) throw new record.window.TypeError('Illegal grouping rule invocation');
+            if (!arguments.length) throw new record.window.TypeError('deleteRule requires an index');
+            index = Number(index) >>> 0;
+            if (index >= rule.cssRules.length) throw new record.window.DOMException('Rule index is outside the grouping rule', 'IndexSizeError');
+            const removed = spliceRules(rule.cssRules, index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;
+          } },
+        });
+      }
+    }
   }
 }
 
 function parse(record, text) {
-  try { return cssom.parse(String(text)); }
-  catch (error) {
-    // rrweb-cssom exposes the valid prefix for malformed rules. Preserve that
-    // real parse result instead of claiming unsupported syntax was applied.
-    record.unsupported.add('CSS syntax recovery and unsupported at-rules');
-    if (error.styleSheet?.cssRules) return error.styleSheet;
-    throw notSupported(record, 'This CSS syntax is not supported by the installed parser');
-  }
+  return parseStyleSheet(String(text), { window: record.window, onUnsupported: value => record.unsupported.add(value) });
 }
 
 function operation(record, sheet, name, args) {
@@ -87,9 +158,11 @@ function operation(record, sheet, name, args) {
 
 function upgradeSheet(record, sheet, constructed = false) {
   let metadata = SHEETS.get(sheet);
+  const fresh = !metadata;
   if (!metadata) {
     metadata = { record, document: record.document, constructed, locked: false };
     SHEETS.set(sheet, metadata);
+    sheet.cssRules = asRuleList(sheet.cssRules);
     if (!sheet.media) sheet.media = new cssom.MediaList();
     if (sheet.disabled === undefined) sheet.disabled = false;
     if (sheet.ownerNode === undefined) sheet.ownerNode = null;
@@ -116,11 +189,13 @@ function upgradeSheet(record, sheet, constructed = false) {
         if (!arguments.length) throw new record.window.TypeError('insertRule requires a CSS rule');
         if (metadata.locked) throw new record.window.DOMException('The stylesheet is being replaced', 'NotAllowedError');
         index = Number(index) >>> 0;
-        if (index > sheet.cssRules.length) throw new record.window.DOMException('Rule index is outside the stylesheet', 'IndexSizeError');
+        // Native Lightpanda clamps insertion indexes (its documented CSS-in-JS
+        // compatibility workaround); deletion remains range checked.
+        index = Math.min(index, sheet.cssRules.length);
         const rules = parse(record, text).cssRules;
         if (rules.length !== 1) throw new record.window.DOMException('insertRule requires exactly one CSS rule', 'SyntaxError');
         if (metadata.constructed && rules[0].type === 3) throw new record.window.DOMException('Constructed stylesheets cannot import other sheets', 'SyntaxError');
-        normalizeRules(rules, sheet); sheet.cssRules.splice(index, 0, rules[0]);
+        normalizeRules(rules, sheet); spliceRules(sheet.cssRules, index, 0, rules[0]);
         return index;
       } },
       deleteRule: { configurable: true, writable: true, value(index) {
@@ -129,20 +204,20 @@ function upgradeSheet(record, sheet, constructed = false) {
         if (metadata.locked) throw new record.window.DOMException('The stylesheet is being replaced', 'NotAllowedError');
         index = Number(index) >>> 0;
         if (index >= sheet.cssRules.length) throw new record.window.DOMException('Rule index is outside the stylesheet', 'IndexSizeError');
-        const removed = sheet.cssRules.splice(index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;
+        const removed = spliceRules(sheet.cssRules, index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;
       } },
     });
     metadata.operations = Object.fromEntries(['replaceSync', 'replace', 'insertRule', 'deleteRule'].map(name => [name, sheet[name]]));
   }
-  normalizeRules(sheet.cssRules, sheet);
+  if (fresh) normalizeRules(sheet.cssRules, sheet);
   return sheet;
 }
 
 function replaceRules(record, sheet, text) {
-  const rules = parse(record, text).cssRules.filter(rule => rule.type !== 3);
+  const rules = Array.from(parse(record, text).cssRules).filter(rule => rule.type !== 3);
   normalizeRules(rules, sheet);
   for (const old of sheet.cssRules) old.parentStyleSheet = null;
-  sheet.cssRules.splice(0, sheet.cssRules.length, ...rules);
+  spliceRules(sheet.cssRules, 0, sheet.cssRules.length, ...rules);
 }
 
 function stateFor(root, record, fresh = false) {
@@ -287,7 +362,14 @@ function shadowStyleSheet(record, element) {
 
 function scopeSheets(record, root) {
   const sheets = [];
-  const elements = root.querySelectorAll?.('style,link[rel~="stylesheet"]') ?? [];
+  record.scopeCache ??= new WeakMap();
+  const version = implForWrapper(root)._version;
+  let cached = record.scopeCache.get(root);
+  if (!cached || cached.version !== version) {
+    cached = { version, elements: Array.from(root.querySelectorAll?.('style,link[rel~="stylesheet"]') ?? []) };
+    record.scopeCache.set(root, cached);
+  }
+  const elements = cached.elements;
   for (const element of elements) {
     if (rootOf(element) !== root) continue;
     let sheet;
@@ -300,7 +382,7 @@ function scopeSheets(record, root) {
 }
 
 function sheetFingerprint(sheet) {
-  return [id(sheet), Boolean(sheet.disabled), sheet.media?.mediaText ?? '', sheet.cssRules.map(rule => rule.cssText)];
+  return [id(sheet), Boolean(sheet.disabled), sheet.media?.mediaText ?? '', Array.from(sheet.cssRules, rule => rule.cssText)];
 }
 
 function inheritanceParent(element) {
@@ -311,7 +393,7 @@ function inheritanceParent(element) {
 }
 
 function localToken(record, element) {
-  const tokens = [implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+  const tokens = [record.stateRevision, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
   const roots = new Set();
   for (let current = element; current; current = inheritanceParent(current)) {
     const root = rootOf(current); roots.add(root);
@@ -388,6 +470,8 @@ function cascade(record, element) {
   return chosen;
 }
 
+normalizeRules(UA.cssRules, UA);
+
 function substitute(text, resolve) {
   let result = '', start = 0;
   while (true) {
@@ -414,11 +498,12 @@ function substitute(text, resolve) {
   }
 }
 
-function compute(record, element, memo = new Map()) {
-  if (memo.has(element)) return memo.get(element);
+function compute(record, element, memo = (record.computedMemo ??= new WeakMap()), token = localToken(record, element)) {
+  const retained = memo.get(element);
+  if (retained?.token === token) return retained.style;
   const parent = inheritanceParent(element);
   const parentStyle = parent ? compute(record, parent, memo) : null;
-  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, result);
+  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, { token, style: result });
   const custom = new Map(), resolved = new Map();
   if (parentStyle) for (let index = 0; index < parentStyle.length; index++) if (parentStyle[index].startsWith('--')) custom.set(parentStyle[index], parentStyle.getPropertyValue(parentStyle[index]));
   for (const [property, value] of chosen) if (property.startsWith('--')) {
@@ -480,7 +565,7 @@ function computedStyle(record, element) {
   let token, cached;
   const current = () => {
     const next = localToken(record, element);
-    if (token !== next) { cached = compute(record, element); token = next; }
+    if (token !== next) { cached = compute(record, element, undefined, next); token = next; }
     return cached;
   };
   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
@@ -499,7 +584,7 @@ function computedStyle(record, element) {
 export function getStyleRevision(window) {
   const record = recordFor(window?.document);
   if (!record) return 0;
-  const tokens = [window.innerWidth, window.innerHeight];
+  const tokens = [window.innerWidth, window.innerHeight, record.stateRevision, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
   const visit = root => {
     tokens.push(id(root), implForWrapper(root)._version);
     for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
@@ -525,7 +610,8 @@ export function installStyles(page, window) {
   const originalDocumentSheets = Object.getOwnPropertyDescriptor(window.Document.prototype, 'styleSheets');
   const record = { page, window, document, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
-  }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, signature: null };
+  }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
+  for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
   const define = (prototype, property, descriptor) => Object.defineProperty(prototype, property, descriptor);
   const adoption = { configurable: true, enumerable: true,
     get() {
@@ -537,6 +623,9 @@ export function installStyles(page, window) {
       stateFor(this, record).replace(value);
     },
   };
+  window.CSSRuleList = CSSRuleList;
+  for (const name of ['keys', 'values', 'entries']) delete window.StyleSheetList.prototype[name];
+  define(window.StyleSheetList.prototype, Symbol.iterator, { configurable: true, writable: true, value: function* () { for (let index = 0; index < this.length; index++) yield upgradeSheet(record, this[index]); } });
   define(window.Document.prototype, 'adoptedStyleSheets', adoption); define(window.ShadowRoot.prototype, 'adoptedStyleSheets', adoption);
   define(window.HTMLStyleElement.prototype, 'sheet', { configurable: true, enumerable: true, get() {
     if (rootOf(this).nodeType === 11 && ShadowInterface.is(rootOf(this))) return shadowStyleSheet(record, this);

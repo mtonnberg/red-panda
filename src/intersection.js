@@ -1,4 +1,5 @@
 // Independent observation of the synthetic layout; no paint or CSS renderer.
+import { createInternalMutationObserver } from './mutations.js';
 export function installIntersection(page, window, layout) {
   const observers = new Set();
   let queued = false, timer, stopped = false;
@@ -94,7 +95,7 @@ export function installIntersection(page, window, layout) {
   }
   window.IntersectionObserver = IntersectionObserver;
   window.IntersectionObserverEntry = IntersectionObserverEntry;
-  const mutations = new window.MutationObserver(schedule);
+  const mutations = createInternalMutationObserver(window, schedule);
   mutations.observe(window.document, { childList: true, subtree: true, attributes: true, characterData: true });
   window.addEventListener('scroll', schedule);
   page.documentAbort.signal.addEventListener('abort', () => {

@@ -4,6 +4,7 @@ import { createMessagingRealm, installMessaging } from './messaging.js';
 import { resolveBlobURL } from './blob-urls.js';
 import { GEOMETRY_SOURCE } from './geometry.js';
 import { installNavigator } from './navigator.js';
+import { installStreams } from './streams.js';
 
 // Dedicated worker support. Shared workers and nested workers fail explicitly.
 // Channels and transferred ports use real Node endpoints with realm adapters.
@@ -139,7 +140,8 @@ export function installWorkers(page, window, { enabled = true } = {}) {
 
 async function runWorker() {
   const pending = new Map(), queued = [];
-  let requestId = 1, ready = false, closed = false, context, emit, messaging;
+  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams;
+  const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
   const request = (url, init = {}, script = false, signal) => new Promise((resolve, reject) => {
@@ -168,7 +170,7 @@ async function runWorker() {
       }
     },
     close() { if (!closed) {
-      closed = true; for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose();
+      closed = true; lifetime.abort(); for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose();
       for (const message of queued) for (const port of message.ports ?? []) port.close(); queued.length = 0;
       parentPort.postMessage({ kind: 'close' }); parentPort.close();
     } },
@@ -199,6 +201,7 @@ async function runWorker() {
       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
       const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal);
       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+      streams.adopt(response.body);
       Object.defineProperty(response, 'url', { value: result.url }); return response;
     },
     structuredClone(value, options) { return messaging.clone(value, options); },
@@ -261,6 +264,7 @@ async function runWorker() {
   });
   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+  streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
   vm.runInContext(GEOMETRY_SOURCE, context);
   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;', context);
   const dispatchError = value => vm.runInContext('__dispatchError', context)(value);

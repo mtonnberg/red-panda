@@ -56,7 +56,30 @@ function modifiers(bits = 0) {
 }
 
 function focused(window) {
-  return window.document.activeElement ?? window.document.body ?? window.document.documentElement;
+  let target = window.document.activeElement ?? window.document.body ?? window.document.documentElement;
+  const visited = new Set();
+  while (target && !visited.has(target)) {
+    visited.add(target);
+    const root = implForWrapper(target)?._shadowRoot;
+    const inner = root ? wrapperForImpl(root).activeElement : undefined;
+    if (!inner) break;
+    target = inner;
+  }
+  return target;
+}
+
+function keyboardWindow(page) {
+  let window = page.dom.window;
+  const visited = new Set();
+  while (!visited.has(window)) {
+    visited.add(window);
+    const target = focused(window);
+    if (!['iframe', 'frame'].includes(target?.localName)) break;
+    const child = page.frames?.findElement(target);
+    if (!child || child.closed || child.documentAbort.signal.aborted) break;
+    window = child.dom.window;
+  }
+  return window;
 }
 
 function editableRoot(element) {
@@ -442,7 +465,7 @@ function dispatchMouse(window, params) {
 export function runInput(session, method, params = {}) {
   if (!supportsInput(method)) throw invalid(`Unsupported CDP method: ${method}`, -32601);
   if (session.page.closed) throw invalid('Page is closed');
-  const window = session.page.dom.window;
+  const window = method === 'Input.dispatchMouseEvent' ? session.page.dom.window : keyboardWindow(session.page);
   if (method === 'Input.insertText') {
     if (typeof params.text !== 'string') throw invalid('text must be a string');
     changeText(window, focused(window), params.text, 'insertText');

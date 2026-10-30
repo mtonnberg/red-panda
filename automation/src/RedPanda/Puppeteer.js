@@ -51,6 +51,7 @@ export const evaluateFrameStringImpl = frame => expression => async(async () => 
   return value;
 });
 export const gotoFrameImpl = frame => url => async(async () => (await frame.goto(url, { waitUntil: 'load', timeout: 5000 }))?.status() ?? 0);
+export const focusFrameImpl = frame => selector => async(async () => { await frame.focus(selector); });
 export const screenshotImpl = page => fullPage => async(() => page.screenshot({ type: 'png', fullPage }));
 export const pdfImpl = page => async(() => page.pdf());
 export const byteLength = bytes => bytes.byteLength;

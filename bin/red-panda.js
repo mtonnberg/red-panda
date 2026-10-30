@@ -42,7 +42,7 @@ Fetch options:
   --no-javascript         Parse HTML without running page scripts
   --fail-on-http-error    Dump HTTP errors and exit 22
   --user-agent STRING    Override the user agent
-  --load-resources KIND  Enable stylesheet, iframe or worker requests (repeatable)
+  --load-resources KIND  Enable stylesheet, iframe, worker or beacon requests (repeatable)
   --inject-script JS     Run before page scripts (repeatable, in CLI order)
   --inject-script-file PATH  Read a preload script from a file
   --cookie PATH          Load a JSON or Netscape cookie file into each page
@@ -85,7 +85,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === 'version' || values.version) { console.log(`RedPanda/${VERSION}`); return; }
   const timeout = integer(values['wait-ms'], '--wait-ms');
   let loadResources = values['load-resources'] ?? (command === 'mcp' ? ['stylesheet'] : []);
-  for (const resource of loadResources) if (!['none', 'stylesheet', 'iframe', 'worker'].includes(resource)) throw new Error(`Unsupported resource loading: ${resource}`);
+  for (const resource of loadResources) if (!['none', 'stylesheet', 'iframe', 'worker', 'beacon'].includes(resource)) throw new Error(`Unsupported resource loading: ${resource}`);
   if (loadResources.includes('none')) loadResources = [];
   const options = { timeout, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
   if (command === 'run') {

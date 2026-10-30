@@ -11,7 +11,7 @@ const usage = `Usage: node scripts/conformance.mjs --root /path/to/upstream/src/
   --test node/is_equal_node.html [--test document_fragment/document_fragment.html]
   [--tests-file /path/to/selection.json] [--isolate]
   [--browser-arg=--load-resources --browser-arg=iframe]
-  [--timeout 5000] [--port 9582] [--report /new/report.json]
+  [--timeout 5000] [--settle-ms 0] [--port 9582] [--report /new/report.json]
   [--fixture-profile static|xhr-subset | --fixture-origin http://127.0.0.1:9582]
 
 Runs unchanged upstream fixture assertions through raw CDP. Both targets use
@@ -23,7 +23,7 @@ The native harness requires origin http://127.0.0.1:9582 for its dynamic routes.
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const inside = (root, path) => { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)); };
 
-async function runFixture(client, server, selection, timeout) {
+async function runFixture(client, server, selection, timeout, settleMs = 0) {
   const started = Date.now();
   const deadline = started + timeout;
   const requestOffset = server.requests?.length ?? 0;
@@ -54,6 +54,12 @@ async function runFixture(client, server, selection, timeout) {
     const url = `${server.origin}/src/browser/tests/${selection.path.split('/').map(encodeURIComponent).join('/')}`;
     const navigation = await send('Page.navigate', { url });
     if (navigation.errorText) throw new Error(navigation.errorText);
+    if (settleMs) {
+      while (Date.now() < deadline && await evaluate('document.readyState') !== 'complete') await sleep(Math.min(20,remaining()));
+      if (Date.now() >= deadline) throw new Error('Fixture document-complete deadline exceeded');
+      await sleep(Math.min(settleMs,remaining()));
+      if (Date.now() >= deadline) throw new Error('Fixture settling deadline exceeded');
+    }
     while (Date.now() < deadline) {
       polls++;
       const value = JSON.parse(await evaluate(`JSON.stringify((() => {
@@ -93,7 +99,7 @@ async function runFixture(client, server, selection, timeout) {
     status = 'unobserved'; error = 'Upstream harness recorded no test observations';
   }
   return { ...selection, status, error, durationMs:Date.now()-started, harnessObserved, nativeHarnessBranch, observedUserAgent,
-    deadlineMs:timeout, deadlineIncludesNavigation:true,
+    deadlineMs:timeout, deadlineIncludesNavigation:true, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
     assertOkPolls:polls, nonzeroObservationsEnforced:status==='passed',
     observationCount:null, observationCountNote:'Private upstream harness state; passing assertOk enforces nonzero observations and no pending async blocks.',
     diagnostics:logs, runtimeExceptions:events.filter(event => event.method === 'Runtime.exceptionThrown').map(event => event.params.exceptionDetails?.text),
@@ -105,7 +111,7 @@ async function main() {
   const { values, positionals } = parseArgs({ allowPositionals:true, options:{
     root:{type:'string'}, endpoint:{type:'string'}, binary:{type:'string'}, test:{type:'string',multiple:true},
     'tests-file':{type:'string'}, isolate:{type:'boolean'}, 'browser-arg':{type:'string',multiple:true},
-    timeout:{type:'string',default:'5000'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
+    timeout:{type:'string',default:'5000'}, 'settle-ms':{type:'string',default:'0'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
     'fixture-origin':{type:'string'}, 'fixture-profile':{type:'string'},
   } });
   if (values.help) { console.log(usage); return; }
@@ -123,8 +129,9 @@ async function main() {
   }
   const tests = [...(values.test ?? []), ...fromFile, ...positionals];
   if (!tests.length) throw new Error('Zero selected fixtures: supply at least one explicit --test path');
-  const timeout = Number(values.timeout), port = Number(values.port);
+  const timeout = Number(values.timeout), port = Number(values.port), settleMs=Number(values['settle-ms']);
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120000 || !Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid timeout or port');
+  if(!Number.isInteger(settleMs)||settleMs<0||settleMs>=timeout)throw new Error('--settle-ms must be a nonnegative integer below --timeout');
   const root = await realpath(resolve(values.root));
   const harness = await readFile(join(root,'testing.js'));
   const selections = [];
@@ -174,7 +181,7 @@ async function main() {
           ownedClient = await connect(ownedBrowser.endpoint,{timeout});
           const target = await ownedClient.send('Browser.getVersion');
           version ??= target;
-          result = await runFixture(ownedClient,server,selection,timeout);
+          result = await runFixture(ownedClient,server,selection,timeout,settleMs);
           result.target = target;
         } catch (cause) {
           result = { ...selection,status:/timeout|timed out|deadline/i.test(cause.message)?'timeout':'failed',error:cause.message,
@@ -185,7 +192,7 @@ async function main() {
         }
         result.ownedBrowser = { pid:ownedBrowser?.process.pid ?? null,exitCode:ownedBrowser?.process.exitCode ?? null,signal:ownedBrowser?.process.signalCode ?? null };
         result.totalDurationMs = Date.now()-started;
-      } else result = await runFixture(client,server,selection,timeout);
+      } else result = await runFixture(client,server,selection,timeout,settleMs);
       results.push(result);
       console.error(`${result.status.toUpperCase()} ${result.path}${result.error ? ': '+result.error : ''}`);
     }
@@ -193,7 +200,7 @@ async function main() {
     for (const result of results) counts[result.status]++;
     const report = { schemaVersion:1, target:version, binary:binaryIdentity, root, endpoint, sourceHarnessSHA256:createHash('sha256').update(harness).digest('hex'),
       harnessSourceUnchanged:true, testUserAgent:'Lightpanda/1.0', externalRunnerFlag:true,
-      isolatedBrowserPerFixture:!!values.isolate, browserArgs,
+      isolatedBrowserPerFixture:!!values.isolate, browserArgs, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
       configurationCoverage:{
         sourceHtmlRunnerDefaults:['--load-resources','iframe','--load-resources','worker'],
         sourceDefaultsNote:'src/testing.zig HtmlRunnerOpts enables iframe and worker; individual registrations may override resources, experimental features or injected scripts.',

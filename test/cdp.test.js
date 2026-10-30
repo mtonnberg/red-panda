@@ -36,9 +36,9 @@ test('flattened sessions navigate, evaluate, retain handles, cookies, dump and d
     await send('Runtime.releaseObject', { objectId: handle });
     await assert.rejects(send('Runtime.getProperties', { objectId: handle }), /Cannot find object/);
     const error = await send('Runtime.evaluate', { expression: "throw new Error('expected')" });
-    assert.match(error.exceptionDetails.text, /expected/);
+    assert.equal(error.exceptionDetails.text, 'Uncaught'); assert.match(error.exceptionDetails.exception.description, /expected/);
     const deadline = await send('Runtime.evaluate', { expression: 'while(true){}' });
-    assert.match(deadline.exceptionDetails.text, /timed out/);
+    assert.match(deadline.exceptionDetails.exception.description, /timed out/);
     await send('Network.setCookie', { url: fixture.url, name: 'cdp', value: 'works' });
     assert.ok((await send('Network.getCookies', { urls: [fixture.url] })).cookies.some(cookie => cookie.name === 'cdp'));
     const dump = await send('LP.dump', { format: 'markdown' });

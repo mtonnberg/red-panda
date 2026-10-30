@@ -111,3 +111,18 @@ test('unregistered jsdom documents keep their original focus eligibility', () =>
     assert.equal(other.window.document.activeElement, other.window.document.querySelector('button'));
   } finally { f.close(); other.window.close(); }
 });
+
+test('closed-shadow focus uses the actual leaf and retargets same-document related targets', () => {
+  const f = fixture('<div id="host"></div><input id="parent">');
+  try {
+    const host = f.element('#host'), parent = f.element('#parent'), root = host.attachShadow({ mode: 'closed' });
+    root.innerHTML = '<input id="leaf">'; const leaf = root.querySelector('input'), events = [];
+    leaf.addEventListener('blur', event => events.push(['leaf-blur', event.relatedTarget === parent]));
+    parent.addEventListener('focus', event => events.push(['parent-focus', event.relatedTarget === host]));
+    leaf.focus(); assert.equal(f.document.activeElement, host); assert.equal(root.activeElement, leaf);
+    parent.focus(); assert.equal(root.activeElement, null); assert.deepEqual(events, [['leaf-blur', true], ['parent-focus', true]]);
+    // Native host.blur() does not unfocus its retargeted shadow descendant.
+    leaf.focus(); host.blur(); assert.equal(f.document.activeElement, host); assert.equal(root.activeElement, leaf);
+    leaf.blur(); assert.equal(f.document.activeElement, f.document.body); assert.equal(root.activeElement, null);
+  } finally { f.close(); }
+});

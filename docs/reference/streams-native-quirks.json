@@ -1,0 +1,20 @@
+{
+  "cancel": {
+    "expression": "(async()=>{const o={};let release,seen;const s=new ReadableStream({cancel(r){seen=r;return new Promise(resolve=>release=resolve)}});const r=s.getReader();const pending=r.read();let readSettled=false;pending.then(()=>readSettled=true);const p=r.cancel('stop');o.synchronous={locked:s.locked,seen,readSettled};await Promise.resolve();o.microtask={locked:s.locked,readSettled};release();await p;o.settled={locked:s.locked,read:await pending};try{o.after=await r.read()}catch(e){o.after={name:e.name,message:e.message}}return JSON.stringify(o)})()",
+    "status": 0,
+    "stdout": "{\"synchronous\":{\"locked\":false,\"seen\":\"stop\",\"readSettled\":false},\"microtask\":{\"locked\":false,\"readSettled\":true},\"settled\":{\"locked\":false,\"read\":{\"done\":true}},\"after\":{\"name\":\"TypeError\",\"message\":\"Reader has been released\"}}\n",
+    "stderr": ""
+  },
+  "cancelReject": {
+    "expression": "(async()=>{const s=new ReadableStream({cancel(){return Promise.reject(new Error('failed'))}});const r=s.getReader();try{await r.cancel()}catch(e){return JSON.stringify({locked:s.locked,name:e.name,message:e.message})}})()",
+    "status": 0,
+    "stdout": "\n",
+    "stderr": ""
+  },
+  "byob": {
+    "expression": "(async()=>{const o={};for(const type of ['bytes','other']){const s=new ReadableStream({type,start(c){o[type+'Controller']=c.constructor.name;c.enqueue('notbytes');c.close()}});try{const r=s.getReader({mode:'byob'});o[type]={name:r.constructor.name,value:await r.read(new Uint8Array(1))}}catch(e){o[type]={name:e.name,message:e.message}}}return JSON.stringify(o)})()",
+    "status": 0,
+    "stdout": "{\"bytesController\":\"ReadableStreamDefaultController\",\"bytes\":{\"name\":\"ReadableStreamDefaultReader\",\"value\":{\"done\":false,\"value\":\"notbytes\"}},\"otherController\":\"ReadableStreamDefaultController\",\"other\":{\"name\":\"ReadableStreamDefaultReader\",\"value\":{\"done\":false,\"value\":\"notbytes\"}}}\n",
+    "stderr": ""
+  }
+}

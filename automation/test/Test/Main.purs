@@ -180,10 +180,15 @@ main = launchAff_ $
         navigatedFrameTitle <- Browser.evaluateFrameString frame "document.title"
         parentTitle <- Browser.evaluateString page "document.title"
         assert "frame navigation preserves the parent document" $ frameStatus == 200 && navigatedFrameTitle == "Next frame" && parentTitle == "Parent frames"
+        void $ Browser.evaluateFrameString frame "document.body.insertAdjacentHTML('beforeend','<input id=frame-edit>'); 'ready'"
+        Browser.focusFrame frame "#frame-edit"
+        Browser.insertText page "Child edit"
+        editedFrame <- Browser.evaluateFrameString frame "document.querySelector('#frame-edit').value"
+        assert "PureScript keyboard input follows focus into the actual child frame" $ editedFrame == "Child edit"
         void $ Browser.goto page $ "data:text/html,<h1>PureScript rendering</h1><p>Own selectable text.</p>"
         image <- Browser.screenshot page false
         assert "PureScript Puppeteer receives a real PNG screenshot" $ Browser.signature image == "89504e470d0a1a0a" && Browser.byteLength image > 1000
         pdfBytes <- Browser.pdf page
         assert "PureScript Puppeteer reads a real PDF through CDP streams" $ Browser.signature pdfBytes == "255044462d312e34" && Browser.byteLength pdfBytes > 1000
         Browser.closePage page
-        log "PureScript Puppeteer integration: 49 checks passed"
+        log "PureScript Puppeteer integration: 50 checks passed"

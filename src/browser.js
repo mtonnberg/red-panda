@@ -22,6 +22,12 @@ import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
 import { renderDocument } from './render.js';
 import { installNavigator } from './navigator.js';
 import { installFonts } from './fonts.js';
+import { installBeacon } from './beacon.js';
+import { installErrors } from './errors.js';
+import { installResizeObserver } from './resize-observer.js';
+import { installPerformance } from './performance.js';
+import { installClassicScripts } from './classic-scripts.js';
+import { installMutations } from './mutations.js';
 
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
@@ -162,6 +168,8 @@ export class Page extends EventEmitter {
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
+    installErrors(this, window);
+    installMutations(this, window);
     if (main) implForWrapper(window.document).contentType = this.mimeType;
     installCollections(window, { binding: this.browser.collectionsBinding });
     installInput(window);
@@ -169,6 +177,8 @@ export class Page extends EventEmitter {
     installBlobURLs(this, window);
     installStyles(this, window);
     installIntersection(this, window, installLayout(this, window, this.viewport));
+    installResizeObserver(this, window, this.layout);
+    installPerformance(this, window);
     window.AbortController = AbortController;
     window.AbortSignal = AbortSignal;
     window.TextEncoder = TextEncoder;
@@ -177,10 +187,12 @@ export class Page extends EventEmitter {
     installNavigator(this, window);
     installFonts(window);
     installFetch(this, window);
+    installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
     if (main) this.installHistory(window, historyState);
     installNavigation(this, window);
     installForms(this, window);
     installModuleScripts(this, window);
+    installClassicScripts(this, window);
     installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
     installGeometry(window);
     installXHR(this, window);
@@ -489,6 +501,7 @@ export class Page extends EventEmitter {
     const requestBody = body ?? rememberedRequest?.body;
     const requestHeaders = new Headers(headers ?? rememberedRequest?.headers);
     let navigationWindow, redirect, captureRedirect;
+    this.performanceNavigationType = historyMode === 'reload' ? 'reload' : historyMode === 'traverse' ? 'back_forward' : 'navigate';
     this.loaderId = randomUUID();
     this.emit('navigationStarted');
     try {
@@ -598,7 +611,7 @@ export class Page extends EventEmitter {
 
   evaluate(expression) {
     if (this.closed) throw new Error('Page is closed');
-    try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout, 2000) }); }
+    try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout, 2000), displayErrors: false }); }
     finally { this.reconcileURL(); }
   }
   callFunction(declaration, thisArg, args) {

@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { installStreams } from './streams.js';
 
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
@@ -48,6 +49,7 @@ function safeHeader(name, value) {
  */
 export function installFetch(page, window) {
   if (INSTALLED.has(window)) return INSTALLED.get(window);
+  const streams = installStreams(page, window);
   const generation = page.documentGeneration;
   const documentSignal = page.documentAbort?.signal;
   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
@@ -203,7 +205,7 @@ export function installFetch(page, window) {
     }
     clone() { try { return wrapRequest(getRequest(this).raw.clone()); } catch (error) { throw realmError(error); } }
     get headers() { return getRequest(this).headers; }
-    get body() { return getRequest(this).raw.body; }
+    get body() { return streams.adopt(getRequest(this).raw.body); }
     get bodyUsed() { return getRequest(this).raw.bodyUsed; }
     get [Symbol.toStringTag]() { return 'Request'; }
   }
@@ -294,7 +296,7 @@ export function installFetch(page, window) {
     get type() { const s = getResponse(this); return s.type ?? s.raw.type; }
     get redirected() { const s = getResponse(this); return s.redirected ?? s.raw.redirected; }
     get ok() { return this.status >= 200 && this.status < 300; }
-    get body() { return getResponse(this).raw.body; }
+    get body() { return streams.adopt(getResponse(this).raw.body); }
     get bodyUsed() { return getResponse(this).raw.bodyUsed; }
     get [Symbol.toStringTag]() { return 'Response'; }
   }

@@ -6,6 +6,9 @@ const focusing = require('jsdom/lib/jsdom/living/helpers/focusing.js');
 const { isDisabled, isInteractiveContent } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
 const LabelImpl = require('jsdom/lib/jsdom/living/nodes/HTMLLabelElement-impl.js').implementation;
 const DOCUMENTS = new WeakSet();
+// A frame in its parent's focus chain is a browsing-context proxy. It only
+// receives its own focus/blur events when it was explicitly focused as a leaf.
+const FRAME_PROXIES = new WeakSet();
 const HTML = 'http://www.w3.org/1999/xhtml';
 const originalFocusable = focusing.isFocusableAreaElement;
 let patched = false;
@@ -51,6 +54,88 @@ export function isFocusable(element) {
   return false;
 }
 
+function topDocument(document) {
+  const seen = new Set();
+  while (document?._defaultView?._frameElement && !seen.has(document)) {
+    seen.add(document); document = document._defaultView._frameElement._ownerDocument;
+  }
+  return document;
+}
+
+function focusedChain(document) {
+  const entries = [], seen = new Set(); let leaf = null;
+  while (document && !seen.has(document)) {
+    seen.add(document);
+    const element = document._lastFocusedElement;
+    if (!element) break;
+    const child = ['iframe', 'frame'].includes(element._localName) ? element._contentDocument : null;
+    const proxy = Boolean(child && (FRAME_PROXIES.has(element) || child._lastFocusedElement));
+    entries.push({ document, element, proxy });
+    if (!proxy) { leaf = element; break; }
+    document = child;
+  }
+  return { entries, leaf };
+}
+
+function desiredChain(element) {
+  const entries = [{ document: element._ownerDocument, element, proxy: false }], seen = new Set();
+  for (let document = element._ownerDocument; document?._defaultView?._frameElement && !seen.has(document);) {
+    seen.add(document);
+    const frame = document._defaultView._frameElement;
+    entries.unshift({ document: frame._ownerDocument, element: frame, proxy: true }); document = frame._ownerDocument;
+  }
+  return entries;
+}
+
+function clearEntries(entries) {
+  for (const { document, element } of entries) {
+    if (document._lastFocusedElement === element) document._lastFocusedElement = null;
+    FRAME_PROXIES.delete(element);
+  }
+}
+
+function focusEvents(element, entering, related) {
+  focusing.fireFocusEventWithTargetAdjustment(entering ? 'focus' : 'blur', element, related);
+  focusing.fireFocusEventWithTargetAdjustment(entering ? 'focusin' : 'focusout', element, related, { bubbles: true });
+}
+
+function focusElement(element) {
+  if (!isFocusable(wrapperForImpl(element))) return;
+  const desired = desiredChain(element);
+  // Native checks eligibility inside the owning document. Its bounded profile
+  // still permits a child control beneath a display-none or inert frame element.
+  const root = topDocument(element._ownerDocument), previous = focusedChain(root);
+  // Calling frame.focus() on an already active ancestor retains the child leaf.
+  if (previous.entries.some(entry => entry.element === element)) return;
+  let common = 0;
+  while (common < previous.entries.length && common < desired.length &&
+      previous.entries[common].element === desired[common].element && previous.entries[common].document === desired[common].document) common++;
+  const previousLeaf = previous.leaf;
+  clearEntries(previous.entries.slice(common));
+  const related = previousLeaf?._ownerDocument === element._ownerDocument ? previousLeaf : null;
+  if (previousLeaf && previous.entries.length > common) {
+    focusEvents(previousLeaf, false, related ? element : null);
+  }
+  for (const entry of desired) {
+    entry.document._lastFocusedElement = entry.element;
+    if (entry.proxy) FRAME_PROXIES.add(entry.element);
+    else FRAME_PROXIES.delete(entry.element);
+  }
+  focusEvents(element, true, related);
+  element._ownerDocument.getSelection().collapse(element, 0);
+}
+
+function blurElement(element) {
+  const previous = focusedChain(topDocument(element._ownerDocument));
+  const index = previous.entries.findIndex(entry => entry.element === element);
+  if (index < 0) return;
+  clearEntries(previous.entries.slice(index));
+  if (previous.leaf) {
+    focusEvents(previous.leaf, false, null);
+    previous.leaf._ownerDocument.getSelection().empty();
+  }
+}
+
 function installProperties(window) {
   const prototype = window.HTMLElement.prototype;
   if (!('inert' in prototype)) Object.defineProperty(prototype, 'inert', {
@@ -89,6 +174,26 @@ export function installFocus(window) {
       if (implementation._ownerDocument._lastFocusedElement === implementation) return true;
       return isFocusable(wrapperForImpl(implementation));
     };
+    for (const name of ['HTMLElement', 'SVGElement']) {
+      const prototype = require(`jsdom/lib/jsdom/living/nodes/${name}-impl.js`).implementation.prototype;
+      const originalFocus = prototype.focus;
+      const originalBlur = prototype.blur;
+      prototype.focus = function (...args) {
+        if (!DOCUMENTS.has(this._ownerDocument)) return originalFocus.apply(this, args);
+        const root = this._shadowRoot;
+        if (root && wrapperForImpl(root).delegatesFocus) {
+          for (const candidate of wrapperForImpl(root).querySelectorAll('*')) {
+            const target = implForWrapper(candidate);
+            if (focusing.isFocusableAreaElement(target)) { target.focus(); return; }
+          }
+        }
+        return focusElement(this);
+      };
+      prototype.blur = function (...args) {
+        if (!DOCUMENTS.has(this._ownerDocument)) return originalBlur.apply(this, args);
+        return blurElement(this);
+      };
+    }
     const originalActivation = LabelImpl.prototype._activationBehavior;
     LabelImpl.prototype._activationBehavior = function (event) {
       if (!DOCUMENTS.has(this._ownerDocument)) return originalActivation.call(this, event);

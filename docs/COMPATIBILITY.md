@@ -477,3 +477,28 @@ iteration, parsing and serialization/normalization assertions. This bounded
 selection does not supersede the earlier 178-case cohort or establish full
 browser parity. Navigator metadata identifies Red Panda; native-function
 fingerprints and many remaining API contracts are not replicated.
+
+The subsequent lifecycle checkpoint passes 555 JavaScript tests, 50 PureScript
+Puppeteer assertions, the strict/pedantic build and all 13 existing differential
+scenarios. It adds classic-script scheduling/preloads, genuine public mutation
+delivery, CSSOM parsing and mutation semantics, streams, beacons, resize and
+performance entries, error reporting, safe CDP value handling and nested-frame
+keyboard focus. These features are independently implemented.
+
+[conformance-lifecycle-checkpoint.json](reference/conformance-lifecycle-checkpoint.json)
+retains a frozen 37-fixture comparison: native passed all 37; the initial
+candidate run passed 32, failed the `parser_chunks` assertion and hit four
+timeouts before browser readiness. A separate
+[startup recheck](reference/conformance-lifecycle-startup-recheck.json) passed
+all four affected fixtures with the identical source snapshot, flags and budget.
+The original timeouts remain recorded. Native and candidate used the same
+document-complete plus 100 ms settling procedure, inside the 15-second fixture
+budget. This is evidence for 36 distinct candidate fixtures passing across those
+runs, with large-document parser slicing still unfinished.
+
+Heap enumeration remains unsupported. Both inspector and owned native-profiler
+experiments crashed under lifecycle stress; further controls isolated older
+closed-context probing after heap activity as a trigger. Experimental sources
+are quarantined outside production builds/default tests, with
+[negative evidence and limits](reference/runtime-query-contract.md). No empty or
+partial successful query result substitutes for actual heap enumeration.

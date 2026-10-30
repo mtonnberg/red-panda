@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { createInternalMutationObserver } from './mutations.js';
 
 const methods = new Set([
   'DOM.enable', 'DOM.disable', 'DOM.getDocument', 'DOM.describeNode',
@@ -116,7 +117,7 @@ function serialize(session, state, node, depth = 0, pierce = false, budget = { r
 function enable(session, state) {
   session.domains?.add('DOM');
   if (state.observer) return;
-  state.observer = new session.page.dom.window.MutationObserver(records => {
+  state.observer = createInternalMutationObserver(session.page.dom.window, records => {
     for (const record of records) {
       if (!state.known.has(record.target)) continue;
       const id = session.backendId(record.target);

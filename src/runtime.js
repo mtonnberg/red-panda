@@ -37,9 +37,7 @@ function executionPage(session, id) {
   return session.page;
 }
 function details(session, error, contextId) {
-  // Existing Session.exception accepts Error-like objects, not null/undefined.
-  const printable = error !== null && (typeof error === 'object' || typeof error === 'function') ? error : new Error(String(error));
-  return { ...session.exception(printable, contextId), executionContextId: contextId };
+  return { ...session.exception(error, contextId), executionContextId: contextId };
 }
 
 class RealmInspector {
@@ -198,7 +196,7 @@ export async function runRuntime(session, method, params = {}) {
       state.scripts.delete(params.scriptId); // V8 persisted scripts are single-use.
       try {
         let value;
-        try { value = script.runInContext(page.dom.getInternalVMContext(), { timeout: Math.min(page.timeout, 2000) }); }
+        try { value = script.runInContext(page.dom.getInternalVMContext(), { timeout: Math.min(page.timeout, 2000), displayErrors: false }); }
         finally { page.reconcileURL?.(); }
         if (params.awaitPromise) value = await awaitInState(state, value);
         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);

@@ -1,0 +1,7 @@
+{
+  "expression": "(async()=>{const out={};let seen;const reason={reason:'cancel'};const readable=new ReadableStream({cancel(r){seen=r===reason}});const reader=readable.getReader();const pending=reader.read();await reader.cancel(reason);out.cancel={seen,done:(await pending).done,locked:readable.locked};const encoded=new ReadableStream({start(c){c.enqueue('€'+String.fromCharCode(0xd83d));c.enqueue(String.fromCharCode(0xde00));c.close()}}).pipeThrough(new TextEncoderStream());let bytes=[];const er=encoded.getReader();while(true){let v=await er.read();if(v.done)break;bytes.push(...v.value)}out.utf8=bytes;const compressed=new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('actual gzip €'));c.close()}}).pipeThrough(new CompressionStream('gzip'));const cr=compressed.getReader();let gzip=[];while(true){let v=await cr.read();if(v.done)break;gzip.push(...v.value)}out.gzip=gzip;let startSize,pulls=0;const pressure=new ReadableStream({start(c){startSize=c.desiredSize},pull(c){pulls++;c.enqueue('x')}});await Promise.resolve();await Promise.resolve();out.pressure={startSize,pulls};await pressure.cancel();return JSON.stringify(out)})()",
+  "status": 0,
+  "stdout": "{\"cancel\":{\"seen\":true,\"done\":true,\"locked\":false},\"utf8\":[226,130,172,239,191,189,239,191,189],\"gzip\":[31,139,8,0,0,0,0,0,0,3,75,76,46,41,77,204,81,72,175,202,44,80,120,212,180,6,0,45,222,224,90,15,0,0,0],\"pressure\":{\"startSize\":1,\"pulls\":1}}\n",
+  "stderr": "",
+  "independentGzipText": "actual gzip €"
+}
