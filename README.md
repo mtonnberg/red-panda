@@ -131,7 +131,9 @@ simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
 semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
 CSS painting, canvas, service/shared workers, complete frame behavior and process
-isolation remain absent. Large-document parser slicing, frame POST
+isolation remain absent. Large HTML sources now feed the real parser in bounded
+tasks, allowing actual mutation delivery during loading. Complete parser
+checkpoints and document.open/write lifetimes, frame POST
 navigation, advanced shadow CSS, flattened shadow/frame pointer/Tab input and full
 CSS behavior remain unfinished. Utility-world IDs share their owning frame's
 JS realm. Some configuration commands still

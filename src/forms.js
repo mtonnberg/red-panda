@@ -4,9 +4,13 @@ import { installNavigation, requestNavigation } from './navigation.js';
 
 const require = createRequire(import.meta.url);
 const FormImpl = require('jsdom/lib/jsdom/living/nodes/HTMLFormElement-impl.js').implementation;
+const DataImpl = require('jsdom/lib/jsdom/living/xhr/FormData-impl.js').implementation;
+const HTMLElement = require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
+const FormDataIDL = require('jsdom/lib/jsdom/living/generated/FormData.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const { isDisabled, isSubmitButton } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
 const DOCUMENTS = new WeakMap();
+const DATA_WINDOWS = new WeakSet();
 let patched = false;
 const encodings = new Set(['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain']);
 const crlf = value => String(value).replace(/\r\n|\r|\n/g, '\r\n');
@@ -18,7 +22,11 @@ function dispatchTrusted(target, event) {
 }
 
 function registered(form) {
-  const record = DOCUMENTS.get(form._ownerDocument);
+  return documentRecord(form._ownerDocument);
+}
+
+function documentRecord(document) {
+  const record = DOCUMENTS.get(document);
   return record && !record.disposed && !record.page.closed && !record.signal?.aborted &&
     record.window.document === record.document ? record : null;
 }
@@ -84,9 +92,8 @@ function direction(control) {
   return 'ltr';
 }
 
-function entryList(record, formImpl, submitterImpl) {
+function entryList(record, formImpl, submitterImpl, data = new record.window.FormData()) {
   const { window } = record;
-  const data = new window.FormData();
   for (const implementation of formImpl._getSubmittableElementNodes()) {
     const control = wrapperForImpl(implementation);
     if (isDisabled(implementation) || control.closest('datalist')) continue;
@@ -121,6 +128,31 @@ function entryList(record, formImpl, submitterImpl) {
     }
   }
   return data;
+}
+
+function installFormData(window) {
+  if (DATA_WINDOWS.has(window)) return;
+  DATA_WINDOWS.add(window);
+  const Original = window.FormData;
+  const Constructor = new Proxy(Original, { construct(target, args, newTarget) {
+    const form = implForWrapper(args[0]);
+    const record = form instanceof FormImpl && registered(form);
+    // Let the generated constructor perform ordinary Web IDL conversion for
+    // empty, invalid and unregistered forms. The observed native second argument
+    // accepts any HTMLElement, including a non-button or unrelated control.
+    if (!record) return Reflect.construct(target, args, newTarget);
+    const submitter = args[1] == null ? null : HTMLElement.convert(window, args[1], { context: 'FormData submitter' });
+    if (record.constructing.has(form)) throw new window.DOMException('The form entry list is being constructed', 'InvalidStateError');
+    const data = Reflect.construct(target, [], newTarget);
+    record.constructing.add(form);
+    try {
+      entryList(record, form, submitter, data);
+      dispatchTrusted(wrapperForImpl(form), new record.window.FormDataEvent('formdata', { bubbles: true, formData: data }));
+    } finally { record.constructing.delete(form); }
+    return data;
+  } });
+  Object.defineProperty(Original.prototype, 'constructor', { configurable: true, writable: true, value: Constructor });
+  window.FormData = Constructor;
 }
 
 function serializedPairs(data) {
@@ -201,6 +233,27 @@ function patchHost() {
   const originalSubmit = FormImpl.prototype.submit;
   const originalRequest = FormImpl.prototype.requestSubmit;
   const originalActivation = FormImpl.prototype._doRequestSubmit;
+  const originalReset = FormImpl.prototype.reset;
+  const originalSet = DataImpl.prototype.set;
+  DataImpl.prototype.set = function (...args) {
+    const document = implForWrapper(this._globalObject.document);
+    if (!documentRecord(document)) return originalSet.apply(this, args);
+    const previous = new Set(this._entries);
+    const result = originalSet.apply(this, args);
+    // Native removes all matching entries and appends the replacement. Retain
+    // the generated conversion path without coercing authored arguments twice.
+    const index = this._entries.findIndex(entry => !previous.has(entry));
+    if (index >= 0 && index < this._entries.length - 1) this._entries.push(...this._entries.splice(index, 1));
+    return result;
+  };
+  FormImpl.prototype.reset = function () {
+    const record = registered(this);
+    if (!record) return originalReset.call(this);
+    if (record.resetting.has(this)) return;
+    record.resetting.add(this);
+    try { return originalReset.call(this); }
+    finally { record.resetting.delete(this); }
+  };
   FormImpl.prototype.submit = function () {
     const record = registered(this);
     return record ? submit(record, this, null, true) : originalSubmit.call(this);
@@ -239,10 +292,9 @@ export function installForms(page, window) {
   if (typeof window.FormDataEvent !== 'function') {
     const payloads = new WeakMap();
     const Event = window.Event;
-    const FormData = window.FormData;
     window.FormDataEvent = class FormDataEvent extends Event {
       constructor(type, init = {}) {
-        if (!(init.formData instanceof FormData)) throw new window.TypeError('FormDataEvent requires formData');
+        if (!FormDataIDL.is(init.formData)) throw new window.TypeError('FormDataEvent requires formData');
         super(type, init);
         payloads.set(this, init.formData);
       }
@@ -253,7 +305,7 @@ export function installForms(page, window) {
     };
   }
   const record = { page, window, document, signal: page.documentAbort?.signal, disposed: false, originalClose: window.close,
-    constructing: new WeakSet(), submitting: new WeakSet() };
+    constructing: new WeakSet(), submitting: new WeakSet(), resetting: new WeakSet() };
   const dispose = () => {
     if (record.disposed) return;
     record.disposed = true;
@@ -266,6 +318,7 @@ export function installForms(page, window) {
   record.controller = { dispose };
   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
   DOCUMENTS.set(implementation, record);
+  installFormData(window);
   record.close = function () { dispose(); return record.originalClose.call(window); };
   window.close = record.close;
   record.signal?.addEventListener('abort', dispose, { once: true });

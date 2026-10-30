@@ -494,7 +494,32 @@ all four affected fixtures with the identical source snapshot, flags and budget.
 The original timeouts remain recorded. Native and candidate used the same
 document-complete plus 100 ms settling procedure, inside the 15-second fixture
 budget. This is evidence for 36 distinct candidate fixtures passing across those
-runs, with large-document parser slicing still unfinished.
+runs. Large-document parser slicing was still unfinished at that checkpoint.
+
+The following independent parser/form checkpoint adds genuine bounded tokenizer
+feeding with task yields, actual EOF and script-blocker resumption, close/abort
+cancellation, trusted FormData construction events and form reset guards.
+The bounded [form observations](reference/forms-construction-after.json) match
+the native result object exactly, including its replacement-entry order and
+relaxed HTMLElement submitter behavior. See the
+[form contract](reference/forms-construction-contract.md) and
+[parser investigation](reference/parser-stream-FINDINGS.md).
+The full suite passes 573 JavaScript tests and all 50 PureScript Puppeteer
+assertions; syntax checks, the strict/pedantic PureScript build and the 13
+existing bounded native comparisons also pass.
+
+The new frozen
+[41-fixture comparison](reference/conformance-parser-forms-checkpoint.json)
+passed all 41 native fixtures and initially passed 38 candidate fixtures, with
+two assertion failures and one browser-startup timeout. The unchanged
+`mutation_observer/parser_chunks.html` now passes. A separate
+[same-snapshot recheck](reference/conformance-parser-forms-recheck.json) passes
+both the startup-affected `subtree` fixture and `report_error`, whose initial
+100 ms callback assertion missed the posted-message event. The original
+outcomes are retained; no timing cause is established. This supplies passing
+evidence for 40 distinct candidate fixtures across those runs, rather than a
+40/41 primary-run result. `element/html/form.html` still fails direct named form
+access, named collection enumerability and disconnected form association.
 
 Heap enumeration remains unsupported. Both inspector and owned native-profiler
 experiments crashed under lifecycle stress; further controls isolated older

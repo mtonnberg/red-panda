@@ -1,3 +1,4 @@
+import { createParserStream } from './parser-stream.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -16,7 +17,7 @@ const scriptTypes = new Set(['application/ecmascript', 'application/javascript',
   'text/javascript1.2', 'text/javascript1.3', 'text/javascript1.4', 'text/javascript1.5', 'text/jscript',
   'text/livescript', 'text/x-ecmascript', 'text/x-javascript', 'module', 'importmap']);
 
-function active(record) { return record && !record.disposed && !record.signal?.aborted && !record.page.closed; }
+function active(record) { return record && !record.disposed && !record.signal?.aborted && !record.page.closed && implForWrapper(record.window.document) === record.document; }
 function state(script) {
   if (!flags.has(script)) flags.set(script, { forceAsync: !(script._parserInserted && script._alreadyStarted) });
   return flags.get(script);
@@ -91,7 +92,8 @@ function resumeAfterScript(record, script) {
   queueMicrotask(() => {
     if (!active(record) || record.blocker !== blocker) return;
     record.blocker = null;
-    if (blocker.parser.tokenizer.paused) blocker.parser.tokenizer.resume(() => finishParser(record, blocker.parser));
+    if (record.stream) record.stream.resume();
+    else if (blocker.parser.tokenizer.paused) blocker.parser.tokenizer.resume(() => finishParser(record, blocker.parser));
   });
 }
 
@@ -123,7 +125,7 @@ function patch() {
 
   parse5.parse = function (markup, options) {
     const record = documents.get(options?.treeAdapter?._documentImpl);
-    if (!active(record) || record.page.javascript === false) return parse.call(this, markup, options);
+    if (!active(record)) return parse.call(this, markup, options);
     const parser = new parse5.Parser(options, undefined, null, script => {
       const type = script._getTypeString()?.toLowerCase();
       if (type === 'module' || type === 'importmap' || !scriptTypes.has(type) || !script._canRunScript()) return;
@@ -138,7 +140,12 @@ function patch() {
       parser.tokenizer.pause();
     });
     record.parser = parser; record.parserDone = false;
-    parser.tokenizer.write(markup, true, () => finishParser(record, parser));
+    record.stream = createParserStream(parser, markup, {
+      signal: record.signal, active: () => active(record),
+      onComplete: () => finishParser(record, parser),
+      onError: error => record.page.emit?.('pageError', error),
+    });
+    record.stream.start();
     return parser.document;
   };
   DocumentImpl.prototype.close = function (...args) {
@@ -284,7 +291,7 @@ export function installClassicScripts(page, window) {
   });
   const dispose = () => {
     if (record.disposed) return;
-    record.disposed = true;
+    record.disposed = true; record.stream?.abort();
     if (record.parser && !record.parserDone) { record.parser.tokenizer.pause(); record.parser.stopped = true; }
     record.blocker = null; record.closeRequested = null;
     record.preloadAbort.abort(); record.preloads.clear();

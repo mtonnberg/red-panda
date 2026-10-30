@@ -19,6 +19,86 @@ function fixture(html = '', { register = true, url = 'http://127.0.0.1:9582/star
     close() { page.closed = true; page.documentAbort.abort(); page.emit('close'); dom.window.close(); } };
 }
 
+test('FormData construction dispatches a trusted event with the returned mutable data, including detached forms and subclasses', () => {
+  const f = fixture('<form><input name="q" value="initial"><button name="go" value="yes">Go</button></form>');
+  try {
+    const form = f.document.querySelector('form'); let event;
+    form.addEventListener('formdata', value => {
+      event = value; value.formData.set('q', 'changed'); value.formData.append('added', 'yes');
+    });
+    const data = new f.window.FormData(form, form.querySelector('button'));
+    assert.deepEqual([...data], [['go', 'yes'], ['q', 'changed'], ['added', 'yes']]);
+    assert.equal(event.formData, data); assert.equal(event.target, form);
+    assert.equal(event.isTrusted, true); assert.equal(event.bubbles, true); assert.equal(event.cancelable, false);
+    assert.equal(data.constructor, f.window.FormData);
+    assert.equal(Object.prototype.toString.call(data), '[object FormData]');
+    const detached = f.document.createElement('form'); detached.innerHTML = '<input name="x" value="1">';
+    let events = 0; detached.addEventListener('formdata', () => { events++; });
+    class Derived extends f.window.FormData {}
+    const derived = new Derived(detached);
+    assert.deepEqual([...derived], [['x', '1']]); assert.equal(events, 1);
+    assert.equal(derived instanceof Derived, true); assert.equal(derived instanceof f.window.FormData, true);
+    assert.equal(derived.constructor, Derived);
+  } finally { f.close(); }
+});
+
+test('FormData construction prevents recursive construction and submission, while allowing another form', () => {
+  const f = fixture('<form action="/no-submit"><input name="q" value="1"></form>');
+  try {
+    const form = f.document.querySelector('form'), other = f.document.createElement('form');
+    other.innerHTML = '<input name="other" value="2">'; let events = 0, otherEvents = 0;
+    other.addEventListener('formdata', () => { otherEvents++; });
+    form.addEventListener('formdata', () => {
+      events++;
+      assert.throws(() => new f.window.FormData(form), error => error.name === 'InvalidStateError');
+      form.submit(); form.requestSubmit();
+      assert.deepEqual([...new f.window.FormData(other)], [['other', '2']]);
+    });
+    assert.deepEqual([...new f.window.FormData(form)], [['q', '1']]);
+    assert.equal(events, 1); assert.equal(otherEvents, 1); assert.equal(f.page.pendingNavigation, undefined);
+    // The guard is released after the event, so later independent construction works.
+    new f.window.FormData(form); assert.equal(events, 2);
+  } finally { f.close(); }
+});
+
+test('FormData matches observed HTMLElement submitters and replacement order without repeated coercion', () => {
+  const f = fixture('<form><input name="q" value="1"><button name="go" value="yes">Go</button></form>');
+  try {
+    const form = f.document.querySelector('form');
+    for (const control of [form.querySelector('input'), f.document.createElement('button'), null, undefined]) {
+      assert.deepEqual([...new f.window.FormData(form, control)], [['q', '1']]);
+    }
+    assert.throws(() => new f.window.FormData(form, {}), /HTMLElement/);
+    const data = new f.window.FormData(); data.append('a', '1'); data.append('b', '2'); data.append('a', '3');
+    let names = 0, values = 0;
+    data.set({ toString() { names++; return 'a'; } }, { toString() { values++; return '4'; } });
+    assert.deepEqual([...data], [['b', '2'], ['a', '4']]); assert.equal(names, 1); assert.equal(values, 1);
+    assert.throws(() => f.window.FormData(), /without 'new'/);
+  } finally { f.close(); }
+});
+
+test('reset is guarded during its trusted cancelable event and reset-button activation restores controls', () => {
+  const f = fixture('<form><input value="initial"><input type="checkbox" checked><textarea>text</textarea><output>output</output><select><option>A</option><option selected>B</option></select><button type="reset">Reset</button></form>');
+  try {
+    const form = f.document.querySelector('form'), input = form.querySelector('input'); let events = 0;
+    const listener = event => {
+      events++; assert.equal(event.isTrusted, true); assert.equal(event.bubbles, true); assert.equal(event.cancelable, true);
+      form.reset();
+    };
+    form.addEventListener('reset', listener);
+    input.value = 'dirty'; form.querySelector('input[type=checkbox]').checked = false;
+    form.querySelector('textarea').value = 'dirty'; form.querySelector('output').value = 'dirty';
+    form.querySelector('select').selectedIndex = 0; form.querySelector('button').click();
+    assert.equal(events, 1); assert.equal(input.value, 'initial');
+    assert.equal(form.querySelector('input[type=checkbox]').checked, true);
+    assert.equal(form.querySelector('textarea').value, 'text'); assert.equal(form.querySelector('output').value, 'output');
+    assert.equal(form.querySelector('output').defaultValue, 'output'); assert.equal(form.querySelector('select').selectedIndex, 1);
+    input.value = 'cancelled'; form.addEventListener('reset', event => event.preventDefault(), { once: true });
+    form.reset(); assert.equal(events, 2); assert.equal(input.value, 'cancelled');
+    form.reset(); assert.equal(events, 3); assert.equal(input.value, 'initial');
+  } finally { f.close(); }
+});
+
 test('GET submission serializes successful controls in order and replaces the action query', async () => {
   const f = fixture(`<form id="f" action="/search?discard=yes#results">
     <input name="q" value="red panda 🐼"><input name="q" value="second">
@@ -83,7 +163,7 @@ test('cancelable trusted submit events precede formdata and mutations determine 
     button.click(); assert.equal(f.page.pendingNavigation, undefined); assert.deepEqual(events, ['submit']);
     button.click(); await f.page.pendingNavigation.promise;
     assert.deepEqual(events, ['submit', 'submit', 'formdata']);
-    assert.equal(f.calls[0].url, 'http://127.0.0.1:9582/after?value=formdata&go=yes&added=yes');
+    assert.equal(f.calls[0].url, 'http://127.0.0.1:9582/after?go=yes&value=formdata&added=yes');
     const synthetic = new f.window.FormDataEvent('formdata', { formData: new f.window.FormData() });
     assert.equal(synthetic.isTrusted, false); assert.equal(synthetic.formData instanceof f.window.FormData, true);
     assert.throws(() => new f.window.FormDataEvent('formdata'), /requires formData/);

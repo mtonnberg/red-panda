@@ -1,0 +1,253 @@
+{
+  "schemaVersion": 1,
+  "scope": "Bounded public form constructor and reset observations; not complete form conformance.",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "node": "v24.22.1",
+  "expression": "(() => {\n  const out = {}, form = document.createElement('form');\n  form.innerHTML = '<input name=\"q\" value=\"initial\"><button name=\"go\" value=\"yes\">Go</button>';\n  document.body.append(form);\n  let event;\n  const edit = value => { event = value; value.formData.set('q', 'changed'); value.formData.append('added', 'yes'); };\n  form.addEventListener('formdata', edit);\n  const data = new FormData(form, form.querySelector('button'));\n  out.constructor = { entries: [...data], event: event ? {\n    trusted: event.isTrusted, bubbles: event.bubbles, cancelable: event.cancelable,\n    target: event.target === form, sameData: event.formData === data,\n  } : null, brand: data instanceof FormData, constructor: data.constructor === FormData,\n    tag: Object.prototype.toString.call(data) };\n  form.removeEventListener('formdata', edit);\n  const detached = document.createElement('form'); detached.innerHTML = '<input name=\"x\" value=\"1\">';\n  let count = 0, caught = null;\n  detached.addEventListener('formdata', () => {\n    count++;\n    if (count < 4) try { new FormData(detached); } catch (error) { caught = error.name; }\n  });\n  out.detached = { entries: [...new FormData(detached)], count, caught };\n  const other = document.createElement('form'); other.innerHTML = '<input name=\"other\" value=\"2\">';\n  let otherEvents = 0;\n  other.addEventListener('formdata', () => otherEvents++);\n  form.addEventListener('formdata', () => { out.otherEntries = [...new FormData(other)]; }, { once: true });\n  new FormData(form); out.otherEvents = otherEvents;\n  class Derived extends FormData {}\n  const derived = new Derived(form);\n  out.subclass = { base: derived instanceof FormData, derived: derived instanceof Derived,\n    constructor: derived.constructor === Derived, entries: [...derived] };\n  out.invalid = [];\n  for (const args of [[{}], [form, form.querySelector('input')], [form, document.createElement('button')]]) {\n    try { new FormData(...args); out.invalid.push('accepted'); } catch (error) { out.invalid.push(error.name); }\n  }\n  out.submitters = [];\n  for (const submitter of [form.querySelector('button'), form.querySelector('input'), document.createElement('button'), null, undefined, {}, 1, 'go']) {\n    try { out.submitters.push({ entries: [...new FormData(form, submitter)] }); }\n    catch (error) { out.submitters.push({ error: error.name }); }\n  }\n  const order = new FormData(); order.append('a', '1'); order.append('b', '2'); order.append('a', '3');\n  order.set('a', '4'); out.setOrder = [...order];\n  let resets = 0;\n  form.querySelector('input').value = 'dirty';\n  const reset = value => {\n    resets++;\n    out.resetEvent = { trusted: value.isTrusted, bubbles: value.bubbles, cancelable: value.cancelable };\n    if (resets < 4) form.reset();\n  };\n  form.addEventListener('reset', reset); form.reset(); form.removeEventListener('reset', reset);\n  out.reset = { count: resets, value: form.querySelector('input').value };\n  form.querySelector('input').value = 'cancelled';\n  form.addEventListener('reset', value => value.preventDefault(), { once: true }); form.reset();\n  out.cancelledReset = form.querySelector('input').value;\n  return out;\n})()",
+  "native": {
+    "constructor": {
+      "entries": [
+        [
+          "go",
+          "yes"
+        ],
+        [
+          "q",
+          "changed"
+        ],
+        [
+          "added",
+          "yes"
+        ]
+      ],
+      "event": {
+        "trusted": true,
+        "bubbles": true,
+        "cancelable": false,
+        "target": true,
+        "sameData": true
+      },
+      "brand": true,
+      "constructor": true,
+      "tag": "[object FormData]"
+    },
+    "detached": {
+      "entries": [
+        [
+          "x",
+          "1"
+        ]
+      ],
+      "count": 1,
+      "caught": "InvalidStateError"
+    },
+    "otherEntries": [
+      [
+        "other",
+        "2"
+      ]
+    ],
+    "otherEvents": 1,
+    "subclass": {
+      "base": true,
+      "derived": true,
+      "constructor": true,
+      "entries": [
+        [
+          "q",
+          "initial"
+        ]
+      ]
+    },
+    "invalid": [
+      "TypeError",
+      "accepted",
+      "accepted"
+    ],
+    "submitters": [
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ],
+          [
+            "go",
+            "yes"
+          ]
+        ]
+      },
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ]
+        ]
+      },
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ]
+        ]
+      },
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ]
+        ]
+      },
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ]
+        ]
+      },
+      {
+        "error": "TypeError"
+      },
+      {
+        "error": "TypeError"
+      },
+      {
+        "error": "TypeError"
+      }
+    ],
+    "setOrder": [
+      [
+        "b",
+        "2"
+      ],
+      [
+        "a",
+        "4"
+      ]
+    ],
+    "resetEvent": {
+      "trusted": true,
+      "bubbles": true,
+      "cancelable": true
+    },
+    "reset": {
+      "count": 1,
+      "value": "initial"
+    },
+    "cancelledReset": "cancelled"
+  },
+  "candidate": {
+    "constructor": {
+      "entries": [
+        [
+          "q",
+          "initial"
+        ],
+        [
+          "go",
+          "yes"
+        ]
+      ],
+      "event": null,
+      "brand": true,
+      "constructor": true,
+      "tag": "[object FormData]"
+    },
+    "detached": {
+      "entries": [
+        [
+          "x",
+          "1"
+        ]
+      ],
+      "count": 0,
+      "caught": null
+    },
+    "otherEvents": 0,
+    "subclass": {
+      "base": true,
+      "derived": true,
+      "constructor": true,
+      "entries": [
+        [
+          "q",
+          "initial"
+        ]
+      ]
+    },
+    "invalid": [
+      "TypeError",
+      "TypeError",
+      "NotFoundError"
+    ],
+    "submitters": [
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ],
+          [
+            "go",
+            "yes"
+          ]
+        ]
+      },
+      {
+        "error": "TypeError"
+      },
+      {
+        "error": "NotFoundError"
+      },
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ]
+        ]
+      },
+      {
+        "entries": [
+          [
+            "q",
+            "initial"
+          ]
+        ]
+      },
+      {
+        "error": "TypeError"
+      },
+      {
+        "error": "TypeError"
+      },
+      {
+        "error": "TypeError"
+      }
+    ],
+    "setOrder": [
+      [
+        "a",
+        "4"
+      ],
+      [
+        "b",
+        "2"
+      ]
+    ],
+    "resetEvent": {
+      "trusted": true,
+      "bubbles": true,
+      "cancelable": true
+    },
+    "reset": {
+      "count": 4,
+      "value": "initial"
+    },
+    "cancelledReset": "cancelled"
+  }
+}
