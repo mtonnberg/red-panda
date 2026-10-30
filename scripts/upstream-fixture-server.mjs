@@ -14,7 +14,7 @@ export const implementedRoutes = [
   '/', '/reset', '/xhr', '/xhr_empty', '/xhr/slow', '/xhr/hang', '/xhr/xml', '/xhr/xml_as_text', '/xhr/json', '/xhr/redirect',
   '/xhr/404', '/xhr/reason', '/xhr/duplicate_headers', '/xhr/401', '/xhr/500', '/xhr/bad_gzip', '/xhr/no_content_type', '/xhr/binary',
   '/src/browser/tests/401', '/404.js', '/status/:200-599', '/set_cookie', '/echo_headers', '/download_tool/echo_headers',
-  '/redirect_same_echo_headers', '/redirect_cross_echo_headers', '/download_tool/redirect',
+  '/redirect_same_echo_headers', '/redirect_cross_echo_headers', '/download_tool/redirect', '/echo_brotli',
 ];
 
 export async function startFixtureServer(rootPath,{port=9582,profile='xhr-subset'}={}) {
@@ -28,7 +28,7 @@ export async function startFixtureServer(rootPath,{port=9582,profile='xhr-subset
   });
   const metadata={profile,sourceCommit:'948d773786380bae36f046639fc61e2ddddd212a',sourceFile:'src/test_routes.zig',
     implementedDynamicRoutes:profile==='xhr-subset'?implementedRoutes:[],
-    unsupportedRouteGroups:['CORS-specific endpoints','SSE','WebSocket :9584','raw HTTP responses','compression beyond deliberate bad-gzip','resource timing','serve-count counters','downloads beyond listed redirect'],
+    unsupportedRouteGroups:['CORS-specific endpoints','SSE','WebSocket :9584','raw HTTP responses','compression beyond /echo_brotli and deliberate bad-gzip','resource timing','serve-count counters','downloads beyond listed redirect'],
     completeUpstreamServer:false};
   const server=http.createServer(async(request,response)=>{
     const entry={method:request.method,path:request.url,status:0,routeKnown:false};
@@ -65,6 +65,11 @@ export async function startFixtureServer(rootPath,{port=9582,profile='xhr-subset
         if(exact==='/xhr/401')return send(401,'No',{'WWW-Authenticate':'Basic realm="test"'});
         if(exact==='/xhr/500')return send(500,'Internal Server Error',{'Content-Type':'text/plain'});
         if(exact==='/xhr/bad_gzip')return send(200,'not actually gzip',{'Content-Encoding':'gzip'});
+        if(exact==='/echo_brotli'){
+          const chunks=[];let size=0;
+          for await (const chunk of request){size+=chunk.length;if(size>4*1024*1024)return send(413,'Fixture request body exceeds 4 MiB');chunks.push(chunk);}
+          return send(200,Buffer.concat(chunks),{'Content-Type':'application/octet-stream','Content-Encoding':'br'});
+        }
         if(exact==='/xhr/no_content_type')return send(200,'untyped');
         if(exact==='/xhr/binary')return send(200,Buffer.from([0,0,1,2,0,0,9]),{'Content-Type':'application/octet-stream'});
         if(/^\/status\/\d{3}$/.test(exact)){

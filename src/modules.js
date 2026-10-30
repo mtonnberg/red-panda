@@ -23,12 +23,11 @@ export function installModuleScripts(page, window) {
   const signal = page.documentAbort?.signal;
   const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet();
   const imports = new Map(), scopes = new Map();
-  const tasks = new Set();
-  let context, observer, started = false, disposed = false, graphStarted = false, inlineCount = 0, linkQueue = Promise.resolve();
-  let resolveReady, releaseAbort;
-  const ready = new Promise(resolve => { resolveReady = resolve; });
+  const cycles = new Set();
+  let parseCycle;
+  let context, observer, disposed = false, graphStarted = false, inlineCount = 0, linkQueue = Promise.resolve();
+  let releaseAbort;
   const aborted = new Promise(resolve => { releaseAbort = resolve; });
-  page.moduleReady = ready;
   Object.defineProperty(window.HTMLScriptElement, 'supports', { configurable: true, writable: true,
     value: function supports(type) {
       if (!arguments.length) throw new TypeError('HTMLScriptElement.supports requires a script type');
@@ -36,7 +35,7 @@ export function installModuleScripts(page, window) {
     } });
   const active = () => !disposed && !signal?.aborted && !page.closed;
   const check = () => { if (!active()) throw new DOMException('Document was disposed', 'AbortError'); };
-  function dispose() { disposed = true; observer?.disconnect(); releaseAbort(); resolveReady(); }
+  function dispose() { disposed = true; observer?.disconnect(); releaseAbort(); for (const cycle of cycles) cycle.resolveReady(); }
   signal?.addEventListener('abort', dispose, { once: true });
   function report(error, script) {
     if (!active()) return;
@@ -209,52 +208,55 @@ export function installModuleScripts(page, window) {
     return Promise.resolve().then(() => compile(script.textContent, document.URL,
       `${document.URL}#red-panda-inline-module-${++inlineCount}`, base));
   }
-  function track(task) {
-    tasks.add(task); task.then(() => tasks.delete(task), () => tasks.delete(task)); return task;
+  function track(task, cycle) {
+    cycle.tasks.add(task); task.then(() => cycle.tasks.delete(task), () => cycle.tasks.delete(task)); return task;
   }
-  function execute(script, prepared) {
+  function execute(script, prepared, cycle = parseCycle) {
     return track((async () => {
       try {
         const module = await prepared;
         await evaluate(module);
         if (active() && script.hasAttribute('src')) script.dispatchEvent(new window.Event('load'));
       } catch (error) { report(error, script); }
-    })());
+    })(), cycle);
   }
-  function discover(root = document) {
+  function discover(root = document, includeParser = false) {
     const candidates = root.nodeType === 1 && root.localName === 'script' ? [root] : [];
     candidates.push(...root.querySelectorAll?.('script') ?? []);
     return candidates.filter(script => {
       if (!script.isConnected || !['module', 'importmap'].includes(script.getAttribute('type')?.trim().toLowerCase()) || seen.has(script)) return false;
+      if (!includeParser && !parseCycle.started && implForWrapper(script)._parserInserted) return false;
       seen.add(script); return true;
     });
   }
-  async function begin() {
-    if (started) return;
-    started = true;
-    if (!active() || page.javascript === false) { resolveReady(); return; }
+  async function begin(cycle = parseCycle) {
+    if (cycle.started || cycle !== parseCycle) return;
+    cycle.started = true;
+    if (!active() || page.javascript === false) { cycle.resolveReady(); return; }
     // Fetch roots eagerly, then initiate their evaluations in document order.
     // Suspended top-level await does not hold DOMContentLoaded hostage.
-    const scripts = discover(), prepared = scripts.map(script => script.getAttribute('type').trim().toLowerCase() === 'importmap' ? Promise.resolve() : Promise.resolve().then(() => prepare(script)));
+    const scripts = discover(document, true), prepared = scripts.map(script => script.getAttribute('type').trim().toLowerCase() === 'importmap' ? Promise.resolve() : Promise.resolve().then(() => prepare(script)));
     prepared.forEach(promise => promise.catch(() => {}));
     for (let index = 0; index < scripts.length; index++) {
-      if (!active()) break;
+      if (!active() || cycle !== parseCycle) break;
       const script = scripts[index];
       if (script.getAttribute('type').trim().toLowerCase() === 'importmap') { registerMap(script); continue; }
       graphStarted = true;
       if (script.hasAttribute('async')) {
         const initiated = prepared[index].then(link).then(module => { startEvaluation(module); return true; });
         impl._asyncQueue.push(initiated, () => Promise.resolve(), () => Promise.resolve());
-        execute(script, prepared[index]); continue;
+        execute(script, prepared[index], cycle); continue;
       }
       try {
         const module = await prepared[index];
         await link(module);
         check();
+        if (cycle !== parseCycle) break;
         startEvaluation(module);
-        execute(script, Promise.resolve(module));
+        execute(script, Promise.resolve(module), cycle);
       } catch (error) { report(error, script); }
     }
+    if (!observer) {
     observer = createInternalMutationObserver(window, records => {
       if (!active()) return;
       for (const record of records) {
@@ -266,10 +268,11 @@ export function installModuleScripts(page, window) {
       }
     });
     observer.observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'type'] });
+    }
     for (const script of discover()) startScript(script);
     void (async () => {
-      while (active() && tasks.size) await Promise.race([Promise.all([...tasks]), aborted]);
-      resolveReady();
+      while (active() && cycle.tasks.size) await Promise.race([Promise.all([...cycle.tasks]), aborted]);
+      cycle.resolveReady();
     })();
   }
   function startScript(script) {
@@ -280,6 +283,15 @@ export function installModuleScripts(page, window) {
   if (!impl?._deferQueue) throw new Error('Pinned jsdom deferred script queue is unavailable');
   // Register before parsing, rather than listening for DOMContentLoaded after it
   // has already fired. All errors are observed; script failures do not wedge load.
-  impl._deferQueue.push(Promise.resolve(), () => begin().catch(error => { report(error); resolveReady(); }), null, false);
-  return { ready, start: begin, dispose };
+  function beginParseCycle(queue, token = null) {
+    if (parseCycle && !parseCycle.started) parseCycle.resolveReady();
+    let resolve;
+    const cycle = { token, started: false, tasks: new Set(), done: false, ready: new Promise(done => { resolve = done; }),
+      resolveReady() { if (!cycle.done) { cycle.done = true; cycles.delete(cycle); resolve(); } } };
+    cycles.add(cycle); parseCycle = cycle; page.moduleReady = cycle.ready;
+    queue.push(Promise.resolve(), () => begin(cycle).catch(error => { report(error); cycle.resolveReady(); }), null, false);
+    return cycle.ready;
+  }
+  beginParseCycle(impl._deferQueue);
+  return { get ready() { return parseCycle.ready; }, start: () => begin(parseCycle), beginParseCycle, dispose };
 }

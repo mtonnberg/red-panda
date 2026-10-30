@@ -1,3 +1,4 @@
+import { installListenerOwnership } from './listener-ownership.js';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -271,14 +272,16 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     registry.announce('frameNavigationStarted', { frameId: record.id, loaderId: framePage.loaderId, url: framePage.url });
     const closed = childWindow.close.bind(childWindow);
     childWindow.close = () => { if (record.page === framePage) destroyDocument(record); return closed(); };
+    installListenerOwnership(childWindow._globalProxy).scope(() => {
     record.document.addEventListener('DOMContentLoaded', () => {
       if (!framePage.closed) registry.announce('frameDOMContentLoaded', { frameId: record.id, loaderId: framePage.loaderId });
-    }, { once: true });
+    });
     childWindow.addEventListener('load', () => {
       if (!framePage.closed) registry.announce('frameLoad', { frameId: record.id, loaderId: framePage.loaderId });
-    }, { once: true });
+    });
     childWindow.addEventListener('error', event => {
       if (!framePage.closed) framePage.emit('pageError', event.error ?? new Error(event.message));
+    });
     });
     for (const type of ['log', 'info', 'warn', 'error', 'debug']) childWindow.console[type] = (...args) => framePage.emit('console', { type, args });
     // This call runs inside createWindow, before native frame parsing starts.
@@ -346,7 +349,7 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     const current = record.page; onCommit?.();
     const loaded = new Promise(resolve => {
       if (current.dom.window.document.readyState === 'complete') resolve();
-      else current.dom.window.addEventListener(waitUntil === 'domcontentloaded' ? 'DOMContentLoaded' : 'load', resolve, { once: true });
+      else installListenerOwnership(current.dom.window).add(current.dom.window, waitUntil === 'domcontentloaded' ? 'DOMContentLoaded' : 'load', resolve, { once: true });
     });
     let abort;
     const aborted = new Promise((_, reject) => {

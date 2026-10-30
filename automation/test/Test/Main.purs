@@ -185,10 +185,24 @@ main = launchAff_ $
         Browser.insertText page "Child edit"
         editedFrame <- Browser.evaluateFrameString frame "document.querySelector('#frame-edit').value"
         assert "PureScript keyboard input follows focus into the actual child frame" $ editedFrame == "Child edit"
+        void $ Browser.goto page $ "data:text/html,<button id=anchor>Anchor</button><dialog id=prompt><form method=dialog><button id=confirm value=yes>Confirm</button></form></dialog>"
+        Browser.focus page "#anchor"
+        void $ Browser.evaluateString page "window.dialogEvents=[];window.dialogClosed=new Promise(resolve=>document.querySelector('#prompt').addEventListener('close',e=>{dialogEvents.push(e.isTrusted);resolve();},{once:true}));document.querySelector('#prompt').showModal();'opened'"
+        Browser.pressKey page "Escape"
+        escapedDialog <- Browser.evaluateString page "dialogClosed.then(()=>JSON.stringify([document.querySelector('#prompt').open,document.activeElement.id,dialogEvents]))"
+        assert "PureScript privileged Escape closes a modal with its real trusted event and retained focus" $ escapedDialog == "[false,\"anchor\",[true]]"
+        void $ Browser.evaluateString page "window.dialogClosed=new Promise(resolve=>document.querySelector('#prompt').addEventListener('close',resolve,{once:true}));document.querySelector('#prompt').showModal();'opened'"
+        Browser.click page "#confirm"
+        submittedDialog <- Browser.evaluateString page "dialogClosed.then(()=>JSON.stringify([document.querySelector('#prompt').open,document.querySelector('#prompt').returnValue]))"
+        assert "PureScript coordinate activation submits a dialog form and preserves the submitter value" $ submittedDialog == "[false,\"yes\"]"
+        void $ Browser.evaluateString page "window.beforeReset={document,Array};document.open();document.write('<h1 id=written>Fresh parser</h1><input type=range min=10 max=30 step=4>');document.close();'written'"
+        Browser.waitForSelector page "#written"
+        writtenDocument <- Browser.evaluateString page "JSON.stringify([beforeReset.document===document,beforeReset.Array===Array,document.querySelector('input').value,document.querySelector('h1').innerText])"
+        assert "PureScript sees a fresh written DOM in the retained Document and constructor realm" $ writtenDocument == "[true,true,\"22\",\"Fresh parser\"]"
         void $ Browser.goto page $ "data:text/html,<h1>PureScript rendering</h1><p>Own selectable text.</p>"
         image <- Browser.screenshot page false
         assert "PureScript Puppeteer receives a real PNG screenshot" $ Browser.signature image == "89504e470d0a1a0a" && Browser.byteLength image > 1000
         pdfBytes <- Browser.pdf page
         assert "PureScript Puppeteer reads a real PDF through CDP streams" $ Browser.signature pdfBytes == "255044462d312e34" && Browser.byteLength pdfBytes > 1000
         Browser.closePage page
-        log "PureScript Puppeteer integration: 50 checks passed"
+        log "PureScript Puppeteer integration: 53 checks passed"

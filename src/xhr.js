@@ -1,3 +1,4 @@
+import { installBlobReads } from './blob.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -110,22 +111,7 @@ export function installXHR(page, window) {
       reader.readAsArrayBuffer(blob);
     });
   }
-  // jsdom 26 exposes FileReader but omits these Blob methods. Keep their
-  // promise and ArrayBuffer results in the owning page realm.
-  for (const [name, read] of [['arrayBuffer', 'readAsArrayBuffer'], ['text', 'readAsText']]) {
-    if (typeof window.Blob.prototype[name] === 'function') continue;
-    Object.defineProperty(window.Blob.prototype, name, { configurable: true, writable: true,
-      value: function () {
-        const blob = this;
-        return new window.Promise((resolve, reject) => {
-          const reader = new window.FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = () => reject(reader.error);
-          try { reader[read](blob); } catch (error) { reject(error); }
-        });
-      },
-    });
-  }
+  installBlobReads(window);
   async function requestBody(body, headers) {
     if (body === null || body === undefined) return undefined;
     if (body instanceof window.Document) {

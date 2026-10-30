@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { brotliCompressSync } from 'node:zlib';
 import { mkdtemp, writeFile, symlink, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,10 +21,11 @@ async function fixture(profile='xhr-subset') {
 
 function request(origin,path,options={}) {
   return new Promise((resolve,reject)=>{
-    const req=http.request(origin,{path,...options},res=>{
+    const {body,...requestOptions}=options;
+    const req=http.request(origin,{path,...requestOptions},res=>{
       const chunks=[];res.on('data',chunk=>chunks.push(chunk));
       res.on('end',()=>resolve({status:res.statusCode,reason:res.statusMessage,headers:res.headers,rawHeaders:res.rawHeaders,body:Buffer.concat(chunks)}));
-    });req.on('error',reject);req.end();
+    });req.on('error',reject);req.end(body);
   });
 }
 
@@ -99,4 +101,16 @@ test('fixture shutdown cancels delayed owned requests without waiting for the lo
   while(server.requests.length===0)await new Promise(resolve=>setImmediate(resolve));
   const started=Date.now();await server.close();
   assert.ok(Date.now()-started<1000);assert.ok(await pending instanceof Error);
+});
+
+
+test('fixture Brotli echo returns original compressed request bytes with real HTTP decoding',async()=>{
+ const server=await fixture();
+ try{
+  const input=Buffer.from('actual Brotli transport 🐼'),compressed=brotliCompressSync(input);
+  const raw=await request(server.origin,'/echo_brotli',{method:'POST',body:compressed});
+  assert.equal(raw.status,200);assert.equal(raw.headers['content-encoding'],'br');assert.deepEqual(raw.body,compressed);
+  const decoded=await fetch(server.origin+'/echo_brotli',{method:'POST',body:compressed});
+  assert.deepEqual(Buffer.from(await decoded.arrayBuffer()),input);assert.equal(server.requests.at(-1).routeKnown,true);
+ }finally{await server.close();}
 });

@@ -1,0 +1,38 @@
+diff --git a/src/cssom.js b/src/cssom.js
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -88,2 +88,3 @@
+   value=value.trim();
++  if(property === 'opacity') value=value.replace(/^([+-]?)\.(?=\d)/, (_, sign) => sign + '0.');
+   if(LENGTHS.test(property) && /^[+-]?0(?:\.0+)?$/.test(value))value='0px';
+@@ -188,3 +189,4 @@
+       const before = MUTATIONS.get(this);
+-      descriptor.set.call(this,parserInput(input,property));
++      if (property === 'opacity' && typeof input === 'string' && input !== '') this._setProperty(property, input);
++      else descriptor.set.call(this,parserInput(input,property));
+       if(typeof input==='string' && LENGTHS.test(property) && /^anchor-size\(/i.test(input) && balancedEnd(input,input.indexOf('('))===input.length-1)this._setProperty(property,input);
+@@ -218,3 +220,4 @@
+       const before=MUTATIONS.get(this), previousPriority=this.getPropertyPriority(property);
+-      BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
++      if (property.toLowerCase() === 'opacity' && normalized !== '') this._setProperty('opacity', normalized, priority.toLowerCase());
++      else BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
+       if(MUTATIONS.get(this)===before && normalized!=='') {
+diff --git a/src/styles.js b/src/styles.js
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -440,3 +440,3 @@
+       const expanded = new CSSStyleDeclaration(); expanded.setProperty(property, value);
+-      const entries = [...expanded._values].map(([name, entry]) => ({ name, entry }));
++      const entries = property === 'opacity' ? [{ name: property, entry: value }] : [...expanded._values].map(([name, entry]) => ({ name, entry }));
+       if (property === 'overflow') {
+@@ -544,3 +544,3 @@
+     if (value === undefined) value = inheriting ? parentValue : fallback;
+-    if (/var\(/.test(value)) value = substitute(value, resolveCustom);
++    if (property !== 'opacity' && /var\(/.test(value)) value = substitute(value, resolveCustom);
+     if (selection?.overflowPart !== undefined && value !== null) value = overflowAxes(value)?.[selection.overflowPart] ?? null;
+@@ -561,3 +561,4 @@
+     result.setProperty(property, inherited.has(property) ? parentStyle?.getPropertyValue(property) || initial[property] || '' : initial[property] || '');
+-    result.setProperty(property, value);
++    if (property === 'opacity') result._setProperty(property, value);
++    else result.setProperty(property, value);
+   }

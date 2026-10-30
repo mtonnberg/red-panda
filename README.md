@@ -106,8 +106,8 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | --- | --- |
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Live named controls, trusted FormData events, guarded form reset, validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
-| Web APIs | Real HTMLDDA collections, geometry matrices/points/quads, constructed/adopted stylesheets, scoped CSS cascade, streams/codecs/compression, resize/performance observers and trusted error reporting |
+| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
+| Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
@@ -133,7 +133,7 @@ semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
 CSS painting, canvas, service/shared workers, complete frame behavior and process
 isolation remain absent. Large HTML sources now feed the real parser in bounded
 tasks, allowing actual mutation delivery during loading. Complete parser
-checkpoints and document.open/write lifetimes, frame POST
+checkpoints, early/inactive-frame document.open/write, frame POST
 navigation, advanced shadow CSS, flattened shadow/frame pointer/Tab input and full
 CSS behavior remain unfinished. Utility-world IDs share their owning frame's
 JS realm. Some configuration commands still
@@ -144,7 +144,10 @@ as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly
 `navigator.sendBeacon` validates calls with resource loading disabled. Enable
 actual POST delivery with `--load-resources beacon`; enabled beacons share a
 64 KiB in-flight body budget per document. Streams use real Node primitives with
-realm adapters. Performance entries report observed transport/lifecycle data;
+realm adapters. Post-load document.open/write keeps the Window, Document and
+JavaScript realm while feeding a fresh parser and removing authored listeners.
+Initial loading/frame resets and synchronous written external scripts remain
+incomplete. Performance entries report observed transport/lifecycle data;
 unavailable DNS/TLS/header-phase/wire-byte fields remain zero or empty.
 
 `Runtime.queryObjects` remains unsupported: experimental heap implementations

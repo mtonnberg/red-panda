@@ -252,11 +252,12 @@ helper `scripts/upstream-fixture-server.mjs` exports
 `startFixtureServer(root, {port, profile})`. Its explicit `xhr-subset` profile
 implements selected observable endpoint contracts from the exact upstream
 `src/test_routes.zig`: XHR bodies/MIME/status/reason/duplicate headers, deliberate
-bad gzip, redirects, scoped cookies and header echo. It imports no engine code.
+bad gzip, redirects, scoped cookies, header echo and real compressed-byte
+`/echo_brotli` echo. It imports no engine code.
 `/__fixture_metadata` lists implemented routes, provenance and unsupported route
 groups; it explicitly reports `completeUpstreamServer:false`. Node HTTP automatic
 headers/framing are not byte-for-byte copies of the Zig server. Raw-wire, SSE,
-WebSocket, CORS-specific, compression, resource-timing and counter endpoints
+WebSocket, CORS-specific, other compression, resource-timing and counter endpoints
 remain unsupported. Unknown routes return an explicit error, not an empty
 successful response. Five focused transport, safety and shutdown tests pass.
 
@@ -552,3 +553,31 @@ ownership, bridge prototypes, bounded failure behavior and protocol contracts
 still need integration. Experimental sources remain outside production/default
 tests, with [negative evidence and limits](reference/runtime-query-contract.md).
 No empty or partial successful query result substitutes for actual enumeration.
+
+The independent DOM/value checkpoint adds range/date stepping, radio/label
+association, dialog/popover state and submission, selector validation and private
+CSS state revisions, innerText/checkVisibility, document/XML/XPath adapters,
+Blob byte reads, Fetch value parsing, real stream codecs and post-load written
+parse cycles. Document reset retains the Window, Document and JavaScript realm,
+removes authored listeners and keeps explicit engine listeners and module maps.
+Initial loading/inactive-frame writes and synchronous written external scripts
+remain incomplete.
+
+The full suite passes **687 JavaScript tests and 53 PureScript Puppeteer
+assertions**. Syntax, strict/pedantic PureScript builds and all13 bounded native
+comparisons pass. The [frozen73-fixture comparison](reference/conformance-dom-values-checkpoint.json)
+binds66 production/native/package files, rechecked after both runs. Fresh native
+controls pass73/73; the candidate passes67, fails3 and has3 unobserved stream
+cases. Request stream bodies, MessageChannel identity, BroadcastChannel and
+classic-script microtask checkpoints remain separate unfinished integrations.
+The raw native/candidate reports are retained alongside the checkpoint. This
+uniform iframe/worker profile is not the full registration/options matrix or a
+performance comparison.
+
+An earlier mutable26-fixture preflight omitted both resource flags and produced
+one frame failure and one timeout. Controlled old/current runs reproduce those
+same outcomes with frame resources disabled and pass with them enabled. The
+misconfigured report is retained; these outcomes are not code regressions.
+The test helper now implements real `/echo_brotli` byte echo with HTTP decoding;
+the earlier broader native compression failure from its missing route remains
+recorded rather than being relabeled as a pass.

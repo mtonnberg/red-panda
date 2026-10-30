@@ -1,5 +1,6 @@
 import * as web from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
+import { codecPair } from './stream-codecs.js';
 
 const NATIVES = { ...web, TextEncoder, TextDecoder };
 const SURFACE = {
@@ -33,7 +34,7 @@ const INSTALLED = new WeakMap();
  */
 export function installStreams(page, realm, { signal = page?.documentAbort?.signal } = {}) {
   if (INSTALLED.has(realm)) return INSTALLED.get(realm);
-  const constructors = {}, owned = new WeakMap(), references = new Set(), pending = new Set(), functions = new WeakMap(), special = new WeakMap();
+  const constructors = {}, owned = new WeakMap(), references = new Set(), pending = new Set(), functions = new WeakMap(), special = new WeakMap(), codecDisposers = new WeakMap();
   // Ownership must not keep consumed Fetch bodies, readers or controllers alive
   // for the lifetime of a long-lived document. Finalizer holdings and unregister
   // tokens contain only WeakRefs, never the stream or a closure capturing it.
@@ -45,13 +46,26 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     finalization.register(value, reference, reference);
   }
   let disposed = false, disposalReason;
+  const convertedErrors = new WeakMap();
   const functionInRealm = invoke => realm.Function('invoke', 'return function (...args) { return invoke(this, args); }')(invoke);
   const errorInRealm = error => {
     if (!error || typeof error !== 'object' || error instanceof realm.Error || (realm.DOMException && error instanceof realm.DOMException)) return error;
-    if (error instanceof globalThis.DOMException && realm.DOMException) return new realm.DOMException(error.message, error.name);
+    if (convertedErrors.has(error)) return convertedErrors.get(error);
+    if (error instanceof globalThis.DOMException && realm.DOMException) {
+      const converted = new realm.DOMException(error.message, error.name);
+      convertedErrors.set(error, converted); return converted;
+    }
     if (error instanceof Error) {
       const ErrorClass = ['TypeError', 'RangeError', 'SyntaxError', 'Error'].includes(error.name) ? realm[error.name] : realm.Error;
-      const converted = new ErrorClass(error.message); converted.name = error.name; return converted;
+      const messages = {
+        'Invalid state: Writer is not bound to a WritableStream': 'Writer has been released',
+        'Invalid state: Writer has been released': 'Writer has been released',
+        'Invalid state: WritableStream is closed': 'Stream is not writable',
+        'Invalid state: The reader is not attached to a stream': 'Reader has been released',
+        'Invalid state: The ReadableStream is locked': 'ReadableStream is locked',
+      };
+      const converted = new ErrorClass(error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA' ? 'The encoded data is not valid' : messages[error.message] ?? error.message);
+      converted.name = error.name; convertedErrors.set(error, converted); return converted;
     }
     return error;
   };
@@ -109,21 +123,50 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     args = [...args];
     if (name === 'ReadableStream') args[0] = callbackDictionary(args[0], ['start', 'pull', 'cancel'], true);
     if (name === 'WritableStream') args[0] = callbackDictionary(args[0], ['start', 'write', 'close', 'abort']);
-    if (name === 'TransformStream') args[0] = callbackDictionary(args[0], ['start', 'transform', 'flush', 'cancel']);
+    if (name === 'TransformStream') {
+      args[0] = callbackDictionary(args[0], ['start', 'transform', 'flush', 'cancel']);
+      // Measured target transforms do not block writes on readable queue size,
+      // including an explicitly requested zero readable highWaterMark.
+      args[1] = undefined; args[2] = { highWaterMark: Infinity };
+    }
     if (name === 'CompressionStream' || name === 'DecompressionStream') {
-      if (!['gzip', 'deflate', 'deflate-raw'].includes(String(args[0]))) throw new realm.TypeError('invalid argument');
+      const format = String(args[0]);
+      if (!['gzip', 'deflate', 'deflate-raw', 'brotli'].includes(format)) throw new realm.TypeError('invalid argument');
+      const result = Object.create(constructors[name].prototype);
+      const pair = codecPair({ realm, format, decompress: name === 'DecompressionStream' });
+      special.set(result, pair); tag(result, name); adopt(pair.readable); adopt(pair.writable);
+      codecDisposers.set(pair.readable, pair.dispose); codecDisposers.set(pair.writable, pair.dispose);
+      return result;
     }
     if (name === 'TextEncoderStream') {
       // The target independently encodes each chunk; unlike Node's encoder
       // stream, it does not retain a trailing surrogate for the next chunk.
       const transform = new web.TransformStream({ transform(chunk, controller) {
         controller.enqueue(new TextEncoder().encode(String(chunk)));
-      } });
+      } }, undefined, { highWaterMark: Infinity });
       const result = Object.create(constructors[name].prototype);
       special.set(result, { encoding: 'utf-8', readable: transform.readable, writable: transform.writable });
       tag(result, name);
       adopt(transform.readable); adopt(transform.writable);
       return result;
+    }
+    if (name === 'TextDecoderStream') {
+      let decoder;
+      try { decoder = new TextDecoder(...args); } catch (error) { throw errorInRealm(error); }
+      const transform = new web.TransformStream({ transform(chunk, controller) {
+        let text;
+        try { text = decoder.decode(chunk, { stream: true }); }
+        catch (error) { throw errorInRealm(error); }
+        if (text) controller.enqueue(text);
+      }, flush(controller) {
+        let text;
+        try { text = decoder.decode(); } catch (error) { throw errorInRealm(error); }
+        if (text) controller.enqueue(text);
+      } }, undefined, { highWaterMark: Infinity });
+      const result = Object.create(constructors[name].prototype);
+      special.set(result, { encoding: decoder.encoding, fatal: decoder.fatal, ignoreBOM: decoder.ignoreBOM,
+        readable: transform.readable, writable: transform.writable });
+      tag(result, name); adopt(transform.readable); adopt(transform.writable); return result;
     }
     try { return adopt(Reflect.construct(NATIVES[name], args)); }
     catch (error) { throw errorInRealm(error); }
@@ -214,6 +257,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     }
     references.clear();
     for (const [value, name] of live) {
+      if (codecDisposers.has(value)) ignore(() => codecDisposers.get(value)(disposalReason));
       if (name === 'ReadableStreamDefaultReader') ignore(() => web.ReadableStreamDefaultReader.prototype.cancel.call(value, disposalReason));
       if (name === 'WritableStreamDefaultWriter') ignore(() => web.WritableStreamDefaultWriter.prototype.abort.call(value, disposalReason));
       if (name === 'ReadableStream' && !Reflect.get(web.ReadableStream.prototype, 'locked', value)) ignore(() => web.ReadableStream.prototype.cancel.call(value, disposalReason));

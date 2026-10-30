@@ -1,3 +1,5 @@
+import { prepareInputParserAdapter } from './input-controls.js';
+import { installDocumentReset } from './document-reset.js';
 import { createParserStream } from './parser-stream.js';
 import { createRequire } from 'node:module';
 
@@ -26,8 +28,13 @@ function duringParserScript(record, script, evaluate) {
     (record.parserScriptDepth > 0 || (script._parserInserted &&
       (record.parser.tokenizer.inLoop || record.blocker?.script === script)));
   if (parserScript) record.parserScriptDepth = (record.parserScriptDepth ?? 0) + 1;
+  const writeParser = parserScript && record.stream?.kind === 'write' ? record.stream : null;
+  const entered = writeParser?.enterScript();
   try { return evaluate(); }
-  finally { if (parserScript) record.parserScriptDepth--; }
+  finally {
+    if (entered) writeParser.leaveScript();
+    if (parserScript) record.parserScriptDepth--;
+  }
 }
 function state(script) {
   if (!flags.has(script)) flags.set(script, { forceAsync: !(script._parserInserted && script._alreadyStarted) });
@@ -89,7 +96,7 @@ function adoptPreload(record, url, element) {
   return request;
 }
 function finishParser(record, parser) {
-  if (!active(record) || parser.tokenizer.paused || !parser.stopped) return;
+  if (!active(record) || record.parser !== parser || parser.tokenizer.paused || !parser.stopped) return;
   record.parserDone = true; record.blocker = null;
   if (record.closeRequested) {
     const arguments_ = record.closeRequested; record.closeRequested = null;
@@ -106,6 +113,24 @@ function resumeAfterScript(record, script) {
     if (record.stream) record.stream.resume();
     else if (blocker.parser.tokenizer.paused) blocker.parser.tokenizer.resume(() => finishParser(record, blocker.parser));
   });
+}
+
+function makeParser(record, options) {
+  prepareInputParserAdapter(options?.treeAdapter);
+  const parser = new parse5.Parser(options, undefined, null, script => {
+    const type = script._getTypeString()?.toLowerCase();
+    if (type === 'module' || type === 'importmap' || !scriptTypes.has(type) || !script._canRunScript()) return;
+    if (!script.hasAttributeNS(null, 'src')) {
+      if (script.text.length && record.styles.size) { record.blocker = { script, parser, kind: 'styles', scheduled: false }; parser.tokenizer.pause(); }
+      return;
+    }
+    if (!script.getAttributeNS(null, 'src').trim() ||
+        script._ownerDocument.encodingParseAURL(script.getAttributeNS(null, 'src')) === null ||
+        script.hasAttributeNS(null, 'async') || script.hasAttributeNS(null, 'defer')) return;
+    record.blocker = { script, parser, scheduled: false };
+    parser.tokenizer.pause();
+  });
+  return parser;
 }
 
 function patch() {
@@ -138,22 +163,11 @@ function patch() {
   parse5.parse = function (markup, options) {
     const record = documents.get(options?.treeAdapter?._documentImpl);
     if (!active(record)) return parse.call(this, markup, options);
-    const parser = new parse5.Parser(options, undefined, null, script => {
-      const type = script._getTypeString()?.toLowerCase();
-      if (type === 'module' || type === 'importmap' || !scriptTypes.has(type) || !script._canRunScript()) return;
-      if (!script.hasAttributeNS(null, 'src')) {
-        if (script.text.length && record.styles.size) { record.blocker = { script, parser, kind: 'styles', scheduled: false }; parser.tokenizer.pause(); }
-        return;
-      }
-      if (!script.getAttributeNS(null, 'src').trim() ||
-          script._ownerDocument.encodingParseAURL(script.getAttributeNS(null, 'src')) === null ||
-          script.hasAttributeNS(null, 'async') || script.hasAttributeNS(null, 'defer')) return;
-      record.blocker = { script, parser, scheduled: false };
-      parser.tokenizer.pause();
-    });
+    record.parserOptions = options;
+    const parser = makeParser(record, options);
     record.parser = parser; record.parserDone = false;
     record.stream = createParserStream(parser, markup, {
-      signal: record.signal, active: () => active(record),
+      signal: record.signal, active: () => active(record) && record.parser === parser,
       onComplete: () => finishParser(record, parser),
       onError: error => record.page.emit?.('pageError', error),
     });
@@ -326,7 +340,7 @@ export function installClassicScripts(page, window) {
   });
   const dispose = () => {
     if (record.disposed) return;
-    record.disposed = true; record.stream?.abort();
+    record.disposed = true; record.resetController?.dispose(); record.stream?.abort();
     if (record.parser && !record.parserDone) { record.parser.tokenizer.pause(); record.parser.stopped = true; }
     record.blocker = null; record.closeRequested = null;
     record.preloadAbort.abort(); record.preloads.clear();
@@ -340,6 +354,7 @@ export function installClassicScripts(page, window) {
   window.close = record.close;
   record.controller = { dispose };
   documents.set(document, record); record.signal?.addEventListener('abort', dispose, { once: true });
+  record.resetController = installDocumentReset(page, window, record, makeParser, finishParser);
   if (record.signal?.aborted || page.closed) dispose();
   return record.controller;
 }

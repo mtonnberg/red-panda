@@ -262,7 +262,8 @@ test('invalid submitter ownership and unsupported navigation are explicit failur
     assert.throws(() => form.requestSubmit(form.querySelector('input')), error => error.name === 'TypeError');
     assert.throws(() => form.requestSubmit(f.document.querySelector('#other button')), error => error.name === 'NotFoundError');
     form.target = '_blank'; assert.throws(() => form.requestSubmit(), /Form target _blank/);
-    form.target = '_self'; form.method = 'dialog'; assert.throws(() => form.requestSubmit(), /Dialog form submission/);
+    form.target = '_self'; form.method = 'dialog'; assert.doesNotThrow(() => form.requestSubmit());
+    assert.equal(f.page.pendingNavigation, undefined);
     form.method = 'post'; form.action = 'mailto:example@example.org'; assert.throws(() => form.submit(), /protocol mailto:/);
     assert.equal(f.page.pendingNavigation, undefined);
   } finally { f.close(); }

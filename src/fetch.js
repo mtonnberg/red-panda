@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { types } from 'node:util';
 import { installStreams } from './streams.js';
 
 const require = createRequire(import.meta.url);
@@ -12,6 +13,14 @@ const NativeRequest = globalThis.Request;
 const NativeResponse = globalThis.Response;
 const NativeFormData = globalThis.FormData;
 const NativeBlob = globalThis.Blob;
+const nativeReader = globalThis.ReadableStream.prototype.getReader;
+const typedPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedBuffer = Object.getOwnPropertyDescriptor(typedPrototype, 'buffer').get;
+const typedLength = Object.getOwnPropertyDescriptor(typedPrototype, 'byteLength').get;
+const typedOffset = Object.getOwnPropertyDescriptor(typedPrototype, 'byteOffset').get;
+const viewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get;
+const viewLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
+const viewOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get;
 const INSTALLED = new WeakMap();
 const HEADER_STATE = new WeakMap(), REQUEST_STATE = new WeakMap(), RESPONSE_STATE = new WeakMap();
 const FORBIDDEN = new Set(['accept-charset', 'accept-encoding', 'access-control-request-headers',
@@ -19,6 +28,7 @@ const FORBIDDEN = new Set(['accept-charset', 'accept-encoding', 'access-control-
   'expect', 'host', 'keep-alive', 'origin', 'permissions-policy', 'referer', 'te', 'trailer',
   'transfer-encoding', 'upgrade', 'user-agent', 'via']);
 const SIMPLE_METHODS = new Set(['GET', 'HEAD', 'POST']);
+const REQUEST_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'PROPFIND']);
 const SIMPLE_RESPONSE = new Set(['cache-control', 'content-language', 'content-length', 'content-type',
   'expires', 'last-modified', 'pragma']);
 
@@ -59,11 +69,31 @@ export function installFetch(page, window) {
   const active = () => !disposed && !page.closed && !!window.document && page.documentGeneration === generation && !documentSignal?.aborted;
   const documentOrigin = () => implForWrapper(window.document)?._origin ?? window.location.origin;
   function realmError(error) {
-    if (error instanceof window.Error || error instanceof window.DOMException) return error;
-    if (error instanceof globalThis.DOMException) return new window.DOMException(error.message, error.name);
-    if (error?.name === 'SyntaxError') return new window.SyntaxError(error.message);
-    if (error?.name === 'RangeError') return new window.RangeError(error.message);
-    return new window.TypeError(error?.message ?? String(error));
+    if (types.isProxy(error)) return error;
+    if (error !== null && ['object', 'function'].includes(typeof error) && Object.getPrototypeOf(error) === globalThis.DOMException.prototype) {
+      return new window.DOMException(error.message, error.name);
+    }
+    if (types.isNativeError(error)) {
+      let prototype = Object.getPrototypeOf(error);
+      for (let depth = 0; prototype && depth < 32; depth++) {
+        if (types.isProxy(prototype)) return error;
+        if (prototype === globalThis.SyntaxError.prototype) return new window.SyntaxError(error.message);
+        if (prototype === globalThis.RangeError.prototype) return new window.RangeError(error.message);
+        if (prototype === globalThis.Error.prototype) {
+          const text = error.message === 'Body is unusable: Body has already been read' ? 'Body has already been read' : error.message;
+          return new window.TypeError(text);
+        }
+        prototype = Object.getPrototypeOf(prototype);
+      }
+    }
+    return error;
+  }
+  function headerError(error) {
+    if (error instanceof globalThis.TypeError) {
+      if (/invalid header name/i.test(error.message)) return new window.TypeError('Invalid header name');
+      if (/invalid header value/i.test(error.message)) return new window.TypeError('Invalid header value');
+    }
+    return realmError(error);
   }
   const promise = (task, signal) => new window.Promise((resolve, reject) => {
     Promise.resolve().then(task).then(value => { if (active()) resolve(value); }, error => {
@@ -87,6 +117,7 @@ export function installFetch(page, window) {
     return s;
   };
   function bodyValue(body, allowStream = false) {
+    if (types.isSharedArrayBuffer(body)) throw new window.TypeError('SharedArrayBuffer bodies are not supported');
     if (!allowStream && Object.prototype.toString.call(body) === '[object ReadableStream]') {
       throw new window.TypeError('ReadableStream request bodies are unsupported by this buffered transport');
     }
@@ -102,13 +133,20 @@ export function installFetch(page, window) {
       return converted;
     }
     if (DOMURLSearchParams.is(body)) return new URLSearchParams(body.toString());
-    if (Object.prototype.toString.call(body) === '[object ArrayBuffer]') return new Uint8Array(body).slice();
-    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice();
+    if (types.isArrayBuffer(body)) return body.byteLength ? new Uint8Array(body).slice() : new Uint8Array();
+    if (ArrayBuffer.isView(body)) {
+      const dataView = types.isDataView(body);
+      const buffer = (dataView ? viewBuffer : typedBuffer).call(body);
+      if (types.isSharedArrayBuffer(buffer)) throw new window.TypeError('SharedArrayBuffer bodies are not supported');
+      const length = (dataView ? viewLength : typedLength).call(body);
+      return length ? new Uint8Array(buffer, (dataView ? viewOffset : typedOffset).call(body), length).slice() : new Uint8Array();
+    }
     return body;
   }
   function fillHeaders(init, guard = 'none') {
     const result = new Headers(); headersState.get(result).guard = guard;
-    const source = new NativeHeaders(init);
+    let source;
+    try { source = new NativeHeaders(init); } catch (error) { throw headerError(error); }
     for (const [name, value] of source) result.append(name, value);
     return result;
   }
@@ -119,7 +157,7 @@ export function installFetch(page, window) {
   class Headers {
     constructor(init) {
       try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); }
-      catch (error) { throw realmError(error); }
+      catch (error) { throw headerError(error); }
     }
     append(name, value) { if (arguments.length < 2) throw new window.TypeError('append requires two arguments'); this._change('append', name, value); }
     set(name, value) { if (arguments.length < 2) throw new window.TypeError('set requires two arguments'); this._change('set', name, value); }
@@ -133,7 +171,7 @@ export function installFetch(page, window) {
         if (operation === 'delete') { checked.set(name, ''); value = ''; }
         else checked.set(name, value);
         name = [...checked.keys()][0]; value = checked.get(name);
-      } catch (error) { throw realmError(error); }
+      } catch (error) { throw headerError(error); }
       if (['request', 'request-no-cors'].includes(s.guard) && forbidden(name, value)) return;
       if (s.guard === 'response' && ['set-cookie', 'set-cookie2'].includes(name)) return;
       const combined = operation === 'append' && s.raw.has(name) ? `${s.raw.get(name)}, ${value}` : value;
@@ -157,7 +195,7 @@ export function installFetch(page, window) {
   }
   function consume(owner, kind, isResponse) {
     const s = isResponse ? getResponse(owner) : getRequest(owner);
-    const read = kind === 'json' ? 'text' : kind === 'bytes' ? 'arrayBuffer' : kind;
+    const read = kind === 'json' ? 'text' : ['bytes', 'formData'].includes(kind) ? 'arrayBuffer' : kind;
     let reading;
     try { reading = s.raw[read](); } catch (error) { reading = Promise.reject(error); }
     return promise(async () => {
@@ -169,16 +207,55 @@ export function installFetch(page, window) {
         const blob = await reading; return new window.Blob([bytesInRealm(await blob.arrayBuffer()).buffer], { type: blob.type });
       }
       if (kind === 'formData') {
-        const native = await reading, result = new window.FormData();
-        for (const [name, value] of native) {
-          if (typeof value === 'string') result.append(name, value);
-          else result.append(name, new window.File([bytesInRealm(await value.arrayBuffer()).buffer], value.name,
-            { type: value.type, lastModified: value.lastModified }));
-        }
-        return result;
+        return parseFormData(Buffer.from(await reading), s.raw.headers.get('content-type'));
       }
       return reading;
     }, s.signal);
+  }
+  function parseFormData(bytes, contentType) {
+    let mime;
+    try { mime = new MIMEType(contentType); } catch { throw new window.TypeError('Unsupported form data Content-Type'); }
+    const result = new window.FormData();
+    if (mime.essence === 'application/x-www-form-urlencoded') {
+      for (const [name, value] of new URLSearchParams(bytes.toString('utf8'))) result.append(name, value);
+      return result;
+    }
+    const boundary = mime.parameters.get('boundary');
+    if (mime.essence !== 'multipart/form-data' || !boundary || /[\r\n]/.test(boundary)) throw new window.TypeError('Invalid form data boundary');
+    const delimiter = Buffer.from(`--${boundary}`), separator = Buffer.from(`\r\n--${boundary}`);
+    let cursor = bytes.indexOf(delimiter);
+    const invalid = () => { throw new window.TypeError('Invalid multipart form data'); };
+    if (cursor < 0 || (cursor && !bytes.subarray(cursor - 2, cursor).equals(Buffer.from('\r\n')))) invalid();
+    while (true) {
+      cursor += delimiter.length;
+      if (bytes.subarray(cursor, cursor + 2).equals(Buffer.from('--'))) return result;
+      if (!bytes.subarray(cursor, cursor + 2).equals(Buffer.from('\r\n'))) invalid();
+      cursor += 2;
+      const end = bytes.indexOf('\r\n\r\n', cursor); if (end < 0) invalid();
+      const headers = new Map();
+      for (const line of bytes.subarray(cursor, end).toString('latin1').split('\r\n')) {
+        const colon = line.indexOf(':'); if (colon < 1) invalid();
+        headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
+      }
+      const start = end + 4;
+      let next = bytes.indexOf(separator, start);
+      while (next >= 0) {
+        const suffix = bytes.subarray(next + separator.length, next + separator.length + 2).toString('ascii');
+        if (suffix === '--' || suffix === '\r\n') break;
+        next = bytes.indexOf(separator, next + separator.length);
+      }
+      if (next < 0) invalid();
+      let disposition;
+      try { disposition = new MIMEType(`x/${headers.get('content-disposition')}`); } catch { invalid(); }
+      if (disposition.essence !== 'x/form-data' || !disposition.parameters.has('name')) invalid();
+      const decode = value => Buffer.from(value, 'latin1').toString('utf8');
+      const name = decode(disposition.parameters.get('name')), part = bytes.subarray(start, next);
+      if (disposition.parameters.has('filename')) {
+        result.append(name, new window.File([bytesInRealm(part).buffer], decode(disposition.parameters.get('filename')),
+          { type: headers.get('content-type') ?? 'application/octet-stream' }));
+      } else result.append(name, part.toString('utf8'));
+      cursor = next + 2;
+    }
   }
   function wrapRequest(raw) {
     const request = Object.create(Request.prototype);
@@ -197,6 +274,14 @@ export function installFetch(page, window) {
         const mode = init.mode ?? (source instanceof NativeRequest ? source.mode : 'cors');
         const guarded = fillHeaders(init.headers ?? (source instanceof NativeRequest ? source.headers : undefined), mode === 'no-cors' ? 'request-no-cors' : 'request');
         const prepared = { ...init, headers: getHeaders(guarded).raw };
+        if (prepared.method !== undefined) {
+          if (typeof prepared.method === 'symbol') throw new window.TypeError('Cannot convert a Symbol value to a string');
+          prepared.method = String(prepared.method).toUpperCase();
+          if (!REQUEST_METHODS.has(prepared.method)) throw new window.TypeError();
+        }
+        if (mode === 'no-cors' && !SIMPLE_METHODS.has(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) {
+          throw new window.TypeError(`'${prepared.method ?? source.method}' is unsupported in no-cors mode`);
+        }
         if (Object.hasOwn(init, 'body')) prepared.body = bodyValue(init.body);
         if (prepared.referrer && prepared.referrer !== 'about:client') prepared.referrer = new URL(String(prepared.referrer), window.document.baseURI).href;
         const wrapped = wrapRequest(new NativeRequest(source, prepared));
@@ -253,12 +338,41 @@ export function installFetch(page, window) {
     }, { highWaterMark: 0 });
     return new NativeResponse(stream, { status: raw.status, statusText: raw.statusText, headers: raw.headers });
   }
+  function textStream(raw) {
+    if (raw.bodyUsed) throw new window.TypeError('Body has already been read');
+    const body = raw.body;
+    if (!body) return new window.ReadableStream({ start(controller) { controller.close(); } });
+    if (body.locked) throw new window.TypeError('Body stream is locked');
+    const reader = nativeReader.call(body), decoder = new TextDecoder();
+    reader.closed.catch(() => {});
+    // Request the first real read now, marking the body disturbed before
+    // returning the text stream, independently of later consumer demand.
+    let next = reader.read(), finished = false;
+    const release = () => { if (!finished) { finished = true; reader.releaseLock(); } };
+    return new window.ReadableStream({
+      async pull(controller) {
+        try {
+          while (!finished) {
+            const result = await (next ?? reader.read()); next = undefined;
+            if (result.done) {
+              const tail = decoder.decode(); if (tail) controller.enqueue(tail);
+              release(); controller.close(); return;
+            }
+            const text = decoder.decode(result.value, { stream: true });
+            if (text) { controller.enqueue(text); return; }
+          }
+        } catch (error) { release(); controller.error(realmError(error)); }
+      },
+      async cancel(reason) { try { await reader.cancel(reason); } finally { release(); } },
+    });
+  }
   class Response {
     constructor(body = null, init = {}) {
       init ??= {};
       try {
         const headers = fillHeaders(init.headers, 'response');
-        const raw = new NativeResponse(bodyValue(body, true), { ...init, headers: getHeaders(headers).raw });
+        const status = init.status, statusText = init.statusText;
+        const raw = new NativeResponse(bodyValue(body, true), { status, statusText, headers: getHeaders(headers).raw });
         responseState.set(this, { raw, headers: wrapHeaders(raw.headers, 'response') });
       } catch (error) { throw realmError(error); }
     }
@@ -289,6 +403,7 @@ export function installFetch(page, window) {
       }
       catch (error) { throw realmError(error); }
     }
+    textStream() { return textStream(getResponse(this).raw); }
     get headers() { return getResponse(this).headers; }
     get status() { const s = getResponse(this); return s.status ?? s.raw.status; }
     get statusText() { const s = getResponse(this); return s.statusText ?? s.raw.statusText; }
@@ -300,10 +415,21 @@ export function installFetch(page, window) {
     get bodyUsed() { return getResponse(this).raw.bodyUsed; }
     get [Symbol.toStringTag]() { return 'Response'; }
   }
+  const OriginalParams = window.URLSearchParams;
+  const Params = new Proxy(OriginalParams, { construct(target, args, newTarget) {
+    try { return Reflect.construct(target, args, newTarget); } catch (error) { throw realmError(error); }
+  } });
+  Object.defineProperty(OriginalParams.prototype, 'constructor', { value: Params, writable: true, configurable: true });
+  window.URLSearchParams = Params;
   for (const constructor of [Request, Response]) {
     for (const method of ['text', 'json', 'arrayBuffer', 'bytes', 'blob', 'formData']) Object.defineProperty(constructor.prototype, method,
       { configurable: true, writable: true, value() { return consume(this, method, constructor === Response); } });
   }
+  Object.defineProperty(Request.prototype, 'textStream', { configurable: true, writable: true,
+    value: function () {
+      return textStream(getRequest(this).raw);
+    },
+  });
   function cors(response, origin, credentials) {
     const allowed = response.headers.get('access-control-allow-origin');
     if (allowed !== origin && !(allowed === '*' && !credentials)) throw new window.TypeError('CORS origin is not allowed');

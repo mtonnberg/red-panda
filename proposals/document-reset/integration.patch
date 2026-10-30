@@ -1,0 +1,585 @@
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -1,3 +1,4 @@
++import { installDocumentReset } from './document-reset.js';
+ import { createParserStream } from './parser-stream.js';
+ import { createRequire } from 'node:module';
+ 
+@@ -26,8 +27,13 @@
+     (record.parserScriptDepth > 0 || (script._parserInserted &&
+       (record.parser.tokenizer.inLoop || record.blocker?.script === script)));
+   if (parserScript) record.parserScriptDepth = (record.parserScriptDepth ?? 0) + 1;
++  const writeParser = parserScript && record.stream?.kind === 'write' ? record.stream : null;
++  const entered = writeParser?.enterScript();
+   try { return evaluate(); }
+-  finally { if (parserScript) record.parserScriptDepth--; }
++  finally {
++    if (entered) writeParser.leaveScript();
++    if (parserScript) record.parserScriptDepth--;
++  }
+ }
+ function state(script) {
+   if (!flags.has(script)) flags.set(script, { forceAsync: !(script._parserInserted && script._alreadyStarted) });
+@@ -89,7 +95,7 @@
+   return request;
+ }
+ function finishParser(record, parser) {
+-  if (!active(record) || parser.tokenizer.paused || !parser.stopped) return;
++  if (!active(record) || record.parser !== parser || parser.tokenizer.paused || !parser.stopped) return;
+   record.parserDone = true; record.blocker = null;
+   if (record.closeRequested) {
+     const arguments_ = record.closeRequested; record.closeRequested = null;
+@@ -106,6 +112,23 @@
+     if (record.stream) record.stream.resume();
+     else if (blocker.parser.tokenizer.paused) blocker.parser.tokenizer.resume(() => finishParser(record, blocker.parser));
+   });
++}
++
++function makeParser(record, options) {
++  const parser = new parse5.Parser(options, undefined, null, script => {
++    const type = script._getTypeString()?.toLowerCase();
++    if (type === 'module' || type === 'importmap' || !scriptTypes.has(type) || !script._canRunScript()) return;
++    if (!script.hasAttributeNS(null, 'src')) {
++      if (script.text.length && record.styles.size) { record.blocker = { script, parser, kind: 'styles', scheduled: false }; parser.tokenizer.pause(); }
++      return;
++    }
++    if (!script.getAttributeNS(null, 'src').trim() ||
++        script._ownerDocument.encodingParseAURL(script.getAttributeNS(null, 'src')) === null ||
++        script.hasAttributeNS(null, 'async') || script.hasAttributeNS(null, 'defer')) return;
++    record.blocker = { script, parser, scheduled: false };
++    parser.tokenizer.pause();
++  });
++  return parser;
+ }
+ 
+ function patch() {
+@@ -138,22 +161,11 @@
+   parse5.parse = function (markup, options) {
+     const record = documents.get(options?.treeAdapter?._documentImpl);
+     if (!active(record)) return parse.call(this, markup, options);
+-    const parser = new parse5.Parser(options, undefined, null, script => {
+-      const type = script._getTypeString()?.toLowerCase();
+-      if (type === 'module' || type === 'importmap' || !scriptTypes.has(type) || !script._canRunScript()) return;
+-      if (!script.hasAttributeNS(null, 'src')) {
+-        if (script.text.length && record.styles.size) { record.blocker = { script, parser, kind: 'styles', scheduled: false }; parser.tokenizer.pause(); }
+-        return;
+-      }
+-      if (!script.getAttributeNS(null, 'src').trim() ||
+-          script._ownerDocument.encodingParseAURL(script.getAttributeNS(null, 'src')) === null ||
+-          script.hasAttributeNS(null, 'async') || script.hasAttributeNS(null, 'defer')) return;
+-      record.blocker = { script, parser, scheduled: false };
+-      parser.tokenizer.pause();
+-    });
++    record.parserOptions = options;
++    const parser = makeParser(record, options);
+     record.parser = parser; record.parserDone = false;
+     record.stream = createParserStream(parser, markup, {
+-      signal: record.signal, active: () => active(record),
++      signal: record.signal, active: () => active(record) && record.parser === parser,
+       onComplete: () => finishParser(record, parser),
+       onError: error => record.page.emit?.('pageError', error),
+     });
+@@ -326,7 +338,7 @@
+   });
+   const dispose = () => {
+     if (record.disposed) return;
+-    record.disposed = true; record.stream?.abort();
++    record.disposed = true; record.resetController?.dispose(); record.stream?.abort();
+     if (record.parser && !record.parserDone) { record.parser.tokenizer.pause(); record.parser.stopped = true; }
+     record.blocker = null; record.closeRequested = null;
+     record.preloadAbort.abort(); record.preloads.clear();
+@@ -340,6 +352,7 @@
+   window.close = record.close;
+   record.controller = { dispose };
+   documents.set(document, record); record.signal?.addEventListener('abort', dispose, { once: true });
++  record.resetController = installDocumentReset(page, window, record, makeParser, finishParser);
+   if (record.signal?.aborted || page.closed) dispose();
+   return record.controller;
+ }
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import { installListenerOwnership } from './listener-ownership.js';
+ import { EventEmitter } from 'node:events';
+ import { installVMContextNames } from './context-names.js';
+ import { randomUUID } from 'node:crypto';
+@@ -171,6 +172,8 @@
+   }
+ 
+   prepareWindow(window, historyState = null, { main = true } = {}) {
++    const listenerOwnership = installListenerOwnership(window);
++    listenerOwnership.scope(() => {
+     installErrors(this, window);
+     installMutations(this, window);
+     if (main) implForWrapper(window.document).contentType = this.mimeType;
+@@ -194,13 +197,14 @@
+     if (main) this.installHistory(window, historyState);
+     installNavigation(this, window);
+     installForms(this, window);
+-    installModuleScripts(this, window);
++    this.moduleScripts = installModuleScripts(this, window);
+     installClassicScripts(this, window);
+     installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+     installGeometry(window);
+     installXHR(this, window);
+     if (main) this.frames = installFrames(this, window, {
+       prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
++    });
+     });
+     for (const { source } of this.newDocumentScripts.values()) {
+       try { window.eval(source); } catch (error) { this.emit('pageError', error); }
+@@ -587,11 +591,11 @@
+       onCommit?.();
+       const documentReady = new Promise(resolve => {
+         if (this.dom.window.document.readyState !== 'loading') resolve();
+-        else this.dom.window.document.addEventListener('DOMContentLoaded', resolve, { once: true });
++        else installListenerOwnership(this.dom.window).add(this.dom.window.document, 'DOMContentLoaded', resolve, { once: true });
+       });
+       const loaded = new Promise(resolve => {
+         if (this.dom.window.document.readyState === 'complete') resolve();
+-        else this.dom.window.addEventListener('load', resolve, { once: true });
++        else installListenerOwnership(this.dom.window).add(this.dom.window, 'load', resolve, { once: true });
+       });
+       documentReady.then(() => { if (generation === this.navigationGeneration && !redirect) this.emit('domContentLoaded'); });
+       loaded.then(async () => { await moduleReady; if (generation === this.navigationGeneration && !redirect) this.emit('load'); });
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -1,3 +1,4 @@
++import { installListenerOwnership } from './listener-ownership.js';
+ import vm from 'node:vm';
+ import { EventEmitter } from 'node:events';
+ import { randomUUID } from 'node:crypto';
+@@ -271,14 +272,16 @@
+     registry.announce('frameNavigationStarted', { frameId: record.id, loaderId: framePage.loaderId, url: framePage.url });
+     const closed = childWindow.close.bind(childWindow);
+     childWindow.close = () => { if (record.page === framePage) destroyDocument(record); return closed(); };
++    installListenerOwnership(childWindow._globalProxy).scope(() => {
+     record.document.addEventListener('DOMContentLoaded', () => {
+       if (!framePage.closed) registry.announce('frameDOMContentLoaded', { frameId: record.id, loaderId: framePage.loaderId });
+-    }, { once: true });
++    });
+     childWindow.addEventListener('load', () => {
+       if (!framePage.closed) registry.announce('frameLoad', { frameId: record.id, loaderId: framePage.loaderId });
+-    }, { once: true });
++    });
+     childWindow.addEventListener('error', event => {
+       if (!framePage.closed) framePage.emit('pageError', event.error ?? new Error(event.message));
++    });
+     });
+     for (const type of ['log', 'info', 'warn', 'error', 'debug']) childWindow.console[type] = (...args) => framePage.emit('console', { type, args });
+     // This call runs inside createWindow, before native frame parsing starts.
+@@ -346,7 +349,7 @@
+     const current = record.page; onCommit?.();
+     const loaded = new Promise(resolve => {
+       if (current.dom.window.document.readyState === 'complete') resolve();
+-      else current.dom.window.addEventListener(waitUntil === 'domcontentloaded' ? 'DOMContentLoaded' : 'load', resolve, { once: true });
++      else installListenerOwnership(current.dom.window).add(current.dom.window, waitUntil === 'domcontentloaded' ? 'DOMContentLoaded' : 'load', resolve, { once: true });
+     });
+     let abort;
+     const aborted = new Promise((_, reject) => {
+--- a/src/modules.js
++++ b/src/modules.js
+@@ -23,12 +23,11 @@
+   const signal = page.documentAbort?.signal;
+   const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet();
+   const imports = new Map(), scopes = new Map();
+-  const tasks = new Set();
+-  let context, observer, started = false, disposed = false, graphStarted = false, inlineCount = 0, linkQueue = Promise.resolve();
+-  let resolveReady, releaseAbort;
+-  const ready = new Promise(resolve => { resolveReady = resolve; });
++  const cycles = new Set();
++  let parseCycle;
++  let context, observer, disposed = false, graphStarted = false, inlineCount = 0, linkQueue = Promise.resolve();
++  let releaseAbort;
+   const aborted = new Promise(resolve => { releaseAbort = resolve; });
+-  page.moduleReady = ready;
+   Object.defineProperty(window.HTMLScriptElement, 'supports', { configurable: true, writable: true,
+     value: function supports(type) {
+       if (!arguments.length) throw new TypeError('HTMLScriptElement.supports requires a script type');
+@@ -36,7 +35,7 @@
+     } });
+   const active = () => !disposed && !signal?.aborted && !page.closed;
+   const check = () => { if (!active()) throw new DOMException('Document was disposed', 'AbortError'); };
+-  function dispose() { disposed = true; observer?.disconnect(); releaseAbort(); resolveReady(); }
++  function dispose() { disposed = true; observer?.disconnect(); releaseAbort(); for (const cycle of cycles) cycle.resolveReady(); }
+   signal?.addEventListener('abort', dispose, { once: true });
+   function report(error, script) {
+     if (!active()) return;
+@@ -209,52 +208,55 @@
+     return Promise.resolve().then(() => compile(script.textContent, document.URL,
+       `${document.URL}#red-panda-inline-module-${++inlineCount}`, base));
+   }
+-  function track(task) {
+-    tasks.add(task); task.then(() => tasks.delete(task), () => tasks.delete(task)); return task;
+-  }
+-  function execute(script, prepared) {
++  function track(task, cycle) {
++    cycle.tasks.add(task); task.then(() => cycle.tasks.delete(task), () => cycle.tasks.delete(task)); return task;
++  }
++  function execute(script, prepared, cycle = parseCycle) {
+     return track((async () => {
+       try {
+         const module = await prepared;
+         await evaluate(module);
+         if (active() && script.hasAttribute('src')) script.dispatchEvent(new window.Event('load'));
+       } catch (error) { report(error, script); }
+-    })());
+-  }
+-  function discover(root = document) {
++    })(), cycle);
++  }
++  function discover(root = document, includeParser = false) {
+     const candidates = root.nodeType === 1 && root.localName === 'script' ? [root] : [];
+     candidates.push(...root.querySelectorAll?.('script') ?? []);
+     return candidates.filter(script => {
+       if (!script.isConnected || !['module', 'importmap'].includes(script.getAttribute('type')?.trim().toLowerCase()) || seen.has(script)) return false;
++      if (!includeParser && !parseCycle.started && implForWrapper(script)._parserInserted) return false;
+       seen.add(script); return true;
+     });
+   }
+-  async function begin() {
+-    if (started) return;
+-    started = true;
+-    if (!active() || page.javascript === false) { resolveReady(); return; }
++  async function begin(cycle = parseCycle) {
++    if (cycle.started || cycle !== parseCycle) return;
++    cycle.started = true;
++    if (!active() || page.javascript === false) { cycle.resolveReady(); return; }
+     // Fetch roots eagerly, then initiate their evaluations in document order.
+     // Suspended top-level await does not hold DOMContentLoaded hostage.
+-    const scripts = discover(), prepared = scripts.map(script => script.getAttribute('type').trim().toLowerCase() === 'importmap' ? Promise.resolve() : Promise.resolve().then(() => prepare(script)));
++    const scripts = discover(document, true), prepared = scripts.map(script => script.getAttribute('type').trim().toLowerCase() === 'importmap' ? Promise.resolve() : Promise.resolve().then(() => prepare(script)));
+     prepared.forEach(promise => promise.catch(() => {}));
+     for (let index = 0; index < scripts.length; index++) {
+-      if (!active()) break;
++      if (!active() || cycle !== parseCycle) break;
+       const script = scripts[index];
+       if (script.getAttribute('type').trim().toLowerCase() === 'importmap') { registerMap(script); continue; }
+       graphStarted = true;
+       if (script.hasAttribute('async')) {
+         const initiated = prepared[index].then(link).then(module => { startEvaluation(module); return true; });
+         impl._asyncQueue.push(initiated, () => Promise.resolve(), () => Promise.resolve());
+-        execute(script, prepared[index]); continue;
++        execute(script, prepared[index], cycle); continue;
+       }
+       try {
+         const module = await prepared[index];
+         await link(module);
+         check();
++        if (cycle !== parseCycle) break;
+         startEvaluation(module);
+-        execute(script, Promise.resolve(module));
++        execute(script, Promise.resolve(module), cycle);
+       } catch (error) { report(error, script); }
+     }
++    if (!observer) {
+     observer = createInternalMutationObserver(window, records => {
+       if (!active()) return;
+       for (const record of records) {
+@@ -266,10 +268,11 @@
+       }
+     });
+     observer.observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'type'] });
++    }
+     for (const script of discover()) startScript(script);
+     void (async () => {
+-      while (active() && tasks.size) await Promise.race([Promise.all([...tasks]), aborted]);
+-      resolveReady();
++      while (active() && cycle.tasks.size) await Promise.race([Promise.all([...cycle.tasks]), aborted]);
++      cycle.resolveReady();
+     })();
+   }
+   function startScript(script) {
+@@ -280,6 +283,15 @@
+   if (!impl?._deferQueue) throw new Error('Pinned jsdom deferred script queue is unavailable');
+   // Register before parsing, rather than listening for DOMContentLoaded after it
+   // has already fired. All errors are observed; script failures do not wedge load.
+-  impl._deferQueue.push(Promise.resolve(), () => begin().catch(error => { report(error); resolveReady(); }), null, false);
+-  return { ready, start: begin, dispose };
++  function beginParseCycle(queue, token = null) {
++    if (parseCycle && !parseCycle.started) parseCycle.resolveReady();
++    let resolve;
++    const cycle = { token, started: false, tasks: new Set(), done: false, ready: new Promise(done => { resolve = done; }),
++      resolveReady() { if (!cycle.done) { cycle.done = true; cycles.delete(cycle); resolve(); } } };
++    cycles.add(cycle); parseCycle = cycle; page.moduleReady = cycle.ready;
++    queue.push(Promise.resolve(), () => begin(cycle).catch(error => { report(error); cycle.resolveReady(); }), null, false);
++    return cycle.ready;
++  }
++  beginParseCycle(impl._deferQueue);
++  return { get ready() { return parseCycle.ready; }, start: () => begin(parseCycle), beginParseCycle, dispose };
+ }
+--- /dev/null
++++ b/src/document-reset.js
+@@ -0,0 +1,124 @@
++// Unintegrated proposal: real post-load Document resets in the existing realm.
++import { createRequire } from 'node:module';
++import { createWriteParser } from './write-created-parser.js';
++import { installListenerOwnership } from './listener-ownership.js';
++const require = createRequire(import.meta.url);
++const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const DocumentImpl = require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const ResourceQueue = require('jsdom/lib/jsdom/browser/resources/resource-queue.js');
++const AsyncResourceQueue = require('jsdom/lib/jsdom/browser/resources/async-resource-queue.js');
++const RequestManager = require('jsdom/lib/jsdom/browser/resources/request-manager.js');
++const PerDocumentResourceLoader = require('jsdom/lib/jsdom/browser/resources/per-document-resource-loader.js');
++const { fireAnEvent } = require('jsdom/lib/jsdom/living/helpers/events.js');
++const contexts = new WeakMap();
++let patched = false, underlyingOpen;
++function active(context) {
++  return !context.disposed && !context.page.closed && !context.record.signal?.aborted &&
++    implForWrapper(context.window.document) === context.document;
++}
++function eligible(context) {
++  return context && active(context) && context.loaded &&
++    (context.document.readyState === 'complete' || context.current?.kind === 'write');
++}
++function reset(context, args) {
++  const { record, document, window, ownership } = context;
++  // This path deliberately does not apply to an initial loading/network parse.
++  // Parser-script no-op and original XML/custom-element guards remain outside.
++  context.current?.abort('Superseded write-created parser');
++  record.stream?.abort('Superseded post-load parser');
++  for (const manager of context.retired) if (!manager.size()) context.retired.delete(manager);
++  if (document._requestManager.size()) context.retired.add(document._requestManager);
++  ownership.eraseAuthoredListeners();
++  context.open.apply(document, args);
++  // Keep the original Window and Document, observers and Page.documentAbort.
++  document._asyncQueue = new AsyncResourceQueue();
++  document._queue = new ResourceQueue({ asyncQueue: document._asyncQueue, paused: false });
++  document._deferQueue = new ResourceQueue({ paused: true });
++  document._requestManager = new RequestManager();
++  document._resourceLoader = new PerDocumentResourceLoader(document);
++  document.readyState = 'loading';
++  record.styles.clear(); record.blocker = null; record.closeRequested = null;
++  const options = { ...record.parserOptions,
++    treeAdapter: new record.parserOptions.treeAdapter.constructor(document) };
++  const parser = context.makeParser(record, options);
++  record.parser = parser; record.parserDone = false;
++  const cycle = { kind: 'write', generation: ++context.generation, closedDelivered: false };
++  const controller = createWriteParser(parser, {
++    signal: record.signal,
++    active: () => active(context) && context.current === cycle && record.parser === parser,
++    onComplete: () => context.finishParser(record, parser),
++    onError: error => context.page.emit?.('pageError', error),
++  });
++  Object.defineProperties(cycle, Object.getOwnPropertyDescriptors(controller));
++  context.current = cycle; record.stream = cycle;
++  if (!context.bridgeInstalled) {
++    context.bridgeInstalled = true;
++    // The old unmarked jsdom bridge was erased. Initial Window load already
++    // happened, so its pending nextTick registration cannot race this bridge.
++    ownership.add(window.document, 'load', () => {
++      if (active(context)) fireAnEvent('load', window, undefined, {}, true);
++    });
++  }
++  context.page.moduleScripts?.beginParseCycle(document._deferQueue, cycle);
++  return document;
++}
++function patch() {
++  if (patched) return; patched = true;
++  const open = DocumentImpl.prototype.open, write = DocumentImpl.prototype.write, close = DocumentImpl.prototype.close;
++  underlyingOpen = open;
++  DocumentImpl.prototype.open = function (...args) {
++    const context = contexts.get(this);
++    if (eligible(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
++    if (!eligible(context) || context.record.parserScriptDepth > 0 || this._parsingMode !== 'html' || this._throwOnDynamicMarkupInsertionCounter) return open.apply(this, args);
++    return reset(context, args);
++  };
++  DocumentImpl.prototype.write = function (...args) {
++    const context = contexts.get(this);
++    if (this._parsingMode === 'xml' || this._throwOnDynamicMarkupInsertionCounter) return write.apply(this, args);
++    if (context && active(context)) {
++      if ((!context.current || context.current.state.status === 'complete') &&
++          eligible(context) && !this._writeAfterElement && args.join('')) reset(context, []);
++      if (context.current && context.current.state.status === 'open') {
++        context.current.write(args.join('')); return;
++      }
++    }
++    return write.apply(this, args);
++  };
++  DocumentImpl.prototype.close = function (...args) {
++    const context = contexts.get(this), cycle = context?.current;
++    if (cycle && active(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
++    if (cycle && active(context)) {
++      if (cycle.state.status === 'open') { context.record.closeRequested = args; cycle.close(); return; }
++      if (cycle.state.status === 'complete') {
++        if (cycle.closedDelivered) return;
++        cycle.closedDelivered = true;
++      }
++    }
++    return close.apply(this, args);
++  };
++  return open;
++}
++export function installDocumentReset(page, window, record, makeParser, finishParser) {
++  patch();
++  if (contexts.has(record.document)) return contexts.get(record.document);
++  const context = { page, window, record, document: record.document, ownership: installListenerOwnership(window),
++    open: underlyingOpen, makeParser, finishParser, Exception: window.DOMException,
++    loaded: false, disposed: false, generation: 0, current: null, retired: new Set() };
++  contexts.set(record.document, context);
++  context.ownership.add(window.document, 'DOMContentLoaded', () => {
++    if (active(context) && context.current && !page.registry) page.emit?.('domContentLoaded');
++  });
++  context.ownership.add(window, 'load', async () => {
++    context.loaded = true;
++    const cycle = context.current;
++    if (cycle && !page.registry) {
++      await page.moduleReady;
++      if (active(context) && context.current === cycle) page.emit?.('load');
++    }
++  });
++  context.dispose = () => {
++    if (context.disposed) return; context.disposed = true;
++    context.current?.abort(); for (const manager of context.retired) manager.close(); context.retired.clear();
++  };
++  return context;
++}
+--- /dev/null
++++ b/src/write-created-parser.js
+@@ -0,0 +1,79 @@
++// Isolated design prototype: the caller supplies a real parse5 parser using the
++// existing Document tree adapter. This file is not installed by production.
++export function createWriteParser(parser, {
++  active = () => true, signal, onComplete = () => {}, onError = () => {},
++} = {}) {
++  if (typeof parser?.tokenizer?.write !== 'function' || typeof parser.tokenizer.insertHtmlAtCurrentPos !== 'function') throw new TypeError('A parse5 parser is required');
++  let status = 'open', feeding = 0, scripts = 0, pending = '', closeRequested = false, eofFed = false;
++  let charsWritten = 0, writes = 0, resolve;
++  const completion = new Promise(done => { resolve = done; });
++  const terminal = () => ['complete', 'aborted', 'error'].includes(status);
++  function settle(result) { signal?.removeEventListener('abort', aborted); resolve(result); }
++  function abort(reason = signal?.reason) {
++    if (terminal()) return false;
++    status = 'aborted'; pending = ''; parser.tokenizer.pause(); settle({ status, reason }); return true;
++  }
++  function aborted() { abort(signal.reason); }
++  function check() {
++    if (terminal()) return false;
++    if (signal?.aborted || !active()) { abort(); return false; }
++    return true;
++  }
++  function failed(error) {
++    if (terminal()) return;
++    status = 'error'; pending = ''; parser.tokenizer.pause(); settle({ status, error }); onError(error);
++  }
++  function run(operation) {
++    feeding++;
++    try { operation(); }
++    catch (error) { failed(error); throw error; }
++    finally { feeding--; }
++    drained();
++  }
++  function flushScriptWrites() {
++    if (!check() || scripts || !pending) return;
++    const input = pending; pending = '';
++    // During a parser callback parse5's real inLoop guard queues these bytes
++    // without reentering its tree builder. Concatenation preserves call order.
++    run(() => parser.tokenizer.insertHtmlAtCurrentPos(input));
++  }
++  function drained() {
++    if (!check() || feeding || scripts || parser.tokenizer.inLoop || parser.tokenizer.paused) return;
++    if (pending) { flushScriptWrites(); return; }
++    if (closeRequested && !eofFed) {
++      eofFed = true; run(() => parser.tokenizer.write('', true)); return;
++    }
++    if (eofFed && parser.stopped) {
++      status = 'complete'; settle({ status, charsWritten, writes }); onComplete();
++    }
++  }
++  function write(text) {
++    if (typeof text !== 'string') throw new TypeError('Written parser input must be a string');
++    if (!check() || eofFed) return false;
++    charsWritten += text.length; writes++;
++    if (scripts || parser.tokenizer.inLoop) pending += text;
++    else run(() => parser.tokenizer.write(text, false));
++    return true;
++  }
++  function close() {
++    if (!check()) return false;
++    closeRequested = true; drained(); return true;
++  }
++  function resume() {
++    if (!check() || feeding || parser.tokenizer.inLoop) return false;
++    if (parser.tokenizer.paused) run(() => parser.tokenizer.resume());
++    else drained();
++    return true;
++  }
++  function enterScript() { if (!check()) return false; scripts++; return true; }
++  function leaveScript() {
++    if (!scripts) return false;
++    scripts--;
++    if (check()) { flushScriptWrites(); drained(); }
++    return true;
++  }
++  signal?.addEventListener('abort', aborted, { once: true });
++  if (signal?.aborted) aborted();
++  return { kind: 'write', write, close, resume, abort, enterScript, leaveScript, completion,
++    get state() { return { status, feeding, scripts, pendingChars: pending.length, closeRequested, eofFed, charsWritten, writes, paused: parser.tokenizer.paused }; } };
++}
+--- /dev/null
++++ b/src/listener-ownership.js
+@@ -0,0 +1,63 @@
++// Isolated host-listener ownership prototype. Explicit registration scopes mark
++// actual private records; authored callbacks are never classified by source.
++import { createRequire } from 'node:module';
++const require = createRequire(import.meta.url);
++const contexts = new WeakMap(), scopes = [];
++let patched = false;
++
++function internals() {
++  return { ...require('jsdom/lib/jsdom/living/generated/utils.js'),
++    EventTargetImpl: require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation,
++    tree: require('jsdom/lib/jsdom/living/helpers/internal-constants.js').domSymbolTree };
++}
++
++export function installListenerOwnership(window) {
++  if (contexts.has(window)) return contexts.get(window).controller;
++  const { implForWrapper, EventTargetImpl, tree } = internals();
++  if (!patched) {
++    patched = true; const add = EventTargetImpl.prototype.addEventListener;
++    EventTargetImpl.prototype.addEventListener = function (type, ...args) {
++      const context = scopes.at(-1), targetContext = contexts.get(this._globalObject);
++      const before = context && context === targetContext ? new Set(this._eventListeners[type] ?? []) : null;
++      const result = add.call(this, type, ...args);
++      if (before) for (const listener of this._eventListeners[type] ?? []) if (!before.has(listener)) context.internal.add(listener);
++      return result;
++    };
++  }
++  const implementation = implForWrapper(window);
++  const context = { window, implementation, internal: new WeakSet() };
++  contexts.set(window, context); contexts.set(implementation._globalObject, context);
++  const scope = callback => {
++    scopes.push(context);
++    try { return callback(); }
++    finally { scopes.pop(); }
++  };
++  function eraseTarget(target) {
++    for (const listeners of Object.values(target._eventListeners ?? {})) {
++      // Mutate the actual arrays: jsdom's current dispatch also checks these
++      // arrays, so erased listeners cannot fire later in the same dispatch.
++      const retained = listeners.filter(listener => context.internal.has(listener));
++      listeners.splice(0, listeners.length, ...retained);
++    }
++    if (target._eventHandlers) target._eventHandlers = Object.create(null);
++    if (target._registeredHandlers) target._registeredHandlers = new Set();
++  }
++  function eraseAuthoredListeners(document = window.document) {
++    const implementation = implForWrapper(document);
++    if (!implementation || implementation !== implForWrapper(window.document)) throw new TypeError('The live owned Document is required');
++    const pending = [implementation];
++    while (pending.length) {
++      const target = pending.pop(); eraseTarget(target);
++      for (const child of tree.childrenIterator(target)) pending.push(child);
++      if (target._shadowRoot) pending.push(target._shadowRoot);
++    }
++    eraseTarget(context.implementation);
++    // Window's event-handler maps live on the Window object, while its event
++    // listener arrays are on the EventTarget implementation.
++    if (window._eventHandlers) window._eventHandlers = Object.create(null);
++    if (window._registeredHandlers) window._registeredHandlers = new Set();
++  }
++  context.controller = { scope, eraseAuthoredListeners,
++    add(target, type, callback, options) { return scope(() => target.addEventListener(type, callback, options)); } };
++  return context.controller;
++}

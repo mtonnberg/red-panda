@@ -1,7 +1,8 @@
 # In-place document reset: proposed ownership and parser design
 
-This is an isolated design, not a production change or a compatibility claim.
-Runtime validation remains paused while the coordinator runs its next cohort.
+This is an isolated design, not a production change or a full reset compatibility
+claim. Prototype tests and one paired held-blocker control are now recorded;
+the prototypes remain uninstalled.
 The existing paired evidence is parser-reset-native.json and
 parser-reset-candidate.json. The native post-load observation establishes that
 open keeps the Document identity, clears its tree/listeners, sets loading, and
@@ -65,7 +66,8 @@ outer script callback unwinds. parse5's own inLoop guard prevents reentering the
 tree builder. Completion requires parser.stopped after actual EOF. Neither DOM
 records nor parser completion are invented.
 
-The prototype is not yet wired into an isolated full runtime or executed.
+The prototype has passed six isolated real-parse5 controller tests. It is not
+yet wired into an isolated full runtime.
 Written external scripts require a separate observation: resuming a paused
 parser only after its real external callback preserves queued input order, but
 does not by itself provide native synchronous nested-external execution. This
@@ -160,7 +162,7 @@ not a request for user permission.
 
 ## Replacement control for the earlier timer ambiguity
 
-parser-reset-cdp-control.mjs is prepared but not run. It sends Page.navigate
+parser-reset-cdp-control.mjs sends Page.navigate
 without awaiting its result, waits for an owned HTTP server to receive the
 external script request, keeps its body withheld, then sends Runtime.evaluate
 as another raw-CDP command to call open/write/close. It records complete command
@@ -181,7 +183,7 @@ controllers in its reusable prepareWindow path. The native controls should
 resolve cancellation and module-map reuse before their policies are fixed.
 No broad adapter abort or unmeasured reset compatibility is proposed.
 
-## Prepared artifacts and validation still pending
+## Artifacts and bounded validation
 
 document-reset-proposal.json identifies a copied source/native runtime with
 uninstalled write-created-parser.js and listener-ownership.js prototypes. Neither
@@ -194,9 +196,43 @@ prepared in write-created-parser-tests.mjs and listener-ownership-tests.mjs.
 They cover persistent/split/reentrant input, actual paused EOF, generation
 supersession, public-vs-host listener removal, active dispatch erasure, closed
 shadow descendants, live MutationObserver delivery, and cross-Window ownership.
-They have not run during the coordinator's diagnostic pause. The raw-CDP held
-blocker control has likewise not run; no new native cancellation result is
-claimed.
+After checkpoint 085510c was pushed and the coordinator released diagnostics,
+all ten checks passed using the prepared Node executable and
+--experimental-vm-modules. Exact arguments, source hashes and totals are in
+document-reset-prototype-tests.json. The raw-CDP controls then ran sequentially
+against the verified native executable and a fresh copied current candidate.
+
+Native timeline: the held script request and reset command were at 231ms; the
+1000ms host safety timer released the body at 1232ms; the reset response arrived
+at 1233ms. Its before snapshot was complete, oldScriptRan true and stale true.
+Therefore controlReachedBlockedParser is false and native cancellation remains
+**inconclusive**. Its later open still returned the same Document, set loading,
+and produced the fresh replacement markup. The artifact preserves all actual
+CDP lifecycle events, including the reset's second load/DCL notification.
+
+Current-candidate timeline: held request/reset command at 419ms, reset response
+at 428ms while the body was still withheld. Its before state was loading,
+oldScriptRan false, stale false. The connection remained open after reset
+(peerAlreadyClosed false); the host released its body after that response, and
+the old script then set oldScriptRan true. This reaches a genuine held-parser
+reset in the candidate and establishes that its current reset does not cancel
+that request/execution. The native run does not establish the corresponding
+cancellation policy, so these observations are not presented as a passing
+native comparison or a complete reset fix.
+
+Both controls directly checked Document identity and retained a saved global
+Document reference; explicit constructor/Window-prototype identity was not a
+separate assertion. The isolated design retains the existing JSDOM/VM context,
+but that broader realm guarantee still needs full-runtime integration tests.
+Raw timelines, complete responses, events, source hashes and cleanup are in
+parser-reset-cdp-native.json and parser-reset-cdp-candidate.json. The frozen
+candidate manifest parser-reset-cdp-candidate-snapshot.json pins checkpoint
+085510c and every copied source hash. Both controls ended with all owned
+contexts, connections, processes/services, timers and HTTP servers closed.
+
+The candidate process also emitted Node's 11-close-listener threshold warning;
+the control completed and cleaned up. That warning alone is not evidence of
+a retained-object leak. No runtime code was changed to suppress it.
 
 Future integration tests should also run the unchanged upstream document/write,
 frames/document_write and custom_elements/reentrant_document_{write,close}

@@ -1,3 +1,4 @@
+import { selectorForSpecificity, getSelectorStateRevision } from './selectors.js';
 import { enhanceDeclaration, parseStyleSheet, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
 import { createRequire } from 'node:module';
 
@@ -15,7 +16,7 @@ const SVGElementImpl = require('jsdom/lib/jsdom/living/nodes/SVGElement-impl.js'
 const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
 const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
 const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
-const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js'));
+const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\nnoscript { display: none; }\n');
 const RECORDS = new WeakMap();
 const SHEETS = new WeakMap();
 const ADOPTED = new WeakMap();
@@ -286,6 +287,7 @@ function compare(a, b) { for (let index = 0; index < a.length; index++) if (a[in
 function maximum(values) { return values.reduce((best, value) => compare(best, value) < 0 ? value : best, [0, 0, 0]); }
 
 function specificity(selector) {
+  selector = selectorForSpecificity(selector);
   const score = [0, 0, 0];
   const identifier = start => {
     let end = start;
@@ -393,7 +395,7 @@ function inheritanceParent(element) {
 }
 
 function localToken(record, element) {
-  const tokens = [record.stateRevision, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
   const roots = new Set();
   for (let current = element; current; current = inheritanceParent(current)) {
     const root = rootOf(current); roots.add(root);
@@ -413,15 +415,32 @@ function overflowAxes(value) {
   return [parts[0], parts[1] ?? parts[0]];
 }
 
+// Native text collection supports the case keyword while ignoring width/kana
+// modifiers. Validate declarations before the cascade so invalid values expose
+// a real lower-priority declaration, preserving raw inline serialization.
+function textTransformValue(value) {
+  const tokens = value.trim().toLowerCase().split(/\s+/);
+  if (tokens.length === 1 && ['none', 'inherit', 'initial', 'unset', 'revert', 'revert-layer'].includes(tokens[0])) return tokens[0];
+  let mode = null;
+  for (const token of tokens) {
+    if (token === 'full-width' || token === 'full-size-kana') continue;
+    if (!['uppercase', 'lowercase', 'capitalize'].includes(token) || mode !== null) return null;
+    mode = token;
+  }
+  return mode ?? 'none';
+}
+
 function cascade(record, element) {
   const values = new Map(); let order = 0;
   const offer = (style, score, origin, inline = false) => {
     style = declaration(style);
     for (let index = 0; index < style.length; index++) {
-      const property = style[index], value = style.getPropertyValue(property);
+      const property = style[index];
+      let value = style.getPropertyValue(property);
+      if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
       const important = style.getPropertyPriority(property) === 'important';
       const expanded = new CSSStyleDeclaration(); expanded.setProperty(property, value);
-      const entries = [...expanded._values].map(([name, entry]) => ({ name, entry }));
+      const entries = property === 'opacity' ? [{ name: property, entry: value }] : [...expanded._values].map(([name, entry]) => ({ name, entry }));
       if (property === 'overflow') {
         const axes = overflowAxes(value);
         if (axes) entries.push({ name: 'overflow-x', entry: axes[0] }, { name: 'overflow-y', entry: axes[1] });
@@ -525,7 +544,7 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
     const selection = chosen.get(property);
     let value = typeof selection === 'object' ? selection.value : selection;
     if (value === undefined) value = inheriting ? parentValue : fallback;
-    if (/var\(/.test(value)) value = substitute(value, resolveCustom);
+    if (property !== 'opacity' && /var\(/.test(value)) value = substitute(value, resolveCustom);
     if (selection?.overflowPart !== undefined && value !== null) value = overflowAxes(value)?.[selection.overflowPart] ?? null;
     const keyword = value?.trim().toLowerCase();
     if (value === null || keyword === 'unset') value = inheriting ? parentValue : fallback;
@@ -542,7 +561,8 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
     if (property === 'font-weight') value = ({ normal: '400', bold: '700' })[value] ?? value;
     if (property.endsWith('color') && value) { try { value = getComputedOrUsedColor(value); } catch {} }
     result.setProperty(property, inherited.has(property) ? parentStyle?.getPropertyValue(property) || initial[property] || '' : initial[property] || '');
-    result.setProperty(property, value);
+    if (property === 'opacity') result._setProperty(property, value);
+    else result.setProperty(property, value);
   }
   // CSS Overflow's computed-value coupling turns visible into auto and clip
   // into hidden when the opposite axis establishes a scrolling box.
@@ -584,7 +604,7 @@ function computedStyle(record, element) {
 export function getStyleRevision(window) {
   const record = recordFor(window?.document);
   if (!record) return 0;
-  const tokens = [window.innerWidth, window.innerHeight, record.stateRevision, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
+  const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
   const visit = root => {
     tokens.push(id(root), implForWrapper(root)._version);
     for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));

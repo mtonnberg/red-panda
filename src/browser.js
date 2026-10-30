@@ -1,3 +1,8 @@
+import { installListenerOwnership } from './listener-ownership.js';
+import { installSelectors } from './selectors.js';
+import { installDialogs, isPopoverOpen, getDialogStateRevision } from './dialogs.js';
+import { installInnerText } from './inner-text.js';
+import { installCheckVisibility } from './check-visibility.js';
 import { EventEmitter } from 'node:events';
 import { installVMContextNames } from './context-names.js';
 import { randomUUID } from 'node:crypto';
@@ -10,6 +15,8 @@ import { installIntersection } from './intersection.js';
 import { installNavigation } from './navigation.js';
 import { installModuleScripts } from './modules.js';
 import { installForms } from './forms.js';
+import { installInputControls } from './input-controls.js';
+import { installDocumentXML } from './document-xml.js';
 import { installWorkers } from './workers.js';
 import { installXHR } from './xhr.js';
 import { dumpDocument } from './dump.js';
@@ -171,36 +178,45 @@ export class Page extends EventEmitter {
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
-    installErrors(this, window);
-    installMutations(this, window);
-    if (main) implForWrapper(window.document).contentType = this.mimeType;
-    installCollections(window, { binding: this.browser.collectionsBinding });
-    installInput(window);
-    installShadowDOM(this, window);
-    installBlobURLs(this, window);
-    installStyles(this, window);
-    installIntersection(this, window, installLayout(this, window, this.viewport));
-    installResizeObserver(this, window, this.layout);
-    installPerformance(this, window);
-    window.AbortController = AbortController;
-    window.AbortSignal = AbortSignal;
-    window.TextEncoder = TextEncoder;
-    window.TextDecoder = TextDecoder;
-    window.structuredClone = structuredClone;
-    installNavigator(this, window);
-    installFonts(window);
-    installFetch(this, window);
-    installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
-    if (main) this.installHistory(window, historyState);
-    installNavigation(this, window);
-    installForms(this, window);
-    installModuleScripts(this, window);
-    installClassicScripts(this, window);
-    installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
-    installGeometry(window);
-    installXHR(this, window);
-    if (main) this.frames = installFrames(this, window, {
-      prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+    const listenerOwnership = installListenerOwnership(window);
+    listenerOwnership.scope(() => {
+      installErrors(this, window);
+      installMutations(this, window);
+      if (main) implForWrapper(window.document).contentType = this.mimeType;
+      installCollections(window, { binding: this.browser.collectionsBinding });
+      installInput(window);
+      installShadowDOM(this, window);
+      installBlobURLs(this, window);
+      installSelectors(this, window, { isPopoverOpen, getStateRevision: getDialogStateRevision });
+      installStyles(this, window);
+      installInnerText(this, window);
+      installCheckVisibility(this, window);
+      installIntersection(this, window, installLayout(this, window, this.viewport));
+      installResizeObserver(this, window, this.layout);
+      installPerformance(this, window);
+      window.AbortController = AbortController;
+      window.AbortSignal = AbortSignal;
+      window.TextEncoder = TextEncoder;
+      window.TextDecoder = TextDecoder;
+      window.structuredClone = structuredClone;
+      installNavigator(this, window);
+      installFonts(window);
+      installFetch(this, window);
+      installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
+      if (main) this.installHistory(window, historyState);
+      installNavigation(this, window);
+      installDialogs(this, window);
+      installForms(this, window);
+      installDocumentXML(this, window);
+      this.moduleScripts = installModuleScripts(this, window);
+      installClassicScripts(this, window);
+      installInputControls(this, window);
+      installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+      installGeometry(window);
+      installXHR(this, window);
+      if (main) this.frames = installFrames(this, window, {
+        prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+      });
     });
     for (const { source } of this.newDocumentScripts.values()) {
       try { window.eval(source); } catch (error) { this.emit('pageError', error); }
@@ -587,11 +603,11 @@ export class Page extends EventEmitter {
       onCommit?.();
       const documentReady = new Promise(resolve => {
         if (this.dom.window.document.readyState !== 'loading') resolve();
-        else this.dom.window.document.addEventListener('DOMContentLoaded', resolve, { once: true });
+        else installListenerOwnership(this.dom.window).add(this.dom.window.document, 'DOMContentLoaded', resolve, { once: true });
       });
       const loaded = new Promise(resolve => {
         if (this.dom.window.document.readyState === 'complete') resolve();
-        else this.dom.window.addEventListener('load', resolve, { once: true });
+        else installListenerOwnership(this.dom.window).add(this.dom.window, 'load', resolve, { once: true });
       });
       documentReady.then(() => { if (generation === this.navigationGeneration && !redirect) this.emit('domContentLoaded'); });
       loaded.then(async () => { await moduleReady; if (generation === this.navigationGeneration && !redirect) this.emit('load'); });

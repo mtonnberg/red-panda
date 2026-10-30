@@ -86,6 +86,7 @@ function normalizeAnchors(value) {
 export function normalizeCSSValue(property, value) {
   if(typeof value !== 'string') return value;
   value=value.trim();
+  if(property === 'opacity') value=value.replace(/^([+-]?)\.(?=\d)/, (_, sign) => sign + '0.');
   if(LENGTHS.test(property) && /^[+-]?0(?:\.0+)?$/.test(value))value='0px';
   if(BASELINE.has(property))value=value.replace(/^first\s+baseline\b/i,'baseline');
   if(PAIRS.has(property)){const parts=value.split(/\s+/);if(parts.length===2&&parts[0]===parts[1])value=parts[0];}
@@ -186,7 +187,8 @@ for(const [name,descriptor] of Object.entries(Object.getOwnPropertyDescriptors(B
     return change(this,()=>{
       const input=normalizeCSSValue(property,typeof value==='number'?String(value):value);
       const before = MUTATIONS.get(this);
-      descriptor.set.call(this,parserInput(input,property));
+      if (property === 'opacity' && typeof input === 'string' && input !== '') this._setProperty(property, input);
+      else descriptor.set.call(this,parserInput(input,property));
       if(typeof input==='string' && LENGTHS.test(property) && /^anchor-size\(/i.test(input) && balancedEnd(input,input.indexOf('('))===input.length-1)this._setProperty(property,input);
       if(typeof input==='string' && MUTATIONS.get(this)!==before)restoreUnquotedURLs(this,input,property);
     });
@@ -216,7 +218,8 @@ Object.defineProperties(COMPAT, {
     return change(this,()=>{
       const normalized=normalizeCSSValue(property.startsWith('--')?property:property.toLowerCase(),value==null?'':String(value));
       const before=MUTATIONS.get(this), previousPriority=this.getPropertyPriority(property);
-      BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
+      if (property.toLowerCase() === 'opacity' && normalized !== '') this._setProperty('opacity', normalized, priority.toLowerCase());
+      else BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
       if(MUTATIONS.get(this)===before && normalized!=='') {
         if(previousPriority)this._priorities.set(property,previousPriority);else this._priorities.delete(property);
         return;

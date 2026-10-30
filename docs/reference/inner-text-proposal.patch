@@ -1,0 +1,216 @@
+diff --git a/src/inner-text.js b/src/inner-text.js
+new file mode 100644
+--- /dev/null
++++ b/src/inner-text.js
+@@ -0,0 +1,125 @@
++// Independent HTMLElement text collection using real DOM/style state. The
++// measured native profile uses tag-based line breaks, not a full CSS renderer.
++import { createRequire } from 'node:module';
++const require = createRequire(import.meta.url);
++const HTMLElement = require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
++const ScriptElement = require('jsdom/lib/jsdom/living/generated/HTMLScriptElement.js');
++const installed = new WeakMap();
++
++// Public controls establish these simple case-pair ranges. No locale-sensitive
++// or multi-character folding is imposed on the native implementation.
++export function nativeTextTransform(text, mode) {
++  if (mode !== 'uppercase' && mode !== 'lowercase') return text;
++  const upper = mode === 'uppercase';
++  return Array.from(text, character => {
++    let code = character.codePointAt(0);
++    const between = (a, b) => code >= a && code <= b;
++    if (upper) {
++      if (between(0x61,0x7a) || between(0xe0,0xf6) || between(0xf8,0xfe) || between(0x3b1,0x3c1) || between(0x3c3,0x3c9) || between(0x430,0x44f)) code -= 32;
++      else if (code === 0xff) code = 0x178;
++      else if (code === 0x3c2) code = 0x3a3;
++      else if ((between(0x101,0x12f) || between(0x133,0x137) || between(0x14b,0x177)) && code % 2 === 1) code--;
++      else if ((between(0x13a,0x148) || between(0x17a,0x17e)) && code % 2 === 0) code--;
++      else if (between(0x450,0x45f)) code -= 80;
++    } else {
++      if (between(0x41,0x5a) || between(0xc0,0xd6) || between(0xd8,0xde) || between(0x391,0x3a1) || between(0x3a3,0x3a9) || between(0x410,0x42f)) code += 32;
++      else if (code === 0x178) code = 0xff;
++      else if ((between(0x100,0x12e) || between(0x132,0x136) || between(0x14a,0x176)) && code % 2 === 0) code++;
++      else if ((between(0x139,0x147) || between(0x179,0x17d)) && code % 2 === 1) code++;
++      else if (between(0x400,0x40f)) code += 80;
++    }
++    return String.fromCodePoint(code);
++  }).join('');
++}
++
++const blocks = new Set(['address','article','aside','blockquote','body','caption','center','dd','details','div','dl','dt','fieldset','figcaption','figure','footer','form','h1','h2','h3','h4','h5','h6','header','hr','html','li','main','nav','ol','optgroup','option','pre','section','select','summary','table','tr','ul']);
++const nonText = new Set(['head','script','style','template','noscript']);
++const replaced = new Set(['audio','canvas','embed','iframe','img','input','object','textarea','video']);
++const parentElement = node => node.parentElement ?? (node.parentNode?.nodeType === 11 ? node.parentNode.host : null);
++
++function collect(root) {
++  const document = root.ownerDocument, view = document.defaultView;
++  // A disconnected/non-rendered root returns its actual DOM textContent. The
++  // subtree is not recursively visibility-filtered in this branch.
++  if (!root.isConnected || !view || view.document !== document) return root.textContent;
++  const styles = new Map();
++  const style = element => {
++    if (!styles.has(element)) styles.set(element, view.getComputedStyle(element));
++    return styles.get(element);
++  };
++  for (let current = root; current; current = parentElement(current)) {
++    if (style(current).display === 'none') return root.textContent;
++  }
++  const tokens = [];
++  function visit(node, pre = false, transform = 'none') {
++    if (node.nodeType === 3) { tokens.push({ text: nativeTextTransform(node.data, transform), pre }); return; }
++    if (node.nodeType !== 1 || !HTMLElement.is(node)) return;
++    const computed = style(node);
++    if (computed.display === 'none' || replaced.has(node.localName) || nonText.has(node.localName)) return;
++    const tag = node.localName, visible = !['hidden','collapse'].includes(computed.visibility);
++    transform = computed.textTransform || transform;
++    if (tag === 'br') { if (visible) tokens.push({ literal: '\n' }); return; }
++    const required = tag === 'p' ? 2 : blocks.has(tag) ? 1 : 0;
++    if (required) tokens.push({ required });
++    pre ||= tag === 'pre';
++    if (tag === 'tr') {
++      const cells = [...node.children].filter(child => ['td','th'].includes(child.localName) && style(child).display !== 'none');
++      cells.forEach((cell, index) => { if (index) tokens.push({ literal: '\t' }); visit(cell, pre, transform); });
++    } else {
++      for (const child of node.childNodes) {
++        if (['select','optgroup'].includes(tag) && !(child.nodeType === 1 && ['option','optgroup'].includes(child.localName))) continue;
++        if (child.nodeType === 3 && !visible) continue;
++        visit(child, pre, transform);
++      }
++    }
++    if (required) tokens.push({ required });
++  }
++  visit(root);
++  let result = '', pendingSpace = false, required = 0;
++  const flushBreaks = () => { if (result && required) result += '\n'.repeat(required); required = 0; pendingSpace = false; };
++  for (const token of tokens) {
++    if (token.required) { required = Math.max(required, token.required); pendingSpace = false; continue; }
++    if (token.literal !== undefined) { flushBreaks(); result += token.literal; continue; }
++    if (token.pre) { if (token.text) { flushBreaks(); result += token.text; } continue; }
++    for (const character of token.text) {
++      if (/[\x09-\x0d\x20]/.test(character)) { pendingSpace = true; continue; }
++      if (required) flushBreaks();
++      if (pendingSpace && result && !/[\n\t ]$/.test(result)) result += ' ';
++      pendingSpace = false; result += character;
++    }
++  }
++  return result;
++}
++
++function factory(g, bridge) {
++  const brand = value => { if (!bridge.isHTMLElement(value)) throw new g.TypeError('Illegal invocation'); };
++  const convert = value => value === null ? '' : typeof value === 'symbol' ? String(value.description) : '' + value;
++  const descriptor = Object.getOwnPropertyDescriptor({
++    get innerText() { brand(this); return bridge.collect(this); },
++    set innerText(value) {
++      brand(this);
++      // The native public conversion treats a primitive Symbol as its
++      // description; ordinary object-to-string conversion still rejects one.
++      const text = convert(value);
++      const document = this.ownerDocument, fragment = document.createDocumentFragment();
++      const pieces = text.replace(/\r\n|\r/g, '\n').split('\n');
++      pieces.forEach((piece, index) => { if (index) fragment.appendChild(document.createElement('br')); if (piece) fragment.appendChild(document.createTextNode(piece)); });
++      this.replaceChildren(fragment);
++    },
++  }, 'innerText');
++  Object.defineProperty(g.HTMLElement.prototype, 'innerText', { ...descriptor, configurable: true, enumerable: true });
++  // The reference has a distinct script-text alias on HTMLScriptElement.
++  const script = Object.getOwnPropertyDescriptor({
++    get innerText() { if (!bridge.isScript(this)) throw new g.TypeError('Illegal invocation'); return this.text; },
++    set innerText(value) { if (!bridge.isScript(this)) throw new g.TypeError('Illegal invocation'); this.text = value === null ? 'null' : convert(value); },
++  }, 'innerText');
++  Object.defineProperty(g.HTMLScriptElement.prototype, 'innerText', { ...script, configurable:true, enumerable:true });
++  return { getter: descriptor.get, setter: descriptor.set };
++}
++
++export function installInnerText(page, window) {
++  if (installed.has(window)) return installed.get(window);
++  if (!window?.HTMLElement || typeof window.eval !== 'function') throw new TypeError('innerText requires a document realm');
++  const controller = window.eval(`(${factory.toString()})`)(window, { isHTMLElement: HTMLElement.is, isScript:ScriptElement.is, collect });
++  installed.set(window, controller); return controller;
++}
+diff --git a/test/inner-text.test.js b/test/inner-text.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/inner-text.test.js
+@@ -0,0 +1,81 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import { EventEmitter } from 'node:events';
++import { readFile } from 'node:fs/promises';
++import { installStyles } from '../src/styles.js';
++import { installInnerText } from '../src/inner-text.js';
++
++function fixture(t) {
++  const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});
++  const dom=new JSDOM('<!doctype html><head></head><body></body>',{runScripts:'outside-only',pretendToBeVisual:true,url:'http://127.0.0.1/'});
++  installStyles(page,dom.window);const controller=installInnerText(page,dom.window);
++  t.after(()=>{page.documentAbort.abort();dom.window.close();});return{page,window:dom.window,document:dom.window.document,controller};
++}
++const load = async name => JSON.parse(await readFile(new URL('../docs/reference/'+name,import.meta.url),'utf8')).observations;
++
++test('all public native connected/detached cases match actual DOM and computed styles',async t=>{
++  const{document:d}=fixture(t),data=await load('inner-text-native-observation.json');
++  for(const row of data.cases){const parent=d.createElement('section'),root=d.createElement('div');root.innerHTML=row.html;if(row.style)root.style.cssText=row.style;if(row.ancestorStyle)parent.style.cssText=row.ancestorStyle;parent.append(root);
++    assert.equal(root.innerText,row.detached,row.name+' detached');d.body.append(parent);assert.equal(root.innerText,row.connected,row.name+' connected');parent.remove();}
++});
++
++test('tag-based breaks, literal BR edges, ignored CSS whitespace and Unicode text remain native-shaped',async t=>{
++  const{document:d}=fixture(t),data=await load('inner-text-edges-native-observation.json');
++  for(const row of data.tags){const root=d.createElement('div');root.innerHTML='a<'+row.tag+'>b</'+row.tag+'>c';d.body.append(root);assert.equal(root.innerText,row.text,row.tag);root.remove();}
++  for(const row of data.edges){const root=d.createElement('div');root.innerHTML=row.html;if(row.style)root.style.cssText=row.style;d.body.append(root);assert.equal(root.innerText,row.text,row.name);root.remove();}
++});
++
++test('measured simple Unicode case ranges and form-control roots match public controls',async t=>{
++  const{document:d}=fixture(t),data=await load('inner-text-unicode-native-observation.json');
++  for(const row of data.unicode){const root=d.createElement('div');root.textContent=row.text;root.style.textTransform=row.mode;d.body.append(root);assert.equal(root.innerText,row.result,row.mode+' '+row.text);root.remove();}
++  for(const row of data.roots){const root=d.createElement(row.tag);root.innerHTML=row.html;d.body.append(root);assert.equal(root.innerText,row.text,row.tag);root.remove();}
++  for(const row of data.extra){const root=d.createElement('div');root.innerHTML=row.html;d.body.append(root);assert.equal(root.innerText,row.text,row.html);root.remove();}
++});
++
++test('setter creates real Text/BR nodes, removes actual children, normalizes CR/LF and never parses markup',async t=>{
++  const{window:w,document:d}=fixture(t),data=await load('inner-text-native-observation.json');
++  for(const row of data.setters){const root=d.createElement('div');const old=d.createElement('b');root.append(old);d.body.append(root);const input=row.inputType==='undefined'?undefined:row.input;root.innerText=input;assert.equal(old.parentNode,null);assert.equal(root.innerHTML,row.value.html);assert.equal(root.textContent,row.value.text);assert.equal(root.innerText,row.value.innerText);assert.deepEqual(Array.from(root.childNodes,node=>({type:node.nodeType,name:node.nodeName,data:node.data??null})),row.value.nodes);root.remove();}
++  const root=d.createElement('div');d.body.append(root);root.innerText='<script>globalThis.noExecute=1</script>';assert.equal(w.noExecute,undefined);assert.equal(root.children.length,0);assert.match(root.innerHTML,/&lt;script&gt;/);
++});
++
++test('native primitive Symbol conversion and throwing object coercion preserve real setter semantics',t=>{
++  const{window:w,document:d}=fixture(t),root=d.createElement('div');
++  root.innerText=Symbol('x');assert.equal(root.textContent,'x');root.innerText=Symbol('');assert.equal(root.textContent,'');root.innerText=Symbol();assert.equal(root.textContent,'undefined');root.innerText=12n;assert.equal(root.textContent,'12');
++  assert.throws(()=>root.innerText={toString(){throw new w.Error('coercion');}},/coercion/);assert.equal(root.textContent,'12');assert.throws(()=>root.innerText={toString(){return Symbol('x');}},error=>error instanceof w.TypeError);
++});
++
++test('stylesheet visibility and transforms, DOM edits and adoption are read live',t=>{
++  const{document:d}=fixture(t),sheet=d.createElement('style');sheet.textContent='.hidden{display:none}.upper{text-transform:uppercase}';d.head.append(sheet);
++  const root=d.createElement('div');root.innerHTML='a<span class="hidden">x</span><span class="upper">b</span>';assert.equal(root.innerText,'axb');d.body.append(root);assert.equal(root.innerText,'aB');root.querySelector('.hidden').className='';assert.equal(root.innerText,'axB');root.querySelector('.upper').textContent='updated';assert.equal(root.innerText,'axUPDATED');root.remove();assert.equal(root.innerText,'axupdated');
++});
++
++test('setter emits genuine replacement records and HTMLElement-only accessors enforce realm brands',async t=>{
++  const{window:w,document:d,page,controller}=fixture(t),root=d.createElement('div');d.body.append(root);const child=d.createElement('span');root.append(child);const records=[];new w.MutationObserver(batch=>records.push(...batch)).observe(root,{childList:true});root.innerText='a\nb';await Promise.resolve();assert.equal(records.length,1);assert.equal(records[0].removedNodes[0],child);assert.equal(records[0].addedNodes.length,3);assert.equal(records[0].addedNodes[1],root.children[0]);
++  assert.equal(installInnerText(page,w),controller);assert.equal(Object.hasOwn(w.Element.prototype,'innerText'),false);assert.equal(typeof d.createElementNS('http://www.w3.org/2000/svg','svg').innerText,'undefined');const descriptor=Object.getOwnPropertyDescriptor(w.HTMLElement.prototype,'innerText');assert.equal(descriptor.get.name,'get innerText');assert.equal(descriptor.set.name,'set innerText');assert.throws(()=>descriptor.get.call({}),error=>error instanceof w.TypeError);assert.throws(()=>descriptor.set.call(Object.create(root),'x'),error=>error instanceof w.TypeError);
++});
++
++test('script own innerText is the native raw-text alias with distinct null conversion',async t=>{
++  const{window:w,document:d}=fixture(t),data=await load('inner-text-script-native-observation.json');
++  for(const row of data){const script=d.createElement('script');script.innerText=row.type==='symbol'?Symbol('x'):row.type==='undefined'?undefined:row.input;assert.equal(script.text,row.text);assert.equal(script.innerHTML,row.html);assert.deepEqual(Array.from(script.childNodes,node=>node.nodeType),row.childTypes);}
++  const script=d.createElement('script');script.text='X';script.style.display='block';d.body.append(script);assert.equal(script.innerText,'X');assert.equal(Object.getOwnPropertyDescriptor(w.HTMLElement.prototype,'innerText').get.call(script),'');assert.equal(Object.hasOwn(w.HTMLScriptElement.prototype,'innerText'),true);
++});
++
++test('separate native-UA dependency preserves hidden-element fallback and author display overrides',async t=>{
++  const{installStyles:installNativeStyles}=await import('../src/styles.js');
++  const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});const dom=new JSDOM('<!doctype html><body></body>',{runScripts:'outside-only',url:'http://127.0.0.1/'});t.after(()=>{page.documentAbort.abort();dom.window.close();});installNativeStyles(page,dom.window);installInnerText(page,dom.window);const data=await load('inner-text-hidden-native-observation.json'),d=dom.window.document;
++  for(const row of data){const root=d.createElement('div'),child=d.createElement(row.tag);child.textContent='X';if(row.display)child.style.display=row.display;root.append('a',child,'b');d.body.append(root);assert.equal(root.innerText,row.parentText,row.tag+' parent '+row.display);assert.equal(child.innerText,row.ownText,row.tag+' own '+row.display);assert.equal(dom.window.getComputedStyle(child).display,row.computedDisplay,row.tag+' CSS '+row.display);root.remove();}
++});
++
++test('computed text-transform grammar matches native modifiers, invalid values and raw inline serialization',async t=>{
++  const{installStyles:installNativeStyles}=await import('../src/styles.js');
++  const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});const dom=new JSDOM('<!doctype html><body></body>',{runScripts:'outside-only',url:'http://127.0.0.1/'});t.after(()=>{page.documentAbort.abort();dom.window.close();});installNativeStyles(page,dom.window);installInnerText(page,dom.window);const d=dom.window.document;
++  const controls=[...(await load('inner-text-transform-native-observation.json')).map(row=>({...row,parentMode:'uppercase'})),...(await load('inner-text-transform-invalid-native-observation.json'))];
++  for(const row of controls){const parent=d.createElement('div'),element=d.createElement('span');parent.style.textTransform=row.parentMode;element.textContent='Mixed';element.style.textTransform=row.value;parent.append(element);d.body.append(parent);assert.equal(element.style.textTransform,row.inline,row.value+' inline');assert.equal(dom.window.getComputedStyle(element).textTransform,row.computed,row.value+' computed');assert.equal(element.innerText,row.text,row.value+' innerText');parent.remove();}
++});
++
++test('invalid text-transform reveals real valid stylesheet declaration instead of losing the cascade',async t=>{
++  const{installStyles:installNativeStyles}=await import('../src/styles.js');
++  const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});const dom=new JSDOM('<!doctype html><head><style>.target{text-transform:uppercase}</style></head><body></body>',{runScripts:'outside-only',url:'http://127.0.0.1/'});t.after(()=>{page.documentAbort.abort();dom.window.close();});installNativeStyles(page,dom.window);installInnerText(page,dom.window);const d=dom.window.document;
++  for(const row of await load('inner-text-transform-cascade-native-observation.json')){const parent=d.createElement('div'),element=d.createElement('span');parent.style.textTransform='lowercase';element.className='target';element.textContent='Mixed';element.style.textTransform=row.value;if(row.value==='var(--mode)')element.style.setProperty('--mode','shout');parent.append(element);d.body.append(parent);assert.equal(element.style.textTransform,row.inline);assert.equal(dom.window.getComputedStyle(element).textTransform,row.computed,row.value);assert.equal(element.innerText,row.text,row.value);parent.remove();}
++});

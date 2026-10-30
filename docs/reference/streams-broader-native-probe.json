@@ -1,0 +1,47 @@
+{
+  "eager": {
+    "expression": "(async()=>{const out={};for(const [name,args] of [['TransformStream',[]],['TransformStream',[{},undefined,{highWaterMark:0}]],['TransformStream',[{},undefined,{highWaterMark:1}]],['TextEncoderStream',[]],['TextDecoderStream',[]]]){const s=Reflect.construct(globalThis[name],args),w=s.writable.getWriter();let count=0;for(let i=0;i<3;i++)w.write(name==='TextDecoderStream'?new Uint8Array([97]):'a').then(()=>count++,()=>{});await new Promise(r=>setTimeout(r,30));out[name+JSON.stringify(args)]={count,desired:w.desiredSize};s.readable.cancel().catch(()=>{})}return JSON.stringify(out)})()",
+    "result": {
+      "result": {
+        "type": "string",
+        "value": "{\"TransformStream[]\":{\"count\":3,\"desired\":1},\"TransformStream[{},null,{\\\"highWaterMark\\\":0}]\":{\"count\":3,\"desired\":1},\"TransformStream[{},null,{\\\"highWaterMark\\\":1}]\":{\"count\":3,\"desired\":1},\"TextEncoderStream[]\":{\"count\":3,\"desired\":1},\"TextDecoderStream[]\":{\"count\":3,\"desired\":1}}"
+      }
+    }
+  },
+  "identity": {
+    "expression": "(async()=>{const s=new TextDecoderStream('utf-8',{fatal:true}),w=s.writable.getWriter(),r=s.readable.getReader();const p=r.read().catch(e=>e);const first=await w.write(new Uint8Array([255])).catch(e=>e),next=await w.write(new Uint8Array([97])).catch(e=>e),read=await p;return JSON.stringify({type:first instanceof TypeError,sameWrite:first===next,sameRead:first===read,message:first.message})})()",
+    "result": {
+      "result": {
+        "type": "string",
+        "value": "{\"type\":true,\"sameWrite\":true,\"sameRead\":true,\"message\":\"The encoded data is not valid\"}"
+      }
+    }
+  },
+  "compressionFormats": {
+    "expression": "(()=>{const o={};for(const n of ['CompressionStream','DecompressionStream'])for(const f of ['brotli','br','gzip']){try{new globalThis[n](f);o[n+f]='ok'}catch(e){o[n+f]={name:e.name,message:e.message}}}return JSON.stringify(o)})()",
+    "result": {
+      "result": {
+        "type": "string",
+        "value": "{\"CompressionStreambrotli\":\"ok\",\"CompressionStreambr\":{\"name\":\"TypeError\",\"message\":\"invalid argument\"},\"CompressionStreamgzip\":\"ok\",\"DecompressionStreambrotli\":\"ok\",\"DecompressionStreambr\":{\"name\":\"TypeError\",\"message\":\"invalid argument\"},\"DecompressionStreamgzip\":\"ok\"}"
+      }
+    }
+  },
+  "cancellation": {
+    "expression": "(async()=>{const out={};for(const n of ['TransformStream','CompressionStream','DecompressionStream']){const s=n==='TransformStream'?new TransformStream():new globalThis[n]('gzip'),w=s.writable.getWriter();await s.readable.cancel();out[n]=await w.write(new Uint8Array([1])).then(()=>({resolved:true}),e=>({name:e?.name,message:e?.message,value:String(e)}));out[n+'Close']=await w.close().then(()=>({resolved:true}),e=>({name:e?.name,message:e?.message,value:String(e)}))}return JSON.stringify(out)})()",
+    "result": {
+      "result": {
+        "type": "string",
+        "value": "{\"TransformStream\":{\"name\":\"Error\",\"message\":\"StreamNotReadable\",\"value\":\"Error: StreamNotReadable\"},\"TransformStreamClose\":{\"name\":\"Error\",\"message\":\"StreamNotReadable\",\"value\":\"Error: StreamNotReadable\"},\"CompressionStream\":{\"name\":\"TypeError\",\"message\":\"The readable side is closed\",\"value\":\"TypeError: The readable side is closed\"},\"CompressionStreamClose\":{\"name\":\"TypeError\",\"message\":\"Stream is not writable\",\"value\":\"TypeError: Stream is not writable\"},\"DecompressionStream\":{\"resolved\":true},\"DecompressionStreamClose\":{\"name\":\"TypeError\",\"message\":\"Stream is not writable\",\"value\":\"TypeError: Stream is not writable\"}}"
+      }
+    }
+  },
+  "invalidCompression": {
+    "expression": "(async()=>{const out={};for(const n of ['CompressionStream','DecompressionStream']){const s=new globalThis[n]('gzip'),w=s.writable.getWriter(),r=s.readable.getReader();const p=r.read().catch(e=>e);const a=await w.write('hello').catch(e=>e),b=await p,c=await w.write(new Uint8Array([1])).catch(e=>e),d=await w.close().catch(e=>e);out[n]={write:a?.name,read:b?.name,next:c?.name,close:d?.name,same:[a===b,a===c,a===d],message:a?.message}}return JSON.stringify(out)})()",
+    "result": {
+      "result": {
+        "type": "string",
+        "value": "{\"CompressionStream\":{\"write\":\"TypeError\",\"read\":\"TypeError\",\"next\":\"TypeError\",\"close\":\"TypeError\",\"same\":[true,true,false],\"message\":\"Chunk is not an ArrayBuffer or ArrayBufferView\"},\"DecompressionStream\":{\"write\":\"TypeError\",\"read\":\"TypeError\",\"next\":\"TypeError\",\"close\":\"TypeError\",\"same\":[true,true,false],\"message\":\"Chunk is not an ArrayBuffer or ArrayBufferView\"}}"
+      }
+    }
+  }
+}

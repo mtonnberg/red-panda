@@ -1,3 +1,4 @@
+import { requestDialogClose } from './dialogs.js';
 import { createRequire } from 'node:module';
 import { installFocus, advanceFocus } from './focus.js';
 
@@ -300,6 +301,7 @@ function keyEvent(window, params) {
   if (params.type === 'keyUp') { dispatchKeyboard(window, target, 'keyup', params, flags); return; }
   if (params.type !== 'char' && !dispatchKeyboard(window, target, 'keydown', params, flags)) return;
   target = focused(window);
+  if (params.type !== 'char' && params.key === 'Escape') { requestDialogClose(window); return; }
   if (params.type !== 'char' && params.key === 'Tab') {
     if (!flags.altKey && !flags.ctrlKey && !flags.metaKey) advanceFocus(window, flags.shiftKey);
     return;

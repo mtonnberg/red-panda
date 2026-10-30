@@ -1,0 +1,43 @@
+diff --git a/src/styles.js b/src/styles.js
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -15,7 +15,7 @@
+ const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
+ const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
+ const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
+-const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js'));
++const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\nnoscript { display: none; }\n');
+ const RECORDS = new WeakMap();
+ const SHEETS = new WeakMap();
+ const ADOPTED = new WeakMap();
+@@ -413,12 +413,29 @@
+   return [parts[0], parts[1] ?? parts[0]];
+ }
+ 
++// Native text collection supports the case keyword while ignoring width/kana
++// modifiers. Validate declarations before the cascade so invalid values expose
++// a real lower-priority declaration, preserving raw inline serialization.
++function textTransformValue(value) {
++  const tokens = value.trim().toLowerCase().split(/\s+/);
++  if (tokens.length === 1 && ['none', 'inherit', 'initial', 'unset', 'revert', 'revert-layer'].includes(tokens[0])) return tokens[0];
++  let mode = null;
++  for (const token of tokens) {
++    if (token === 'full-width' || token === 'full-size-kana') continue;
++    if (!['uppercase', 'lowercase', 'capitalize'].includes(token) || mode !== null) return null;
++    mode = token;
++  }
++  return mode ?? 'none';
++}
++
+ function cascade(record, element) {
+   const values = new Map(); let order = 0;
+   const offer = (style, score, origin, inline = false) => {
+     style = declaration(style);
+     for (let index = 0; index < style.length; index++) {
+-      const property = style[index], value = style.getPropertyValue(property);
++      const property = style[index];
++      let value = style.getPropertyValue(property);
++      if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
+       const important = style.getPropertyPriority(property) === 'important';
+       const expanded = new CSSStyleDeclaration(); expanded.setProperty(property, value);
+       const entries = [...expanded._values].map(([name, entry]) => ({ name, entry }));

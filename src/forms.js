@@ -1,3 +1,4 @@
+import { submitDialogForm } from './dialogs.js';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { installNavigation, requestNavigation } from './navigation.js';
@@ -205,7 +206,7 @@ function submit(record, formImpl, submitterImpl, bypass) {
   } finally { record.constructing.delete(formImpl); }
   if (!formImpl.isConnected || record.disposed || record.signal?.aborted) return;
   const rawMethod = setting(form, submitter, 'method')?.toLowerCase();
-  if (rawMethod === 'dialog') throw new window.DOMException('Dialog form submission is not implemented', 'NotSupportedError');
+  if (submitDialogForm(form, submitter)) return;
   const method = rawMethod === 'post' ? 'POST' : 'GET';
   const action = setting(form, submitter, 'action');
   const destination = new URL(action || window.location.href, record.document.baseURI);

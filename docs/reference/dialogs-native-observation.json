@@ -1,0 +1,791 @@
+{
+  "scope": "Bounded public dialog/popover/form/focus observations; not full top-layer conformance",
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "expression": "(async () => {\n  const output = {}, attempt = callback => { try { return callback() ?? null; } catch (error) { return {error:error.name,message:error.message}; } };\n  const state = element => ({open:element.open ?? null,modal:attempt(()=>element.matches(':modal')),popover:attempt(()=>element.matches(':popover-open')),active:document.activeElement?.id,html:element.outerHTML});\n  const create = (tag='dialog', html='') => { const element=document.createElement(tag);element.innerHTML=html;document.body.append(element);return element; };\n  const flush = () => new Promise(resolve=>setTimeout(resolve,20));\n  output.api = Object.fromEntries(['show','showModal','close','requestClose','closedBy','returnValue'].map(name=>[name,{type:typeof document.createElement('dialog')[name],descriptor:attempt(()=>{const d=Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype,name);return d?{enumerable:d.enumerable,configurable:d.configurable,writable:d.writable,length:d.value?.length}:null})}]));\n  output.popoverApi = Object.fromEntries(['popover','showPopover','hidePopover','togglePopover'].map(name=>[name,typeof document.createElement('div')[name]]));output.ToggleEvent=typeof ToggleEvent;\n  try {\n  output.stage='dialog';\n  const before = create('button'); before.id='before';before.focus();\n  const dialog=create('dialog','<input id=first><input id=auto autofocus>');dialog.id='dialog';\n  const events=[];for(const type of ['beforetoggle','toggle','cancel','close'])dialog.addEventListener(type,event=>events.push({type,oldState:event.oldState,newState:event.newState,cancelable:event.cancelable,bubbles:event.bubbles,trusted:event.isTrusted,open:dialog.open,modal:attempt(()=>dialog.matches(':modal'))}));\n  output.show=attempt(()=>{dialog.show();return state(dialog)});output.showSync=events.slice();await flush();output.showAsync=events.splice(0);\n  output.showModalWhileOpen=attempt(()=>dialog.showModal());dialog.close('first');output.closeSync={state:state(dialog),events:events.slice()};await flush();output.closeAsync=events.splice(0);\n  before.focus();dialog.showModal();output.modal=state(dialog);output.showWhileModal=attempt(()=>dialog.show());output.modalAgain=attempt(()=>dialog.showModal());\n  dialog.removeAttribute('open');output.removedOpen=state(dialog);await flush();output.removedEvents=events.splice(0);document.body.append(dialog);dialog.showModal();dialog.remove();output.removedModal=state(dialog);document.body.append(dialog);output.reinsertedModal=state(dialog);output.reinsertedShowModal=attempt(()=>dialog.showModal());dialog.close();await flush();events.length=0;\n  dialog.returnValue='preset';dialog.show();dialog.close(undefined);output.closeUndefined=dialog.returnValue;dialog.show();dialog.close(null);output.closeNull=dialog.returnValue;\n  output.requestClose=attempt(()=>{dialog.show();dialog.requestClose('requested');return state(dialog)});await flush();output.requestCloseEvents=events.splice(0);dialog.close();\n  output.stage='popover';\n  const pop=create('div','<button id=inside>inside</button>');pop.id='pop';\n  output.popoverReflection=[];for(const value of [null,'','auto','manual','hint','bogus','AUTO']){if(value===null)pop.removeAttribute('popover');else pop.setAttribute('popover',value);output.popoverReflection.push([value,pop.popover]);}\n  const pe=[];for(const type of ['beforetoggle','toggle'])pop.addEventListener(type,event=>pe.push({type,oldState:event.oldState,newState:event.newState,cancelable:event.cancelable,bubbles:event.bubbles,trusted:event.isTrusted}));\n  pop.popover='auto';output.popShow=attempt(()=>{pop.showPopover();return state(pop)});output.popSync=pe.slice();await flush();output.popAsync=pe.splice(0);output.popAgain=attempt(()=>pop.showPopover());\n  output.popToggle=attempt(()=>pop.togglePopover());output.popToggleForced=attempt(()=>pop.togglePopover(true));output.popHide=attempt(()=>pop.hidePopover());await flush();output.popToggleEvents=pe.splice(0);\n  const cancel=event=>event.preventDefault();pop.addEventListener('beforetoggle',cancel);output.popCancelled=attempt(()=>{pop.showPopover();return state(pop)});pop.removeEventListener('beforetoggle',cancel);\n  pop.showPopover();pop.removeAttribute('popover');output.popRemovedAttribute=state(pop);await flush();output.popRemovedEvents=pe.splice(0);pop.popover='manual';pop.showPopover();pop.remove();output.popRemoved=state(pop);document.body.append(pop);output.popReinserted=state(pop);pop.hidePopover();\n  const detached=document.createElement('div');detached.popover='manual';output.detachedPopover=attempt(()=>detached.showPopover());output.missingPopover=attempt(()=>document.body.showPopover());output.missingPopoverHide=attempt(()=>document.body.hidePopover());output.detachedPopoverHide=attempt(()=>detached.hidePopover());\n  output.popToggleDictionary=attempt(()=>{pop.togglePopover({force:true});return pop.matches(':popover-open')});pop.hidePopover();\n  output.stage='dialog-popover';\n  const dpop=create();dpop.popover='manual';dpop.show();output.dialogNonModalPopover=attempt(()=>dpop.showPopover());dpop.close();dpop.hidePopover();dpop.showModal();output.dialogModalPopover=attempt(()=>dpop.showPopover());dpop.close();\n  output.stage='forms';\n  output.forms=[];\n  for(const mode of ['button-value','button-none','input-value','submit','request','prevent','invalid','formmethod']){\n    const d=create('dialog','<form method=dialog><input name=q><button value=yes>go</button><input type=submit value=input></form>');d.returnValue='preset';d.showModal();const form=d.firstChild,button=form.querySelector('button'),log=[];\n    for(const type of ['submit','formdata','close']) (type==='close'?d:form).addEventListener(type,event=>{log.push({type,trusted:event.isTrusted,cancelable:event.cancelable});if(mode==='prevent'&&type==='submit')event.preventDefault()});\n    if(mode==='button-none')button.removeAttribute('value');if(mode==='invalid'){form.firstChild.required=true;form.firstChild.value='';}if(mode==='formmethod'){form.method='get';button.setAttribute('formmethod','dialog');}\n    const result=attempt(()=>{if(mode==='submit')form.submit();else if(mode==='request')form.requestSubmit();else if(mode==='input-value')form.querySelector('[type=submit]').click();else button.click();return {open:d.open,value:d.returnValue,log:log.slice()}});await flush();output.forms.push({mode,result,async:log.slice()});d.close();d.remove();\n  }\n  output.stage='autostack';\n  output.autoStack=attempt(()=>{const a=create('div'),b=create('div'),c=create('div');for(const p of[a,b,c])p.popover='auto';a.showPopover();b.showPopover();b.append(c);c.showPopover();const result=[a,b,c].map(p=>p.matches(':popover-open'));for(const p of[a,b,c])p.remove();return result});\n  output.toggleArguments=[];for(const input of [undefined,null,false,true,0,1,{}, {force:false}, {force:true}]){pop.hidePopover();const result=attempt(()=>pop.togglePopover(input));output.toggleArguments.push({input:JSON.stringify(input)??'undefined',result,open:pop.matches(':popover-open')})}pop.hidePopover();\n  output.popAttributeChange=attempt(()=>{pop.popover='auto';pop.showPopover();pop.popover='manual';return pop.matches(':popover-open')});pop.hidePopover();\n  output.hintStack=attempt(()=>{const a=create('div'),b=create('div');a.popover='hint';b.popover='hint';a.showPopover();b.showPopover();const result=[a,b].map(p=>p.matches(':popover-open'));a.remove();b.remove();return result});\n  output.modalPopoverInteraction=attempt(()=>{pop.popover='auto';pop.showPopover();const d=create();d.showModal();const result=pop.matches(':popover-open');d.close();d.remove();pop.hidePopover();return result});\n  } catch(error) { output.probeError={name:error.name,message:error.message,stack:error.stack}; }\n  return output;\n})()",
+  "result": {
+    "api": {
+      "show": {
+        "type": "function",
+        "descriptor": {
+          "enumerable": true,
+          "configurable": true,
+          "writable": true,
+          "length": 0
+        }
+      },
+      "showModal": {
+        "type": "function",
+        "descriptor": {
+          "enumerable": true,
+          "configurable": true,
+          "writable": true,
+          "length": 0
+        }
+      },
+      "close": {
+        "type": "function",
+        "descriptor": {
+          "enumerable": true,
+          "configurable": true,
+          "writable": true,
+          "length": 0
+        }
+      },
+      "requestClose": {
+        "type": "undefined",
+        "descriptor": null
+      },
+      "closedBy": {
+        "type": "undefined",
+        "descriptor": null
+      },
+      "returnValue": {
+        "type": "string",
+        "descriptor": {
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    "popoverApi": {
+      "popover": "object",
+      "showPopover": "function",
+      "hidePopover": "function",
+      "togglePopover": "function"
+    },
+    "ToggleEvent": "function",
+    "stage": "autostack",
+    "show": {
+      "open": true,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<dialog id=\"dialog\" open><input id=\"first\"><input id=\"auto\" autofocus></dialog>"
+    },
+    "showSync": [],
+    "showAsync": [],
+    "showModalWhileOpen": {
+      "error": "InvalidStateError",
+      "message": "The object is in an invalid state"
+    },
+    "closeSync": {
+      "state": {
+        "open": false,
+        "modal": false,
+        "popover": false,
+        "active": "before",
+        "html": "<dialog id=\"dialog\"><input id=\"first\"><input id=\"auto\" autofocus></dialog>"
+      },
+      "events": []
+    },
+    "closeAsync": [
+      {
+        "type": "close",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true,
+        "open": false,
+        "modal": false
+      }
+    ],
+    "modal": {
+      "open": true,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<dialog id=\"dialog\" open><input id=\"first\"><input id=\"auto\" autofocus></dialog>"
+    },
+    "showWhileModal": null,
+    "modalAgain": null,
+    "removedOpen": {
+      "open": false,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<dialog id=\"dialog\"><input id=\"first\"><input id=\"auto\" autofocus></dialog>"
+    },
+    "removedEvents": [],
+    "removedModal": {
+      "open": true,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<dialog id=\"dialog\" open><input id=\"first\"><input id=\"auto\" autofocus></dialog>"
+    },
+    "reinsertedModal": {
+      "open": true,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<dialog id=\"dialog\" open><input id=\"first\"><input id=\"auto\" autofocus></dialog>"
+    },
+    "reinsertedShowModal": {
+      "error": "InvalidStateError",
+      "message": "The object is in an invalid state"
+    },
+    "closeUndefined": "preset",
+    "closeNull": "preset",
+    "requestClose": {
+      "error": "TypeError",
+      "message": "dialog.requestClose is not a function"
+    },
+    "requestCloseEvents": [
+      {
+        "type": "close",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true,
+        "open": true,
+        "modal": false
+      },
+      {
+        "type": "close",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true,
+        "open": true,
+        "modal": false
+      }
+    ],
+    "popoverReflection": [
+      [
+        null,
+        null
+      ],
+      [
+        "",
+        "auto"
+      ],
+      [
+        "auto",
+        "auto"
+      ],
+      [
+        "manual",
+        "manual"
+      ],
+      [
+        "hint",
+        "hint"
+      ],
+      [
+        "bogus",
+        "manual"
+      ],
+      [
+        "AUTO",
+        "auto"
+      ]
+    ],
+    "popShow": {
+      "open": null,
+      "modal": false,
+      "popover": true,
+      "active": "before",
+      "html": "<div id=\"pop\" popover=\"auto\"><button id=\"inside\">inside</button></div>"
+    },
+    "popSync": [
+      {
+        "type": "beforetoggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": true,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      }
+    ],
+    "popAsync": [
+      {
+        "type": "beforetoggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": true,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      }
+    ],
+    "popAgain": null,
+    "popToggle": false,
+    "popToggleForced": true,
+    "popHide": null,
+    "popToggleEvents": [
+      {
+        "type": "beforetoggle",
+        "oldState": "open",
+        "newState": "closed",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "open",
+        "newState": "closed",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "beforetoggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": true,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "beforetoggle",
+        "oldState": "open",
+        "newState": "closed",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "open",
+        "newState": "closed",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      }
+    ],
+    "popCancelled": {
+      "open": null,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<div id=\"pop\" popover=\"auto\"><button id=\"inside\">inside</button></div>"
+    },
+    "popRemovedAttribute": {
+      "open": null,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<div id=\"pop\"><button id=\"inside\">inside</button></div>"
+    },
+    "popRemovedEvents": [
+      {
+        "type": "beforetoggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": true,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "beforetoggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": true,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "closed",
+        "newState": "open",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "beforetoggle",
+        "oldState": "open",
+        "newState": "closed",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      },
+      {
+        "type": "toggle",
+        "oldState": "open",
+        "newState": "closed",
+        "cancelable": false,
+        "bubbles": false,
+        "trusted": true
+      }
+    ],
+    "popRemoved": {
+      "open": null,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<div id=\"pop\" popover=\"manual\"><button id=\"inside\">inside</button></div>"
+    },
+    "popReinserted": {
+      "open": null,
+      "modal": false,
+      "popover": false,
+      "active": "before",
+      "html": "<div id=\"pop\" popover=\"manual\"><button id=\"inside\">inside</button></div>"
+    },
+    "detachedPopover": {
+      "error": "InvalidStateError",
+      "message": "The object is in an invalid state"
+    },
+    "missingPopover": {
+      "error": "NotSupportedError",
+      "message": "The operation is not supported"
+    },
+    "missingPopoverHide": {
+      "error": "NotSupportedError",
+      "message": "The operation is not supported"
+    },
+    "detachedPopoverHide": null,
+    "popToggleDictionary": true,
+    "dialogNonModalPopover": null,
+    "dialogModalPopover": null,
+    "forms": [
+      {
+        "mode": "button-value",
+        "result": {
+          "open": false,
+          "value": "yes",
+          "log": [
+            {
+              "type": "submit",
+              "trusted": true,
+              "cancelable": true
+            },
+            {
+              "type": "formdata",
+              "trusted": true,
+              "cancelable": false
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "submit",
+            "trusted": true,
+            "cancelable": true
+          },
+          {
+            "type": "formdata",
+            "trusted": true,
+            "cancelable": false
+          },
+          {
+            "type": "close",
+            "trusted": true,
+            "cancelable": false
+          }
+        ]
+      },
+      {
+        "mode": "button-none",
+        "result": {
+          "open": false,
+          "value": "preset",
+          "log": [
+            {
+              "type": "submit",
+              "trusted": true,
+              "cancelable": true
+            },
+            {
+              "type": "formdata",
+              "trusted": true,
+              "cancelable": false
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "submit",
+            "trusted": true,
+            "cancelable": true
+          },
+          {
+            "type": "formdata",
+            "trusted": true,
+            "cancelable": false
+          },
+          {
+            "type": "close",
+            "trusted": true,
+            "cancelable": false
+          }
+        ]
+      },
+      {
+        "mode": "input-value",
+        "result": {
+          "open": false,
+          "value": "input",
+          "log": [
+            {
+              "type": "submit",
+              "trusted": true,
+              "cancelable": true
+            },
+            {
+              "type": "formdata",
+              "trusted": true,
+              "cancelable": false
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "submit",
+            "trusted": true,
+            "cancelable": true
+          },
+          {
+            "type": "formdata",
+            "trusted": true,
+            "cancelable": false
+          },
+          {
+            "type": "close",
+            "trusted": true,
+            "cancelable": false
+          }
+        ]
+      },
+      {
+        "mode": "submit",
+        "result": {
+          "open": false,
+          "value": "preset",
+          "log": [
+            {
+              "type": "formdata",
+              "trusted": true,
+              "cancelable": false
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "formdata",
+            "trusted": true,
+            "cancelable": false
+          },
+          {
+            "type": "close",
+            "trusted": true,
+            "cancelable": false
+          }
+        ]
+      },
+      {
+        "mode": "request",
+        "result": {
+          "open": false,
+          "value": "preset",
+          "log": [
+            {
+              "type": "submit",
+              "trusted": true,
+              "cancelable": true
+            },
+            {
+              "type": "formdata",
+              "trusted": true,
+              "cancelable": false
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "submit",
+            "trusted": true,
+            "cancelable": true
+          },
+          {
+            "type": "formdata",
+            "trusted": true,
+            "cancelable": false
+          },
+          {
+            "type": "close",
+            "trusted": true,
+            "cancelable": false
+          }
+        ]
+      },
+      {
+        "mode": "prevent",
+        "result": {
+          "open": true,
+          "value": "preset",
+          "log": [
+            {
+              "type": "submit",
+              "trusted": true,
+              "cancelable": true
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "submit",
+            "trusted": true,
+            "cancelable": true
+          }
+        ]
+      },
+      {
+        "mode": "invalid",
+        "result": {
+          "open": true,
+          "value": "preset",
+          "log": []
+        },
+        "async": []
+      },
+      {
+        "mode": "formmethod",
+        "result": {
+          "open": false,
+          "value": "yes",
+          "log": [
+            {
+              "type": "submit",
+              "trusted": true,
+              "cancelable": true
+            },
+            {
+              "type": "formdata",
+              "trusted": true,
+              "cancelable": false
+            }
+          ]
+        },
+        "async": [
+          {
+            "type": "submit",
+            "trusted": true,
+            "cancelable": true
+          },
+          {
+            "type": "formdata",
+            "trusted": true,
+            "cancelable": false
+          },
+          {
+            "type": "close",
+            "trusted": true,
+            "cancelable": false
+          }
+        ]
+      }
+    ],
+    "autoStack": [
+      false,
+      true,
+      true
+    ],
+    "toggleArguments": [
+      {
+        "input": "undefined",
+        "result": true,
+        "open": true
+      },
+      {
+        "input": "null",
+        "result": true,
+        "open": true
+      },
+      {
+        "input": "false",
+        "result": false,
+        "open": false
+      },
+      {
+        "input": "true",
+        "result": true,
+        "open": true
+      },
+      {
+        "input": "0",
+        "result": false,
+        "open": false
+      },
+      {
+        "input": "1",
+        "result": true,
+        "open": true
+      },
+      {
+        "input": "{}",
+        "result": true,
+        "open": true
+      },
+      {
+        "input": "{\"force\":false}",
+        "result": true,
+        "open": true
+      },
+      {
+        "input": "{\"force\":true}",
+        "result": true,
+        "open": true
+      }
+    ],
+    "popAttributeChange": false,
+    "hintStack": [
+      false,
+      true
+    ],
+    "modalPopoverInteraction": true
+  },
+  "keyboard": [
+    {
+      "mode": "modal",
+      "result": {
+        "a": false,
+        "b": false,
+        "log": [
+          {
+            "id": "a",
+            "type": "cancel",
+            "trusted": false,
+            "cancelable": true,
+            "bubbles": false
+          },
+          {
+            "id": "a",
+            "type": "close",
+            "trusted": true,
+            "cancelable": false,
+            "bubbles": false
+          }
+        ],
+        "popover": null
+      }
+    },
+    {
+      "mode": "nonmodal",
+      "result": {
+        "a": true,
+        "b": false,
+        "log": [],
+        "popover": null
+      }
+    },
+    {
+      "mode": "stack",
+      "result": {
+        "a": true,
+        "b": false,
+        "log": [
+          {
+            "id": "b",
+            "type": "cancel",
+            "trusted": false,
+            "cancelable": true,
+            "bubbles": false
+          },
+          {
+            "id": "b",
+            "type": "close",
+            "trusted": true,
+            "cancelable": false,
+            "bubbles": false
+          }
+        ],
+        "popover": null
+      }
+    },
+    {
+      "mode": "cancelled-cancel",
+      "result": {
+        "a": true,
+        "b": false,
+        "log": [
+          {
+            "id": "a",
+            "type": "cancel",
+            "trusted": false,
+            "cancelable": true,
+            "bubbles": false
+          }
+        ],
+        "popover": null
+      }
+    },
+    {
+      "mode": "cancelled-key",
+      "result": {
+        "a": true,
+        "b": false,
+        "log": [],
+        "popover": null
+      }
+    },
+    {
+      "mode": "synthetic",
+      "result": {
+        "a": true,
+        "b": false,
+        "log": [],
+        "popover": null
+      }
+    },
+    {
+      "mode": "removed",
+      "result": {
+        "a": true,
+        "b": false,
+        "log": [],
+        "popover": null
+      }
+    },
+    {
+      "mode": "removed-open",
+      "result": {
+        "a": false,
+        "b": false,
+        "log": [],
+        "popover": null
+      }
+    },
+    {
+      "mode": "popover-auto",
+      "result": {
+        "a": false,
+        "b": false,
+        "log": [],
+        "popover": true
+      }
+    },
+    {
+      "mode": "popover-manual",
+      "result": {
+        "a": false,
+        "b": false,
+        "log": [],
+        "popover": true
+      }
+    }
+  ]
+}

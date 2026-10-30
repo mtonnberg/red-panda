@@ -1,0 +1,303 @@
+--- a/src/streams.js
++++ b/src/streams.js
+@@ -1,5 +1,6 @@
+ import * as web from 'node:stream/web';
+ import { TextEncoder, TextDecoder } from 'node:util';
++import { codecPair } from './stream-codecs.js';
+ 
+ const NATIVES = { ...web, TextEncoder, TextDecoder };
+ const SURFACE = {
+@@ -33,7 +34,7 @@
+  */
+ export function installStreams(page, realm, { signal = page?.documentAbort?.signal } = {}) {
+   if (INSTALLED.has(realm)) return INSTALLED.get(realm);
+-  const constructors = {}, owned = new WeakMap(), references = new Set(), pending = new Set(), functions = new WeakMap(), special = new WeakMap();
++  const constructors = {}, owned = new WeakMap(), references = new Set(), pending = new Set(), functions = new WeakMap(), special = new WeakMap(), codecDisposers = new WeakMap();
+   // Ownership must not keep consumed Fetch bodies, readers or controllers alive
+   // for the lifetime of a long-lived document. Finalizer holdings and unregister
+   // tokens contain only WeakRefs, never the stream or a closure capturing it.
+@@ -45,13 +46,26 @@
+     finalization.register(value, reference, reference);
+   }
+   let disposed = false, disposalReason;
++  const convertedErrors = new WeakMap();
+   const functionInRealm = invoke => realm.Function('invoke', 'return function (...args) { return invoke(this, args); }')(invoke);
+   const errorInRealm = error => {
+     if (!error || typeof error !== 'object' || error instanceof realm.Error || (realm.DOMException && error instanceof realm.DOMException)) return error;
+-    if (error instanceof globalThis.DOMException && realm.DOMException) return new realm.DOMException(error.message, error.name);
++    if (convertedErrors.has(error)) return convertedErrors.get(error);
++    if (error instanceof globalThis.DOMException && realm.DOMException) {
++      const converted = new realm.DOMException(error.message, error.name);
++      convertedErrors.set(error, converted); return converted;
++    }
+     if (error instanceof Error) {
+       const ErrorClass = ['TypeError', 'RangeError', 'SyntaxError', 'Error'].includes(error.name) ? realm[error.name] : realm.Error;
+-      const converted = new ErrorClass(error.message); converted.name = error.name; return converted;
++      const messages = {
++        'Invalid state: Writer is not bound to a WritableStream': 'Writer has been released',
++        'Invalid state: Writer has been released': 'Writer has been released',
++        'Invalid state: WritableStream is closed': 'Stream is not writable',
++        'Invalid state: The reader is not attached to a stream': 'Reader has been released',
++        'Invalid state: The ReadableStream is locked': 'ReadableStream is locked',
++      };
++      const converted = new ErrorClass(error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA' ? 'The encoded data is not valid' : messages[error.message] ?? error.message);
++      converted.name = error.name; convertedErrors.set(error, converted); return converted;
+     }
+     return error;
+   };
+@@ -109,21 +123,50 @@
+     args = [...args];
+     if (name === 'ReadableStream') args[0] = callbackDictionary(args[0], ['start', 'pull', 'cancel'], true);
+     if (name === 'WritableStream') args[0] = callbackDictionary(args[0], ['start', 'write', 'close', 'abort']);
+-    if (name === 'TransformStream') args[0] = callbackDictionary(args[0], ['start', 'transform', 'flush', 'cancel']);
++    if (name === 'TransformStream') {
++      args[0] = callbackDictionary(args[0], ['start', 'transform', 'flush', 'cancel']);
++      // Measured target transforms do not block writes on readable queue size,
++      // including an explicitly requested zero readable highWaterMark.
++      args[1] = undefined; args[2] = { highWaterMark: Infinity };
++    }
+     if (name === 'CompressionStream' || name === 'DecompressionStream') {
+-      if (!['gzip', 'deflate', 'deflate-raw'].includes(String(args[0]))) throw new realm.TypeError('invalid argument');
++      const format = String(args[0]);
++      if (!['gzip', 'deflate', 'deflate-raw', 'brotli'].includes(format)) throw new realm.TypeError('invalid argument');
++      const result = Object.create(constructors[name].prototype);
++      const pair = codecPair({ realm, format, decompress: name === 'DecompressionStream' });
++      special.set(result, pair); tag(result, name); adopt(pair.readable); adopt(pair.writable);
++      codecDisposers.set(pair.readable, pair.dispose); codecDisposers.set(pair.writable, pair.dispose);
++      return result;
+     }
+     if (name === 'TextEncoderStream') {
+       // The target independently encodes each chunk; unlike Node's encoder
+       // stream, it does not retain a trailing surrogate for the next chunk.
+       const transform = new web.TransformStream({ transform(chunk, controller) {
+         controller.enqueue(new TextEncoder().encode(String(chunk)));
+-      } });
++      } }, undefined, { highWaterMark: Infinity });
+       const result = Object.create(constructors[name].prototype);
+       special.set(result, { encoding: 'utf-8', readable: transform.readable, writable: transform.writable });
+       tag(result, name);
+       adopt(transform.readable); adopt(transform.writable);
+       return result;
++    }
++    if (name === 'TextDecoderStream') {
++      let decoder;
++      try { decoder = new TextDecoder(...args); } catch (error) { throw errorInRealm(error); }
++      const transform = new web.TransformStream({ transform(chunk, controller) {
++        let text;
++        try { text = decoder.decode(chunk, { stream: true }); }
++        catch (error) { throw errorInRealm(error); }
++        if (text) controller.enqueue(text);
++      }, flush(controller) {
++        let text;
++        try { text = decoder.decode(); } catch (error) { throw errorInRealm(error); }
++        if (text) controller.enqueue(text);
++      } }, undefined, { highWaterMark: Infinity });
++      const result = Object.create(constructors[name].prototype);
++      special.set(result, { encoding: decoder.encoding, fatal: decoder.fatal, ignoreBOM: decoder.ignoreBOM,
++        readable: transform.readable, writable: transform.writable });
++      tag(result, name); adopt(transform.readable); adopt(transform.writable); return result;
+     }
+     try { return adopt(Reflect.construct(NATIVES[name], args)); }
+     catch (error) { throw errorInRealm(error); }
+@@ -214,6 +257,7 @@
+     }
+     references.clear();
+     for (const [value, name] of live) {
++      if (codecDisposers.has(value)) ignore(() => codecDisposers.get(value)(disposalReason));
+       if (name === 'ReadableStreamDefaultReader') ignore(() => web.ReadableStreamDefaultReader.prototype.cancel.call(value, disposalReason));
+       if (name === 'WritableStreamDefaultWriter') ignore(() => web.WritableStreamDefaultWriter.prototype.abort.call(value, disposalReason));
+       if (name === 'ReadableStream' && !Reflect.get(web.ReadableStream.prototype, 'locked', value)) ignore(() => web.ReadableStream.prototype.cancel.call(value, disposalReason));
+--- /dev/null
++++ b/src/stream-codecs.js
+@@ -0,0 +1,148 @@
++import * as web from 'node:stream/web';
++import * as zlib from 'node:zlib';
++import { types } from 'node:util';
++
++const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
++const viewGetters = prototype => Object.fromEntries(['buffer', 'byteOffset', 'byteLength'].map(key => [key, Object.getOwnPropertyDescriptor(prototype, key).get]));
++const typedArrayGetters = viewGetters(typedArrayPrototype), dataViewGetters = viewGetters(DataView.prototype);
++
++// An independent streaming adapter over Node's real zlib/Brotli engines. A
++// separate readable/writable pair preserves the measured cancellation behavior.
++export function codecPair({ realm, format, decompress }) {
++  let readableController, writableController, failure, failed = false, cancelled = false;
++  let gzipHeader = Buffer.alloc(0), headerDone = !(decompress && format === 'gzip');
++  let trailer = Buffer.alloc(0), crc = 0, size = 0, ended = false;
++  const inflight = new Set();
++  const factories = decompress
++    ? { gzip: zlib.createInflateRaw, deflate: zlib.createInflate, 'deflate-raw': zlib.createInflateRaw, brotli: zlib.createBrotliDecompress }
++    : { gzip: zlib.createGzip, deflate: zlib.createDeflate, 'deflate-raw': zlib.createDeflateRaw, brotli: zlib.createBrotliCompress };
++  const engine = factories[format](format === 'brotli' && !decompress ? {
++    params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5, [zlib.constants.BROTLI_PARAM_LGWIN]: 22 },
++  } : undefined);
++  function fail(error) {
++    if (!failed) {
++      failed = true;
++      failure = error instanceof realm.TypeError ? error : new realm.TypeError(error?.message ?? String(error));
++      if (!cancelled) { try { readableController.error(failure); } catch {} }
++      try { writableController.error(failure); } catch {}
++      for (const reject of inflight) reject(failure);
++      inflight.clear();
++      engine.destroy();
++    }
++    return failure;
++  }
++  function bytes(chunk) {
++    if (!ArrayBuffer.isView(chunk) && !types.isAnyArrayBuffer(chunk)) {
++      throw new realm.TypeError('Chunk is not an ArrayBuffer or ArrayBufferView');
++    }
++    // Copy before exposing any output/result object to user promise assimilation.
++    if (!ArrayBuffer.isView(chunk)) return Buffer.from(new Uint8Array(chunk));
++    const getters = types.isDataView(chunk) ? dataViewGetters : typedArrayGetters;
++    return Buffer.from(new Uint8Array(Reflect.apply(getters.buffer, chunk, []),
++      Reflect.apply(getters.byteOffset, chunk, []), Reflect.apply(getters.byteLength, chunk, [])));
++  }
++  function stripHeader(input) {
++    if (headerDone) return input;
++    gzipHeader = Buffer.concat([gzipHeader, input]);
++    const h = gzipHeader;
++    if (h.length >= 2 && (h[0] !== 31 || h[1] !== 139)) throw new realm.TypeError('Invalid gzip header');
++    if (h.length >= 3 && h[2] !== 8) throw new realm.TypeError('Invalid gzip compression method');
++    if (h.length < 10) return Buffer.alloc(0);
++    const flags = h[3];
++    if (flags & 0xe0) throw new realm.TypeError('Invalid gzip flags');
++    let offset = 10;
++    if (flags & 4) {
++      if (h.length < offset + 2) return Buffer.alloc(0);
++      const length = h.readUInt16LE(offset); offset += 2;
++      if (h.length < offset + length) return Buffer.alloc(0);
++      offset += length;
++    }
++    for (const flag of [8, 16]) if (flags & flag) {
++      const end = h.indexOf(0, offset);
++      if (end === -1) return Buffer.alloc(0);
++      offset = end + 1;
++    }
++    if (flags & 2) {
++      if (h.length < offset + 2) return Buffer.alloc(0);
++      if ((zlib.crc32(h.subarray(0, offset)) & 0xffff) !== h.readUInt16LE(offset)) throw new realm.TypeError('Invalid gzip header checksum');
++      offset += 2;
++    }
++    headerDone = true; gzipHeader = Buffer.alloc(0);
++    return h.subarray(offset);
++  }
++  function extra(input) {
++    if (!input.length) return;
++    if (format !== 'gzip') throw new realm.TypeError('Trailing compressed data');
++    trailer = Buffer.concat([trailer, input]);
++    if (trailer.length > 8) throw new realm.TypeError('Trailing compressed data');
++    if (trailer.length === 8 && (trailer.readUInt32LE(0) !== crc || trailer.readUInt32LE(4) !== size)) {
++      throw new realm.TypeError('Invalid gzip checksum or size');
++    }
++  }
++  engine.on('data', chunk => {
++    if (failed || chunk.length === 0) return;
++    if (decompress && format === 'gzip') { crc = zlib.crc32(chunk, crc); size = (size + chunk.length) >>> 0; }
++    try {
++      if (cancelled) throw new realm.TypeError('The readable side is closed');
++      const output = new realm.Uint8Array(chunk.length); output.set(chunk);
++      readableController.enqueue(output);
++    } catch (error) { fail(error); }
++  });
++  engine.on('error', error => fail(error));
++  engine.on('end', () => { ended = true; });
++  const readable = new web.ReadableStream({
++    start(controller) { readableController = controller; },
++    cancel() { cancelled = true; },
++  });
++  const writable = new web.WritableStream({
++    start(controller) { writableController = controller; },
++    async write(chunk) {
++      if (failed) throw failure;
++      try {
++        let input = bytes(chunk);
++        if (decompress) input = stripHeader(input);
++        if (!input.length) return;
++        if (ended) { extra(input); return; }
++        const before = engine.bytesWritten;
++        await new Promise((resolve, reject) => {
++          inflight.add(reject);
++          engine.write(input, error => {
++            inflight.delete(reject);
++            if (error || failed) reject(failed ? failure : fail(error)); else resolve();
++          });
++        });
++        if (failed) throw failure;
++        if (decompress) {
++          const consumed = engine.bytesWritten - before;
++          if (consumed < input.length) extra(input.subarray(consumed));
++        }
++      } catch (error) { throw fail(error); }
++    },
++    async close() {
++      if (failed) throw failure;
++      try {
++        if (!headerDone) throw new realm.TypeError('Incomplete gzip header');
++        if (!ended) await new Promise((resolve, reject) => {
++          inflight.add(reject);
++          const complete = () => { inflight.delete(reject); resolve(); };
++          engine.once('end', complete);
++          engine.end();
++        });
++        if (failed) throw failure;
++        if (decompress && format === 'gzip' && trailer.length !== 8) throw new realm.TypeError('Incomplete gzip trailer');
++        if (!cancelled) readableController.close();
++      } catch (error) { throw fail(error); }
++      finally { engine.destroy(); }
++    },
++    abort(reason) { dispose(reason); },
++  });
++  function dispose(reason) {
++    if (failed) return;
++    failed = true; failure = reason;
++    if (!cancelled) { try { readableController.error(reason); } catch {} }
++    try { writableController.error(reason); } catch {}
++    for (const reject of inflight) reject(reason);
++    inflight.clear(); engine.destroy();
++  }
++  return { readable, writable, dispose };
++}
+--- /dev/null
++++ b/test/streams-compat.test.js
+@@ -0,0 +1,40 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import * as zlib from 'node:zlib';
++import { installStreams } from '../src/streams.js';
++function fixture(){const dom=new JSDOM('',{runScripts:'outside-only'}),w=dom.window,c=installStreams(null,w);return {w,controller:c,close(){c.dispose();w.close()}}}
++async function collect(s){const chunks=[],r=s.getReader();for(;;){const x=await r.read();if(x.done)return chunks;chunks.push(x.value)}}
++async function run(s,chunks){const out=collect(s.readable),w=s.writable.getWriter();const writes=chunks.map(c=>w.write(c));const close=w.close();await Promise.all(writes);await close;return Buffer.concat(await out)}
++test('native transforms/codecs complete unread writes and preserve stored realm errors',async()=>{
++const {w,close}=fixture();try{
++ for(const [name,chunk]of [['TransformStream','a'],['TextEncoderStream','a'],['TextDecoderStream',new Uint8Array([97])]]){
++  const s=new w[name](),writer=s.writable.getWriter();await writer.write(chunk);await writer.write(chunk);await writer.write(chunk);await writer.close();assert.equal((await collect(s.readable)).length,3)
++ }
++ const decoder=new w.TextDecoderStream('utf-8',{fatal:true}),writer=decoder.writable.getWriter(),reader=decoder.readable.getReader();const read=reader.read().catch(e=>e),a=await writer.write(new Uint8Array([255])).catch(e=>e),b=await writer.write(new Uint8Array([97])).catch(e=>e);assert.ok(a instanceof w.TypeError);assert.equal(a.message,'The encoded data is not valid');assert.equal(a,b);assert.equal(a,await read);
++ const ignored=new w.TransformStream({}, {highWaterMark:-1},{highWaterMark:NaN});assert.equal(ignored.writable.getWriter().desiredSize,1);
++ const reason=new w.Error('actual reason'),s=new w.TransformStream({transform(_,c){c.error(reason)}}),wr=s.writable.getWriter();await wr.write('a').catch(()=>{});assert.equal(await s.readable.getReader().read().catch(e=>e),reason);assert.equal(await wr.write('b').catch(e=>e),reason);assert.ok(await wr.close().catch(e=>e) instanceof w.TypeError);
++}finally{close()}});
++test('released/closed/locked stream errors match observed native messages and realm promises',async()=>{
++const {w,close}=fixture();try{const released=new w.WritableStream().getWriter();released.releaseLock();const closed=new w.WritableStream().getWriter();await closed.close();const reader=new w.ReadableStream().getReader();reader.releaseLock();const locked=new w.ReadableStream();locked.getReader();const calls=[()=>released.write('x'),()=>released.close(),()=>released.closed,()=>closed.write('x'),()=>closed.close(),()=>reader.cancel(),()=>locked.pipeTo(new w.WritableStream())];const errors=[];for(const call of calls){const p=call();assert.ok(p instanceof w.Promise);errors.push(await p.catch(e=>String(e)))}assert.deepEqual(errors,['TypeError: Writer has been released','TypeError: Writer has been released','TypeError: Writer has been released','TypeError: Stream is not writable','TypeError: Stream is not writable','TypeError: Reader has been released','TypeError: ReadableStream is locked'])}finally{close()}});
++test('all native compression formats encode real bytes and decode split/whole input',async()=>{
++const {w,close}=fixture();try{const input=Buffer.from('hello world €😀 '.repeat(10000));for(const format of ['gzip','deflate','deflate-raw','brotli']){const encoded=await run(new w.CompressionStream(format),[input.subarray(0,1),input.subarray(1,70000),input.subarray(70000)]);assert.ok(encoded.length<input.length);assert.deepEqual(await run(new w.DecompressionStream(format),[encoded.subarray(0,1),encoded.subarray(1,4),encoded.subarray(4)]),input);const empty=await run(new w.CompressionStream(format),[new w.ArrayBuffer(0)]);assert.deepEqual(await run(new w.DecompressionStream(format),[empty]),Buffer.alloc(0))}const brotli=await run(new w.CompressionStream('brotli'),[Buffer.from('hello')]);assert.deepEqual(Array.from(brotli),[11,2,128,104,101,108,108,111,3])}finally{close()}});
++test('codec bad chunks reject both sides with one real realm TypeError, close gets a new error',async()=>{
++const {w,close}=fixture();try{for(const kind of ['CompressionStream','DecompressionStream'])for(const chunk of ['hello',undefined,null,42,{},[1,2,3]]){const s=new w[kind]('gzip'),writer=s.writable.getWriter(),reader=s.readable.getReader();const pending=reader.read().catch(e=>e);const first=await writer.write(chunk).catch(e=>e);assert.ok(first instanceof w.TypeError);assert.equal(first,await pending);assert.equal(first,await reader.read().catch(e=>e));assert.equal(first,await writer.write(new Uint8Array([1])).catch(e=>e));const last=await writer.close().catch(e=>e);assert.ok(last instanceof w.TypeError);assert.notEqual(last,first)}}finally{close()}});
++test('decompression errors at corrupt/trailing write, preserving earlier actual output',async()=>{
++const {w,close}=fixture();try{for(const format of ['gzip','deflate','deflate-raw','brotli']){const compressed=await run(new w.CompressionStream(format),[Buffer.from('hello')]);const s=new w.DecompressionStream(format),writer=s.writable.getWriter(),reader=s.readable.getReader();const pending=reader.read();const write=writer.write(Buffer.concat([compressed,Buffer.from([0])])).catch(e=>e);assert.equal(Buffer.from((await pending).value).toString(),'hello');const error=await write;assert.ok(error instanceof w.TypeError);assert.equal(error,await reader.read().catch(e=>e));const invalid=new w.DecompressionStream(format),r=collect(invalid.readable).catch(e=>e),wr=invalid.writable.getWriter();const failed=await wr.write(format==='deflate-raw'?new Uint8Array([7,0]):new Uint8Array([17,0,0,0,0,0,0,0,0,0])).catch(e=>e);assert.ok(failed instanceof w.TypeError);assert.equal(failed,await r)}
++const gzip=zlib.gzipSync('hello'),s=new w.DecompressionStream('gzip'),r=collect(s.readable).catch(e=>e),writer=s.writable.getWriter();const failure=await writer.write(Buffer.concat([gzip,gzip])).catch(e=>e);assert.ok(failure instanceof w.TypeError);assert.equal(failure,await r);
++}finally{close()}});
++test('truncated flush stores one TypeError for read and writes but a fresh second close',async()=>{
++const {w,close}=fixture();try{for(const format of ['gzip','deflate','deflate-raw','brotli']){const compressed=await run(new w.CompressionStream(format),[Buffer.from('hello')]),s=new w.DecompressionStream(format),wr=s.writable.getWriter(),r=s.readable.getReader(),first=r.read();await wr.write(compressed.subarray(0,-1));assert.equal(Buffer.from((await first).value).toString(),'hello');const error=await wr.close().catch(e=>e);assert.ok(error instanceof w.TypeError);assert.equal(error,await r.read().catch(e=>e));assert.equal(error,await wr.write(new Uint8Array([1])).catch(e=>e));assert.notEqual(error,await wr.close().catch(e=>e))}}finally{close()}});
++test('codec buffer-source conversion uses real view slots and validates gzip optional framing',async()=>{
++const {w,close}=fixture();try{const input=new w.Uint8Array([104,101,108,108,111]);for(const key of ['buffer','byteOffset','byteLength'])Object.defineProperty(input,key,{get(){throw Error('authored getter must not run')}});const compressed=await run(new w.CompressionStream('gzip'),[input]);assert.equal(zlib.gunzipSync(compressed).toString(),'hello');const header=Buffer.from([31,139,8,30,0,0,0,0,0,255,2,0,1,2,110,97,109,101,0,99,111,109,109,101,110,116,0]);const sum=Buffer.alloc(2);sum.writeUInt16LE(zlib.crc32(header)&0xffff);const framed=Buffer.concat([header,sum,compressed.subarray(10)]);assert.equal(zlib.gunzipSync(framed).toString(),'hello');assert.equal((await run(new w.DecompressionStream('gzip'),Array.from(framed,b=>new Uint8Array([b])))).toString(),'hello')}finally{close()}});
++test('cancelled compression still performs real encoding and rejects output enqueue with a stored TypeError',async()=>{
++const {w,close}=fixture();try{for(const mode of ['write','close']){const s=new w.CompressionStream('gzip'),writer=s.writable.getWriter();await s.readable.cancel();const error=await (mode==='write'?writer.write(new Uint8Array([1])):writer.close()).catch(e=>e);assert.ok(error instanceof w.TypeError);assert.equal(error.message,'The readable side is closed');if(mode==='write')assert.equal(error,await writer.write(new Uint8Array([2])).catch(e=>e))}}finally{close()}});
++test('compression snapshots input before user promise assimilation can detach it',async()=>{
++const {w,close}=fixture();try{const input=new w.Uint8Array(200*1024);for(let i=0;i<input.length;i++)input[i]=(Math.imul(i,1103515245)>>>16)&255;const copy=Buffer.from(input),s=new w.CompressionStream('deflate'),writer=s.writable.getWriter(),reader=s.readable.getReader(),first=reader.read();let detached=false;Object.defineProperty(w.Object.prototype,'then',{configurable:true,get(){delete w.Object.prototype.then;input.buffer.transfer();detached=true}});const writing=writer.write(input),closing=writer.close(),chunks=[];const initial=await first;if(!initial.done)chunks.push(initial.value);for(;;){const r=await reader.read();if(r.done)break;chunks.push(r.value)}await writing;await closing;assert.equal(detached,true);assert.equal(input.byteLength,0);assert.deepEqual(zlib.inflateSync(Buffer.concat(chunks)),copy)}finally{delete w.Object.prototype.then;close()}});
++test('decompression fulfills concurrent pending reads and preserves large actual payloads',async()=>{
++const {w,close}=fixture();try{const input=Buffer.from(Array.from({length:256*1024},(_,i)=>i%251)),compressed=zlib.deflateSync(input),s=new w.DecompressionStream('deflate'),writer=s.writable.getWriter(),reader=s.readable.getReader(),pending=[reader.read(),reader.read(),reader.read()];const writing=writer.write(compressed),closing=writer.close(),first=await Promise.all(pending);assert.deepEqual(first.map(r=>r.done),[false,false,false]);const chunks=first.map(r=>r.value);for(;;){const r=await reader.read();if(r.done)break;chunks.push(r.value)}await writing;await closing;assert.deepEqual(Buffer.concat(chunks),input)}finally{close()}});
++
++test('disposal errors internally locked codec pipes and releases their actual locks',async()=>{
++const {w,controller,close}=fixture();try{const input=new w.ReadableStream({start(c){c.enqueue(new w.Uint8Array(zlib.gzipSync('hello').subarray(0,10)))}}),codec=new w.DecompressionStream('gzip'),output=input.pipeThrough(codec),reader=output.getReader(),pending=reader.read();await new Promise(r=>setImmediate(r));assert.equal(input.locked,true);assert.equal(codec.writable.locked,true);controller.dispose();const error=await pending.catch(e=>e);assert.equal(error.name,'AbortError');await new Promise(r=>setImmediate(r));assert.equal(input.locked,false);assert.equal(codec.writable.locked,false)}finally{close()}});
