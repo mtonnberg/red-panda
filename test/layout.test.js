@@ -131,3 +131,24 @@ test('standalone layout does not patch the supplied window', t => {
   assert.equal(layout.rect(dom.window.document.querySelector('button')).width, 5);
   assert.equal(dom.window.Element.prototype.getBoundingClientRect, original);
 });
+
+test('intrinsic parent heights, document scroll extents and horizontal scrolling match native sizing probes', t => {
+  const records = JSON.parse(readFileSync(new URL('../docs/reference/geometry-sizing-observations.json', import.meta.url))).cases;
+  for (const record of records) {
+    const dom = new JSDOM(record.html); t.after(() => dom.window.close());
+    installLayout({}, dom.window); dom.window.scrollTo(100, 100);
+    const boxes = [...dom.window.document.querySelectorAll('*')].map(node => ({ tag: node.tagName,
+      width: node.getBoundingClientRect().width, height: node.getBoundingClientRect().height,
+      scrollWidth: node.scrollWidth, scrollHeight: node.scrollHeight }));
+    assert.deepEqual(boxes, record.result.boxes);
+    assert.equal(dom.window.scrollX, record.result.scrollX); assert.equal(dom.window.scrollY, record.result.scrollY);
+  }
+});
+
+test('hit-test viewport checks round coordinates before checking the bounds', t => {
+  const dom = new JSDOM('<!doctype html><div>One</div>'); t.after(() => dom.window.close());
+  installLayout({}, dom.window);
+  assert.equal(dom.window.document.elementFromPoint(-.4, 10), dom.window.document.documentElement);
+  assert.equal(dom.window.document.elementFromPoint(-.6, 10), null);
+  assert.equal(dom.window.document.elementFromPoint(1919.6, 10), null);
+});

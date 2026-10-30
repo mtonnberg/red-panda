@@ -12,19 +12,27 @@ const javascriptMIME = /^(?:text|application)\/(?:javascript|ecmascript|x-javasc
 // are host-only dependencies and are never stored on the page's window.
 // page.moduleReady waits initial evaluation, including top-level await. Native
 // DOMContentLoaded/load wait graph initiation, so modules may await those events.
-// Limits: import maps/JSON modules, CORS policy and ordering against classic
+// Import maps support inline imports/scopes registered before the first module
+// graph starts. External maps and late map registration fail explicitly.
+// Limits: JSON modules, CORS policy and ordering against classic
 // external defer scripts are not implemented by this adapter. Classic dynamic
 // import outside a SourceTextModule still needs its own VM import callback.
 export function installModuleScripts(page, window) {
   const document = window.document;
   const signal = page.documentAbort?.signal;
   const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet();
+  const imports = new Map(), scopes = new Map();
   const tasks = new Set();
-  let context, observer, started = false, disposed = false, inlineCount = 0, linkQueue = Promise.resolve();
+  let context, observer, started = false, disposed = false, graphStarted = false, inlineCount = 0, linkQueue = Promise.resolve();
   let resolveReady, releaseAbort;
   const ready = new Promise(resolve => { resolveReady = resolve; });
   const aborted = new Promise(resolve => { releaseAbort = resolve; });
   page.moduleReady = ready;
+  Object.defineProperty(window.HTMLScriptElement, 'supports', { configurable: true, writable: true,
+    value: function supports(type) {
+      if (!arguments.length) throw new TypeError('HTMLScriptElement.supports requires a script type');
+      return ['classic', 'module', 'importmap'].includes('' + type);
+    } });
   const active = () => !disposed && !signal?.aborted && !page.closed;
   const check = () => { if (!active()) throw new DOMException('Document was disposed', 'AbortError'); };
   function dispose() { disposed = true; observer?.disconnect(); releaseAbort(); resolveReady(); }
@@ -43,9 +51,78 @@ export function installModuleScripts(page, window) {
     }
     return context;
   }
+  function urlLike(specifier, base) {
+    if (/^(?:\/|\.\/|\.\.\/)/.test(specifier)) return new URL(specifier, base);
+    try { return new URL(specifier); } catch { return undefined; }
+  }
+  function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+  function normalizeMappings(values, base, script) {
+    if (!object(values)) throw new TypeError('Import-map specifier maps must be objects');
+    const result = new Map();
+    for (const [key, address] of Object.entries(values)) {
+      if (!key) { report(new TypeError('Import-map specifier keys must not be empty'), script); continue; }
+      let normalized;
+      try { normalized = urlLike(key, base)?.href ?? key; }
+      catch { report(new TypeError(`Invalid import-map specifier key: ${key}`), script); continue; }
+      let target = null;
+      if (address !== null) {
+        try {
+          if (typeof address !== 'string') throw new TypeError();
+          target = urlLike(address, base)?.href;
+          if (!target || (normalized.endsWith('/') && !target.endsWith('/'))) throw new TypeError();
+        } catch { target = null; report(new TypeError(`Invalid import-map address for ${key}`), script); }
+      }
+      result.set(normalized, target);
+    }
+    return result;
+  }
+  function registerMap(script) {
+    try {
+      if (script.hasAttribute('src')) throw new TypeError('External import maps are not supported');
+      if (graphStarted) throw new TypeError('Import maps registered after module execution starts are not supported');
+      const parsed = JSON.parse(script.textContent);
+      if (!object(parsed)) throw new TypeError('Import maps must contain a JSON object');
+      const base = document.baseURI;
+      const nextImports = parsed.imports === undefined ? new Map() : normalizeMappings(parsed.imports, base, script);
+      if (parsed.scopes !== undefined && !object(parsed.scopes)) throw new TypeError('Import-map scopes must be an object');
+      const nextScopes = new Map();
+      for (const [prefix, values] of Object.entries(parsed.scopes ?? {})) {
+        let scope;
+        try { scope = new URL(prefix, base).href; }
+        catch { report(new TypeError(`Invalid import-map scope: ${prefix}`), script); continue; }
+        nextScopes.set(scope, normalizeMappings(values, base, script));
+      }
+      const merge = (target, source) => { for (const [key, value] of source) if (!target.has(key)) target.set(key, value); };
+      merge(imports, nextImports);
+      for (const [prefix, values] of nextScopes) {
+        if (!scopes.has(prefix)) scopes.set(prefix, new Map());
+        merge(scopes.get(prefix), values);
+      }
+    } catch (error) { report(error, script); }
+  }
+  function mappedSpecifier(specifier, map) {
+    let key = map.has(specifier) ? specifier : [...map.keys()].filter(key => key.endsWith('/') && specifier.startsWith(key)).sort((a, b) => b.length - a.length)[0];
+    if (key === undefined) return undefined;
+    const target = map.get(key);
+    if (target === null) throw new TypeError(`Import map blocked module specifier: ${specifier}`);
+    if (key === specifier) return target;
+    const result = new URL(specifier.slice(key.length), target).href;
+    if (!result.startsWith(target)) throw new TypeError(`Import-map prefix resolution escaped its target: ${specifier}`);
+    return result;
+  }
   function resolveSpecifier(specifier, base) {
-    if (!/^(?:[./]|[a-zA-Z][a-zA-Z\d+.-]*:)/.test(specifier)) throw new TypeError(`Unmapped bare module specifier: ${specifier}`);
-    const url = new URL(specifier, base);
+    specifier = String(specifier);
+    const candidate = urlLike(specifier, base);
+    const normalized = candidate?.href ?? specifier;
+    let resolved;
+    for (const prefix of [...scopes.keys()].sort((a, b) => b.length - a.length)) {
+      if (base !== prefix && !(prefix.endsWith('/') && base.startsWith(prefix))) continue;
+      resolved = mappedSpecifier(normalized, scopes.get(prefix));
+      if (resolved !== undefined) break;
+    }
+    resolved ??= mappedSpecifier(normalized, imports);
+    if (resolved === undefined && !candidate) throw new TypeError(`Unmapped bare module specifier: ${specifier}`);
+    const url = new URL(resolved ?? candidate.href);
     if (!['http:', 'https:', 'data:'].includes(url.protocol)) throw new TypeError(`Unsupported module URL scheme: ${url.protocol}`);
     return url.href;
   }
@@ -147,7 +224,7 @@ export function installModuleScripts(page, window) {
     const candidates = root.nodeType === 1 && root.localName === 'script' ? [root] : [];
     candidates.push(...root.querySelectorAll?.('script') ?? []);
     return candidates.filter(script => {
-      if (!script.isConnected || script.getAttribute('type')?.trim().toLowerCase() !== 'module' || seen.has(script)) return false;
+      if (!script.isConnected || !['module', 'importmap'].includes(script.getAttribute('type')?.trim().toLowerCase()) || seen.has(script)) return false;
       seen.add(script); return true;
     });
   }
@@ -157,11 +234,13 @@ export function installModuleScripts(page, window) {
     if (!active() || page.javascript === false) { resolveReady(); return; }
     // Fetch roots eagerly, then initiate their evaluations in document order.
     // Suspended top-level await does not hold DOMContentLoaded hostage.
-    const scripts = discover(), prepared = scripts.map(script => Promise.resolve().then(() => prepare(script)));
+    const scripts = discover(), prepared = scripts.map(script => script.getAttribute('type').trim().toLowerCase() === 'importmap' ? Promise.resolve() : Promise.resolve().then(() => prepare(script)));
     prepared.forEach(promise => promise.catch(() => {}));
     for (let index = 0; index < scripts.length; index++) {
       if (!active()) break;
       const script = scripts[index];
+      if (script.getAttribute('type').trim().toLowerCase() === 'importmap') { registerMap(script); continue; }
+      graphStarted = true;
       if (script.hasAttribute('async')) {
         const initiated = prepared[index].then(link).then(module => { startEvaluation(module); return true; });
         impl._asyncQueue.push(initiated, () => Promise.resolve(), () => Promise.resolve());
@@ -179,18 +258,22 @@ export function installModuleScripts(page, window) {
       if (!active()) return;
       for (const record of records) {
         if (record.type === 'attributes') {
-          for (const script of discover(record.target)) execute(script, Promise.resolve().then(() => prepare(script)));
+          for (const script of discover(record.target)) startScript(script);
         } else for (const node of record.addedNodes) {
-          for (const script of discover(node)) execute(script, Promise.resolve().then(() => prepare(script)));
+          for (const script of discover(node)) startScript(script);
         }
       }
     });
     observer.observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'type'] });
-    for (const script of discover()) execute(script, Promise.resolve().then(() => prepare(script)));
+    for (const script of discover()) startScript(script);
     void (async () => {
       while (active() && tasks.size) await Promise.race([Promise.all([...tasks]), aborted]);
       resolveReady();
     })();
+  }
+  function startScript(script) {
+    if (script.getAttribute('type').trim().toLowerCase() === 'importmap') registerMap(script);
+    else { graphStarted = true; execute(script, Promise.resolve().then(() => prepare(script))); }
   }
   const impl = implForWrapper(document);
   if (!impl?._deferQueue) throw new Error('Pinned jsdom deferred script queue is unavailable');

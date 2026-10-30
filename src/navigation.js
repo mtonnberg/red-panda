@@ -212,3 +212,15 @@ export function installNavigation(page, window) {
   page.once?.('close', dispose);
   return record.controller;
 }
+
+// Other host defaults (such as form submission) share the same document-owned
+// queue and redirect-chain bookkeeping as Location and hyperlink navigation.
+export function requestNavigation(page, window, url, options = {}) {
+  const record = DOCUMENTS.get(implForWrapper(window?.document));
+  if (!record || record.page !== page || !active(record)) {
+    throw new window.DOMException('The source document is not registered for navigation', 'InvalidStateError');
+  }
+  return schedule(record, new URL(url, window.location.href).href, {
+    historyMode: 'push', referrer: window.location.href, ...options,
+  });
+}

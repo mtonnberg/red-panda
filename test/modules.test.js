@@ -205,6 +205,104 @@ test('invalid src URLs fail one script without preventing later module execution
   await f.ready(); assert.equal(f.window.afterInvalidURL, true); assert.equal(f.errors.length, 1);
 });
 
+test('HTMLScriptElement.supports reports implemented script types with case-sensitive matching', async t => {
+  const f = fixture(t, `<script>window.supports = ['classic','module','importmap','speculationrules','Module',' module',''].map(type => HTMLScriptElement.supports(type));</script>`);
+  await f.ready();
+  assert.deepEqual([...f.window.supports], [true, true, true, false, false, false, false]);
+  assert.throws(() => f.window.HTMLScriptElement.supports(), /requires a script type/);
+});
+
+test('import maps resolve exact bare imports, dynamic imports and import.meta.resolve', async t => {
+  const f = fixture(t, `<script type="importmap">{"imports":{"answer":"./mapped.js","dynamic":"./dynamic.js"}}</script>
+    <script type="module">import { value } from 'answer'; const dynamic = await import('dynamic');
+      window.mapped = value + dynamic.value; window.resolved = import.meta.resolve('answer');</script>`, {
+    'https://example.test/app/mapped.js': 'export const value = 20;',
+    'https://example.test/app/dynamic.js': 'export const value = 22;',
+  });
+  await f.ready(); assert.equal(f.window.mapped, 42);
+  assert.equal(f.window.resolved, 'https://example.test/app/mapped.js'); assert.deepEqual(f.errors, []);
+});
+
+test('import-map prefixes choose the longest match and normalize URL-like keys against map base', async t => {
+  const f = fixture(t, `<base href="/assets/"><script type="importmap">{"imports":{
+      "pkg/":"./generic/","pkg/special/":"./special/","./original.js":"./replacement.js",
+      "https://example.test/assets/absolute.js":"./absolute-replacement.js"}}</script>
+    <script type="module">import { value as a } from 'pkg/one.js'; import { value as b } from 'pkg/special/two.js';
+      import { value as c } from './original.js'; import { value as d } from './absolute.js'; window.mapped = [a,b,c,d];</script>`, {
+    'https://example.test/assets/generic/one.js': 'export const value = 1;',
+    'https://example.test/assets/special/two.js': 'export const value = 2;',
+    'https://example.test/assets/replacement.js': 'export const value = 3;',
+    'https://example.test/assets/absolute-replacement.js': 'export const value = 4;',
+  });
+  await f.ready(); assert.deepEqual([...f.window.mapped], [1, 2, 3, 4]); assert.deepEqual(f.errors, []);
+});
+
+test('import-map scopes use longest referrer prefix and fall back through enclosing scopes to imports', async t => {
+  const f = fixture(t, `<script type="importmap">{"imports":{"value":"./global.js","fallback":"./fallback.js"},
+      "scopes":{"./feature/":{"value":"./outer.js"},"./feature/deep/":{"deep":"./deep.js"}}}</script>
+    <script type="module" src="./feature/deep/main.js"></script>
+    <script type="module">import { value } from 'value'; window.globalValue = value;</script>`, {
+    'https://example.test/app/feature/deep/main.js': "import { value as a } from 'value'; import { value as b } from 'deep'; import { value as c } from 'fallback'; window.scoped = [a,b,c];",
+    'https://example.test/app/global.js': 'export const value = 1;',
+    'https://example.test/app/outer.js': 'export const value = 2;',
+    'https://example.test/app/deep.js': 'export const value = 3;',
+    'https://example.test/app/fallback.js': 'export const value = 4;',
+  });
+  await f.ready(); assert.deepEqual([...f.window.scoped], [2, 3, 4]); assert.equal(f.window.globalValue, 1); assert.deepEqual(f.errors, []);
+});
+
+test('null mappings block exact and prefix imports, including scoped fallback', async t => {
+  const f = fixture(t, `<script type="importmap">{"imports":{"blocked":null,"pkg/":null,"scoped":"./global.js"},
+      "scopes":{"./":{"scoped":null}}}</script>
+    <script type="module">window.blocked = []; for (const key of ['blocked','pkg/child.js','scoped']) {
+      try { await import(key); } catch (error) { window.blocked.push(error.message); } }</script>`);
+  await f.ready(); assert.equal(f.window.blocked.length, 3);
+  assert.ok([...f.window.blocked].every(message => message.includes('blocked module specifier')));
+  assert.equal(f.requests.length, 0); assert.deepEqual(f.errors, []);
+});
+
+test('prefix mapping prevents backtracking outside its mapped URL', async t => {
+  const f = fixture(t, `<script type="importmap">{"imports":{"pkg/":"./safe/"}}</script>
+    <script type="module">try { await import('pkg/../escape.js'); } catch (error) { window.error = error.message; }</script>`);
+  await f.ready(); assert.match(f.window.error, /escaped its target/); assert.equal(f.requests.length, 0);
+});
+
+test('multiple early maps merge first definitions without overwriting existing entries', async t => {
+  const f = fixture(t, `<script type="importmap">{"imports":{"value":"./first.js"}}</script>
+    <script type="importmap">{"imports":{"value":"./wrong.js","second":"./second.js"}}</script>
+    <script type="module">import { value as a } from 'value'; import { value as b } from 'second'; window.mapped = a+b;</script>`, {
+    'https://example.test/app/first.js': 'export const value = 2;',
+    'https://example.test/app/second.js': 'export const value = 3;',
+  });
+  await f.ready(); assert.equal(f.window.mapped, 5); assert.deepEqual(f.errors, []);
+});
+
+test('malformed and unsupported import maps report errors without silently enabling mappings', async t => {
+  const f = fixture(t, `<script type="importmap">{</script><script type="importmap">[]</script>
+    <script type="importmap" src="./external.json"></script>
+    <script type="importmap">{"imports":{"bad":"bare-address","pkg/":"./missing-slash.js"}}</script>
+    <script type="module">window.invalid = []; for(const key of ['bad','pkg/a.js']) {
+      try { import.meta.resolve(key); } catch(error) { window.invalid.push(error.message); } }</script>
+    <script type="importmap">{"imports":{"late":"./late.js"}}</script>
+    <script type="module">try { await import('late'); } catch(error) { window.lateError = error.message; }</script>`);
+  await f.ready(); assert.equal(f.errors.length, 6);
+  assert.ok(f.errors.some(error => /External import maps/.test(error.message)));
+  assert.ok(f.errors.some(error => /after module execution/.test(error.message)));
+  assert.equal(f.window.invalid.length, 2); assert.match(f.window.lateError, /Unmapped bare/);
+  assert.equal(f.requests.length, 0);
+});
+
+test('dynamically inserted import maps work before the first dynamically inserted module', async t => {
+  const f = fixture(t, '<body></body>', { 'https://example.test/app/dynamic-main.js': "import { value } from 'mapped'; window.dynamicValue = value;",
+    'https://example.test/app/value.js': 'export const value = 42;' });
+  await f.ready();
+  const map = f.document.createElement('script'); map.type = 'importmap'; map.textContent = '{"imports":{"mapped":"./value.js"}}';
+  const module = f.document.createElement('script'); module.type = 'module'; module.src = './dynamic-main.js';
+  const loaded = new Promise(resolve => module.addEventListener('load', resolve, { once: true }));
+  f.document.body.append(map, module); await timeout(loaded);
+  assert.equal(f.window.dynamicValue, 42); assert.deepEqual(f.errors, []);
+});
+
 test('disabled JavaScript skips module execution and fetches', async t => {
   const f = fixture(t, '<script type="module" src="main.js"></script>', {}, { javascript: false });
   await f.ready(); assert.deepEqual(f.requests, []); assert.deepEqual(f.errors, []);

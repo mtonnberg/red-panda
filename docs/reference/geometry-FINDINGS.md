@@ -40,10 +40,11 @@ Scenario files and `geometry-probe.mjs` preserve reproduction instructions.
   Explicit widths advance by their authored value. Text-only and empty DIVs
   have width1920; a SPAN with a B child and a BUTTON with a B child have width5.
   An explicitly inline DIV has width5.
-- Document/body scrollHeight is five times all preorder nodes, including hidden
-  nodes. Root clientHeight is the viewport height; body clientHeight is its
-  synthetic box height. Document scrollWidth remains viewport width even when
-  a box extends beyond it.
+- The captured long documents with default boxes have scrollHeight equal to
+  five times all preorder nodes, including hidden nodes. Root scrollHeight is
+  at least the viewport height; body scrollHeight follows its synthetic box.
+  Root clientHeight is the viewport height. Later inline-sizing probes below
+  establish additional document extents and horizontal scrolling.
 - A target at document Y1365 with height5 and document height1375 scrolls to
   window.scrollY295, the maximum for a1080px viewport. With500 nodes appended
   after it, the same target scrolls to window.scrollY1365 and viewport Y0.
@@ -81,6 +82,15 @@ jsdom and can differ from native (for example default BUTTON display).
 Direct CSSOM insertRule/deleteRule changes can encounter jsdom's computed-style
 cache limitation; stylesheet text/attribute changes are covered. Scroll event
 timing, scroll options and smooth behavior have not been matched.
+
+Additional owned raw-CDP probes in `geometry-sizing-observations.json` and
+`geometry-viewport-observations.json` are black-box observations, not REA Evidence
+records. They establish summed intrinsic child heights, different root/body
+scroll extents, horizontal scrolling for wide inline boxes, nested inline
+overflow, and coordinate rounding before viewport-bound checks. The model
+distinguishes computed element boxes from document extents: stylesheet-only
+heights do not advance the measured document like inline heights. These rules
+fit the retained cases; complete arbitrary-page sizing remains unverified.
 
 `test/layout.test.js` compares the complete static capture and six dynamic
 preorder snapshots, plus hit tests, fractional model rounding, default shapes,

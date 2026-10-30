@@ -7,6 +7,9 @@ import { installLayout } from './layout.js';
 import { installIntersection } from './intersection.js';
 import { installNavigation } from './navigation.js';
 import { installModuleScripts } from './modules.js';
+import { installForms } from './forms.js';
+import { installWorkers } from './workers.js';
+import { installXHR } from './xhr.js';
 
 export const VERSION = '0.1.0';
 const now = () => performance.now() / 1000;
@@ -32,6 +35,10 @@ export function withTimeout(promise, timeout, message = 'Operation timed out') {
 class PageResources extends ResourceLoader {
   constructor(page) { super({ userAgent: page.userAgent }); this.page = page; }
   fetch(url, options = {}) {
+    const enabled = this.page.browser.options.loadResources;
+    const kind = options.element?.localName === 'iframe' || options.element?.localName === 'frame' ? 'iframe'
+      : options.element?.localName === 'link' ? 'stylesheet' : null;
+    if (kind && enabled !== undefined && !enabled.includes(kind)) return null;
     const abort = new AbortController();
     const headers = new Headers();
     if (options.accept) headers.set('accept', options.accept);
@@ -138,7 +145,8 @@ export class Page extends EventEmitter {
           const active = () => !this.closed && this.documentGeneration === generation;
           // A disposed document must never resume page callbacks. Observe the native
           // rejection even after teardown, while leaving its realm promise unsettled.
-          this.fetch(input, { ...init, signal }, 'Fetch').then(
+          const credentials = init.credentials ?? (input instanceof Request ? input.credentials : 'same-origin');
+          this.fetch(input, { ...init, credentials, credentialsOrigin: window.location.origin, signal }, 'Fetch').then(
             value => { if (active()) resolve(value); },
             error => { if (active()) reject(error); },
           );
@@ -153,7 +161,10 @@ export class Page extends EventEmitter {
         window.structuredClone = structuredClone;
         this.installHistory(window, historyState);
         installNavigation(this, window);
+        installForms(this, window);
         installModuleScripts(this, window);
+        installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+        installXHR(this, window);
         Object.defineProperty(window.navigator, 'userAgent', { get: () => this.userAgent });
         Object.defineProperty(window.navigator, 'language', { get: () => this.acceptLanguage.split(',')[0].split(';')[0].trim() });
         Object.defineProperty(window.navigator, 'languages', { get: () => Object.freeze(this.acceptLanguage.split(',').map(value => value.split(';')[0].trim()).filter(Boolean)) });
@@ -305,15 +316,17 @@ export class Page extends EventEmitter {
     }
     let method = init.method ?? (input instanceof Request ? input.method : 'GET');
     let body = init.body ?? (input instanceof Request && !['GET', 'HEAD'].includes(method) ? await input.arrayBuffer() : undefined);
-    const useCookies = init.credentials !== 'omit';
+    const credentials = init.credentials ?? (input instanceof Request ? input.credentials : 'include');
+    const credentialsOrigin = init.credentialsOrigin ?? new URL(this.url).origin;
     const deadline = AbortSignal.timeout(this.timeout);
     const signal = init.signal ? AbortSignal.any([deadline, init.signal]) : deadline;
     let redirectResponse;
     for (let redirects = 0; redirects <= 20; redirects++) {
+      const useCookies = credentials !== 'omit' && (credentials !== 'same-origin' || new URL(url).origin === credentialsOrigin);
       if (useCookies) {
         const cookies = await this.context.cookies.getCookieString(url);
         if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
-      }
+      } else headers.delete('cookie');
       const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse);
       try {
         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
@@ -325,6 +338,10 @@ export class Page extends EventEmitter {
           if (redirects === 20) throw new Error('Too many redirects');
           const next = new URL(location, url);
           if (!['http:', 'https:'].includes(next.protocol)) throw new Error('Unsupported redirect protocol');
+          if (init.onRedirect) {
+            try { await init.onRedirect(response, next.href, url, headers); }
+            catch (error) { await response.body?.cancel(); throw error; }
+          }
           if (next.origin !== new URL(url).origin) {
             headers.delete('authorization'); headers.delete('cookie');
           }
@@ -356,7 +373,8 @@ export class Page extends EventEmitter {
         const bytes = Buffer.concat(chunks);
         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
           { status: response.status, statusText: response.statusText, headers: response.headers });
-        for (const [key, value] of Object.entries({ url, finalUrl: url, requestId: id, redirected: redirects > 0 })) {
+        for (const [key, value] of Object.entries({ url, finalUrl: url, requestId: id, redirected: redirects > 0,
+          requestMethod: method, requestBody: body, requestHeaders: Object.fromEntries(headers) })) {
           Object.defineProperty(buffered, key, { value });
         }
         this.responseBodies ??= new Map();
@@ -368,7 +386,8 @@ export class Page extends EventEmitter {
     }
   }
 
-  async navigate(url, { waitUntil = 'load', waitMs = 0, selector, script, historyMode = 'push', historyIndex, onCommit, referrer } = {}) {
+  async navigate(url, { waitUntil = 'load', waitMs = 0, selector, script, historyMode = 'push', historyIndex, onCommit, referrer,
+    method, body, headers } = {}) {
     if (this.closed) throw new Error('Page is closed');
     const generation = ++this.navigationGeneration;
     const deadline = Date.now() + this.timeout;
@@ -376,6 +395,10 @@ export class Page extends EventEmitter {
     this.navigationAbort?.abort();
     this.navigationAbort = new AbortController();
     const target = new URL(url, this.url).href;
+    const rememberedRequest = (historyMode === 'reload' ? this.history[this.historyIndex] : historyMode === 'traverse' ? this.history[historyIndex] : null)?.request;
+    const requestMethod = method ?? rememberedRequest?.method ?? 'GET';
+    const requestBody = body ?? rememberedRequest?.body;
+    const requestHeaders = new Headers(headers ?? rememberedRequest?.headers);
     let navigationWindow, redirect, captureRedirect;
     this.loaderId = randomUUID();
     this.emit('navigationStarted');
@@ -386,7 +409,8 @@ export class Page extends EventEmitter {
       else {
         const referrerSource = referrer === undefined ? this.url : referrer;
         const referer = this.referrerFor(target, referrerSource);
-        response = await this.fetch(target, { signal: this.navigationAbort.signal, ...(referer ? { headers: { referer } } : {}) }, 'Document');
+        if (referer) requestHeaders.set('referer', referer);
+        response = await this.fetch(target, { signal: this.navigationAbort.signal, method: requestMethod, body: requestBody, headers: requestHeaders }, 'Document');
         const reader = response.body?.getReader();
         const chunks = [];
         let size = 0;
@@ -429,6 +453,12 @@ export class Page extends EventEmitter {
         entry.url = this.url;
         state = structuredClone(entry.state);
       } else this.commitHistory(this.url, null, historyMode === 'replace' ? 'replace' : 'push');
+      if (this.history[this.historyIndex]) this.history[this.historyIndex].request = {
+        method: response?.requestMethod ?? requestMethod,
+        body: structuredClone(response ? response.requestBody : requestBody),
+        // Credentials/defaults are recomputed by the transport for each request.
+        headers: Object.fromEntries([...new Headers(response?.requestHeaders ?? requestHeaders)].filter(([name]) => !['cookie', 'authorization', 'user-agent', 'accept-language'].includes(name))),
+      };
       let resolveRedirect;
       const requested = new Promise(resolve => { resolveRedirect = resolve; });
       captureRedirect = pending => {

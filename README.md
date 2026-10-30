@@ -88,13 +88,14 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Surface | Supported |
 | --- | --- |
 | Fetch | HTTP(S), data URLs, redirects, response status/headers, per-context cookies, plain-text/API documents, a 16 MiB response limit |
-| HTML / JS | HTML parsing, classic scripts, ES modules with imports/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
+| HTML / JS | Classic scripts, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
+| Forms / workers | Validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with messaging, imports, timers and fetch |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | Serialized HTML, text, basic Markdown with absolute links, link inventory, selected structured metadata |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
 | CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads |
-| CDP DOM/input | Tree/search/editing/mutation events, node handles, trusted keyboard/text/mouse input, surrogate quads/boxes/hit testing and viewport dimensions |
+| CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
 | Extension | `LP.dump` returns `{format, content}` |
 | WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
@@ -119,8 +120,9 @@ No speed or memory parity is claimed.
 ES modules use Node's experimental VM-module API in the actual page realm. The
 Linux CLI enables it by replacing its own process, preserving its PID. Embedding
 the library requires `node --experimental-vm-modules`; unsupported hosts report
-module execution errors. Import maps, JSON modules and complete mixed classic/
-module ordering remain unfinished. Saved-script limits are documented in the
+module execution errors. Early inline import maps support scoped/exact/prefix
+resolution. Late/external maps, JSON modules and complete mixed classic/module
+ordering remain unfinished. Saved-script limits are documented in the
 [script contract](docs/reference/script-contract.md).
 
 ```sh
@@ -136,7 +138,21 @@ passing an empty header list clears them. Configuration is per page and survives
 navigation. Automatic referrers use the full URL for the same origin, only the
 origin across origins, and are omitted on HTTPS-to-HTTP downgrades. Cross-origin
 redirects remove authorization. Custom referrer policies and applying these
-header overrides to XMLHttpRequest are not yet supported.
+header overrides reach asynchronous XMLHttpRequest too, including cookies,
+redirects and CDP events. XHR enforces basic CORS/preflight rules and rejects
+synchronous use, redirects needing another preflight and opaque-origin redirect
+taint. Progress is buffered; there is no preflight cache. Page `fetch` CORS
+coverage remains unfinished.
+
+Dedicated workers use actual isolated threads and are terminated when their
+document is disposed. SharedWorker, nested workers, blob worker URLs and
+MessagePort transfer remain unsupported. Keyboard Tab traversal currently covers
+the light DOM; it does not traverse frame or shadow trees. CLI fetch/serve enable
+no optional resources by default; MCP defaults to stylesheet loading. Repeated
+`--load-resources stylesheet|iframe|worker` enables the implemented subsets;
+`none` clears them. Direct Browser embedding retains its unrestricted resource
+default unless `loadResources` is supplied. Frame protocol integration remains
+unfinished, even when jsdom loads frame resources.
 
 ## PureScript automation
 

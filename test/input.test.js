@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { Browser } from '../src/browser.js';
 import { runInput, supportsInput, installInput } from '../src/input.js';
 
@@ -301,4 +302,127 @@ test('PointerEvent constructor and page-dispatched mouse events remain untrusted
     target.dispatchEvent(new f.window.MouseEvent('click', { bubbles: true })); click(f.session, 5, 5);
     assert.deepEqual(trusted, [false, true]);
   } finally { f.browser.close(); }
+});
+
+test('Enter activation honors keydown, keypress, click and submit cancellation before queuing form navigation', () => {
+  const f = fixture('<form action="http://127.0.0.1:9582/submitted"><input name="q" value="red panda"><button id="go">Go</button></form>');
+  try {
+    const input = f.element('input'), button = f.element('button'), form = f.element('form'); input.focus();
+    const events = [];
+    for (const type of ['keydown', 'keypress', 'click', 'submit']) form.addEventListener(type, event => {
+      events.push({ type, trusted: event.isTrusted, target: event.target, submitter: event.submitter, detail: event.detail });
+    });
+    for (const [target, type] of [[input, 'keydown'], [input, 'keypress'], [button, 'click'], [form, 'submit']]) {
+      target.addEventListener(type, event => event.preventDefault(), { once: true });
+      key(f.session, 'Enter', { text: '\r', windowsVirtualKeyCode: 13 });
+      assert.equal(f.page.pendingNavigation, undefined, `${type} cancellation`);
+    }
+    events.length = 0;
+    key(f.session, 'Enter', { text: '\r', windowsVirtualKeyCode: 13 });
+    const pending = f.page.pendingNavigation;
+    assert.equal(pending.url, 'http://127.0.0.1:9582/submitted?q=red+panda');
+    assert.deepEqual(events.map(event => event.type), ['keydown', 'keypress', 'click', 'submit']);
+    assert.ok(events.every(event => event.trusted)); assert.equal(events[2].target, button);
+    assert.equal(events[2].detail, 0); assert.equal(events[3].submitter, button);
+    pending.cancel();
+  } finally { f.browser.close(); }
+});
+
+test('implicit Enter submits one text field without a button and blocks multiple fields or a disabled default button', () => {
+  for (const [controls, submits] of [
+    ['<input id="field" readonly name="q" value="value">', true],
+    ['<input id="field" type="number" name="n" value="1">', true],
+    ['<input id="field"><input>', false],
+    ['<input id="field"><button disabled>Disabled</button><button>Other</button>', false],
+    ['<input id="field" type="checkbox">', false],
+  ]) {
+    const f = fixture(`<form action="http://127.0.0.1:9582/submitted">${controls}</form>`);
+    try {
+      f.element('#field').focus(); key(f.session, 'Enter', { text: '\r' });
+      assert.equal(Boolean(f.page.pendingNavigation), submits, controls);
+      f.page.pendingNavigation?.cancel();
+    } finally { f.browser.close(); }
+  }
+});
+
+test('raw Enter and Enter without text do not activate; char Enter and focused buttons use normal host activation', () => {
+  const f = fixture('<form action="http://127.0.0.1:9582/submitted"><input required><button id="go" formnovalidate>Go</button><button type="reset" id="reset">Reset</button></form>');
+  try {
+    const go = f.element('#go'); go.focus();
+    key(f.session, 'Enter');
+    runInput(f.session, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', text: '\r' });
+    assert.equal(f.page.pendingNavigation, undefined);
+    runInput(f.session, 'Input.dispatchKeyEvent', { type: 'char', key: 'Enter', text: '\r' });
+    assert.ok(f.page.pendingNavigation); f.page.pendingNavigation.cancel();
+    const input = f.element('input'); input.value = 'changed'; f.element('#reset').focus();
+    key(f.session, 'Enter', { text: '\r' }); assert.equal(input.value, '');
+  } finally { f.browser.close(); }
+});
+
+test('implicit form submission retains native validation and never submits textarea or contenteditable Enter', () => {
+  const f = fixture('<form action="http://127.0.0.1:9582/submitted"><input required><textarea>a</textarea><div contenteditable id="editor">Edit</div><button>Go</button></form>');
+  try {
+    const input = f.element('input'); let invalid = 0; input.addEventListener('invalid', () => invalid++);
+    input.focus(); key(f.session, 'Enter', { text: '\r' }); assert.equal(invalid, 1); assert.equal(f.page.pendingNavigation, undefined);
+    const textarea = f.element('textarea'); textarea.focus(); textarea.setSelectionRange(1, 1);
+    key(f.session, 'Enter', { text: '\r' }); assert.equal(textarea.value, 'a\n');
+    const editor = f.element('#editor'); editor.focus();
+    runInput(f.session, 'Input.insertText', { text: 'X' }); key(f.session, 'Enter', { text: '\r' });
+    assert.ok(editor.textContent.includes('X\n')); assert.equal(editor.hasAttribute('tabindex'), false);
+    assert.equal(f.page.pendingNavigation, undefined);
+  } finally { f.browser.close(); }
+});
+
+test('Tab and Shift+Tab move real focus after uncanceled keydown and keyup targets the new control', () => {
+  const f = fixture('<button id="normal">Normal</button><button tabindex="2" id="two">Two</button><button tabindex="1" id="one">One</button><input disabled><input hidden><div inert><button>Inert</button></div>');
+  try {
+    const events = [];
+    f.window.document.addEventListener('keydown', event => events.push(['down', event.target.id || event.target.tagName]));
+    f.window.document.addEventListener('keyup', event => events.push(['up', event.target.id]));
+    runInput(f.session, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Tab' });
+    runInput(f.session, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab' });
+    assert.equal(f.window.document.activeElement, f.element('#one'));
+    assert.deepEqual(events, [['down', 'BODY'], ['up', 'one']]);
+    f.element('#one').addEventListener('keydown', event => event.preventDefault(), { once: true });
+    key(f.session, 'Tab'); assert.equal(f.window.document.activeElement, f.element('#one'));
+    key(f.session, 'Tab'); assert.equal(f.window.document.activeElement, f.element('#two'));
+    key(f.session, 'Tab', { modifiers: 8 }); assert.equal(f.window.document.activeElement, f.element('#one'));
+    key(f.session, 'Tab', { modifiers: 8 }); assert.equal(f.window.document.activeElement, f.element('#normal'));
+    key(f.session, 'Tab', { modifiers: 2 }); assert.equal(f.window.document.activeElement, f.element('#normal'));
+  } finally { f.browser.close(); }
+});
+
+test('driver label activation focuses its control and preserves trust through the forwarded cancelable click', () => {
+  const f = fixture('<label for="control">Label</label><input id="control" type="checkbox">');
+  try {
+    const label = f.element('label'), input = f.element('input');
+    f.window.document.elementFromPoint = () => label;
+    const events = [];
+    input.addEventListener('click', event => {
+      events.push({ trusted: event.isTrusted, detail: event.detail, pointer: event instanceof f.window.PointerEvent });
+      event.preventDefault();
+    });
+    click(f.session, 5, 5);
+    assert.equal(f.window.document.activeElement, input); assert.equal(input.checked, false);
+    assert.deepEqual(events, [{ trusted: true, detail: 0, pointer: true }]);
+  } finally { f.browser.close(); }
+});
+
+test('keyboard Enter performs an actual HTTP POST navigation through installed form hooks', async () => {
+  let received;
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    response.setHeader('content-type', 'text/html');
+    if (request.url === '/form') response.end('<form action="/submitted" method="post"><input name="q" value="red panda"><button>Go</button></form>');
+    else { received = { method: request.method, body: Buffer.concat(chunks).toString() }; response.end('<title>Keyboard submitted</title>'); }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = new Browser();
+  try {
+    const page = browser.createPage(); await page.navigate(`http://127.0.0.1:${server.address().port}/form`);
+    page.dom.window.document.querySelector('input').focus();
+    key({ page }, 'Enter', { text: '\r' }); await page.pendingNavigation.promise;
+    assert.deepEqual(received, { method: 'POST', body: 'q=red+panda' });
+    assert.equal(page.evaluate('document.title'), 'Keyboard submitted'); assert.match(page.url, /\/submitted$/);
+  } finally { browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });

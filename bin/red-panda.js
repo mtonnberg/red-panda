@@ -34,6 +34,7 @@ Fetch options:
   --no-javascript         Parse HTML without running page scripts
   --fail-on-http-error    Dump HTTP errors and exit 22
   --user-agent STRING    Override the user agent
+  --load-resources KIND  Enable stylesheet, iframe or worker requests (repeatable)
   --inject-script JS     Run before page scripts (repeatable, in CLI order)
   --inject-script-file PATH  Read a preload script from a file
   --cookie PATH          Load a JSON or Netscape cookie file into each page
@@ -65,13 +66,17 @@ export async function main(argv = process.argv.slice(2)) {
     'http-session-timeout': { type: 'string', default: '60' },
     'remote-allow-origins': { type: 'string', multiple: true },
     'cdp-port': { type: 'string' },
+    'load-resources': { type: 'string', multiple: true },
   } });
   if (values.version) { console.log(`RedPanda/${VERSION}`); return; }
   if (values.help || !positionals.length) { console.log(help); return; }
   const [command, ...rest] = positionals;
   if (command === 'version' || values.version) { console.log(`RedPanda/${VERSION}`); return; }
   const timeout = integer(values['wait-ms'], '--wait-ms');
-  const options = { timeout, javascript: !values['no-javascript'], userAgent: values['user-agent'] };
+  let loadResources = values['load-resources'] ?? (command === 'mcp' ? ['stylesheet'] : []);
+  for (const resource of loadResources) if (!['none', 'stylesheet', 'iframe', 'worker'].includes(resource)) throw new Error(`Unsupported resource loading: ${resource}`);
+  if (loadResources.includes('none')) loadResources = [];
+  const options = { timeout, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
   if (command === 'run') {
     if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
     if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');

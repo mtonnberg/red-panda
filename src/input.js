@@ -1,13 +1,16 @@
 import { createRequire } from 'node:module';
+import { installFocus, advanceFocus } from './focus.js';
 
 // CDP is privileged browser input. jsdom's public dispatchEvent correctly marks
 // page-created events untrusted; its pinned internal dispatch path preserves
 // the trusted flag for events created by this driver instead.
 const require = createRequire(import.meta.url);
-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const { isSubmitButton } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
 
 const METHODS = new Set(['Input.dispatchKeyEvent', 'Input.insertText', 'Input.dispatchMouseEvent']);
 const TEXT_TYPES = new Set(['text', 'search', 'url', 'tel', 'password', 'email']);
+const IMPLICIT_TYPES = new Set([...TEXT_TYPES, 'date', 'month', 'week', 'time', 'datetime-local', 'number']);
 const KEY_TYPES = new Set(['keyDown', 'rawKeyDown', 'keyUp', 'char']);
 const CONTROL_SELECTIONS = new WeakMap();
 const POINTER_STATES = new WeakMap();
@@ -23,6 +26,7 @@ function invalid(message, code = -32602) {
 export function supportsInput(method) { return METHODS.has(method); }
 
 export function installInput(window) {
+  installFocus(window);
   if (typeof window.PointerEvent === 'function') return;
   class PointerEvent extends window.MouseEvent {
     constructor(type, init = {}) {
@@ -220,6 +224,38 @@ function dispatchKeyboard(window, target, type, params, flags) {
   }));
 }
 
+function activateKeyboard(window, target, flags) {
+  if (!target?.isConnected || target.matches?.(':disabled')) return;
+  installInput(window);
+  // Dispatch through the host event path so canceling click still prevents the
+  // element's existing activation default (form submission, reset or a link).
+  dispatchDriverEvent(target, new window.PointerEvent('click', {
+    bubbles: true, cancelable: true, composed: true, view: window,
+    button: 0, buttons: 0, detail: 0, ...flags, pointerId: -1, pointerType: '', isPrimary: false,
+  }));
+}
+
+function enterDefault(window, target, flags) {
+  if (!target?.isConnected || target.matches?.(':disabled') || editableRoot(target)) return;
+  if (target.localName === 'button' || (target.localName === 'input' && ['submit', 'image', 'reset', 'button'].includes(target.type)) ||
+      (target.localName === 'a' && target.hasAttribute('href'))) {
+    activateKeyboard(window, target, flags); return;
+  }
+  if (target.localName !== 'input' || !IMPLICIT_TYPES.has(target.type) || !target.form) return;
+  const form = target.form;
+  const implementation = implForWrapper(form);
+  const controls = implementation._getSubmittableElementNodes();
+  const submitter = controls.find(isSubmitButton);
+  if (submitter) {
+    // A disabled first submit button blocks implicit submission; it does not
+    // transfer its default-button status to the next enabled button.
+    activateKeyboard(window, wrapperForImpl(submitter), flags);
+    return;
+  }
+  const blockers = controls.filter(control => control._localName === 'input' && IMPLICIT_TYPES.has(control.type));
+  if (blockers.length <= 1) implementation.requestSubmit();
+}
+
 function keyEvent(window, params) {
   if (!KEY_TYPES.has(params.type)) throw invalid('Invalid key event type');
   for (const key of ['key', 'code', 'text', 'unmodifiedText', 'keyIdentifier']) {
@@ -241,6 +277,10 @@ function keyEvent(window, params) {
   if (params.type === 'keyUp') { dispatchKeyboard(window, target, 'keyup', params, flags); return; }
   if (params.type !== 'char' && !dispatchKeyboard(window, target, 'keydown', params, flags)) return;
   target = focused(window);
+  if (params.type !== 'char' && params.key === 'Tab') {
+    if (!flags.altKey && !flags.ctrlKey && !flags.metaKey) advanceFocus(window, flags.shiftKey);
+    return;
+  }
   const current = model(window, target);
   const accelerator = (flags.ctrlKey && !flags.altKey) || flags.metaKey;
   if (current && (params.commands?.includes('selectAll') || (accelerator && params.key?.toLowerCase() === 'a'))) {
@@ -262,7 +302,9 @@ function keyEvent(window, params) {
   target = focused(window);
   const isEnter = params.key === 'Enter' || /^[\r\n]+$/.test(text);
   const editable = model(window, target);
-  if (isEnter && editable?.kind === 'control' && editable.root.localName === 'input') return;
+  if (isEnter && !(editable?.kind === 'editable' || target.localName === 'textarea')) {
+    enterDefault(window, target, flags); return;
+  }
   changeText(window, target, isEnter ? '\n' : text, isEnter ? 'insertLineBreak' : 'insertText');
 }
 

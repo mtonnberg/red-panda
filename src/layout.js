@@ -45,6 +45,7 @@ export function createLayout(window, options = {}) {
     }
     const key = JSON.stringify(tokens);
     if (key === cachedKey) return cached;
+    let documentHeight = nodes.length * 5;
     const style = node => {
       if (!computed.has(node)) computed.set(node, rawComputedStyle(node));
       return computed.get(node);
@@ -61,13 +62,14 @@ export function createLayout(window, options = {}) {
       let value;
       if (isHidden(node) || ![1, 3, 9].includes(node.nodeType)) value = ZERO;
       else if (node.nodeType === 3) value = /\S/.test(node.data) ? { width: 5, height: 5 } : { width: 0, height: 5 };
-      else if (node.nodeType === 9) value = { width, height: nodes.length * 5 };
+      else if (node.nodeType === 9) value = { width, height: documentHeight };
       else {
         const declaration = style(node);
         const explicitWidth = dimension(declaration.width);
         const explicitHeight = dimension(declaration.height);
-        let childHeight = 5;
-        for (const child of node.childNodes) childHeight = Math.max(childHeight, sizes.get(child)?.height ?? 0);
+        let childHeight = 0;
+        for (const child of node.childNodes) childHeight += sizes.get(child)?.height ?? 0;
+        childHeight = Math.max(5, childHeight);
         let advance = 0;
         for (const child of node.childNodes) advance += sizes.get(child)?.advance ?? sizes.get(child)?.width ?? 0;
         advance = explicitWidth ?? Math.max(5, advance);
@@ -75,7 +77,7 @@ export function createLayout(window, options = {}) {
         value = {
           advance,
           width: explicitWidth ?? (block ? width : advance),
-          height: explicitHeight ?? (['html', 'body'].includes(node.localName) ? nodes.length * 5 : childHeight),
+          height: explicitHeight ?? (['html', 'body'].includes(node.localName) ? documentHeight : childHeight),
         };
       }
       sizes.set(node, value); return value;
@@ -90,6 +92,20 @@ export function createLayout(window, options = {}) {
       positions.set(node, value); return value;
     }
     for (const node of nodes) isHidden(node);
+    // Native document extents differ from individual computed boxes. The
+    // measured root uses inline child advances and nested inline overflow;
+    // stylesheet-only dimensions still affect individual element rectangles.
+    let directHeight = 0;
+    for (const child of document.body?.childNodes ?? []) {
+      if (!isHidden(child)) directHeight += dimension(child.style?.height) ?? 5;
+    }
+    documentHeight = Math.max(documentHeight, directHeight);
+    for (const node of nodes) {
+      const inlineHeight = dimension(node.style?.height);
+      if (inlineHeight !== undefined && !isHidden(node) && node.parentNode !== document.body && !['html', 'body'].includes(node.localName)) {
+        documentHeight = Math.max(documentHeight, order.get(node) * 5 + inlineHeight);
+      }
+    }
     for (let index = nodes.length - 1; index >= 0; index--) size(nodes[index]);
     for (const node of nodes) position(node);
     function record(node) {
@@ -113,7 +129,9 @@ export function createLayout(window, options = {}) {
     return { content: [...quad], padding: [...quad], border: [...quad], margin: [...quad], width: Math.trunc(value.width), height: Math.trunc(value.height) };
   }
   function elementsFromPoint(x, y) {
-    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= width || y >= height) return [];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
+    x = Math.round(x); y = Math.round(y);
+    if (x < 0 || y < 0 || x >= width || y >= height) return [];
     const state = snapshot();
     return state.nodes.filter(node => {
       if (node.nodeType !== 1) return false;
@@ -136,8 +154,9 @@ export function createLayout(window, options = {}) {
   }
   function scrollTo(x = 0, y = 0) {
     const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
-    const nextX = 0; // The observed synthetic document scrollWidth equals its viewport width.
-    const nextY = Math.min(Math.max(0, number(y)), Math.max(0, snapshot().nodes.length * 5 - height));
+    const extent = documentSize();
+    const nextX = Math.min(Math.max(0, number(x)), Math.max(0, extent.width - width));
+    const nextY = Math.min(Math.max(0, number(y)), Math.max(0, extent.height - height));
     const changed = nextX !== scrollX || nextY !== scrollY;
     scrollX = nextX; scrollY = nextY;
     if (changed) window.dispatchEvent(new window.Event('scroll'));
@@ -149,11 +168,18 @@ export function createLayout(window, options = {}) {
     const offset = region?.y ?? 0, regionHeight = region?.height ?? box.height;
     if (box.top + offset < 0 || box.top + offset + regionHeight > height) scrollTo(scrollX, value.rect.y + offset);
   }
+  function documentSize() {
+    const state = snapshot();
+    let documentWidth = width;
+    for (const node of state.nodes) documentWidth = Math.max(documentWidth, state.record(node).rect.width);
+    return { width: documentWidth,
+      height: Math.max(height, state.record(window.document.documentElement).rect.height) };
+  }
   return {
     rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollIntoView,
     scrollBy(x, y) { scrollTo(scrollX + Number(x || 0), scrollY + Number(y || 0)); },
     get scroll() { return { x: scrollX, y: scrollY }; },
-    get documentSize() { return { width, height: snapshot().nodes.length * 5 }; },
+    get documentSize() { return documentSize(); },
     get viewport() { return { width, height }; },
     setViewport(viewport) {
       const nextWidth = optionDimension(viewport.width ?? width, 'Viewport width');
@@ -185,7 +211,7 @@ export function installLayout(page, window, options = {}) {
     define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement ? layout.viewport[dimension] : layout.rect(this)[dimension]); } });
   }
   for (const [name, dimension] of [['scrollWidth', 'width'], ['scrollHeight', 'height']]) {
-    define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement || this === window.document.body ? layout.documentSize[dimension] : layout.rect(this)[dimension]); } });
+    define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement ? layout.documentSize[dimension] : layout.rect(this)[dimension]); } });
   }
   define(window.Document.prototype, 'elementFromPoint', { writable: true, value(x, y) { return layout.hitTest(Number(x), Number(y)); } });
   define(window.Document.prototype, 'elementsFromPoint', { writable: true, value(x, y) { return layout.elementsFromPoint(Number(x), Number(y)); } });
@@ -196,6 +222,7 @@ export function installLayout(page, window, options = {}) {
   window.scroll = window.scrollTo = (x, y) => layout.scrollTo(...scrollArguments(x, y));
   window.scrollBy = (x, y) => layout.scrollBy(...(typeof x === 'object' && x !== null ? [x.left ?? 0, x.top ?? 0] : [x, y]));
   define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { layout.scrollIntoView(this); } });
+  define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { layout.scrollIntoView(this); } });
   window.getComputedStyle = (node, pseudoElement) => {
     const original = layout.rawComputedStyle(node, pseudoElement);
     const computed = name => {

@@ -365,3 +365,22 @@ be classified separately. A trial cohort run overlapped changing source and a
 syntax error; it is invalid as a compatibility baseline. Repeatable runs use a
 fixed candidate source snapshot with a file-level SHA-256 manifest. No upstream
 fixture passing rate is claimed until that run and its native control finish.
+
+The fixed checkpoint run has now finished. Its paired results and source-file
+hashes are retained in [conformance-classic-checkpoint.json](reference/conformance-classic-checkpoint.json).
+
+| Selected classic-script cohort | Passed | Failed | Timeout |
+| --- | ---: | ---: | ---: |
+| Native control | 170 | 8 | 0 |
+| Red Panda `cf85fb9` runtime snapshot | 108 | 69 | 1 |
+
+107 fixtures passed both implementations. Of the 170 native-passing cases, Red
+Panda failed 62 and timed out on one. One candidate-passing fixture failed the
+native control. This selection covers 178 explicit fixtures, uses a static
+external server and a 3,000 ms per-fixture budget, and excludes module-script
+fixtures. It is not a full-suite or browser-parity result.
+
+Later independent work adds real form submission, dedicated workers, import
+maps, focus/keyboard defaults, shared-transport XHR and additional measured
+geometry. These are independently tested; the historical checkpoint figures
+must not be interpreted as their current full-suite result.
