@@ -1,7 +1,7 @@
 import 'jsdom';
 import { createRequire } from 'node:module';
 import { geometryFor, metricsFor, unionBounds } from './svg-path.js';
-import { getCascadedStyleValue } from './styles.js';
+import { getCascadedStyleValue, getStyleInheritanceParent } from './styles.js';
 const require = createRequire(import.meta.url);
 const SVG = require('jsdom/lib/jsdom/living/generated/SVGElement.js');
 const Graphics = require('jsdom/lib/jsdom/living/generated/SVGGraphicsElement.js');
@@ -36,7 +36,7 @@ export function installSVGGeometry(page, window, geometry) {
   function font(element) {
     if (!element) return 16;
     if (fontCache.has(element)) return fontCache.get(element);
-    const inherited = font(parent(element)), declaration = getCascadedStyleValue(element, 'font-size'), value = declaration ?? get(element, 'font-size');
+    const inherited = font(getStyleInheritanceParent(element)), declaration = getCascadedStyleValue(element, 'font-size'), value = declaration ?? get(element, 'font-size');
     let result = inherited;
     if (value !== null && value !== undefined) {
       const text = String(value).trim().toLowerCase(), match = /^([-+]?(?:\d+(?:\.\d*)?|\.\d+))(px|em|rem|%|pt|pc|in|cm|mm)?$/.exec(text);

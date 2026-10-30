@@ -41,6 +41,18 @@ test('Browser frames use their real realms, relative network transport and modul
   assert.equal(page.frames.getTree().childFrames.length, 2);
 });
 
+test('actual child-frame invocation ignores authored apply and exposes no temporary Window frame',async t=>{
+ const {page,base}=await fixture(t);await page.navigate(`${base}/parent`);
+ const child=page.frames.findElement(page.dom.window.document.getElementById('child'));
+ child.evaluate('Function.prototype.apply=function(){throw Error("authored apply")};Reflect.apply=function(){throw Error("authored Reflect")}');
+ const body=child.dom.window.document.body,keys=Reflect.ownKeys(child.dom.window);
+ const declaration='Object.defineProperty(function(value){this.dataset.invoked=value;return this},"apply",{get(){throw Error("own apply")}})';
+ assert.equal(child.callFunction(declaration,body,['actual']),body);assert.equal(body.dataset.invoked,'actual');
+ assert.deepEqual(Reflect.ownKeys(child.dom.window),keys);
+ page.timeout=50;assert.throws(()=>child.callFunction('function(){try{for(;;){}}finally{globalThis.finished=true}}',null,[]),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});
+ assert.equal(child.evaluate('globalThis.finished'),undefined);assert.equal(child.callFunction('function(){return 42}',null,[]),42);
+});
+
 test('child navigation changes its real iframe document and invalidates old realms without replacing the parent', async t => {
   const { page, base } = await fixture(t);
   await page.navigate(`${base}/parent`);

@@ -615,6 +615,38 @@ also run on Node24.22.1 and26.13.0. This closes one observed case from the older
 48-case report without rewriting that frozen report or claiming a new full-suite
 pass rate.
 
+The actual-world/Abort integration passes **954 JavaScript tests and53
+PureScript Puppeteer assertions**, syntax/strict builds and all13 existing native
+differential groups. [Validation](reference/phase12-integration-validation.json)
+binds119 production/native/package files to the same frozen graph. The
+[default32 comparison](reference/conformance-phase12-default32-candidate.json)
+passes32/32 with the unchanged native harness, actual iframe/worker flags,
+document-complete plus100ms settling and15s diagnostic deadline. The separately
+rerun Abort/encoding trio also passes. These are scoped outcomes, not a
+455-registration or WPT pass rate.
+
+Named isolated worlds now use actual separate VMs, constructor/prototype/expando
+state and typed wrappers over the original shared DOM implementation. Genuine
+utility observer/geometry/font/RAF producers pass the existing Puppeteer workflow.
+Both main-page and active child-frame protocol calls use the owned bounded VM
+invocation helper. Window/frame AbortSignals retain real realm EventTarget error
+delivery and private native transport cancellation; Request.signal is the
+native-observed nullable original supplied object. Standalone installation uses
+the private constructor registry and cannot rewrite Node transport statics.
+
+Real DOM traversal/cascade optimizations reduce the isolated position control
+from13573ms to2454ms. Native measured63ms; strict2s still fails. The new SVG
+flat-tree font inheritance matches8 host/slot/mutation controls and restores the
+check_visibility source case. Relative Bezier tolerance matches31 controlled
+numeric cases at1e-9, including the two prior negative scale100 cases, whose
+original reports remain unchanged. Broader geometric precision is not implied.
+
+At this checkpoint heap enumeration, retained-frame lifetime, geometry codec/
+provenance, custom elements, main synchronous XHR and HTTP header-policy proposals
+remain unmerged. Utility CSS/XML/SVG/messaging coverage, Worker error delivery,
+full async execution deadlines, browser isolation and full native performance
+remain incomplete.
+
 The full suite passes **687 JavaScript tests and 53 PureScript Puppeteer
 assertions**. Syntax, strict/pedantic PureScript builds and all13 bounded native
 comparisons pass. The [frozen73-fixture comparison](reference/conformance-dom-values-checkpoint.json)

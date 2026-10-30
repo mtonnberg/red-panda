@@ -1,0 +1,312 @@
+--- /dev/null
++++ b/src/abort-signals.js
+@@ -0,0 +1,95 @@
++import { createRequire } from 'node:module';
++const require = createRequire(import.meta.url);
++const Signal = require('jsdom/lib/jsdom/living/generated/AbortSignal.js');
++const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const SignalImpl = require('jsdom/lib/jsdom/living/aborting/AbortSignal-impl.js').implementation;
++const conversions = require('webidl-conversions');
++const NativeController = globalThis.AbortController;
++const installed = new WeakMap();
++
++// Keep the genuine document's EventTarget/AbortSignal objects. Only the
++// transport counterpart is a Node signal; it is never returned to author code.
++export function installAbortSignals(page, window) {
++  if (installed.has(window)) return installed.get(window);
++  const document = window.document, generation = page.documentGeneration;
++  const documentSignal = page.documentAbort?.signal;
++  const bridges = new WeakMap(), bridgeEntries = new Set(), timers = new Set();
++  const bridgeFinalizer = new FinalizationRegistry(entry => bridgeEntries.delete(entry));
++  const setTimer = window.setTimeout.bind(window), clearTimer = window.clearTimeout.bind(window);
++  const Controller = window.AbortController, AbortSignal = window.AbortSignal;
++  const abort = Controller.prototype.abort, staticAbort = AbortSignal.abort;
++  let disposed = false;
++  const active = () => !disposed && !page.closed && !documentSignal?.aborted && page.documentGeneration === generation && window.document === document;
++  const reason = () => new window.DOMException('signal is aborted without reason', 'AbortError');
++  const api = {
++    native(signal) {
++      if (!Signal.is(signal)) throw new window.TypeError('The provided value is not of type AbortSignal.');
++      const source = implForWrapper(signal);
++      let bridge = bridges.get(source);
++      if (bridge) return bridge.signal;
++      bridge = new NativeController(); bridges.set(source, bridge);
++      const sourceRef = new WeakRef(source);
++      let entry;
++      const propagate = () => {
++        const actual = sourceRef.deref(); if (actual) bridge.abort(actual.reason);
++        if (entry) { bridgeEntries.delete(entry); bridgeFinalizer.unregister(entry); }
++      };
++      if (source.aborted) propagate();
++      else if (!disposed) {
++        source._addAlgorithm(propagate);
++        // Weak source references allow unused signals to be collected while
++        // still permitting deterministic algorithm removal at document close.
++        entry = { source: sourceRef, propagate };
++        bridgeEntries.add(entry); bridgeFinalizer.register(source, entry, entry);
++      }
++      return bridge.signal;
++    },
++    validate(signal) { if (!Signal.is(signal)) throw new window.TypeError('The provided value is not of type AbortSignal.'); return signal; },
++    timeout(value, count) {
++      if (!count) throw new window.TypeError('AbortSignal.timeout requires 1 argument');
++      const milliseconds = conversions['unsigned long long'](value, { globals: window, enforceRange: true });
++      const signal = Signal.create(window, []), implementation = implForWrapper(signal);
++      let remaining = milliseconds;
++      const schedule = () => {
++        if (!active()) return;
++        const chunk = Math.min(remaining, 2147483647);
++        const timer = setTimer(() => {
++          timers.delete(timer);
++          if (!active()) return;
++          remaining -= chunk;
++          if (remaining > 0) schedule();
++          else implementation._signalAbort(new window.DOMException('signal timed out', 'TimeoutError'));
++        }, chunk);
++        timers.add(timer);
++      };
++      schedule(); return signal;
++    },
++    abort(receiver, value) { return abort.call(receiver, value === undefined ? reason() : value); },
++    staticAbort(value) { return staticAbort.call(AbortSignal, value === undefined ? reason() : value); },
++    sequence() { return []; },
++    member(list, signal) { list.push(implForWrapper(api.validate(signal))); },
++    any(signals) { return wrapperForImpl(SignalImpl.any(window, signals)); },
++    dispose() {
++      if (disposed) return;
++      disposed = true;
++      for (const timer of timers) clearTimer(timer); timers.clear();
++      for (const entry of bridgeEntries) { entry.source.deref()?._removeAlgorithm(entry.propagate); bridgeFinalizer.unregister(entry); }
++      bridgeEntries.clear(); documentSignal?.removeEventListener('abort', api.dispose);
++      if (window.close === close) window.close = previousClose;
++    },
++  };
++  window.eval(`(function(bridge) {
++    Object.defineProperty(AbortController.prototype, 'abort', {value: function abort() { return bridge.abort(this, arguments[0]); }, writable:true, enumerable:true, configurable:true});
++    Object.defineProperty(AbortSignal, 'abort', {value: function abort() { return bridge.staticAbort(arguments[0]); }, writable:true, enumerable:true, configurable:true});
++    Object.defineProperty(AbortSignal, 'any', {value: function any(signals) {
++      if (!arguments.length || signals === null || (typeof signals !== 'object' && typeof signals !== 'function')) throw new TypeError('AbortSignal.any requires an iterable object');
++      const list = bridge.sequence(); for (const signal of signals) bridge.member(list, signal);
++      return bridge.any(list);
++    }, writable:true, enumerable:true, configurable:true});
++    Object.defineProperty(AbortSignal, 'timeout', {value: function timeout(milliseconds) { return bridge.timeout(milliseconds, arguments.length); }, writable:true, enumerable:true, configurable:true});
++  })`)(api);
++  const previousClose = window.close;
++  const close = function(...args) { api.dispose(); return previousClose.apply(this, args); };
++  window.close = close; documentSignal?.addEventListener('abort', api.dispose, {once: true});
++  installed.set(window, api); return api;
++}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -37,6 +37,7 @@
+ import { installSerialization } from './serialization.js';
+ import { installFrames } from './frames.js';
+ import { installFetch } from './fetch.js';
++import { installAbortSignals } from './abort-signals.js';
+ import { loadCollectionsBinding, installCollections } from './collections.js';
+ import { installStyles } from './styles.js';
+ import { installGeometry } from './geometry.js';
+@@ -215,8 +216,7 @@
+       installIntersection(this, window, installLayout(this, window, this.viewport));
+       installResizeObserver(this, window, this.layout);
+       installPerformance(this, window);
+-      window.AbortController = AbortController;
+-      window.AbortSignal = AbortSignal;
++      installAbortSignals(this, window);
+       window.TextEncoder = TextEncoder;
+       window.TextDecoder = TextDecoder;
+       window.structuredClone = structuredClone;
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -3,6 +3,7 @@
+ import { createRequire } from 'node:module';
+ import { types } from 'node:util';
+ import { installStreams } from './streams.js';
++import { installAbortSignals } from './abort-signals.js';
+ 
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+@@ -62,6 +63,7 @@
+ export function installFetch(page, window) {
+   if (INSTALLED.has(window)) return INSTALLED.get(window);
+   const streams = installStreams(page, window);
++  const abortSignals = installAbortSignals(page, window);
+   const generation = page.documentGeneration;
+   const documentSignal = page.documentAbort?.signal;
+   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
+@@ -366,12 +368,12 @@
+       cursor = next + 2;
+     }
+   }
+-  function wrapRequest(raw, bufferedBytes) {
++  function wrapRequest(raw, bufferedBytes, signal = null) {
+     const request = Object.create(Request.prototype);
+     const headers = fillHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request');
+     for (const name of [...raw.headers.keys()]) raw.headers.delete(name);
+     for (const [name, value] of headers) raw.headers.set(name, value);
+-    requestState.set(request, { raw, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
++    requestState.set(request, { raw, publicSignal: signal, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
+     return request;
+   }
+   class Request {
+@@ -384,7 +386,10 @@
+         const mode = init.mode ?? (source instanceof NativeRequest ? source.mode : 'cors');
+         const guarded = fillHeaders(init.headers ?? (source instanceof NativeRequest ? source.headers : undefined), mode === 'no-cors' ? 'request-no-cors' : 'request');
+         const prepared = {};
+-        for (const key of Reflect.ownKeys(Object(init))) if (key !== 'duplex' && Object.prototype.propertyIsEnumerable.call(init, key)) prepared[key] = init[key];
++        for (const key of Reflect.ownKeys(Object(init))) if (key !== 'duplex' && key !== 'signal' && Object.prototype.propertyIsEnumerable.call(init, key)) prepared[key] = init[key];
++        const requestedSignal = init.signal;
++        const publicSignal = requestedSignal == null ? sourceState?.publicSignal ?? null : abortSignals.validate(requestedSignal);
++        prepared.signal = publicSignal === null ? null : abortSignals.native(publicSignal);
+         prepared.headers = getHeaders(guarded).raw;
+         if (prepared.method !== undefined) {
+           if (typeof prepared.method === 'symbol') throw new window.TypeError('Cannot convert a Symbol value to a string');
+@@ -403,7 +408,7 @@
+         if (!streamBody && bufferedBytes !== undefined && prepared.body == null) { assertBufferedBodyUsable(sourceState); prepared.body = new Uint8Array(bufferedBytes); }
+         if (streamBody && ['GET', 'HEAD'].includes(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) throw new window.TypeError('Request with GET/HEAD method cannot have body.');
+         if (prepared.referrer && prepared.referrer !== 'about:client') prepared.referrer = new URL(String(prepared.referrer), window.document.baseURI).href;
+-        const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes);
++        const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes, publicSignal);
+         const state = requestState.get(wrapped);
+         if (streamBody) { state.streamBody = streamBody; state.streamUsed = false; if (streamBody === sourceState?.streamBody && sourceState.streamBytes) { state.streamBytes = sourceState.streamBytes; state.streamVersion = sourceState.streamVersion; } }
+         requestState.set(this, state);
+@@ -412,9 +417,9 @@
+     clone() {
+       try {
+         const s = getRequest(this);
+-        if (s.streamBody) { const bytes = extractStreamBody(s, { cache: true }); return wrapRequest(new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw }), bytes); }
++        if (s.streamBody) { const bytes = extractStreamBody(s, { cache: true }); return wrapRequest(new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw }), bytes, s.publicSignal); }
+         assertBufferedBodyUsable(s);
+-        return wrapRequest(s.raw.clone(), s.bufferedBody?.bytes);
++        return wrapRequest(s.raw.clone(), s.bufferedBody?.bytes, s.publicSignal);
+       } catch (error) { throw realmError(error); }
+     }
+     get headers() { return getRequest(this).headers; }
+@@ -422,9 +427,10 @@
+     get bodyUsed() { const s = getRequest(this); return s.streamBody ? s.streamUsed : s.raw.bodyUsed; }
+     get [Symbol.toStringTag]() { return 'Request'; }
+   }
+-  for (const name of ['url', 'method', 'mode', 'credentials', 'cache', 'redirect', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal', 'destination', 'duplex']) {
++  for (const name of ['url', 'method', 'mode', 'credentials', 'cache', 'redirect', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'destination', 'duplex']) {
+     Object.defineProperty(Request.prototype, name, { configurable: true, enumerable: true, get() { return getRequest(this).raw[name]; } });
+   }
++  Object.defineProperty(Request.prototype, 'signal', { configurable: true, enumerable: true, get() { return getRequest(this).publicSignal; } });
+   function wrapResponse(raw, view = {}) {
+     const response = Object.create(Response.prototype);
+     const { bufferedBytes, ...metadata } = view;
+@@ -677,7 +683,8 @@
+       } catch (error) { reject(error); return; }
+       perform(request).then(value => { if (active()) resolve(value); }, error => {
+         if (!active()) return;
+-        reject(request.signal.aborted ? request.signal.reason : realmError(error));
++        const signal = getRequest(request).raw.signal;
++        reject(signal.aborted ? signal.reason : realmError(error));
+       });
+     });
+   }
+--- /dev/null
++++ b/test/abort-signals.test.js
+@@ -0,0 +1,103 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {setTimeout as delay} from 'node:timers/promises';
++import {Browser} from '../src/browser.js';
++import {installAbortSignals} from '../src/abort-signals.js';
++
++async function fixture(action) {
++  const requests=[],aborted=[];
++  const server=http.createServer((req,res)=>{
++    requests.push(req.url);
++    if(req.url==='/slow'){
++      res.on('close',()=>{if(!res.writableEnded)aborted.push(req.url)});
++      const timer=setTimeout(()=>{if(!res.destroyed)res.end('late')},250);timer.unref();return;
++    }
++    if(req.url==='/') {res.setHeader('content-type','text/html');res.end('<!doctype html><body><button>click</button>');return;}
++    res.end('real bytes');
++  });
++  server.listen(0,'127.0.0.1');await once(server,'listening');
++  const origin=`http://127.0.0.1:${server.address().port}`,browser=new Browser({timeout:1500,loadResources:['iframe','worker']}),page=browser.createPage();
++  try {await page.navigate(origin);await action({browser,page,window:page.dom.window,requests,aborted,origin});}
++  finally {browser.close();await new Promise(resolve=>{server.close(resolve);server.closeAllConnections()});}
++}
++
++test('genuine realm signals produce trusted abort events and exact default reason once',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),s=c.signal,events=[];assert.equal(s instanceof w.AbortSignal,true);assert.equal(s instanceof w.EventTarget,true);assert.equal(c instanceof w.Object,true);assert.equal(s instanceof w.Object,true);assert.equal(s,c.signal);assert.equal(s.reason,undefined);assert.equal(s.aborted,false);
++ s.addEventListener('abort',e=>events.push(e));c.abort();c.abort('second');assert.equal(events.length,1);assert.equal(events[0] instanceof w.Event,true);assert.equal(events[0].isTrusted,true);assert.equal(events[0].target,s);assert.equal(events[0].bubbles,false);assert.equal(events[0].cancelable,false);assert.equal(s.reason instanceof w.DOMException,true);assert.equal(s.reason.message,'signal is aborted without reason');assert.equal(s.reason.name,'AbortError');assert.throws(()=>s.throwIfAborted(),e=>e===s.reason);
++ assert.equal(w.AbortSignal.abort().reason.message,'signal is aborted without reason');assert.equal(w.AbortSignal.abort(null).reason,null);assert.throws(()=>w.AbortController.prototype.abort.call({}),w.TypeError);assert.throws(()=>w.AbortSignal.prototype.throwIfAborted.call({}),w.TypeError);
++}));
++
++test('abort exceptions dispatch real cancelable Window errors and do not skip source or dependents',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),a=w.AbortSignal.any([c.signal]),b=w.AbortSignal.any([a]),reason={},error=new w.DOMException('nope','SyntaxError'),log=[];
++ w.addEventListener('error',e=>{assert.equal(e.error,error);assert.equal(e instanceof w.ErrorEvent,true);assert.equal(e.cancelable,true);assert.equal(e.isTrusted,true);log.push('error');e.preventDefault()});
++ c.signal.addEventListener('abort',()=>{log.push('source');assert.equal(a.aborted,true);assert.equal(b.aborted,true);throw error});c.signal.addEventListener('abort',()=>log.push('source2'));a.onabort=()=>log.push('a');b.onabort=()=>log.push('b');c.abort(reason);
++ assert.deepEqual(log,['source','error','source2','a','b']);assert.equal(a.reason,reason);assert.equal(b.reason,reason);
++}));
++
++test('timeout listener failure remains in the Window and every dependent signal aborts',()=>fixture(async({window:w})=>{
++ const errors=[],s=w.AbortSignal.timeout(1);let dependents=0;
++ w.addEventListener('error',e=>{errors.push(e);e.preventDefault()});for(let i=0;i<3;i++)w.AbortSignal.any([s]).addEventListener('abort',()=>dependents++);s.addEventListener('abort',()=>{throw new w.DOMException('nope','SyntaxError')});await delay(30);
++ assert.equal(errors.length,1);assert.equal(dependents,3);assert.equal(s.reason instanceof w.DOMException,true);assert.equal(s.reason.name,'TimeoutError');assert.equal(s.reason.message,'signal timed out');assert.equal(s.reason.code,23);
++}));
++
++test('timeout EnforceRange accepts safe integers/coercion and never wraps a huge delay',()=>fixture(async({window:w})=>{
++ for(const n of [-1,NaN,Infinity,2**53,1n,Symbol()])assert.throws(()=>w.AbortSignal.timeout(n),w.TypeError);assert.throws(()=>w.AbortSignal.timeout(),w.TypeError);
++ const huge=w.AbortSignal.timeout(2**53-1),tiny=w.AbortSignal.timeout(-.5);assert.equal(huge.aborted,false);await delay(20);assert.equal(huge.aborted,false);assert.equal(tiny.aborted,true);
++}));
++
++test('any consumes real iterables and snapshots first reason while validating every member',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),s=w.AbortSignal.any(new w.Set([c.signal])),reason={};c.abort(reason);assert.equal(s.reason,reason);assert.equal(w.AbortSignal.any([]).aborted,false);assert.equal(w.AbortSignal.any([w.AbortSignal.abort('one'),w.AbortSignal.abort('two')]).reason,'one');for(const bad of [undefined,{},c.signal,[{}],[w.AbortSignal.abort(),{}]])assert.throws(()=>w.AbortSignal.any(bad),w.TypeError);
++}));
++
++test('signal-backed genuine DOM listeners are removed by actual abort algorithms',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),target=new w.EventTarget();let n=0;c.signal.addEventListener('abort',e=>e.stopImmediatePropagation());target.addEventListener('x',()=>n++,{signal:c.signal});target.dispatchEvent(new w.Event('x'));c.abort();target.dispatchEvent(new w.Event('x'));assert.equal(n,1);target.addEventListener('x',()=>n++,{signal:c.signal});target.dispatchEvent(new w.Event('x'));assert.equal(n,1);assert.throws(()=>target.addEventListener('x',()=>{},{signal:{aborted:false}}),w.TypeError);
++}));
++
++test('Request stores nullable original genuine signal and keeps clone/copy identity and brands',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),r=new w.Request('/bytes',{signal:c.signal});assert.equal(new w.Request('/').signal,null);assert.equal(r.signal,c.signal);assert.equal(r.clone().signal,c.signal);assert.equal(new w.Request(r).signal,c.signal);assert.equal(new w.Request(r,{signal:null}).signal,c.signal);assert.equal(new w.Request(r,{signal:undefined}).signal,c.signal);assert.equal(r.signal instanceof w.AbortSignal,true);assert.equal(r.signal instanceof w.EventTarget,true);assert.throws(()=>new w.Request('/',{signal:{aborted:false,addEventListener(){}}}),w.TypeError);assert.throws(()=>Object.getOwnPropertyDescriptor(w.Request.prototype,'signal').get.call({}),w.TypeError);
++ const proto=Object.create(null,{signal:{get(){return c.signal}}});assert.equal(new w.Request('/',proto).signal,c.signal);
++}));
++
++test('cross-frame signals retain their own realm and work in parent Request/any/DOM listeners',()=>fixture(async({window:w})=>{
++ const f=w.document.createElement('iframe');w.document.body.append(f);const child=f.contentWindow,c=new child.AbortController(),s=w.AbortSignal.any([c.signal]);assert.equal(c.signal instanceof w.AbortSignal,false);assert.equal(c.signal instanceof child.AbortSignal,true);assert.equal(new w.Request('/bytes',{signal:c.signal}).signal,c.signal);let n=0;w.document.body.addEventListener('x',()=>n++,{signal:c.signal});w.document.body.dispatchEvent(new w.Event('x'));c.abort('child');w.document.body.dispatchEvent(new w.Event('x'));assert.equal(n,1);assert.equal(s.reason,'child');f.remove();
++}));
++
++test('real in-flight HTTP fetch is canceled despite authored stopImmediatePropagation or public getter overrides',()=>fixture(async({window:w,requests,aborted})=>{
++ const c=new w.AbortController(),reason={cancel:'physical'};c.signal.addEventListener('abort',e=>e.stopImmediatePropagation());const pending=w.fetch('/slow',{signal:c.signal});while(!requests.includes('/slow'))await delay(2);Object.defineProperties(c.signal,{aborted:{value:false},reason:{value:'spoof'}});c.abort(reason);await assert.rejects(pending,e=>e===reason);for(let i=0;i<30&&!aborted.length;i++)await delay(2);assert.deepEqual(aborted,['/slow']);
++}));
++
++test('pre-aborted fetch preserves arbitrary reason and does not send a request',()=>fixture(async({window:w,requests})=>{
++ for(const reason of ['literal',null,{},new w.DOMException('realm','AbortError')])await assert.rejects(w.fetch('/slow',{signal:w.AbortSignal.abort(reason)}),e=>e===reason);assert.equal(requests.includes('/slow'),false);
++}));
++
++test('response bytes/clones/readers reject original reason after transport abort',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),response=await w.fetch('/bytes',{signal:c.signal}),clone=response.clone(),reader=response.body.getReader(),reason={body:true};c.abort(reason);await assert.rejects(reader.read(),e=>e===reason);await assert.rejects(clone.text(),e=>e===reason);
++}));
++
++test('post-load document.open retains the real signal listener and timeout without changing realm identity',()=>fixture(async({page,window:w})=>{
++ const doc=w.document,c=new w.AbortController(),signal=c.signal,timeout=w.AbortSignal.timeout(15),seen=[];
++ signal.addEventListener('abort',()=>seen.push('abort'));timeout.addEventListener('abort',()=>seen.push('timeout'));
++ doc.open();doc.write('<!doctype html><title>reset</title><body>new document');doc.close();c.abort('retained');await delay(40);assert.deepEqual(seen,['abort','timeout']);assert.equal(page.dom.window,w);assert.equal(w.document,doc);assert.equal(signal,c.signal);assert.equal(signal.reason,'retained');
++}));
++
++test('raw Window close cancels pending timeout jobs and actual fetch resources',()=>fixture(async({page,window:w,requests,aborted})=>{
++ let n=0;w.AbortSignal.timeout(30).onabort=()=>n++;const pending=w.fetch('/slow');pending.catch(()=>{});while(!requests.includes('/slow'))await delay(2);w.close();await delay(60);assert.equal(n,0);assert.equal(page.closed,false);assert.equal(aborted.length,1);
++}));
++
++test('installer disposal is idempotent and removes timeout scheduling without changing public constructors',()=>fixture(async({page,window:w})=>{
++ const api=installAbortSignals(page,w),Constructor=w.AbortSignal;let n=0;w.AbortSignal.timeout(10).onabort=()=>n++;api.dispose();api.dispose();await delay(25);assert.equal(n,0);assert.equal(w.AbortSignal,Constructor);
++}));
++
++// Supplying a signal controls the HTTP operation; it must not add a new
++// aborting wrapper around the actual authored Request body producer.
++test('Request body producers and buffered clone bytes survive signal abort independently of HTTP cancellation',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController(),r=new w.Request('/bytes',{method:'POST',body:'body',signal:c.signal}),clone=r.clone(),reader=r.body.getReader();c.abort('cancel HTTP');assert.equal(await clone.text(),'body');const chunk=await reader.read();assert.deepEqual([...chunk.value],[98,111,100,121]);
++ const source=new w.ReadableStream({start(controller){controller.enqueue(new w.Uint8Array([1,2]));controller.close()}}),control=new w.AbortController(),request=new w.Request('/bytes',{method:'POST',body:source,signal:control.signal});assert.equal(request.body,source);control.abort('cancel HTTP');assert.equal(request.body,source);assert.equal(await request.text(),'\u0001\u0002');
++}));
++
++test('any converts its authored sequence once and closes iterators on invalid signal members',()=>fixture(async({window:w})=>{
++ const c=new w.AbortController();let iterations=0,closed=0;const iterable={*[Symbol.iterator](){iterations++;yield c.signal;}};const result=w.AbortSignal.any(iterable);assert.equal(iterations,1);c.abort('one');assert.equal(result.reason,'one');
++ const invalid={*[Symbol.iterator](){try{yield {}}finally{closed++}}};assert.throws(()=>w.AbortSignal.any(invalid),w.TypeError);assert.equal(closed,1);
++}));

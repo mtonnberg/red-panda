@@ -1,3 +1,4 @@
+import {utilityNodeIdentity} from './isolated-world.js';
 // CDP value metadata without evaluating page getters or coercion hooks. This
 // module deliberately does not allocate handles or select execution contexts.
 import { types } from 'node:util';
@@ -70,6 +71,7 @@ function constructorName(value, fallback='Object') {
  * object with nodeType/ownerDocument fields, or a Proxy around a Node, is not
  * promoted to a DOM node. No public Node getters are called. */
 export function nodeIdentity(value) {
+  const utility=utilityNodeIdentity(value);if(utility)return utility;
   if (!objectLike(value) || htmlDDA(value) || types.isProxy(value)) return undefined;
   const implementation=dataProperty(value,implSymbol,false);
   if (!implementation.found || !objectLike(implementation.value) || types.isProxy(implementation.value)) return undefined;

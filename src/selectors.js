@@ -14,7 +14,7 @@ const RECORDS=new WeakMap();
 const NAMESPACE_FALLBACK=Symbol('selector namespace handled by existing engine');
 const HTML='http://www.w3.org/1999/xhtml';
 const SPACE=/[\t\n\r\f ]/;
-const lower=value=>value.replace(/[A-Z]/g,c=>c.toLowerCase());
+const lower=value=>/[A-Z]/.test(value)?value.replace(/[A-Z]/g,c=>c.toLowerCase()):value;
 const htmlInsensitive=new Set(('accept accept-charset align alink axis bgcolor charset checked clear codetype color compact declare defer dir direction disabled enctype face frame hreflang http-equiv lang language link media method multiple nohref noresize noshade nowrap readonly rel rev rules scope scrolling selected shape target text type valign valuetype vlink').split(' '));
 const simplePseudos=new Set(('scope root empty first-child last-child only-child first-of-type last-of-type only-of-type any-link link visited target defined hover active focus-within focus-visible focus enabled disabled read-only read-write placeholder-shown default autofill -webkit-autofill checked indeterminate required optional valid invalid in-range out-of-range playing paused seeking buffering stalled muted volume-locked open closed modal fullscreen picture-in-picture popover-open popover current past future').split(' '));
 const logical=new Set(['is','where','not','has','matches']);
@@ -110,10 +110,10 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
   return {compiled:retained.length?retained.map(item=>item.compiled).join(','):emitPredicate({kind:'never'}),effective:retained.map(item=>item.effective).join(','),groups:parsed};
  };
  const branch=(value,container,relative)=>{
-  let compiled='',effective='',pe=null,hasPE=false,canType=true;
+  let compiled='',effective='',pe=null,hasPE=false,canType=true,required=[];
   for(let i=0;i<value.length;){const c=value[i];
-   if(SPACE.test(c)){const end=skipSpace(value,i);if(pe&&end<value.length&&value[end]!==':')fail(window,'Pseudo-elements cannot have descendant subjects');compiled+=value.slice(i,end);effective+=value.slice(i,end);canType=true;i=end;continue;}
-   if(c==='['){if(pe)fail(window,'Attributes cannot follow a pseudo-element');const token=attribute(value,i,window);compiled+=emitPredicate(token.predicate);effective+=token.raw;canType=false;i=token.end;continue;}
+   if(SPACE.test(c)){const end=skipSpace(value,i);if(pe&&end<value.length&&value[end]!==':')fail(window,'Pseudo-elements cannot have descendant subjects');compiled+=value.slice(i,end);effective+=value.slice(i,end);required=[];canType=true;i=end;continue;}
+   if(c==='['){if(pe)fail(window,'Attributes cannot follow a pseudo-element');const token=attribute(value,i,window);compiled+=emitPredicate(token.predicate);required.push(token.predicate);effective+=token.raw;canType=false;i=token.end;continue;}
    if(c===':'){
     const double=value[i+1]===':';const token=readName(value,i+(double?2:1),window);const name=lower(token.value);let end=token.end,arg=null;
     if(value[end]==='('){const fn=block(value,end,window);arg=fn.body;end=fn.end;}
@@ -148,14 +148,14 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
     canType=false;i=end;continue;
    }
    if(pe)fail(window,'A pseudo-element must be the final subject');
-   if(c==='.'||c==='#'){const token=readName(value,i+1,window);compiled+=emitPredicate({kind:c==='#'?'id':'class',name:token.value});effective+=c+token.raw;canType=false;i=token.end;continue;}
-   if('>+~'.includes(c)){if(i===0&&!relative)fail(window,'Leading combinator');if(!value.slice(i+1).trim()||/^[>+~]/.test(value.slice(i+1).trim()))fail(window,'Unfinished combinator');compiled+=c;effective+=c;canType=true;i++;continue;}
+   if(c==='.'||c==='#'){const token=readName(value,i+1,window);const item={kind:c==='#'?'id':'class',name:token.value};required.push(item);compiled+=emitPredicate(item);effective+=c+token.raw;canType=false;i=token.end;continue;}
+   if('>+~'.includes(c)){if(i===0&&!relative)fail(window,'Leading combinator');if(!value.slice(i+1).trim()||/^[>+~]/.test(value.slice(i+1).trim()))fail(window,'Unfinished combinator');compiled+=c;effective+=c;required=[];canType=true;i++;continue;}
    if(c==='*'||c==='|'||nameStart(value,i)){
-    if(!canType)fail(window,'Multiple type selectors in one compound');const token=typeSelector(value,i,window);compiled+=token.predicate.name==='*'&&token.predicate.namespace===null?'*':emitPredicate(token.predicate);effective+=token.raw;canType=false;i=token.end;continue;
+    if(!canType)fail(window,'Multiple type selectors in one compound');const token=typeSelector(value,i,window);compiled+=token.predicate.name==='*'&&token.predicate.namespace===null?'*':emitPredicate(token.predicate);required.push(token.predicate);effective+=token.raw;canType=false;i=token.end;continue;
    }
    fail(window,'Unexpected selector token');
   }
-  return {compiled:hasPE?emitPredicate({kind:'never'}):compiled,effective,discard:hasPE&&(container==='is'||container==='where')};
+  return {compiled:hasPE?emitPredicate({kind:'never'}):compiled,effective,required,discard:hasPE&&(container==='is'||container==='where')};
  };
  return list(text);
 }
@@ -188,7 +188,7 @@ function predicate(record,element,item) {
 }
 function compiled(record,source) {
  let parsed=record.cache.get(source);if(parsed)return parsed;
- const emitted=[];parsed=parseSelector(source,{window:record.window,emitPredicate(item){const index=record.predicates.push(item)-1,text=`:${internal}(${index})`;emitted.push({item,text});return text;}});if(emitted.length===1&&parsed.compiled===emitted[0].text)parsed.primitive=emitted[0].item;record.cache.set(source,parsed);return parsed;
+ const emitted=[];parsed=parseSelector(source,{window:record.window,emitPredicate(item){const index=record.predicates.push(item)-1,text=`:${internal}(${index})`;emitted.push({item,text});return text;}});if(emitted.length===1&&parsed.compiled===emitted[0].text)parsed.primitive=emitted[0].item;const conjunction=emitted.map(entry=>entry.text).join('');if(conjunction&&(parsed.compiled===conjunction||parsed.compiled==='*'+conjunction))parsed.conjunction=emitted.map(entry=>entry.item);record.cache.set(source,parsed);return parsed;
 }
 function matcher(record){
  if(record.matcher){record.matcher.Snapshot.root=wrapperForImpl(record.documentImpl.documentElement);return record.matcher;}
@@ -199,16 +199,16 @@ function matcher(record){
  record.matcher=engine;return engine;
 }
 function match(record,selector,element,scope=element){
- const parsed=compiled(record,selector);if(!record.documentImpl.documentElement)return false;if(parsed.primitive)return predicate(record,element,parsed.primitive);
+ const parsed=compiled(record,selector);if(!record.documentImpl.documentElement)return false;if(parsed.primitive)return predicate(record,element,parsed.primitive);if(parsed.conjunction)return parsed.conjunction.every(item=>predicate(record,element,item));if(parsed.groups.every(group=>group.required.some(item=>!predicate(record,element,item))))return false;
  const engine=matcher(record),previous=engine.Snapshot.from;engine.Snapshot.from=scope;
  try{return engine.match(parsed.compiled,element);}finally{engine.Snapshot.from=previous;}
 }
 function select(record,root,selector,first){
  const parsed=compiled(record,selector);if(!record.document.documentElement)return first?null:[];
  // Validate/compile even if the queried subtree has no candidate elements.
- match(record,selector,record.document.documentElement,wrapperForImpl(root));
+ const universal=parsed.compiled==='*';if(!universal)match(record,selector,record.document.documentElement,wrapperForImpl(root));
  const result=[];const scope=wrapperForImpl(root);
- for(const node of domSymbolTree.treeIterator(root)){if(node===root||node.nodeType!==1)continue;if(match(record,selector,wrapperForImpl(node),scope)){if(first)return node;result.push(node);}}
+ for(const node of domSymbolTree.treeIterator(root)){if(node===root||node.nodeType!==1)continue;if(universal||match(record,selector,wrapperForImpl(node),scope)){if(first)return node;result.push(node);}}
  return first?null:result;
 }
 for(const Interface of [DocumentImpl,ElementImpl,FragmentImpl])for(const name of ['querySelector','querySelectorAll']){
@@ -253,3 +253,9 @@ export function matchesInScope(element,selector,scope=element.ownerDocument.docu
 
 // Host cascade code may reuse its genuine document record and scoping root.
 export function createScopedMatcher(document,scope=document.documentElement){const record=RECORDS.get(implForWrapper(document));if(!record)return(selector,element)=>element.matches(selector);return(selector,element)=>{try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}};}
+
+// Conservative stylesheet candidate index: only direct type requirements of
+// every outer selector branch qualify. Logical functions remain unindexed.
+export function selectorSubjectTypes(source){
+ try{const parsed=parseSelector(source),types=[];for(const group of parsed.groups){const type=group.required.find(item=>item.kind==='type'&&item.name!=='*');if(!type)return null;types.push(type.name);}return types;}catch{return null;}
+}

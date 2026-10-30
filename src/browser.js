@@ -1,3 +1,4 @@
+import {prepareUtilityPlatform} from './utility-platform.js';
 import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
 import {createInvocationTrampoline} from './invocation.js';
 import {captureWorkerCreator} from './worker-apis.js';
@@ -37,6 +38,7 @@ import { installShadowDOM } from './shadow.js';
 import { installSerialization } from './serialization.js';
 import { installFrames } from './frames.js';
 import { installFetch } from './fetch.js';
+import { installAbortSignals } from './abort-signals.js';
 import { loadCollectionsBinding, installCollections } from './collections.js';
 import { installStyles } from './styles.js';
 import { installGeometry } from './geometry.js';
@@ -215,8 +217,7 @@ export class Page extends EventEmitter {
       installIntersection(this, window, installLayout(this, window, this.viewport));
       installResizeObserver(this, window, this.layout);
       installPerformance(this, window);
-      window.AbortController = AbortController;
-      window.AbortSignal = AbortSignal;
+      installAbortSignals(this, window);
       window.TextEncoder = TextEncoder;
       window.TextDecoder = TextDecoder;
       window.structuredClone = structuredClone;
@@ -252,7 +253,10 @@ export class Page extends EventEmitter {
         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
       });
     });
-    for (const { source } of this.newDocumentScripts.values()) {
+    prepareUtilityPlatform(window);
+    (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
+    for (const { source,worldName } of this.newDocumentScripts.values()) {
+      if(worldName)continue;
       try { window.eval(source); } catch (error) { this.emit('pageError', error); }
     }
   }

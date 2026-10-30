@@ -118,7 +118,7 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Experimental storage | `--experimental-features serviceworker` enables secure-context Cache and threaded service-worker lifecycle; in-memory context storage |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
-| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; by-reference serialization preserves thrown primitives/Symbols without calling authored getters |
+| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, actual isolated VM worlds over shared DOM implementations, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; by-reference serialization preserves thrown primitives/Symbols without calling authored getters |
 | CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, nested frame/shadow keyboard focus, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
 | Rendering | Text-only CLI dumps, CDP screenshots/PDF streams and MCP screenshots, with real font rasterization and selectable PDF text |
@@ -142,8 +142,10 @@ takeover, fetch interception, updates and persistence remain incomplete. Large H
 tasks, allowing actual mutation delivery during loading. Classic scripts now drain actual queued microtasks before clearing currentScript,
 and loading/inactive-frame writes have bounded native controls. Frame POST
 navigation, advanced shadow CSS, flattened shadow/frame pointer/Tab input and full
-CSS behavior remain unfinished. Utility-world IDs share their owning frame's
-JS realm. Some configuration commands still
+CSS behavior remain unfinished. Utility worlds have independent globals,
+constructors and DOM wrapper expandos, with actual observer/geometry/font
+producers for the supported workflow. Their CSS/XML/SVG/messaging decorators
+and retired-frame lifetime remain incomplete. Some configuration commands still
 only acknowledge requests. Markdown and structured metadata are subsets, not byte-identical
 Lightpanda output. `done` does not track every future timer. Documents are decoded
 as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly.

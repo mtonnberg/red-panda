@@ -1,3 +1,5 @@
+import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+import {canonicalUtilityValue} from './isolated-world.js';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { types } from 'node:util';
@@ -47,6 +49,8 @@ class Session {
     this.listeners = [];
     this.nextBackendNodeId = 1;
     this.lifecycle = false;
+    initializeUtilitySession(this,resetRuntime);
+    this.utility = utilitySessionController(this,ProtocolError);
     const listen = (event, callback) => { page.on(event, callback); this.listeners.push([event, callback]); };
     listen('navigationStarted', () => {
       this.event('Page.frameStartedNavigating', { frameId: page.frameId, url: page.url, loaderId: page.loaderId, navigationType: 'differentDocument' });
@@ -70,10 +74,7 @@ class Session {
     });
     listen('contextCreated', () => {
       this.contextCreated();
-      for (const name of this.worldNames) {
-        const id = page.browser.nextExecutionContext++;
-        this.worlds.set(name, id); this.contextCreated(name, id);
-      }
+      for (const name of this.worldNames) this.isolatedWorld(page,name);
     });
     listen('frameAttached', params => this.event('Page.frameAttached', params));
     listen('frameDetached', params => this.event('Page.frameDetached', params));
@@ -180,34 +181,27 @@ class Session {
     } else this.idleTimer = setTimeout(() => this.checkIdle(), 100);
   }
   contextCreated(name = '', id = this.page.executionContextId, page = this.page) {
+    if(this.utility.contextCreated(name,id,page))return;
     for (const binding of this.bindings) this.installBinding(binding, page);
     this.event('Runtime.executionContextCreated', { context: {
-      id, origin: page.securityOrigin ?? new URL(page.url).origin, name, uniqueId: randomUUID(),
+      id, origin: page.securityOrigin ?? new URL(page.url).origin, name, uniqueId: this.utility.uniqueId(page),
       auxData: { isDefault: !name, type: name ? 'isolated' : 'default', frameId: page.frameId },
     } });
+    this.utility.mainContextAnnounced(page);
   }
   isolatedWorld(page, name) {
-    if (page === this.page) {
-      let id = this.worlds.get(name);
-      if (!id) { id = page.browser.nextExecutionContext++; this.worlds.set(name, id); this.contextCreated(name, id, page); }
-      return id;
-    }
-    const key = `${page.frameId}\0${name}`;
-    let world = this.frameWorlds.get(key);
-    if (!world) {
-      world = { id: page.browser.nextExecutionContext++, page, name }; this.frameWorlds.set(key, world);
-      this.contextCreated(name, world.id, page);
-    }
-    return world.id;
+    return this.utility.isolatedWorld(page,name);
   }
   executionPage(id) {
-    if (id === undefined || id === this.page.executionContextId || [...this.worlds.values()].includes(id)) return this.page;
+    const utility=this.utility.executionPage(id);
+    if(utility)return utility;
+    if (id === undefined || id === this.page.executionContextId) return this.page;
     const found = this.page.frames?.findContext(id)?.page;
     if (found) return found;
-    for (const world of this.frameWorlds.values()) if (world.id === id && !world.page.closed) return world.page;
     throw new ProtocolError('Cannot find context with specified id');
   }
   valueContext(value) {
+    const utility=this.utility.valueContext(value);if(utility!==undefined)return utility;
     const document = ownerDocumentOf(value);
     for (const page of this.page.frames?.frames.values() ?? []) {
       if (document && document === page.dom.window.document || value === page.dom.window) return page.executionContextId;
@@ -215,9 +209,7 @@ class Session {
     return this.page.executionContextId;
   }
   installBinding(name, page = this.page) {
-    page.dom.window[name] = payload => this.event('Runtime.bindingCalled', {
-      name, payload: String(payload), executionContextId: page.executionContextId,
-    });
+    return this.utility.installBinding(name,page);
   }
   remote(value, byValue = false, group, contextId = this.valueContext(value)) {
     const primitive = primitiveRemoteValue(value);
@@ -267,14 +259,16 @@ class Session {
     if (supportsInput(method)) return runInput(this, method, params);
     if (supportsRuntime(method)) return runRuntime(this, method, params);
     if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
+      if(method==='Runtime.enable'&&this.domains.has('Runtime'))return {};
       this.domains.add(method.split('.')[0]);
       if (method === 'Runtime.enable') {
         this.contextCreated();
         for (const child of page.frames?.frames.values() ?? []) if (child !== page) this.contextCreated('', child.executionContextId, child);
+        this.utility.runtimeEnabled();
       }
       return {};
     }
-    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { this.domains.delete(method.split('.')[0]); return {}; }
+    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { if(method==='Runtime.disable')this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
     switch (method) {
       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
       case 'Page.getLayoutMetrics': {
@@ -319,6 +313,8 @@ class Session {
         return { frameId: page.frameId, loaderId: page.loaderId };
       }
       case 'Page.createIsolatedWorld': {
+        if(params.worldName===undefined)throw new ProtocolError('MissingField',-31998);
+        if(typeof params.worldName!=='string')throw new ProtocolError('UnexpectedToken',-31998);
         const target = params.frameId === page.frameId ? page : page.frames?.findFrame(params.frameId);
         if (!target) throw new ProtocolError('Unknown frame');
         const name = params.worldName ?? '';
@@ -352,7 +348,10 @@ class Session {
         if (invoking && params.objectId !== undefined) this.object(params.objectId);
         const receiver = invoking ? this.objects.get(params.objectId) : undefined;
         const group = params.objectGroup !== undefined ? params.objectGroup : receiver?.group;
-        const contextId = params.contextId ?? params.executionContextId ?? receiver?.contextId ?? page.executionContextId;
+        // Caller mutual-exclusion and receiver validation above precede unique
+        // context lookup. The selected record owns a real VM context.
+        const uniqueId=params.uniqueContextId===undefined?undefined:this.utility.uniqueContextId(params.uniqueContextId);
+        const contextId = params.contextId ?? params.executionContextId ?? uniqueId ?? receiver?.contextId ?? page.executionContextId;
         let target = page, value;
         try {
           target = this.executionPage(contextId);
@@ -385,14 +384,8 @@ class Session {
       }
       case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
       case 'Runtime.releaseObjectGroup': for (const [id, object] of this.objects) if (object.group === params.objectGroup) this.objects.delete(id); return {};
-      case 'Runtime.addBinding':
-        this.bindings.add(params.name);
-        for (const target of page.frames?.frames.values() ?? [page]) this.installBinding(params.name, target);
-        return {};
-      case 'Runtime.removeBinding':
-        this.bindings.delete(params.name);
-        for (const target of page.frames?.frames.values() ?? [page]) delete target.dom.window[params.name];
-        return {};
+      case 'Runtime.addBinding': this.utility.addBinding(params);return {};
+      case 'Runtime.removeBinding': this.utility.removeBinding(params.name);return {};
       case 'Runtime.runIfWaitingForDebugger': return {};
       case 'Network.getCookies': {
         const urls = params.urls ?? [page.url];
@@ -478,11 +471,13 @@ class Session {
     }
   }
   backendId(node) {
+    node=canonicalUtilityValue(node);
     this.nodes ??= new Map();
     for (const [id, value] of this.nodes) if (value === node) return id;
     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
   }
   close() {
+    this.utility.close();
     clearTimeout(this.idleTimer);
     resetDOM(this);
     resetRuntime(this);

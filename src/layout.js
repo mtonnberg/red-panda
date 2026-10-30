@@ -8,6 +8,7 @@ import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision } from './styl
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
+const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const LAYOUTS=new WeakMap(),COMPUTED_VIEWS=new WeakMap();
 const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
@@ -44,26 +45,29 @@ export function createLayout(window, options = {}) {
     const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,implForWrapper(document)._version,width,height]);
     if(fastKey!==null&&cachedFastKey===fastKey)return cached;
     const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
-    const stack = [document], shadowRoots = [], tokens = [width, height, styleRevision??getStyleRevision(window)];
-    while (stack.length || shadowRoots.length) {
-      if (!stack.length) stack.push(shadowRoots.shift());
-      const node = stack.pop();
-      if (!identities.has(node)) identities.set(node, nextIdentity++);
-      order.set(node, nodes.length); nodes.push(node);
-      tokens.push(identities.get(node), node.nodeType, node.nodeValue);
-      if (node.attributes) tokens.push([...node.attributes].flatMap(attribute => [attribute.name, attribute.value]));
-      const shadow = implForWrapper(node)?._shadowRoot;
-      if (shadow) shadowRoots.push(wrapperForImpl(shadow));
-      for (let index = node.childNodes.length - 1; index >= 0; index--) stack.push(node.childNodes[index]);
-    }
-    for (const sheet of document.styleSheets) {
-      try { tokens.push([...sheet.cssRules].map(rule => rule.cssText)); } catch { tokens.push(null); }
-    }
-    const key = JSON.stringify(tokens);
-    if (key === cachedKey) return cached;
+    const childNodeLists=new Map(),childElementLists=new Map();
+    const children=node=>{let list=childNodeLists.get(node);if(!list){list=Array.from(domSymbolTree.childrenIterator(implForWrapper(node)),wrapperForImpl);childNodeLists.set(node,list);}return list;};
+    const elements=node=>{let list=childElementLists.get(node);if(!list){list=children(node).filter(child=>child.nodeType===1);childElementLists.set(node,list);}return list;};
+    const documentImpl=implForWrapper(document),shadowRoots=[],tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
+    const appendTree=root=>{
+      for(const implementation of domSymbolTree.treeIterator(root)){
+        const node=wrapperForImpl(implementation);
+        order.set(node,nodes.length);nodes.push(node);
+        if(tokens){
+          if(!identities.has(node))identities.set(node,nextIdentity++);
+          tokens.push(identities.get(node),node.nodeType,node.nodeValue);
+          if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
+        }
+        if(implementation._shadowRoot)shadowRoots.push(implementation._shadowRoot);
+      }
+    };
+    appendTree(documentImpl);for(let index=0;index<shadowRoots.length;index++)appendTree(shadowRoots[index]);
+    if(tokens)for(const sheet of document.styleSheets){try{tokens.push([...sheet.cssRules].map(rule=>rule.cssText));}catch{tokens.push(null);}}
+    const key=fastKey??JSON.stringify(tokens);
+    if(key===cachedKey)return cached;
     let documentHeight = nodes.length * 5;
     const style = node => {
-      if(!computed.has(node)){const projected=getLayoutStyle(node);if(projected)computed.set(node,projected);else{const raw=rawComputedStyle(node);computed.set(node,new Proxy(raw,{get(target,key){if(key==='display')return target.display||'inline';if(key==='float')return target.float||'none';if(key==='position')return target.position||'static';return Reflect.get(target,key,target);}}));}}
+      if(!computed.has(node)){const projected=getLayoutStyle(node,styleRevision);if(projected)computed.set(node,projected);else{const raw=rawComputedStyle(node);computed.set(node,new Proxy(raw,{get(target,key){if(key==='display')return target.display||'inline';if(key==='float')return target.float||'none';if(key==='position')return target.position||'static';return Reflect.get(target,key,target);}}));}}
       return computed.get(node);
     };
     function isHidden(node) {
@@ -77,8 +81,8 @@ export function createLayout(window, options = {}) {
       const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
       hidden.set(node, result); return result;
     }
-    const textHeight=node=>nativeTextHeight([...node.childNodes].filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(style(node).width),Number.parseFloat(style(node).fontSize)||16,style(node).whiteSpace==='nowrap'||style(node).textWrap==='nowrap'||style(node).textWrapMode==='nowrap');
-    const horizontal=createHorizontalLayout(window,{style,hidden:isHidden,viewportWidth:width});
+    const textHeight=node=>nativeTextHeight(children(node).filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(style(node).width),Number.parseFloat(style(node).fontSize)||16,style(node).whiteSpace==='nowrap'||style(node).textWrap==='nowrap'||style(node).textWrapMode==='nowrap');
+    const horizontal=createHorizontalLayout(window,{style,hidden:isHidden,viewportWidth:width,styleRevision});
     function size(node) {
       if (sizes.has(node)) return sizes.get(node);
       let value;
@@ -90,10 +94,10 @@ export function createLayout(window, options = {}) {
         const explicitWidth = dimension(declaration.width);
         const explicitHeight = dimension(declaration.height);
         let childHeight = 0;
-        for(const child of node.children??[])if(!isHidden(child))childHeight+=dimension(style(child).height)??5;
+        for(const child of elements(node))if(!isHidden(child))childHeight+=dimension(style(child).height)??5;
         childHeight = Math.max(5, childHeight,textHeight(node));
         let advance = 0;
-        for (const child of node.childNodes) advance += sizes.get(child)?.advance ?? sizes.get(child)?.width ?? 0;
+        for (const child of children(node)) advance += sizes.get(child)?.advance ?? sizes.get(child)?.width ?? 0;
         advance = explicitWidth ?? Math.max(5, advance);
         const block = blockTags.has(node.localName) && !['inline', 'inline-block'].includes(declaration.display);
         value = {
@@ -104,13 +108,26 @@ export function createLayout(window, options = {}) {
       }
       sizes.set(node, value); return value;
     }
+    const siblingAdvances=new Map();
+    function siblingAdvance(node){
+      if(siblingAdvances.has(node))return siblingAdvances.get(node);
+      const parent=domSymbolTree.parent(implForWrapper(node));if(!parent)return 0;
+      let sum=0;
+      for(const implementation of domSymbolTree.childrenIterator(parent)){
+        const sibling=wrapperForImpl(implementation);siblingAdvances.set(sibling,sum);
+        if(isHidden(sibling))continue;
+        if(sibling.nodeType===1)sum+=horizontal.advance(sibling);
+        else if(sibling.nodeType===3&&/\S/.test(sibling.data))sum+=5;
+      }
+      return siblingAdvances.get(node)??0;
+    }
     function position(node) {
       if (positions.has(node)) return positions.get(node);
       if (isHidden(node)) { positions.set(node, ZERO); return ZERO; }
       const parent = node.parentNode ?? node.host;
       const parentX = parent ? position(parent).x : 0;
       let x = parentX;
-      for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) x += size(sibling).advance ?? size(sibling).width;
+      x+=siblingAdvance(node);
       if(node.nodeType===1)x+=horizontal.translation(node);
       const value = rectValue(x, order.get(node) * 5, size(node).width, size(node).height);
       positions.set(node, value); return value;
@@ -120,7 +137,7 @@ export function createLayout(window, options = {}) {
     // measured root uses inline child advances and nested inline overflow;
     // stylesheet-only dimensions still affect individual element rectangles.
     let directHeight = 0;
-    for (const child of document.body?.childNodes ?? []) {
+    for (const child of document.body?children(document.body):[]) {
       if (!isHidden(child)) directHeight += dimension(child.style?.height) ?? 5;
     }
     documentHeight = Math.max(documentHeight, directHeight);
@@ -136,7 +153,7 @@ export function createLayout(window, options = {}) {
       return { rect: position(node), rendered: true };
     }
     cachedKey = key;cachedFastKey=fastKey;
-    cached = { nodes, style, record, horizontal, isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of node.children??[])if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
+    cached = { nodes, style, record, horizontal, isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
     return cached;
   }
 

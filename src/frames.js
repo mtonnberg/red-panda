@@ -1,4 +1,5 @@
 import { completeInitialBlankFrame } from './document-reset.js';
+import { createInvocationTrampoline } from './invocation.js';
 import { installListenerOwnership, createOwnedWindow } from './listener-ownership.js';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
@@ -175,10 +176,11 @@ class FramePage extends EventEmitter {
     finally { if (!this.closed) this.reconcileURL(); }
   }
   callFunction(declaration, thisArg, args = []) {
-    this.current(); const key = `__redpanda_frame_${randomUUID().replaceAll('-', '')}`;
-    this.dom.window[key] = { thisArg, args };
-    try { return this.evaluate(`(${declaration}\n).apply(globalThis[${JSON.stringify(key)}].thisArg, globalThis[${JSON.stringify(key)}].args)`); }
-    finally { delete this.dom.window[key]; }
+    this.current();
+    try {
+      return createInvocationTrampoline(this.dom.getInternalVMContext()).invokeDeclaration(declaration, thisArg, args,
+        {timeout:Math.min(this.timeout ?? 10000,2000),displayErrors:false});
+    } finally { if (!this.closed) this.reconcileURL(); }
   }
   referrerFor(url, source = this.url) { return this.registry.page.referrerFor(url, source); }
   async fetch(input, init = {}, type = 'Fetch') {

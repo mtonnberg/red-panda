@@ -17,10 +17,11 @@ function roots(a, b, c) {
   return discriminant < 0 ? [] : [(-b + Math.sqrt(discriminant)) / (2*a), (-b - Math.sqrt(discriminant)) / (2*a)];
 }
 function flattenBezier(controls) {
+  const tolerance = Math.max(.001, controls.slice(1).reduce((sum,p,i) => sum + Math.hypot(p.x-controls[i].x,p.y-controls[i].y), 0) * 1e-6);
   const points = [controls[0]], midpoint = (a,b) => point((a.x+b.x)/2,(a.y+b.y)/2);
   function distance(p,a,b) { const x=b.x-a.x,y=b.y-a.y,squared=x*x+y*y,t=squared?Math.max(0,Math.min(1,((p.x-a.x)*x+(p.y-a.y)*y)/squared)):0;return Math.hypot(p.x-a.x-t*x,p.y-a.y-t*y); }
   function subdivide(values,depth) {
-    if(depth===10||Math.max(...values.slice(1,-1).map(p=>distance(p,values[0],values.at(-1))))<=.001){points.push(values.at(-1));return;}
+    if(depth===10||Math.max(...values.slice(1,-1).map(p=>distance(p,values[0],values.at(-1))))<=tolerance){points.push(values.at(-1));return;}
     const levels=[values];while(levels.at(-1).length>1){const row=levels.at(-1);levels.push(row.slice(1).map((p,i)=>midpoint(row[i],p)));}
     subdivide(levels.map(row=>row[0]),depth+1);subdivide(levels.map(row=>row.at(-1)).reverse(),depth+1);
   }

@@ -1,3 +1,5 @@
+import {canonicalUtilityValue} from './isolated-world.js';
+import {wrapUtilityDOMNode} from './world-sessions.js';
 import { randomUUID } from 'node:crypto';
 import { createInternalMutationObserver } from './mutations.js';
 
@@ -48,7 +50,7 @@ function nodeFor(session, params, identifiers = ['nodeId', 'backendNodeId', 'obj
   let node;
   if (key === 'objectId') {
     if (typeof params.objectId !== 'string') throw error('Invalid object identifier');
-    node = session.object(params.objectId);
+    node = canonicalUtilityValue(session.object(params.objectId));
   } else {
     if (!Number.isInteger(params[key]) || params[key] <= 0) throw error('Invalid DOM node identifier');
     node = session.nodes?.get(params[key]);
@@ -222,8 +224,8 @@ export function runDOM(session, method, params = {}) {
           else if (params.executionContextId !== session.page.executionContextId && ![...(session.worlds?.values() ?? [])].includes(params.executionContextId)) throw error('Cannot find context with specified id');
         }
         const node = nodeFor(session, params, ['nodeId', 'backendNodeId']);
-        if (params.executionContextId !== undefined && (node.ownerDocument ?? node) !== page.dom.window.document) throw error('Node belongs to a different frame');
-        return { object: session.remote(node, false, params.objectGroup, params.executionContextId) };
+        if (params.executionContextId !== undefined && (node.ownerDocument ?? node) !== canonicalUtilityValue(page.dom.window.document)) throw error('Node belongs to a different frame');
+        return { object: session.remote(wrapUtilityDOMNode(session,node,params.executionContextId), false, params.objectGroup, params.executionContextId) };
       }
       case 'DOM.getFrameOwner': {
         const frame = session.page.frames?.findFrame(params.frameId);

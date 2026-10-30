@@ -1,0 +1,422 @@
+diff --git a/src/isolated-world.js b/src/isolated-world.js
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,4 @@
++import {registerPlatformFactory} from './platform-factories.js';
+ // Independent genuine VM/IDL-world prototype. Generated wrapper source comes
+ // from the pinned existing jsdom dependency; no target engine source is used.
+ import vm from 'node:vm';
+@@ -26,7 +27,7 @@
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+  const localUtils=utilsModule.exports,modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
+  const metadata={context,global,mainWindow,signal,disposed:false};const pendingFactories=[];let factoryReady=false;
+- const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
++ const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);registerPlatformFactory(wrapper,{kind:interfaceName,implementation:impl,globalObject:global});if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
+  const utilityPrototypes=new Map();
+  const mainPrototypes=new Map(),observerImpls=new Set(),listeners=[],timers=new Set();let disposed=false;
+  const requireLive=()=>{if(disposed)throw new Error('Isolated world has been disposed');};
+diff --git a/src/world-sessions.js b/src/world-sessions.js
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,7 @@
++import {installFonts} from './fonts.js';
++import {installUtilityLayout} from './utility-layout.js';
++import {installUtilityAnimationFrame} from './utility-platform.js';
++import {installUtilityIntersection} from './utility-observers.js';
+ import vm from 'node:vm';
+ import {randomUUID} from 'node:crypto';
+ import {createRequire} from 'node:module';
+@@ -25,7 +29,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- record.global=record.controller.global;record.context=record.controller.context;record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ record.global=record.controller.global;record.context=record.controller.context;installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {prepareUtilityPlatform} from './utility-platform.js';
+ import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
+ import {createInvocationTrampoline} from './invocation.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+@@ -252,6 +253,7 @@
+         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+       });
+     });
++    prepareUtilityPlatform(window);
+     (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
+     for (const { source,worldName } of this.newDocumentScripts.values()) {
+       if(worldName)continue;
+diff --git a/src/utility-platform.js b/src/utility-platform.js
+new file mode 100644
+--- /dev/null
++++ b/src/utility-platform.js
+@@ -0,0 +1,39 @@
++// Trusted original document scheduling captured before author code. Each public
++// entry and callback executes in its own real utility VM; no main API is aliased.
++import vm from 'node:vm';
++import { createInvocationTrampoline } from './invocation.js';
++const prepared = new WeakMap();
++const apply = Reflect.apply;
++export function prepareUtilityPlatform(window) {
++  if (!prepared.has(window)) prepared.set(window, {
++    request:window.requestAnimationFrame, cancel:window.cancelAnimationFrame,
++    performance:window.performance,
++  });
++}
++function animationFactory(g,bridge) {
++  const methods={
++    requestAnimationFrame(callback) { if(typeof callback!=='function')throw new TypeError('invalid argument');return bridge.request(callback); },
++    cancelAnimationFrame(handle) { const value=+handle;bridge.cancel(Number.isFinite(value)?Math.trunc(value)>>>0:0); },
++  };
++  for(const[name,value]of Object.entries(methods))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:true});
++}
++export function installUtilityAnimationFrame(page,world,main=page.dom.window,{report=error=>page.emit('pageError',error)}={}) {
++  const source=prepared.get(main);
++  if(!source||typeof source.request!=='function'||typeof source.cancel!=='function')throw new Error('The actual document scheduler must be prepared before author code');
++  const pending=new Set(),signal=page.documentAbort.signal,invocation=createInvocationTrampoline(world.context);
++  let disposed=false;
++  // This is a genuine generated Performance wrapper over the shared document
++  // implementation. The main wrapper and its authored expandos are not reused.
++  Object.defineProperty(world.global,'performance',{value:world.wrap(source.performance),configurable:true,enumerable:true});
++  const bridge={
++    request(callback) {
++      if(disposed)return 0;
++      let id;id=apply(source.request,main,[timestamp=>{pending.delete(id);if(disposed)return;try{invocation.invoke(callback,world.global,[timestamp],{timeout:Math.min(page.timeout,2000),displayErrors:false});}catch(error){report(error);}}]);
++      pending.add(id);return id;
++    },
++    cancel(handle) {apply(source.cancel,main,[handle]);pending.delete(handle);},
++  };
++  vm.compileFunction(`(${animationFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:world.context})(bridge);
++  const dispose=()=>{if(disposed)return;disposed=true;for(const id of pending)apply(source.cancel,main,[id]);pending.clear();signal.removeEventListener('abort',dispose);};
++  signal.addEventListener('abort',dispose,{once:true});if(signal.aborted)dispose();return {dispose};
++}
+diff --git a/src/utility-observers.js b/src/utility-observers.js
+new file mode 100644
+--- /dev/null
++++ b/src/utility-observers.js
+@@ -0,0 +1,95 @@
++// Actual utility-realm observation over the existing shared layout. The public
++// classes, private state, records and callback arrays are allocated in that VM.
++import vm from 'node:vm';
++import { performance } from 'node:perf_hooks';
++import { canonicalUtilityValue } from './isolated-world.js';
++import { nodeIdentity } from './remote-values.js';
++import { createInternalMutationObserver } from './mutations.js';
++import { getLayoutStyle } from './styles.js';
++
++function intersectionFactory(g, bridge) {
++  const states = new WeakMap(), entries = new WeakMap(), active = new Set();
++  const apply = Reflect.apply, rect = DOMRectReadOnly.fromRect;
++  let queued = false, timer, stopped = false;
++  const brand = observer => { const state = states.get(observer); if (!state) throw new TypeError('Illegal invocation'); return state; };
++  const element = value => { if (!bridge.isElement(value)) throw new TypeError('invalid argument'); };
++  function margins(input = '0px') {
++    const parts = String(input).replace(/\/\*[\s\S]*?\*\//g, ' ').trim().split(/\s+/).filter(Boolean);
++    if (!parts.length) parts.push('0px');
++    if (parts.length > 4 || parts.some(value => !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?(?:px|%)$/i.test(value))) throw new DOMException('The string did not match the expected pattern', 'SyntaxError');
++    const values = parts.map(value => ({ value: Number.parseFloat(value), unit: value.endsWith('%') ? '%' : 'px' }));
++    const [a, b = a, c = a, d = b] = values;
++    return [a, b, c, d];
++  }
++  const marginText = values => values.map(part => `${part.value}${part.unit}`).join(' ');
++  class IntersectionObserverEntry { constructor() { throw new TypeError('Illegal Constructor'); } }
++  for (const name of ['time','target','rootBounds','boundingClientRect','intersectionRect','isIntersecting','intersectionRatio','isVisible']) {
++    Object.defineProperty(IntersectionObserverEntry.prototype,name,{configurable:true,enumerable:true,get() { if (!entries.has(this)) throw new TypeError('Illegal invocation'); return entries.get(this)[name]; }});
++  }
++  Object.defineProperty(IntersectionObserverEntry.prototype,Symbol.toStringTag,{value:'IntersectionObserverEntry',configurable:true});
++  function measure(state,target) {
++    const measured=bridge.measure(target,state.root),bounds=measured.bounds;
++    let root=measured.root;
++    const offsets=state.margin.map(part=>part.unit==='%'?part.value*root.width/100:part.value);
++    root={x:root.x-offsets[3],y:root.y-offsets[0],width:root.width+offsets[3]+offsets[1],height:root.height+offsets[0]+offsets[2]};
++    const left=Math.max(bounds.left,root.x),top=Math.max(bounds.top,root.y),right=Math.min(bounds.right,root.x+root.width),bottom=Math.min(bounds.bottom,root.y+root.height);
++    const intersects=measured.validRoot&&measured.rendered&&right>=left&&bottom>=top,area=bounds.width*bounds.height;
++    const intersection={x:left,y:top,width:Math.max(0,right-left),height:Math.max(0,bottom-top)};
++    const entry=Object.create(IntersectionObserverEntry.prototype);
++    entries.set(entry,{time:bridge.now(),target,rootBounds:apply(rect,DOMRectReadOnly,[root]),boundingClientRect:apply(rect,DOMRectReadOnly,[bounds]),intersectionRect:apply(rect,DOMRectReadOnly,[intersects?intersection:{x:0,y:0,width:0,height:0}]),isIntersecting:intersects,intersectionRatio:intersects?(area?intersection.width*intersection.height/area:1):0,isVisible:intersects&&measured.visible});
++    return entry;
++  }
++  function arm() { if (!stopped&&active.size&&timer===undefined) timer=bridge.setTimer(()=>{timer=undefined;schedule();},16); }
++  function deliver() {
++    queued=false;if(stopped)return;
++    for(const observer of active){const state=states.get(observer);for(const[target,previous]of state.targets){if(!bridge.connected(target))continue;const entry=measure(state,target),index=state.thresholds.filter(value=>value<=entry.intersectionRatio).length;if(!previous||previous.index!==index||previous.intersecting!==entry.isIntersecting){state.records.push(entry);state.targets.set(target,{index,intersecting:entry.isIntersecting});}}}
++    for(const observer of [...active]){const state=states.get(observer),records=state.records.splice(0);if(records.length)try{apply(state.callback,observer,[records,observer]);}catch(error){bridge.report(error);}}
++    arm();
++  }
++  function schedule() { if(!stopped&&!queued&&active.size){queued=true;bridge.microtask(deliver);} }
++  class IntersectionObserver {
++    constructor(callback,options={}) {
++      if(typeof callback!=='function')throw new TypeError('invalid argument');
++      options=options??{};const root=options.root??null;if(root!==null&&!bridge.isRoot(root))throw new TypeError('invalid argument');
++      let thresholds=Array.isArray(options.threshold)?Array.from(options.threshold,Number):[Number(options.threshold??0)];
++      if(thresholds.some(value=>!Number.isFinite(value)))throw new TypeError('invalid argument');
++      if(thresholds.some(value=>value<0||value>1))throw new RangeError('');
++      if(!thresholds.length)thresholds=[0];thresholds=Object.freeze(thresholds.sort((a,b)=>a-b));
++      const margin=margins(options.rootMargin),scrollMargin=margins(options.scrollMargin),trackVisibility=Boolean(options.trackVisibility),delay=Math.max(trackVisibility?100:0,Math.trunc(Number(options.delay)||0));
++      states.set(this,{callback,root,thresholds,margin,rootMargin:marginText(margin),scrollMargin:marginText(scrollMargin),trackVisibility,delay,targets:new Map(),records:[]});
++    }
++    observe(target){const state=brand(this);element(target);if(!state.targets.has(target))state.targets.set(target,null);bridge.watch(target);active.add(this);schedule();}
++    unobserve(target){const state=brand(this);element(target);state.targets.delete(target);if(!state.targets.size)active.delete(this);if(!active.size&&timer!==undefined){bridge.clearTimer(timer);timer=undefined;}}
++    disconnect(){const state=brand(this);state.targets.clear();state.records=[];active.delete(this);if(!active.size&&timer!==undefined){bridge.clearTimer(timer);timer=undefined;}}
++    takeRecords(){return brand(this).records.splice(0);}
++  }
++  for(const name of ['root','rootMargin','scrollMargin','thresholds','trackVisibility','delay'])Object.defineProperty(IntersectionObserver.prototype,name,{configurable:true,enumerable:true,get(){return brand(this)[name];}});
++  Object.defineProperty(IntersectionObserver.prototype,Symbol.toStringTag,{value:'IntersectionObserver',configurable:true});
++  Object.assign(g,{IntersectionObserver,IntersectionObserverEntry});
++  return {schedule,dispose(){stopped=true;active.clear();if(timer!==undefined)bridge.clearTimer(timer);timer=undefined;}};
++}
++
++export function installUtilityIntersection(page,world,main=page.dom.window) {
++  const document=main.document,signal=page.documentAbort.signal;
++  const canonical=canonicalUtilityValue;
++  const identify=value=>nodeIdentity(canonical(value));
++  const owner=target=>{const doc=target.ownerDocument??target;return [...(page.registry?.frames.values()??page.frames?.frames.values()??[page])].find(candidate=>candidate.dom.window.document===doc)??page;};
++  let disposed=false,controller;const roots=new WeakSet();
++  const mutations=createInternalMutationObserver(main,()=>controller?.schedule());
++  const watch=target=>{const root=canonical(target).getRootNode();if(!roots.has(root)){roots.add(root);mutations.observe(root,{attributes:true,childList:true,subtree:true,characterData:true});}};
++  const bridge={
++    isElement:value=>identify(value)?.nodeType===1,
++    isRoot:value=>[1,9].includes(identify(value)?.nodeType),
++    connected:value=>{const node=canonical(value);return !disposed&&node.isConnected&&node.ownerDocument===document;},
++    measure(value,rootValue){const target=canonical(value),root=rootValue===null?null:canonical(rootValue),layout=owner(target).layout;
++      return {bounds:layout.rect(target),root:root?.nodeType===1?owner(root).layout.rect(root):{x:0,y:0,...layout.viewport},rendered:layout.rects(target).length>0,validRoot:root===null||root===document||root.contains(target),visible:getLayoutStyle(target)?.visibility!=='hidden'};},
++    now:()=>performance.now(),watch,
++    microtask:callback=>queueMicrotask(()=>{if(!disposed)callback();}),
++    setTimer:(callback,ms)=>setTimeout(()=>{if(!disposed)callback();},ms),clearTimer:timer=>clearTimeout(timer),
++    report:error=>{if(!disposed){const event=new world.global.ErrorEvent('error',{error,cancelable:true});if(world.global.dispatchEvent(event))page.emit('pageError',error);}},
++  };
++  controller=vm.compileFunction(`return (${intersectionFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:world.context})(bridge);
++  watch(document);const schedule=()=>controller.schedule();main.addEventListener('scroll',schedule);main.addEventListener('resize',schedule);
++  const dispose=()=>{if(disposed)return;disposed=true;controller.dispose();mutations.disconnect();main.removeEventListener('scroll',schedule);main.removeEventListener('resize',schedule);signal.removeEventListener('abort',dispose);};
++  signal.addEventListener('abort',dispose,{once:true});if(signal.aborted)dispose();return {schedule,dispose};
++}
+diff --git a/src/utility-layout.js b/src/utility-layout.js
+new file mode 100644
+--- /dev/null
++++ b/src/utility-layout.js
+@@ -0,0 +1,55 @@
++// Realm-local public geometry over the same authoritative private layout and
++// canonical DOM nodes used by privileged input. No DOM or layout is copied.
++import vm from 'node:vm';
++import { createRequire } from 'node:module';
++import { canonicalUtilityValue } from './isolated-world.js';
++import { nodeIdentity } from './remote-values.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++export function utilityLayoutFor(page,value) {
++  const node=canonicalUtilityValue(value),identity=nodeIdentity(node);
++  if(!identity||identity.nodeType!==1)throw new TypeError('Illegal invocation');
++  const document=identity.ownerDocument;
++  const registry=page.registry??page.frames;
++  const owner=[...(registry?.frames.values()??[page])].find(candidate=>candidate.dom.window.document===document)??page;
++  return {node,document,layout:owner.layout};
++}
++function geometryFactory(g,bridge) {
++  const Rect=DOMRect,states=new WeakMap();
++  const element=value=>{if(!bridge.isElement(value))throw new TypeError('Illegal invocation');return value;};
++  const unsigned=value=>{value=+value;return Number.isFinite(value)?Math.trunc(value)>>>0:0;};
++  class DOMRectList {
++    constructor(){throw new TypeError('Illegal Constructor');}
++    get length(){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this).length;}
++    item(index){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this)[unsigned(index)]??null;}
++    *[Symbol.iterator](){if(!states.has(this))throw new TypeError('Illegal invocation');yield* states.get(this);}
++  }
++  Object.defineProperty(DOMRectList.prototype,Symbol.toStringTag,{value:'DOMRectList',configurable:true});
++  Object.defineProperty(g,'DOMRectList',{value:DOMRectList,writable:true,configurable:true});
++  const rect=value=>new Rect(value.x,value.y,value.width,value.height);
++  const methods={
++    getBoundingClientRect(){return rect(bridge.rect(element(this)));},
++    getClientRects(){const result=Object.create(DOMRectList.prototype),values=Array.from(bridge.rects(element(this)),rect);states.set(result,values);for(let i=0;i<values.length;i++)Object.defineProperty(result,i,{value:values[i],enumerable:true,configurable:true});return result;},
++    scrollIntoView(){bridge.scrollIntoView(element(this));},
++    scrollIntoViewIfNeeded(){bridge.scrollIntoView(element(this));},
++  };
++  for(const[name,value]of Object.entries(methods))Object.defineProperty(Element.prototype,name,{value,writable:true,configurable:true,enumerable:true});
++  for(const name of ['clientWidth','clientHeight','scrollWidth','scrollHeight'])Object.defineProperty(Element.prototype,name,{configurable:true,enumerable:true,get(){return bridge.dimension(element(this),name);}});
++  for(const name of ['offsetWidth','offsetHeight','offsetTop','offsetLeft'])Object.defineProperty(HTMLElement.prototype,name,{configurable:true,enumerable:true,get(){return bridge.dimension(element(this),name);}});
++  for(const name of ['innerWidth','innerHeight','scrollX','scrollY','pageXOffset','pageYOffset'])Object.defineProperty(g,name,{configurable:true,enumerable:true,get(){return bridge.viewport(name);}});
++}
++export function installUtilityLayout(page,world,main=page.dom.window) {
++  const bridge={
++    isElement:value=>nodeIdentity(canonicalUtilityValue(value))?.nodeType===1,
++    rect:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rect(node);},
++    rects:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rects(node);},
++    scrollIntoView:value=>{const{node,layout}=utilityLayoutFor(page,value);layout.scrollIntoView(node);},
++    dimension(value,name){const{node,document,layout}=utilityLayoutFor(page,value);const root=utils.implForWrapper(node)===utils.implForWrapper(document).documentElement;
++      const axis=name.endsWith('Width')?'width':'height';
++      if(name.startsWith('client'))return root?layout.viewport[axis]:layout.dimension(node,axis);
++      if(name.startsWith('scroll'))return root?layout.documentSize[axis]:axis==='width'?layout.scrollWidth(node):layout.scrollHeight(node);
++      if(name==='offsetTop')return layout.absoluteRect(node).y;if(name==='offsetLeft')return layout.absoluteRect(node).x;
++      return layout.dimension(node,axis);},
++    viewport(name){const layout=page.layout;if(name==='innerWidth')return layout.viewport.width;if(name==='innerHeight')return layout.viewport.height;return ['scrollX','pageXOffset'].includes(name)?layout.scroll.x:layout.scroll.y;},
++  };
++  vm.compileFunction(`(${geometryFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:world.context})(bridge);
++}
+diff --git a/test/utility-platform.test.js b/test/utility-platform.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/utility-platform.test.js
+@@ -0,0 +1,53 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++import {createIsolatedWorld,canonicalUtilityValue} from '../src/isolated-world.js';
++import {installUtilityIntersection} from '../src/utility-observers.js';
++import {installUtilityAnimationFrame} from '../src/utility-platform.js';
++import {installUtilityLayout} from '../src/utility-layout.js';
++import {installFonts} from '../src/fonts.js';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t){const browser=new Browser({timeout:1000}),page=browser.createPage();await page.navigate('data:text/html,<div id="a" style="width:20px;height:30px">A</div>');const main=page.dom.window,world=createIsolatedWorld(main,{signal:page.documentAbort.signal});installUtilityLayout(page,world,main);installUtilityAnimationFrame(page,world,main);installUtilityIntersection(page,world,main);installFonts(world.global);t.after(()=>{world.dispose();browser.close();});return {browser,page,main,world};}
++
++test('native public observer producers, ordering and option errors use genuine utility values',async t=>{
++ const{world}=await fixture(t),native=JSON.parse(await readFile(new URL('./fixtures/utility-platform-native.json',import.meta.url),'utf8'));
++ for(const row of native.observations){const actual=plain(await world.evaluate(row.expression));if(row.label==='raf-producer'){assert.equal(Number.isFinite(actual.clockDelta),true);assert.ok(Math.abs(actual.clockDelta)<100);delete actual.clockDelta;const expected={...row.result.result.value};delete expected.clockDelta;assert.deepEqual(actual,expected);}else assert.deepEqual(actual,row.result.result.value);}
++});
++
++test('rectangles and live layout dimensions come from canonical nodes while result identities stay utility-local',async t=>{
++ const{page,main,world}=await fixture(t),node=main.document.getElementById('a');node.mainExpando=42;
++ const expected=plain(node.getBoundingClientRect().toJSON());
++ const actual=plain(world.evaluate('globalThis.target=document.getElementById("a");globalThis.rect=target.getBoundingClientRect();globalThis.rects=target.getClientRects();({value:rect.toJSON(),rect:rect instanceof DOMRect,base:rect instanceof DOMRectReadOnly,list:rects instanceof DOMRectList,item:rects.item(0)===rects[0],array:[...rects] instanceof Array,method:target.getBoundingClientRect instanceof Function,width:document.documentElement.clientWidth,height:document.documentElement.clientHeight,mainExpando:target.mainExpando})'));
++ assert.deepEqual(actual,{value:expected,rect:true,base:true,list:true,item:true,array:true,method:true,width:page.layout.viewport.width,height:page.layout.viewport.height});
++ assert.notEqual(world.evaluate('rect'),node.getBoundingClientRect());assert.equal(canonicalUtilityValue(world.evaluate('target')),node);
++ node.style.width='40px';assert.equal(world.evaluate('target.getBoundingClientRect().width'),40);assert.equal(world.evaluate('rect.width'),20);
++ assert.deepEqual(plain(world.evaluate('(()=>{const result=[];for(const fn of [()=>Element.prototype.getBoundingClientRect.call({}),()=>Object.getOwnPropertyDescriptor(Element.prototype,"clientWidth").get.call({})]){try{fn()}catch(error){result.push([error instanceof TypeError,error.message])}}return result})()')),[[true,'Illegal invocation'],[true,'Illegal invocation']]);
++});
++
++test('observer receives real changed geometry and utility target identity after main-world DOM mutations',async t=>{
++ const{main,world}=await fixture(t);
++ world.evaluate('globalThis.deliveries=[];globalThis.observer=new IntersectionObserver((records,observer)=>{deliveries.push({same:records[0].target===document.getElementById("a"),self:observer===globalThis.observer,array:records instanceof Array,entry:records[0] instanceof IntersectionObserverEntry,intersects:records[0].isIntersecting,ratio:records[0].intersectionRatio});});observer.observe(document.getElementById("a"));');
++ await new Promise(resolve=>setTimeout(resolve,0));main.document.getElementById('a').style.display='none';await new Promise(resolve=>setTimeout(resolve,0));
++ assert.deepEqual(plain(world.evaluate('deliveries')),[{same:true,self:true,array:true,entry:true,intersects:true,ratio:1},{same:true,self:true,array:true,entry:true,intersects:false,ratio:0}]);
++});
++
++test('RAF uses the prepared document scheduler, realm-local callback and single cancellation conversion',async t=>{
++ const{main,world}=await fixture(t);main.requestAnimationFrame=()=>{throw new Error('authored main scheduler');};main.cancelAnimationFrame=()=>{throw new Error('authored main cancellation');};
++ const result=await world.evaluate('new Promise(resolve=>{globalThis.canceledCalled=false;globalThis.conversions=0;const id=requestAnimationFrame(()=>{canceledCalled=true});cancelAnimationFrame({valueOf(){conversions++;return id}});requestAnimationFrame(function(timestamp){resolve({self:this===window,time:typeof timestamp,clock:performance.now()-timestamp,conversions,canceledCalled,entry:requestAnimationFrame instanceof Function,performance:performance instanceof Performance});});})');
++ assert.deepEqual({...plain(result),clock:undefined},{self:true,time:'number',clock:undefined,conversions:1,canceledCalled:false,entry:true,performance:true});assert.ok(Math.abs(result.clock)<100);
++});
++
++test('document abort cancels pending RAF, observer work and its genuine font Promise remains in the utility realm',async t=>{
++ const{page,main,world}=await fixture(t);assert.deepEqual(plain(world.evaluate('({set:document.fonts instanceof FontFaceSet,promise:document.fonts.ready instanceof Promise,global:FontFaceSet instanceof Function,same:document.fonts===document.fonts})')),{set:true,promise:true,global:true,same:true});
++ world.evaluate('requestAnimationFrame(()=>document.documentElement.setAttribute("late-frame","bad"));new IntersectionObserver(()=>document.documentElement.setAttribute("late-observer","bad")).observe(document.getElementById("a"));');
++ const document=main.document;page.documentAbort.abort();await new Promise(resolve=>setTimeout(resolve,25));assert.equal(document.documentElement.hasAttribute('late-frame'),false);assert.equal(document.documentElement.hasAttribute('late-observer'),false);
++});
++
++test('trusted utility factories publish weak provenance after final wrapper identity without heap dependencies',async t=>{
++ const{world}=await fixture(t);const {platformFactoryRecord,subscribePlatformFactories}=await import('../src/platform-factories.js');
++ const notifications=[];const unsubscribe=subscribePlatformFactories((value,record)=>{notifications.push({value,record});throw new Error('observer failure');});t.after(unsubscribe);
++ const value=world.evaluate('new DOMRect(1,2,3,4)'),record=platformFactoryRecord(value);
++ assert.equal(record.kind,'DOMRect');assert.equal(record.globalRef.deref(),world.global);assert.equal(record.implementation,world.implementationFor(value));assert.equal(notifications.find(row=>row.value===value).record,record);assert.equal(value.width,3);
++ const fake=Object.create(Object.getPrototypeOf(value));for(const key of Object.getOwnPropertySymbols(value))Object.defineProperty(fake,key,Object.getOwnPropertyDescriptor(value,key));assert.equal(platformFactoryRecord(fake),undefined);
++});
+diff --git a/test/fixtures/utility-platform-native.json b/test/fixtures/utility-platform-native.json
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/utility-platform-native.json
+@@ -0,0 +1,102 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e2dac92b5f4e63e8d51930c71e3f15c9cbb81ca0d46a84e1c1c1bbe241982a8c",
++  "observations": [
++    {
++      "label": "real-producers",
++      "expression": "new Promise(resolve=>{const target=document.getElementById('a'),order=[];const observer=new IntersectionObserver(function(records,argument){order.push('callback');resolve({order,ctor:IntersectionObserver instanceof Function,observer:this===observer&&argument===observer,observerObject:observer instanceof Object,array:records instanceof Array,entry:records[0] instanceof IntersectionObserverEntry,entryObject:records[0] instanceof Object,target:records[0].target===target,rect:records[0].boundingClientRect instanceof DOMRectReadOnly,ratio:records[0].intersectionRatio,isIntersecting:records[0].isIntersecting,rectValue:records[0].boundingClientRect.toJSON(),thresholds:observer.thresholds instanceof Array});observer.disconnect();});observer.observe(target);order.push('observe-returned');queueMicrotask(()=>order.push('microtask'));})",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "order": [
++              "observe-returned",
++              "callback",
++              "microtask"
++            ],
++            "ctor": true,
++            "observer": true,
++            "observerObject": true,
++            "array": true,
++            "entry": true,
++            "entryObject": true,
++            "target": true,
++            "rect": true,
++            "ratio": 1,
++            "isIntersecting": true,
++            "rectValue": {
++              "x": 0,
++              "y": 20,
++              "width": 20,
++              "height": 30,
++              "top": 20,
++              "right": 20,
++              "bottom": 50,
++              "left": 0
++            },
++            "thresholds": true
++          }
++        }
++      }
++    },
++    {
++      "label": "raf-producer",
++      "expression": "new Promise(resolve=>{let canceledCalled=false;const canceled=requestAnimationFrame(()=>{canceledCalled=true});cancelAnimationFrame(canceled);requestAnimationFrame(function(timestamp){resolve({self:this===window,entry:requestAnimationFrame instanceof Function,cancel:cancelAnimationFrame instanceof Function,performance:performance instanceof Performance,timeType:typeof timestamp,clockDelta:performance.now()-timestamp,canceledCalled});});})",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "self": true,
++            "entry": true,
++            "cancel": true,
++            "performance": true,
++            "timeType": "number",
++            "clockDelta": 0.5150000000000006,
++            "canceledCalled": false
++          }
++        }
++      }
++    },
++    {
++      "label": "options-and-brands",
++      "expression": "(()=>{const results={};for(const[name,fn]of Object.entries({entry:()=>new IntersectionObserverEntry({}),callback:()=>new IntersectionObserver(1),target:()=>new IntersectionObserver(()=>{}).observe({}),margin:()=>new IntersectionObserver(()=>{},{rootMargin:'auto'}),threshold:()=>new IntersectionObserver(()=>{},{threshold:[2]}),borrow:()=>IntersectionObserver.prototype.disconnect.call({})})){try{fn();results[name]={ok:true}}catch(e){results[name]={name:e.name,message:e.message,realm:e instanceof Error}}}return results})()",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "entry": {
++              "name": "TypeError",
++              "message": "Illegal Constructor",
++              "realm": true
++            },
++            "callback": {
++              "name": "TypeError",
++              "message": "invalid argument",
++              "realm": true
++            },
++            "target": {
++              "name": "TypeError",
++              "message": "invalid argument",
++              "realm": true
++            },
++            "margin": {
++              "name": "SyntaxError",
++              "message": "The string did not match the expected pattern",
++              "realm": true
++            },
++            "threshold": {
++              "name": "RangeError",
++              "message": "",
++              "realm": true
++            },
++            "borrow": {
++              "name": "TypeError",
++              "message": "Illegal invocation",
++              "realm": true
++            }
++          }
++        }
++      }
++    }
++  ]
++}

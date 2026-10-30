@@ -1,0 +1,898 @@
+diff --git a/src/isolated-world.js b/src/isolated-world.js
+new file mode 100644
+--- /dev/null
++++ b/src/isolated-world.js
+@@ -0,0 +1,102 @@
++import {registerPlatformFactory} from './platform-factories.js';
++// Independent genuine VM/IDL-world prototype. Generated wrapper source comes
++// from the pinned existing jsdom dependency; no target engine source is used.
++import vm from 'node:vm';
++import {readFileSync} from 'node:fs';
++import {createRequire} from 'node:module';
++import {dirname,resolve,join} from 'node:path';
++import {types} from 'node:util';
++import {createInvocationTrampoline} from './invocation.js';
++import 'jsdom';
++const require=createRequire(import.meta.url);
++const hostUtils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const generatedRoot=dirname(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'));
++const interfacesPath=require.resolve('jsdom/lib/jsdom/living/interfaces.js');
++const own=Object.getOwnPropertyDescriptor;
++const objectLike=v=>v!==null&&(typeof v==='object'||typeof v==='function');
++
++const WORLD_WRAPPERS=new WeakMap();
++export function utilityWrapperRecord(value){const record=objectLike(value)?WORLD_WRAPPERS.get(value):undefined;return record&&!record.disposed?record:undefined;}
++export function canonicalUtilityValue(value){const record=utilityWrapperRecord(value);return record?hostUtils.wrapperForImpl(record.impl):value;}
++export function utilityNodeIdentity(value){const record=utilityWrapperRecord(value);if(!record)return undefined;const type=own(record.impl,'nodeType')?.value;if(!Number.isInteger(type)||type<1||type>12)return undefined;const document=type===9?record.impl:own(record.impl,'_ownerDocument')?.value;return {nodeType:type,ownerDocument:hostUtils.wrapperForImpl(document),className:record.interfaceName};}
++
++export function createIsolatedWorld(mainWindow,{name='independent-utility-world',timeout=1000,signal,resolveWindow,resolveImplementation,onConsole,onRealm,onWrapper}={}) {
++ const context=vm.createContext({}, {name});const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
++ const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
++ const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
++ const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
++ const localUtils=utilsModule.exports,modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
++ const metadata={context,global,mainWindow,signal,disposed:false};const pendingFactories=[];let factoryReady=false;
++ const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);registerPlatformFactory(wrapper,{kind:interfaceName,implementation:impl,globalObject:global});if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
++ const utilityPrototypes=new Map();
++ const mainPrototypes=new Map(),observerImpls=new Set(),listeners=[],timers=new Set();let disposed=false;
++ const requireLive=()=>{if(disposed)throw new Error('Isolated world has been disposed');};
++ const mainContext=hostUtils.implForWrapper(mainWindow.document)._globalObject;
++ const utilityApply=global.Reflect.apply;
++ const realmFunction=bridge=>vm.compileFunction('return function(...args){return apply(bridge,this,args)}',['bridge','apply'],{parsingContext:context})(bridge,utilityApply);
++ for(const[name,constructor]of Object.entries(mainWindow[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)mainPrototypes.set(constructor.prototype,name);
++ function interfaceFor(impl){const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(!canonical)throw new Error('DOM implementation has no canonical wrapper');let proto=Object.getPrototypeOf(canonical);for(let i=0;proto&&i<64;i++,proto=Object.getPrototypeOf(proto)){const name=mainPrototypes.get(proto)??utilityPrototypes.get(proto);if(name&&!name.startsWith('%'))return name;}throw new Error('No pinned IDL interface for implementation');}
++ function wrapImpl(impl){
++  const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
++  const cached=wrappers.get(impl);if(cached)return cached;
++  const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
++  const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
++  if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
++  const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
++  Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
++  wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);
++  return wrapper;
++ }
++ function wrap(value){
++  if(!objectLike(value))return value;if(value===mainWindow||value===mainWindow._globalProxy)return global;if(value===global||wrapperImpls.has(value))return value;const otherWindow=resolveWindow?.(value);if(otherWindow)return otherWindow;
++  const known=mainWrappers.get(value);if(known)return wrapImpl(known);
++  if(types.isProxy(value))return value;
++  const candidate=own(value,hostUtils.implSymbol)?.value;
++  if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
++  const canonical=own(value,hostUtils.wrapperSymbol)?.value;
++  if(canonical&&objectLike(canonical)&&own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);
++  if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
++  return value;
++ }
++ localUtils.wrapperForImpl=impl=>impl?wrapImpl(impl):null;
++ localUtils.tryWrapperForImpl=wrap;
++ function canonicalizeNew(name,wrapper){const impl=hostUtils.implForWrapper(wrapper);if(!impl)return wrapper;wrappers.set(impl,wrapper);wrapperImpls.set(wrapper,impl);
++  // Utility-created implementations also receive an independent canonical main
++  // wrapper. Never replace an existing implementation's main wrapper to enter a world.
++  const hostGenerated=require(join(generatedRoot,name+'.js'));
++  if(typeof hostGenerated.new==='function'&&mainWindow[name]){
++   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);
++  }
++  register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
++ }
++ function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
++  const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
++  const source=readFileSync(filename,'utf8');const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
++  if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){return canonicalizeNew(name,original(...args));};
++   // Measured native producer quirk: MO arguments are real main-world values,
++   // while the authored callback itself continues in its genuine utility realm.
++   if(name==='MutationCallback')module.exports.convert=(ignored,value)=>{if(typeof value!=='function')throw new global.TypeError('Mutation callback is not a function');const invoke=function(records,observer){if(disposed)return;const array=vm.runInContext('[]',mainContext);for(let i=0;i<records.length;i++){const item=hostUtils.tryWrapperForImpl(records[i]);Object.defineProperty(array,String(i),{value:item,writable:true,enumerable:true,configurable:true});}const mainObserver=hostUtils.tryWrapperForImpl(observer);return Reflect.apply(value,hostUtils.tryWrapperForImpl(this),[array,mainObserver]);};invoke[hostUtils.wrapperSymbol]=value;invoke.objectReference=value;return invoke;};
++  }
++  return module.exports;
++ }
++ Object.defineProperties(global,{window:{value:global,writable:false},self:{value:global,writable:false},top:{get:realmFunction(()=>resolveWindow?.(mainWindow.top)??global)},parent:{get:realmFunction(()=>resolveWindow?.(mainWindow.parent)??global)},frames:{value:global}});
++ load(interfacesPath).installInterfaces(global,['Window']);
++ for(const[name,constructor]of Object.entries(global[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)utilityPrototypes.set(constructor.prototype,name);
++ Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
++ Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
++ Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
++ const windowImpl=hostUtils.implForWrapper(mainWindow);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
++ global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);Object.setPrototypeOf(global,global.Window.prototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
++ const add=global.EventTarget.prototype.addEventListener,remove=global.EventTarget.prototype.removeEventListener;
++ const removeImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype.removeEventListener;
++ global.EventTarget.prototype.addEventListener=realmFunction(function(...args){requireLive();const impl=wrapperImpls.get(this),before=new Set(Object.values(impl?._eventListeners??{}).flat());const result=Reflect.apply(add,this,args);for(const[type,entries]of Object.entries(impl._eventListeners))for(const entry of entries)if(!before.has(entry))listeners.push({impl:new WeakRef(impl),type,entry:new WeakRef(entry)});return result;});
++ global.EventTarget.prototype.removeEventListener=realmFunction(function(...args){return Reflect.apply(remove,this,args);});
++ const timerBridge=(repeating,callback,ms,...args)=>{requireLive();if(typeof callback!=='function')throw new global.TypeError('Prototype timers require a function');let id;const invoke=()=>{if(!repeating)timers.delete(id);if(!disposed)Reflect.apply(callback,global,args);};id=mainWindow[repeating?'setInterval':'setTimeout'](invoke,ms);timers.add(id);return id;};
++ global.setTimeout=realmFunction((...args)=>timerBridge(false,...args));global.setInterval=realmFunction((...args)=>timerBridge(true,...args));global.clearTimeout=realmFunction(id=>{timers.delete(id);mainWindow.clearTimeout(id);});global.clearInterval=realmFunction(id=>{timers.delete(id);mainWindow.clearInterval(id);});
++ global.queueMicrotask=realmFunction(callback=>{if(typeof callback!=='function')throw new global.TypeError('Callback must be a function');queueMicrotask(()=>{if(!disposed)Reflect.apply(callback,undefined,[]);});});
++ global.console=vm.runInContext('({})',context);for(const method of ['log','warn','error','info','debug'])global.console[method]=realmFunction((...args)=>onConsole?onConsole(method,args):mainWindow.console[method](...args));
++ const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers){mainWindow.clearTimeout(id);mainWindow.clearInterval(id);}timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
++ if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
++ onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
++ return {context,global,realmFunction,evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
++}
+diff --git a/src/world-sessions.js b/src/world-sessions.js
+new file mode 100644
+--- /dev/null
++++ b/src/world-sessions.js
+@@ -0,0 +1,67 @@
++import {installFonts} from './fonts.js';
++import {installUtilityLayout} from './utility-layout.js';
++import {installUtilityAnimationFrame} from './utility-platform.js';
++import {installUtilityIntersection} from './utility-observers.js';
++import vm from 'node:vm';
++import {randomUUID} from 'node:crypto';
++import {createRequire} from 'node:module';
++import {createIsolatedWorld,utilityWrapperRecord,canonicalUtilityValue} from './isolated-world.js';
++import {captureProtocolRealm} from './realm-values.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const META=new WeakMap(),STORES=new WeakMap(),ROOT_SESSIONS=new WeakMap(),REALMS=new WeakMap(),BY_CONTEXT=new WeakMap(),WINDOW_OWNERS=new WeakMap();
++let FACTORY_HOOKS={};
++export function configureUtilityFactories(hooks={}){FACTORY_HOOKS={...hooks};}
++const rootFor=page=>page.registry?.page??page;
++const contextFor=window=>utils.implForWrapper(window.document)._globalObject;
++const live=record=>!record.disposed&&!record.page.closed&&!record.signal.aborted;
++function rootSessions(page){const root=rootFor(page);let sessions=ROOT_SESSIONS.get(root);if(!sessions){sessions=new Set();ROOT_SESSIONS.set(root,sessions);}return sessions;}
++function pages(session){return [...new Set([session.page,...(session.page.frames?.frames.values()??[])])].filter(page=>!page.closed);}
++function mainRealm(page,window=page.dom.window){const context=contextFor(window);WINDOW_OWNERS.set(window,page);WINDOW_OWNERS.set(context,page);let record=REALMS.get(context);if(!record){record={page,global:window,context,id:page.executionContextId,uniqueId:randomUUID(),name:'',signal:page.documentAbort.signal,bindings:new Map(),pendingBindings:new Map(),disposed:false};const apply=window.Reflect.apply;record.realmFunction=bridge=>vm.compileFunction('return function(...args){return apply(bridge,this,args)}',['bridge','apply'],{parsingContext:context})(bridge,apply);record.Error=window.Error;record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();},{once:true});REALMS.set(context,record);}return record;}
++function pageStore(page){let store=STORES.get(page);if(!store){store={names:new Set(),records:new Map()};STORES.set(page,store);}return store;}
++function findPageForWindow(session,value){if(value&&typeof value==='object'){const known=WINDOW_OWNERS.get(value);if(known&&!known.closed)return known;}for(const page of pages(session)){const window=page.dom.window;if(window?.document&&(value===window||value===contextFor(window)))return page;}return undefined;}
++function installRecord(session,record){const meta=META.get(session);meta.byId.set(record.id,record);if(record.page===session.page)session.worlds.set(record.name,record.id);else session.frameWorlds.set(record.page.frameId+'\0'+record.name,{id:record.id,page:record.page,name:record.name});}
++function emitBinding(session,record,params){const meta=META.get(session);if(!session.domains.has('Runtime'))return;if((record.controller?meta.announced:meta.defaultAnnounced).has(record.id))session.event('Runtime.bindingCalled',params);else{let events=record.pendingBindings.get(session);if(!events){events=[];record.pendingBindings.set(session,events);}events.push(params);}}
++function flushBindings(session,record){for(const params of record.pendingBindings.get(session)??[])session.event('Runtime.bindingCalled',params);record.pendingBindings.delete(session);}
++function announce(session,record){installRecord(session,record);const meta=META.get(session);if(!session.domains.has('Runtime')||meta.announced.has(record.id))return;meta.announced.add(record.id);for(const name of session.bindings)session.installBinding(name,record.facade);session.event('Runtime.executionContextCreated',{context:{id:record.id,origin:record.page.securityOrigin??new URL(record.page.url).origin,name:record.name,uniqueId:record.uniqueId,auxData:{isDefault:false,type:'isolated',frameId:record.page.frameId}}});flushBindings(session,record);}
++function worldFor(session,page,name,window=page.dom.window){const store=pageStore(page);store.names.add(name);let record=store.records.get(name);if(record&&live(record)&&record.mainWindow===window)return record;
++ WINDOW_OWNERS.set(window,page);WINDOW_OWNERS.set(contextFor(window),page);
++ record={page,name,mainWindow:window,id:page.browser.nextExecutionContext++,uniqueId:randomUUID(),signal:page.documentAbort.signal,bindings:new Map(),pendingBindings:new Map(),executedScripts:new Set(),disposed:false};
++ const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
++ const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
++ record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
++ record.global=record.controller.global;record.context=record.controller.context;installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
++ store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
++ record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
++ for(const[id,script]of page.newDocumentScripts){if(script.worldName&&script.worldName===name&&!record.executedScripts.has(id)){record.executedScripts.add(id);try{record.controller.evaluate(script.source);}catch(error){for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});}}}
++ return record;
++}
++function specApplies(spec,record){return spec&&(spec.executionContextId===undefined||spec.executionContextId===record.id)&&(spec.executionContextName===undefined||spec.executionContextName===record.name);}
++function realmForPage(session,page){return META.get(session).byId.get(page.executionContextId)??mainRealm(page);}
++function installBinding(session,name,page,preparedRecord){const meta=META.get(session),record=preparedRecord??realmForPage(session,page),spec=meta.bindingSpecs.get(name);if(!specApplies(spec,record))return;let producer=record.bindings.get(name);if(!producer){producer={sessions:new Set()};producer.fn=record.realmFunction(function(...args){if(args.length!==1||typeof args[0]!=='string')throw new record.Error('Invalid arguments: should be exactly one string.');if(!live(record))return;for(const member of producer.sessions){if(specApplies(META.get(member)?.bindingSpecs.get(name),record))emitBinding(member,record,{name,payload:args[0],executionContextId:record.id});}});record.bindings.set(name,producer);Object.defineProperty(record.global,name,{value:producer.fn,writable:true,enumerable:true,configurable:true});}producer.sessions.add(session);}
++export function initializeUtilitySession(session,resetRuntime){const meta={byId:new Map(),announced:new Set(),defaultAnnounced:new Set(),bindingSpecs:new Map(),resetRuntime};META.set(session,meta);rootSessions(session.page).add(session);
++ const prepared=({page,window})=>{const main=mainRealm(page,window);for(const binding of session.bindings)installBinding(session,binding,page,main);const names=new Set([...pageStore(page).names,...session.worldNames,...[...page.newDocumentScripts.values()].map(script=>script.worldName).filter(Boolean)]);for(const name of names)worldFor(session,page,name,window);};
++ session.page.on('utilityWindowPrepared',prepared);meta.prepared=prepared;
++ for(const page of pages(session))for(const record of pageStore(page).records.values())if(live(record))installRecord(session,record);
++}
++export function wrapUtilityDOMNode(session,node,contextId){const record=META.get(session)?.byId.get(contextId);return record?record.controller.wrap(node):node;}
++// Ordinary Session methods delegate to this private controller. No Session
++// prototype mutation or interception of protocol argument validation is used.
++export function utilitySessionController(session,ProtocolError) {
++ const meta=META.get(session);
++ return {
++  isolatedWorld(page,name){const record=worldFor(session,page,name);announce(session,record);return record.id;},
++  executionPage(id){const record=meta.byId.get(id);if(record){if(!live(record))throw new ProtocolError('Cannot find context with specified id');return record.facade;}if([...session.worlds.values()].includes(id)||[...session.frameWorlds.values()].some(world=>world.id===id))throw new ProtocolError('Cannot find context with specified id');return undefined;},
++  contextCreated(name,id,page){if(name||id!==page.executionContextId){announce(session,worldFor(session,page,name));return true;}return false;},
++  mainContextAnnounced(page){meta.defaultAnnounced.add(page.executionContextId);flushBindings(session,mainRealm(page));},
++  uniqueId(page){return mainRealm(page).uniqueId;},
++  valueContext(value){const own=utilityWrapperRecord(value);if(own){const record=BY_CONTEXT.get(own.context);if(record&&live(record))return record.id;}return undefined;},
++  installBinding(name,page){return installBinding(session,name,page);},
++  uniqueContextId(uniqueId){const records=[...pages(session).map(page=>mainRealm(page)),...meta.byId.values()].filter(live);const record=records.find(record=>record.uniqueId===uniqueId);if(!record)throw new ProtocolError('Cannot find context with specified id');return record.id;},
++  runtimeEnabled(){for(const page of pages(session))for(const record of pageStore(page).records.values())if(live(record))announce(session,record);},
++  runtimeDisabled(){meta.announced.clear();meta.defaultAnnounced.clear();},
++  addBinding(params){if(typeof params.name!=='string')throw new ProtocolError('Invalid parameters');if(params.executionContextId!==undefined)session.executionPage(params.executionContextId);meta.bindingSpecs.set(params.name,{executionContextId:params.executionContextId,executionContextName:params.executionContextName});session.bindings.add(params.name);for(const page of pages(session))session.installBinding(params.name,page);for(const record of meta.byId.values())if(live(record))session.installBinding(params.name,record.facade);},
++  removeBinding(name){meta.bindingSpecs.delete(name);session.bindings.delete(name);for(const record of [...pages(session).map(page=>mainRealm(page)),...meta.byId.values()])record.bindings.get(name)?.sessions.delete(session);},
++  close(){session.page.off('utilityWindowPrepared',meta.prepared);rootSessions(session.page).delete(session);for(const record of [...pages(session).map(page=>mainRealm(page)),...meta.byId.values()]){for(const producer of record.bindings.values())producer.sessions.delete(session);record.pendingBindings.delete(session);}meta.byId.clear();meta.bindingSpecs.clear();meta.defaultAnnounced.clear();meta.announced.clear();},
++ };
++}
+diff --git a/src/cdp.js b/src/cdp.js
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,5 @@
++import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
++import {canonicalUtilityValue} from './isolated-world.js';
+ import http from 'node:http';
+ import { randomUUID } from 'node:crypto';
+ import { types } from 'node:util';
+@@ -47,6 +49,8 @@
+     this.listeners = [];
+     this.nextBackendNodeId = 1;
+     this.lifecycle = false;
++    initializeUtilitySession(this,resetRuntime);
++    this.utility = utilitySessionController(this,ProtocolError);
+     const listen = (event, callback) => { page.on(event, callback); this.listeners.push([event, callback]); };
+     listen('navigationStarted', () => {
+       this.event('Page.frameStartedNavigating', { frameId: page.frameId, url: page.url, loaderId: page.loaderId, navigationType: 'differentDocument' });
+@@ -70,10 +74,7 @@
+     });
+     listen('contextCreated', () => {
+       this.contextCreated();
+-      for (const name of this.worldNames) {
+-        const id = page.browser.nextExecutionContext++;
+-        this.worlds.set(name, id); this.contextCreated(name, id);
+-      }
++      for (const name of this.worldNames) this.isolatedWorld(page,name);
+     });
+     listen('frameAttached', params => this.event('Page.frameAttached', params));
+     listen('frameDetached', params => this.event('Page.frameDetached', params));
+@@ -180,34 +181,27 @@
+     } else this.idleTimer = setTimeout(() => this.checkIdle(), 100);
+   }
+   contextCreated(name = '', id = this.page.executionContextId, page = this.page) {
++    if(this.utility.contextCreated(name,id,page))return;
+     for (const binding of this.bindings) this.installBinding(binding, page);
+     this.event('Runtime.executionContextCreated', { context: {
+-      id, origin: page.securityOrigin ?? new URL(page.url).origin, name, uniqueId: randomUUID(),
++      id, origin: page.securityOrigin ?? new URL(page.url).origin, name, uniqueId: this.utility.uniqueId(page),
+       auxData: { isDefault: !name, type: name ? 'isolated' : 'default', frameId: page.frameId },
+     } });
++    this.utility.mainContextAnnounced(page);
+   }
+   isolatedWorld(page, name) {
+-    if (page === this.page) {
+-      let id = this.worlds.get(name);
+-      if (!id) { id = page.browser.nextExecutionContext++; this.worlds.set(name, id); this.contextCreated(name, id, page); }
+-      return id;
+-    }
+-    const key = `${page.frameId}\0${name}`;
+-    let world = this.frameWorlds.get(key);
+-    if (!world) {
+-      world = { id: page.browser.nextExecutionContext++, page, name }; this.frameWorlds.set(key, world);
+-      this.contextCreated(name, world.id, page);
+-    }
+-    return world.id;
++    return this.utility.isolatedWorld(page,name);
+   }
+   executionPage(id) {
+-    if (id === undefined || id === this.page.executionContextId || [...this.worlds.values()].includes(id)) return this.page;
++    const utility=this.utility.executionPage(id);
++    if(utility)return utility;
++    if (id === undefined || id === this.page.executionContextId) return this.page;
+     const found = this.page.frames?.findContext(id)?.page;
+     if (found) return found;
+-    for (const world of this.frameWorlds.values()) if (world.id === id && !world.page.closed) return world.page;
+     throw new ProtocolError('Cannot find context with specified id');
+   }
+   valueContext(value) {
++    const utility=this.utility.valueContext(value);if(utility!==undefined)return utility;
+     const document = ownerDocumentOf(value);
+     for (const page of this.page.frames?.frames.values() ?? []) {
+       if (document && document === page.dom.window.document || value === page.dom.window) return page.executionContextId;
+@@ -215,9 +209,7 @@
+     return this.page.executionContextId;
+   }
+   installBinding(name, page = this.page) {
+-    page.dom.window[name] = payload => this.event('Runtime.bindingCalled', {
+-      name, payload: String(payload), executionContextId: page.executionContextId,
+-    });
++    return this.utility.installBinding(name,page);
+   }
+   remote(value, byValue = false, group, contextId = this.valueContext(value)) {
+     const primitive = primitiveRemoteValue(value);
+@@ -267,14 +259,16 @@
+     if (supportsInput(method)) return runInput(this, method, params);
+     if (supportsRuntime(method)) return runRuntime(this, method, params);
+     if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
++      if(method==='Runtime.enable'&&this.domains.has('Runtime'))return {};
+       this.domains.add(method.split('.')[0]);
+       if (method === 'Runtime.enable') {
+         this.contextCreated();
+         for (const child of page.frames?.frames.values() ?? []) if (child !== page) this.contextCreated('', child.executionContextId, child);
++        this.utility.runtimeEnabled();
+       }
+       return {};
+     }
+-    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { this.domains.delete(method.split('.')[0]); return {}; }
++    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { if(method==='Runtime.disable')this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
+     switch (method) {
+       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
+       case 'Page.getLayoutMetrics': {
+@@ -319,6 +313,8 @@
+         return { frameId: page.frameId, loaderId: page.loaderId };
+       }
+       case 'Page.createIsolatedWorld': {
++        if(params.worldName===undefined)throw new ProtocolError('MissingField',-31998);
++        if(typeof params.worldName!=='string')throw new ProtocolError('UnexpectedToken',-31998);
+         const target = params.frameId === page.frameId ? page : page.frames?.findFrame(params.frameId);
+         if (!target) throw new ProtocolError('Unknown frame');
+         const name = params.worldName ?? '';
+@@ -352,7 +348,10 @@
+         if (invoking && params.objectId !== undefined) this.object(params.objectId);
+         const receiver = invoking ? this.objects.get(params.objectId) : undefined;
+         const group = params.objectGroup !== undefined ? params.objectGroup : receiver?.group;
+-        const contextId = params.contextId ?? params.executionContextId ?? receiver?.contextId ?? page.executionContextId;
++        // Caller mutual-exclusion and receiver validation above precede unique
++        // context lookup. The selected record owns a real VM context.
++        const uniqueId=params.uniqueContextId===undefined?undefined:this.utility.uniqueContextId(params.uniqueContextId);
++        const contextId = params.contextId ?? params.executionContextId ?? uniqueId ?? receiver?.contextId ?? page.executionContextId;
+         let target = page, value;
+         try {
+           target = this.executionPage(contextId);
+@@ -385,14 +384,8 @@
+       }
+       case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
+       case 'Runtime.releaseObjectGroup': for (const [id, object] of this.objects) if (object.group === params.objectGroup) this.objects.delete(id); return {};
+-      case 'Runtime.addBinding':
+-        this.bindings.add(params.name);
+-        for (const target of page.frames?.frames.values() ?? [page]) this.installBinding(params.name, target);
+-        return {};
+-      case 'Runtime.removeBinding':
+-        this.bindings.delete(params.name);
+-        for (const target of page.frames?.frames.values() ?? [page]) delete target.dom.window[params.name];
+-        return {};
++      case 'Runtime.addBinding': this.utility.addBinding(params);return {};
++      case 'Runtime.removeBinding': this.utility.removeBinding(params.name);return {};
+       case 'Runtime.runIfWaitingForDebugger': return {};
+       case 'Network.getCookies': {
+         const urls = params.urls ?? [page.url];
+@@ -478,11 +471,13 @@
+     }
+   }
+   backendId(node) {
++    node=canonicalUtilityValue(node);
+     this.nodes ??= new Map();
+     for (const [id, value] of this.nodes) if (value === node) return id;
+     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
+   }
+   close() {
++    this.utility.close();
+     clearTimeout(this.idleTimer);
+     resetDOM(this);
+     resetRuntime(this);
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {prepareUtilityPlatform} from './utility-platform.js';
+ import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
+ import {createInvocationTrampoline} from './invocation.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+@@ -252,7 +253,10 @@
+         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+       });
+     });
+-    for (const { source } of this.newDocumentScripts.values()) {
++    prepareUtilityPlatform(window);
++    (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
++    for (const { source,worldName } of this.newDocumentScripts.values()) {
++      if(worldName)continue;
+       try { window.eval(source); } catch (error) { this.emit('pageError', error); }
+     }
+   }
+diff --git a/src/remote-values.js b/src/remote-values.js
+--- a/src/remote-values.js
++++ b/src/remote-values.js
+@@ -1,3 +1,4 @@
++import {utilityNodeIdentity} from './isolated-world.js';
+ // CDP value metadata without evaluating page getters or coercion hooks. This
+ // module deliberately does not allocate handles or select execution contexts.
+ import { types } from 'node:util';
+@@ -70,6 +71,7 @@
+  * object with nodeType/ownerDocument fields, or a Proxy around a Node, is not
+  * promoted to a DOM node. No public Node getters are called. */
+ export function nodeIdentity(value) {
++  const utility=utilityNodeIdentity(value);if(utility)return utility;
+   if (!objectLike(value) || htmlDDA(value) || types.isProxy(value)) return undefined;
+   const implementation=dataProperty(value,implSymbol,false);
+   if (!implementation.found || !objectLike(implementation.value) || types.isProxy(implementation.value)) return undefined;
+diff --git a/src/dom.js b/src/dom.js
+--- a/src/dom.js
++++ b/src/dom.js
+@@ -1,3 +1,5 @@
++import {canonicalUtilityValue} from './isolated-world.js';
++import {wrapUtilityDOMNode} from './world-sessions.js';
+ import { randomUUID } from 'node:crypto';
+ import { createInternalMutationObserver } from './mutations.js';
+ 
+@@ -48,7 +50,7 @@
+   let node;
+   if (key === 'objectId') {
+     if (typeof params.objectId !== 'string') throw error('Invalid object identifier');
+-    node = session.object(params.objectId);
++    node = canonicalUtilityValue(session.object(params.objectId));
+   } else {
+     if (!Number.isInteger(params[key]) || params[key] <= 0) throw error('Invalid DOM node identifier');
+     node = session.nodes?.get(params[key]);
+@@ -222,8 +224,8 @@
+           else if (params.executionContextId !== session.page.executionContextId && ![...(session.worlds?.values() ?? [])].includes(params.executionContextId)) throw error('Cannot find context with specified id');
+         }
+         const node = nodeFor(session, params, ['nodeId', 'backendNodeId']);
+-        if (params.executionContextId !== undefined && (node.ownerDocument ?? node) !== page.dom.window.document) throw error('Node belongs to a different frame');
+-        return { object: session.remote(node, false, params.objectGroup, params.executionContextId) };
++        if (params.executionContextId !== undefined && (node.ownerDocument ?? node) !== canonicalUtilityValue(page.dom.window.document)) throw error('Node belongs to a different frame');
++        return { object: session.remote(wrapUtilityDOMNode(session,node,params.executionContextId), false, params.objectGroup, params.executionContextId) };
+       }
+       case 'DOM.getFrameOwner': {
+         const frame = session.page.frames?.findFrame(params.frameId);
+diff --git a/src/utility-platform.js b/src/utility-platform.js
+new file mode 100644
+--- /dev/null
++++ b/src/utility-platform.js
+@@ -0,0 +1,39 @@
++// Trusted original document scheduling captured before author code. Each public
++// entry and callback executes in its own real utility VM; no main API is aliased.
++import vm from 'node:vm';
++import { createInvocationTrampoline } from './invocation.js';
++const prepared = new WeakMap();
++const apply = Reflect.apply;
++export function prepareUtilityPlatform(window) {
++  if (!prepared.has(window)) prepared.set(window, {
++    request:window.requestAnimationFrame, cancel:window.cancelAnimationFrame,
++    performance:window.performance,
++  });
++}
++function animationFactory(g,bridge) {
++  const methods={
++    requestAnimationFrame(callback) { if(typeof callback!=='function')throw new TypeError('invalid argument');return bridge.request(callback); },
++    cancelAnimationFrame(handle) { const value=+handle;bridge.cancel(Number.isFinite(value)?Math.trunc(value)>>>0:0); },
++  };
++  for(const[name,value]of Object.entries(methods))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:true});
++}
++export function installUtilityAnimationFrame(page,world,main=page.dom.window,{report=error=>page.emit('pageError',error)}={}) {
++  const source=prepared.get(main);
++  if(!source||typeof source.request!=='function'||typeof source.cancel!=='function')throw new Error('The actual document scheduler must be prepared before author code');
++  const pending=new Set(),signal=page.documentAbort.signal,invocation=createInvocationTrampoline(world.context);
++  let disposed=false;
++  // This is a genuine generated Performance wrapper over the shared document
++  // implementation. The main wrapper and its authored expandos are not reused.
++  Object.defineProperty(world.global,'performance',{value:world.wrap(source.performance),configurable:true,enumerable:true});
++  const bridge={
++    request(callback) {
++      if(disposed)return 0;
++      let id;id=apply(source.request,main,[timestamp=>{pending.delete(id);if(disposed)return;try{invocation.invoke(callback,world.global,[timestamp],{timeout:Math.min(page.timeout,2000),displayErrors:false});}catch(error){report(error);}}]);
++      pending.add(id);return id;
++    },
++    cancel(handle) {apply(source.cancel,main,[handle]);pending.delete(handle);},
++  };
++  vm.compileFunction(`(${animationFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:world.context})(bridge);
++  const dispose=()=>{if(disposed)return;disposed=true;for(const id of pending)apply(source.cancel,main,[id]);pending.clear();signal.removeEventListener('abort',dispose);};
++  signal.addEventListener('abort',dispose,{once:true});if(signal.aborted)dispose();return {dispose};
++}
+diff --git a/src/utility-observers.js b/src/utility-observers.js
+new file mode 100644
+--- /dev/null
++++ b/src/utility-observers.js
+@@ -0,0 +1,95 @@
++// Actual utility-realm observation over the existing shared layout. The public
++// classes, private state, records and callback arrays are allocated in that VM.
++import vm from 'node:vm';
++import { performance } from 'node:perf_hooks';
++import { canonicalUtilityValue } from './isolated-world.js';
++import { nodeIdentity } from './remote-values.js';
++import { createInternalMutationObserver } from './mutations.js';
++import { getLayoutStyle } from './styles.js';
++
++function intersectionFactory(g, bridge) {
++  const states = new WeakMap(), entries = new WeakMap(), active = new Set();
++  const apply = Reflect.apply, rect = DOMRectReadOnly.fromRect;
++  let queued = false, timer, stopped = false;
++  const brand = observer => { const state = states.get(observer); if (!state) throw new TypeError('Illegal invocation'); return state; };
++  const element = value => { if (!bridge.isElement(value)) throw new TypeError('invalid argument'); };
++  function margins(input = '0px') {
++    const parts = String(input).replace(/\/\*[\s\S]*?\*\//g, ' ').trim().split(/\s+/).filter(Boolean);
++    if (!parts.length) parts.push('0px');
++    if (parts.length > 4 || parts.some(value => !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?(?:px|%)$/i.test(value))) throw new DOMException('The string did not match the expected pattern', 'SyntaxError');
++    const values = parts.map(value => ({ value: Number.parseFloat(value), unit: value.endsWith('%') ? '%' : 'px' }));
++    const [a, b = a, c = a, d = b] = values;
++    return [a, b, c, d];
++  }
++  const marginText = values => values.map(part => `${part.value}${part.unit}`).join(' ');
++  class IntersectionObserverEntry { constructor() { throw new TypeError('Illegal Constructor'); } }
++  for (const name of ['time','target','rootBounds','boundingClientRect','intersectionRect','isIntersecting','intersectionRatio','isVisible']) {
++    Object.defineProperty(IntersectionObserverEntry.prototype,name,{configurable:true,enumerable:true,get() { if (!entries.has(this)) throw new TypeError('Illegal invocation'); return entries.get(this)[name]; }});
++  }
++  Object.defineProperty(IntersectionObserverEntry.prototype,Symbol.toStringTag,{value:'IntersectionObserverEntry',configurable:true});
++  function measure(state,target) {
++    const measured=bridge.measure(target,state.root),bounds=measured.bounds;
++    let root=measured.root;
++    const offsets=state.margin.map(part=>part.unit==='%'?part.value*root.width/100:part.value);
++    root={x:root.x-offsets[3],y:root.y-offsets[0],width:root.width+offsets[3]+offsets[1],height:root.height+offsets[0]+offsets[2]};
++    const left=Math.max(bounds.left,root.x),top=Math.max(bounds.top,root.y),right=Math.min(bounds.right,root.x+root.width),bottom=Math.min(bounds.bottom,root.y+root.height);
++    const intersects=measured.validRoot&&measured.rendered&&right>=left&&bottom>=top,area=bounds.width*bounds.height;
++    const intersection={x:left,y:top,width:Math.max(0,right-left),height:Math.max(0,bottom-top)};
++    const entry=Object.create(IntersectionObserverEntry.prototype);
++    entries.set(entry,{time:bridge.now(),target,rootBounds:apply(rect,DOMRectReadOnly,[root]),boundingClientRect:apply(rect,DOMRectReadOnly,[bounds]),intersectionRect:apply(rect,DOMRectReadOnly,[intersects?intersection:{x:0,y:0,width:0,height:0}]),isIntersecting:intersects,intersectionRatio:intersects?(area?intersection.width*intersection.height/area:1):0,isVisible:intersects&&measured.visible});
++    return entry;
++  }
++  function arm() { if (!stopped&&active.size&&timer===undefined) timer=bridge.setTimer(()=>{timer=undefined;schedule();},16); }
++  function deliver() {
++    queued=false;if(stopped)return;
++    for(const observer of active){const state=states.get(observer);for(const[target,previous]of state.targets){if(!bridge.connected(target))continue;const entry=measure(state,target),index=state.thresholds.filter(value=>value<=entry.intersectionRatio).length;if(!previous||previous.index!==index||previous.intersecting!==entry.isIntersecting){state.records.push(entry);state.targets.set(target,{index,intersecting:entry.isIntersecting});}}}
++    for(const observer of [...active]){const state=states.get(observer),records=state.records.splice(0);if(records.length)try{apply(state.callback,observer,[records,observer]);}catch(error){bridge.report(error);}}
++    arm();
++  }
++  function schedule() { if(!stopped&&!queued&&active.size){queued=true;bridge.microtask(deliver);} }
++  class IntersectionObserver {
++    constructor(callback,options={}) {
++      if(typeof callback!=='function')throw new TypeError('invalid argument');
++      options=options??{};const root=options.root??null;if(root!==null&&!bridge.isRoot(root))throw new TypeError('invalid argument');
++      let thresholds=Array.isArray(options.threshold)?Array.from(options.threshold,Number):[Number(options.threshold??0)];
++      if(thresholds.some(value=>!Number.isFinite(value)))throw new TypeError('invalid argument');
++      if(thresholds.some(value=>value<0||value>1))throw new RangeError('');
++      if(!thresholds.length)thresholds=[0];thresholds=Object.freeze(thresholds.sort((a,b)=>a-b));
++      const margin=margins(options.rootMargin),scrollMargin=margins(options.scrollMargin),trackVisibility=Boolean(options.trackVisibility),delay=Math.max(trackVisibility?100:0,Math.trunc(Number(options.delay)||0));
++      states.set(this,{callback,root,thresholds,margin,rootMargin:marginText(margin),scrollMargin:marginText(scrollMargin),trackVisibility,delay,targets:new Map(),records:[]});
++    }
++    observe(target){const state=brand(this);element(target);if(!state.targets.has(target))state.targets.set(target,null);bridge.watch(target);active.add(this);schedule();}
++    unobserve(target){const state=brand(this);element(target);state.targets.delete(target);if(!state.targets.size)active.delete(this);if(!active.size&&timer!==undefined){bridge.clearTimer(timer);timer=undefined;}}
++    disconnect(){const state=brand(this);state.targets.clear();state.records=[];active.delete(this);if(!active.size&&timer!==undefined){bridge.clearTimer(timer);timer=undefined;}}
++    takeRecords(){return brand(this).records.splice(0);}
++  }
++  for(const name of ['root','rootMargin','scrollMargin','thresholds','trackVisibility','delay'])Object.defineProperty(IntersectionObserver.prototype,name,{configurable:true,enumerable:true,get(){return brand(this)[name];}});
++  Object.defineProperty(IntersectionObserver.prototype,Symbol.toStringTag,{value:'IntersectionObserver',configurable:true});
++  Object.assign(g,{IntersectionObserver,IntersectionObserverEntry});
++  return {schedule,dispose(){stopped=true;active.clear();if(timer!==undefined)bridge.clearTimer(timer);timer=undefined;}};
++}
++
++export function installUtilityIntersection(page,world,main=page.dom.window) {
++  const document=main.document,signal=page.documentAbort.signal;
++  const canonical=canonicalUtilityValue;
++  const identify=value=>nodeIdentity(canonical(value));
++  const owner=target=>{const doc=target.ownerDocument??target;return [...(page.registry?.frames.values()??page.frames?.frames.values()??[page])].find(candidate=>candidate.dom.window.document===doc)??page;};
++  let disposed=false,controller;const roots=new WeakSet();
++  const mutations=createInternalMutationObserver(main,()=>controller?.schedule());
++  const watch=target=>{const root=canonical(target).getRootNode();if(!roots.has(root)){roots.add(root);mutations.observe(root,{attributes:true,childList:true,subtree:true,characterData:true});}};
++  const bridge={
++    isElement:value=>identify(value)?.nodeType===1,
++    isRoot:value=>[1,9].includes(identify(value)?.nodeType),
++    connected:value=>{const node=canonical(value);return !disposed&&node.isConnected&&node.ownerDocument===document;},
++    measure(value,rootValue){const target=canonical(value),root=rootValue===null?null:canonical(rootValue),layout=owner(target).layout;
++      return {bounds:layout.rect(target),root:root?.nodeType===1?owner(root).layout.rect(root):{x:0,y:0,...layout.viewport},rendered:layout.rects(target).length>0,validRoot:root===null||root===document||root.contains(target),visible:getLayoutStyle(target)?.visibility!=='hidden'};},
++    now:()=>performance.now(),watch,
++    microtask:callback=>queueMicrotask(()=>{if(!disposed)callback();}),
++    setTimer:(callback,ms)=>setTimeout(()=>{if(!disposed)callback();},ms),clearTimer:timer=>clearTimeout(timer),
++    report:error=>{if(!disposed){const event=new world.global.ErrorEvent('error',{error,cancelable:true});if(world.global.dispatchEvent(event))page.emit('pageError',error);}},
++  };
++  controller=vm.compileFunction(`return (${intersectionFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:world.context})(bridge);
++  watch(document);const schedule=()=>controller.schedule();main.addEventListener('scroll',schedule);main.addEventListener('resize',schedule);
++  const dispose=()=>{if(disposed)return;disposed=true;controller.dispose();mutations.disconnect();main.removeEventListener('scroll',schedule);main.removeEventListener('resize',schedule);signal.removeEventListener('abort',dispose);};
++  signal.addEventListener('abort',dispose,{once:true});if(signal.aborted)dispose();return {schedule,dispose};
++}
+diff --git a/src/utility-layout.js b/src/utility-layout.js
+new file mode 100644
+--- /dev/null
++++ b/src/utility-layout.js
+@@ -0,0 +1,55 @@
++// Realm-local public geometry over the same authoritative private layout and
++// canonical DOM nodes used by privileged input. No DOM or layout is copied.
++import vm from 'node:vm';
++import { createRequire } from 'node:module';
++import { canonicalUtilityValue } from './isolated-world.js';
++import { nodeIdentity } from './remote-values.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++export function utilityLayoutFor(page,value) {
++  const node=canonicalUtilityValue(value),identity=nodeIdentity(node);
++  if(!identity||identity.nodeType!==1)throw new TypeError('Illegal invocation');
++  const document=identity.ownerDocument;
++  const registry=page.registry??page.frames;
++  const owner=[...(registry?.frames.values()??[page])].find(candidate=>candidate.dom.window.document===document)??page;
++  return {node,document,layout:owner.layout};
++}
++function geometryFactory(g,bridge) {
++  const Rect=DOMRect,states=new WeakMap();
++  const element=value=>{if(!bridge.isElement(value))throw new TypeError('Illegal invocation');return value;};
++  const unsigned=value=>{value=+value;return Number.isFinite(value)?Math.trunc(value)>>>0:0;};
++  class DOMRectList {
++    constructor(){throw new TypeError('Illegal Constructor');}
++    get length(){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this).length;}
++    item(index){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this)[unsigned(index)]??null;}
++    *[Symbol.iterator](){if(!states.has(this))throw new TypeError('Illegal invocation');yield* states.get(this);}
++  }
++  Object.defineProperty(DOMRectList.prototype,Symbol.toStringTag,{value:'DOMRectList',configurable:true});
++  Object.defineProperty(g,'DOMRectList',{value:DOMRectList,writable:true,configurable:true});
++  const rect=value=>new Rect(value.x,value.y,value.width,value.height);
++  const methods={
++    getBoundingClientRect(){return rect(bridge.rect(element(this)));},
++    getClientRects(){const result=Object.create(DOMRectList.prototype),values=Array.from(bridge.rects(element(this)),rect);states.set(result,values);for(let i=0;i<values.length;i++)Object.defineProperty(result,i,{value:values[i],enumerable:true,configurable:true});return result;},
++    scrollIntoView(){bridge.scrollIntoView(element(this));},
++    scrollIntoViewIfNeeded(){bridge.scrollIntoView(element(this));},
++  };
++  for(const[name,value]of Object.entries(methods))Object.defineProperty(Element.prototype,name,{value,writable:true,configurable:true,enumerable:true});
++  for(const name of ['clientWidth','clientHeight','scrollWidth','scrollHeight'])Object.defineProperty(Element.prototype,name,{configurable:true,enumerable:true,get(){return bridge.dimension(element(this),name);}});
++  for(const name of ['offsetWidth','offsetHeight','offsetTop','offsetLeft'])Object.defineProperty(HTMLElement.prototype,name,{configurable:true,enumerable:true,get(){return bridge.dimension(element(this),name);}});
++  for(const name of ['innerWidth','innerHeight','scrollX','scrollY','pageXOffset','pageYOffset'])Object.defineProperty(g,name,{configurable:true,enumerable:true,get(){return bridge.viewport(name);}});
++}
++export function installUtilityLayout(page,world,main=page.dom.window) {
++  const bridge={
++    isElement:value=>nodeIdentity(canonicalUtilityValue(value))?.nodeType===1,
++    rect:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rect(node);},
++    rects:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rects(node);},
++    scrollIntoView:value=>{const{node,layout}=utilityLayoutFor(page,value);layout.scrollIntoView(node);},
++    dimension(value,name){const{node,document,layout}=utilityLayoutFor(page,value);const root=utils.implForWrapper(node)===utils.implForWrapper(document).documentElement;
++      const axis=name.endsWith('Width')?'width':'height';
++      if(name.startsWith('client'))return root?layout.viewport[axis]:layout.dimension(node,axis);
++      if(name.startsWith('scroll'))return root?layout.documentSize[axis]:axis==='width'?layout.scrollWidth(node):layout.scrollHeight(node);
++      if(name==='offsetTop')return layout.absoluteRect(node).y;if(name==='offsetLeft')return layout.absoluteRect(node).x;
++      return layout.dimension(node,axis);},
++    viewport(name){const layout=page.layout;if(name==='innerWidth')return layout.viewport.width;if(name==='innerHeight')return layout.viewport.height;return ['scrollX','pageXOffset'].includes(name)?layout.scroll.x:layout.scroll.y;},
++  };
++  vm.compileFunction(`(${geometryFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:world.context})(bridge);
++}
+diff --git a/test/isolated-world.test.js b/test/isolated-world.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/isolated-world.test.js
+@@ -0,0 +1,51 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createRequire} from 'node:module';
++import vm from 'node:vm';
++import {JSDOM} from 'jsdom';
++import {createIsolatedWorld,utilityNodeIdentity,canonicalUtilityValue} from '../src/isolated-world.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++function setup(t,options={}){const dom=new JSDOM('<!doctype html><button id="a">A</button><p id="p">P</p>',{runScripts:'dangerously'}),abort=new AbortController();const world=createIsolatedWorld(dom.window,{signal:abort.signal,...options});t.after(()=>{abort.abort();dom.window.close();});return{dom,main:dom.window,world,abort};}
++const plain=value=>JSON.parse(JSON.stringify(value));
++
++test('actual VM globals, functions and per-world DOM prototypes/expandos differ over one real tree',t=>{
++ const{main,world}=setup(t),button=main.document.getElementById('a'),impl=utils.implForWrapper(button),canonical=impl[utils.wrapperSymbol];main.onlyMain=42;button.mainExpando=42;
++ assert.equal(vm.isContext(world.context),true);assert.notEqual(world.context,main);assert.deepEqual(plain(world.evaluate('({global:typeof onlyMain,expando:document.getElementById("a").mainExpando,node:document.getElementById("a") instanceof HTMLButtonElement,object:document instanceof Object,method:document.querySelector instanceof Function,window:window instanceof Window,view:document.defaultView===window})')),{global:'undefined',node:true,object:true,method:true,window:true,view:true});
++ world.evaluate('globalThis.onlyUtility=84;document.getElementById("a").utilityExpando=84;Node.prototype.utilityProperty=84;document.getElementById("a").textContent="shared mutation";');assert.equal(main.onlyUtility,undefined);assert.equal(button.utilityExpando,undefined);assert.equal(main.Node.prototype.utilityProperty,undefined);assert.equal(button.textContent,'shared mutation');assert.equal(impl[utils.wrapperSymbol],canonical);
++});
++
++test('two genuine worlds retain independent wrappers and original canonical main backlink',t=>{
++ const{main,world}=setup(t),other=createIsolatedWorld(main);t.after(()=>other.dispose());const first=world.evaluate('document.getElementById("a")'),second=other.evaluate('document.getElementById("a")');assert.notEqual(first,second);assert.equal(canonicalUtilityValue(first),main.document.getElementById('a'));assert.equal(canonicalUtilityValue(second),main.document.getElementById('a'));first.expando=1;assert.equal(second.expando,undefined);world.evaluate('document.getElementById("a").setAttribute("shared","yes")');assert.equal(other.evaluate('document.getElementById("a").getAttribute("shared")'),'yes');
++});
++
++test('real live collections and static NodeLists return their own genuine public wrappers',t=>{
++ const{main,world}=setup(t);assert.deepEqual(plain(world.evaluate('globalThis.list=document.querySelectorAll("p");globalThis.live=document.body.children;({list:list instanceof NodeList,index:list[0]===document.getElementById("p"),array:document.getElementById("p").getAttributeNames() instanceof Array,collection:live instanceof HTMLCollection,count:live.length})')),{list:true,index:true,array:true,collection:true,count:2});main.document.body.append(main.document.createElement('p'));assert.deepEqual(plain(world.evaluate('({static:list.length,live:live.length})')),{static:1,live:3});
++});
++
++test('utility-created nodes preserve shared identity and keep utility expandos out of main wrappers',t=>{
++ const{main,world}=setup(t);const node=world.evaluate('globalThis.created=document.createElement("span");created.id="created";created.expando=17;document.body.append(created);created');assert.equal(world.evaluate('document.getElementById("created")===created'),true);assert.equal(main.document.getElementById('created').expando,undefined);assert.equal(canonicalUtilityValue(node),main.document.getElementById('created'));
++});
++
++test('events use real world callback/this/target wrappers in both producer directions',t=>{
++ const{main,world}=setup(t),button=main.document.getElementById('a');let rootEvent;button.addEventListener('audit',event=>{rootEvent=event;event.mainExpando=1;assert.equal(event instanceof main.Event,true);});world.evaluate('globalThis.result=null;document.getElementById("a").addEventListener("audit",function(e){e.utilityExpando=2;result={event:e instanceof Event,target:e.target===this,self:this===document.getElementById("a"),main:e.mainExpando};});');button.dispatchEvent(new main.Event('audit'));assert.deepEqual(plain(world.evaluate('result')),{event:true,target:true,self:true});assert.equal(rootEvent.utilityExpando,undefined);world.evaluate('document.getElementById("a").dispatchEvent(new Event("audit"))');assert.equal(rootEvent instanceof main.Event,true);assert.equal(rootEvent.utilityExpando,undefined);
++});
++
++test('authored CustomEvent.detail values retain original cross-world identity rather than being copied',t=>{
++ const{main,world}=setup(t);main.detailArray=[main.document.getElementById('p')];main.detailArray[0].mainExpando=42;world.evaluate('document.addEventListener("detail",e=>{globalThis.detailResult={array:e.detail instanceof Array,node:e.detail[0]===document.getElementById("p"),expando:e.detail[0].mainExpando};e.detail.push(2)});');main.document.dispatchEvent(new main.CustomEvent('detail',{detail:main.detailArray}));assert.equal(main.detailArray.length,2);assert.deepEqual(plain(world.evaluate('detailResult')),{array:false,node:false,expando:42});
++});
++
++test('MutationObserver preserves the measured main-delivery native quirk in a real utility callback',async t=>{
++ const{main,world}=setup(t);main.utilityMarker=undefined;let result;main.document.getElementById('p').addEventListener('mo',e=>{result={array:e.detail.records instanceof main.Array,node:e.detail.records[0].target===main.document.getElementById('p'),observer:e.detail.observer instanceof main.MutationObserver};});world.evaluate('globalThis.utilityMarker=84;globalThis.observer=new MutationObserver((records,observer)=>{globalThis.observation={array:records instanceof Array,node:records[0].target===document.getElementById("p"),observer:observer===globalThis.observer,global:utilityMarker};document.getElementById("p").dispatchEvent(new CustomEvent("mo",{detail:{records,observer}}));});observer.observe(document.getElementById("p"),{attributes:true});');assert.equal(world.evaluate('observer instanceof MutationObserver'),true);main.document.getElementById('p').setAttribute('x','yes');await new Promise(resolve=>setTimeout(resolve,0));assert.deepEqual(plain(world.evaluate('observation')),{array:false,node:false,observer:false,global:84});assert.deepEqual(result,{array:true,node:true,observer:true});
++});
++
++test('abort removes actual callbacks/observers/timers without repeating authored conversion hooks',async t=>{
++ const{main,world,abort}=setup(t);main.calls=[];world.evaluate('globalThis.conversions=0;const type={toString(){conversions++;return "audit"}};const opts={get capture(){conversions++;return false}};document.addEventListener(type,()=>document.documentElement.setAttribute("late-event","bad"),opts);globalThis.observer=new MutationObserver(()=>document.documentElement.setAttribute("late-observer","bad"));observer.observe(document.getElementById("p"),{attributes:true});setTimeout(()=>document.documentElement.setAttribute("late-timer","bad"),20);');assert.equal(world.evaluate('conversions'),2);main.document.getElementById('p').setAttribute('x','before-abort');abort.abort();main.document.dispatchEvent(new main.Event('audit'));await new Promise(resolve=>setTimeout(resolve,30));for(const name of ['late-event','late-observer','late-timer'])assert.equal(main.document.documentElement.hasAttribute(name),false);assert.throws(()=>world.evaluate('1'),/disposed/);world.dispose();
++});
++
++test('factory notifications carry actual realm/implementation/final public values with weak-identity recognition',t=>{
++ const events=[],factories=[];const{world,abort}=setup(t,{onRealm(global,context){events.push('realm');assert.equal(vm.isContext(context),true);assert.equal(global.document instanceof global.Document,true);},onWrapper(value,global,metadata){events.push('factory');factories.push({value,global,metadata});}});assert.equal(events[0],'realm');const list=world.evaluate('document.querySelectorAll("p")');const entry=factories.find(row=>row.value===list);assert.ok(entry);assert.equal(entry.global,world.global);assert.equal(entry.metadata.impl,world.implementationFor(list));assert.equal(entry.metadata.interfaceName,'NodeList');const node=world.evaluate('document.getElementById("p")');assert.equal(utilityNodeIdentity(node).nodeType,1);const fake=Object.create(Object.getPrototypeOf(node));Object.defineProperty(fake,utils.implSymbol,{value:world.implementationFor(node)});assert.equal(utilityNodeIdentity(fake),undefined);abort.abort();assert.equal(entry.metadata.disposed,true);assert.equal(utilityNodeIdentity(node),undefined);
++});
++
++test('bounded private invocation preserves utility literals/lexical scope and ignores authored apply replacements',t=>{
++ const{world}=setup(t,{timeout:30});world.evaluate('globalThis.answer=42;globalThis.before=[];before=Object.getOwnPropertyNames(globalThis);Function.prototype.apply=()=>99;Reflect.apply=()=>98;JSON.parse=()=>({poisoned:true});');assert.equal(world.callFunction('function(){return answer}',world.global,[]),42);assert.equal(world.callFunction('function(){return Object.getOwnPropertyNames(globalThis).filter(key=>!before.includes(key)).length}',world.global,[]),0);assert.throws(()=>world.callFunction('function(){while(true){}}',world.global,[]),error=>error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT');assert.equal(world.callFunction('function(){return answer+1}',world.global,[]),43);
++});
+diff --git a/test/world-protocol.test.js b/test/world-protocol.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/world-protocol.test.js
+@@ -0,0 +1,70 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++
++import vm from 'node:vm';
++import {configureUtilityFactories} from '../src/world-sessions.js';
++import {connect} from './cdp-client.js';
++const {serve}=await import('../src/cdp.js');
++async function setup(t,options={}){const service=await serve({host:'127.0.0.1',port:0,...options});const client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close();});const{browserContextId}=await client.send('Target.createBrowserContext');const{targetId}=await client.send('Target.createTarget',{browserContextId,url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Runtime.enable');const evaluate=async(expression,contextId,extra={})=>{const r=await send('Runtime.evaluate',{expression,returnByValue:true,...(contextId?{contextId}:{}),...extra});assert.equal(r.exceptionDetails,undefined,JSON.stringify(r));return r.result.value;};return{service,client,send,evaluate,targetId,sessionId};}
++
++test('raw CDP selects genuine utility node/literal realms, private node identity and stable unique contexts',async t=>{
++ const{client,send,evaluate}=await setup(t);await send('Page.navigate',{url:'data:text/html,<button id="a">A</button>'});const{frameTree}=await send('Page.getFrameTree');const{id}=frameTree.frame;const{executionContextId:world}=await send('Page.createIsolatedWorld',{frameId:id,worldName:'actual-world'});const node=(await send('Runtime.evaluate',{contextId:world,expression:'globalThis.utilityOnly=42;document.getElementById("a").worldExpando=17;document.getElementById("a")'})).result;assert.equal(node.subtype,'node');assert.equal(node.className,'HTMLButtonElement');assert.equal(await evaluate('typeof utilityOnly'),'undefined');assert.equal(await evaluate('document.getElementById("a").worldExpando'),undefined);await evaluate('JSON.parse=()=>({poisoned:true});true',world);
++ const called=await send('Runtime.callFunctionOn',{objectId:node.objectId,functionDeclaration:'function(arg){return {literal:arg instanceof Object,nested:arg.nested instanceof Array,node:this instanceof HTMLButtonElement,document:this.ownerDocument===document}}',arguments:[{value:{nested:[1]}}],returnByValue:true});assert.deepEqual(called.result.value,{literal:true,nested:true,node:true,document:true});
++ const root=(await send('DOM.getDocument')).root;const selected=await send('DOM.querySelector',{nodeId:root.nodeId,selector:'#a'});const resolved=await send('DOM.resolveNode',{nodeId:selected.nodeId,executionContextId:world});assert.equal(resolved.object.subtype,'node');assert.equal((await send('DOM.requestNode',{objectId:node.objectId})).nodeId,selected.nodeId);assert.equal((await send('DOM.describeNode',{objectId:node.objectId})).node.backendNodeId,selected.nodeId);assert.equal((await send('Runtime.callFunctionOn',{objectId:resolved.object.objectId,functionDeclaration:'function(){return this===document.getElementById("a")}',returnByValue:true})).result.value,true);
++ const context=client.events.find(e=>e.method==='Runtime.executionContextCreated'&&e.params.context.id===world).params.context;assert.equal(await evaluate('utilityOnly',undefined,{uniqueContextId:context.uniqueId}),42);const count=client.events.filter(e=>e.method==='Runtime.executionContextCreated').length;await send('Runtime.enable');assert.equal(client.events.filter(e=>e.method==='Runtime.executionContextCreated').length,count);
++});
++
++test('world-name cache is frame/document scoped across sessions and binding removal leaves inert real function',async t=>{
++ const authorities=[];configureUtilityFactories({onRealm(global,context,metadata){assert.equal(vm.isContext(context),true);assert.equal(metadata.isActive(),true);authorities.push({global,context,metadata});return()=>{};}});t.after(()=>configureUtilityFactories({}));
++ const{client,send,evaluate,targetId}=await setup(t);await send('Page.navigate',{url:'data:text/html,<p>cache</p>'});const{frameTree}=await send('Page.getFrameTree');const first=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'shared-world'});const other=await client.send('Target.attachToTarget',{targetId,flatten:true});const second=await client.send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'shared-world'},other.sessionId);assert.equal(first.executionContextId,second.executionContextId);assert.equal(authorities.length,1);assert.equal(authorities[0].metadata.contextId,first.executionContextId);await evaluate('globalThis.sameActualWorld=33',first.executionContextId);assert.equal((await client.send('Runtime.evaluate',{contextId:second.executionContextId,expression:'sameActualWorld',returnByValue:true},other.sessionId)).result.value,33);
++ await send('Runtime.addBinding',{name:'report',executionContextId:first.executionContextId});assert.equal(await evaluate('typeof report'),'undefined');assert.equal(await evaluate('report instanceof Function',first.executionContextId),true);await evaluate('report("before");true',first.executionContextId);assert.equal(client.events.filter(e=>e.method==='Runtime.bindingCalled').length,1);await send('Runtime.removeBinding',{name:'report'});assert.equal(await evaluate('typeof report',first.executionContextId),'function');await evaluate('report("after");true',first.executionContextId);assert.equal(client.events.filter(e=>e.method==='Runtime.bindingCalled').length,1);
++});
++
++test('utility preload callbacks execute before main authored events and compiled/lexical APIs use the actual VM',async t=>{
++ const{client,send,evaluate}=await setup(t);await send('Runtime.addBinding',{name:'preloadReport',executionContextName:'preload'});await send('Page.addScriptToEvaluateOnNewDocument',{worldName:'preload',source:'globalThis.utilityPreload=17;preloadReport("boot");document.addEventListener("author",()=>document.documentElement.setAttribute("seen","yes"));'});await send('Page.navigate',{url:'data:text/html,'+encodeURIComponent('<!doctype html><script>document.dispatchEvent(new Event("author"));globalThis.observed={hidden:typeof utilityPreload,shared:document.documentElement.getAttribute("seen")};</script>')});assert.deepEqual(await evaluate('observed'),{hidden:'undefined',shared:'yes'});const context=client.events.find(e=>e.method==='Runtime.executionContextCreated'&&e.params.context.name==='preload').params.context;assert.equal(await evaluate('utilityPreload',context.id),17);const binding=client.events.find(e=>e.method==='Runtime.bindingCalled'&&e.params.name==='preloadReport');assert.equal(binding.params.executionContextId,context.id);assert.equal(binding.params.payload,'boot');assert.ok(client.events.findIndex(e=>e.method==='Runtime.executionContextCreated'&&e.params.context.id===context.id)<client.events.indexOf(binding));assert.equal(await evaluate('typeof preloadReport'),'undefined');
++ const compiled=await send('Runtime.compileScript',{expression:'let utilityLexical=33;utilityLexical+1',sourceURL:'utility-proof.js',persistScript:true,executionContextId:context.id});const result=await send('Runtime.runScript',{scriptId:compiled.scriptId,executionContextId:context.id,returnByValue:true});assert.equal(result.result.value,34);const names=await send('Runtime.globalLexicalScopeNames',{executionContextId:context.id});assert.ok(names.names.includes('utilityLexical'));assert.equal(await evaluate('typeof utilityLexical'),'undefined');
++});
++
++
++test('native required worldName validation and explicit empty-name worlds retain real isolation',async t=>{
++ const{send,evaluate}=await setup(t);const{frameTree}=await send('Page.getFrameTree');for(const value of [undefined,7,null])await assert.rejects(send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,...(value===undefined?{}:{worldName:value})}),error=>error.code===-31998&&error.message===(value===undefined?'MissingField':'UnexpectedToken'));const world=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:''});const repeat=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:''});assert.equal(world.executionContextId,repeat.executionContextId);await evaluate('globalThis.emptyNameValue=42',world.executionContextId);assert.equal(await evaluate('typeof emptyNameValue'),'undefined');
++});
++
++test('actual unique-world selection preserves caller validation, receiver groups and bounded invocation',async t=>{
++ const{client,send,evaluate}=await setup(t,{timeout:150});
++ const frameId=(await send('Page.getFrameTree')).frameTree.frame.id;
++ const{executionContextId}=await send('Page.createIsolatedWorld',{frameId,worldName:'caller-world'});
++ const context=client.events.find(e=>e.method==='Runtime.executionContextCreated'&&e.params.context.id===executionContextId).params.context;
++ await evaluate('globalThis.worldMark=71;Function.prototype.apply=()=>{throw new Error("authored apply")};true',executionContextId);
++ const receiver=(await send('Runtime.evaluate',{uniqueContextId:context.uniqueId,expression:'({})',objectGroup:'actual-world-group'})).result.objectId;
++ const mixed={objectId:receiver,uniqueContextId:'invalid-unique-context',functionDeclaration:'function(){return 1}'};
++ await assert.rejects(send('Runtime.callFunctionOn',mixed),{code:-32602,message:'ObjectId, executionContextId and uniqueContextId must mutually exclude each other'});
++ await assert.rejects(send('Runtime.callFunctionOn',{executionContextId,uniqueContextId:context.uniqueId,functionDeclaration:'function(){return 1}'}),{code:-32602,message:'ObjectId, executionContextId and uniqueContextId must mutually exclude each other'});
++ const called=await send('Runtime.callFunctionOn',{uniqueContextId:context.uniqueId,functionDeclaration:'function(arg){return [this===globalThis,worldMark,arg instanceof Object,arg.a instanceof Array]}',arguments:[{value:{a:[]}}],returnByValue:true});
++ assert.deepEqual(called.result.value,[true,71,true,true]);
++ const child=await send('Runtime.callFunctionOn',{objectId:receiver,functionDeclaration:'function(){return {mark:worldMark}}'});
++ const thrown=await send('Runtime.callFunctionOn',{objectId:receiver,functionDeclaration:'function(){throw {realm:worldMark}}'});
++ assert.equal(thrown.exceptionDetails.executionContextId,executionContextId);
++ assert.equal((await send('Runtime.callFunctionOn',{objectId:child.result.objectId,functionDeclaration:'function(){return this.mark}',returnByValue:true})).result.value,71);
++ await send('Runtime.releaseObjectGroup',{objectGroup:'actual-world-group'});
++ for(const objectId of [receiver,child.result.objectId,thrown.result.objectId,thrown.exceptionDetails.exception.objectId])await assert.rejects(send('Runtime.getProperties',{objectId}),{code:-32000,message:'Could not find object with given id'});
++ const timeout=await send('Runtime.callFunctionOn',{uniqueContextId:context.uniqueId,functionDeclaration:'function(){while(true){}}'});
++ assert.ok(timeout.exceptionDetails);
++ assert.match(timeout.result.description,/timed out/);
++ assert.equal(await evaluate('worldMark',undefined,{uniqueContextId:context.uniqueId}),71);
++ assert.equal(await evaluate('typeof worldMark'),'undefined');
++});
++
++test('navigation creates a fresh actual named world and retires prior unique context authority',async t=>{
++ const authorities=[];configureUtilityFactories({onRealm(global,context,metadata){const entry={context,metadata,disposed:false};authorities.push(entry);return()=>{entry.disposed=true};}});t.after(()=>configureUtilityFactories({}));
++ const{client,send,evaluate}=await setup(t);
++ const frameId=(await send('Page.getFrameTree')).frameTree.frame.id;
++ const first=(await send('Page.createIsolatedWorld',{frameId,worldName:'document-life'})).executionContextId;
++ const firstUnique=client.events.find(e=>e.method==='Runtime.executionContextCreated'&&e.params.context.id===first).params.context.uniqueId;
++ await evaluate('globalThis.firstDocumentOnly=42',first);
++ await send('Page.navigate',{url:'data:text/html,<p>next actual document</p>'});
++ const second=(await send('Page.createIsolatedWorld',{frameId,worldName:'document-life'})).executionContextId;
++ assert.notEqual(first,second);assert.equal(await evaluate('typeof firstDocumentOnly',second),'undefined');
++ await assert.rejects(send('Runtime.evaluate',{uniqueContextId:firstUnique,expression:'1'}),{code:-32602,message:'Cannot find context with specified id'});
++ assert.equal(authorities.length,2);assert.equal(authorities[0].metadata.isActive(),false);assert.equal(authorities[0].disposed,true);assert.equal(authorities[1].metadata.isActive(),true);assert.notEqual(authorities[0].context,authorities[1].context);
++});
+diff --git a/test/utility-platform.test.js b/test/utility-platform.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/utility-platform.test.js
+@@ -0,0 +1,53 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++import {createIsolatedWorld,canonicalUtilityValue} from '../src/isolated-world.js';
++import {installUtilityIntersection} from '../src/utility-observers.js';
++import {installUtilityAnimationFrame} from '../src/utility-platform.js';
++import {installUtilityLayout} from '../src/utility-layout.js';
++import {installFonts} from '../src/fonts.js';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t){const browser=new Browser({timeout:1000}),page=browser.createPage();await page.navigate('data:text/html,<div id="a" style="width:20px;height:30px">A</div>');const main=page.dom.window,world=createIsolatedWorld(main,{signal:page.documentAbort.signal});installUtilityLayout(page,world,main);installUtilityAnimationFrame(page,world,main);installUtilityIntersection(page,world,main);installFonts(world.global);t.after(()=>{world.dispose();browser.close();});return {browser,page,main,world};}
++
++test('native public observer producers, ordering and option errors use genuine utility values',async t=>{
++ const{world}=await fixture(t),native=JSON.parse(await readFile(new URL('./fixtures/utility-platform-native.json',import.meta.url),'utf8'));
++ for(const row of native.observations){const actual=plain(await world.evaluate(row.expression));if(row.label==='raf-producer'){assert.equal(Number.isFinite(actual.clockDelta),true);assert.ok(Math.abs(actual.clockDelta)<100);delete actual.clockDelta;const expected={...row.result.result.value};delete expected.clockDelta;assert.deepEqual(actual,expected);}else assert.deepEqual(actual,row.result.result.value);}
++});
++
++test('rectangles and live layout dimensions come from canonical nodes while result identities stay utility-local',async t=>{
++ const{page,main,world}=await fixture(t),node=main.document.getElementById('a');node.mainExpando=42;
++ const expected=plain(node.getBoundingClientRect().toJSON());
++ const actual=plain(world.evaluate('globalThis.target=document.getElementById("a");globalThis.rect=target.getBoundingClientRect();globalThis.rects=target.getClientRects();({value:rect.toJSON(),rect:rect instanceof DOMRect,base:rect instanceof DOMRectReadOnly,list:rects instanceof DOMRectList,item:rects.item(0)===rects[0],array:[...rects] instanceof Array,method:target.getBoundingClientRect instanceof Function,width:document.documentElement.clientWidth,height:document.documentElement.clientHeight,mainExpando:target.mainExpando})'));
++ assert.deepEqual(actual,{value:expected,rect:true,base:true,list:true,item:true,array:true,method:true,width:page.layout.viewport.width,height:page.layout.viewport.height});
++ assert.notEqual(world.evaluate('rect'),node.getBoundingClientRect());assert.equal(canonicalUtilityValue(world.evaluate('target')),node);
++ node.style.width='40px';assert.equal(world.evaluate('target.getBoundingClientRect().width'),40);assert.equal(world.evaluate('rect.width'),20);
++ assert.deepEqual(plain(world.evaluate('(()=>{const result=[];for(const fn of [()=>Element.prototype.getBoundingClientRect.call({}),()=>Object.getOwnPropertyDescriptor(Element.prototype,"clientWidth").get.call({})]){try{fn()}catch(error){result.push([error instanceof TypeError,error.message])}}return result})()')),[[true,'Illegal invocation'],[true,'Illegal invocation']]);
++});
++
++test('observer receives real changed geometry and utility target identity after main-world DOM mutations',async t=>{
++ const{main,world}=await fixture(t);
++ world.evaluate('globalThis.deliveries=[];globalThis.observer=new IntersectionObserver((records,observer)=>{deliveries.push({same:records[0].target===document.getElementById("a"),self:observer===globalThis.observer,array:records instanceof Array,entry:records[0] instanceof IntersectionObserverEntry,intersects:records[0].isIntersecting,ratio:records[0].intersectionRatio});});observer.observe(document.getElementById("a"));');
++ await new Promise(resolve=>setTimeout(resolve,0));main.document.getElementById('a').style.display='none';await new Promise(resolve=>setTimeout(resolve,0));
++ assert.deepEqual(plain(world.evaluate('deliveries')),[{same:true,self:true,array:true,entry:true,intersects:true,ratio:1},{same:true,self:true,array:true,entry:true,intersects:false,ratio:0}]);
++});
++
++test('RAF uses the prepared document scheduler, realm-local callback and single cancellation conversion',async t=>{
++ const{main,world}=await fixture(t);main.requestAnimationFrame=()=>{throw new Error('authored main scheduler');};main.cancelAnimationFrame=()=>{throw new Error('authored main cancellation');};
++ const result=await world.evaluate('new Promise(resolve=>{globalThis.canceledCalled=false;globalThis.conversions=0;const id=requestAnimationFrame(()=>{canceledCalled=true});cancelAnimationFrame({valueOf(){conversions++;return id}});requestAnimationFrame(function(timestamp){resolve({self:this===window,time:typeof timestamp,clock:performance.now()-timestamp,conversions,canceledCalled,entry:requestAnimationFrame instanceof Function,performance:performance instanceof Performance});});})');
++ assert.deepEqual({...plain(result),clock:undefined},{self:true,time:'number',clock:undefined,conversions:1,canceledCalled:false,entry:true,performance:true});assert.ok(Math.abs(result.clock)<100);
++});
++
++test('document abort cancels pending RAF, observer work and its genuine font Promise remains in the utility realm',async t=>{
++ const{page,main,world}=await fixture(t);assert.deepEqual(plain(world.evaluate('({set:document.fonts instanceof FontFaceSet,promise:document.fonts.ready instanceof Promise,global:FontFaceSet instanceof Function,same:document.fonts===document.fonts})')),{set:true,promise:true,global:true,same:true});
++ world.evaluate('requestAnimationFrame(()=>document.documentElement.setAttribute("late-frame","bad"));new IntersectionObserver(()=>document.documentElement.setAttribute("late-observer","bad")).observe(document.getElementById("a"));');
++ const document=main.document;page.documentAbort.abort();await new Promise(resolve=>setTimeout(resolve,25));assert.equal(document.documentElement.hasAttribute('late-frame'),false);assert.equal(document.documentElement.hasAttribute('late-observer'),false);
++});
++
++test('trusted utility factories publish weak provenance after final wrapper identity without heap dependencies',async t=>{
++ const{world}=await fixture(t);const {platformFactoryRecord,subscribePlatformFactories}=await import('../src/platform-factories.js');
++ const notifications=[];const unsubscribe=subscribePlatformFactories((value,record)=>{notifications.push({value,record});throw new Error('observer failure');});t.after(unsubscribe);
++ const value=world.evaluate('new DOMRect(1,2,3,4)'),record=platformFactoryRecord(value);
++ assert.equal(record.kind,'DOMRect');assert.equal(record.globalRef.deref(),world.global);assert.equal(record.implementation,world.implementationFor(value));assert.equal(notifications.find(row=>row.value===value).record,record);assert.equal(value.width,3);
++ const fake=Object.create(Object.getPrototypeOf(value));for(const key of Object.getOwnPropertySymbols(value))Object.defineProperty(fake,key,Object.getOwnPropertyDescriptor(value,key));assert.equal(platformFactoryRecord(fake),undefined);
++});
+diff --git a/test/fixtures/utility-platform-native.json b/test/fixtures/utility-platform-native.json
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/utility-platform-native.json
+@@ -0,0 +1,102 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e2dac92b5f4e63e8d51930c71e3f15c9cbb81ca0d46a84e1c1c1bbe241982a8c",
++  "observations": [
++    {
++      "label": "real-producers",
++      "expression": "new Promise(resolve=>{const target=document.getElementById('a'),order=[];const observer=new IntersectionObserver(function(records,argument){order.push('callback');resolve({order,ctor:IntersectionObserver instanceof Function,observer:this===observer&&argument===observer,observerObject:observer instanceof Object,array:records instanceof Array,entry:records[0] instanceof IntersectionObserverEntry,entryObject:records[0] instanceof Object,target:records[0].target===target,rect:records[0].boundingClientRect instanceof DOMRectReadOnly,ratio:records[0].intersectionRatio,isIntersecting:records[0].isIntersecting,rectValue:records[0].boundingClientRect.toJSON(),thresholds:observer.thresholds instanceof Array});observer.disconnect();});observer.observe(target);order.push('observe-returned');queueMicrotask(()=>order.push('microtask'));})",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "order": [
++              "observe-returned",
++              "callback",
++              "microtask"
++            ],
++            "ctor": true,
++            "observer": true,
++            "observerObject": true,
++            "array": true,
++            "entry": true,
++            "entryObject": true,
++            "target": true,
++            "rect": true,
++            "ratio": 1,
++            "isIntersecting": true,
++            "rectValue": {
++              "x": 0,
++              "y": 20,
++              "width": 20,
++              "height": 30,
++              "top": 20,
++              "right": 20,
++              "bottom": 50,
++              "left": 0
++            },
++            "thresholds": true
++          }
++        }
++      }
++    },
++    {
++      "label": "raf-producer",
++      "expression": "new Promise(resolve=>{let canceledCalled=false;const canceled=requestAnimationFrame(()=>{canceledCalled=true});cancelAnimationFrame(canceled);requestAnimationFrame(function(timestamp){resolve({self:this===window,entry:requestAnimationFrame instanceof Function,cancel:cancelAnimationFrame instanceof Function,performance:performance instanceof Performance,timeType:typeof timestamp,clockDelta:performance.now()-timestamp,canceledCalled});});})",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "self": true,
++            "entry": true,
++            "cancel": true,
++            "performance": true,
++            "timeType": "number",
++            "clockDelta": 0.5150000000000006,
++            "canceledCalled": false
++          }
++        }
++      }
++    },
++    {
++      "label": "options-and-brands",
++      "expression": "(()=>{const results={};for(const[name,fn]of Object.entries({entry:()=>new IntersectionObserverEntry({}),callback:()=>new IntersectionObserver(1),target:()=>new IntersectionObserver(()=>{}).observe({}),margin:()=>new IntersectionObserver(()=>{},{rootMargin:'auto'}),threshold:()=>new IntersectionObserver(()=>{},{threshold:[2]}),borrow:()=>IntersectionObserver.prototype.disconnect.call({})})){try{fn();results[name]={ok:true}}catch(e){results[name]={name:e.name,message:e.message,realm:e instanceof Error}}}return results})()",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "entry": {
++              "name": "TypeError",
++              "message": "Illegal Constructor",
++              "realm": true
++            },
++            "callback": {
++              "name": "TypeError",
++              "message": "invalid argument",
++              "realm": true
++            },
++            "target": {
++              "name": "TypeError",
++              "message": "invalid argument",
++              "realm": true
++            },
++            "margin": {
++              "name": "SyntaxError",
++              "message": "The string did not match the expected pattern",
++              "realm": true
++            },
++            "threshold": {
++              "name": "RangeError",
++              "message": "",
++              "realm": true
++            },
++            "borrow": {
++              "name": "TypeError",
++              "message": "Illegal invocation",
++              "realm": true
++            }
++          }
++        }
++      }
++    }
++  ]
++}

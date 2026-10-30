@@ -1,0 +1,11 @@
+# Coverage48 frozen evidence
+
+This cohort selects 48 previously unattempted default-profile fixtures. On one frozen candidate graph, native passes 48; candidate passes 11, fails 36, and times out once. The native initial missing `/echo_method` route is preserved as a transport-blocked attempt; separate real-route controls provide the valid final paired result. Assertions and source harness bytes are unchanged.
+
+`report.json` contains fixture-level results, exact source hashes, transport scope, and separate historical coverage unions. Those unions span different candidate snapshots and are not a current pass rate. Registration inventory distinguishes 440 default, 5 stylesheet, and 10 other profiles. This cohort adds only default-profile observations. Source budget is 2 seconds; this diagnostic run uses 15 seconds plus a 100ms settle, and makes no timing-equivalence claim.
+
+`inventory.json` indexes 108 retained evidence-bearing artifacts copied under `evidence-inputs/`, preserving JSON pointers and original hashes. It records 1,635 outcomes, no unknown actors, and distinguishes attempted, harness-observed, and ever-positive evidence. Run `python3 proposals/coverage48/inventory.py --frozen-inputs` to reproduce the index, then `python3 proposals/coverage48/summarize.py` for the disjoint cohort report. The refined historical classifier recognizes actor-prefixed harness flags and actual script assertion diagnostics; original selection-time inventory hash is retained in `manifest.json`.
+
+The fatal AbortSignal case is separately reproduced in `abort-diagnostic/`: Node EventTarget dispatch schedules the authored thrown DOMException through process.nextTick, terminating the candidate with exit1. Native passes the unchanged fixture. No process-wide exception interception was added. All owned browser/server processes are closed.
+
+Next gaps include real realm AbortSignal/error dispatch, custom-element parser/upgrade reactions and registry promise identity, frame Window reuse/focus/retired jobs/named targets, selection/validation, event constructor and coordinate semantics, DOMException cloning, and XPath recursion. Exact failures remain in report.json. TextEncoder is already separately assigned to Root; this frozen old-source outcome is retained without claiming the newer fix was tested here.

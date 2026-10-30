@@ -1,6 +1,6 @@
 import {computedTransform,computedFontSize} from './computed-values.js';
 import {evaluateMedia} from './media.js';
-import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher } from './selectors.js';
+import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher, selectorSubjectTypes } from './selectors.js';
 import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
 import { createRequire } from 'node:module';
 
@@ -392,7 +392,10 @@ function inheritanceParent(element) {
   const implementation = implForWrapper(element);
   const assigned = implementation._assignedSlot;
   if (assigned) return wrapperForImpl(assigned);
-  return element.parentElement ?? rootOf(element).host ?? null;
+  const parent = implementation.parentElement;
+  if (parent) return wrapperForImpl(parent);
+  const root = implementation.getRootNode({ composed: false });
+  return root._host ? wrapperForImpl(root._host) : null;
 }
 
 function localToken(record, element) {
@@ -431,6 +434,21 @@ function textTransformValue(value) {
   return mode ?? 'none';
 }
 
+// Parsing one property in an empty declaration is independent of element,
+// selector and cascade rank. Cache only that immutable expansion, never winners.
+const EXPANDED_VALUES=new Map();
+function expandedEntries(property,value){
+ const key=property+'\0'+value;if(EXPANDED_VALUES.has(key))return EXPANDED_VALUES.get(key);
+ const expanded=new CSSStyleDeclaration();expanded.setProperty(property,value);
+ let entries=property==='opacity'?[{name:property,entry:value}]:[...expanded._values].map(([name,entry])=>({name,entry}));
+ if(property==='overflow'){
+  const axes=overflowAxes(value);if(axes)entries.push({name:'overflow-x',entry:axes[0]},{name:'overflow-y',entry:axes[1]});
+  else if(/var\(/.test(value))entries.push({name:'overflow-x',entry:value,overflowPart:0},{name:'overflow-y',entry:value,overflowPart:1});
+  else entries=null;
+ }
+ if(EXPANDED_VALUES.size<1000)EXPANDED_VALUES.set(key,entries);return entries;
+}
+
 function cascade(record, element) {
   const values = new Map(); let order = 0;
   const matchSelector=createScopedMatcher(record.document,record.document.documentElement);record.badStyleSelectors??=new Set();
@@ -457,15 +475,7 @@ function cascade(record, element) {
       let value = style.getPropertyValue(property);
       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
       const important = style.getPropertyPriority(property) === 'important';
-      const expanded = new CSSStyleDeclaration(); expanded.setProperty(property, value);
-      const entries = property === 'opacity' ? [{ name: property, entry: value }] : [...expanded._values].map(([name, entry]) => ({ name, entry }));
-      if (property === 'overflow') {
-        const axes = overflowAxes(value);
-        if (axes) entries.push({ name: 'overflow-x', entry: axes[0] }, { name: 'overflow-y', entry: axes[1] });
-        else if (/var\(/.test(value)) {
-          entries.push({ name: 'overflow-x', entry: value, overflowPart: 0 }, { name: 'overflow-y', entry: value, overflowPart: 1 });
-        } else continue;
-      }
+      const entries=expandedEntries(property,value);if(!entries)continue;
       // cssstyle's pinned parsed value map includes genuine shorthand
       // expansions except overflow. Its independently expanded axes likewise
       // take part in source order, specificity and importance.
@@ -514,7 +524,7 @@ function cascade(record, element) {
       } else if(rule.cssRules&&rule.type!==7)record.unsupported.add('Cascade layers, @supports and other grouping rules');
     }
   };
-  walk(UA.cssRules, 0);
+  walk(uaRulesFor(element), 0);
   if (element.localName === 'a' && element.hasAttribute('href')) {
     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
   }
@@ -532,6 +542,17 @@ function cascade(record, element) {
 }
 
 normalizeRules(UA.cssRules, UA);
+// The private UA sheet is immutable after normalization. Keep actual rule
+// objects in source order, indexed only by parser-proven subject type.
+const UA_TYPES=new WeakMap(),UA_CANDIDATES=new Map();
+for(const rule of UA.cssRules)if(rule.selectorText)UA_TYPES.set(rule,selectorSubjectTypes(rule.selectorText));
+function uaRulesFor(element){
+ const impl=implForWrapper(element),fold=impl._ownerDocument._parsingMode==='html',name=fold?element.localName.replace(/[A-Z]/g,c=>c.toLowerCase()):element.localName,key=(fold?'h:':'x:')+name;
+ let rules=UA_CANDIDATES.get(key);if(rules)return rules;
+ rules=Array.from(UA.cssRules).filter(rule=>{const types=UA_TYPES.get(rule);return !types||types.some(type=>(fold?type.replace(/[A-Z]/g,c=>c.toLowerCase()):type)===name);});
+ if(UA_CANDIDATES.size<1000)UA_CANDIDATES.set(key,rules);return rules;
+}
+
 
 function substitute(text, resolve) {
   let result = '', start = 0;
@@ -769,12 +790,12 @@ export function getCascadedStyleValue(element, property) {
 // surrogate boxes. It avoids allocating a full public CSS declaration for
 // every node when only flow properties are needed.
 const FLOW_PROPERTIES=['display','position','float','width','height','min-width','max-width','margin-left','margin-right','flex-grow','flex-shrink','flex-direction','flex-wrap','overflow-x','overflow-y','visibility','pointer-events','opacity','direction','font-size','white-space','text-wrap','text-wrap-mode'];
-export function getLayoutStyle(element){
+const FLOW_ENTRIES=FLOW_PROPERTIES.map(name=>[name,name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase()),initial[name]??'']);
+export function getLayoutStyle(element,revision){
  const record=recordFor(element.ownerDocument);if(!record)return null;
- const token=localToken(record,element);record.layoutMemo??=new WeakMap();const retained=record.layoutMemo.get(element);if(retained?.token===token)return retained.style;
- const parent=inheritanceParent(element),parentStyle=parent?getLayoutStyle(parent):null,chosen=cascade(record,element),style=Object.create(null);
- const propertyKey=name=>name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
- for(const name of FLOW_PROPERTIES){const key=propertyKey(name),fallback=initial[name]??'',parentValue=parentStyle?.[key]||fallback;let value=chosen.get(name);if(typeof value==='object')value=value.value;const keyword=value?.toLowerCase();if(value===undefined||keyword==='unset')value=inherited.has(name)?parentValue:fallback;else if(keyword==='inherit')value=parentValue;else if(keyword==='initial')value=fallback;if(['display','position','float','visibility','pointer-events'].includes(name))value=value.toLowerCase();style[key]=value;}
+ const token=revision===undefined?localToken(record,element):'layout-revision:'+revision;record.layoutMemo??=new WeakMap();const retained=record.layoutMemo.get(element);if(retained?.token===token)return retained.style;
+ const parent=inheritanceParent(element),parentStyle=parent?getLayoutStyle(parent,revision):null,chosen=cascade(record,element),style=Object.create(null);
+ for(const[name,key,fallback]of FLOW_ENTRIES){const parentValue=parentStyle?.[key]||fallback;let value=chosen.get(name);if(typeof value==='object')value=value.value;const keyword=value?.toLowerCase();if(value===undefined||keyword==='unset')value=inherited.has(name)?parentValue:fallback;else if(keyword==='inherit')value=parentValue;else if(keyword==='initial')value=fallback;if(['display','position','float','visibility','pointer-events'].includes(name))value=value.toLowerCase();style[key]=value;}
  const fontRoot=element===record.document.documentElement?'16px':record.layoutMemo.get(record.document.documentElement)?.style.fontSize??'16px';style.fontSize=computedFontSize(style.fontSize,parentStyle?.fontSize,fontRoot,{isRoot:element===record.document.documentElement});
  const flow=chosen.get('flex-flow');if(typeof flow==='string'){const parts=flow.toLowerCase().split(/\s+/),directions=['row','row-reverse','column','column-reverse'],wraps=['wrap','wrap-reverse','nowrap'];if(parts.length<=2&&parts.every(p=>directions.includes(p)||wraps.includes(p))){for(const[property,key,value]of[['flex-direction','flexDirection',parts.find(p=>directions.includes(p))??'row'],['flex-wrap','flexWrap',parts.find(p=>wraps.includes(p))??'nowrap']]){const explicit=chosen.orderKeys.get(property);if(!explicit||compare(chosen.orderKeys.get('flex-flow'),explicit)>0)style[key]=value;}}}
  const directions=style.direction==='rtl'?['marginRight','marginLeft']:['marginLeft','marginRight'];
@@ -784,7 +805,10 @@ export function getLayoutStyle(element){
  if(element===record.document.documentElement)style.display=({inline:'block','inline-block':'block','inline-flex':'flex','inline-grid':'grid',contents:'block'})[style.display]??style.display;
  record.layoutMemo.set(element,{token,style,specified:chosen});return style;
 }
-export function getSpecifiedStyle(element,name){const record=recordFor(element.ownerDocument);if(!record)return element.style?.getPropertyValue(name)||undefined;getLayoutStyle(element);return record.layoutMemo.get(element)?.specified.get(name);}
-export function hasSpecifiedStyle(element,name){const record=recordFor(element.ownerDocument);if(!record)return !!element.style?.getPropertyValue(name);getLayoutStyle(element);return record.layoutMemo.get(element)?.specified.has(name)??false;}
+export function getSpecifiedStyle(element,name,revision){const record=recordFor(element.ownerDocument);if(!record)return element.style?.getPropertyValue(name)||undefined;getLayoutStyle(element,revision);return record.layoutMemo.get(element)?.specified.get(name);}
+export function hasSpecifiedStyle(element,name,revision){const record=recordFor(element.ownerDocument);if(!record)return !!element.style?.getPropertyValue(name);getLayoutStyle(element,revision);return record.layoutMemo.get(element)?.specified.has(name)??false;}
 
 export function getLayoutCacheRevision(window){return recordFor(window.document)?getStyleRevision(window):undefined;}
+
+// Shared real flat-tree parent for consumers of inherited SVG presentation values.
+export { inheritanceParent as getStyleInheritanceParent };

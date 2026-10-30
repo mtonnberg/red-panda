@@ -35,7 +35,7 @@ test('shape perimeter calculations use actual attributes and point parsing retai
   assert.deepEqual(parsePoints('1e1-2 .5,+4'), [{ x:10, y:-2 }, { x:.5, y:4 }]); assert.deepEqual(parsePoints('1 2 bad'), []);
 });
 
-test('adaptive curves follow native scale controls with an explicit bounded large-curve precision gap', () => {
+test('adaptive curves follow all native scale controls at strict1e-9 precision', () => {
   const controls = [
     [.1, 2.957719276249771, 1.999232961352048],
     [1, 29.57866610568414, 19.999520629118503],
@@ -45,8 +45,18 @@ test('adaptive curves follow native scale controls with an explicit bounded larg
   for (const [scale, quadratic, cubic] of controls) {
     const scaled = source => source.replace(/[-+]?(?:\d+\.?\d*|\.\d+)/g, number => String(Number(number) * scale));
     const q = metrics(scaled('M0 0 Q10 20 20 0')), c = metrics(scaled('M0 0 C0 10 10 10 10 0'));
-    near(q.length, quadratic, scale === 100 ? .001 : 1e-9); near(c.length, cubic); // scale100 exact differential remains recorded, not claimed equal.
+    near(q.length, quadratic); near(c.length, cubic);
     near(q.pointAt(q.length / 2).x, 10 * scale); near(q.pointAt(q.length / 2).y, 10 * scale);
     near(c.pointAt(c.length / 2).x, 5 * scale); near(c.pointAt(c.length / 2).y, 7.5 * scale);
+  }
+});
+
+
+test('relative Bezier tolerance reproduces native scale saturation and rigid-transform controls', () => {
+  for (const [scale, expected] of [[20,591.5769766185527],[30,887.3654958002438],[40,1183.1539944003248],[100,2957.884986000809],[1000,29578.849860008104]]) {
+    for (const [ox,oy,degrees] of [[0,0,0],[1000,1000,0],[0,0,45],[0,0,90]]) {
+      const angle=degrees*Math.PI/180,at=(x,y)=>[ox+scale*(x*Math.cos(angle)-y*Math.sin(angle)),oy+scale*(x*Math.sin(angle)+y*Math.cos(angle))];
+      const a=at(0,0),b=at(10,20),c=at(20,0);near(metrics(`M${a} Q${b} ${c}`).length,expected);
+    }
   }
 });

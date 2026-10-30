@@ -3,6 +3,7 @@ import { isReadableSource, readableWasDrained, readableVersion, readableLocked, 
 import { createRequire } from 'node:module';
 import { types } from 'node:util';
 import { installStreams } from './streams.js';
+import { installAbortSignals } from './abort-signals.js';
 
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
@@ -62,6 +63,7 @@ function safeHeader(name, value) {
 export function installFetch(page, window) {
   if (INSTALLED.has(window)) return INSTALLED.get(window);
   const streams = installStreams(page, window);
+  const abortSignals = installAbortSignals(page, window);
   const generation = page.documentGeneration;
   const documentSignal = page.documentAbort?.signal;
   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
@@ -366,12 +368,12 @@ export function installFetch(page, window) {
       cursor = next + 2;
     }
   }
-  function wrapRequest(raw, bufferedBytes) {
+  function wrapRequest(raw, bufferedBytes, signal = null) {
     const request = Object.create(Request.prototype);
     const headers = fillHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request');
     for (const name of [...raw.headers.keys()]) raw.headers.delete(name);
     for (const [name, value] of headers) raw.headers.set(name, value);
-    requestState.set(request, { raw, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
+    requestState.set(request, { raw, publicSignal: signal, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
     return request;
   }
   class Request {
@@ -384,7 +386,10 @@ export function installFetch(page, window) {
         const mode = init.mode ?? (source instanceof NativeRequest ? source.mode : 'cors');
         const guarded = fillHeaders(init.headers ?? (source instanceof NativeRequest ? source.headers : undefined), mode === 'no-cors' ? 'request-no-cors' : 'request');
         const prepared = {};
-        for (const key of Reflect.ownKeys(Object(init))) if (key !== 'duplex' && Object.prototype.propertyIsEnumerable.call(init, key)) prepared[key] = init[key];
+        for (const key of Reflect.ownKeys(Object(init))) if (key !== 'duplex' && key !== 'signal' && Object.prototype.propertyIsEnumerable.call(init, key)) prepared[key] = init[key];
+        const requestedSignal = init.signal;
+        const publicSignal = requestedSignal == null ? sourceState?.publicSignal ?? null : abortSignals.validate(requestedSignal);
+        prepared.signal = publicSignal === null ? null : abortSignals.native(publicSignal);
         prepared.headers = getHeaders(guarded).raw;
         if (prepared.method !== undefined) {
           if (typeof prepared.method === 'symbol') throw new window.TypeError('Cannot convert a Symbol value to a string');
@@ -403,7 +408,7 @@ export function installFetch(page, window) {
         if (!streamBody && bufferedBytes !== undefined && prepared.body == null) { assertBufferedBodyUsable(sourceState); prepared.body = new Uint8Array(bufferedBytes); }
         if (streamBody && ['GET', 'HEAD'].includes(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) throw new window.TypeError('Request with GET/HEAD method cannot have body.');
         if (prepared.referrer && prepared.referrer !== 'about:client') prepared.referrer = new URL(String(prepared.referrer), window.document.baseURI).href;
-        const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes);
+        const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes, publicSignal);
         const state = requestState.get(wrapped);
         if (streamBody) { state.streamBody = streamBody; state.streamUsed = false; if (streamBody === sourceState?.streamBody && sourceState.streamBytes) { state.streamBytes = sourceState.streamBytes; state.streamVersion = sourceState.streamVersion; } }
         requestState.set(this, state);
@@ -412,9 +417,9 @@ export function installFetch(page, window) {
     clone() {
       try {
         const s = getRequest(this);
-        if (s.streamBody) { const bytes = extractStreamBody(s, { cache: true }); return wrapRequest(new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw }), bytes); }
+        if (s.streamBody) { const bytes = extractStreamBody(s, { cache: true }); return wrapRequest(new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw }), bytes, s.publicSignal); }
         assertBufferedBodyUsable(s);
-        return wrapRequest(s.raw.clone(), s.bufferedBody?.bytes);
+        return wrapRequest(s.raw.clone(), s.bufferedBody?.bytes, s.publicSignal);
       } catch (error) { throw realmError(error); }
     }
     get headers() { return getRequest(this).headers; }
@@ -422,9 +427,10 @@ export function installFetch(page, window) {
     get bodyUsed() { const s = getRequest(this); return s.streamBody ? s.streamUsed : s.raw.bodyUsed; }
     get [Symbol.toStringTag]() { return 'Request'; }
   }
-  for (const name of ['url', 'method', 'mode', 'credentials', 'cache', 'redirect', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal', 'destination', 'duplex']) {
+  for (const name of ['url', 'method', 'mode', 'credentials', 'cache', 'redirect', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'destination', 'duplex']) {
     Object.defineProperty(Request.prototype, name, { configurable: true, enumerable: true, get() { return getRequest(this).raw[name]; } });
   }
+  Object.defineProperty(Request.prototype, 'signal', { configurable: true, enumerable: true, get() { return getRequest(this).publicSignal; } });
   function wrapResponse(raw, view = {}) {
     const response = Object.create(Response.prototype);
     const { bufferedBytes, ...metadata } = view;
@@ -677,7 +683,8 @@ export function installFetch(page, window) {
       } catch (error) { reject(error); return; }
       perform(request).then(value => { if (active()) resolve(value); }, error => {
         if (!active()) return;
-        reject(request.signal.aborted ? request.signal.reason : realmError(error));
+        const signal = getRequest(request).raw.signal;
+        reject(signal.aborted ? signal.reason : realmError(error));
       });
     });
   }

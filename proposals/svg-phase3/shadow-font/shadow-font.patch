@@ -1,0 +1,70 @@
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -392,7 +392,10 @@
+   const implementation = implForWrapper(element);
+   const assigned = implementation._assignedSlot;
+   if (assigned) return wrapperForImpl(assigned);
+-  return element.parentElement ?? rootOf(element).host ?? null;
++  const parent = implementation.parentElement;
++  if (parent) return wrapperForImpl(parent);
++  const root = implementation.getRootNode({ composed: false });
++  return root._host ? wrapperForImpl(root._host) : null;
+ }
+ 
+ function localToken(record, element) {
+@@ -806,3 +809,6 @@
+ export function hasSpecifiedStyle(element,name,revision){const record=recordFor(element.ownerDocument);if(!record)return !!element.style?.getPropertyValue(name);getLayoutStyle(element,revision);return record.layoutMemo.get(element)?.specified.has(name)??false;}
+ 
+ export function getLayoutCacheRevision(window){return recordFor(window.document)?getStyleRevision(window):undefined;}
++
++// Shared real flat-tree parent for consumers of inherited SVG presentation values.
++export { inheritanceParent as getStyleInheritanceParent };
+--- a/src/svg-geometry.js
++++ b/src/svg-geometry.js
+@@ -1,7 +1,7 @@
+ import 'jsdom';
+ import { createRequire } from 'node:module';
+ import { geometryFor, metricsFor, unionBounds } from './svg-path.js';
+-import { getCascadedStyleValue } from './styles.js';
++import { getCascadedStyleValue, getStyleInheritanceParent } from './styles.js';
+ const require = createRequire(import.meta.url);
+ const SVG = require('jsdom/lib/jsdom/living/generated/SVGElement.js');
+ const Graphics = require('jsdom/lib/jsdom/living/generated/SVGGraphicsElement.js');
+@@ -36,7 +36,7 @@
+   function font(element) {
+     if (!element) return 16;
+     if (fontCache.has(element)) return fontCache.get(element);
+-    const inherited = font(parent(element)), declaration = getCascadedStyleValue(element, 'font-size'), value = declaration ?? get(element, 'font-size');
++    const inherited = font(getStyleInheritanceParent(element)), declaration = getCascadedStyleValue(element, 'font-size'), value = declaration ?? get(element, 'font-size');
+     let result = inherited;
+     if (value !== null && value !== undefined) {
+       const text = String(value).trim().toLowerCase(), match = /^([-+]?(?:\d+(?:\.\d*)?|\.\d+))(px|em|rem|%|pt|pc|in|cm|mm)?$/.exec(text);
+--- /dev/null
++++ b/test/svg-font-tree.test.js
+@@ -0,0 +1,26 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++import { Browser } from '../src/browser.js';
++import { getStyleInheritanceParent } from '../src/styles.js';
++
++async function fixture(t) { const browser = new Browser(); t.after(() => browser.close()); const page = browser.createPage(); await page.navigate('data:text/html,<body></body>'); return { page, window:page.dom.window }; }
++
++test('SVG em font inheritance matches all native open/closed host, assigned-slot and mutation controls', async t => {
++  const { page } = await fixture(t);
++  const expression = await readFile(new URL('../docs/reference/svg-phase3-shadow-font-native-expression.js', import.meta.url), 'utf8');
++  const native = JSON.parse(await readFile(new URL('../docs/reference/svg-phase3-shadow-font-native-observation.json', import.meta.url), 'utf8')).observations;
++  assert.deepEqual(JSON.parse(JSON.stringify(page.evaluate(expression))), native);
++});
++
++test('shared style parent uses genuine closed-slot/host state and SVG font values update after reassignment', async t => {
++  const { window:w } = await fixture(t), host=w.document.createElement('div'); w.document.body.append(host); host.style.fontSize='30px';
++  const root=host.attachShadow({mode:'closed'}), slot=w.document.createElement('slot'), other=w.document.createElement('slot'); slot.name='one'; other.name='two'; slot.style.fontSize='40px'; other.style.fontSize='60px'; root.append(slot,other);
++  const svg=w.document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('x','2em'); svg.setAttribute('slot','one'); host.append(svg);
++  assert.equal(svg.assignedSlot,null); assert.equal(getStyleInheritanceParent(svg),slot); assert.equal(svg.x.baseVal.value,80);
++  svg.setAttribute('slot','two'); assert.equal(getStyleInheritanceParent(svg),other); assert.equal(svg.x.baseVal.value,120);
++  const inner=w.document.createElementNS('http://www.w3.org/2000/svg','svg'); inner.setAttribute('x','2em'); root.append(inner);
++  assert.equal(getStyleInheritanceParent(inner),host); assert.equal(inner.x.baseVal.value,60);
++  Object.defineProperty(inner,'parentElement',{get(){throw new Error('authored parent getter')}}); Object.defineProperty(svg,'assignedSlot',{get(){throw new Error('authored slot getter')}});
++  assert.equal(getStyleInheritanceParent(inner),host); assert.equal(getStyleInheritanceParent(svg),other);
++});
