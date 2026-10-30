@@ -26,6 +26,32 @@ export const STREAM_CONSTRUCTORS = Object.freeze(Object.keys(SURFACE));
 const ILLEGAL = new Set(['ReadableStreamDefaultReader', 'ReadableStreamDefaultController',
   'WritableStreamDefaultWriter', 'WritableStreamDefaultController', 'TransformStreamDefaultController']);
 const INSTALLED = new WeakMap();
+const TEXT_ENCODERS = new WeakSet();
+
+// WebIDL converts the first argument before validating the destination. Preserve
+// authored conversion exceptions while creating conversion errors in the API realm.
+function encoderString(input, TypeErrorClass) {
+  const object = value => value !== null && (typeof value === 'object' || typeof value === 'function');
+  if (object(input)) {
+    const exotic = input[Symbol.toPrimitive];
+    if (exotic !== undefined && exotic !== null) {
+      if (typeof exotic !== 'function') throw new TypeErrorClass('invalid argument');
+      input = Reflect.apply(exotic, input, ['string']);
+      if (object(input)) throw new TypeErrorClass('invalid argument');
+    } else {
+      let converted = false;
+      for (const key of ['toString', 'valueOf']) {
+        const method = input[key];
+        if (typeof method !== 'function') continue;
+        const primitive = Reflect.apply(method, input, []);
+        if (!object(primitive)) { input = primitive; converted = true; break; }
+      }
+      if (!converted) throw new TypeErrorClass('invalid argument');
+    }
+  }
+  if (typeof input === 'symbol') throw new TypeErrorClass('invalid argument');
+  return String(input);
+}
 
 /** Real Node WebStreams behind one realm's constructors, callbacks and promises.
  * installStreams(page, window) or installStreams(null, vmGlobal) must precede
@@ -177,7 +203,8 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
         readable: transform.readable, writable: transform.writable });
       tag(result, name); adopt(transform.readable); adopt(transform.writable); return result;
     }
-    try { const result = Reflect.construct(NATIVES[name], args); if (name === 'ReadableStream') bindReadable(result, readableState);
+    try { const result = Reflect.construct(NATIVES[name], args); if (name === 'TextEncoder') TEXT_ENCODERS.add(result);
+      if (name === 'ReadableStream') bindReadable(result, readableState);
       if (name === 'TransformStream') bindTransformPair(result.readable, result.writable, readableState); return adopt(result); }
     catch (error) { throw errorInRealm(error); }
   }
@@ -227,6 +254,21 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
             }
             catch (error) { throw errorInRealm(error); }
           }) });
+      } else if (name === 'TextEncoder' && key === 'encodeInto') {
+        const TypeErrorClass = realm.TypeError;
+        const invoke = (receiver, source, destination, count) => {
+          assertActive();
+          if (!TEXT_ENCODERS.has(receiver)) throw new TypeErrorClass('Illegal invocation');
+          if (count < 2) throw new TypeErrorClass('invalid argument');
+          const input = encoderString(source, TypeErrorClass);
+          try { return Reflect.apply(descriptor.value, receiver, [input, destination]); }
+          catch (error) {
+            if (error instanceof TypeError) throw new TypeErrorClass('invalid argument');
+            throw errorInRealm(error);
+          }
+        };
+        const method = realm.Function('invoke', 'return ({encodeInto(source,destination){const result=invoke(this,source,destination,arguments.length);return {read:result.read,written:result.written};}}).encodeInto;')(invoke);
+        Object.defineProperty(prototype, key, {configurable:true, enumerable:true, writable:true, value:method});
       } else {
         Object.defineProperty(prototype, key, { configurable: true, enumerable: true, writable: true,
           value: functionInRealm((receiver, args) => {

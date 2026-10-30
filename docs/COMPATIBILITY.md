@@ -606,6 +606,15 @@ encoding/XPath behavior remains different. These results are separate from the
 900-test development suite. Actual utility worlds and heap enumeration are still
 unmerged proposals; their acceptance and lifecycle gaps remain explicit.
 
+A subsequent narrow [TextEncoder fix](../proposals/text-encoder/README.md)
+matches its pinned native public control exactly and passes both unchanged
+encoding fixtures. It corrects encodeInto's required-argument/method shape,
+conversion order, private receiver validation and result/error realm handling
+while retaining genuine UTF-8 bytes.42 focused checks pass, including4 new checks
+also run on Node24.22.1 and26.13.0. This closes one observed case from the older
+48-case report without rewriting that frozen report or claiming a new full-suite
+pass rate.
+
 The full suite passes **687 JavaScript tests and 53 PureScript Puppeteer
 assertions**. Syntax, strict/pedantic PureScript builds and all13 bounded native
 comparisons pass. The [frozen73-fixture comparison](reference/conformance-dom-values-checkpoint.json)
