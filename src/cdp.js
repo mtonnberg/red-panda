@@ -1,0 +1,465 @@
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { WebSocketServer, WebSocket } from 'ws';
+import { Browser, VERSION, withTimeout } from './browser.js';
+import { cookieToCDP, setCookie, exportCookies } from './cookies.js';
+
+const timestamp = () => performance.now() / 1000;
+class ProtocolError extends Error {
+  constructor(message, code = -32602) { super(message); this.code = code; }
+}
+
+export function targetInfo(page) {
+  return { targetId: page.id, type: 'page', title: page.dom.window.document.title,
+    url: page.url, attached: true, canAccessOpener: false,
+    browserContextId: page.context.id };
+}
+function frameInfo(page) {
+  return { id: page.frameId, loaderId: page.loaderId, url: page.url,
+    securityOrigin: new URL(page.url).origin, mimeType: 'text/html',
+    domainAndRegistry: '', secureContextType: 'InsecureScheme',
+    crossOriginIsolatedContextType: 'NotIsolated', gatedAPIFeatures: [] };
+}
+
+class Session {
+  constructor(connection, page, id = randomUUID()) {
+    this.connection = connection;
+    this.page = page;
+    this.id = id;
+    this.domains = new Set();
+    this.objects = new Map();
+    this.worlds = new Map();
+    this.worldNames = new Set();
+    this.scripts = new Map();
+    this.bindings = new Set();
+    this.listeners = [];
+    this.lifecycle = false;
+    const listen = (event, callback) => { page.on(event, callback); this.listeners.push([event, callback]); };
+    listen('navigationStarted', () => {
+      this.event('Page.frameStartedNavigating', { frameId: page.frameId, url: page.url, loaderId: page.loaderId, navigationType: 'differentDocument' });
+      this.event('Page.frameStartedLoading', { frameId: page.frameId });
+    });
+    listen('contextsCleared', () => {
+      this.objects.clear(); this.worlds.clear(); this.nodes?.clear();
+      this.event('Runtime.executionContextsCleared', {});
+    });
+    listen('navigated', () => {
+      this.event('Page.frameNavigated', { frame: frameInfo(page), type: 'Navigation' });
+      this.event('DOM.documentUpdated', {});
+      this.lifecycleEvent('init');
+      connection.targetChanged(page);
+    });
+    listen('contextCreated', () => {
+      this.contextCreated();
+      for (const name of this.worldNames) {
+        const id = page.browser.nextExecutionContext++;
+        this.worlds.set(name, id); this.contextCreated(name, id);
+      }
+    });
+    listen('domContentLoaded', () => {
+      this.event('Page.domContentEventFired', { timestamp: timestamp() });
+      this.lifecycleEvent('DOMContentLoaded');
+    });
+    listen('load', () => {
+      this.event('Page.loadEventFired', { timestamp: timestamp() });
+      this.lifecycleEvent('load');
+      this.event('Page.frameStoppedLoading', { frameId: page.frameId });
+      // Network idle is observed rather than emitted immediately after load.
+      clearTimeout(this.idleTimer);
+      this.idleTimer = setTimeout(() => this.checkIdle(), 510);
+    });
+    listen('navigationError', error => {
+      this.event('Page.frameStoppedLoading', { frameId: page.frameId });
+      this.event('Runtime.exceptionThrown', { timestamp: timestamp(), exceptionDetails: this.exception(error) });
+    });
+    listen('request', request => {
+      this.event('Network.requestWillBeSent', {
+        requestId: request.id, loaderId: page.loaderId, documentURL: page.url,
+        request: { url: request.url, method: request.method, headers: request.headers,
+          initialPriority: 'High', referrerPolicy: 'no-referrer-when-downgrade' },
+        timestamp: request.timestamp, wallTime: Date.now() / 1000,
+        initiator: { type: 'other' }, type: request.type, frameId: page.frameId,
+        hasUserGesture: false,
+        ...(request.redirectResponse ? { redirectResponse: request.redirectResponse, redirectHasExtraInfo: false } : {}),
+      });
+    });
+    listen('response', response => {
+      this.event('Network.responseReceived', {
+        requestId: response.id, loaderId: page.loaderId, timestamp: response.timestamp,
+        type: response.type, hasExtraInfo: false, frameId: page.frameId,
+        response: { url: response.url, status: response.status, statusText: http.STATUS_CODES[response.status] ?? '',
+          headers: response.headers, mimeType: (response.headers['content-type'] ?? 'text/html').split(';')[0],
+          connectionReused: false, connectionId: 0, encodedDataLength: response.size,
+          securityState: 'neutral', protocol: 'http/1.1', fromDiskCache: false, fromServiceWorker: false },
+      });
+      this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
+    });
+    listen('requestFailed', request => this.event('Network.loadingFailed', {
+      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
+    }));
+    listen('console', ({ type, args }) => this.event('Runtime.consoleAPICalled', {
+      type: type === 'log' ? 'log' : type, args: args.map(arg => this.remote(arg)),
+      executionContextId: page.executionContextId, timestamp: Date.now(),
+    }));
+    listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
+    listen('close', () => connection.detach(this.id));
+  }
+  event(method, params) {
+    if (this.domains.has(method.split('.')[0])) this.connection.send({ method, params, ...(this.id ? { sessionId: this.id } : {}) });
+  }
+  lifecycleEvent(name) {
+    if (this.lifecycle) this.event('Page.lifecycleEvent', { frameId: this.page.frameId, loaderId: this.page.loaderId, name, timestamp: timestamp() });
+  }
+  checkIdle() {
+    if (this.page.closed) return;
+    if (!this.page.activeRequests.size && Date.now() - this.page.lastActivity >= 500) {
+      this.lifecycleEvent('networkAlmostIdle'); this.lifecycleEvent('networkIdle');
+    } else this.idleTimer = setTimeout(() => this.checkIdle(), 100);
+  }
+  contextCreated(name = '', id = this.page.executionContextId) {
+    for (const binding of this.bindings) this.installBinding(binding);
+    this.event('Runtime.executionContextCreated', { context: {
+      id, origin: new URL(this.page.url).origin, name, uniqueId: randomUUID(),
+      auxData: { isDefault: !name, type: name ? 'isolated' : 'default', frameId: this.page.frameId },
+    } });
+  }
+  installBinding(name) {
+    this.page.dom.window[name] = payload => this.event('Runtime.bindingCalled', {
+      name, payload: String(payload), executionContextId: this.page.executionContextId,
+    });
+  }
+  remote(value, byValue = false, group) {
+    if (value === undefined) return { type: 'undefined' };
+    if (value === null) return { type: 'object', subtype: 'null', value: null };
+    const type = typeof value;
+    if (type === 'number' && (!Number.isFinite(value) || Object.is(value, -0))) return { type, unserializableValue: Object.is(value, -0) ? '-0' : String(value), description: String(value) };
+    if (type === 'bigint') return { type, unserializableValue: `${value}n`, description: `${value}n` };
+    if (['string', 'number', 'boolean'].includes(type)) return { type, value };
+    if (type === 'symbol') return { type, description: String(value) };
+    if (byValue) return { type, value: JSON.parse(JSON.stringify(value)) };
+    const objectId = randomUUID();
+    this.objects.set(objectId, { value, group });
+    const subtype = value.nodeType ? 'node' : Array.isArray(value) ? 'array' : value instanceof this.page.dom.window.Promise ? 'promise' : undefined;
+    return { type, ...(subtype ? { subtype } : {}), className: value.constructor?.name ?? 'Object',
+      description: value.nodeName ?? value.constructor?.name ?? type, objectId };
+  }
+  object(id) {
+    if (!this.objects.has(id)) throw new ProtocolError('Cannot find object with given id');
+    return this.objects.get(id).value;
+  }
+  argument(arg) {
+    if (arg.objectId) return this.object(arg.objectId);
+    if (arg.unserializableValue) {
+      const value = arg.unserializableValue;
+      if (value.endsWith('n')) return BigInt(value.slice(0, -1));
+      if (value === 'NaN') return NaN;
+      if (value === 'Infinity') return Infinity;
+      if (value === '-Infinity') return -Infinity;
+      if (value === '-0') return -0;
+      throw new ProtocolError('Invalid unserializable value');
+    }
+    return arg.value;
+  }
+  exception(error) {
+    return { exceptionId: 1, text: error.message ?? String(error), lineNumber: 0, columnNumber: 0,
+      exception: { type: 'object', subtype: 'error', className: error.name ?? 'Error', description: error.stack ?? String(error) } };
+  }
+  async run(method, params) {
+    const page = this.page;
+    if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
+      this.domains.add(method.split('.')[0]);
+      if (method === 'Runtime.enable') this.contextCreated();
+      return {};
+    }
+    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { this.domains.delete(method.split('.')[0]); return {}; }
+    switch (method) {
+      case 'Page.getFrameTree': return { frameTree: { frame: frameInfo(page) } };
+      case 'Page.setLifecycleEventsEnabled': this.lifecycle = params.enabled; return {};
+      case 'Page.navigate': {
+        const url = new URL(params.url, page.url).href;
+        if (!['http:', 'https:', 'data:', 'about:'].includes(new URL(url).protocol) || (url.startsWith('about:') && url !== 'about:blank')) {
+          return { frameId: page.frameId, errorText: 'Unsupported URL protocol' };
+        }
+        // Reply after commit so clients receive fetch errors, but before waiting for load.
+        let settled = false;
+        return await new Promise(resolve => {
+          const finish = result => { if (settled) return; settled = true; page.off('navigated', committed); resolve(result); };
+          const committed = () => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false });
+          page.once('navigated', committed);
+          page.navigate(url).then(committed, error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
+        });
+      }
+      case 'Page.reload': await page.navigate(page.url); return {};
+      case 'Page.getNavigationHistory': return { currentIndex: page.history.length - 1, entries: page.history.map((url, index) => ({ id: index, url, userTypedURL: url, title: '' })) };
+      case 'Page.createIsolatedWorld': {
+        if (params.frameId !== page.frameId) throw new ProtocolError('Unknown frame');
+        const name = params.worldName ?? '';
+        this.worldNames.add(name);
+        let id = this.worlds.get(name);
+        if (!id) { id = page.browser.nextExecutionContext++; this.worlds.set(name, id); this.contextCreated(name, id); }
+        return { executionContextId: id };
+      }
+      case 'Page.addScriptToEvaluateOnNewDocument': {
+        const id = randomUUID();
+        const script = { source: params.source, worldName: params.worldName ?? '' };
+        this.scripts.set(id, script); page.newDocumentScripts.set(id, script);
+        if (params.worldName) this.worldNames.add(params.worldName);
+        return { identifier: id };
+      }
+      case 'Page.removeScriptToEvaluateOnNewDocument': this.scripts.delete(params.identifier); page.newDocumentScripts.delete(params.identifier); return {};
+      case 'Page.setDocumentContent': {
+        page.evaluate(`document.open(); document.write(${JSON.stringify(params.html)}); document.close();`);
+        this.lifecycleEvent('init'); this.lifecycleEvent('DOMContentLoaded'); this.lifecycleEvent('load'); return {};
+      }
+      case 'Runtime.evaluate':
+      case 'Runtime.callFunctionOn': {
+        try {
+          const contextId = params.contextId ?? params.executionContextId;
+          if (contextId !== undefined && contextId !== page.executionContextId && ![...this.worlds.values()].includes(contextId)) {
+            throw new ProtocolError('Cannot find context with specified id');
+          }
+          let value = method === 'Runtime.evaluate' ? page.evaluate(params.expression) : page.callFunction(
+            params.functionDeclaration,
+            params.objectId ? this.object(params.objectId) : page.dom.window,
+            (params.arguments ?? []).map(arg => this.argument(arg)),
+          );
+          if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), page.timeout);
+          return { result: this.remote(value, params.returnByValue, params.objectGroup) };
+        } catch (error) {
+          if (error instanceof ProtocolError) throw error;
+          return { result: { type: 'undefined' }, exceptionDetails: this.exception(error) };
+        }
+      }
+      case 'Runtime.getProperties': {
+        const object = this.object(params.objectId);
+        const result = Object.getOwnPropertyNames(object).map(name => {
+          const descriptor = Object.getOwnPropertyDescriptor(object, name);
+          return { name, configurable: !!descriptor.configurable, enumerable: !!descriptor.enumerable,
+            isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value), writable: !!descriptor.writable } : {}),
+            ...(descriptor.get ? { get: this.remote(descriptor.get) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set) } : {}) };
+        });
+        return { result, internalProperties: [] };
+      }
+      case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
+      case 'Runtime.releaseObjectGroup': for (const [id, object] of this.objects) if (object.group === params.objectGroup) this.objects.delete(id); return {};
+      case 'Runtime.addBinding': this.bindings.add(params.name); this.installBinding(params.name); return {};
+      case 'Runtime.removeBinding': this.bindings.delete(params.name); delete page.dom.window[params.name]; return {};
+      case 'Runtime.runIfWaitingForDebugger': return {};
+      case 'Network.getCookies': {
+        const urls = params.urls ?? [page.url];
+        const cookies = (await Promise.all(urls.map(url => page.context.cookies.getCookies(url)))).flat();
+        const unique = new Map(cookies.map(cookie => [`${cookie.domain}|${cookie.path}|${cookie.key}`, cookie]));
+        return { cookies: [...unique.values()].map(cookieToCDP) };
+      }
+      case 'Network.setCookie': await setCookie(page.context.cookies, params, page.url); return { success: true };
+      case 'Network.setCookies': for (const cookie of params.cookies) await setCookie(page.context.cookies, cookie, page.url); return {};
+      case 'Network.clearBrowserCookies': await page.context.cookies.removeAllCookies(); return {};
+      case 'Network.getResponseBody': {
+        if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
+        return { body: page.responseBodies.get(params.requestId), base64Encoded: false };
+      }
+      case 'Network.setUserAgentOverride': page.userAgent = params.userAgent; return {};
+      case 'DOM.getDocument': {
+        const id = this.backendId(page.dom.window.document);
+        return { root: { nodeId: id, backendNodeId: id, nodeType: 9, nodeName: '#document', localName: '', nodeValue: '' } };
+      }
+      case 'DOM.describeNode': {
+        const node = params.objectId ? this.object(params.objectId) : page.dom.window.document;
+        const backendNodeId = this.backendId(node);
+        return { node: { nodeId: backendNodeId, backendNodeId, nodeType: node.nodeType, nodeName: node.nodeName, localName: node.localName ?? '', nodeValue: node.nodeValue ?? '' } };
+      }
+      case 'DOM.resolveNode': {
+        const node = this.nodes?.get(params.backendNodeId ?? params.nodeId);
+        if (!node) throw new ProtocolError('Unknown DOM node');
+        return { object: this.remote(node) };
+      }
+      case 'DOM.getOuterHTML': return { outerHTML: params.objectId ? this.object(params.objectId).outerHTML : page.dom.serialize() };
+      case 'LP.dump': { const format = params.format ?? 'html'; return { format, content: page.dump(format) }; }
+      // Acknowledgements for protocol configuration that does not require layout.
+      case 'Network.setCacheDisabled':
+      case 'Page.setInterceptFileChooserDialog':
+      case 'Emulation.setFocusEmulationEnabled':
+      case 'Emulation.setEmulatedMedia':
+      case 'Emulation.setDeviceMetricsOverride':
+      case 'Emulation.clearDeviceMetricsOverride':
+      case 'Emulation.setTouchEmulationEnabled':
+      case 'Performance.setTimeDomain':
+      case 'Target.setAutoAttach': return {};
+      case 'Emulation.setScriptExecutionDisabled': page.javascript = !params.value; return {};
+      default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+    }
+  }
+  backendId(node) {
+    this.nodes ??= new Map();
+    for (const [id, value] of this.nodes) if (value === node) return id;
+    const id = this.nodes.size + 1; this.nodes.set(id, node); return id;
+  }
+  close() {
+    clearTimeout(this.idleTimer);
+    for (const [event, callback] of this.listeners) this.page.off(event, callback);
+    this.objects.clear(); this.nodes?.clear();
+    for (const id of this.scripts.keys()) this.page.newDocumentScripts.delete(id);
+  }
+}
+
+class Connection {
+  constructor(socket, browser, directPage) {
+    this.socket = socket;
+    this.browser = browser;
+    this.sessions = new Map();
+    this.discover = false;
+    this.autoAttach = false;
+    if (directPage) this.sessions.set('', new Session(this, directPage, ''));
+    this.created = page => {
+      if (this.discover) this.send({ method: 'Target.targetCreated', params: { targetInfo: targetInfo(page) } });
+      if (this.autoAttach) this.attach(page);
+    };
+    this.destroyed = page => {
+      if (this.discover) this.send({ method: 'Target.targetDestroyed', params: { targetId: page.id } });
+    };
+    browser.on('targetCreated', this.created);
+    browser.on('targetDestroyed', this.destroyed);
+    socket.on('message', raw => this.receive(raw));
+    socket.on('close', () => this.close());
+    socket.on('error', () => this.close());
+  }
+  send(message) { if (this.socket.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }
+  targetChanged(page) { if (this.discover) this.send({ method: 'Target.targetInfoChanged', params: { targetInfo: targetInfo(page) } }); }
+  attach(page) {
+    const session = new Session(this, page);
+    this.sessions.set(session.id, session);
+    this.send({ method: 'Target.attachedToTarget', params: { sessionId: session.id, targetInfo: targetInfo(page), waitingForDebugger: false } });
+    return session.id;
+  }
+  detach(id) {
+    const session = this.sessions.get(id);
+    if (!session) return;
+    session.close(); this.sessions.delete(id);
+    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id } });
+  }
+  async receive(raw) {
+    let message;
+    try {
+      message = JSON.parse(raw);
+      if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+          (message.params !== undefined && (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
+        throw new ProtocolError('Invalid CDP request', -32600);
+      }
+      const { method, params = {}, sessionId } = message;
+      const session = this.sessions.get(sessionId ?? '');
+      if (sessionId && !session) throw new ProtocolError('Unknown session');
+      const result = session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+        ? await session.run(method, params) : await this.run(method, params, session);
+      this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
+    } catch (error) {
+      this.send({ id: message?.id ?? null, error: { code: error.code ?? -32602, message: error.message }, ...(message?.sessionId ? { sessionId: message.sessionId } : {}) });
+    }
+  }
+  async run(method, params, parent) {
+    const browser = this.browser;
+    switch (method) {
+      case 'Browser.getVersion': return { protocolVersion: '1.3', product: `RedPanda/${VERSION}`, revision: VERSION, userAgent: `RedPanda/${VERSION}`, jsVersion: process.versions.v8 };
+      case 'Browser.getBrowserCommandLine': return { arguments: [] };
+      case 'Target.setDiscoverTargets':
+        this.discover = params.discover;
+        if (params.discover) for (const page of browser.pages.values()) this.send({ method: 'Target.targetCreated', params: { targetInfo: targetInfo(page) } });
+        return {};
+      case 'Target.setAutoAttach':
+        if (!parent) {
+          this.autoAttach = params.autoAttach;
+          if (this.autoAttach) for (const page of browser.pages.values()) if (![...this.sessions.values()].some(session => session.page === page)) this.attach(page);
+        }
+        return {};
+      case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
+      case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
+      case 'Target.createBrowserContext': return { browserContextId: browser.createContext() };
+      case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId); return {};
+      case 'Target.createTarget': {
+        const page = browser.createPage(params.browserContextId);
+        if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
+        return { targetId: page.id };
+      }
+      case 'Target.getTargetInfo': {
+        const page = browser.pages.get(params.targetId) ?? parent?.page;
+        if (!page) throw new ProtocolError('Unknown target');
+        return { targetInfo: targetInfo(page) };
+      }
+      case 'Target.attachToTarget': {
+        const page = browser.pages.get(params.targetId);
+        if (!page) throw new ProtocolError('Unknown target');
+        return { sessionId: this.attach(page) };
+      }
+      case 'Target.detachFromTarget': this.detach(params.sessionId); return {};
+      case 'Target.closeTarget': {
+        const page = browser.pages.get(params.targetId);
+        if (!page) throw new ProtocolError('Unknown target');
+        page.close(); return { success: true };
+      }
+      case 'Browser.close': browser.close(); return {};
+      case 'Storage.getCookies': {
+        const context = browser.contexts.get(params.browserContextId ?? 'default');
+        if (!context) throw new ProtocolError('Unknown browser context');
+        return { cookies: await exportCookies(context.cookies) };
+      }
+      case 'Storage.setCookies': {
+        const context = browser.contexts.get(params.browserContextId ?? 'default');
+        if (!context) throw new ProtocolError('Unknown browser context');
+        for (const cookie of params.cookies) await setCookie(context.cookies, cookie, 'about:blank');
+        return {};
+      }
+      default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+    }
+  }
+  close() {
+    this.browser.off('targetCreated', this.created);
+    this.browser.off('targetDestroyed', this.destroyed);
+    for (const session of this.sessions.values()) session.close();
+    this.sessions.clear();
+  }
+}
+
+export async function serve({ host = '127.0.0.1', port = 9222, ...options } = {}) {
+  const browser = new Browser(options);
+  const connections = new Set();
+  const server = http.createServer((request, response) => {
+    const address = server.address();
+    const authority = `${host.includes(':') ? `[${host}]` : host}:${address.port}`;
+    const url = new URL(request.url, `http://${authority}`);
+    const send = (status, value) => { response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); response.end(JSON.stringify(value)); };
+    if (request.method !== 'GET') { send(405, { error: 'Method not allowed' }); return; }
+    if (url.pathname === '/json/version') send(200, {
+      Browser: `RedPanda/${VERSION}`, 'Protocol-Version': '1.3', 'User-Agent': `RedPanda/${VERSION}`,
+      'V8-Version': process.versions.v8, webSocketDebuggerUrl: `ws://${authority}/`,
+    });
+    else if (url.pathname === '/json' || url.pathname === '/json/list') send(200, [...browser.pages.values()].map(page => ({
+      ...targetInfo(page), id: page.id, webSocketDebuggerUrl: `ws://${authority}/devtools/page/${page.id}`,
+    })));
+    else if (url.pathname === '/health') send(200, { status: 'ok', browser: `RedPanda/${VERSION}`, pages: browser.pages.size });
+    else send(404, { error: 'Not found' });
+  });
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
+  server.on('upgrade', (request, socket, head) => {
+    // CDP executes JavaScript. A browser webpage must not attach cross-origin.
+    if (request.headers.origin) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
+    const path = request.url.split('?')[0];
+    const page = path.startsWith('/devtools/page/') ? browser.pages.get(path.slice('/devtools/page/'.length)) : undefined;
+    if (path !== '/' && !page) { socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); return; }
+    sockets.handleUpgrade(request, socket, head, ws => {
+      const connection = new Connection(ws, browser, page);
+      connections.add(connection);
+      ws.once('close', () => connections.delete(connection));
+    });
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
+  const address = server.address();
+  return {
+    browser, server, port: address.port, host,
+    close: async () => {
+      browser.close();
+      for (const connection of connections) { connection.close(); connection.socket.terminate(); }
+      sockets.close();
+      server.closeAllConnections();
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    },
+  };
+}

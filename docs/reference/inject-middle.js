@@ -1,0 +1,1 @@
+globalThis.boot += "B";
