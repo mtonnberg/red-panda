@@ -95,3 +95,19 @@ test('invalid header updates return errors without partially changing request co
     assert.equal(result.result.value, 'retained');
   } finally { await client.send('Target.closeTarget', { targetId }); await client.close(); }
 });
+
+test('superseded CDP navigation does not resolve as a different navigation', async () => {
+  const client = await connect(`ws://127.0.0.1:${service.port}/`);
+  const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+  try {
+    const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+    const first = client.send('Page.navigate', { url: `${fixture.url}slow` }, sessionId);
+    const second = client.send('Page.navigate', { url: `${fixture.url}next` }, sessionId);
+    const [canceled, completed] = await Promise.all([first, second]);
+    assert.match(canceled.errorText, /aborted|superseded/i);
+    assert.equal(completed.errorText, undefined);
+    const history = await client.send('Page.getNavigationHistory', {}, sessionId);
+    assert.deepEqual(history.entries.map(entry => entry.url), [`${fixture.url}next`]);
+    await assert.rejects(client.send('Page.navigateToHistoryEntry', { entryId: -1 }, sessionId), /Unknown history/);
+  } finally { await client.send('Target.closeTarget', { targetId }); await client.close(); }
+});

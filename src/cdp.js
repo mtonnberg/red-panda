@@ -3,6 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Browser, VERSION, withTimeout } from './browser.js';
 import { cookieToCDP, setCookie, exportCookies } from './cookies.js';
+import { supportsDOM, runDOM, resetDOM } from './dom.js';
+import { supportsInput, runInput } from './input.js';
+import { createWebDriver } from './webdriver.js';
+import { supportsRuntime, runRuntime, resetRuntime } from './runtime.js';
 
 const timestamp = () => performance.now() / 1000;
 class ProtocolError extends Error {
@@ -33,6 +37,7 @@ class Session {
     this.scripts = new Map();
     this.bindings = new Set();
     this.listeners = [];
+    this.nextBackendNodeId = 1;
     this.lifecycle = false;
     const listen = (event, callback) => { page.on(event, callback); this.listeners.push([event, callback]); };
     listen('navigationStarted', () => {
@@ -40,6 +45,8 @@ class Session {
       this.event('Page.frameStartedLoading', { frameId: page.frameId });
     });
     listen('contextsCleared', () => {
+      resetDOM(this);
+      resetRuntime(this);
       this.objects.clear(); this.worlds.clear(); this.nodes?.clear();
       this.event('Runtime.executionContextsCleared', {});
     });
@@ -47,6 +54,10 @@ class Session {
       this.event('Page.frameNavigated', { frame: frameInfo(page), type: 'Navigation' });
       this.event('DOM.documentUpdated', {});
       this.lifecycleEvent('init');
+      connection.targetChanged(page);
+    });
+    listen('withinDocument', ({ url, navigationType }) => {
+      this.event('Page.navigatedWithinDocument', { frameId: page.frameId, url, navigationType });
       connection.targetChanged(page);
     });
     listen('contextCreated', () => {
@@ -166,6 +177,9 @@ class Session {
   }
   async run(method, params) {
     const page = this.page;
+    if (supportsDOM(method)) return runDOM(this, method, params);
+    if (supportsInput(method)) return runInput(this, method, params);
+    if (supportsRuntime(method)) return runRuntime(this, method, params);
     if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
       this.domains.add(method.split('.')[0]);
       if (method === 'Runtime.enable') this.contextCreated();
@@ -174,6 +188,19 @@ class Session {
     if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { this.domains.delete(method.split('.')[0]); return {}; }
     switch (method) {
       case 'Page.getFrameTree': return { frameTree: { frame: frameInfo(page) } };
+      case 'Page.getLayoutMetrics': {
+        const { width, height } = page.layout.viewport, { x, y } = page.layout.scroll;
+        const layoutViewport = { pageX: x, pageY: y, clientWidth: width, clientHeight: height };
+        const visualViewport = { offsetX: 0, offsetY: 0, pageX: x, pageY: y, clientWidth: width, clientHeight: height, scale: 1, zoom: 1 };
+        const contentSize = { x: 0, y: 0, ...page.layout.documentSize };
+        return { layoutViewport, visualViewport, contentSize, cssLayoutViewport: layoutViewport, cssVisualViewport: visualViewport, cssContentSize: contentSize };
+      }
+      case 'Emulation.setDeviceMetricsOverride': {
+        if (![params.width, params.height].every(value => Number.isInteger(value) && value >= 0)) throw new ProtocolError('Invalid viewport dimensions');
+        page.viewport = { width: params.width || 1920, height: params.height || 1080 };
+        page.layout.setViewport(page.viewport); return {};
+      }
+      case 'Emulation.clearDeviceMetricsOverride': page.viewport = undefined; page.layout.setViewport({ width: 1920, height: 1080 }); return {};
       case 'Page.setLifecycleEventsEnabled': this.lifecycle = params.enabled; return {};
       case 'Page.navigate': {
         const url = new URL(params.url, page.url).href;
@@ -183,14 +210,19 @@ class Session {
         // Reply after commit so clients receive fetch errors, but before waiting for load.
         let settled = false;
         return await new Promise(resolve => {
-          const finish = result => { if (settled) return; settled = true; page.off('navigated', committed); resolve(result); };
+          const finish = result => { if (settled) return; settled = true; resolve(result); };
           const committed = () => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false });
-          page.once('navigated', committed);
-          page.navigate(url).then(committed, error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
+          page.navigate(url, { onCommit: committed }).catch(error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
         });
       }
-      case 'Page.reload': await page.navigate(page.url); return {};
-      case 'Page.getNavigationHistory': return { currentIndex: page.history.length - 1, entries: page.history.map((url, index) => ({ id: index, url, userTypedURL: url, title: '' })) };
+      case 'Page.reload': await page.navigate(page.url, { historyMode: 'reload' }); return {};
+      case 'Page.getNavigationHistory': return page.navigationHistory();
+      case 'Page.navigateToHistoryEntry': {
+        const index = page.history.findIndex(entry => entry.id === params.entryId);
+        if (index < 0) throw new ProtocolError('Unknown history entry');
+        await page.traverseHistory(index, { forceReload: true });
+        return { frameId: page.frameId, loaderId: page.loaderId };
+      }
       case 'Page.createIsolatedWorld': {
         if (params.frameId !== page.frameId) throw new ProtocolError('Unknown frame');
         const name = params.worldName ?? '';
@@ -260,29 +292,12 @@ class Session {
       }
       case 'Network.setExtraHTTPHeaders': page.setExtraHTTPHeaders(params.headers); return {};
       case 'Network.setUserAgentOverride': page.setUserAgentOverride(params); return {};
-      case 'DOM.getDocument': {
-        const id = this.backendId(page.dom.window.document);
-        return { root: { nodeId: id, backendNodeId: id, nodeType: 9, nodeName: '#document', localName: '', nodeValue: '' } };
-      }
-      case 'DOM.describeNode': {
-        const node = params.objectId ? this.object(params.objectId) : page.dom.window.document;
-        const backendNodeId = this.backendId(node);
-        return { node: { nodeId: backendNodeId, backendNodeId, nodeType: node.nodeType, nodeName: node.nodeName, localName: node.localName ?? '', nodeValue: node.nodeValue ?? '' } };
-      }
-      case 'DOM.resolveNode': {
-        const node = this.nodes?.get(params.backendNodeId ?? params.nodeId);
-        if (!node) throw new ProtocolError('Unknown DOM node');
-        return { object: this.remote(node) };
-      }
-      case 'DOM.getOuterHTML': return { outerHTML: params.objectId ? this.object(params.objectId).outerHTML : page.dom.serialize() };
       case 'LP.dump': { const format = params.format ?? 'html'; return { format, content: page.dump(format) }; }
       // Acknowledgements for protocol configuration that does not require layout.
       case 'Network.setCacheDisabled':
       case 'Page.setInterceptFileChooserDialog':
       case 'Emulation.setFocusEmulationEnabled':
       case 'Emulation.setEmulatedMedia':
-      case 'Emulation.setDeviceMetricsOverride':
-      case 'Emulation.clearDeviceMetricsOverride':
       case 'Emulation.setTouchEmulationEnabled':
       case 'Performance.setTimeDomain':
       case 'Target.setAutoAttach': return {};
@@ -293,10 +308,12 @@ class Session {
   backendId(node) {
     this.nodes ??= new Map();
     for (const [id, value] of this.nodes) if (value === node) return id;
-    const id = this.nodes.size + 1; this.nodes.set(id, node); return id;
+    const id = this.nextBackendNodeId++; this.nodes.set(id, node); return id;
   }
   close() {
     clearTimeout(this.idleTimer);
+    resetDOM(this);
+    resetRuntime(this);
     for (const [event, callback] of this.listeners) this.page.off(event, callback);
     this.objects.clear(); this.nodes?.clear();
     for (const id of this.scripts.keys()) this.page.newDocumentScripts.delete(id);
@@ -420,32 +437,46 @@ class Connection {
 }
 
 export async function serve({ host = '127.0.0.1', port = 9222, ...options } = {}) {
+  const protocols = new Set(options.protocols ?? ['cdp']);
+  if (!protocols.size || [...protocols].some(protocol => !['cdp', 'webdriver'].includes(protocol))) throw new Error('Unsupported automation protocol');
+  const allowedOrigins = new Set(options.allowedOrigins ?? []);
   const browser = new Browser(options);
   const connections = new Set();
-  const server = http.createServer((request, response) => {
+  const authority = () => `${host.includes(':') ? `[${host}]` : host}:${server.address().port}`;
+  const driver = protocols.has('webdriver') ? createWebDriver(browser, {
+    sessionTimeout: options.httpSessionTimeout ?? 60,
+    webSocketUrl: sessionId => `ws://${authority()}/session/${sessionId}`,
+  }) : null;
+  const server = http.createServer(async (request, response) => {
     const address = server.address();
-    const authority = `${host.includes(':') ? `[${host}]` : host}:${address.port}`;
-    const url = new URL(request.url, `http://${authority}`);
+    const currentAuthority = `${host.includes(':') ? `[${host}]` : host}:${address.port}`;
+    const url = new URL(request.url, `http://${currentAuthority}`);
     const send = (status, value) => { response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); response.end(JSON.stringify(value)); };
+    try { if (driver && await driver.handle(request, response, url)) return; }
+    catch (error) { send(500, { error: error.message }); return; }
     if (request.method !== 'GET') { send(405, { error: 'Method not allowed' }); return; }
-    if (url.pathname === '/json/version') send(200, {
+    if (protocols.has('cdp') && url.pathname === '/json/version') send(200, {
       Browser: `RedPanda/${VERSION}`, 'Protocol-Version': '1.3', 'User-Agent': `RedPanda/${VERSION}`,
-      'V8-Version': process.versions.v8, webSocketDebuggerUrl: `ws://${authority}/`,
+      'V8-Version': process.versions.v8, webSocketDebuggerUrl: `ws://${currentAuthority}/`,
     });
-    else if (url.pathname === '/json' || url.pathname === '/json/list') send(200, [...browser.pages.values()].map(page => ({
-      ...targetInfo(page), id: page.id, webSocketDebuggerUrl: `ws://${authority}/devtools/page/${page.id}`,
+    else if (protocols.has('cdp') && (url.pathname === '/json' || url.pathname === '/json/list')) send(200, [...browser.pages.values()].map(page => ({
+      ...targetInfo(page), id: page.id, webSocketDebuggerUrl: `ws://${currentAuthority}/devtools/page/${page.id}`,
     })));
-    else if (url.pathname === '/health') send(200, { status: 'ok', browser: `RedPanda/${VERSION}`, pages: browser.pages.size });
+    else if (url.pathname === '/health') send(200, { status: 'ok', browser: `RedPanda/${VERSION}`, pages: browser.pages.size, protocols: [...protocols] });
     else send(404, { error: 'Not found' });
   });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
   server.on('upgrade', (request, socket, head) => {
     // CDP executes JavaScript. A browser webpage must not attach cross-origin.
-    if (request.headers.origin) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
+    if (request.headers.origin && !allowedOrigins.has('*') && !allowedOrigins.has(request.headers.origin)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
     const path = request.url.split('?')[0];
     const page = path.startsWith('/devtools/page/') ? browser.pages.get(path.slice('/devtools/page/'.length)) : undefined;
-    if (path !== '/' && !page) { socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); return; }
+    let bidi;
+    try { bidi = driver?.accepts(request.url); }
+    catch { socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); return; }
+    if (!bidi && (!protocols.has('cdp') || (path !== '/' && !page))) { socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); return; }
     sockets.handleUpgrade(request, socket, head, ws => {
+      if (bidi) { driver.attach(ws, { path: request.url, webSocketUrl: `ws://${authority()}` }); return; }
       const connection = new Connection(ws, browser, page);
       connections.add(connection);
       ws.once('close', () => connections.delete(connection));
@@ -456,6 +487,7 @@ export async function serve({ host = '127.0.0.1', port = 9222, ...options } = {}
   return {
     browser, server, port: address.port, host,
     close: async () => {
+      driver?.close();
       browser.close();
       for (const connection of connections) { connection.close(); connection.socket.terminate(); }
       sockets.close();

@@ -28,6 +28,24 @@ export async function createFixture() {
       response.writeHead(200, { 'content-type': 'text/plain' }); response.end(request.headers.cookie ?? '');
     } else if (url.pathname === '/next') {
       response.writeHead(200, { 'content-type': 'text/html' }); response.end('<!doctype html><title>Next page</title><h1>Next</h1>');
+    } else if (url.pathname === '/history') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end(`<!doctype html><title>History fixture</title><h1>History</h1><a id="fragment" href="#anchor">Fragment</a>
+        <script>globalThis.historyEvents=[];globalThis.documentToken='original';
+        addEventListener('popstate',e=>historyEvents.push({type:'popstate',state:e.state}));
+        addEventListener('hashchange',e=>historyEvents.push({type:'hashchange',oldURL:e.oldURL,newURL:e.newURL}));</script>`);
+    } else if (url.pathname === '/modules') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<!doctype html><h1>Loading module</h1><script type="module">import {answer} from "/module-value.js";await new Promise(resolve=>setTimeout(resolve,20));document.querySelector("h1").textContent=String(answer)</script>');
+    } else if (url.pathname === '/module-value.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript' }); response.end('export const answer=42;');
+    } else if (url.pathname === '/navigation-source') {
+      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<!doctype html><script>location.replace("/next")</script>');
+    } else if (url.pathname === '/click-navigation') {
+      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<!doctype html><a id="next" href="/next">Next</a>');
+    } else if (url.pathname === '/forms') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<!doctype html><title>Forms fixture</title><input id="text"><textarea id="notes"></textarea><input id="readonly" readonly value="locked"><div id="editable" contenteditable="true"></div>');
     } else if (url.pathname === '/response') {
       response.writeHead(200, { 'content-type': 'text/html' });
       response.end('<h1>source</h1><script>document.querySelector("h1").textContent="mutated"</script>');

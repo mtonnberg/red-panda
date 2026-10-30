@@ -2,8 +2,10 @@ module RedPanda.Puppeteer
   ( Browser, BrowserContext, Page, Response, PreloadScript, Header
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText
+  , withNavigation, goBack, goForward, reload, pageUrl
   , evaluateOnNewDocument, removePreload
   , setExtraHTTPHeaders, setUserAgent
+  , click, focus, typeText, pressKey, insertText
   , evaluateString, textContent, waitForSelector, dispatchClick, content, cookieNames, setCookie
   , Async, fromAsync, quote
   ) where
@@ -12,7 +14,7 @@ import Prelude
 
 import Data.Either (Either(..))
 import Effect (Effect)
-import Effect.Aff (Aff, Canceler(..), makeAff)
+import Effect.Aff (Aff, Canceler(..), makeAff, bracket)
 import Effect.Class (liftEffect)
 import Effect.Exception (Error)
 
@@ -20,6 +22,7 @@ foreign import data Browser :: Type
 foreign import data BrowserContext :: Type
 foreign import data Page :: Type
 foreign import data Response :: Type
+foreign import data PendingNavigation :: Type
 
 newtype PreloadScript = PreloadScript String
 
@@ -41,12 +44,24 @@ foreign import newPageImpl :: BrowserContext -> Async Page
 foreign import closePageImpl :: Page -> Async Unit
 foreign import gotoImpl :: Page -> String -> Async Int
 foreign import gotoResponseImpl :: Page -> String -> Async Response
+foreign import armNavigationImpl :: Page -> Effect PendingNavigation
+foreign import awaitNavigationImpl :: PendingNavigation -> Async String
+foreign import cancelNavigationImpl :: PendingNavigation -> Effect Unit
+foreign import goBackImpl :: Page -> Async String
+foreign import goForwardImpl :: Page -> Async String
+foreign import reloadImpl :: Page -> Async String
+foreign import pageUrlImpl :: Page -> Effect String
 foreign import responseStatus :: Response -> Int
 foreign import responseTextImpl :: Response -> Async String
 foreign import evaluateOnNewDocumentImpl :: Page -> String -> Async String
 foreign import removePreloadImpl :: Page -> String -> Async Unit
 foreign import setExtraHTTPHeadersImpl :: Page -> Array Header -> Async Unit
 foreign import setUserAgentImpl :: Page -> String -> Async Unit
+foreign import focusImpl :: Page -> String -> Async Unit
+foreign import clickImpl :: Page -> String -> Async Unit
+foreign import typeTextImpl :: Page -> String -> String -> Async Unit
+foreign import pressKeyImpl :: Page -> String -> Async Unit
+foreign import insertTextImpl :: Page -> String -> Async Unit
 foreign import evaluateStringImpl :: Page -> String -> Async String
 foreign import waitForSelectorImpl :: Page -> String -> Async Unit
 foreign import contentImpl :: Page -> Async String
@@ -77,6 +92,28 @@ goto page url = fromAsync $ gotoImpl page url
 gotoResponse :: Page -> String -> Aff Response
 gotoResponse page url = fromAsync $ gotoResponseImpl page url
 
+-- Arm the listener before the action can trigger a navigation; always cancel it
+-- on failure so a failed click/evaluation does not leave a watcher behind.
+withNavigation :: forall a. Page -> Aff a -> Aff String
+withNavigation page action = bracket
+  (liftEffect $ armNavigationImpl page)
+  (liftEffect <<< cancelNavigationImpl)
+  \pending -> do
+    void action
+    fromAsync $ awaitNavigationImpl pending
+
+goBack :: Page -> Aff String
+goBack page = fromAsync $ goBackImpl page
+
+goForward :: Page -> Aff String
+goForward page = fromAsync $ goForwardImpl page
+
+reload :: Page -> Aff String
+reload page = fromAsync $ reloadImpl page
+
+pageUrl :: Page -> Aff String
+pageUrl page = liftEffect $ pageUrlImpl page
+
 responseText :: Response -> Aff String
 responseText response = fromAsync $ responseTextImpl response
 
@@ -91,6 +128,21 @@ setExtraHTTPHeaders page headers = fromAsync $ setExtraHTTPHeadersImpl page head
 
 setUserAgent :: Page -> String -> Aff Unit
 setUserAgent page userAgent = fromAsync $ setUserAgentImpl page userAgent
+
+focus :: Page -> String -> Aff Unit
+focus page selector = fromAsync $ focusImpl page selector
+
+click :: Page -> String -> Aff Unit
+click page selector = fromAsync $ clickImpl page selector
+
+typeText :: Page -> String -> String -> Aff Unit
+typeText page selector text = fromAsync $ typeTextImpl page selector text
+
+pressKey :: Page -> String -> Aff Unit
+pressKey page key = fromAsync $ pressKeyImpl page key
+
+insertText :: Page -> String -> Aff Unit
+insertText page text = fromAsync $ insertTextImpl page text
 
 evaluateString :: Page -> String -> Aff String
 evaluateString page expression = fromAsync $ evaluateStringImpl page expression

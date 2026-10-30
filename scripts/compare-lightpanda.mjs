@@ -12,6 +12,7 @@ import { serve } from '../src/cdp.js';
 import { until } from '../src/browser.js';
 import { startReference } from './reference-server.mjs';
 import { probeRequestHeaders } from '../test/header-probe.js';
+import { probeHistory, historyObservation } from '../test/history-probe.js';
 
 const exec = promisify(execFile);
 const binary = process.argv[2];
@@ -140,6 +141,12 @@ try {
   );
   results.push({ name: 'CDP extra headers, user agent, language, referrers and clearing', passed: true });
   console.log('PASS CDP extra headers, user agent, language, referrers and clearing');
+  assert.deepEqual(
+    historyObservation(await probeHistory(`ws://127.0.0.1:${service.port}/`, fixture.url, { scripted: true })),
+    historyObservation(await probeHistory(official.endpoint, fixture.url, { scripted: true })),
+  );
+  results.push({ name: 'History API, scripted fragments, traversal and navigation events', passed: true });
+  console.log('PASS History API, scripted fragments, traversal and navigation events');
   console.log(JSON.stringify({ referenceSHA256: sha256, checks: results }, null, 2));
 } finally {
   await service?.close();

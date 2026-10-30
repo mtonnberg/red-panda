@@ -10,6 +10,7 @@ if (['build', 'test', 'run'].includes(args[0]) && !args.includes('--pure')) args
 const child = spawn(process.execPath, [join(root, 'node_modules/spago/bin/bundle.js'), ...(args.length ? args : ['build'])], {
   cwd: join(root, 'automation'), stdio: 'inherit',
   env: { ...process.env,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --experimental-vm-modules`.trim(),
     PATH: `${join(root, 'node_modules/.bin')}${delimiter}${process.env.PATH}`,
     XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? join(root, '.cache'),
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? join(root, '.cache/config'),

@@ -5,9 +5,10 @@ An experimental headless browser implementing a useful subset of
 and Chrome DevTools Protocol (CDP) behavior. Puppeteer automation, the example,
 and integration assertions are written in PureScript.
 
-The runtime uses Node's V8 and **jsdom** for HTML, DOM and classic page scripts.
-It does not launch Chromium. This is an initial functional implementation, not
-a replacement for Lightpanda's native Zig engine or its performance profile.
+The independent runtime uses Node's V8 and **jsdom** for HTML, DOM and page
+scripts. It does not import Lightpanda's production engine or launch Chromium.
+Full independent replication is the goal; the [compatibility ledger](docs/COMPATIBILITY.md)
+records substantial remaining gaps. No engine or performance parity is claimed.
 
 **Use trusted pages only.** jsdom's script execution is not a security sandbox.
 Page scripts can potentially access the Node process and host machine. CDP also
@@ -87,28 +88,47 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Surface | Supported |
 | --- | --- |
 | Fetch | HTTP(S), data URLs, redirects, response status/headers, per-context cookies, plain-text/API documents, a 16 MiB response limit |
-| HTML / JS | HTML parsing, classic inline and external scripts, DOM mutation and event handlers, timers, relative `fetch`, JSON responses |
+| HTML / JS | HTML parsing, classic scripts, ES modules with imports/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | Serialized HTML, text, basic Markdown with absolute links, link inventory, selected structured metadata |
-| CLI | Batch `fetch`, `serve`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export, `--no-javascript`, `--wait-ms`, `--fail-on-http-error` |
+| CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
-| CDP page/runtime | Navigation and lifecycle events, reload, frame tree, evaluation, functions/arguments, promises, remote handles/properties, preload scripts, DOM node resolution |
+| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads |
+| CDP DOM/input | Tree/search/editing/mutation events, node handles, trusted keyboard/text/mouse input, surrogate quads/boxes/hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
 | Extension | `LP.dump` returns `{format, content}` |
-| PureScript / Puppeteer | Connect/disconnect, context/page lifetime, `goto`, response status/body, preload install/removal, headers/user agent, evaluation, selector waiting, DOM click dispatch, cookies and `content` |
+| WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
+| MCP / saved scripts | Stdio and HTTP MCP sessions, extraction/actions/waits/cookies/downloads; saved scripts with top-level await/return and synchronous browser actions |
+| PureScript / Puppeteer | Resource lifetime, `goto`, history, response status/body, preloads, headers, evaluation, waits, keyboard/text input, coordinate clicks, cookies and `content` |
 
 Unsupported commands return a CDP error with code `-32601`. HTTP discovery
 provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
 connect with `defaultViewport: null` (already configured by the PureScript FFI).
 
-This version has no layout, coordinate-based input, screenshots, PDF, canvas,
-ES module scripts, service workers, full iframe support, browser-grade CORS or
-process isolation. Utility-world IDs share the page's JS realm. Some Puppeteer
-initialization/viewport configuration commands are acknowledged without layout
-effects. Markdown and structured metadata are subsets, not byte-identical
+Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), including
+simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
+observation uses those boxes; visibility tracking, nested scrolling and delay
+semantics remain incomplete. Screenshots, PDF, canvas, service workers, full
+iframe support, browser-grade CORS and process isolation remain absent.
+Utility-world IDs share the page's JS realm. Some configuration commands still
+only acknowledge requests. Markdown and structured metadata are subsets, not byte-identical
 Lightpanda output. `done` does not track every future timer. Documents are decoded
 as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly.
 No speed or memory parity is claimed.
+
+ES modules use Node's experimental VM-module API in the actual page realm. The
+Linux CLI enables it by replacing its own process, preserving its PID. Embedding
+the library requires `node --experimental-vm-modules`; unsupported hosts report
+module execution errors. Import maps, JSON modules and complete mixed classic/
+module ordering remain unfinished. Saved-script limits are documented in the
+[script contract](docs/reference/script-contract.md).
+
+```sh
+node bin/red-panda.js serve --protocol cdp --protocol webdriver
+node bin/red-panda.js mcp                 # JSON-lines stdio
+node bin/red-panda.js mcp --port 8080     # HTTP /mcp
+node bin/red-panda.js run script.js
+```
 
 Request configuration covers navigation, classic external resources, and
 `window.fetch`. Extra CDP headers override conflicting page-supplied headers;
@@ -135,23 +155,26 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 22 assertions against a real Puppeteer
-connection and a deterministic local HTTP fixture. `npm run test:protocol` runs
-27 browser, CLI, cookie-file and raw-CDP tests, including error paths and evaluation timeouts.
+`automation/test/Test/Main.purs` runs 44 assertions against a real Puppeteer
+connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
+the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
+MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
 ## REA investigation and comparison
 
 REA 6.8.0 captured behavior from the official Lightpanda
 `1.1.0-nightly.11326+948d77378` binary. Its SHA-256 was checked against the
-official GitHub release asset's published digest. The complete fourteen Evidence
+official GitHub release asset's published digest. Twenty complete Evidence
 records, an index, fixtures and observed limitations are in
 [`docs/reference/FINDINGS.md`](docs/reference/FINDINGS.md).
 
-Twelve differential checks compare this implementation with that binary on the
+Thirteen differential checks compare this implementation with that binary on the
 same local fixture: async scripts, selectors, Markdown, error exits, ordered
 batches, preloads, cookie isolation/export/import, plain-text documents, and
-CDP navigation/evaluation/clicks/cookies/dump structure and request configuration.
+CDP navigation/evaluation/clicks/cookies/dump structure, request configuration,
+history traversal and navigation events. Separate saved-script probes compare
+25 successful fixture outputs; these do not cover unsupported operations.
 
 ```sh
 npm run test:reference -- /path/to/verified/lightpanda

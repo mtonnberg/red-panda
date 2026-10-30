@@ -1,11 +1,15 @@
 import { WebSocket } from 'ws';
 
-export async function connect(endpoint) {
-  const socket = new WebSocket(endpoint);
+export async function connect(endpoint, { timeout = 15000 } = {}) {
+  const socket = new WebSocket(endpoint, { handshakeTimeout: timeout });
   await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
   let id = 0;
   const pending = new Map();
   const events = [];
+  socket.on('close', () => {
+    for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('CDP connection closed')); }
+    pending.clear();
+  });
   socket.on('message', raw => {
     const message = JSON.parse(raw);
     if (!message.id) { events.push(message); return; }
@@ -14,9 +18,9 @@ export async function connect(endpoint) {
   });
   return {
     socket, events,
-    send: (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    send: (method, params = {}, sessionId, options = {}) => new Promise((resolve, reject) => {
       const requestId = ++id;
-      const timer = setTimeout(() => { pending.delete(requestId); reject(new Error(`CDP timeout: ${method}`)); }, 5000);
+      const timer = setTimeout(() => { pending.delete(requestId); reject(new Error(`CDP timeout: ${method} (request ${requestId})`)); }, options.timeout ?? timeout);
       pending.set(requestId, { resolve, reject, timer });
       socket.send(JSON.stringify({ id: requestId, method, params, ...(sessionId ? { sessionId } : {}) }));
     }),
@@ -25,7 +29,9 @@ export async function connect(endpoint) {
       pending.clear();
       if (socket.readyState === WebSocket.CLOSED) return;
       const closed = new Promise(resolve => socket.once('close', resolve));
-      socket.close(); await closed;
+      const force = setTimeout(() => socket.terminate(), 1000); force.unref();
+      socket.close();
+      try { await closed; } finally { clearTimeout(force); }
     },
   };
 }

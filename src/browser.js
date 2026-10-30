@@ -2,6 +2,11 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import vm from 'node:vm';
 import { JSDOM, CookieJar, ResourceLoader, VirtualConsole } from 'jsdom';
+import { installInput } from './input.js';
+import { installLayout } from './layout.js';
+import { installIntersection } from './intersection.js';
+import { installNavigation } from './navigation.js';
+import { installModuleScripts } from './modules.js';
 
 export const VERSION = '0.1.0';
 const now = () => performance.now() / 1000;
@@ -97,13 +102,18 @@ export class Page extends EventEmitter {
     this.activeRequests = new Set();
     this.lastActivity = Date.now();
     this.history = [];
+    this.historyIndex = -1;
+    this.nextHistoryId = 1;
+    this.documentId = randomUUID();
+    this.documentGeneration = 0;
+    this.documentAbort = new AbortController();
     this.closed = false;
     this.navigationGeneration = 0;
     this.newDocumentScripts = new Map();
     this.dom = this.createDOM('<!doctype html><html><head></head><body></body></html>');
   }
 
-  createDOM(html) {
+  createDOM(html, historyState = null) {
     const virtualConsole = new VirtualConsole();
     virtualConsole.on('jsdomError', error => this.emit('pageError', error));
     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
@@ -117,13 +127,15 @@ export class Page extends EventEmitter {
       virtualConsole,
       pretendToBeVisual: true,
       beforeParse: window => {
+        installInput(window);
+        installIntersection(this, window, installLayout(this, window, this.viewport));
         // Fetch is missing from jsdom. Preserve the page's URL and cookie jar.
-        const generation = this.navigationGeneration;
-        const navigationSignal = this.navigationAbort?.signal;
+        const generation = this.documentGeneration;
+        const navigationSignal = this.documentAbort.signal;
         window.fetch = (input, init = {}) => new window.Promise((resolve, reject) => {
           const callerSignal = init.signal ?? (input instanceof Request ? input.signal : undefined);
           const signal = navigationSignal && callerSignal ? AbortSignal.any([navigationSignal, callerSignal]) : navigationSignal ?? callerSignal;
-          const active = () => !this.closed && this.navigationGeneration === generation;
+          const active = () => !this.closed && this.documentGeneration === generation;
           // A disposed document must never resume page callbacks. Observe the native
           // rejection even after teardown, while leaving its realm promise unsettled.
           this.fetch(input, { ...init, signal }, 'Fetch').then(
@@ -139,6 +151,9 @@ export class Page extends EventEmitter {
         window.TextEncoder = TextEncoder;
         window.TextDecoder = TextDecoder;
         window.structuredClone = structuredClone;
+        this.installHistory(window, historyState);
+        installNavigation(this, window);
+        installModuleScripts(this, window);
         Object.defineProperty(window.navigator, 'userAgent', { get: () => this.userAgent });
         Object.defineProperty(window.navigator, 'language', { get: () => this.acceptLanguage.split(',')[0].split(';')[0].trim() });
         Object.defineProperty(window.navigator, 'languages', { get: () => Object.freeze(this.acceptLanguage.split(',').map(value => value.split(';')[0].trim()).filter(Boolean)) });
@@ -156,6 +171,79 @@ export class Page extends EventEmitter {
     this.lastActivity = Date.now();
     this.emit('request', { id, url, type, method, headers, timestamp: now(), redirectResponse });
     return id;
+  }
+
+  installHistory(window, state) {
+    const nativePush = window.history.pushState.bind(window.history);
+    const nativeReplace = window.history.replaceState.bind(window.history);
+    const nativeState = Object.getOwnPropertyDescriptor(window.History.prototype, 'state').get.bind(window.history);
+    if (state !== null) nativeReplace(structuredClone(state), '', window.location.href);
+    this.nativeHistoryReplace = nativeReplace;
+    Object.defineProperty(window.history, 'length', { get: () => Math.max(1, this.history.length) });
+    Object.defineProperty(window.history, 'state', { get: () => nativeState() ?? null });
+    for (const [name, native] of [['pushState', nativePush], ['replaceState', nativeReplace]]) {
+      window.history[name] = (...args) => {
+        const input = [...args];
+        if (input.length) input[0] = structuredClone(input[0]);
+        const result = native(...input);
+        this.commitHistory(window.location.href, window.history.state, name === 'pushState' ? 'push' : 'replace');
+        this.url = window.location.href;
+        this.emit('withinDocument', { url: this.url, navigationType: 'historyApi' });
+        return result;
+      };
+    }
+    window.addEventListener('hashchange', () => this.reconcileURL(window));
+    for (const [name, fixedDelta] of [['back', -1], ['forward', 1], ['go', undefined]]) {
+      window.history[name] = (delta = 0) => {
+        const distance = fixedDelta ?? Math.trunc(Number(delta) || 0);
+        if (!Number.isFinite(distance)) return;
+        window.setTimeout(() => {
+          if (this.closed || this.dom.window !== window) return;
+          const action = distance === 0 ? this.navigate(this.url, { historyMode: 'reload' }) : this.traverseHistory(this.historyIndex + distance);
+          action.catch(error => this.emit('pageError', error));
+        }, 0);
+      };
+    }
+  }
+
+  commitHistory(url, state = null, mode = 'push') {
+    const entry = { id: this.nextHistoryId++, url, state: structuredClone(state), documentId: this.documentId };
+    if (mode === 'replace' && this.historyIndex >= 0) this.history[this.historyIndex] = entry;
+    else {
+      this.history.splice(this.historyIndex + 1);
+      this.history.push(entry);
+      this.historyIndex = this.history.length - 1;
+    }
+  }
+
+  reconcileURL(window = this.dom.window, { historyMode = 'push' } = {}) {
+    if (this.closed || window !== this.dom.window || window.location.href === this.url) return;
+    this.url = window.location.href;
+    this.commitHistory(this.url, window.history.state, historyMode);
+    this.emit('withinDocument', { url: this.url, navigationType: 'fragment' });
+  }
+
+  navigationHistory() {
+    return { currentIndex: this.historyIndex, entries: this.history.map(({ id, url }) => ({ id, url, userTypedURL: url, title: '', transitionType: 'other' })) };
+  }
+
+  async traverseHistory(index, { forceReload = false } = {}) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.history.length) return false;
+    const entry = this.history[index];
+    if (!forceReload && entry.documentId === this.documentId) {
+      const previousURL = this.url;
+      this.nativeHistoryReplace(structuredClone(entry.state), '', entry.url);
+      this.historyIndex = index;
+      this.url = entry.url;
+      const hashChanged = new URL(previousURL).hash !== new URL(this.url).hash;
+      this.emit('withinDocument', { url: this.url, navigationType: hashChanged ? 'fragment' : 'historyApi' });
+      const window = this.dom.window;
+      window.dispatchEvent(new window.PopStateEvent('popstate', { state: structuredClone(entry.state) }));
+      if (hashChanged) {
+        window.dispatchEvent(new window.HashChangeEvent('hashchange', { oldURL: previousURL, newURL: this.url }));
+      }
+    } else await this.navigate(entry.url, { historyMode: 'traverse', historyIndex: index });
+    return true;
   }
   requestFinished(id, url, status, size = 0, headers = {}, type = 'Other') {
     this.activeRequests.delete(id);
@@ -280,7 +368,7 @@ export class Page extends EventEmitter {
     }
   }
 
-  async navigate(url, { waitUntil = 'load', waitMs = 0, selector, script, recordHistory = true } = {}) {
+  async navigate(url, { waitUntil = 'load', waitMs = 0, selector, script, historyMode = 'push', historyIndex, onCommit, referrer } = {}) {
     if (this.closed) throw new Error('Page is closed');
     const generation = ++this.navigationGeneration;
     const deadline = Date.now() + this.timeout;
@@ -288,14 +376,17 @@ export class Page extends EventEmitter {
     this.navigationAbort?.abort();
     this.navigationAbort = new AbortController();
     const target = new URL(url, this.url).href;
+    let navigationWindow, redirect, captureRedirect;
     this.loaderId = randomUUID();
     this.emit('navigationStarted');
     try {
       let html;
       let response;
-      if (target === 'about:blank') html = '<!doctype html><html><head></head><body></body></html>';
+      if (target.split('#')[0] === 'about:blank') html = '<!doctype html><html><head></head><body></body></html>';
       else {
-        response = await this.fetch(target, { signal: this.navigationAbort.signal }, 'Document');
+        const referrerSource = referrer === undefined ? this.url : referrer;
+        const referer = this.referrerFor(target, referrerSource);
+        response = await this.fetch(target, { signal: this.navigationAbort.signal, ...(referer ? { headers: { referer } } : {}) }, 'Document');
         const reader = response.body?.getReader();
         const chunks = [];
         let size = 0;
@@ -317,16 +408,39 @@ export class Page extends EventEmitter {
         this.responseHeaders = [...response.headers].map(([name, value]) => ({ name, value }));
       }
       if (generation !== this.navigationGeneration || this.closed) throw new Error('Navigation superseded');
+      this.documentGeneration++;
+      this.documentAbort.abort();
+      this.documentAbort = new AbortController();
       this.dom.window.close();
       this.responseHeaders = response ? [...response.headers].map(([name, value]) => ({ name, value })) : [];
       this.url = response?.finalUrl ?? target;
       this.status = response?.status ?? 200;
       this.executionContextId = this.browser.nextExecutionContext++;
       this.emit('contextsCleared');
-      this.dom = this.createDOM(html);
-      if (recordHistory) this.history.push(this.url);
+      this.documentId = randomUUID();
+      let state = null;
+      if (historyMode === 'traverse' || (historyMode === 'reload' && this.historyIndex >= 0)) {
+        const index = historyMode === 'reload' ? this.historyIndex : historyIndex;
+        const entry = this.history[index];
+        if (!entry) throw new Error('History entry no longer exists');
+        const oldDocumentId = entry.documentId;
+        for (const candidate of this.history) if (candidate.documentId === oldDocumentId) candidate.documentId = this.documentId;
+        this.historyIndex = index;
+        entry.url = this.url;
+        state = structuredClone(entry.state);
+      } else this.commitHistory(this.url, null, historyMode === 'replace' ? 'replace' : 'push');
+      let resolveRedirect;
+      const requested = new Promise(resolve => { resolveRedirect = resolve; });
+      captureRedirect = pending => {
+        if (!navigationWindow || pending.window === navigationWindow) { redirect = pending; resolveRedirect(); }
+      };
+      this.on('navigationRequested', captureRedirect);
+      this.dom = this.createDOM(html, state);
+      navigationWindow = this.dom.window;
+      const moduleReady = this.moduleReady;
       this.emit('navigated');
       this.emit('contextCreated');
+      onCommit?.();
       const documentReady = new Promise(resolve => {
         if (this.dom.window.document.readyState !== 'loading') resolve();
         else this.dom.window.document.addEventListener('DOMContentLoaded', resolve, { once: true });
@@ -335,9 +449,11 @@ export class Page extends EventEmitter {
         if (this.dom.window.document.readyState === 'complete') resolve();
         else this.dom.window.addEventListener('load', resolve, { once: true });
       });
-      documentReady.then(() => { if (generation === this.navigationGeneration) this.emit('domContentLoaded'); });
-      loaded.then(() => { if (generation === this.navigationGeneration) this.emit('load'); });
-      await withTimeout(waitUntil === 'domcontentloaded' ? documentReady : loaded, remaining(), 'Page load timed out');
+      documentReady.then(() => { if (generation === this.navigationGeneration && !redirect) this.emit('domContentLoaded'); });
+      loaded.then(async () => { await moduleReady; if (generation === this.navigationGeneration && !redirect) this.emit('load'); });
+      const ready = waitUntil === 'domcontentloaded' ? documentReady : Promise.all([loaded, moduleReady]);
+      await withTimeout(Promise.race([ready, requested]), remaining(), 'Page load timed out');
+      if (redirect) await withTimeout(redirect.promise, remaining(), 'Page navigation chain timed out');
       if (waitUntil === 'networkidle0' || waitUntil === 'networkidle2') {
         const allowed = waitUntil === 'networkidle2' ? 2 : 0;
         await until(() => this.activeRequests.size <= allowed && Date.now() - this.lastActivity >= 500, { timeout: remaining() });
@@ -349,12 +465,13 @@ export class Page extends EventEmitter {
     } catch (error) {
       if (generation === this.navigationGeneration) this.emit('navigationError', error);
       throw error;
-    }
+    } finally { if (captureRedirect) this.off('navigationRequested', captureRedirect); }
   }
 
   evaluate(expression) {
     if (this.closed) throw new Error('Page is closed');
-    return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout, 2000) });
+    try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout, 2000) }); }
+    finally { this.reconcileURL(); }
   }
   callFunction(declaration, thisArg, args) {
     const key = `__redpanda_${randomUUID().replaceAll('-', '')}`;
@@ -401,6 +518,7 @@ export class Page extends EventEmitter {
     this.closed = true;
     this.navigationGeneration++;
     this.navigationAbort?.abort();
+    this.documentAbort.abort();
     this.dom.window.close();
     this.emit('close');
     this.removeAllListeners();

@@ -28,6 +28,18 @@ export const gotoResponseImpl = page => url => async(async () => {
   if (!response) throw new Error('Navigation did not produce an HTTP response');
   return response;
 });
+export const armNavigationImpl = page => () => {
+  const controller = new AbortController();
+  const promise = page.waitForNavigation({ waitUntil: 'load', timeout: 5000, signal: controller.signal }).then(() => page.url());
+  promise.catch(() => {}); // Owned watcher can be canceled before anyone awaits it.
+  return { controller, promise };
+};
+export const awaitNavigationImpl = pending => async(() => pending.promise);
+export const cancelNavigationImpl = pending => () => { pending.controller.abort(); };
+export const goBackImpl = page => async(async () => { await page.goBack({ waitUntil: 'load', timeout: 5000 }); return page.url(); });
+export const goForwardImpl = page => async(async () => { await page.goForward({ waitUntil: 'load', timeout: 5000 }); return page.url(); });
+export const reloadImpl = page => async(async () => { await page.reload({ waitUntil: 'load', timeout: 5000 }); return page.url(); });
+export const pageUrlImpl = page => () => page.url();
 export const responseStatus = response => response.status();
 export const responseTextImpl = response => async(() => response.text());
 export const evaluateOnNewDocumentImpl = page => source => async(async () => (await page.evaluateOnNewDocument(source)).identifier);
@@ -36,6 +48,11 @@ export const setExtraHTTPHeadersImpl = page => headers => async(async () => {
   await page.setExtraHTTPHeaders(Object.fromEntries(headers.map(({ name, value }) => [name, value])));
 });
 export const setUserAgentImpl = page => userAgent => async(async () => { await page.setUserAgent(userAgent); });
+export const focusImpl = page => selector => async(async () => { await page.focus(selector); });
+export const clickImpl = page => selector => async(async () => { await page.click(selector); });
+export const typeTextImpl = page => selector => text => async(async () => { await page.type(selector, text); });
+export const pressKeyImpl = page => key => async(async () => { await page.keyboard.press(key); });
+export const insertTextImpl = page => text => async(async () => { await page.keyboard.sendCharacter(text); });
 export const evaluateStringImpl = page => expression => async(async () => {
   const result = await page.evaluate(expression);
   if (typeof result !== 'string') throw new TypeError('Expected a string from page.evaluate');

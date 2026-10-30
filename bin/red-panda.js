@@ -1,15 +1,27 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
+import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { Browser, VERSION } from '../src/browser.js';
 import { serve } from '../src/cdp.js';
+import { runMCPStdio } from '../src/mcp.js';
+import { serveMCPHTTP } from '../src/mcp-http.js';
+import { runScript } from '../src/script.js';
 import { readCookieFile, writeCookieFile, setCookie, exportCookies } from '../src/cookies.js';
+
+// Re-exec in place so module scripts share the page VM and server ownership
+// remains attached to the same PID (including bounded conformance cleanup).
+if (typeof vm.SourceTextModule !== 'function' && typeof process.execve === 'function') {
+  process.execve(process.execPath, [process.execPath, '--experimental-vm-modules', ...process.execArgv, ...process.argv.slice(1)], process.env);
+}
 
 const help = `Red Panda ${VERSION} — experimental headless browser (no rendering)
 
 Usage:
   red-panda fetch [options] <URL>...   Multiple URLs require --json
-  red-panda serve [--host 127.0.0.1] [--port 9222]
+  red-panda serve [--host 127.0.0.1] [--port 9222] [--protocol cdp|webdriver]...
+  red-panda mcp [--port PORT | --cdp-port PORT]   MCP over stdio or HTTP
+  red-panda run <script.js | ->        Execute a saved browser script
   red-panda version
 
 Fetch options:
@@ -49,6 +61,10 @@ export async function main(argv = process.argv.slice(2)) {
     'fail-on-http-error': { type: 'boolean' },
     'inject-script': { type: 'string', multiple: true }, 'inject-script-file': { type: 'string', multiple: true },
     cookie: { type: 'string' }, 'cookie-jar': { type: 'string' },
+    protocol: { type: 'string', multiple: true },
+    'http-session-timeout': { type: 'string', default: '60' },
+    'remote-allow-origins': { type: 'string', multiple: true },
+    'cdp-port': { type: 'string' },
   } });
   if (values.version) { console.log(`RedPanda/${VERSION}`); return; }
   if (values.help || !positionals.length) { console.log(help); return; }
@@ -56,18 +72,59 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === 'version' || values.version) { console.log(`RedPanda/${VERSION}`); return; }
   const timeout = integer(values['wait-ms'], '--wait-ms');
   const options = { timeout, javascript: !values['no-javascript'], userAgent: values['user-agent'] };
+  if (command === 'run') {
+    if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
+    if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');
+    try {
+      const result = await runScript({ path: rest[0], browserOptions: options, timeout });
+      process.stdout.write(result.output);
+    } catch (error) { if (error.output) process.stdout.write(error.output); throw error; }
+    return;
+  }
+  if (command === 'mcp') {
+    if (rest.length) throw new Error('mcp does not accept positional arguments');
+    if (values.cookie || values['cookie-jar']) throw new Error('Cookie files are not yet supported for MCP');
+    if (tokens.some(token => token.kind === 'option' && token.name === 'port')) {
+      if (values['cdp-port'] !== undefined) throw new Error('--cdp-port cannot be combined with --port');
+      const port = integer(values.port, '--port', 0);
+      if (port > 65535) throw new Error('--port must be between 0 and 65535');
+      const httpSessionTimeout = tokens.some(token => token.kind === 'option' && token.name === 'http-session-timeout')
+        ? integer(values['http-session-timeout'], '--http-session-timeout', 0) : 0;
+      const service = await serveMCPHTTP({ host: values.host, port, httpSessionTimeout, browserOptions: options,
+        remoteAllowOrigins: values['remote-allow-origins'] ?? [],
+      });
+      console.error(`RedPanda/${VERSION} MCP HTTP listening on ${service.host}:${service.port}`);
+      let stopping = false;
+      const stop = async () => { if (stopping) return; stopping = true; await service.close(); };
+      process.once('SIGINT', stop); process.once('SIGTERM', stop);
+      return;
+    }
+    let service;
+    try {
+      if (values['cdp-port'] !== undefined) {
+        const port = integer(values['cdp-port'], '--cdp-port', 0);
+        if (port > 65535) throw new Error('--cdp-port must be between 0 and 65535');
+        service = await serve({ ...options, host: values.host, port, allowedOrigins: values['remote-allow-origins'] });
+      }
+      await runMCPStdio({ ...(service ? { browser: service.browser } : {}), browserOptions: options });
+    } finally { await service?.close(); }
+    return;
+  }
   if (command === 'serve') {
     if (rest.length) throw new Error('serve does not accept positional arguments');
     const port = integer(values.port, '--port', 0);
     if (port > 65535) throw new Error('--port must be between 0 and 65535');
-    const service = await serve({ ...options, host: values.host, port });
-    console.error(`RedPanda/${VERSION} CDP listening on ${service.host}:${service.port}`);
+    const service = await serve({ ...options, host: values.host, port, protocols: values.protocol,
+      httpSessionTimeout: integer(values['http-session-timeout'], '--http-session-timeout', 0),
+      allowedOrigins: values['remote-allow-origins'],
+    });
+    console.error(`RedPanda/${VERSION} automation server listening on ${service.host}:${service.port}`);
     let stopping = false;
     const stop = async () => { if (stopping) return; stopping = true; await service.close(); };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     return;
   }
-  if (command !== 'fetch' || !rest.length) throw new Error('Expected fetch <URL>..., serve, or version');
+  if (command !== 'fetch' || !rest.length) throw new Error('Expected fetch <URL>..., serve, mcp, run, or version');
   if (rest.length > 1 && !values.json) throw new Error('Fetching multiple URLs requires --json');
   if (!['html', 'text', 'markdown', 'links', 'structured_data'].includes(values.dump)) throw new Error('Unsupported --dump format');
   if (!['load', 'domcontentloaded', 'done'].includes(values['wait-until'])) throw new Error('Unsupported --wait-until value');
