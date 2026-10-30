@@ -5,9 +5,11 @@ import { Browser } from '../src/browser.js';
 
 test('same-origin fetch credentials are recalculated at every redirect and foreign cookies are not imported', async t => {
   const received = [];
+  let allowedOrigin;
   const foreign = http.createServer((req, res) => {
     received.push(req.headers.cookie ?? '');
-    res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'foreign=yes; Path=/' }); res.end('{}');
+    res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'foreign=yes; Path=/',
+      'access-control-allow-origin': allowedOrigin, 'access-control-allow-credentials': 'true' }); res.end('{}');
   });
   await new Promise(resolve => foreign.listen(0, '127.0.0.1', resolve));
   const destination = `http://127.0.0.1:${foreign.address().port}/foreign`;
@@ -17,6 +19,7 @@ test('same-origin fetch credentials are recalculated at every redirect and forei
   });
   await new Promise(resolve => source.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${source.address().port}`, browser = new Browser(), page = browser.createPage();
+  allowedOrigin = base;
   t.after(async () => { browser.close(); for (const server of [source, foreign]) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } });
   await page.navigate(base);
   await page.context.cookies.setCookie('session=source; Path=/', base);

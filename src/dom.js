@@ -8,6 +8,7 @@ const methods = new Set([
   'DOM.getAttributes', 'DOM.setAttributeValue', 'DOM.removeAttribute',
   'DOM.setNodeValue', 'DOM.setOuterHTML', 'DOM.removeNode',
   'DOM.getContentQuads', 'DOM.getBoxModel', 'DOM.scrollIntoViewIfNeeded',
+  'DOM.getFrameOwner',
 ]);
 const states = new WeakMap();
 
@@ -91,6 +92,8 @@ function serialize(session, state, node, depth = 0, pierce = false, budget = { r
   }
   if (node.nodeType === 1) {
     result.attributes = [...node.attributes].flatMap(attribute => [attribute.name, attribute.value]);
+    const frame = session.page.frames?.findElement(node);
+    if (frame) result.frameId = frame.frameId;
     if (node.namespaceURI === 'http://www.w3.org/2000/svg') result.isSVG = true;
     if (pierce && node.shadowRoot) result.shadowRoots = [serialize(session, state, node.shadowRoot, depth === -1 ? -1 : Math.max(0, depth - 1), pierce, budget)];
     if (pierce && node.contentDocument) result.contentDocument = serialize(session, state, node.contentDocument, depth === -1 ? -1 : Math.max(0, depth - 1), pierce, budget);
@@ -212,9 +215,20 @@ export function runDOM(session, method, params = {}) {
         return { nodeId: node ? reveal(session, state, node) : 0 };
       }
       case 'DOM.resolveNode': {
-        if (params.executionContextId !== undefined && params.executionContextId !== session.page.executionContextId &&
-            ![...(session.worlds?.values() ?? [])].includes(params.executionContextId)) throw error('Cannot find context with specified id');
-        return { object: session.remote(nodeFor(session, params, ['nodeId', 'backendNodeId']), false, params.objectGroup) };
+        let page = session.page;
+        if (params.executionContextId !== undefined) {
+          if (session.executionPage) page = session.executionPage(params.executionContextId);
+          else if (params.executionContextId !== session.page.executionContextId && ![...(session.worlds?.values() ?? [])].includes(params.executionContextId)) throw error('Cannot find context with specified id');
+        }
+        const node = nodeFor(session, params, ['nodeId', 'backendNodeId']);
+        if (params.executionContextId !== undefined && (node.ownerDocument ?? node) !== page.dom.window.document) throw error('Node belongs to a different frame');
+        return { object: session.remote(node, false, params.objectGroup, params.executionContextId === undefined ? undefined : page.executionContextId) };
+      }
+      case 'DOM.getFrameOwner': {
+        const frame = session.page.frames?.findFrame(params.frameId);
+        const node = frame?.dom.window.frameElement;
+        if (!node) throw error('Frame has no owner element');
+        return { backendNodeId: session.backendId(node), nodeId: reveal(session, state, node) };
       }
       case 'DOM.requestNode': return { nodeId: reveal(session, state, nodeFor(session, params, ['objectId'])) };
       case 'DOM.requestChildNodes': {

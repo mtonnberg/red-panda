@@ -45,3 +45,29 @@ test('MCP stdio CLI initializes, discovers tools, rejects malformed JSON and clo
   assert.equal(messages[1].result.serverInfo.name, 'red-panda');
   assert.ok(messages[2].result.tools.some(tool => tool.name === 'goto'));
 });
+
+test('fetch defaults to no dump and dump errors remain isolated within a batch', async () => {
+  const url = 'data:text/html,<h1>Default output</h1>';
+  const plain = await cli(['fetch', url]); assert.equal(plain.code, 0, plain.stderr); assert.equal(plain.stdout, '');
+  const json = await cli(['fetch', '--json', url]); const status = JSON.parse(json.stdout);
+  assert.equal(status.dump, ''); assert.equal(status.content, ''); assert.equal(status.http_status, 200);
+  const mixed = await cli(['fetch', '--json', '--dump', 'html', '--dump-selector', '#present',
+    'data:text/html,<h1>Missing</h1>', 'data:text/html,<section id=present>Found</section>']);
+  assert.equal(mixed.code, 1); const { results } = JSON.parse(mixed.stdout);
+  assert.equal(results[0].error, 'SelectorNotFound'); assert.equal(results[0].content, '');
+  assert.equal(results[1].error, null); assert.equal(results[1].content, '<section id="present">Found</section>');
+});
+
+test('fetch dump flags preserve Unicode boundaries and remove requested groups', async () => {
+  const url = 'data:text/html,' + encodeURIComponent('<!doctype html><style>p{color:red}</style><h1 id="target">🐼 Panda</h1><script>globalThis.ran=true</script>');
+  const capped = await cli(['fetch', '--json', '--dump', 'html', '--dump-selector', '#target', '--dump-max-bytes', '24', url]);
+  assert.equal(capped.code, 0, capped.stderr);
+  const content = JSON.parse(capped.stdout).content;
+  assert.equal(content, '<h1 id="target">🐼 Pan\n\n[truncated]\n');
+  assert.doesNotMatch(content, /\uFFFD/);
+  const stripped = await cli(['fetch', '--json', '--dump', 'html', '--strip-mode', 'js', '--strip-mode', 'css', url]);
+  assert.equal(stripped.code, 0, stripped.stderr);
+  assert.doesNotMatch(JSON.parse(stripped.stdout).content, /<(?:style|script)/);
+  const semantic = await cli(['fetch', '--json', '--dump', 'semantic_tree', url]);
+  assert.equal(semantic.code, 0, semantic.stderr); assert.ok(JSON.parse(JSON.parse(semantic.stdout).content));
+});

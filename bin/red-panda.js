@@ -7,6 +7,7 @@ import { serve } from '../src/cdp.js';
 import { runMCPStdio } from '../src/mcp.js';
 import { serveMCPHTTP } from '../src/mcp-http.js';
 import { runScript } from '../src/script.js';
+import { DUMP_FORMATS, STRIP_MODES } from '../src/dump.js';
 import { readCookieFile, writeCookieFile, setCookie, exportCookies } from '../src/cookies.js';
 
 // Re-exec in place so module scripts share the page VM and server ownership
@@ -25,10 +26,15 @@ Usage:
   red-panda version
 
 Fetch options:
-  --dump html|text|markdown|links|structured_data   Output format (default html)
+  --dump FORMAT          html, markdown, semantic_tree, semantic_tree_text,
+                         structured_data, text or links (default no dump)
+  --dump-selector CSS    Dump the first matching element
+  --dump-max-bytes N     Soft UTF-8 cap for HTML/Markdown, with truncation marker
+  --strip-mode GROUP     js, css, ui, invisible, shell or clutter (repeatable)
+  --with-base            Insert an absolute base URL into full-document HTML
   --json                 Wrap the dump and HTTP metadata in JSON
   --wait-until load|domcontentloaded|done          Readiness (default load)
-  --wait-ms N             Maximum page wait in milliseconds (default 10000)
+  --wait-ms N             Maximum page wait in milliseconds (default 5000)
   --wait-selector CSS     Wait for a matching DOM element
   --wait-script JS        Wait for a truthy JavaScript expression
   --no-javascript         Parse HTML without running page scripts
@@ -54,9 +60,11 @@ function integer(value, name, minimum = 1) {
 export async function main(argv = process.argv.slice(2)) {
   const { values, positionals, tokens } = parseArgs({ args: argv, allowPositionals: true, tokens: true, options: {
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
-    dump: { type: 'string', default: 'html' }, json: { type: 'boolean' },
+    dump: { type: 'string', default: '' }, json: { type: 'boolean' },
+    'dump-selector': { type: 'string' }, 'dump-max-bytes': { type: 'string' },
+    'strip-mode': { type: 'string', multiple: true }, 'with-base': { type: 'boolean' },
     host: { type: 'string', default: '127.0.0.1' }, port: { type: 'string', default: '9222' },
-    'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '10000' },
+    'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
     'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' },
     'no-javascript': { type: 'boolean' }, 'user-agent': { type: 'string' },
     'fail-on-http-error': { type: 'boolean' },
@@ -131,7 +139,13 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (command !== 'fetch' || !rest.length) throw new Error('Expected fetch <URL>..., serve, mcp, run, or version');
   if (rest.length > 1 && !values.json) throw new Error('Fetching multiple URLs requires --json');
-  if (!['html', 'text', 'markdown', 'links', 'structured_data'].includes(values.dump)) throw new Error('Unsupported --dump format');
+  if (values.dump && !DUMP_FORMATS.includes(values.dump)) throw new Error('Unsupported --dump format');
+  const dumpOptions = { selector: values['dump-selector'], withBase: values['with-base'] ?? false,
+    maxBytes: values['dump-max-bytes'] === undefined ? undefined : integer(values['dump-max-bytes'], '--dump-max-bytes', 0),
+    stripModes: values['strip-mode'] ?? [],
+  };
+  for (const mode of dumpOptions.stripModes) if (!STRIP_MODES.includes(mode)) throw new Error(`Unsupported strip mode: ${mode}`);
+  if (dumpOptions.maxBytes !== undefined && !['html', 'markdown'].includes(values.dump)) throw new Error('--dump-max-bytes requires HTML or Markdown');
   if (!['load', 'domcontentloaded', 'done'].includes(values['wait-until'])) throw new Error('Unsupported --wait-until value');
   const browser = new Browser(options);
   try {
@@ -175,8 +189,14 @@ export async function main(argv = process.argv.slice(2)) {
         if (!values.json) console.error(`red-panda: ${error}`);
       }
       try {
+        let content = '';
+        try { if (values.dump) content = page.dump(values.dump, dumpOptions); }
+        catch (cause) {
+          failed = true; error ??= cause.code ?? cause.message;
+          if (!values.json) console.error(`red-panda: ${error}`);
+        }
         results.push({ url: page.status ? page.url : url, http_status: page.status ?? 0,
-          headers: page.responseHeaders ?? [], dump: values.dump, content: page.dump(values.dump), error });
+          headers: page.responseHeaders ?? [], dump: values.dump, content, error });
         httpError ||= page.status >= 400;
         if (values['cookie-jar']) for (const cookie of await exportCookies(context.cookies)) {
           collectedCookies.set(`${cookie.domain}|${cookie.path}|${cookie.name}`, cookie);
@@ -184,7 +204,8 @@ export async function main(argv = process.argv.slice(2)) {
       } finally { browser.disposeContext(contextId); }
     }
     if (values['cookie-jar']) await writeCookieFile(values['cookie-jar'], [...collectedCookies.values()]);
-    console.log(values.json ? JSON.stringify(results.length === 1 ? results[0] : { results }) : results[0].content);
+    if (values.json) console.log(JSON.stringify(results.length === 1 ? results[0] : { results }));
+    else if (values.dump) console.log(results[0].content);
     process.exitCode = failed ? 1 : values['fail-on-http-error'] && httpError ? 22 : 0;
   } finally { browser.close(); }
 }

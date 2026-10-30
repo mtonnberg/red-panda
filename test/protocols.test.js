@@ -116,3 +116,49 @@ test('CDP geometry, viewport overrides and persisted scripts operate on the sele
     await assert.rejects(send('Runtime.runScript', { scriptId }), /script|Script/);
   } finally { await client.close(); await service.close(); }
 });
+
+test('CDP frame trees, contexts, node ownership and navigation use the real child realms', async () => {
+  const fixture = await createFixture(), service = await serve({ port: 0, loadResources: ['iframe'] });
+  const client = await connect(`ws://127.0.0.1:${service.port}/`);
+  try {
+    const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+    const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+    const send = (method, params = {}) => client.send(method, params, sessionId);
+    await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
+    await send('Page.navigate', { url: `${fixture.url}frames` });
+    const page = service.browser.pages.get(targetId);
+    await until(() => [...page.frames.frames.values()].some(frame => frame.url === `${fixture.url}frame-content` && frame.dom.window.document.readyState === 'complete'));
+    const { frameTree } = await send('Page.getFrameTree');
+    assert.equal(frameTree.childFrames.length, 2);
+    const inline = frameTree.childFrames.find(frame => frame.frame.url === 'about:srcdoc');
+    assert.equal(inline.childFrames.length, 1);
+    const ordered = client.events;
+    const mainCommit = ordered.findIndex(event => event.method === 'Page.frameNavigated' && event.params.frame.id === page.frameId);
+    const firstChildAttach = ordered.findIndex(event => event.method === 'Page.frameAttached');
+    assert.ok(mainCommit >= 0 && firstChildAttach > mainCommit, 'parent document commits before child attachment');
+    const inlineCommit = ordered.findIndex(event => event.method === 'Page.frameNavigated' && event.params.frame.id === inline.frame.id);
+    const nestedAttach = ordered.findIndex(event => event.method === 'Page.frameAttached' && event.params.frameId === inline.childFrames[0].frame.id);
+    assert.ok(nestedAttach > inlineCommit, 'nested frame attachment follows its parent document commit');
+    const frameId = frameTree.childFrames.find(frame => frame.frame.url.endsWith('/frame-content')).frame.id;
+    const context = client.events.find(event => event.method === 'Runtime.executionContextCreated' && event.params.context.auxData.frameId === frameId && event.params.context.auxData.isDefault).params.context;
+    const child = await send('Runtime.evaluate', { expression: '[document.title,frameOnly]', contextId: context.id, returnByValue: true });
+    assert.deepEqual(child.result.value, ['Child frame', 'child realm']);
+    assert.equal((await send('Runtime.evaluate', { expression: 'typeof frameOnly', returnByValue: true })).result.value, 'undefined');
+    const { backendNodeId } = await send('DOM.getFrameOwner', { frameId });
+    assert.equal((await send('DOM.describeNode', { backendNodeId })).node.frameId, frameId);
+    const world = await send('Page.createIsolatedWorld', { frameId, worldName: 'child-test' });
+    assert.equal((await send('Runtime.evaluate', { expression: 'document.title', contextId: world.executionContextId, returnByValue: true })).result.value, 'Child frame');
+    const { result: handle } = await send('Runtime.evaluate', { expression: '({owner:frameOnly})', contextId: context.id });
+    const called = await send('Runtime.callFunctionOn', { objectId: handle.objectId, functionDeclaration: 'function(){return this.owner}', returnByValue: true });
+    assert.equal(called.result.value, 'child realm');
+    const navigation = await send('Page.navigate', { frameId, url: `${fixture.url}frame-next` });
+    assert.equal(navigation.frameId, frameId); assert.equal(page.url, `${fixture.url}frames`);
+    assert.equal(page.dom.window.document.getElementById('child').contentDocument.title, 'Next frame');
+    await assert.rejects(send('Runtime.evaluate', { expression: '1', contextId: context.id }), /Cannot find context/);
+    await assert.rejects(send('Runtime.getProperties', { objectId: handle.objectId }), /Cannot find object/);
+    const request = client.events.find(event => event.method === 'Network.requestWillBeSent' && event.params.request.url === `${fixture.url}frame-content`);
+    assert.equal(request.params.frameId, frameId); assert.notEqual(request.params.loaderId, page.loaderId);
+    await send('Runtime.evaluate', { expression: 'document.getElementById("child").remove()' });
+    await until(() => client.events.some(event => event.method === 'Page.frameDetached' && event.params.frameId === frameId));
+  } finally { await client.close(); await service.close(); await fixture.close(); }
+});

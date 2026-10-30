@@ -7,18 +7,21 @@ import { supportsRuntime, runRuntime, resetRuntime } from '../src/runtime.js';
 function sessionFor(page) {
   return {
     page, worlds: new Map(), objects: new Map(),
-    remote(value, byValue = false, group) {
+    remote(value, byValue = false, group, contextId = page.executionContextId) {
       if (value === undefined) return { type: 'undefined' };
       if (value === null) return { type: 'object', subtype: 'null', value: null };
       const type = typeof value;
       if (['string', 'number', 'boolean'].includes(type)) return { type, value };
       if (byValue) return { type, value: JSON.parse(JSON.stringify(value)) };
-      const objectId = randomUUID(); this.objects.set(objectId, { value, group });
+      const objectId = randomUUID(); this.objects.set(objectId, { value, group, contextId });
       return { type, objectId, ...(Array.isArray(value) ? { subtype: 'array' } : {}) };
     },
-    object(id) { if (!this.objects.has(id)) throw Object.assign(new Error('Unknown object'), { code: -32602 }); return this.objects.get(id).value; },
-    exception(error) { return { exceptionId: 1, text: error.message ?? String(error), lineNumber: 0, columnNumber: 0,
-      exception: { type: 'object', subtype: 'error', description: error.stack ?? String(error) } }; },
+    object(id) {
+      if (!this.objects.has(id)) throw Object.assign(new Error('Unknown object'), { code: -32602 });
+      const entry = this.objects.get(id); this.executionPage?.(entry.contextId); return entry.value;
+    },
+    exception(error, contextId = page.executionContextId) { return { exceptionId: 1, text: error.message ?? String(error), lineNumber: 0, columnNumber: 0,
+      exception: { ...this.remote(error, false, undefined, contextId), subtype: 'error', description: error.stack ?? String(error) } }; },
   };
 }
 
@@ -27,6 +30,27 @@ async function fixture(action, options) {
   const session = sessionFor(page);
   try { await action({ browser, page, session }); }
   finally { resetRuntime(session); browser.close(); }
+}
+
+async function frameFixture(action) {
+  return fixture(async ({ browser, page, session }) => {
+    const frames = ['First frame', 'Second frame'].map(title => {
+      const element = page.dom.window.document.createElement('iframe');
+      element.srcdoc = `<!doctype html><title>${title}</title>`; page.dom.window.document.body.append(element);
+      return { element, page: page.frames.findElement(element) };
+    });
+    assert.ok(frames.every(frame => frame.page));
+    session.executionPage = (id = page.executionContextId) => {
+      const selected = page.frames.findContext(id)?.page;
+      if (!selected || selected.closed) throw Object.assign(new Error('Cannot find context with specified id'), { code: -32602 });
+      return selected;
+    };
+    const cleanup = ({ executionContextId }) => resetRuntime(session, executionContextId);
+    page.on('frameContextDestroyed', cleanup);
+    try { await action({ browser, page, session, first: frames[0].page, second: frames[1].page,
+      firstElement: frames[0].element, secondElement: frames[1].element }); }
+    finally { page.off('frameContextDestroyed', cleanup); }
+  }, { loadResources: ['iframe'] });
 }
 
 test('compiled scripts validate without execution, persist once, and affect only the page realm', async () => fixture(async ({ page, session }) => {
@@ -126,4 +150,87 @@ test('unsupported execution interruption/formatting and invalid parameters retur
   await assert.rejects(runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: page.executionContextId + 1000 }), /Cannot find context/);
   await assert.rejects(runRuntime(session, 'Runtime.compileScript', { expression: '1', sourceURL: '', persistScript: 'yes' }), /must be boolean/);
   await assert.rejects(runRuntime(session, 'Runtime.setMaxCallStackSizeToCapture', { size: -1 }), /non-negative/);
+}));
+
+test('persistent scripts remain bound to actual frame realms without overwriting sibling scripts', async () => frameFixture(async ({ page, session, first, second }) => {
+  const compile = (target, expression) => runRuntime(session, 'Runtime.compileScript', {
+    expression, sourceURL: `frame-${target.executionContextId}.js`, persistScript: true, executionContextId: target.executionContextId,
+  });
+  const root = await compile(page, 'globalThis.rootRuntimeValue=7;rootRuntimeValue');
+  const child = await compile(first, 'globalThis.childRuntimeValue=42;({title:document.title})');
+  const sibling = await compile(second, 'globalThis.childRuntimeValue=73;childRuntimeValue');
+  await assert.rejects(runRuntime(session, 'Runtime.runScript', { scriptId: child.scriptId, executionContextId: second.executionContextId }), /different execution context/);
+  const result = await runRuntime(session, 'Runtime.runScript', { scriptId: child.scriptId, objectGroup: 'frame results' });
+  assert.equal(session.object(result.result.objectId).title, 'First frame');
+  assert.ok(session.object(result.result.objectId) instanceof first.dom.window.Object);
+  assert.equal(session.objects.get(result.result.objectId).contextId, first.executionContextId);
+  assert.equal(session.objects.get(result.result.objectId).group, 'frame results');
+  assert.equal(page.evaluate('typeof childRuntimeValue'), 'undefined'); assert.equal(second.evaluate('typeof childRuntimeValue'), 'undefined');
+  assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: sibling.scriptId, returnByValue: true })).result.value, 73);
+  assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: root.scriptId, returnByValue: true })).result.value, 7);
+  const invalid = await runRuntime(session, 'Runtime.compileScript', {
+    expression: 'let = ;', sourceURL: 'frame-syntax.js', persistScript: true, contextId: first.executionContextId,
+  });
+  assert.equal(invalid.exceptionDetails.executionContextId, first.executionContextId);
+  assert.equal(session.objects.get(invalid.exceptionDetails.exception.objectId).contextId, first.executionContextId);
+}));
+
+test('promise and exception handles infer their actual owning frame and preserve result/error contexts', async () => frameFixture(async ({ session, first, second }) => {
+  const promise = session.remote(first.evaluate('Promise.resolve({title:document.title})'), false, 'frame promises', first.executionContextId);
+  const reply = await runRuntime(session, 'Runtime.awaitPromise', { promiseObjectId: promise.objectId });
+  assert.equal(session.object(reply.result.objectId).title, 'First frame'); assert.ok(session.object(reply.result.objectId) instanceof first.dom.window.Object);
+  assert.equal(session.objects.get(reply.result.objectId).contextId, first.executionContextId); assert.equal(session.objects.get(reply.result.objectId).group, 'frame promises');
+  await assert.rejects(runRuntime(session, 'Runtime.awaitPromise', { promiseObjectId: promise.objectId, contextId: second.executionContextId }), /different execution context/);
+  const failure = session.remote(first.evaluate('Promise.reject(new Error("frame rejection"))'), false, 'frame errors', first.executionContextId);
+  const rejected = await runRuntime(session, 'Runtime.awaitPromise', { promiseObjectId: failure.objectId });
+  assert.equal(rejected.exceptionDetails.executionContextId, first.executionContextId);
+  assert.equal(session.objects.get(rejected.result.objectId).contextId, first.executionContextId);
+  assert.equal(session.objects.get(rejected.exceptionDetails.exception.objectId).contextId, first.executionContextId);
+  const details = await runRuntime(session, 'Runtime.getExceptionDetails', { errorObjectId: rejected.result.objectId });
+  assert.equal(details.exceptionDetails.executionContextId, first.executionContextId); assert.match(details.exceptionDetails.text, /frame rejection/);
+}));
+
+test('frame destruction cancels pending Runtime work and leaves compiled parent/sibling scripts intact', async () => frameFixture(async ({ page, session, first, second, firstElement }) => {
+  const compile = (target, expression) => runRuntime(session, 'Runtime.compileScript', {
+    expression, sourceURL: 'pending-frame.js', persistScript: true, executionContextId: target.executionContextId,
+  });
+  const parent = await compile(page, '42'), sibling = await compile(second, '73');
+  const pendingScript = await compile(first, 'new Promise(()=>{})');
+  const pendingPromise = session.remote(first.evaluate('new Promise(()=>{})'), false, 'pending', first.executionContextId);
+  const waitingScript = assert.rejects(runRuntime(session, 'Runtime.runScript', { scriptId: pendingScript.scriptId, awaitPromise: true }), /context was destroyed/);
+  const waitingPromise = assert.rejects(runRuntime(session, 'Runtime.awaitPromise', { promiseObjectId: pendingPromise.objectId }), /context was destroyed/);
+  const before = session.objects.size;
+  firstElement.remove(); await Promise.all([waitingScript, waitingPromise]);
+  assert.equal(session.objects.size, before); assert.throws(() => session.object(pendingPromise.objectId), /Cannot find context/);
+  assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: parent.scriptId, returnByValue: true })).result.value, 42);
+  assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: sibling.scriptId, returnByValue: true })).result.value, 73);
+}));
+
+test('native inspector names and stack-depth settings are scoped to actual iframe VM contexts', async () => frameFixture(async ({ page, session, first, second }) => {
+  page.evaluate('let mainLexicalOnly=1'); first.evaluate('let selectedFrameLexical=2'); second.evaluate('let siblingLexicalOnly=3');
+  const root = await runRuntime(session, 'Runtime.globalLexicalScopeNames'); assert.ok(root.names.includes('mainLexicalOnly'));
+  const child = await runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: first.executionContextId });
+  assert.ok(child.names.includes('selectedFrameLexical')); assert.equal(child.names.includes('mainLexicalOnly'), false); assert.equal(child.names.includes('siblingLexicalOnly'), false);
+  assert.equal(Object.getOwnPropertyNames(first.dom.window).some(key => key.startsWith('__redpanda_inspector_')), false);
+  const original = first.evaluate('Error.stackTraceLimit'), parentLimit = page.evaluate('Error.stackTraceLimit');
+  await runRuntime(session, 'Runtime.setMaxCallStackSizeToCapture', { size: 0, contextId: first.executionContextId });
+  await runRuntime(session, 'Runtime.setMaxCallStackSizeToCapture', { size: 3, contextId: second.executionContextId });
+  assert.equal(first.evaluate('new Error("no frames").stack.split("\\n").length'), 1); assert.equal(page.evaluate('Error.stackTraceLimit'), parentLimit);
+  resetRuntime(session, first.executionContextId); assert.equal(first.evaluate('Error.stackTraceLimit'), original); assert.equal(second.evaluate('Error.stackTraceLimit'), 3);
+  assert.ok((await runRuntime(session, 'Runtime.globalLexicalScopeNames')).names.includes('mainLexicalOnly'));
+  assert.ok((await runRuntime(session, 'Runtime.globalLexicalScopeNames', { contextId: first.executionContextId })).names.includes('selectedFrameLexical'));
+}));
+
+test('child navigation invalidates only its scripts/inspector and rejects obsolete context selectors', async () => frameFixture(async ({ page, session, first, firstElement }) => {
+  const oldId = first.executionContextId;
+  const child = await runRuntime(session, 'Runtime.compileScript', { expression: '42', sourceURL: 'old-frame.js', persistScript: true, executionContextId: oldId });
+  const parent = await runRuntime(session, 'Runtime.compileScript', { expression: '73', sourceURL: 'parent.js', persistScript: true });
+  first.evaluate('let previousFrameLexical=1');
+  assert.ok((await runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: oldId })).names.includes('previousFrameLexical'));
+  await first.navigate('data:text/html,<title>Replacement</title>');
+  const replacement = page.frames.findElement(firstElement); assert.notEqual(replacement.executionContextId, oldId);
+  await assert.rejects(runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: oldId }), /Cannot find context/);
+  await assert.rejects(runRuntime(session, 'Runtime.runScript', { scriptId: child.scriptId }), /No script with given id/);
+  assert.equal((await runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: replacement.executionContextId })).names.includes('previousFrameLexical'), false);
+  assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: parent.scriptId, returnByValue: true })).result.value, 73);
 }));

@@ -40,6 +40,17 @@ export const goBackImpl = page => async(async () => { await page.goBack({ waitUn
 export const goForwardImpl = page => async(async () => { await page.goForward({ waitUntil: 'load', timeout: 5000 }); return page.url(); });
 export const reloadImpl = page => async(async () => { await page.reload({ waitUntil: 'load', timeout: 5000 }); return page.url(); });
 export const pageUrlImpl = page => () => page.url();
+export const childFrameImpl = page => index => async(async () => {
+  const frame = page.mainFrame().childFrames()[index];
+  if (!frame) throw new Error(`No child frame at index ${index}`);
+  return frame;
+});
+export const evaluateFrameStringImpl = frame => expression => async(async () => {
+  const value = await frame.evaluate(expression);
+  if (typeof value !== 'string') throw new TypeError('Expected a string from frame.evaluate');
+  return value;
+});
+export const gotoFrameImpl = frame => url => async(async () => (await frame.goto(url, { waitUntil: 'load', timeout: 5000 }))?.status() ?? 0);
 export const responseStatus = response => response.status();
 export const responseTextImpl = response => async(() => response.text());
 export const evaluateOnNewDocumentImpl = page => source => async(async () => (await page.evaluateOnNewDocument(source)).identifier);

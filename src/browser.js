@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import vm from 'node:vm';
+import { createRequire } from 'node:module';
 import { JSDOM, CookieJar, ResourceLoader, VirtualConsole } from 'jsdom';
 import { installInput } from './input.js';
 import { installLayout } from './layout.js';
@@ -10,6 +11,13 @@ import { installModuleScripts } from './modules.js';
 import { installForms } from './forms.js';
 import { installWorkers } from './workers.js';
 import { installXHR } from './xhr.js';
+import { dumpDocument } from './dump.js';
+import { installShadowDOM } from './shadow.js';
+import { installFrames } from './frames.js';
+import { installFetch } from './fetch.js';
+
+const require = createRequire(import.meta.url);
+const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
 
 export const VERSION = '0.1.0';
 const now = () => performance.now() / 1000;
@@ -44,8 +52,10 @@ class PageResources extends ResourceLoader {
     if (options.accept) headers.set('accept', options.accept);
     const referrer = this.page.referrerFor(url, options.referrer);
     if (referrer) headers.set('referer', referrer);
-    const type = options.element?.localName === 'script' ? 'Script' : options.element?.localName === 'link' ? 'Stylesheet' : 'Other';
-    const request = this.page.fetch(url, { headers, signal: abort.signal }, type).then(async response => {
+    const type = kind === 'iframe' ? 'Document' : options.element?.localName === 'script' ? 'Script' : options.element?.localName === 'link' ? 'Stylesheet' : 'Other';
+    const registry = this.page.frames ?? this.page.registry;
+    const requestPage = kind === 'iframe' ? registry?.findElement(options.element) ?? this.page : this.page;
+    const request = requestPage.fetch(url, { headers, signal: abort.signal }, type).then(async response => {
       request.response = { statusCode: response.status, headers: Object.fromEntries(response.headers) };
       request.href = response.url;
       // The shared transport already updated the CookieJar, including separate
@@ -100,6 +110,7 @@ export class Page extends EventEmitter {
     this.loaderId = randomUUID();
     this.executionContextId = browser.nextExecutionContext++;
     this.url = 'about:blank';
+    this.mimeType = 'text/html';
     this.userAgent = browser.options.userAgent ?? `RedPanda/${VERSION}`;
     this.acceptLanguage = 'en-US';
     this.platform = 'Linux x86_64';
@@ -117,6 +128,10 @@ export class Page extends EventEmitter {
     this.closed = false;
     this.navigationGeneration = 0;
     this.newDocumentScripts = new Map();
+    this.frameEventQueue = [];
+    this.attachedFrames = new Set([this.frameId]);
+    this.committedFrames = new Set([this.frameId]);
+    this.createdFrameContexts = new Set();
     this.dom = this.createDOM('<!doctype html><html><head></head><body></body></html>');
   }
 
@@ -133,54 +148,80 @@ export class Page extends EventEmitter {
       resources: this.javascript ? new PageResources(this) : undefined,
       virtualConsole,
       pretendToBeVisual: true,
-      beforeParse: window => {
-        installInput(window);
-        installIntersection(this, window, installLayout(this, window, this.viewport));
-        // Fetch is missing from jsdom. Preserve the page's URL and cookie jar.
-        const generation = this.documentGeneration;
-        const navigationSignal = this.documentAbort.signal;
-        window.fetch = (input, init = {}) => new window.Promise((resolve, reject) => {
-          const callerSignal = init.signal ?? (input instanceof Request ? input.signal : undefined);
-          const signal = navigationSignal && callerSignal ? AbortSignal.any([navigationSignal, callerSignal]) : navigationSignal ?? callerSignal;
-          const active = () => !this.closed && this.documentGeneration === generation;
-          // A disposed document must never resume page callbacks. Observe the native
-          // rejection even after teardown, while leaving its realm promise unsettled.
-          const credentials = init.credentials ?? (input instanceof Request ? input.credentials : 'same-origin');
-          this.fetch(input, { ...init, credentials, credentialsOrigin: window.location.origin, signal }, 'Fetch').then(
-            value => { if (active()) resolve(value); },
-            error => { if (active()) reject(error); },
-          );
-        });
-        window.Headers = Headers;
-        window.Request = Request;
-        window.Response = Response;
-        window.AbortController = AbortController;
-        window.AbortSignal = AbortSignal;
-        window.TextEncoder = TextEncoder;
-        window.TextDecoder = TextDecoder;
-        window.structuredClone = structuredClone;
-        this.installHistory(window, historyState);
-        installNavigation(this, window);
-        installForms(this, window);
-        installModuleScripts(this, window);
-        installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
-        installXHR(this, window);
-        Object.defineProperty(window.navigator, 'userAgent', { get: () => this.userAgent });
-        Object.defineProperty(window.navigator, 'language', { get: () => this.acceptLanguage.split(',')[0].split(';')[0].trim() });
-        Object.defineProperty(window.navigator, 'languages', { get: () => Object.freeze(this.acceptLanguage.split(',').map(value => value.split(';')[0].trim()).filter(Boolean)) });
-        Object.defineProperty(window.navigator, 'platform', { get: () => this.platform });
-        for (const { source } of this.newDocumentScripts.values()) {
-          try { window.eval(source); } catch (error) { this.emit('pageError', error); }
-        }
-      },
+      beforeParse: window => this.prepareWindow(window, historyState),
     });
   }
 
-  requestStarted(url, type = 'Document', method = 'GET', headers = {}, redirectResponse) {
-    const id = type === 'Document' ? this.loaderId : randomUUID();
+  prepareWindow(window, historyState = null, { main = true } = {}) {
+    if (main) implForWrapper(window.document).contentType = this.mimeType;
+    installInput(window);
+    installShadowDOM(this, window);
+    installIntersection(this, window, installLayout(this, window, this.viewport));
+    window.AbortController = AbortController;
+    window.AbortSignal = AbortSignal;
+    window.TextEncoder = TextEncoder;
+    window.TextDecoder = TextDecoder;
+    window.structuredClone = structuredClone;
+    installFetch(this, window);
+    if (main) this.installHistory(window, historyState);
+    installNavigation(this, window);
+    installForms(this, window);
+    installModuleScripts(this, window);
+    installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+    installXHR(this, window);
+    Object.defineProperty(window.navigator, 'userAgent', { get: () => this.userAgent });
+    Object.defineProperty(window.navigator, 'language', { get: () => this.acceptLanguage.split(',')[0].split(';')[0].trim() });
+    Object.defineProperty(window.navigator, 'languages', { get: () => Object.freeze(this.acceptLanguage.split(',').map(value => value.split(';')[0].trim()).filter(Boolean)) });
+    Object.defineProperty(window.navigator, 'platform', { get: () => this.platform });
+    if (main) this.frames = installFrames(this, window, {
+      prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+    });
+    for (const { source } of this.newDocumentScripts.values()) {
+      try { window.eval(source); } catch (error) { this.emit('pageError', error); }
+    }
+  }
+
+  emitFrameEvent(name, payload) {
+    this.frameEventQueue.push({ name, payload });
+    this.flushFrameEvents();
+  }
+
+  flushFrameEvents() {
+    if (this.creatingDOM || this.flushingFrameEvents) return;
+    this.flushingFrameEvents = true;
+    try {
+      while (this.frameEventQueue.length) {
+        const index = this.frameEventQueue.findIndex(({ name, payload }) => {
+          const id = payload.frameId ?? payload.frame?.id;
+          if (name === 'frameAttached') return this.committedFrames.has(payload.parentFrameId);
+          if (['frameDetached', 'frameContextDestroyed'].includes(name)) return true;
+          if (!this.attachedFrames.has(id)) return false;
+          if (name === 'frameNavigated' || name === 'frameNavigationStarted') return true;
+          if (!this.committedFrames.has(id)) return false;
+          return !['frameConsole', 'framePageError'].includes(name) || this.createdFrameContexts.has(payload.executionContextId);
+        });
+        if (index < 0) break;
+        const { name, payload } = this.frameEventQueue.splice(index, 1)[0];
+        const id = payload.frameId ?? payload.frame?.id;
+        if (name === 'frameAttached') this.attachedFrames.add(id);
+        if (name === 'frameNavigationStarted') this.committedFrames.delete(id);
+        if (name === 'frameNavigated') this.committedFrames.add(id);
+        if (name === 'frameContextCreated') this.createdFrameContexts.add(payload.page.executionContextId);
+        if (name === 'frameContextDestroyed') this.createdFrameContexts.delete(payload.executionContextId);
+        if (name === 'frameDetached') {
+          this.attachedFrames.delete(id); this.committedFrames.delete(id);
+          this.frameEventQueue = this.frameEventQueue.filter(event => (event.payload.frameId ?? event.payload.frame?.id) !== id);
+        }
+        this.emit(name, payload);
+      }
+    } finally { this.flushingFrameEvents = false; }
+  }
+
+  requestStarted(url, type = 'Document', method = 'GET', headers = {}, redirectResponse, frameId = this.frameId, loaderId = this.loaderId) {
+    const id = type === 'Document' ? loaderId : randomUUID();
     this.activeRequests.add(id);
     this.lastActivity = Date.now();
-    this.emit('request', { id, url, type, method, headers, timestamp: now(), redirectResponse });
+    this.emit('request', { id, url, type, method, headers, timestamp: now(), redirectResponse, frameId, loaderId });
     return id;
   }
 
@@ -256,10 +297,10 @@ export class Page extends EventEmitter {
     } else await this.navigate(entry.url, { historyMode: 'traverse', historyIndex: index });
     return true;
   }
-  requestFinished(id, url, status, size = 0, headers = {}, type = 'Other') {
+  requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId) {
     this.activeRequests.delete(id);
     this.lastActivity = Date.now();
-    this.emit('response', { id, url, status, size, headers, type, timestamp: now() });
+    this.emit('response', { id, url, status, size, headers, type, timestamp: now(), frameId, loaderId });
   }
   requestFailed(id, error) {
     this.activeRequests.delete(id);
@@ -310,7 +351,7 @@ export class Page extends EventEmitter {
     this.extraHTTPHeaders.forEach((value, key) => headers.set(key, value));
     headers.set('user-agent', this.userAgent);
     if (!headers.has('accept-language')) headers.set('accept-language', this.acceptLanguage);
-    if (type === 'Fetch' && !headers.has('referer')) {
+    if (type === 'Fetch' && !init.skipDefaultReferrer && !headers.has('referer')) {
       const referrer = this.referrerFor(url);
       if (referrer) headers.set('referer', referrer);
     }
@@ -327,14 +368,19 @@ export class Page extends EventEmitter {
         const cookies = await this.context.cookies.getCookieString(url);
         if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
       } else headers.delete('cookie');
-      const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse);
+      const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId);
       try {
         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
           await this.context.cookies.setCookie(cookie, url, { ignoreError: true });
         }
         const location = response.headers.get('location');
-        if (location && [301, 302, 303, 307, 308].includes(response.status)) {
+        const redirectStatus = [301, 302, 303, 307, 308].includes(response.status);
+        const isRedirect = location && redirectStatus;
+        if (redirectStatus && init.redirect === 'error') {
+          await response.body?.cancel(); throw new TypeError('Redirects are not allowed for this request');
+        }
+        if (isRedirect && init.redirect !== 'manual') {
           if (redirects === 20) throw new Error('Too many redirects');
           const next = new URL(location, url);
           if (!['http:', 'https:'].includes(next.protocol)) throw new Error('Unsupported redirect protocol');
@@ -345,7 +391,7 @@ export class Page extends EventEmitter {
           if (next.origin !== new URL(url).origin) {
             headers.delete('authorization'); headers.delete('cookie');
           }
-          if (headers.has('referer')) {
+          if (!init.skipDefaultReferrer && headers.has('referer')) {
             const referrer = this.referrerFor(next.href, headers.get('referer'));
             if (referrer) headers.set('referer', referrer); else headers.delete('referer');
           }
@@ -380,7 +426,7 @@ export class Page extends EventEmitter {
         this.responseBodies ??= new Map();
         if (this.responseBodies.size >= 100) this.responseBodies.delete(this.responseBodies.keys().next().value);
         this.responseBodies.set(id, bytes.toString('utf8'));
-        this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type);
+        this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
         return buffered;
       } catch (error) { this.requestFailed(id, error); throw error; }
     }
@@ -405,9 +451,10 @@ export class Page extends EventEmitter {
     try {
       let html;
       let response;
+      let mimeType = 'text/html';
       if (target.split('#')[0] === 'about:blank') html = '<!doctype html><html><head></head><body></body></html>';
       else {
-        const referrerSource = referrer === undefined ? this.url : referrer;
+        const referrerSource = referrer ?? '';
         const referer = this.referrerFor(target, referrerSource);
         if (referer) requestHeaders.set('referer', referer);
         response = await this.fetch(target, { signal: this.navigationAbort.signal, method: requestMethod, body: requestBody, headers: requestHeaders }, 'Document');
@@ -423,6 +470,7 @@ export class Page extends EventEmitter {
         }
         const source = Buffer.concat(chunks).toString('utf8');
         const mime = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
+        mimeType = mime ?? 'text/html';
         // Plain-text and API responses must not become executable HTML documents.
         const textDocument = mime && !['text/html', 'application/xhtml+xml'].includes(mime);
         const escaped = textDocument ? source.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') : source;
@@ -438,6 +486,7 @@ export class Page extends EventEmitter {
       this.dom.window.close();
       this.responseHeaders = response ? [...response.headers].map(([name, value]) => ({ name, value })) : [];
       this.url = response?.finalUrl ?? target;
+      this.mimeType = mimeType;
       this.status = response?.status ?? 200;
       this.executionContextId = this.browser.nextExecutionContext++;
       this.emit('contextsCleared');
@@ -465,11 +514,17 @@ export class Page extends EventEmitter {
         if (!navigationWindow || pending.window === navigationWindow) { redirect = pending; resolveRedirect(); }
       };
       this.on('navigationRequested', captureRedirect);
-      this.dom = this.createDOM(html, state);
+      this.frameEventQueue = [];
+      this.attachedFrames = new Set([this.frameId]); this.committedFrames = new Set([this.frameId]); this.createdFrameContexts.clear();
+      this.creatingDOM = true;
+      try {
+        this.dom = this.createDOM(html, state);
+        this.emit('navigated');
+        this.emit('contextCreated');
+      } finally { this.creatingDOM = false; }
       navigationWindow = this.dom.window;
       const moduleReady = this.moduleReady;
-      this.emit('navigated');
-      this.emit('contextCreated');
+      this.flushFrameEvents();
       onCommit?.();
       const documentReady = new Promise(resolve => {
         if (this.dom.window.document.readyState !== 'loading') resolve();
@@ -510,38 +565,14 @@ export class Page extends EventEmitter {
       return this.evaluate(`(${declaration}\n).apply(globalThis[${JSON.stringify(key)}].thisArg, globalThis[${JSON.stringify(key)}].args)`);
     } finally { delete this.dom.window[key]; }
   }
-  dump(format = 'html') {
-    const document = this.dom.window.document;
-    if (format === 'html') return this.dom.serialize();
-    if (format === 'links') return JSON.stringify([...document.querySelectorAll('a[href]')].map(a => ({ text: a.textContent.trim(), href: a.href })), null, 2);
-    if (format === 'structured_data') {
-      return JSON.stringify({
-        url: this.url, title: document.title,
-        meta: [...document.querySelectorAll('meta[name],meta[property]')].map(m => ({ name: m.name || m.getAttribute('property'), content: m.content })),
-        jsonLd: [...document.querySelectorAll('script[type="application/ld+json"]')].map(s => { try { return JSON.parse(s.textContent); } catch { return { invalidJson: s.textContent }; } }),
-      }, null, 2);
-    }
-    const body = document.body.cloneNode(true);
-    body.querySelectorAll('script,style,noscript,template').forEach(node => node.remove());
-    if (format === 'text') return body.textContent.trim();
-    if (format !== 'markdown') throw new Error(`Unknown dump format: ${format}`);
-    const render = node => {
-      if (node.nodeType === 3) return node.textContent.replace(/\s+/g, ' ');
-      if (node.nodeType !== 1) return '';
-      const tag = node.localName;
-      const content = [...node.childNodes].map(render).join('');
-      if (/^h[1-6]$/.test(tag)) return `\n\n${'#'.repeat(Number(tag[1]))} ${content.trim()}\n\n`;
-      if (tag === 'a') return `[${content.trim()}](${new URL(node.getAttribute('href') || '', this.url).href})`;
-      if (tag === 'img') return node.alt ? `![${node.alt}](${node.src})` : '';
-      if (tag === 'br') return '\n';
-      if (tag === 'li') return `\n- ${content.trim()}`;
-      if (tag === 'pre') return `\n\n\`\`\`\n${node.textContent.trim()}\n\`\`\`\n\n`;
-      if (tag === 'code' && node.parentElement?.localName !== 'pre') return `\`${content}\``;
-      if (tag === 'strong' || tag === 'b') return `**${content}**`;
-      if (tag === 'em' || tag === 'i') return `*${content}*`;
-      return ['p', 'div', 'section', 'article', 'main', 'ul', 'ol', 'blockquote'].includes(tag) ? `\n\n${content}\n\n` : content;
-    };
-    return render(body).replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  dump(format = 'html', options = {}) {
+    this.dumpNodeIds ??= new WeakMap();
+    this.nextDumpNodeId ??= 1;
+    const nodeIdFor = options.nodeIdFor ?? (node => {
+      if (!this.dumpNodeIds.has(node)) this.dumpNodeIds.set(node, this.nextDumpNodeId++);
+      return this.dumpNodeIds.get(node);
+    });
+    return dumpDocument(this.dom.window.document, { ...options, nodeIdFor, format });
   }
   close() {
     if (this.closed) return;

@@ -99,12 +99,12 @@ test('selector deadline rejects and closing releases pages and timers', async ()
 });
 
 test('CLI JSON exposes the DOM dump and HTTP status; HTTP errors exit 22', async () => {
-  const { stdout } = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', '--wait-until', 'done', fixture.url]);
+  const { stdout } = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', '--wait-until', 'done', fixture.url]);
   const data = JSON.parse(stdout);
   assert.equal(data.http_status, 200);
   assert.equal(data.error, null);
   assert.match(data.content, /async data/);
-  await assert.rejects(exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', '--fail-on-http-error', `${fixture.url}missing`]), error => {
+  await assert.rejects(exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', '--fail-on-http-error', `${fixture.url}missing`]), error => {
     assert.equal(error.code, 22);
     assert.equal(JSON.parse(error.stdout).http_status, 404);
     assert.match(JSON.parse(error.stdout).content, /Not found/);
@@ -119,7 +119,7 @@ test('CLI rejects invalid formats, deadlines and commands', async () => {
 });
 
 test('batch CLI keeps order, includes failed pages and prioritizes failure exit 1 over 22', async () => {
-  await assert.rejects(exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', '--fail-on-http-error',
+  await assert.rejects(exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', '--fail-on-http-error',
     `${fixture.url}missing`, 'http://127.0.0.1:1/unreachable', `${fixture.url}next`]), error => {
     assert.equal(error.code, 1);
     const data = JSON.parse(error.stdout);
@@ -133,7 +133,7 @@ test('batch CLI keeps order, includes failed pages and prioritizes failure exit 
 });
 
 test('single URL failures remain structured JSON and preserve the requested URL', async () => {
-  await assert.rejects(exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', 'http://127.0.0.1:1/unreachable']), error => {
+  await assert.rejects(exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', 'http://127.0.0.1:1/unreachable']), error => {
     const result = JSON.parse(error.stdout);
     assert.equal(error.code, 1);
     assert.equal(result.url, 'http://127.0.0.1:1/unreachable');
@@ -149,7 +149,7 @@ test('CLI mixes inline and file preloads in command-line order before page code'
     const path = join(directory, 'middle.js');
     await writeFile(path, 'globalThis.boot += "B";');
     const page = 'data:text/html,<h1></h1><script>document.querySelector("h1").textContent=globalThis.boot</script>';
-    const { stdout } = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json',
+    const { stdout } = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json',
       '--inject-script', 'globalThis.boot="A"', '--inject-script-file', path, '--inject-script', 'globalThis.boot+="C"', page]);
     assert.match(JSON.parse(stdout).content, /<h1>ABC<\/h1>/);
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -159,15 +159,15 @@ test('batch pages isolate newly set cookies; a saved jar can seed a later CLI ru
   const directory = await mkdtemp(join(tmpdir(), 'red-panda-cli-cookies-'));
   const jar = join(directory, 'cookies.json');
   try {
-    const { stdout } = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', '--cookie-jar', jar,
+    const { stdout } = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', '--cookie-jar', jar,
       fixture.url, `${fixture.url}echo-cookie`]);
     assert.doesNotMatch(JSON.parse(stdout).results[1].content, /server=present/);
     assert.ok(JSON.parse(await readFile(jar, 'utf8')).some(cookie => cookie.name === 'server' && cookie.httpOnly));
-    const loaded = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', '--cookie', jar, `${fixture.url}echo-cookie`]);
+    const loaded = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', '--cookie', jar, `${fixture.url}echo-cookie`]);
     assert.match(JSON.parse(loaded.stdout).content, /server=present/);
     const netscape = join(directory, 'legacy.txt');
     await writeFile(netscape, '#HttpOnly_127.0.0.1\tFALSE\t/\tFALSE\t0\tlegacy\tdummy\n');
-    const legacy = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--json', '--cookie', netscape, `${fixture.url}echo-cookie`]);
+    const legacy = await exec(process.execPath, ['bin/red-panda.js', 'fetch', '--dump', 'html', '--json', '--cookie', netscape, `${fixture.url}echo-cookie`]);
     assert.match(JSON.parse(legacy.stdout).content, /legacy=dummy/);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -190,11 +190,13 @@ test('plain-text and JSON responses display text rather than executing or parsin
   try {
     const page = browser.createPage();
     await page.navigate(`${fixture.url}plain-text`);
+    assert.equal(page.evaluate('document.contentType'), 'text/plain');
     assert.equal(page.evaluate('typeof globalThis.shouldNotRun'), 'undefined');
     assert.equal(page.dom.window.document.querySelector('b'), null);
     assert.equal(page.evaluate('document.body.textContent'), '\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
     assert.equal(page.responseBodies.get(page.loaderId), '\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
     await page.navigate(`${fixture.url}api`);
+    assert.equal(page.evaluate('document.contentType'), 'application/json');
     assert.equal(page.evaluate('document.querySelector("pre").textContent'), '{"message":"async data"}');
   } finally { browser.close(); }
 });

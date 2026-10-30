@@ -87,11 +87,12 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 
 | Surface | Supported |
 | --- | --- |
-| Fetch | HTTP(S), data URLs, redirects, response status/headers, per-context cookies, plain-text/API documents, a 16 MiB response limit |
+| Fetch | HTTP(S)/data, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Classic scripts, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Forms / workers | Validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with messaging, imports, timers and fetch |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
-| Dumps | Serialized HTML, text, basic Markdown with absolute links, link inventory, selected structured metadata |
+| Dumps | HTML, Markdown, semantic JSON/text, structured metadata, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
+| Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
 | CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads |
@@ -100,7 +101,7 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Extension | `LP.dump` returns `{format, content}` |
 | WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
 | MCP / saved scripts | Stdio and HTTP MCP sessions, extraction/actions/waits/cookies/downloads; saved scripts with top-level await/return and synchronous browser actions |
-| PureScript / Puppeteer | Resource lifetime, `goto`, history, response status/body, preloads, headers, evaluation, waits, keyboard/text input, coordinate clicks, cookies and `content` |
+| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, responses, preloads, headers, waits, keyboard/text input, coordinate clicks, cookies and `content` |
 
 Unsupported commands return a CDP error with code `-32601`. HTTP discovery
 provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
@@ -109,9 +110,11 @@ connect with `defaultViewport: null` (already configured by the PureScript FFI).
 Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), including
 simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
-semantics remain incomplete. Screenshots, PDF, canvas, service workers, full
-iframe support, browser-grade CORS and process isolation remain absent.
-Utility-world IDs share the page's JS realm. Some configuration commands still
+semantics remain incomplete. Screenshots, PDF, canvas, service/shared workers,
+complete frame behavior and process isolation remain absent. Frame POST
+navigation, shadow stylesheet adoption, flattened shadow/frame input and full
+CSS behavior remain unfinished. Utility-world IDs share their owning frame's
+JS realm. Some configuration commands still
 only acknowledge requests. Markdown and structured metadata are subsets, not byte-identical
 Lightpanda output. `done` does not track every future timer. Documents are decoded
 as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly.
@@ -137,12 +140,15 @@ Request configuration covers navigation, classic external resources, and
 passing an empty header list clears them. Configuration is per page and survives
 navigation. Automatic referrers use the full URL for the same origin, only the
 origin across origins, and are omitted on HTTPS-to-HTTP downgrades. Cross-origin
-redirects remove authorization. Custom referrer policies and applying these
-header overrides reach asynchronous XMLHttpRequest too, including cookies,
+redirects remove authorization. Custom referrer policies remain unfinished.
+Header overrides reach asynchronous XMLHttpRequest too, including cookies,
 redirects and CDP events. XHR enforces basic CORS/preflight rules and rejects
 synchronous use, redirects needing another preflight and opaque-origin redirect
-taint. Progress is buffered; there is no preflight cache. Page `fetch` CORS
-coverage remains unfinished.
+taint. Page `fetch` also enforces CORS and filters response headers; opaque
+responses hide status, headers and bodies. Progress is buffered; there is no
+preflight/cache implementation. Streaming uploads and blob URL resolution are
+unsupported, and invalid compression can fail before response headers become
+available. These bounds apply to the implemented subset, not full network parity.
 
 Dedicated workers use actual isolated threads and are terminated when their
 document is disposed. SharedWorker, nested workers, blob worker URLs and
@@ -151,8 +157,16 @@ the light DOM; it does not traverse frame or shadow trees. CLI fetch/serve enabl
 no optional resources by default; MCP defaults to stylesheet loading. Repeated
 `--load-resources stylesheet|iframe|worker` enables the implemented subsets;
 `none` clears them. Direct Browser embedding retains its unrestricted resource
-default unless `loadResources` is supplied. Frame protocol integration remains
-unfinished, even when jsdom loads frame resources.
+default unless `loadResources` is supplied. Frame realms are real, and CDP
+routes evaluation, navigation, handles and selected Runtime methods to them;
+cross-origin Window access restrictions and full frame history/input remain
+unfinished.
+
+CLI `fetch` now matches native defaults: no dump and a 5,000 ms page deadline.
+Use `--dump html` or another format explicitly. `--dump-selector`,
+`--dump-max-bytes`, repeated `--strip-mode` and `--with-base` affect dumps while
+leaving the live DOM intact. The [dump contract](docs/reference/dump-contract.md)
+records 47 exact native fixture outputs and remaining formatting limits.
 
 ## PureScript automation
 
@@ -171,7 +185,7 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 44 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 47 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.

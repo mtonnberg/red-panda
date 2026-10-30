@@ -23,16 +23,23 @@ function boolean(value, name, optional = true) {
   if (value === undefined && optional) return;
   if (typeof value !== 'boolean') throw new RuntimeError(`${name} must be boolean`);
 }
-function context(session, id) {
-  if (id === undefined) return;
-  if (!Number.isInteger(id) || (id !== session.page.executionContextId && ![...(session.worlds?.values() ?? [])].includes(id))) {
+function executionPage(session, id) {
+  if (id !== undefined && !Number.isInteger(id)) throw new RuntimeError('Cannot find context with specified id');
+  if (typeof session.executionPage === 'function') {
+    const page = session.executionPage(id);
+    if (!page || page.closed) throw new RuntimeError('Cannot find context with specified id');
+    return page;
+  }
+  if (id !== undefined && id !== session.page.executionContextId && ![...(session.worlds?.values() ?? [])].includes(id)) {
     throw new RuntimeError('Cannot find context with specified id');
   }
+  if (session.page.closed) throw new RuntimeError('Execution context was destroyed', -32000);
+  return session.page;
 }
-function details(session, error) {
+function details(session, error, contextId) {
   // Existing Session.exception accepts Error-like objects, not null/undefined.
   const printable = error !== null && (typeof error === 'object' || typeof error === 'function') ? error : new Error(String(error));
-  return session.exception(printable);
+  return { ...session.exception(printable, contextId), executionContextId: contextId };
 }
 
 class RealmInspector {
@@ -83,13 +90,13 @@ class RealmInspector {
   }
 }
 
-function releaseStack(session, state) {
+function releaseStack(state) {
   const constructor = state.errorConstructor;
   if (!constructor) return;
   const config = stackConfigurations.get(constructor);
   if (!config) return;
-  config.sessions.delete(session);
-  if (config.sessions.size) constructor.stackTraceLimit = [...config.sessions.values()].at(-1);
+  config.overrides.delete(state);
+  if (config.overrides.size) constructor.stackTraceLimit = [...config.overrides.values()].at(-1);
   else {
     if (config.original) Object.defineProperty(constructor, 'stackTraceLimit', config.original);
     else delete constructor.stackTraceLimit;
@@ -97,18 +104,47 @@ function releaseStack(session, state) {
   }
 }
 
-function stateFor(session) {
-  if (session.page.closed) throw new RuntimeError('Execution context was destroyed', -32000);
-  let state = states.get(session);
-  if (state && state.contextId !== session.page.executionContextId) { resetRuntime(session); state = undefined; }
+function current(state) {
+  return !state.closed && !state.page.closed && !state.page.documentAbort?.signal.aborted &&
+    state.page.executionContextId === state.pageContextId && state.page.dom.window === state.window && !!state.window.document;
+}
+function closeState(state) {
+  if (state.closed) return;
+  state.closed = true; state.abort.abort(new RuntimeError('Execution context was destroyed', -32000));
+  state.scripts.clear(); state.inspector?.close(); releaseStack(state);
+}
+function prune(session) {
+  const realms = states.get(session);
+  if (!realms) return;
+  for (const [id, state] of realms) if (!current(state)) { closeState(state); realms.delete(id); }
+  if (!realms.size) states.delete(session);
+}
+function stateFor(session, page, contextId = page.executionContextId) {
+  let realms = states.get(session);
+  if (!realms) { realms = new Map(); states.set(session, realms); }
+  let state = realms.get(contextId);
+  if (state && state.page !== page) { closeState(state); realms.delete(contextId); state = undefined; }
   if (!state) {
-    state = { contextId: session.page.executionContextId, scripts: new Map(), inspector: null, closed: false };
-    states.set(session, state);
+    state = { contextId, page, pageContextId: page.executionContextId, window: page.dom.window,
+      scripts: new Map(), inspector: null, closed: false, abort: new AbortController() };
+    realms.set(contextId, state);
   }
   return state;
 }
+async function awaitInState(state, value) {
+  if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+  let abort;
+  const destroyed = new Promise((resolve, reject) => {
+    abort = () => reject(state.abort.signal.reason);
+    state.abort.signal.addEventListener('abort', abort, { once: true });
+  });
+  try { return await withTimeout(Promise.race([Promise.resolve(value), destroyed]), state.page.timeout, 'Promise await timed out'); }
+  finally { state.abort.signal.removeEventListener('abort', abort); }
+}
 
-/** Route supported Runtime commands here; reset on Session context clear/close.
+/** Route supported Runtime commands here; resetRuntime(session, contextId?)
+ * releases one context or the entire Session. Session.executionPage(id) selects
+ * an actual page/frame facade; old unit fixtures may omit it for root fallback.
  * Inspector operations are scoped to the selected jsdom VM by a random marker.
  * Heap usage/isolate IDs describe the shared Node V8 isolate, not a separate page
  * process. Heap object enumeration is deliberately unsupported: Node/V8
@@ -119,20 +155,41 @@ export function supportsRuntime(method) { return methods.has(method); }
 export async function runRuntime(session, method, params = {}) {
   if (!supportsRuntime(method)) throw new RuntimeError(`Unsupported Runtime method: ${method}`, -32601);
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new RuntimeError('Parameters must be an object');
-  const state = stateFor(session), page = session.page;
+  prune(session);
+  if (params.executionContextId !== undefined && params.contextId !== undefined && params.executionContextId !== params.contextId) {
+    throw new RuntimeError('Conflicting execution context ids');
+  }
+  let contextId = params.executionContextId ?? params.contextId;
+  let scriptState;
+  if (method === 'Runtime.runScript' && typeof params.scriptId === 'string') {
+    scriptState = [...(states.get(session)?.values() ?? [])].find(state => state.scripts.has(params.scriptId));
+    if (scriptState && contextId === undefined) contextId = scriptState.contextId;
+    if (scriptState && contextId !== scriptState.contextId) throw new RuntimeError('Script belongs to a different execution context', -32000);
+  }
+  const objectId = method === 'Runtime.awaitPromise' ? params.promiseObjectId : method === 'Runtime.getExceptionDetails' ? params.errorObjectId : undefined;
+  if (objectId !== undefined) {
+    const objectContext = session.objects?.get(objectId)?.contextId;
+    if (objectContext !== undefined) {
+      if (contextId !== undefined && contextId !== objectContext) throw new RuntimeError('Object belongs to a different execution context');
+      contextId = objectContext;
+    }
+  }
+  const page = executionPage(session, contextId);
+  contextId ??= page.executionContextId;
+  const state = stateFor(session, page, contextId);
   const inspector = () => state.inspector ??= new RealmInspector(page);
   switch (method) {
     case 'Runtime.compileScript': {
-      context(session, params.executionContextId); string(params.expression, 'expression'); string(params.sourceURL, 'sourceURL');
+      string(params.expression, 'expression'); string(params.sourceURL, 'sourceURL');
       boolean(params.persistScript, 'persistScript', false);
       try {
         const script = new vm.Script(params.expression, { filename: params.sourceURL || '<anonymous>' });
         if (!params.persistScript) return {};
         const scriptId = randomUUID(); state.scripts.set(scriptId, script); return { scriptId };
-      } catch (error) { return { exceptionDetails: details(session, error) }; }
+      } catch (error) { return { exceptionDetails: details(session, error, contextId) }; }
     }
     case 'Runtime.runScript': {
-      context(session, params.executionContextId); string(params.scriptId, 'scriptId');
+      string(params.scriptId, 'scriptId');
       boolean(params.awaitPromise, 'awaitPromise'); boolean(params.returnByValue, 'returnByValue');
       if (params.objectGroup !== undefined) string(params.objectGroup, 'objectGroup');
       if (params.includeCommandLineAPI) throw new RuntimeError('Command-line API injection is not implemented', -32601);
@@ -143,12 +200,13 @@ export async function runRuntime(session, method, params = {}) {
         let value;
         try { value = script.runInContext(page.dom.getInternalVMContext(), { timeout: Math.min(page.timeout, 2000) }); }
         finally { page.reconcileURL?.(); }
-        if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), page.timeout, 'Promise await timed out');
-        if (state.closed || page.executionContextId !== state.contextId || page.closed) throw new RuntimeError('Execution context was destroyed', -32000);
-        return { result: session.remote(value, params.returnByValue, params.objectGroup) };
+        if (params.awaitPromise) value = await awaitInState(state, value);
+        if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+        return { result: session.remote(value, params.returnByValue, params.objectGroup, contextId) };
       } catch (error) {
         if (error instanceof RuntimeError) throw error;
-        return { result: { type: 'undefined' }, exceptionDetails: details(session, error) };
+        if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+        return { result: { type: 'undefined' }, exceptionDetails: details(session, error, contextId) };
       }
     }
     case 'Runtime.awaitPromise': {
@@ -157,34 +215,45 @@ export async function runRuntime(session, method, params = {}) {
       if (!types.isPromise(promise)) throw new RuntimeError('Object is not a Promise');
       const group = session.objects?.get(params.promiseObjectId)?.group;
       try {
-        const value = await withTimeout(promise, page.timeout, 'Promise await timed out');
-        if (state.closed || page.executionContextId !== state.contextId || page.closed) throw new RuntimeError('Execution context was destroyed', -32000);
-        return { result: session.remote(value, params.returnByValue, group) };
+        const value = await awaitInState(state, promise);
+        if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+        return { result: session.remote(value, params.returnByValue, group, contextId) };
       } catch (error) {
         if (error instanceof RuntimeError) throw error;
-        return { result: session.remote(error, params.returnByValue, group), exceptionDetails: details(session, error) };
+        if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+        return { result: session.remote(error, params.returnByValue, group, contextId), exceptionDetails: details(session, error, contextId) };
       }
     }
-    case 'Runtime.globalLexicalScopeNames': context(session, params.executionContextId); return inspector().lexicalNames();
+    case 'Runtime.globalLexicalScopeNames': return inspector().lexicalNames();
     case 'Runtime.getHeapUsage': return inspector().post('Runtime.getHeapUsage');
     case 'Runtime.getIsolateId': return inspector().post('Runtime.getIsolateId');
     case 'Runtime.getExceptionDetails': {
       string(params.errorObjectId, 'errorObjectId'); const error = session.object(params.errorObjectId);
-      return types.isNativeError(error) ? { exceptionDetails: details(session, error) } : {};
+      return types.isNativeError(error) ? { exceptionDetails: details(session, error, contextId) } : {};
     }
     case 'Runtime.setMaxCallStackSizeToCapture': {
       if (!Number.isSafeInteger(params.size) || params.size < 0) throw new RuntimeError('size must be a non-negative integer');
       const constructor = page.evaluate('Error');
       let config = stackConfigurations.get(constructor);
-      if (!config) { config = { original: Object.getOwnPropertyDescriptor(constructor, 'stackTraceLimit'), sessions: new Map() }; stackConfigurations.set(constructor, config); }
-      config.sessions.delete(session); config.sessions.set(session, params.size);
+      if (!config) { config = { original: Object.getOwnPropertyDescriptor(constructor, 'stackTraceLimit'), overrides: new Map() }; stackConfigurations.set(constructor, config); }
+      config.overrides.delete(state); config.overrides.set(state, params.size);
       state.errorConstructor = constructor; constructor.stackTraceLimit = params.size; return {};
     }
   }
 }
 
-export function resetRuntime(session) {
-  const state = states.get(session);
-  if (!state) return;
-  state.closed = true; state.scripts.clear(); state.inspector?.close(); releaseStack(session, state); states.delete(session);
+export function resetRuntime(session, contextId) {
+  const realms = states.get(session);
+  if (!realms) return;
+  if (contextId === undefined) {
+    for (const state of realms.values()) closeState(state);
+    realms.clear(); states.delete(session);
+  } else {
+    for (const [id, state] of realms) {
+      // A compatibility world alias can share the actual VM context. Destroying
+      // that VM also destroys every alias's pending work and stack overrides.
+      if (id === contextId || state.pageContextId === contextId) { closeState(state); realms.delete(id); }
+    }
+    if (!realms.size) states.delete(session);
+  }
 }

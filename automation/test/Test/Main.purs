@@ -169,5 +169,16 @@ main = launchAff_ $
         void $ Browser.goto page $ url <> "click-navigation"
         clickedDestination <- Browser.withNavigation page $ Browser.click page "#next"
         assert "PureScript owns coordinate click and full-document navigation together" $ clickedDestination == url <> "next"
+        void $ Browser.goto page $ url <> "frames"
+        frame <- Browser.childFrame page 0
+        frameTitle <- Browser.evaluateFrameString frame "document.title"
+        assert "Puppeteer child frame evaluation uses its actual document" $ frameTitle == "Child frame"
+        frameOnly <- Browser.evaluateFrameString frame "frameOnly"
+        parentOnly <- Browser.evaluateString page "typeof frameOnly"
+        assert "child globals remain isolated from the parent" $ frameOnly == "child realm" && parentOnly == "undefined"
+        frameStatus <- Browser.gotoFrame frame $ url <> "frame-next"
+        navigatedFrameTitle <- Browser.evaluateFrameString frame "document.title"
+        parentTitle <- Browser.evaluateString page "document.title"
+        assert "frame navigation preserves the parent document" $ frameStatus == 200 && navigatedFrameTitle == "Next frame" && parentTitle == "Parent frames"
         Browser.closePage page
-        log "PureScript Puppeteer integration: 44 checks passed"
+        log "PureScript Puppeteer integration: 47 checks passed"

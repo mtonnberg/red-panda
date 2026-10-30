@@ -202,7 +202,9 @@ export function installXHR(page, window) {
       if (s.authorization && !headers.has('authorization')) headers.set('authorization', s.authorization);
       const body = ['GET', 'HEAD'].includes(s.method) ? undefined : await requestBody(inputBody, headers);
       if (!same(s, op) || op.done) return;
-      const origin = window.location.origin;
+      // about:blank/srcdoc children inherit their document origin; the URL's
+      // origin remains "null". Window.origin itself is replaceable by script.
+      const origin = implForWrapper(window.document)?._origin ?? window.location.origin;
       const credentials = s.withCredentials;
       const isCross = url => ['http:', 'https:'].includes(new URL(url).protocol) && new URL(url).origin !== origin;
       const unsafe = unsafeHeaders(headers);

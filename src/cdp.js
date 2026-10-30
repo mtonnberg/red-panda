@@ -20,7 +20,7 @@ export function targetInfo(page) {
 }
 function frameInfo(page) {
   return { id: page.frameId, loaderId: page.loaderId, url: page.url,
-    securityOrigin: new URL(page.url).origin, mimeType: 'text/html',
+    securityOrigin: page.securityOrigin ?? new URL(page.url).origin, mimeType: page.mimeType ?? page.dom.window.document.contentType,
     domainAndRegistry: '', secureContextType: 'InsecureScheme',
     crossOriginIsolatedContextType: 'NotIsolated', gatedAPIFeatures: [] };
 }
@@ -33,6 +33,8 @@ class Session {
     this.domains = new Set();
     this.objects = new Map();
     this.worlds = new Map();
+    this.frameWorlds = new Map();
+    this.nodeContexts = new Map();
     this.worldNames = new Set();
     this.scripts = new Map();
     this.bindings = new Set();
@@ -47,7 +49,7 @@ class Session {
     listen('contextsCleared', () => {
       resetDOM(this);
       resetRuntime(this);
-      this.objects.clear(); this.worlds.clear(); this.nodes?.clear();
+      this.objects.clear(); this.worlds.clear(); this.frameWorlds.clear(); this.nodes?.clear(); this.nodeContexts.clear();
       this.event('Runtime.executionContextsCleared', {});
     });
     listen('navigated', () => {
@@ -67,6 +69,50 @@ class Session {
         this.worlds.set(name, id); this.contextCreated(name, id);
       }
     });
+    listen('frameAttached', params => this.event('Page.frameAttached', params));
+    listen('frameDetached', params => this.event('Page.frameDetached', params));
+    listen('frameNavigationStarted', params => {
+      this.event('Page.frameStartedNavigating', { ...params, navigationType: 'differentDocument' });
+      this.event('Page.frameStartedLoading', { frameId: params.frameId });
+    });
+    listen('frameNavigated', ({ frame, page: child }) => {
+      this.event('Page.frameNavigated', { frame, type: 'Navigation' });
+      this.lifecycleEvent('init', child);
+    });
+    listen('frameWithinDocument', params => this.event('Page.navigatedWithinDocument', params));
+    listen('frameContextCreated', ({ page: child }) => {
+      this.contextCreated('', child.executionContextId, child);
+      for (const name of this.worldNames) this.isolatedWorld(child, name);
+    });
+    listen('frameContextDestroyed', params => {
+      const ids = new Set([params.executionContextId]);
+      for (const [key, world] of this.frameWorlds) if (world.page.frameId === params.frameId) {
+        ids.add(world.id); this.frameWorlds.delete(key);
+        this.event('Runtime.executionContextDestroyed', { executionContextId: world.id });
+      }
+      for (const [id, object] of this.objects) if (ids.has(object.contextId)) this.objects.delete(id);
+      for (const [id, context] of this.nodeContexts) if (ids.has(context)) { this.nodes?.delete(id); this.nodeContexts.delete(id); }
+      resetRuntime(this, params.executionContextId);
+      this.event('Runtime.executionContextDestroyed', { executionContextId: params.executionContextId,
+        executionContextUniqueId: params.executionContextUniqueId });
+    });
+    listen('frameDOMContentLoaded', params => {
+      const child = page.frames?.findFrame(params.frameId);
+      if (child) this.lifecycleEvent('DOMContentLoaded', child);
+    });
+    listen('frameLoad', async params => {
+      const child = page.frames?.findFrame(params.frameId);
+      if (!child) return;
+      await child.moduleReady;
+      if (child.closed) return;
+      this.lifecycleEvent('load', child); this.event('Page.frameStoppedLoading', { frameId: params.frameId });
+    });
+    listen('framePageError', ({ error, executionContextId }) => this.event('Runtime.exceptionThrown', {
+      timestamp: Date.now(), exceptionDetails: this.exception(error, executionContextId),
+    }));
+    listen('frameConsole', ({ type, args, executionContextId }) => this.event('Runtime.consoleAPICalled', {
+      type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
+    }));
     listen('domContentLoaded', () => {
       this.event('Page.domContentEventFired', { timestamp: timestamp() });
       this.lifecycleEvent('DOMContentLoaded');
@@ -85,19 +131,19 @@ class Session {
     });
     listen('request', request => {
       this.event('Network.requestWillBeSent', {
-        requestId: request.id, loaderId: page.loaderId, documentURL: page.url,
+        requestId: request.id, loaderId: request.loaderId ?? page.loaderId, documentURL: page.frames?.findFrame(request.frameId)?.url ?? page.url,
         request: { url: request.url, method: request.method, headers: request.headers,
           initialPriority: 'High', referrerPolicy: 'no-referrer-when-downgrade' },
         timestamp: request.timestamp, wallTime: Date.now() / 1000,
-        initiator: { type: 'other' }, type: request.type, frameId: page.frameId,
+        initiator: { type: 'other' }, type: request.type, frameId: request.frameId ?? page.frameId,
         hasUserGesture: false,
         ...(request.redirectResponse ? { redirectResponse: request.redirectResponse, redirectHasExtraInfo: false } : {}),
       });
     });
     listen('response', response => {
       this.event('Network.responseReceived', {
-        requestId: response.id, loaderId: page.loaderId, timestamp: response.timestamp,
-        type: response.type, hasExtraInfo: false, frameId: page.frameId,
+        requestId: response.id, loaderId: response.loaderId ?? page.loaderId, timestamp: response.timestamp,
+        type: response.type, hasExtraInfo: false, frameId: response.frameId ?? page.frameId,
         response: { url: response.url, status: response.status, statusText: http.STATUS_CODES[response.status] ?? '',
           headers: response.headers, mimeType: (response.headers['content-type'] ?? 'text/html').split(';')[0],
           connectionReused: false, connectionId: 0, encodedDataLength: response.size,
@@ -108,9 +154,9 @@ class Session {
     listen('requestFailed', request => this.event('Network.loadingFailed', {
       requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
     }));
-    listen('console', ({ type, args }) => this.event('Runtime.consoleAPICalled', {
-      type: type === 'log' ? 'log' : type, args: args.map(arg => this.remote(arg)),
-      executionContextId: page.executionContextId, timestamp: Date.now(),
+    listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
+      type: type === 'log' ? 'log' : type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+      executionContextId, timestamp: Date.now(),
     }));
     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
     listen('close', () => connection.detach(this.id));
@@ -118,8 +164,8 @@ class Session {
   event(method, params) {
     if (this.domains.has(method.split('.')[0])) this.connection.send({ method, params, ...(this.id ? { sessionId: this.id } : {}) });
   }
-  lifecycleEvent(name) {
-    if (this.lifecycle) this.event('Page.lifecycleEvent', { frameId: this.page.frameId, loaderId: this.page.loaderId, name, timestamp: timestamp() });
+  lifecycleEvent(name, page = this.page) {
+    if (this.lifecycle) this.event('Page.lifecycleEvent', { frameId: page.frameId, loaderId: page.loaderId, name, timestamp: timestamp() });
   }
   checkIdle() {
     if (this.page.closed) return;
@@ -127,19 +173,47 @@ class Session {
       this.lifecycleEvent('networkAlmostIdle'); this.lifecycleEvent('networkIdle');
     } else this.idleTimer = setTimeout(() => this.checkIdle(), 100);
   }
-  contextCreated(name = '', id = this.page.executionContextId) {
-    for (const binding of this.bindings) this.installBinding(binding);
+  contextCreated(name = '', id = this.page.executionContextId, page = this.page) {
+    for (const binding of this.bindings) this.installBinding(binding, page);
     this.event('Runtime.executionContextCreated', { context: {
-      id, origin: new URL(this.page.url).origin, name, uniqueId: randomUUID(),
-      auxData: { isDefault: !name, type: name ? 'isolated' : 'default', frameId: this.page.frameId },
+      id, origin: page.securityOrigin ?? new URL(page.url).origin, name, uniqueId: randomUUID(),
+      auxData: { isDefault: !name, type: name ? 'isolated' : 'default', frameId: page.frameId },
     } });
   }
-  installBinding(name) {
-    this.page.dom.window[name] = payload => this.event('Runtime.bindingCalled', {
-      name, payload: String(payload), executionContextId: this.page.executionContextId,
+  isolatedWorld(page, name) {
+    if (page === this.page) {
+      let id = this.worlds.get(name);
+      if (!id) { id = page.browser.nextExecutionContext++; this.worlds.set(name, id); this.contextCreated(name, id, page); }
+      return id;
+    }
+    const key = `${page.frameId}\0${name}`;
+    let world = this.frameWorlds.get(key);
+    if (!world) {
+      world = { id: page.browser.nextExecutionContext++, page, name }; this.frameWorlds.set(key, world);
+      this.contextCreated(name, world.id, page);
+    }
+    return world.id;
+  }
+  executionPage(id) {
+    if (id === undefined || id === this.page.executionContextId || [...this.worlds.values()].includes(id)) return this.page;
+    const found = this.page.frames?.findContext(id)?.page;
+    if (found) return found;
+    for (const world of this.frameWorlds.values()) if (world.id === id && !world.page.closed) return world.page;
+    throw new ProtocolError('Cannot find context with specified id');
+  }
+  valueContext(value) {
+    const document = value?.nodeType === 9 ? value : value?.ownerDocument;
+    for (const page of this.page.frames?.frames.values() ?? []) {
+      if (document === page.dom.window.document || value === page.dom.window) return page.executionContextId;
+    }
+    return this.page.executionContextId;
+  }
+  installBinding(name, page = this.page) {
+    page.dom.window[name] = payload => this.event('Runtime.bindingCalled', {
+      name, payload: String(payload), executionContextId: page.executionContextId,
     });
   }
-  remote(value, byValue = false, group) {
+  remote(value, byValue = false, group, contextId = this.valueContext(value)) {
     if (value === undefined) return { type: 'undefined' };
     if (value === null) return { type: 'object', subtype: 'null', value: null };
     const type = typeof value;
@@ -149,14 +223,15 @@ class Session {
     if (type === 'symbol') return { type, description: String(value) };
     if (byValue) return { type, value: JSON.parse(JSON.stringify(value)) };
     const objectId = randomUUID();
-    this.objects.set(objectId, { value, group });
-    const subtype = value.nodeType ? 'node' : Array.isArray(value) ? 'array' : value instanceof this.page.dom.window.Promise ? 'promise' : undefined;
+    const page = this.executionPage(contextId);
+    this.objects.set(objectId, { value, group, contextId });
+    const subtype = value.nodeType ? 'node' : Array.isArray(value) ? 'array' : value instanceof page.dom.window.Promise ? 'promise' : undefined;
     return { type, ...(subtype ? { subtype } : {}), className: value.constructor?.name ?? 'Object',
       description: value.nodeName ?? value.constructor?.name ?? type, objectId };
   }
   object(id) {
     if (!this.objects.has(id)) throw new ProtocolError('Cannot find object with given id');
-    return this.objects.get(id).value;
+    const entry = this.objects.get(id); this.executionPage(entry.contextId); return entry.value;
   }
   argument(arg) {
     if (arg.objectId) return this.object(arg.objectId);
@@ -171,8 +246,9 @@ class Session {
     }
     return arg.value;
   }
-  exception(error) {
+  exception(error, contextId = this.page.executionContextId) {
     return { exceptionId: 1, text: error.message ?? String(error), lineNumber: 0, columnNumber: 0,
+      executionContextId: contextId,
       exception: { type: 'object', subtype: 'error', className: error.name ?? 'Error', description: error.stack ?? String(error) } };
   }
   async run(method, params) {
@@ -182,12 +258,15 @@ class Session {
     if (supportsRuntime(method)) return runRuntime(this, method, params);
     if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
       this.domains.add(method.split('.')[0]);
-      if (method === 'Runtime.enable') this.contextCreated();
+      if (method === 'Runtime.enable') {
+        this.contextCreated();
+        for (const child of page.frames?.frames.values() ?? []) if (child !== page) this.contextCreated('', child.executionContextId, child);
+      }
       return {};
     }
     if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { this.domains.delete(method.split('.')[0]); return {}; }
     switch (method) {
-      case 'Page.getFrameTree': return { frameTree: { frame: frameInfo(page) } };
+      case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
       case 'Page.getLayoutMetrics': {
         const { width, height } = page.layout.viewport, { x, y } = page.layout.scroll;
         const layoutViewport = { pageX: x, pageY: y, clientWidth: width, clientHeight: height };
@@ -203,16 +282,22 @@ class Session {
       case 'Emulation.clearDeviceMetricsOverride': page.viewport = undefined; page.layout.setViewport({ width: 1920, height: 1080 }); return {};
       case 'Page.setLifecycleEventsEnabled': this.lifecycle = params.enabled; return {};
       case 'Page.navigate': {
-        const url = new URL(params.url, page.url).href;
+        const target = params.frameId && params.frameId !== page.frameId ? page.frames?.findFrame(params.frameId) : page;
+        if (!target) throw new ProtocolError('Unknown frame');
+        const url = new URL(params.url, target.url).href;
         if (!['http:', 'https:', 'data:', 'about:'].includes(new URL(url).protocol) || (url.startsWith('about:') && url !== 'about:blank')) {
           return { frameId: page.frameId, errorText: 'Unsupported URL protocol' };
+        }
+        if (target !== page) {
+          try { const result = await target.navigate(url, { referrer: params.referrer }); return { frameId: result.frameId, loaderId: result.loaderId, isDownload: false }; }
+          catch (error) { return { frameId: target.frameId, errorText: error.message }; }
         }
         // Reply after commit so clients receive fetch errors, but before waiting for load.
         let settled = false;
         return await new Promise(resolve => {
           const finish = result => { if (settled) return; settled = true; resolve(result); };
           const committed = () => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false });
-          page.navigate(url, { onCommit: committed }).catch(error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
+          page.navigate(url, { onCommit: committed, referrer: params.referrer }).catch(error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
         });
       }
       case 'Page.reload': await page.navigate(page.url, { historyMode: 'reload' }); return {};
@@ -224,11 +309,11 @@ class Session {
         return { frameId: page.frameId, loaderId: page.loaderId };
       }
       case 'Page.createIsolatedWorld': {
-        if (params.frameId !== page.frameId) throw new ProtocolError('Unknown frame');
+        const target = params.frameId === page.frameId ? page : page.frames?.findFrame(params.frameId);
+        if (!target) throw new ProtocolError('Unknown frame');
         const name = params.worldName ?? '';
-        this.worldNames.add(name);
-        let id = this.worlds.get(name);
-        if (!id) { id = page.browser.nextExecutionContext++; this.worlds.set(name, id); this.contextCreated(name, id); }
+        if (target === page) this.worldNames.add(name);
+        const id = this.isolatedWorld(target, name);
         return { executionContextId: id };
       }
       case 'Page.addScriptToEvaluateOnNewDocument': {
@@ -245,37 +330,43 @@ class Session {
       }
       case 'Runtime.evaluate':
       case 'Runtime.callFunctionOn': {
+        let target = page;
         try {
-          const contextId = params.contextId ?? params.executionContextId;
-          if (contextId !== undefined && contextId !== page.executionContextId && ![...this.worlds.values()].includes(contextId)) {
-            throw new ProtocolError('Cannot find context with specified id');
-          }
-          let value = method === 'Runtime.evaluate' ? page.evaluate(params.expression) : page.callFunction(
+          const contextId = params.contextId ?? params.executionContextId ?? this.objects.get(params.objectId)?.contextId;
+          target = this.executionPage(contextId);
+          let value = method === 'Runtime.evaluate' ? target.evaluate(params.expression) : target.callFunction(
             params.functionDeclaration,
-            params.objectId ? this.object(params.objectId) : page.dom.window,
+            params.objectId ? this.object(params.objectId) : target.dom.window,
             (params.arguments ?? []).map(arg => this.argument(arg)),
           );
-          if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), page.timeout);
-          return { result: this.remote(value, params.returnByValue, params.objectGroup) };
+          if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), target.timeout);
+          return { result: this.remote(value, params.returnByValue, params.objectGroup, target.executionContextId) };
         } catch (error) {
           if (error instanceof ProtocolError) throw error;
-          return { result: { type: 'undefined' }, exceptionDetails: this.exception(error) };
+          return { result: { type: 'undefined' }, exceptionDetails: this.exception(error, target.executionContextId) };
         }
       }
       case 'Runtime.getProperties': {
         const object = this.object(params.objectId);
+        const contextId = this.objects.get(params.objectId).contextId;
         const result = Object.getOwnPropertyNames(object).map(name => {
           const descriptor = Object.getOwnPropertyDescriptor(object, name);
           return { name, configurable: !!descriptor.configurable, enumerable: !!descriptor.enumerable,
-            isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value), writable: !!descriptor.writable } : {}),
-            ...(descriptor.get ? { get: this.remote(descriptor.get) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set) } : {}) };
+            isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, undefined, contextId), writable: !!descriptor.writable } : {}),
+            ...(descriptor.get ? { get: this.remote(descriptor.get, false, undefined, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, undefined, contextId) } : {}) };
         });
         return { result, internalProperties: [] };
       }
       case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
       case 'Runtime.releaseObjectGroup': for (const [id, object] of this.objects) if (object.group === params.objectGroup) this.objects.delete(id); return {};
-      case 'Runtime.addBinding': this.bindings.add(params.name); this.installBinding(params.name); return {};
-      case 'Runtime.removeBinding': this.bindings.delete(params.name); delete page.dom.window[params.name]; return {};
+      case 'Runtime.addBinding':
+        this.bindings.add(params.name);
+        for (const target of page.frames?.frames.values() ?? [page]) this.installBinding(params.name, target);
+        return {};
+      case 'Runtime.removeBinding':
+        this.bindings.delete(params.name);
+        for (const target of page.frames?.frames.values() ?? [page]) delete target.dom.window[params.name];
+        return {};
       case 'Runtime.runIfWaitingForDebugger': return {};
       case 'Network.getCookies': {
         const urls = params.urls ?? [page.url];
@@ -292,7 +383,17 @@ class Session {
       }
       case 'Network.setExtraHTTPHeaders': page.setExtraHTTPHeaders(params.headers); return {};
       case 'Network.setUserAgentOverride': page.setUserAgentOverride(params); return {};
-      case 'LP.dump': { const format = params.format ?? 'html'; return { format, content: page.dump(format) }; }
+      case 'LP.dump': {
+        const format = params.format ?? 'html';
+        if (params.strip !== undefined && (!params.strip || typeof params.strip !== 'object' || Array.isArray(params.strip))) throw new ProtocolError('strip must be an object');
+        const stripModes = Object.entries(params.strip ?? {}).filter(([, enabled]) => enabled).map(([name]) => name);
+        const rootNode = params.backendNodeId === undefined ? undefined : this.nodes?.get(params.backendNodeId);
+        if (params.backendNodeId !== undefined && !rootNode) throw new ProtocolError('Unknown DOM node');
+        try {
+          return { format, content: page.dump(format, { selector: params.selector, rootNode, maxBytes: params.maxBytes,
+            stripModes, nodeIdFor: node => this.backendId(node) }) };
+        } catch (error) { throw new ProtocolError(error.message, error.code === 'UnsupportedDumpFormat' ? -32601 : -32602); }
+      }
       // Acknowledgements for protocol configuration that does not require layout.
       case 'Network.setCacheDisabled':
       case 'Page.setInterceptFileChooserDialog':
@@ -308,7 +409,7 @@ class Session {
   backendId(node) {
     this.nodes ??= new Map();
     for (const [id, value] of this.nodes) if (value === node) return id;
-    const id = this.nextBackendNodeId++; this.nodes.set(id, node); return id;
+    const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
   }
   close() {
     clearTimeout(this.idleTimer);

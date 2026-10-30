@@ -1,8 +1,9 @@
 module RedPanda.Puppeteer
-  ( Browser, BrowserContext, Page, Response, PreloadScript, Header
+  ( Browser, BrowserContext, Page, Frame, Response, PreloadScript, Header
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText
   , withNavigation, goBack, goForward, reload, pageUrl
+  , childFrame, evaluateFrameString, gotoFrame
   , evaluateOnNewDocument, removePreload
   , setExtraHTTPHeaders, setUserAgent
   , click, focus, typeText, pressKey, insertText
@@ -21,6 +22,7 @@ import Effect.Exception (Error)
 foreign import data Browser :: Type
 foreign import data BrowserContext :: Type
 foreign import data Page :: Type
+foreign import data Frame :: Type
 foreign import data Response :: Type
 foreign import data PendingNavigation :: Type
 
@@ -51,6 +53,9 @@ foreign import goBackImpl :: Page -> Async String
 foreign import goForwardImpl :: Page -> Async String
 foreign import reloadImpl :: Page -> Async String
 foreign import pageUrlImpl :: Page -> Effect String
+foreign import childFrameImpl :: Page -> Int -> Async Frame
+foreign import evaluateFrameStringImpl :: Frame -> String -> Async String
+foreign import gotoFrameImpl :: Frame -> String -> Async Int
 foreign import responseStatus :: Response -> Int
 foreign import responseTextImpl :: Response -> Async String
 foreign import evaluateOnNewDocumentImpl :: Page -> String -> Async String
@@ -113,6 +118,15 @@ reload page = fromAsync $ reloadImpl page
 
 pageUrl :: Page -> Aff String
 pageUrl page = liftEffect $ pageUrlImpl page
+
+childFrame :: Page -> Int -> Aff Frame
+childFrame page index = fromAsync $ childFrameImpl page index
+
+evaluateFrameString :: Frame -> String -> Aff String
+evaluateFrameString frame expression = fromAsync $ evaluateFrameStringImpl frame expression
+
+gotoFrame :: Frame -> String -> Aff Int
+gotoFrame frame url = fromAsync $ gotoFrameImpl frame url
 
 responseText :: Response -> Aff String
 responseText response = fromAsync $ responseTextImpl response

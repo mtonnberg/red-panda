@@ -34,6 +34,14 @@ export async function createFixture() {
         <script>globalThis.historyEvents=[];globalThis.documentToken='original';
         addEventListener('popstate',e=>historyEvents.push({type:'popstate',state:e.state}));
         addEventListener('hashchange',e=>historyEvents.push({type:'hashchange',oldURL:e.oldURL,newURL:e.newURL}));</script>`);
+    } else if (url.pathname === '/frames') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end(`<!doctype html><title>Parent frames</title><iframe id="child" src="/frame-content"></iframe><iframe id="inline" srcdoc="<p>Inline child</p><iframe id='nested' srcdoc='<p>Nested child</p>'></iframe>"></iframe>`);
+    } else if (url.pathname === '/frame-content') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<!doctype html><title>Child frame</title><h1>Frame content</h1><script>globalThis.frameOnly="child realm";</script>');
+    } else if (url.pathname === '/frame-next') {
+      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<!doctype html><title>Next frame</title><h1>Next frame</h1>');
     } else if (url.pathname === '/modules') {
       response.writeHead(200, { 'content-type': 'text/html' });
       response.end('<!doctype html><h1>Loading module</h1><script type="module">import {answer} from "/module-value.js";await new Promise(resolve=>setTimeout(resolve,20));document.querySelector("h1").textContent=String(answer)</script>');

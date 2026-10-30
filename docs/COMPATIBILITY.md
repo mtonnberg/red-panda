@@ -363,8 +363,8 @@ bounded deadlines and forced cleanup of a stalled child before the next case.
 Native failures, unavailable dynamic fixture routes and absent observations must
 be classified separately. A trial cohort run overlapped changing source and a
 syntax error; it is invalid as a compatibility baseline. Repeatable runs use a
-fixed candidate source snapshot with a file-level SHA-256 manifest. No upstream
-fixture passing rate is claimed until that run and its native control finish.
+fixed candidate source snapshot with a file-level SHA-256 manifest. Its completed
+results are recorded below with the native control kept separate.
 
 The fixed checkpoint run has now finished. Its paired results and source-file
 hashes are retained in [conformance-classic-checkpoint.json](reference/conformance-classic-checkpoint.json).
@@ -384,3 +384,25 @@ Later independent work adds real form submission, dedicated workers, import
 maps, focus/keyboard defaults, shared-transport XHR and additional measured
 geometry. These are independently tested; the historical checkpoint figures
 must not be interpreted as their current full-suite result.
+
+The subsequent expanded checkpoint is retained in
+[conformance-expanded-checkpoint.json](reference/conformance-expanded-checkpoint.json):
+12/18 candidate fixtures passed, compared with17/18 native controls. This is a
+different selection with explicit iframe/worker loading and a5,000ms budget.
+The native worker fixture also needs a dynamic `/xhr` route absent from the
+static server; its failure cannot establish an engine incompatibility.
+
+The latest implemented checkpoint passes299 JavaScript tests and47 PureScript
+Puppeteer assertions, plus13 differential scenarios and a strict PureScript
+build. It adds browser-facing Fetch wrappers/CORS, real frame realm dispatch and
+lifecycles, declarative/serializable/clonable shadow roots and manual slots,
+native-shaped dump formats/flags, and the native CLI no-dump/5-second defaults.
+Both unchanged upstream shadow serialization/declarative fixtures pass on
+candidate and native, recorded in
+[conformance-shadow-checkpoint.json](reference/conformance-shadow-checkpoint.json).
+
+These results remain bounded. Missing protocol methods, separate utility realms,
+full frame input/history/POST, constructed/adopted stylesheets, MessagePorts,
+network streaming/cache, many HTML/WebAPI contracts, rendering dumps and runtime
+isolation still prevent full replication. More recent work must be validated
+independently before updating the checkpoint figures.

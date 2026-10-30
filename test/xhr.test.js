@@ -271,3 +271,12 @@ test('upload event contracts, validation, forbidden headers and explicit sync re
   xhr.onload = () => { handlerCalls += 100; }; const handler = () => handlerCalls++;
   xhr.onload = handler; assert.equal(xhr.onload, handler); xhr.dispatchEvent(new window.Event('load')); assert.equal(handlerCalls, 1);
 }));
+
+test('about:blank iframe XHR uses its inherited document origin despite a replaceable window.origin', async () => fixture(async ({ page, window, base }) => {
+  window.document.cookie = 'inheritedCookie=yes';
+  const iframe = window.document.createElement('iframe'); window.document.body.append(iframe);
+  const child = iframe.contentWindow; installXHR(page, child);
+  assert.equal(child.location.origin, 'null'); assert.equal(child.origin, base); child.origin = 'http://forged.invalid';
+  const result = await send(child, `${base}/echo`, { type: 'json' });
+  assert.equal(result.outcome, 'load'); assert.match(result.xhr.response.headers.cookie, /inheritedCookie=yes/);
+}));
