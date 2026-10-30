@@ -1,4 +1,4 @@
-# Independent collection binding
+# Independent V8 bindings
 
 `collections.cc` supplies a small V8 binding for the real `[[IsHTMLDDA]]`
 behavior of `document.all`. A JavaScript Proxy cannot supply this engine bit.
@@ -22,7 +22,30 @@ list must refresh its lazy form-controls parent, and its value setter must
 refresh membership before selecting a radio. The private update hook applies
 only to globals that installed this adapter.
 
-## Build and integration
+## Runtime entry and microtasks
+
+`runtime.cc` adds two public-V8 operations independently of the collection code:
+real guarded microtask checkpoints and realm-local native entry functions that
+capture the actual incumbent caller context. It imports no Lightpanda engine.
+`src/clear-hook.js` requests a checkpoint at the real classic evaluator's private
+currentScript-clear boundary, after exception reporting. Outermost evaluation
+tracking and real host tasks preserve nested-script order; no dependency source
+is patched and no callback receives a fabricated script identity.
+
+`src/native-runtime.js` verifies Node patch, V8, ABI, platform, architecture,
+source digest and binary digest before loading `runtime.node`. It provides no
+heap enumeration. Runtime and collection outputs share the versioned build
+folder but retain separate source and binary manifests. Rebuild and restart
+when either source or runtime changes; live replacement is unsupported.
+
+`npm run build:native` builds both. `node native/build-runtime.mjs` builds only
+the runtime helper and accepts the same header/output overrides as the collection
+builder. The runtime entry, actual queued jobs, reentrancy guards, numeric
+prototype setters and native-trace tests pass on Node24.19.0,24.22.1 and26.13.0.
+The first Node26 compilation exposed a removed Context API; the final source
+uses the public current-Isolate API on all three versions.
+
+## Collection build and integration
 
 This binding has a Linux build recipe and requires `g++`, matching Node/V8
 headers, and the repository's existing jsdom dependency. No node-gyp package or

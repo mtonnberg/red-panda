@@ -1,3 +1,4 @@
+import { createPlatformCodec } from "./platform-codec.js";
 import { MessageChannel as NativeChannel, MessagePort as NativePort } from 'node:worker_threads';
 import { types } from 'node:util';
 import { createRequire } from 'node:module';
@@ -20,12 +21,14 @@ const VIEW_NAMES = ['DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 
  * additionally emits a MessageEvent. wrap/unwrap are host-only port adapters.
  * clone implements genuine native structured clone/transfer plus realm adoption.
  * dispose closes only ports still owned by this realm; transferred ports survive.
- * Blob/File/SharedArrayBuffer and DOM platform objects currently reject rather
- * than losing their native state while cloning.
+ * Blob/File preserve their immutable bytes and private metadata through graph
+ * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
  */
 export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {} } = {}) {
   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
+  const codec = createPlatformCodec(realm);
+  const deliveryQueues = new WeakMap(), pendingDeliveries = new Set();
   const EventTarget = realm.EventTarget;
   const owned = new Set(), wrapped = new WeakMap(), channels = new WeakMap(), secret = {};
   let disposed = false;
@@ -71,7 +74,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     native.on('close', state.close); native.unref();
     return port;
   }
-  function encode(value, allowed, seen = new Map()) {
+  function encode(value, allowed, seen = new Map(), platforms) {
     if (typeof value === 'function' || typeof value === 'symbol') throw cloneError('Value cannot be structured cloned');
     if (value === null || typeof value !== 'object') return value;
     if (types.isProxy(value)) throw cloneError('Proxy objects cannot be structured cloned');
@@ -82,23 +85,25 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     }
     if (value instanceof NativePort) throw cloneError('Native MessagePort must be wrapped before sending');
     if (seen.has(value)) return seen.get(value);
+    const platform = codec.serialize(value);
+    if (platform) { const placeholder = {}; seen.set(value, placeholder); platforms.set(placeholder, platform); return placeholder; }
     if (types.isSharedArrayBuffer(value)) throw cloneError('SharedArrayBuffer messaging is not implemented');
     if (types.isArrayBuffer(value) || ArrayBuffer.isView(value) || types.isDate(value) || types.isRegExp(value)) return value;
     if (types.isNativeError(value)) {
       const Constructor = ERROR_NAMES.includes(value.name) ? globalThis[value.name] : Error;
       const result = new Constructor(value.message); seen.set(value, result);
       if (value.stack !== undefined) result.stack = value.stack;
-      if (Object.hasOwn(value, 'cause')) result.cause = encode(value.cause, allowed, seen);
+      if (Object.hasOwn(value, 'cause')) result.cause = encode(value.cause, allowed, seen, platforms);
       return result;
     }
     if (types.isMap(value)) {
       const result = new Map(); seen.set(value, result);
-      for (const [key, item] of value) result.set(encode(key, allowed, seen), encode(item, allowed, seen));
+      for (const [key, item] of value) result.set(encode(key, allowed, seen, platforms), encode(item, allowed, seen, platforms));
       return result;
     }
     if (types.isSet(value)) {
       const result = new Set(); seen.set(value, result);
-      for (const item of value) result.add(encode(item, allowed, seen)); return result;
+      for (const item of value) result.add(encode(item, allowed, seen, platforms)); return result;
     }
     if (implForWrapper(value) || types.isPromise(value) || types.isWeakMap(value) || types.isWeakSet(value) ||
         !['[object Object]', '[object Array]'].includes(Object.prototype.toString.call(value))) {
@@ -107,7 +112,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     const result = Array.isArray(value) ? new Array(value.length) : {};
     seen.set(value, result);
     for (const key of Object.keys(value)) Object.defineProperty(result, key, {
-      value: encode(value[key], allowed, seen), enumerable: true, configurable: true, writable: true,
+      value: encode(value[key], allowed, seen, platforms), enumerable: true, configurable: true, writable: true,
     });
     return result;
   }
@@ -130,23 +135,26 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       } else if (types.isArrayBuffer(value)) transfer.push(value);
       else throw cloneError('Transfer list contains a non-transferable value');
     }
-    const message = { data: encode(data, allowed), ports };
+    const platforms = new Map();
+    const message = { data: encode(data, allowed, new Map(), platforms), ports };
+    if (platforms.size) message.platforms = platforms;
     let committed = false;
     return { message, transfer, commit() {
       if (committed) return;
       committed = true; for (const state of moved) release(state, true);
     } };
   }
-  function adopt(value, seen = new Map()) {
+  function adopt(value, seen = new Map(), platforms) {
     if (value === null || typeof value !== 'object') return value;
     if (seen.has(value)) return seen.get(value);
+    if (platforms?.has(value)) { const result = codec.deserialize(platforms.get(value)); seen.set(value, result); return result; }
     if (value instanceof NativePort) { const result = wrap(value); seen.set(value, result); return result; }
     if (types.isSharedArrayBuffer(value)) throw cloneError('SharedArrayBuffer messaging is not implemented');
     if (types.isArrayBuffer(value)) {
       Object.setPrototypeOf(value, I.ArrayBuffer.prototype); seen.set(value, value); return value;
     }
     if (ArrayBuffer.isView(value)) {
-      const buffer = adopt(value.buffer, seen), name = Object.prototype.toString.call(value).slice(8, -1);
+      const buffer = adopt(value.buffer, seen, platforms), name = Object.prototype.toString.call(value).slice(8, -1);
       if (!I[name]) throw cloneError(`Unsupported array view: ${name}`);
       const result = name === 'DataView' ? new I.DataView(buffer, value.byteOffset, value.byteLength) : new I[name](buffer, value.byteOffset, value.length);
       seen.set(value, result); return result;
@@ -156,21 +164,21 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     }
     if (types.isNativeError(value)) {
       Object.setPrototypeOf(value, (I[value.name] ?? I.Error).prototype); seen.set(value, value);
-      if (Object.hasOwn(value, 'cause')) value.cause = adopt(value.cause, seen);
+      if (Object.hasOwn(value, 'cause')) value.cause = adopt(value.cause, seen, platforms);
       return value;
     }
     if (types.isMap(value)) {
       const result = new I.Map(); seen.set(value, result);
-      for (const [key, item] of value) result.set(adopt(key, seen), adopt(item, seen)); return result;
+      for (const [key, item] of value) result.set(adopt(key, seen, platforms), adopt(item, seen, platforms)); return result;
     }
     if (types.isSet(value)) {
       const result = new I.Set(); seen.set(value, result);
-      for (const item of value) result.add(adopt(item, seen)); return result;
+      for (const item of value) result.add(adopt(item, seen, platforms)); return result;
     }
     const result = Array.isArray(value) ? new I.Array(value.length) : new I.Object();
     seen.set(value, result);
     for (const key of Object.keys(value)) I.Object.defineProperty(result, key, {
-      value: adopt(value[key], seen), enumerable: true, configurable: true, writable: true,
+      value: adopt(value[key], seen, platforms), enumerable: true, configurable: true, writable: true,
     });
     return result;
   }
@@ -180,15 +188,49 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       throw new realm.DOMException('The realm is disposed', 'InvalidStateError');
     }
     if (!message || !Array.isArray(message.ports) || message.ports.some(port => !(port instanceof NativePort))) throw cloneError('Malformed messaging envelope');
-    const seen = new Map(), ports = new I.Array();
-    for (const port of message.ports) ports.push(adopt(port, seen));
-    return { data: adopt(message.data, seen), ports: I.Object.freeze(ports) };
+    const platforms = codec.records(message), seen = new Map(), ports = new I.Array(message.ports.length);
+    for (let index = 0; index < message.ports.length; index++) Object.defineProperty(ports, index, {value: adopt(message.ports[index], seen, platforms), enumerable: true, configurable: true, writable: true});
+    return { data: adopt(message.data, seen, platforms), ports: Object.freeze(ports) };
   }
-  function dispatchMessage(target, message, type = 'message') {
-    const { data, ports } = receive(message); emit(target, type, data, ports);
+  function dropMessage(message) { for (const port of message?.ports ?? []) if (port instanceof NativePort) port.close(); }
+  function deliver(target, message, callback, guard = () => true) {
+    const valid = () => { const port = PORTS.get(target); return live() && guard() && (!port || (!port.closed && !port.detached)); };
+    const previous = deliveryQueues.get(target);
+    if (!previous && !codec.needsAsync(message)) {
+      if (!valid()) { dropMessage(message); return; }
+      return callback(receive(message));
+    }
+    const work = { message }; pendingDeliveries.add(work);
+    let operation;
+    operation = (previous ?? Promise.resolve()).then(async () => {
+      if (!valid()) { dropMessage(message); return; }
+      await codec.hydrate(message);
+      if (!valid()) { dropMessage(message); return; }
+      callback(receive(message));
+    }).catch(error => {
+      dropMessage(message);
+      if (valid()) { try { emit(target, 'messageerror', null, I.Object.freeze(new I.Array())); } catch (eventError) { reportError(eventError); } }
+    }).finally(() => {
+      pendingDeliveries.delete(work);
+      if (deliveryQueues.get(target) === operation) deliveryQueues.delete(target);
+    });
+    deliveryQueues.set(target, operation); return operation;
+  }
+  function dispatchMessage(target, message, type = 'message', guard) {
+    return deliver(target, message, ({data, ports}) => emit(target, type, data, ports), guard);
+  }
+  function prepareBroadcast(data) {
+    const prepared = prepare(data);
+    let message;
+    try { message = nativeClone(prepared.message); prepared.commit(); }
+    catch (error) { if(error?.name==='DataCloneError')throw cloneError(error.message);throw error; }
+    const pending = codec.needsBroadcastBytes(message);
+    if (!pending) codec.stripNativeHandles(message);
+    return {message, pending};
   }
   function clone(data, options) {
     const prepared = prepare(data, options);
+    if (codec.needsAsync(prepared.message)) throw cloneError('Synchronous clone cannot asynchronously read an embedded native Blob');
     try {
       const message = nativeClone(prepared.message, { transfer: prepared.transfer }); prepared.commit(); return receive(message).data;
     } catch (error) { if (error?.name === 'DataCloneError') throw cloneError(error.message); throw error; }
@@ -245,9 +287,10 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
   function dispose() {
     if (disposed) return;
     disposed = true;
+    for (const work of pendingDeliveries) dropMessage(work.message); pendingDeliveries.clear();
     for (const state of [...owned]) { state.closed = true; release(state); state.native.close(); }
   }
-  return { MessageChannel, MessagePort, prepare, receive, dispatchMessage, clone, discard, wrap,
+  return { MessageChannel, MessagePort, prepare, receive, deliver, prepareBroadcast, broadcastBody: codec.broadcastBody, dispatchMessage, clone, discard, wrap,
     unwrap(port) { const state = record(port); if (state.detached) throw cloneError('MessagePort is detached'); return state.native; },
     isPort: value => PORTS.has(value), dispose, get size() { return owned.size; } };
 }

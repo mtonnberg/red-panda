@@ -1,0 +1,381 @@
+{
+  "scope": "Bounded public CSS computed/declaration/media/owner controls; not full CSS conformance",
+  "documentCompleteAndPresetStylesheetObserved": true,
+  "binary": "proposals/css-compat/launch.sh",
+  "binarySHA256": "7936347f27c1eabf471905870cf582eaa90db3cbc85b78b7a82b4bb0cccb227f",
+  "expression": "(async()=>{\n const output={},attempt=fn=>{try{return fn()??null}catch(error){return{error:error.name,message:error.message}}};\n const make=(style='')=>{const element=document.createElement('div');element.style.cssText=style;document.body.append(element);return element};\n output.viewport={width:innerWidth,height:innerHeight,screenWidth:screen.width,screenHeight:screen.height};\n output.transforms=[];for(const value of ['translateX(10px) scale(2)','rotate(45deg)','rotate(90deg)','translate3d(0px,0px,0px)','matrix(1.23456789,0,0,1,0.00001,1000000)','translate(50%,25%)','translateX(2em)','translateX(calc(5px + 2px))','scale(0)','bad(3)','translateX(2cm)','translateX(1in)','rotate(0.25turn)','rotate(1rad)','matrix(1,0,0,1,0.000001,0.0000001)']){const el=make('width:100px;height:40px;transform:'+value);output.transforms.push({input:value,inline:el.style.transform,computed:attempt(()=>getComputedStyle(el).transform)});el.remove()}\n const percent=make('width:200px;height:80px;transform:translate(50%,25%)');output.percent={width:percent.style.width,height:percent.style.height,transform:getComputedStyle(percent).transform};\n const preset=make();preset.className='preset';output.presetPseudo={normal:getComputedStyle(preset).color,before:getComputedStyle(preset,'::before').color,content:getComputedStyle(preset,'::before').content};\n const raw=make('--base:4px;--alias:var(--base);width:var(--alias);--cycle:var(--cycle, 7px);--empty: ;');const child=make('--base:9px;width:var(--alias)');raw.append(child);output.custom={base:getComputedStyle(raw).getPropertyValue('--base'),alias:getComputedStyle(raw).getPropertyValue('--alias'),width:getComputedStyle(raw).width,childWidth:getComputedStyle(child).width,childAlias:getComputedStyle(child).getPropertyValue('--alias'),cycle:getComputedStyle(raw).getPropertyValue('--cycle')};\n const inline=make();inline.style.cssText='color:red;background-color:blue';output.declarationCase={value:inline.style.getPropertyValue('BACKGROUND-COLOR'),priority:inline.style.getPropertyPriority('COLOR')};\n output.float=[];for(const value of ['right',undefined,null,'bogus']){inline.style.cssFloat=value;output.float.push({input:String(value),value:inline.style.cssFloat,text:inline.style.cssText})}\n inline.style.cssText='';inline.style.setProperty('-webkit-border-radius','5px');output.vendor={prefixed:inline.style.webkitBorderRadius,plain:inline.style.borderRadius,dashed:inline.style.getPropertyValue('-webkit-border-radius'),text:inline.style.cssText,length:inline.style.length};\n output.pairs=[];for(const property of ['overflow','overscroll-behavior']){inline.style.cssText='';inline.style.setProperty(property,property==='overflow'?'hidden scroll':'contain auto');output.pairs.push({property,x:inline.style.getPropertyValue(property+'-x'),y:inline.style.getPropertyValue(property+'-y'),value:inline.style.getPropertyValue(property),text:inline.style.cssText,length:inline.style.length});inline.style.setProperty(property+'-x','auto','important');output.pairs.push({property,important:true,value:inline.style.getPropertyValue(property),priority:inline.style.getPropertyPriority(property),text:inline.style.cssText,length:inline.style.length})}\n const plain=make();const computed=getComputedStyle(plain);output.defaults=Object.fromEntries(['padding','margin','border-width','border-style','border-top-width','z-index','flex-grow','flex-shrink','flex-basis','gap','column-gap','border-radius','border-top-left-radius','font-size','transform'].map(name=>[name,computed.getPropertyValue(name)]));output.identity={same:computed===getComputedStyle(plain),sameBefore:getComputedStyle(plain,':before')===getComputedStyle(plain,'::BEFORE'),pseudoDistinct:computed!==getComputedStyle(plain,'::before'),invalidIgnored:computed===getComputedStyle(plain,'before')};\n const rules=document.createElement('style');rules.textContent='div {color:green} div::before {color:red;content:\"before\"}';document.head.append(rules);output.pseudo={normal:getComputedStyle(plain).color,before:attempt(()=>getComputedStyle(plain,'::before').color),unknown:attempt(()=>getComputedStyle(plain,'::unrecognized').color),null:attempt(()=>getComputedStyle(plain,null)===computed)};\n output.replace={ordinary:attempt(()=>{rules.sheet.replaceSync('div {color:blue}');return{color:getComputedStyle(plain).color,text:rules.textContent,rules:rules.sheet.cssRules.length}})};\n const parent=make('font-size:20px');output.fonts=[];for(const value of ['1.5em','2rem','larger','smaller','LARGE','xx-small','xxx-large','125%','1pt']){const item=make('font-size:'+value);parent.append(item);output.fonts.push({input:value,inline:item.style.fontSize,computed:getComputedStyle(item).fontSize})}\n const nested=new CSSStyleSheet();nested.replaceSync('.nested { color:red; & {color:blue;} color:green; @media screen { opacity:0.5; > span {display:none} } }');const describe=rule=>({type:rule.type,constructor:rule.constructor.name,selector:rule.selectorText,text:rule.cssText,style:rule.style?.cssText,children:rule.cssRules?[...rule.cssRules].map(describe):undefined});output.nesting=[...nested.cssRules].map(describe);\n output.media={api:typeof matchMedia,event:typeof MediaQueryListEvent};if(typeof matchMedia==='function'){\n output.media.queries=[];for(const query of ['', 'SCREEN','not unknown','not (unknown: x)','not (width: nonsense)','(orientation: landscape)','(width: 120em)','(device-width: 1920px)','(width >= 100px)','(min-width:1in)','screen and /*x*/ (min-width:1px)','screen or print','(min-width:4294967296px)']){const value=matchMedia(query);output.media.queries.push({query,media:value.media,matches:value.matches})}\n const m=matchMedia('(min-width:600px)');output.media.brand={tag:Object.prototype.toString.call(m),eventTarget:m instanceof EventTarget,constructor:attempt(()=>new MediaQueryList()),name:MediaQueryList.name,length:MediaQueryList.length,readonly:attempt(()=>{m.matches=false;return m.matches})};\n globalThis.__mediaChanges=[];globalThis.__mediaQuery=matchMedia('(max-width:1000px)');__mediaQuery.onchange=e=>__mediaChanges.push({matches:e.matches,media:e.media,trusted:e.isTrusted});\n }\n return output;\n})()",
+  "result": {
+    "viewport": {
+      "width": 1920,
+      "height": 1080,
+      "screenWidth": 1920,
+      "screenHeight": 1080
+    },
+    "transforms": [
+      {
+        "input": "translateX(10px) scale(2)",
+        "inline": "translateX(10px) scale(2)",
+        "computed": "matrix(2, 0, 0, 2, 10, 0)"
+      },
+      {
+        "input": "rotate(45deg)",
+        "inline": "rotate(45deg)",
+        "computed": "matrix(0.707107, 0.707107, -0.707107, 0.707107, 0, 0)"
+      },
+      {
+        "input": "rotate(90deg)",
+        "inline": "rotate(90deg)",
+        "computed": "matrix(6.12323e-17, 1, -1, 6.12323e-17, 0, 0)"
+      },
+      {
+        "input": "translate3d(0px,0px,0px)",
+        "inline": "translate3d(0px,0px,0px)",
+        "computed": "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)"
+      },
+      {
+        "input": "matrix(1.23456789,0,0,1,0.00001,1000000)",
+        "inline": "matrix(1.23456789,0,0,1,0.00001,1000000)",
+        "computed": "matrix(1.23457, 0, 0, 1, 0.00001, 1e+6)"
+      },
+      {
+        "input": "translate(50%,25%)",
+        "inline": "translate(50%,25%)",
+        "computed": "matrix(1, 0, 0, 1, 50, 25)"
+      },
+      {
+        "input": "translateX(2em)",
+        "inline": "translateX(2em)",
+        "computed": "none"
+      },
+      {
+        "input": "translateX(calc(5px + 2px))",
+        "inline": "translateX(calc(5px + 2px))",
+        "computed": "none"
+      },
+      {
+        "input": "scale(0)",
+        "inline": "scale(0)",
+        "computed": "matrix(0, 0, 0, 0, 0, 0)"
+      },
+      {
+        "input": "bad(3)",
+        "inline": "bad(3)",
+        "computed": "none"
+      },
+      {
+        "input": "translateX(2cm)",
+        "inline": "translateX(2cm)",
+        "computed": "matrix(1, 0, 0, 1, 2, 0)"
+      },
+      {
+        "input": "translateX(1in)",
+        "inline": "translateX(1in)",
+        "computed": "matrix(1, 0, 0, 1, 1, 0)"
+      },
+      {
+        "input": "rotate(0.25turn)",
+        "inline": "rotate(0.25turn)",
+        "computed": "matrix(6.12323e-17, 1, -1, 6.12323e-17, 0, 0)"
+      },
+      {
+        "input": "rotate(1rad)",
+        "inline": "rotate(1rad)",
+        "computed": "matrix(0.540302, 0.841471, -0.841471, 0.540302, 0, 0)"
+      },
+      {
+        "input": "matrix(1,0,0,1,0.000001,0.0000001)",
+        "inline": "matrix(1,0,0,1,0.000001,0.0000001)",
+        "computed": "matrix(1, 0, 0, 1, 0.000001, 1e-7)"
+      }
+    ],
+    "percent": {
+      "width": "200px",
+      "height": "80px",
+      "transform": "matrix(1, 0, 0, 1, 50, 25)"
+    },
+    "presetPseudo": {
+      "normal": "rgb(0, 128, 0)",
+      "before": "rgb(0, 128, 0)",
+      "content": "normal"
+    },
+    "custom": {
+      "base": "4px",
+      "alias": "var(--base)",
+      "width": "var(--alias)",
+      "childWidth": "var(--alias)",
+      "childAlias": "var(--base)",
+      "cycle": "var(--cycle, 7px)"
+    },
+    "declarationCase": {
+      "value": "blue",
+      "priority": ""
+    },
+    "float": [
+      {
+        "input": "right",
+        "value": "right",
+        "text": "color: red; background-color: blue; float: right;"
+      },
+      {
+        "input": "undefined",
+        "value": "undefined",
+        "text": "color: red; background-color: blue; float: undefined;"
+      },
+      {
+        "input": "null",
+        "value": "",
+        "text": "color: red; background-color: blue;"
+      },
+      {
+        "input": "bogus",
+        "value": "bogus",
+        "text": "color: red; background-color: blue; float: bogus;"
+      }
+    ],
+    "vendor": {
+      "prefixed": "5px",
+      "plain": "",
+      "dashed": "5px",
+      "text": "-webkit-border-radius: 5px;",
+      "length": 1
+    },
+    "pairs": [
+      {
+        "property": "overflow",
+        "x": "hidden",
+        "y": "scroll",
+        "value": "hidden scroll",
+        "text": "overflow: hidden scroll;",
+        "length": 2
+      },
+      {
+        "property": "overflow",
+        "important": true,
+        "value": "",
+        "priority": "",
+        "text": "overflow-x: auto !important; overflow-y: scroll;",
+        "length": 2
+      },
+      {
+        "property": "overscroll-behavior",
+        "x": "contain",
+        "y": "auto",
+        "value": "contain auto",
+        "text": "overscroll-behavior: contain auto;",
+        "length": 2
+      },
+      {
+        "property": "overscroll-behavior",
+        "important": true,
+        "value": "",
+        "priority": "",
+        "text": "overscroll-behavior-x: auto !important; overscroll-behavior-y: auto;",
+        "length": 2
+      }
+    ],
+    "defaults": {
+      "padding": "0px",
+      "margin": "0px",
+      "border-width": "0px",
+      "border-style": "none",
+      "border-top-width": "0px",
+      "z-index": "auto",
+      "flex-grow": "0",
+      "flex-shrink": "1",
+      "flex-basis": "auto",
+      "gap": "normal",
+      "column-gap": "normal",
+      "border-radius": "0px",
+      "border-top-left-radius": "0px",
+      "font-size": "16px",
+      "transform": "none"
+    },
+    "identity": {
+      "same": true,
+      "sameBefore": true,
+      "pseudoDistinct": true,
+      "invalidIgnored": true
+    },
+    "pseudo": {
+      "normal": "rgb(0, 128, 0)",
+      "before": "rgb(0, 128, 0)",
+      "unknown": "rgb(0, 128, 0)",
+      "null": true
+    },
+    "replace": {
+      "ordinary": {
+        "color": "rgb(0, 0, 255)",
+        "text": "div {color:green} div::before {color:red;content:\"before\"}",
+        "rules": 1
+      }
+    },
+    "fonts": [
+      {
+        "input": "1.5em",
+        "inline": "1.5em",
+        "computed": "30px"
+      },
+      {
+        "input": "2rem",
+        "inline": "2rem",
+        "computed": "32px"
+      },
+      {
+        "input": "larger",
+        "inline": "larger",
+        "computed": "24px"
+      },
+      {
+        "input": "smaller",
+        "inline": "smaller",
+        "computed": "16.666666666666668px"
+      },
+      {
+        "input": "LARGE",
+        "inline": "large",
+        "computed": "18px"
+      },
+      {
+        "input": "xx-small",
+        "inline": "xx-small",
+        "computed": "9px"
+      },
+      {
+        "input": "xxx-large",
+        "inline": "xxx-large",
+        "computed": "48px"
+      },
+      {
+        "input": "125%",
+        "inline": "125%",
+        "computed": "25px"
+      },
+      {
+        "input": "1pt",
+        "inline": "1pt",
+        "computed": "1.3333333333333333px"
+      }
+    ],
+    "nesting": [
+      {
+        "type": 1,
+        "constructor": "CSSStyleRule",
+        "selector": ".nested",
+        "text": ".nested { color: green; & { color: blue; } @media screen { opacity:0.5; > span {display:none} } }",
+        "style": "color: green;",
+        "children": [
+          {
+            "type": 1,
+            "constructor": "CSSStyleRule",
+            "selector": "&",
+            "text": "& { color: blue; }",
+            "style": "color: blue;",
+            "children": []
+          },
+          {
+            "type": 4,
+            "constructor": "CSSRule",
+            "text": "@media screen { opacity:0.5; > span {display:none} }"
+          }
+        ]
+      }
+    ],
+    "media": {
+      "api": "function",
+      "event": "function",
+      "queries": [
+        {
+          "query": "",
+          "media": "",
+          "matches": false
+        },
+        {
+          "query": "SCREEN",
+          "media": "SCREEN",
+          "matches": true
+        },
+        {
+          "query": "not unknown",
+          "media": "not unknown",
+          "matches": false
+        },
+        {
+          "query": "not (unknown: x)",
+          "media": "not (unknown: x)",
+          "matches": true
+        },
+        {
+          "query": "not (width: nonsense)",
+          "media": "not (width: nonsense)",
+          "matches": true
+        },
+        {
+          "query": "(orientation: landscape)",
+          "media": "(orientation: landscape)",
+          "matches": true
+        },
+        {
+          "query": "(width: 120em)",
+          "media": "(width: 120em)",
+          "matches": true
+        },
+        {
+          "query": "(device-width: 1920px)",
+          "media": "(device-width: 1920px)",
+          "matches": true
+        },
+        {
+          "query": "(width >= 100px)",
+          "media": "(width >= 100px)",
+          "matches": false
+        },
+        {
+          "query": "(min-width:1in)",
+          "media": "(min-width:1in)",
+          "matches": false
+        },
+        {
+          "query": "screen and /*x*/ (min-width:1px)",
+          "media": "screen and /*x*/ (min-width:1px)",
+          "matches": true
+        },
+        {
+          "query": "screen or print",
+          "media": "screen or print",
+          "matches": false
+        },
+        {
+          "query": "(min-width:4294967296px)",
+          "media": "(min-width:4294967296px)",
+          "matches": false
+        }
+      ],
+      "brand": {
+        "tag": "[object MediaQueryList]",
+        "eventTarget": true,
+        "constructor": {
+          "error": "TypeError",
+          "message": "Illegal Constructor"
+        },
+        "name": "MediaQueryList",
+        "length": 0,
+        "readonly": true
+      }
+    }
+  },
+  "resized": {
+    "width": 800,
+    "height": 600,
+    "screenWidth": 800,
+    "screenHeight": 600,
+    "deviceMatch": true,
+    "matches": true,
+    "changes": [
+      {
+        "matches": true,
+        "media": "(max-width:1000px)",
+        "trusted": true
+      }
+    ]
+  }
+}

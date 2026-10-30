@@ -1,0 +1,355 @@
+diff --git a/src/fetch.js b/src/fetch.js
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -1,3 +1,4 @@
++import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable } from './request-stream-state.js';
+ import { createRequire } from 'node:module';
+ import { types } from 'node:util';
+ import { installStreams } from './streams.js';
+@@ -53,8 +54,8 @@
+  * no page can obtain those internal buffers. Network headers are immutable and
+  * CORS-filtered. Opaque views expose neither status/URL/headers nor entity data.
+  * Redirects needing another preflight or opaque-origin taint reject explicitly.
+- * Streaming upload bodies reject explicitly; ordinary request bodies and all
+- * network responses use the shared buffered transport.
++ * Stream upload bodies are extracted only after real source closure; queued
++ * data and ordinary request bodies use the shared buffered transport.
+  * Returns an idempotent silent disposal hook.
+  */
+ export function installFetch(page, window) {
+@@ -118,9 +119,6 @@
+   };
+   function bodyValue(body, allowStream = false) {
+     if (types.isSharedArrayBuffer(body)) throw new window.TypeError('SharedArrayBuffer bodies are not supported');
+-    if (!allowStream && Object.prototype.toString.call(body) === '[object ReadableStream]') {
+-      throw new window.TypeError('ReadableStream request bodies are unsupported by this buffered transport');
+-    }
+     if (DOMBlob.is(body)) {
+       return new NativeBlob([new Uint8Array(implForWrapper(body)._buffer)], { type: body.type });
+     }
+@@ -142,6 +140,30 @@
+       return length ? new Uint8Array(buffer, (dataView ? viewOffset : typedOffset).call(body), length).slice() : new Uint8Array();
+     }
+     return body;
++  }
++  function streamChunkBytes(chunk) {
++    if (typeof chunk === 'string') return Buffer.from(chunk, 'utf8');
++    if (types.isArrayBuffer(chunk) || ArrayBuffer.isView(chunk)) return bodyValue(chunk);
++    return null;
++  }
++  function extractStreamBody(s, { keepLock = false, cache = false } = {}) {
++    if (s.streamUsed) throw new window.TypeError('Body has already been read');
++    if (s.streamBytes) {
++      if (readableLocked(s.streamBody) || readableVersion(s.streamBody) !== s.streamVersion) throw new window.TypeError('Body is disturbed or locked');
++      if (keepLock && !lockDrainedReadable(s.streamBody, s.streamVersion)) throw new window.TypeError('Body is disturbed or locked');
++      return s.streamBytes;
++    }
++    if (readableLocked(s.streamBody) && readableWasDrained(s.streamBody)) throw new window.TypeError('Body is disturbed or locked');
++    const extracted = drainReadableSource(s.streamBody, streamChunkBytes, { keepLock });
++    if (!extracted) throw new window.TypeError('Failed to read ReadableStream body');
++    if (cache) { s.streamBytes = extracted.bytes; s.streamVersion = extracted.version; }
++    return extracted.bytes;
++  }
++  function materializeStreamBody(s) {
++    if (!s.streamBody) return;
++    const bytes = extractStreamBody(s, { keepLock: true });
++    s.raw = new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw });
++    s.streamUsed = true;
+   }
+   function fillHeaders(init, guard = 'none') {
+     const result = new Headers(); headersState.get(result).guard = guard;
+@@ -197,7 +219,7 @@
+     const s = isResponse ? getResponse(owner) : getRequest(owner);
+     const read = kind === 'json' ? 'text' : ['bytes', 'formData'].includes(kind) ? 'arrayBuffer' : kind;
+     let reading;
+-    try { reading = s.raw[read](); } catch (error) { reading = Promise.reject(error); }
++    try { if (!isResponse) materializeStreamBody(s); reading = s.raw[read](); } catch (error) { reading = Promise.reject(error); }
+     return promise(async () => {
+       if (kind === 'json') return window.JSON.parse(await reading);
+       if (kind === 'arrayBuffer' || kind === 'bytes') {
+@@ -270,10 +292,13 @@
+       if (arguments.length === 0) throw new window.TypeError('Request requires an input');
+       init ??= {};
+       try {
+-        const source = requestState.get(input)?.raw ?? (input instanceof NativeRequest ? input : new URL(String(input), window.document.baseURI).href);
++        const sourceState = requestState.get(input);
++        const source = sourceState?.raw ?? (input instanceof NativeRequest ? input : new URL(String(input), window.document.baseURI).href);
+         const mode = init.mode ?? (source instanceof NativeRequest ? source.mode : 'cors');
+         const guarded = fillHeaders(init.headers ?? (source instanceof NativeRequest ? source.headers : undefined), mode === 'no-cors' ? 'request-no-cors' : 'request');
+-        const prepared = { ...init, headers: getHeaders(guarded).raw };
++        const prepared = {};
++        for (const key of Reflect.ownKeys(Object(init))) if (key !== 'duplex' && Object.prototype.propertyIsEnumerable.call(init, key)) prepared[key] = init[key];
++        prepared.headers = getHeaders(guarded).raw;
+         if (prepared.method !== undefined) {
+           if (typeof prepared.method === 'symbol') throw new window.TypeError('Cannot convert a Symbol value to a string');
+           prepared.method = String(prepared.method).toUpperCase();
+@@ -282,16 +307,29 @@
+         if (mode === 'no-cors' && !SIMPLE_METHODS.has(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) {
+           throw new window.TypeError(`'${prepared.method ?? source.method}' is unsupported in no-cors mode`);
+         }
+-        if (Object.hasOwn(init, 'body')) prepared.body = bodyValue(init.body);
++        let streamBody = sourceState?.streamBody;
++        if (Object.hasOwn(init, 'body')) {
++          if (prepared.body != null && isReadableSource(prepared.body)) { streamBody = prepared.body; prepared.body = null; }
++          else { if (prepared.body != null) streamBody = undefined; prepared.body = bodyValue(prepared.body); }
++        }
++        if (streamBody && ['GET', 'HEAD'].includes(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) throw new window.TypeError('Request with GET/HEAD method cannot have body.');
+         if (prepared.referrer && prepared.referrer !== 'about:client') prepared.referrer = new URL(String(prepared.referrer), window.document.baseURI).href;
+         const wrapped = wrapRequest(new NativeRequest(source, prepared));
+-        requestState.set(this, requestState.get(wrapped));
++        const state = requestState.get(wrapped);
++        if (streamBody) { state.streamBody = streamBody; state.streamUsed = false; if (streamBody === sourceState?.streamBody && sourceState.streamBytes) { state.streamBytes = sourceState.streamBytes; state.streamVersion = sourceState.streamVersion; } }
++        requestState.set(this, state);
+       } catch (error) { throw realmError(error); }
+     }
+-    clone() { try { return wrapRequest(getRequest(this).raw.clone()); } catch (error) { throw realmError(error); } }
++    clone() {
++      try {
++        const s = getRequest(this);
++        if (s.streamBody) return wrapRequest(new NativeRequest(s.raw, { body: extractStreamBody(s, { cache: true }), headers: getHeaders(s.headers).raw }));
++        return wrapRequest(s.raw.clone());
++      } catch (error) { throw realmError(error); }
++    }
+     get headers() { return getRequest(this).headers; }
+-    get body() { return streams.adopt(getRequest(this).raw.body); }
+-    get bodyUsed() { return getRequest(this).raw.bodyUsed; }
++    get body() { const s = getRequest(this); return s.streamBody ?? streams.adopt(s.raw.body); }
++    get bodyUsed() { const s = getRequest(this); return s.streamBody ? s.streamUsed : s.raw.bodyUsed; }
+     get [Symbol.toStringTag]() { return 'Request'; }
+   }
+   for (const name of ['url', 'method', 'mode', 'credentials', 'cache', 'redirect', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal', 'destination', 'duplex']) {
+@@ -427,7 +465,7 @@
+   }
+   Object.defineProperty(Request.prototype, 'textStream', { configurable: true, writable: true,
+     value: function () {
+-      return textStream(getRequest(this).raw);
++      const s = getRequest(this); materializeStreamBody(s); return textStream(s.raw);
+     },
+   });
+   function cors(response, origin, credentials) {
+@@ -470,7 +508,7 @@
+     const signal = AbortSignal.any([controller.signal, raw.signal]);
+     try {
+       const headers = new NativeHeaders(getHeaders(s.headers).raw);
+-      const body = raw.body === null ? undefined : new Uint8Array(await raw.arrayBuffer());
++      const body = s.streamBody ? extractStreamBody(s) : raw.body === null ? undefined : new Uint8Array(await raw.arrayBuffer());
+       if (!active()) return;
+       if (raw.keepalive && body?.byteLength > 65536) throw new window.TypeError('Keepalive request body exceeds 64 KiB');
+       const unsafe = [...headers].filter(([name, value]) => !safeHeader(name, value)).map(([name]) => name).sort();
+diff --git a/src/streams.js b/src/streams.js
+--- a/src/streams.js
++++ b/src/streams.js
+@@ -1,3 +1,4 @@
++import { createReadableState, bindReadable, bindReadableController, failReadable, noteReadableOperation } from './request-stream-state.js';
+ import * as web from 'node:stream/web';
+ import { TextEncoder, TextDecoder } from 'node:util';
+ import { codecPair } from './stream-codecs.js';
+@@ -103,7 +104,7 @@
+     });
+     return converted(value, record);
+   }
+-  function callbackDictionary(value, names, ignoreByteType = false) {
++  function callbackDictionary(value, names, ignoreByteType = false, readableState) {
+     if (value === null || !['object', 'function'].includes(typeof value)) return value;
+     // Keep property access/getter order with Node's WebIDL converter: callbacks
+     // are read when its implementation reads the corresponding dictionary key.
+@@ -113,7 +114,9 @@
+       if (!names.includes(key) || typeof callback !== 'function') return callback;
+       return (...args) => {
+         if (!['cancel', 'abort'].includes(key)) assertActive();
+-        return Reflect.apply(callback, value, ['cancel', 'abort'].includes(key) ? args : args.map(argument => converted(argument)));
++        if (readableState && ['start', 'pull'].includes(key)) bindReadableController(args[0], readableState);
++        try { return Reflect.apply(callback, value, ['cancel', 'abort'].includes(key) ? args : args.map(argument => converted(argument))); }
++        catch (error) { failReadable(readableState); throw error; }
+       };
+     } });
+   }
+@@ -121,7 +124,8 @@
+     assertActive();
+     if (ILLEGAL.has(name)) throw new realm.TypeError('Illegal Constructor');
+     args = [...args];
+-    if (name === 'ReadableStream') args[0] = callbackDictionary(args[0], ['start', 'pull', 'cancel'], true);
++    const readableState = name === 'ReadableStream' ? createReadableState() : null;
++    if (readableState) args[0] = callbackDictionary(args[0], ['start', 'pull', 'cancel'], true, readableState);
+     if (name === 'WritableStream') args[0] = callbackDictionary(args[0], ['start', 'write', 'close', 'abort']);
+     if (name === 'TransformStream') {
+       args[0] = callbackDictionary(args[0], ['start', 'transform', 'flush', 'cancel']);
+@@ -168,7 +172,7 @@
+         readable: transform.readable, writable: transform.writable });
+       tag(result, name); adopt(transform.readable); adopt(transform.writable); return result;
+     }
+-    try { return adopt(Reflect.construct(NATIVES[name], args)); }
++    try { const result = Reflect.construct(NATIVES[name], args); if (readableState) bindReadable(result, readableState); return adopt(result); }
+     catch (error) { throw errorInRealm(error); }
+   }
+   for (const name of STREAM_CONSTRUCTORS) {
+@@ -183,6 +187,7 @@
+   }
+   function iteratorFor(stream, options) {
+     const iterator = Reflect.apply(web.ReadableStream.prototype[Symbol.asyncIterator], stream, [options]);
++    noteReadableOperation('ReadableStream', Symbol.asyncIterator, stream, [], iterator);
+     const result = new realm.Object();
+     for (const key of ['next', 'return', 'throw']) if (typeof iterator[key] === 'function') {
+       result[key] = functionInRealm((_, args) => {
+@@ -222,6 +227,7 @@
+             assertActive();
+             try {
+               const result = Reflect.apply(descriptor.value, receiver, name === 'ReadableStream' && key === 'getReader' ? [] : args);
++              noteReadableOperation(name, key, receiver, args, result);
+               if (name === 'ReadableStreamDefaultReader' && key === 'cancel') {
+                 // Native releases synchronously, even while source.cancel's
+                 // returned promise is still pending. Pending reads settle done.
+@@ -260,12 +266,12 @@
+       if (codecDisposers.has(value)) ignore(() => codecDisposers.get(value)(disposalReason));
+       if (name === 'ReadableStreamDefaultReader') ignore(() => web.ReadableStreamDefaultReader.prototype.cancel.call(value, disposalReason));
+       if (name === 'WritableStreamDefaultWriter') ignore(() => web.WritableStreamDefaultWriter.prototype.abort.call(value, disposalReason));
+-      if (name === 'ReadableStream' && !Reflect.get(web.ReadableStream.prototype, 'locked', value)) ignore(() => web.ReadableStream.prototype.cancel.call(value, disposalReason));
++      if (name === 'ReadableStream' && !Reflect.get(web.ReadableStream.prototype, 'locked', value)) ignore(() => { const result = web.ReadableStream.prototype.cancel.call(value, disposalReason); noteReadableOperation(name, 'cancel', value, [disposalReason], result); return result; });
+       if (name === 'WritableStream' && !Reflect.get(web.WritableStream.prototype, 'locked', value)) ignore(() => web.WritableStream.prototype.abort.call(value, disposalReason));
+     }
+     for (const [value, name] of live) {
+       if (['ReadableStreamDefaultController', 'TransformStreamDefaultController', 'WritableStreamDefaultController'].includes(name)) {
+-        ignore(() => Reflect.apply(NATIVES[name].prototype.error, value, [disposalReason]));
++        ignore(() => { const result = Reflect.apply(NATIVES[name].prototype.error, value, [disposalReason]); noteReadableOperation(name, 'error', value, [disposalReason], result); return result; });
+       }
+     }
+     for (const item of pending) item.reject(disposalReason);
+diff --git a/src/request-stream-state.js b/src/request-stream-state.js
+new file mode 100644
+--- /dev/null
++++ b/src/request-stream-state.js
+@@ -0,0 +1,67 @@
++// Private observations of successful operations on genuine Node WebStreams.
++// Queue entries retain actual enqueued values until the real queue consumes them.
++import * as web from 'node:stream/web';
++const states = new WeakMap(), controllers = new WeakMap(), readers = new WeakMap();
++const locked = Object.getOwnPropertyDescriptor(web.ReadableStream.prototype, 'locked').get;
++const getReader = web.ReadableStream.prototype.getReader;
++const read = web.ReadableStreamDefaultReader.prototype.read;
++const release = web.ReadableStreamDefaultReader.prototype.releaseLock;
++const desiredSize = Object.getOwnPropertyDescriptor(web.ReadableStreamDefaultController.prototype, 'desiredSize').get;
++export function createReadableState() { return { queue: [], closed: false, errored: false, drained: false, pending: 0, version: 0 }; }
++export function bindReadable(stream, state) { states.set(stream, state); }
++export function bindReadableController(controller, state) { controllers.set(controller, state); state.controller = new WeakRef(controller); }
++export function failReadable(state) { if (state && (!state.closed || state.queue.length)) { state.errored = true; state.queue.length = 0; state.pending = 0; if (state.reader) state.reader.pending = 0; } }
++export function isReadableSource(stream) { try { locked.call(stream); return true; } catch { return false; } }
++export function readableWasDrained(stream) { return !!states.get(stream)?.drained; }
++export function readableVersion(stream) { return states.get(stream)?.version; }
++export function readableLocked(stream) { return locked.call(stream); }
++export function noteReadableOperation(name, key, receiver, args, result) {
++  if (name === 'ReadableStreamDefaultController') {
++    const state = controllers.get(receiver); if (!state) return;
++    if (key === 'enqueue') { if (state.pending) { state.pending--; if (state.reader?.pending) state.reader.pending--; } else state.queue.push(args[0]); }
++    if (key === 'close') { state.closed = true; state.pending = 0; if (state.reader) state.reader.pending = 0; }
++    if (key === 'error') failReadable(state);
++  }
++  if (name === 'ReadableStream') {
++    const state = states.get(receiver); if (!state) return;
++    if (key === 'getReader') { const binding = { state, released: false, pending: 0 }; readers.set(result, binding); state.reader = binding; }
++    if (key === 'cancel' && !locked.call(receiver)) { state.queue.length = 0; state.closed = true; state.drained = false; state.version++; }
++    // Node's native tee/pipe machinery bypasses the public reader methods.
++    // Stop claiming a synchronous mirror rather than reusing stale queue data.
++    if (['tee', 'pipeThrough', 'pipeTo', Symbol.asyncIterator].includes(key)) state.untracked = true;
++  }
++  if (name === 'ReadableStreamDefaultReader') {
++    const binding = readers.get(receiver); if (!binding || binding.released) return;
++    const { state } = binding;
++    if (key === 'read') { state.version++; if (state.queue.length) state.queue.shift(); else if (!state.closed && !state.errored) { state.pending++; binding.pending++; } }
++    if (key === 'cancel') { state.version++; state.queue.length = 0; state.closed = true; state.drained = false; state.pending = 0; binding.pending = 0; binding.released = true; state.reader = null; }
++    if (key === 'releaseLock') { state.pending -= binding.pending; binding.pending = 0; binding.released = true; state.reader = null; }
++  }
++}
++export function drainReadableSource(stream, convertChunk, { keepLock = false } = {}) {
++  const state = states.get(stream);
++  if (!state || state.untracked || !state.closed || state.errored || state.drained || locked.call(stream)) return null;
++  const controller = state.controller?.deref();
++  // The genuine native getter also observes errors raised by rejected source
++  // promises, without attaching handlers or rereading authored then getters.
++  if (controller && desiredSize.call(controller) === null) return null;
++  // Conversion must succeed for every actual queued chunk before disturbing or
++  // locking anything, as observed for invalid native stream body values.
++  let chunks;
++  try { chunks = state.queue.map(convertChunk); } catch { return null; }
++  if (chunks.some(chunk => chunk === null)) return null;
++  const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0), bytes = new Uint8Array(length);
++  let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
++  const reader = getReader.call(stream);
++  // A closed, unlocked queue has no pending reads. Each genuine read removes
++  // one queued value synchronously; the last observes its real closed state.
++  for (let index = 0; index <= state.queue.length; index++) read.call(reader).catch(() => {});
++  state.queue.length = 0; state.pending = 0; state.drained = true;
++  if (!keepLock) release.call(reader);
++  return { bytes, version: state.version };
++}
++export function lockDrainedReadable(stream, expectedVersion) {
++  const state = states.get(stream);
++  if (!state || state.version !== expectedVersion || locked.call(stream)) return false;
++  const reader = getReader.call(stream); read.call(reader).catch(() => {}); return true;
++}
+diff --git a/test/request-streams.test.js b/test/request-streams.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/request-streams.test.js
+@@ -0,0 +1,62 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import { EventEmitter } from 'node:events';
++import http from 'node:http';
++import { installFetch } from '../src/fetch.js';
++
++function fixture(t, origin='http://127.0.0.1/') {
++ const page=Object.assign(new EventEmitter(),{closed:false,documentGeneration:0,documentAbort:new AbortController(),fetch:(url,options)=>globalThis.fetch(url,options)});
++ const{window}=new JSDOM('<!doctype html><body></body>',{runScripts:'outside-only',url:origin});installFetch(page,window);t.after(()=>{page.documentAbort.abort();window.close()});return window;
++}
++const body=(w,chunks)=>new w.ReadableStream({start(c){for(const chunk of chunks)c.enqueue(chunk);c.close()}});
++const request=(w,stream)=>new w.Request('http://127.0.0.1/',{method:'POST',body:stream});
++
++test('Request preserves genuine stream identity, ignores duplex getters and does not synthesize content-type',t=>{
++ const w=fixture(t);for(const s of[new w.ReadableStream(),body(w,[new w.Uint8Array([65])])]){const r=new w.Request('http://127.0.0.1/',{method:'POST',body:s,get duplex(){throw new Error('must not read')}});assert.equal(r.body,s);assert.equal(r.bodyUsed,false);assert.equal(s.locked,false);assert.equal(r.headers.get('content-type'),null)}
++ for(const method of['GET','HEAD'])assert.throws(()=>new w.Request('http://127.0.0.1/',{method,body:body(w,[])}),w.TypeError);
++});
++
++test('closed source extraction consumes actual UTF8/binary queue bytes and immediately locks and marks used',async t=>{
++ const w=fixture(t),s=body(w,[new w.TextEncoder().encode('hé 🐼'),new w.Uint8Array([0,255])]),r=request(w,s),p=r.bytes();assert.equal(r.body,s);assert.equal(r.bodyUsed,true);assert.equal(s.locked,true);const bytes=await p;assert.ok(bytes instanceof w.Uint8Array);assert.deepEqual([...bytes],[104,195,169,32,240,159,144,188,0,255]);await assert.rejects(r.text(),e=>e instanceof w.TypeError&&e.message==='Body has already been read');
++});
++
++test('open source first consumption rejects unchanged, then actual late enqueue and close enables consumption',async t=>{
++ const w=fixture(t);let controller;const s=new w.ReadableStream({start(c){controller=c}}),r=request(w,s);await assert.rejects(r.text(),e=>e instanceof w.TypeError&&e.message==='Failed to read ReadableStream body');assert.equal(r.bodyUsed,false);assert.equal(s.locked,false);controller.enqueue(new w.TextEncoder().encode('late'));controller.close();assert.equal(await r.text(),'late');assert.equal(r.bodyUsed,true);
++});
++
++test('native string and BufferSource chunks use real view offsets and invalid values stay in the real queue',async t=>{
++ const w=fixture(t),buffer=new w.Uint8Array([0,65,66,0]).buffer;
++ for(const [chunk,expected]of[['abc',[97,98,99]],[buffer,[0,65,66,0]],[new w.Int8Array([-1,2]),[255,2]],[new w.DataView(buffer,1,2),[65,66]]])assert.deepEqual([...await request(w,body(w,[chunk])).bytes()],expected);
++ const invalid=[65,66],s=body(w,[invalid]),r=request(w,s);await assert.rejects(r.text(),w.TypeError);assert.equal(s.locked,false);assert.equal(r.bodyUsed,false);const reader=s.getReader();assert.equal((await reader.read()).value,invalid);reader.releaseLock();assert.equal(await r.text(),'');
++});
++
++test('clone really empties source unlocked and caches independent byte snapshots for original and copy',async t=>{
++ const w=fixture(t),chunk=new w.Uint8Array([65,66,67]),s=body(w,[chunk]),r=request(w,s),copy=r.clone();assert.equal(r.body,s);assert.notEqual(copy.body,s);assert.equal(s.locked,false);assert.equal(r.bodyUsed,false);assert.equal(copy.bodyUsed,false);chunk.fill(90);assert.equal(await copy.text(),'ABC');assert.equal(await r.text(),'ABC');assert.equal(s.locked,true);
++ const second=body(w,['real']),original=request(w,second),cloned=original.clone(),reader=second.getReader();assert.equal((await reader.read()).done,true);reader.releaseLock();await assert.rejects(original.text(),e=>e.message==='Body is disturbed or locked');assert.equal(await cloned.text(),'real');
++});
++
++test('external source reads and carried Request values retain separate real used state',async t=>{
++ const w=fixture(t),s=body(w,['first','remaining']),r=request(w,s),reader=s.getReader();assert.equal((await reader.read()).value,'first');reader.releaseLock();assert.equal(r.bodyUsed,false);assert.equal(await r.text(),'remaining');
++ const source=body(w,['carried']),original=request(w,source),carried=new w.Request(original);assert.equal(carried.body,source);assert.equal(await carried.text(),'carried');assert.equal(original.bodyUsed,false);await assert.rejects(original.text(),e=>e.message==='Body is disturbed or locked');
++});
++
++test('source failures and invalid closed controller operations cannot fabricate bytes or usable state',async t=>{
++ const w=fixture(t),sentinel=new w.Error('source');let c;const source=new w.ReadableStream({start(x){c=x;x.enqueue('discarded');x.error(sentinel)}}),r=request(w,source);await assert.rejects(r.text(),e=>e instanceof w.TypeError&&e.message==='Failed to read ReadableStream body');assert.equal(r.bodyUsed,false);assert.equal(source.locked,false);await assert.rejects(source.getReader().read(),e=>e===sentinel);
++ let closed;const actual=new w.ReadableStream({start(x){closed=x;x.enqueue('kept');x.close()}});assert.throws(()=>closed.enqueue('not queued'),w.TypeError);assert.throws(()=>closed.close(),w.TypeError);assert.equal(await request(w,actual).text(),'kept');
++});
++
++test('async source completion updates actual closed state while rejection preserves actual source error',async t=>{
++ const w=fixture(t);let resolve;const wait=new w.Promise(r=>{resolve=r});const s=new w.ReadableStream({async start(c){await wait;c.enqueue('async');c.close()}}),r=request(w,s);await assert.rejects(r.text(),w.TypeError);resolve();await wait;await w.Promise.resolve();assert.equal(await r.text(),'async');
++ const failure=new w.Error('async failure'),errored=new w.ReadableStream({async start(c){c.enqueue('not available');await w.Promise.resolve();throw failure}});await w.Promise.resolve();await w.Promise.resolve();const failed=request(w,errored);await assert.rejects(failed.text(),w.TypeError);assert.equal(failed.bodyUsed,false);
++});
++
++test('real loopback upload receives exact source bytes, no default content-type, and no request for open/error bodies',async t=>{
++ const rows=[],server=http.createServer(async(req,res)=>{const chunks=[];for await(const c of req)chunks.push(c);const row={bytes:[...Buffer.concat(chunks)],contentType:req.headers['content-type']??null};rows.push(row);res.setHeader('content-type','application/json');res.end(JSON.stringify(row))});await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r))});const origin=`http://127.0.0.1:${server.address().port}/`,w=fixture(t,origin),s=body(w,[new w.Uint8Array([0,255,65])]),original=new w.Request(origin,{method:'POST',body:s});const response=await w.fetch(original);assert.equal(response.status,200);assert.deepEqual(JSON.parse(await response.text()),{bytes:[0,255,65],contentType:null});assert.equal(original.body,s);assert.equal(original.bodyUsed,false);assert.equal(s.locked,false);const reader=s.getReader();assert.equal((await reader.read()).done,true);reader.releaseLock();await assert.rejects(original.text(),e=>e.message==='Failed to read ReadableStream body');
++ for(const stream of[new w.ReadableStream(),new w.ReadableStream({start(c){c.error(new w.Error('upload error'))}})])await assert.rejects(w.fetch(origin,{method:'POST',body:stream}),w.TypeError);assert.equal(rows.length,1);
++});
++
++
++test('releasing a real pending read cannot lose later actual queued bytes in the private mirror',async t=>{
++ const w=fixture(t);let controller;const s=new w.ReadableStream({start(c){controller=c}}),reader=s.getReader(),pending=reader.read();reader.releaseLock();await assert.rejects(pending,w.TypeError);controller.enqueue('after-release');controller.close();assert.equal(await request(w,s).text(),'after-release');
++});

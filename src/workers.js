@@ -1,3 +1,9 @@
+import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
+import {completeWorkerSyncResponse,createSyncWorkerRequest} from './worker-sync-transport.js';
+import {installServiceWorkerRealm} from './service-workers.js';
+import {installCache,cacheStoreFor} from './cache.js';
+import { broadcastConfig } from "./broadcast-config.js";
+import { createBroadcastRealm, createBroadcastRelay } from "./broadcast-realm.js";
 import vm from 'node:vm';
 import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { createMessagingRealm, installMessaging } from './messaging.js';
@@ -8,28 +14,32 @@ import { installStreams } from './streams.js';
 
 // Dedicated worker support. Shared workers and nested workers fail explicitly.
 // Channels and transferred ports use real Node endpoints with realm adapters.
-// Blob/File/SharedArrayBuffer message cloning and
-// importScripts has an 8MiB response limit.
+// Blob/File message values preserve native bytes and metadata through private codecs.
+// SharedArrayBuffer messages reject explicitly. importScripts has an 8MiB response limit.
 // Worker networking is buffered, with per-fetch AbortSignal and document abort.
 // The VM worker global is an API boundary, not a
 // security sandbox for hostile code. HTTP CORS/CSP policy remains a browser gap.
 const SYNC_BYTES = 8 * 1024 * 1024;
 export function installWorkers(page, window, { enabled = true } = {}) {
+  const creatorSnapshot=captureWorkerCreator(page,window);
   const signal = page.documentAbort?.signal, owned = new Set();
   const messaging = installMessaging(page, window);
   const clone = value => messaging.receive({ data: value, ports: [] }).data;
+  const serviceRequests=new Map();
   let disposed = false;
   const active = () => !disposed && !signal?.aborted && !page.closed;
   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
   signal?.addEventListener('abort', dispose, { once: true });
   class Worker extends window.EventTarget {
-    #thread; #abort = new AbortController(); #terminated = false; #requests = new Map();
-    constructor(input, options = {}) {
+    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map();
+    constructor(input, options = {}, serviceToken) {
       super();
+      const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
       if (!active()) throw new window.DOMException('The document is disposed', 'InvalidStateError');
-      const url = new URL(String(input), window.document.baseURI);
+      const creator=creatorSnapshot();
+      const url = new URL(String(input), creator.baseURL);
       if (!['http:', 'https:', 'data:', 'blob:'].includes(url.protocol)) throw new window.DOMException(`Unsupported worker URL: ${url.protocol}`, 'NotSupportedError');
-      const origin = page.securityOrigin ?? window.location.origin;
+      const origin = creator.origin;
       if (url.protocol !== 'data:' && origin !== 'null' && url.origin !== origin) throw new window.DOMException('Worker URL must have the document origin', 'SecurityError');
       const type = options.type ?? 'classic';
       if (!['classic', 'module'].includes(type)) throw new TypeError('Worker type must be classic or module');
@@ -37,21 +47,37 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       if (!['omit', 'same-origin', 'include'].includes(credentials)) throw new TypeError('Invalid worker credentials');
       // A disabled resource policy intentionally creates an inert Worker, as
       // observed in native serve/fetch defaults; no script request is issued.
-      if (!enabled) return;
+      if (!enabled&&!service) return;
       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+      this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
       this.#thread = new ThreadWorker(new URL(import.meta.url), {
         // File-backed workers must not inherit an embedding CLI's --input-type
         // or --eval flags. Only the VM-module capability is needed here.
         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
-        redPandaWorker: true, url: url.href, type, name: String(options.name ?? ''),
+        redPandaWorker: true, origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
         navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
           languages: [...window.navigator.languages], platform: window.navigator.platform },
       } });
+      service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
       owned.add(this);
       this.#thread.on('message', async message => {
+        if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
+        if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
+        if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
         if (this.#terminated || !active()) { for (const port of message.ports ?? []) port.close(); return; }
-        if (message.kind === 'message') messaging.dispatchMessage(this, message);
+        if(message.kind==='serviceReady')service?.ready();
+        else if(message.kind==='serviceLifecycle')service?.lifecycle(message.type,message.error);
+        else if(message.kind==='serviceError')service?.error(message.error);
+        else if(message.kind==='serviceCall'){
+          try{const result=await service.call(message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'serviceResponse',id:message.id,result});}
+          catch(error){if(!this.#terminated&&active())this.#thread.postMessage({kind:'serviceResponse',id:message.id,error:{name:error.name,message:error.message}});}
+        }
+        else if (message.kind === 'cacheOperation') {
+          try { const result=await cacheStoreFor(page).operate(creator.origin,message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,result}); }
+          catch(error) {if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}});}
+        } else if (message.kind === 'message') messaging.dispatchMessage(this, message);
         else if (message.kind === 'error') {
+          if(service){page.emit('console',{type:'error',args:[message.error.message]});return;}
           const error = new window.Error(message.error.message); error.name = message.error.name; error.stack = message.error.stack;
           const event = new window.ErrorEvent('error', { message: error.message, filename: message.error.filename || url.href, error, cancelable: true });
           if (this.dispatchEvent(event)) page.emit('pageError', error);
@@ -74,18 +100,20 @@ export function installWorkers(page, window, { enabled = true } = {}) {
               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
               credentialsOrigin: url.origin,
               ...(blobSnapshot ? { blobSnapshot } : {}),
-            }, message.script ? 'Script' : 'Fetch');
+            }, message.script ? 'Script' : message.resourceType ?? 'Fetch');
             const bytes = new Uint8Array(await response.arrayBuffer());
             const result = { status: response.status, statusText: response.statusText,
               headers: [...response.headers], url: response.url || message.url, bytes };
-            if (message.sync) {
+            if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);
+            else if (message.sync) {
               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
               const encoded = new TextEncoder().encode(JSON.stringify({ ...result, bytes: undefined, source: new TextDecoder().decode(bytes) }));
               if (encoded.length > destination.length) throw new Error('importScripts response exceeds 8MiB limit');
               destination.set(encoded); Atomics.store(state, 1, encoded.length); Atomics.store(state, 0, 1); Atomics.notify(state, 0);
             } else if (!this.#terminated && active()) this.#thread.postMessage({ kind: 'response', id: message.id, result }, [bytes.buffer]);
           } catch (error) {
-            if (message.sync) {
+            if(message.syncBinary)completeWorkerSyncResponse(message.sync,null,error);
+            else if (message.sync) {
               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
               const encoded = new TextEncoder().encode(JSON.stringify({ error: String(error.message ?? error) }));
               destination.set(encoded.subarray(0, destination.length)); Atomics.store(state, 1, Math.min(encoded.length, destination.length)); Atomics.store(state, 0, 1); Atomics.notify(state, 0);
@@ -95,6 +123,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       });
       this.#thread.on('error', error => {
         if (!this.#terminated && active()) {
+          if(service){service.error({name:error.name,message:error.message});return;}
           const event = new window.ErrorEvent('error', { message: error.message, error, filename: url.href, cancelable: true });
           if (this.dispatchEvent(event)) page.emit('pageError', error);
         }
@@ -102,7 +131,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       this.#thread.on('messageerror', () => {
         if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
       });
-      this.#thread.once('exit', () => { owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+      this.#thread.once('exit', () => { this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
       // Installing a message listener refs Node's underlying MessagePort; unref
       // after installing listeners so workers cannot hold server shutdown open.
       this.#thread.unref();
@@ -135,22 +164,22 @@ export function installWorkers(page, window, { enabled = true } = {}) {
   window.SharedWorker = class SharedWorker {
     constructor() { throw new window.DOMException('SharedWorker is not implemented', 'NotSupportedError'); }
   };
-  return { dispose, get size() { return owned.size; } };
+  return { dispose, createService(input,options,configuration){const token=Symbol();serviceRequests.set(token,configuration);return new Worker(input,options,token);}, get size() { return owned.size; } };
 }
 
 async function runWorker() {
-  const pending = new Map(), queued = [];
-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams;
+  const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime;
   const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
-  const request = (url, init = {}, script = false, signal) => new Promise((resolve, reject) => {
+  const request = (url, init = {}, script = false, signal, resourceType) => new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return; }
     const id = requestId++;
     const abort = () => { pending.delete(id); parentPort.postMessage({ kind: 'cancel', id }); reject(signal.reason); };
     signal?.addEventListener('abort', abort, { once: true });
     pending.set(id, { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
-    parentPort.postMessage({ kind: 'request', id, url, init, script });
+    parentPort.postMessage({ kind: 'request', id, url, init, script, resourceType });
   });
   const syncSource = url => {
     const sync = new SharedArrayBuffer(SYNC_BYTES + 8), state = new Int32Array(sync, 0, 2);
@@ -170,7 +199,7 @@ async function runWorker() {
       }
     },
     close() { if (!closed) {
-      closed = true; lifetime.abort(); for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose();
+      closed = true; lifetime.abort(); for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose(); broadcast?.dispose();
       for (const message of queued) for (const port of message.ports ?? []) port.close(); queued.length = 0;
       parentPort.postMessage({ kind: 'close' }); parentPort.close();
     } },
@@ -194,12 +223,12 @@ async function runWorker() {
         vm.runInContext(result.source, context, { filename: result.url });
       }
     },
-    async fetch(input, init = {}) {
+    async fetch(input, init = {}, resourceType) {
       const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), init);
       const headers = [...new Headers(init.headers ?? original.headers)];
       const method = init.method ?? original.method;
       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal);
+      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal, resourceType);
       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
       streams.adopt(response.body);
       Object.defineProperty(response, 'url', { value: result.url }); return response;
@@ -251,30 +280,44 @@ async function runWorker() {
     const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
     Object.assign(globalThis, { WorkerNavigator, navigator: nav });
     globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
-    const createTrustedMessage = (type, data, ports) => { const event = new MessageEvent(type, { data, ports }); trustedEvents.add(event); return event; };
+    globalThis.__trustWorkerEvent=event=>{trustedEvents.add(event);return event;};
+    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); trustedEvents.add(event); return event; };
     globalThis.__createTrustedMessage = createTrustedMessage;
     globalThis.__emitMessage = (data, ports) => dispatchEvent(createTrustedMessage('message', data, ports));
   })();`, context);
   emit = vm.runInContext('__emitMessage', context);
   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
+  const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
   messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
     active: () => !closed,
     dispatch: (target, type, data, ports) => target.dispatchEvent(createTrustedMessage(type, data, ports)),
     reportError: value => dispatchError(value),
   });
   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
+  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>target.dispatchEvent(createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
+  Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
   vm.runInContext(GEOMETRY_SOURCE, context);
-  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;', context);
+  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+  installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+    store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+
+  if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
+    call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
+  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
   const dispatchError = value => vm.runInContext('__dispatchError', context)(value);
   parentPort.on('message', message => {
     if (closed) return;
-    if (message.kind === 'response') {
+    if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+    else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
+    else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+    else if(message.kind==='cacheResponse') {const entry=cachePending.get(message.id);if(!entry)return;cachePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+    else if (message.kind === 'response') {
       const entry = pending.get(message.id); if (!entry) return; pending.delete(message.id); entry.cleanup();
       message.error ? entry.reject(new Error(message.error)) : entry.resolve(message.result);
     } else if (message.kind === 'message') {
-      if (!ready) queued.push(message); else { const event = messaging.receive(message); emit(event.data, event.ports); }
+      if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
     }
   });
   process.on('unhandledRejection', dispatchError);
@@ -329,9 +372,10 @@ async function runWorker() {
       });
     }
     ready = true;
-    for (const message of queued) { if (!closed) { const event = messaging.receive(message); emit(event.data, event.ports); } }
+    if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
+    for (const message of queued) { if (!closed) { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
     queued.length = 0;
-  } catch (error) { dispatchError(error); }
+  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else dispatchError(failure); }
 }
 
 if (!isMainThread && workerData?.redPandaWorker) void runWorker();

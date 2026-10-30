@@ -24,7 +24,16 @@ export function createWriteParser(parser, {
   }
   function run(operation) {
     feeding++;
-    try { operation(); }
+    try {
+      operation();
+      // parse5 groups already-consumed character tokens across chunks. Expose
+      // that real pending token before write returns, without a synthetic EOF,
+      // delimiter, node, or table-builder token.
+      const tokenizer = parser.tokenizer;
+      if (!tokenizer.inLoop && !tokenizer.paused && tokenizer.currentCharacterToken) {
+        tokenizer._emitCurrentCharacterToken(tokenizer.getCurrentLocation(0));
+      }
+    }
     catch (error) { failed(error); throw error; }
     finally { feeding--; }
     drained();

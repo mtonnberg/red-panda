@@ -1,0 +1,1 @@
+(()=>{const x=new TouchEvent('x',{touches:[new Touch({identifier:1,target:document})]}).touches;return [-1,0,1,1.5,NaN,Infinity,undefined,null,'0','1',4294967296].map(i=>{try{return {input:String(i),result:x.item(i)?.identifier??null}}catch(e){return {input:String(i),error:e.name,message:e.message}}});})()

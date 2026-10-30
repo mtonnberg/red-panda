@@ -1,4 +1,5 @@
-import { installListenerOwnership } from './listener-ownership.js';
+import { completeInitialBlankFrame } from './document-reset.js';
+import { installListenerOwnership, createOwnedWindow } from './listener-ownership.js';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -71,7 +72,8 @@ function patch() {
   };
   WindowFactory.createWindow = function (options) {
     const operation = operations.at(-1);
-    const window = createWindow(options);
+    const window = operation && !operation.created && !operation.owner.registry.disposed
+      ? createOwnedWindow(createWindow, options) : createWindow(options);
     if (!operation || operation.created || operation.owner.registry.disposed) return window;
     operation.created = true; operation.restore();
     operation.owner.registry.register(operation, window);
@@ -99,6 +101,36 @@ function patch() {
     page.documentAbort.signal.addEventListener('abort', abort, { once: true });
     return request;
   };
+}
+
+// Keep retained inactive Documents as real DOM trees. Delegate every other
+// cleanup operation to the original close, including timers, requests and ports.
+function closeRetainingDocument(document, close) {
+  const view = document._defaultView;
+  // Registry teardown already discarded child browsing contexts. Remove their
+  // Window accessors before native close recurses; retained iframe DOM nodes
+  // no longer have a live contentWindow after their own teardown.
+  if (view) {
+    for (let index = 0; index < view._length; index++) Reflect.deleteProperty(view, String(index));
+    view._length = 0;
+  }
+  document._lastFocusedElement = null;
+  const body = document.body;
+  const descriptor = body && Object.getOwnPropertyDescriptor(body, '_replaceAll');
+  const replaceAll = body?._replaceAll;
+  let pending = true;
+  if (body) Object.defineProperty(body, '_replaceAll', { configurable: true, writable: true, value(node, ...args) {
+    // Pinned jsdom's native close clears body.innerHTML with an empty real
+    // fragment. Skip only that destructive teardown replacement, not parsing
+    // or public mutation methods, and restore the private method immediately.
+    if (pending && node?.nodeType === 11 && !node.firstChild) { pending = false; return; }
+    return replaceAll.call(this, node, ...args);
+  } });
+  try { return close(); }
+  finally {
+    if (body) { if (descriptor) Object.defineProperty(body, '_replaceAll', descriptor); else delete body._replaceAll; }
+    document._defaultView = null;
+  }
 }
 
 function stale() { return Object.assign(new Error('Frame document is detached or no longer current'), { code: -32602 }); }
@@ -271,7 +303,10 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     if (fresh) registry.announce('frameAttached', { frameId: record.id, parentFrameId: record.parentId });
     registry.announce('frameNavigationStarted', { frameId: record.id, loaderId: framePage.loaderId, url: framePage.url });
     const closed = childWindow.close.bind(childWindow);
-    childWindow.close = () => { if (record.page === framePage) destroyDocument(record); return closed(); };
+    childWindow.close = () => {
+      if (record.page === framePage) destroyDocument(record);
+      return closeRetainingDocument(impl, closed);
+    };
     installListenerOwnership(childWindow._globalProxy).scope(() => {
     record.document.addEventListener('DOMContentLoaded', () => {
       if (!framePage.closed) registry.announce('frameDOMContentLoaded', { frameId: record.id, loaderId: framePage.loaderId });
@@ -286,11 +321,21 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     for (const type of ['log', 'info', 'warn', 'error', 'debug']) childWindow.console[type] = (...args) => framePage.emit('console', { type, args });
     // This call runs inside createWindow, before native frame parsing starts.
     prepareWindow?.(framePage, childWindow._globalProxy);
+    // The known literal about:blank placeholder has no authored parser script.
+    // Adopt only native load listeners added after prepareWindow has returned;
+    // authored new-document injection listeners are already in the checkpoint.
+    if (framePage.url === 'about:blank' && operation.srcdoc === undefined) {
+      operation.blankListeners = installListenerOwnership(childWindow._globalProxy).checkpoint(record.document, 'load');
+    }
     operation.record = record;
   };
   registry.afterOperation = operation => {
     const record = operation.record;
     if (!record?.page || record.page.closed || record.waitingResource) return;
+    if (operation.blankListeners) {
+      installListenerOwnership(record.window._globalProxy).adoptSince(record.document, 'load', operation.blankListeners);
+      completeInitialBlankFrame(record.window._globalProxy);
+    }
     registry.committed(record);
   };
   registry.committed = record => {
@@ -310,6 +355,7 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     if (finalURL) {
       const documentImpl = implForWrapper(record.document);
       documentImpl._URL = parseURL(finalURL); documentImpl._origin = new URL(finalURL).origin;
+      documentImpl._clearBaseURLCache();
       record.window._origin = documentImpl._origin; record.page.url = finalURL;
       const mimeType = request?.response?.headers?.['content-type']?.split(';')[0].trim();
       if (mimeType) documentImpl.contentType = mimeType;
@@ -369,6 +415,8 @@ export function installFrames(page, window, { prepareWindow } = {}) {
   registry.dispose = () => {
     if (registry.disposed) return;
     for (const child of children(root)) registry.detach(child.element);
+    for (let index = 0; index < window._length; index++) Reflect.deleteProperty(window, String(index));
+    window._length = 0;
     registry.disposed = true; contexts.clear(); registry.frames.clear(); DOCUMENTS.delete(implForWrapper(document));
     page.documentAbort?.signal.removeEventListener('abort', registry.dispose);
   };

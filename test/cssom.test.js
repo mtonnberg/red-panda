@@ -134,7 +134,8 @@ test('stylesheet parsing resumes after nested blocks and exposes useful parent a
   const sheet=d.querySelector('style').sheet,rule=sheet.cssRules[0];
   assert.equal(rule.style.color,'red');assert.equal(rule.style.display,'none');assert.equal(rule.style.opacity,'0');
   assert.equal(rule.style.parentRule,rule);assert.equal(rule.parentStyleSheet,sheet);assert.equal(w.getComputedStyle(d.querySelector('div')).display,'none');
-  assert.equal(rule.cssText,'.target { color: red; display: none; opacity: 0; }');
+  assert.equal(rule.cssText,'.target { color: red; display: none; opacity: 0; &.nested { color: blue; } span:hover { opacity: 0.4; } }');
+  assert.equal(rule.cssRules.length,2);assert.equal(rule.cssRules[0].parentRule,rule);
   rule.cssText='.renamed { width: 0; color: green; }';
   assert.equal(rule.selectorText,'.renamed');assert.equal(rule.style.width,'0px');assert.equal(rule.style.parentRule,rule);
   rule.selectorText='.target';assert.equal(w.getComputedStyle(d.querySelector('div')).width,'0px');

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {prepareCLIArguments,readCLIWaitScript,parseCLIHTTPHeaders} from '../src/cli-options.js';
 import { parseArgs } from 'node:util';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
@@ -28,20 +29,23 @@ Usage:
 
 Fetch options:
   --dump FORMAT          html, markdown, semantic_tree, semantic_tree_text,
-                         structured_data, text, links, png or pdf (default no dump)
+                         structured_data, text, links, png or pdf (no flag: no dump; bare --dump: html)
   --dump-selector CSS    Dump the first matching element
   --dump-max-bytes N     Soft UTF-8 cap for HTML/Markdown, with truncation marker
   --strip-mode GROUP     js, css, ui, invisible, shell or clutter (repeatable)
   --with-base            Insert an absolute base URL into full-document HTML
   --markdown-alternate   Prefer an authored Markdown alternate within the page deadline
   --json                 Wrap the dump and HTTP metadata in JSON
-  --wait-until load|domcontentloaded|done          Readiness (default load)
+  --wait-until load|domcontentloaded|done          Readiness (default load; none with a wait predicate)
   --wait-ms N             Maximum page wait in milliseconds (default 5000)
   --wait-selector CSS     Wait for a matching DOM element
   --wait-script JS        Wait for a truthy JavaScript expression
+  --wait-script-file PATH Read a wait expression from a UTF-8 file (last script flag wins)
+  --http-header HEADER   Set a fixed Name: Value header on every HTTP request (repeatable)
   --no-javascript         Parse HTML without running page scripts
   --fail-on-http-error    Dump HTTP errors and exit 22
   --user-agent STRING    Override the user agent
+  --experimental-features FEATURE  Enable serviceworker (repeatable)
   --load-resources KIND  Enable stylesheet, iframe, worker or beacon requests (repeatable)
   --inject-script JS     Run before page scripts (repeatable, in CLI order)
   --inject-script-file PATH  Read a preload script from a file
@@ -60,7 +64,7 @@ function integer(value, name, minimum = 1) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { values, positionals, tokens } = parseArgs({ args: argv, allowPositionals: true, tokens: true, options: {
+  const { values, positionals, tokens } = parseArgs({ args: prepareCLIArguments(argv, [...DUMP_FORMATS, 'png', 'pdf']), allowPositionals: true, tokens: true, options: {
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
     dump: { type: 'string', default: '' }, json: { type: 'boolean' },
     'dump-selector': { type: 'string' }, 'dump-max-bytes': { type: 'string' },
@@ -68,7 +72,8 @@ export async function main(argv = process.argv.slice(2)) {
     'markdown-alternate': { type: 'boolean' },
     host: { type: 'string', default: '127.0.0.1' }, port: { type: 'string', default: '9222' },
     'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
-    'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' },
+    'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' }, 'wait-script-file': { type: 'string' },
+    'http-header': { type: 'string', multiple: true },
     'no-javascript': { type: 'boolean' }, 'user-agent': { type: 'string' },
     'fail-on-http-error': { type: 'boolean' },
     'inject-script': { type: 'string', multiple: true }, 'inject-script-file': { type: 'string', multiple: true },
@@ -78,16 +83,20 @@ export async function main(argv = process.argv.slice(2)) {
     'remote-allow-origins': { type: 'string', multiple: true },
     'cdp-port': { type: 'string' },
     'load-resources': { type: 'string', multiple: true },
+    'experimental-features': { type: 'string', multiple: true },
   } });
   if (values.version) { console.log(`RedPanda/${VERSION}`); return; }
   if (values.help || !positionals.length) { console.log(help); return; }
   const [command, ...rest] = positionals;
   if (command === 'version' || values.version) { console.log(`RedPanda/${VERSION}`); return; }
   const timeout = integer(values['wait-ms'], '--wait-ms');
+  const cliHTTPHeaders = parseCLIHTTPHeaders(values['http-header']);
   let loadResources = values['load-resources'] ?? (command === 'mcp' ? ['stylesheet'] : []);
   for (const resource of loadResources) if (!['none', 'stylesheet', 'iframe', 'worker', 'beacon'].includes(resource)) throw new Error(`Unsupported resource loading: ${resource}`);
   if (loadResources.includes('none')) loadResources = [];
-  const options = { timeout, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
+  const features = values['experimental-features'] ?? [];
+  for (const feature of features) if (feature !== 'serviceworker') throw new Error(`Unsupported experimental feature: ${feature}`);
+  const options = { experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
   if (command === 'run') {
     if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
     if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');
@@ -153,6 +162,8 @@ export async function main(argv = process.argv.slice(2)) {
   for (const mode of dumpOptions.stripModes) if (!STRIP_MODES.includes(mode)) throw new Error(`Unsupported strip mode: ${mode}`);
   if (dumpOptions.maxBytes !== undefined && !['html', 'markdown'].includes(values.dump)) throw new Error('--dump-max-bytes requires HTML or Markdown');
   if (!['load', 'domcontentloaded', 'done'].includes(values['wait-until'])) throw new Error('Unsupported --wait-until value');
+  const waitScript = await readCLIWaitScript(tokens);
+  const waitUntil = tokens.some(token => token.kind === 'option' && token.name === 'wait-until') ? values['wait-until'] : (values['wait-selector'] !== undefined || waitScript !== undefined ? 'none' : 'load');
   const browser = new Browser(options);
   try {
     const template = browser.contexts.get('default').cookies;
@@ -180,8 +191,8 @@ export async function main(argv = process.argv.slice(2)) {
       try {
         // Lightpanda's wait-ms is a deadline, not an unconditional delay.
         await page.navigate(url, {
-          waitUntil: values['wait-until'] === 'done' ? 'networkidle0' : values['wait-until'],
-          selector: values['wait-selector'], script: values['wait-script'],
+          waitUntil: waitUntil === 'done' ? 'networkidle0' : waitUntil,
+          selector: values['wait-selector'], script: waitScript,
         });
       } catch (cause) {
         failed = true;
@@ -223,7 +234,7 @@ export async function main(argv = process.argv.slice(2)) {
     if (values['cookie-jar']) await writeCookieFile(values['cookie-jar'], [...collectedCookies.values()]);
     if (values.json) console.log(JSON.stringify(results.length === 1 ? results[0] : { results }));
     else if (binaryDump) process.stdout.write(Buffer.from(results[0].content, 'base64'));
-    else if (values.dump) console.log(results[0].content);
+    else if (values.dump) process.stdout.write(results[0].content);
     process.exitCode = failed ? 1 : values['fail-on-http-error'] && httpError ? 22 : 0;
   } finally { browser.close(); }
 }

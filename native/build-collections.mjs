@@ -7,8 +7,10 @@ import { spawn } from 'node:child_process';
 const source = fileURLToPath(new URL('./collections.cc', import.meta.url));
 export const defaultCollectionPath = fileURLToPath(new URL(`./build/${process.platform}-${process.arch}/node-${process.versions.node}/collections.node`, import.meta.url));
 
-export async function buildCollections({ headers = process.env.RED_PANDA_NODE_HEADERS, output = defaultCollectionPath } = {}) {
-  if (process.platform !== 'linux') throw new Error('The independent collection addon currently has a Linux build recipe');
+export async function buildCollections({ headers = process.env.RED_PANDA_NODE_HEADERS, output = defaultCollectionPath,
+  sourcePath = source, moduleName = 'red_panda_collections', label = 'Collection' } = {}) {
+  if (process.platform !== 'linux') throw new Error(`The independent ${label.toLowerCase()} addon currently has a Linux build recipe`);
+  sourcePath = path.resolve(sourcePath);
   const executable = await realpath(process.execPath);
   const candidates = [headers, path.resolve(path.dirname(executable), '../include/node'),
     path.resolve(path.dirname(executable), `../node_modules/node-${process.platform}-${process.arch}/include/node`),
@@ -28,14 +30,14 @@ export async function buildCollections({ headers = process.env.RED_PANDA_NODE_HE
   const temporary = `${output}.${process.pid}.tmp`;
   await new Promise((resolve, reject) => {
     const child = spawn(process.env.CXX ?? 'g++', ['-std=c++20', '-O2', '-fno-strict-aliasing', '-fPIC', '-shared', '-Wall', '-Wextra',
-      '-Wno-unused-parameter', '-DNODE_GYP_MODULE_NAME=red_panda_collections', `-I${include}`, source, '-o', temporary], { stdio: ['ignore', 'ignore', 'pipe'] });
+      '-Wno-unused-parameter', `-DNODE_GYP_MODULE_NAME=${moduleName}`, `-I${include}`, sourcePath, '-o', temporary], { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', data => { if (stderr.length < 20000) stderr += data; });
-    child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Collection addon compiler exited ${code}: ${stderr}`)));
+    child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`${label} addon compiler exited ${code}: ${stderr}`)));
   });
   const manifest = { node: process.version, abi: process.versions.modules, v8: process.versions.v8,
     platform: process.platform, architecture: process.arch, headers: include,
-    sourceSHA256: createHash('sha256').update(await readFile(source)).digest('hex'),
+    sourceSHA256: createHash('sha256').update(await readFile(sourcePath)).digest('hex'),
     binarySHA256: createHash('sha256').update(await readFile(temporary)).digest('hex') };
   await rename(temporary, output);
   await writeFile(`${output}.json`, JSON.stringify(manifest, null, 2) + '\n');

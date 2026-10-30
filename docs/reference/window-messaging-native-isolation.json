@@ -1,0 +1,441 @@
+{
+  "scope": "Bounded public Window.postMessage caller/receiver/transfer and BroadcastChannel observations",
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "expression": "(async()=>{\n const report={},attempt=fn=>{try{return fn()??null}catch(e){return{error:e.name,message:e.message}}},wait=()=>new Promise(r=>setTimeout(r,40));\n const frame=document.createElement('iframe');document.body.append(frame);const child=frame.contentWindow;\n const log=[];for(const [target,name]of[[window,'parent'],[child,'child']])target.addEventListener('message',event=>log.push({target:name,label:event.data?.label,origin:event.origin,sourceParent:event.source===window,sourceChild:event.source===child,sourceNull:event.source===null,trusted:event.isTrusted,ports:event.ports.length,identity:event.ports[0]===event.data?.port,realmObject:event.data instanceof target.Object,realmArray:event.ports instanceof target.Array}));\n child.postMessage({label:'parent-to-child'},'*');\n child.eval(\"parent.postMessage({label:'child-to-parent'},'*')\");\n child.postMessage.call(window,{label:'borrowed-child-method'},'*');\n child.eval(\"parent.postMessage.call(window,{label:'borrowed-parent-method'},'*')\");\n report.validation={zero:attempt(()=>postMessage()),one:attempt(()=>postMessage({label:'one'})),slash:attempt(()=>child.postMessage({label:'slash'},'/')),options:attempt(()=>child.postMessage({label:'options'},{targetOrigin:'*'})),nullOrigin:attempt(()=>child.postMessage({label:'null-target'},null)),invalid:attempt(()=>child.postMessage('x','http://[')),illegalThis:attempt(()=>window.postMessage.call({},'x','*'))};\n const channel=new MessageChannel();report.port=attempt(()=>window.postMessage({label:'port',port:channel.port2},'*',[channel.port2]));\n const buffer=new ArrayBuffer(4);report.mismatch=attempt(()=>{child.postMessage({label:'mismatch',buffer},'https://wrong.example',[buffer]);return buffer.byteLength});\n report.originCoercion=[];report.symbolOrigin=attempt(()=>child.postMessage({label:'symbol-origin'},Symbol()));\n report.originObject=attempt(()=>child.postMessage({label:'origin-object'},{get targetOrigin(){report.originCoercion.push('targetOrigin');return '*'},get transfer(){report.originCoercion.push('transfer');return []},toString(){report.originCoercion.push('toString');return '*'}}));\n const optionsPort=new MessageChannel();report.optionsTransfer=attempt(()=>window.postMessage({label:'options-port',port:optionsPort.port2},{targetOrigin:'*',transfer:[optionsPort.port2]}));\n report.invalidTransfer=attempt(()=>window.postMessage('invalid','*',[{}]));report.duplicateBuffer=attempt(()=>{const b=new ArrayBuffer(1);window.postMessage('duplicate','*',[b,b]);return b.byteLength});\n report.mismatchCloneError=attempt(()=>child.postMessage(()=>{},'https://wrong.example'));\n await wait();report.events=log;channel.port1.close();frame.remove();\n report.broadcast={api:typeof BroadcastChannel};if(typeof BroadcastChannel!=='function')return report;\n const bc=new BroadcastChannel('probe'),receiver=new BroadcastChannel('probe'),other=new BroadcastChannel('other');let self=0,wrong=0;bc.onmessage=()=>self++;other.onmessage=()=>wrong++;\n const events=[];receiver.onmessage=async e=>{const entry={value:e.data,origin:e.origin,sourceNull:e.source===null,ports:e.ports.length,trusted:e.isTrusted,bubbles:e.bubbles,cancelable:e.cancelable,realm:e.data instanceof Object,tag:Object.prototype.toString.call(e.data),blob:e.data instanceof Blob,file:e.data instanceof File};if(entry.blob)entry.blobData={text:await e.data.text(),size:e.data.size,type:e.data.type,name:e.data.name};events.push(entry)};\n const payload={value:1};bc.postMessage(payload);payload.value=9;report.broadcast.sync=events.length;\n report.broadcast.validation={missingConstructor:attempt(()=>new BroadcastChannel()),missingMessage:attempt(()=>bc.postMessage()),uncloneable:attempt(()=>bc.postMessage(()=>{})),port:attempt(()=>bc.postMessage(new MessageChannel().port1)),constructorName:BroadcastChannel.name,constructorLength:BroadcastChannel.length,tag:Object.prototype.toString.call(bc),eventTarget:bc instanceof EventTarget};\n report.broadcast.descriptors=Object.fromEntries(['name','postMessage','close','onmessage','onmessageerror',Symbol.toStringTag].map(key=>{const d=Object.getOwnPropertyDescriptor(BroadcastChannel.prototype,key);return[String(key),d?{enumerable:d.enumerable,configurable:d.configurable,writable:d.writable,value:typeof d.value==='function'?'function':d.value,get:typeof d.get,set:typeof d.set,length:d.value?.length}:null]}));\n report.broadcast.cloneability={blob:attempt(()=>bc.postMessage(new Blob(['blob']))),file:attempt(()=>bc.postMessage(new File(['file'],'file.txt'))),symbol:attempt(()=>bc.postMessage(Symbol())),sharedArrayBuffer:typeof SharedArrayBuffer==='function'?attempt(()=>bc.postMessage(new SharedArrayBuffer(2))):'constructor absent'};\n await wait();report.broadcast.events=events;report.broadcast.self=self;report.broadcast.wrong=wrong;receiver.close();receiver.close();report.broadcast.closed=attempt(()=>receiver.postMessage('closed'));report.broadcast.closedUncloneable=attempt(()=>receiver.postMessage(()=>{}));report.broadcast.nameAfterClose=receiver.name;\n const lateSender=new BroadcastChannel('late'),early=new BroadcastChannel('late');let lateLog=[];early.onmessage=e=>{const late=new BroadcastChannel('late');late.onmessage=e=>lateLog.push(e.data);early.close();lateSender.postMessage('after');setTimeout(()=>late.close(),20)};lateSender.postMessage('before');early.postMessage('not-for-late');await wait();report.broadcast.late=lateLog;\n for(const c of[bc,other,lateSender,early])c.close();return report;\n})()",
+  "result": {
+    "validation": {
+      "zero": {
+        "error": "TypeError",
+        "message": "invalid argument"
+      },
+      "one": null,
+      "slash": null,
+      "options": null,
+      "nullOrigin": null,
+      "invalid": null,
+      "illegalThis": {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    },
+    "port": null,
+    "mismatch": 4,
+    "originCoercion": [
+      "transfer"
+    ],
+    "symbolOrigin": null,
+    "originObject": null,
+    "optionsTransfer": null,
+    "invalidTransfer": {
+      "error": "DataCloneError",
+      "message": "The object can not be cloned"
+    },
+    "duplicateBuffer": 1,
+    "mismatchCloneError": {
+      "error": "DataCloneError",
+      "message": "The object can not be cloned"
+    },
+    "events": [
+      {
+        "target": "parent",
+        "label": "child-to-parent",
+        "origin": "null",
+        "sourceParent": false,
+        "sourceChild": true,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "parent",
+        "label": "borrowed-child-method",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "parent",
+        "label": "one",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "parent",
+        "label": "port",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 1,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "parent",
+        "label": "options-port",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 1,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "parent",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": false,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "parent-to-child",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "borrowed-parent-method",
+        "origin": "null",
+        "sourceParent": false,
+        "sourceChild": true,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "slash",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "options",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "null-target",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": false,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "mismatch",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "symbol-origin",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      },
+      {
+        "target": "child",
+        "label": "origin-object",
+        "origin": "http://127.0.0.1:41829",
+        "sourceParent": true,
+        "sourceChild": false,
+        "sourceNull": false,
+        "trusted": true,
+        "ports": 0,
+        "identity": true,
+        "realmObject": true,
+        "realmArray": true
+      }
+    ],
+    "broadcast": {
+      "api": "function",
+      "sync": 0,
+      "validation": {
+        "missingConstructor": {
+          "error": "TypeError",
+          "message": "invalid argument"
+        },
+        "missingMessage": {
+          "error": "TypeError",
+          "message": "invalid argument"
+        },
+        "uncloneable": {
+          "error": "DataCloneError",
+          "message": "The object can not be cloned"
+        },
+        "port": {
+          "error": "DataCloneError",
+          "message": "The object can not be cloned"
+        },
+        "constructorName": "BroadcastChannel",
+        "constructorLength": 1,
+        "tag": "[object BroadcastChannel]",
+        "eventTarget": true
+      },
+      "descriptors": {
+        "name": {
+          "enumerable": true,
+          "configurable": true,
+          "get": "function",
+          "set": "undefined"
+        },
+        "postMessage": {
+          "enumerable": true,
+          "configurable": true,
+          "writable": true,
+          "value": "function",
+          "get": "undefined",
+          "set": "undefined",
+          "length": 1
+        },
+        "close": {
+          "enumerable": true,
+          "configurable": true,
+          "writable": true,
+          "value": "function",
+          "get": "undefined",
+          "set": "undefined",
+          "length": 0
+        },
+        "onmessage": {
+          "enumerable": true,
+          "configurable": true,
+          "get": "function",
+          "set": "function"
+        },
+        "onmessageerror": {
+          "enumerable": true,
+          "configurable": true,
+          "get": "function",
+          "set": "function"
+        },
+        "Symbol(Symbol.toStringTag)": {
+          "enumerable": false,
+          "configurable": true,
+          "writable": false,
+          "value": "BroadcastChannel",
+          "get": "undefined",
+          "set": "undefined",
+          "length": 16
+        }
+      },
+      "cloneability": {
+        "blob": null,
+        "file": null,
+        "symbol": {
+          "error": "DataCloneError",
+          "message": "The object can not be cloned"
+        },
+        "sharedArrayBuffer": {
+          "error": "DataCloneError",
+          "message": "The object can not be cloned"
+        }
+      },
+      "events": [
+        {
+          "value": {
+            "value": 1
+          },
+          "origin": "http://127.0.0.1:41829",
+          "sourceNull": true,
+          "ports": 0,
+          "trusted": true,
+          "bubbles": false,
+          "cancelable": false,
+          "realm": true,
+          "tag": "[object Object]",
+          "blob": false,
+          "file": false
+        },
+        {
+          "value": {},
+          "origin": "http://127.0.0.1:41829",
+          "sourceNull": true,
+          "ports": 0,
+          "trusted": true,
+          "bubbles": false,
+          "cancelable": false,
+          "realm": true,
+          "tag": "[object Blob]",
+          "blob": true,
+          "file": false,
+          "blobData": {
+            "text": "blob",
+            "size": 4,
+            "type": ""
+          }
+        },
+        {
+          "value": {},
+          "origin": "http://127.0.0.1:41829",
+          "sourceNull": true,
+          "ports": 0,
+          "trusted": true,
+          "bubbles": false,
+          "cancelable": false,
+          "realm": true,
+          "tag": "[object File]",
+          "blob": true,
+          "file": true,
+          "blobData": {
+            "text": "file",
+            "size": 4,
+            "type": "",
+            "name": "file.txt"
+          }
+        }
+      ],
+      "self": 0,
+      "wrong": 0,
+      "closed": {
+        "error": "InvalidStateError",
+        "message": "The object is in an invalid state"
+      },
+      "closedUncloneable": {
+        "error": "InvalidStateError",
+        "message": "The object is in an invalid state"
+      },
+      "nameAfterClose": "probe",
+      "late": [
+        "after"
+      ]
+    }
+  },
+  "contextCreation": {
+    "error": "Cannot have more than one browser context at a time",
+    "code": -32000
+  },
+  "targetCreation": {
+    "error": "TargetAlreadyLoaded",
+    "code": -31998
+  },
+  "partitions": [],
+  "framePartitions": [
+    {
+      "probe": "partition-snapshot",
+      "name": "same-origin",
+      "events": [
+        {
+          "data": "http",
+          "origin": "http://127.0.0.1:41829"
+        }
+      ],
+      "sourceMatched": true,
+      "sourceName": "same-origin",
+      "sourceOrigin": "http://127.0.0.1:41829"
+    },
+    {
+      "probe": "partition-snapshot",
+      "name": "cross-origin",
+      "events": [],
+      "sourceMatched": true,
+      "sourceName": "cross-origin",
+      "sourceOrigin": "http://127.0.0.1:46803"
+    },
+    {
+      "probe": "partition-snapshot",
+      "name": "opaque-one",
+      "events": [],
+      "sourceMatched": true,
+      "sourceName": "opaque-one",
+      "sourceOrigin": "null"
+    },
+    {
+      "probe": "partition-snapshot",
+      "name": "opaque-two",
+      "events": [],
+      "sourceMatched": true,
+      "sourceName": "opaque-two",
+      "sourceOrigin": "null"
+    }
+  ],
+  "frameBroadcast": {
+    "data": "child-origin",
+    "origin": "http://127.0.0.1:41829",
+    "childURLOrigin": "null"
+  }
+}

@@ -1,0 +1,8 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync,copyFileSync,writeFileSync,readFileSync,rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { loadHeapBinding } from './src/native-heap.js';
+const binary=path.resolve(`.cache/heap-query-production/native/heap-query-node${process.versions.node.split('.')[0]}.node`),original=JSON.parse(readFileSync(binary+'.json','utf8')),directory=mkdtempSync(path.join(os.tmpdir(),'red-panda-heap-loader-')),file=path.join(directory,'heap-query.node');
+const observations=[];
+try{copyFileSync(binary,file);for(const field of ['kind','backend','apiVersion','node','v8','abi','platform','architecture','sourceSHA256','binarySHA256']){writeFileSync(file+'.json',JSON.stringify({...original,[field]:'deliberate mismatch'}));assert.throws(()=>loadHeapBinding(file),/mismatch/);observations.push(field)}writeFileSync(file+'.json',JSON.stringify(original));const heap=loadHeapBinding(file);assert.equal(heap.backend,'public-v8-query-objects');assert.equal(heap.v8HeaderBase,process.versions.v8.split('-')[0]);assert.throws(()=>heap.queryObjects({},[],1,1,1,0),error=>error.code==='ERR_HEAP_QUERY_ARGUMENT');assert.throws(()=>heap.queryObjects({},new Proxy([],{}),1,1,1,1),error=>error.code==='ERR_HEAP_QUERY_ARGUMENT');const output={passed:true,node:process.version,rejectedManifestFields:observations,compiledHeaderVerified:true,invalidNativeArgumentsRejected:true};writeFileSync(`docs/reference/runtime-query-production-loader-node${process.versions.node.split('.')[0]}.json`,JSON.stringify(output,null,2)+'\n');console.log(JSON.stringify(output))}finally{rmSync(directory,{recursive:true,force:true})}

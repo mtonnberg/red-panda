@@ -1,5 +1,7 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { types } from 'node:util';
+import { protocolValue } from './realm-values.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Browser, VERSION, withTimeout } from './browser.js';
 import { cookieToCDP, setCookie, exportCookies } from './cookies.js';
@@ -232,11 +234,18 @@ class Session {
     return { ...metadata, objectId };
   }
   object(id) {
-    if (!this.objects.has(id)) throw new ProtocolError('Cannot find object with given id');
+    if (!this.objects.has(id)) {
+      const valid = typeof id === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id);
+      throw new ProtocolError(valid ? 'Could not find object with given id' : 'Invalid remote object id', -32000);
+    }
     const entry = this.objects.get(id); this.executionPage(entry.contextId); return entry.value;
   }
-  argument(arg) {
-    if (arg.objectId) return this.object(arg.objectId);
+  argument(arg, contextId, window) {
+    if (arg.objectId !== undefined) {
+      const value = this.object(arg.objectId);
+      if (this.objects.get(arg.objectId).contextId !== contextId) throw new ProtocolError('Argument should belong to the same JavaScript world as target object', -32000);
+      return value;
+    }
     if (arg.unserializableValue) {
       const value = arg.unserializableValue;
       if (value.endsWith('n')) return BigInt(value.slice(0, -1));
@@ -246,7 +255,7 @@ class Session {
       if (value === '-0') return -0;
       throw new ProtocolError('Invalid unserializable value');
     }
-    return arg.value;
+    return protocolValue(window, arg.value);
   }
   exception(error, contextId = this.page.executionContextId, group) {
     return exceptionDetailsFor(error, { executionContextId: contextId,
@@ -326,29 +335,42 @@ class Session {
       }
       case 'Page.removeScriptToEvaluateOnNewDocument': this.scripts.delete(params.identifier); page.newDocumentScripts.delete(params.identifier); return {};
       case 'Page.setDocumentContent': {
-        page.evaluate(`document.open(); document.write(${JSON.stringify(params.html)}); document.close();`);
-        this.lifecycleEvent('init'); this.lifecycleEvent('DOMContentLoaded'); this.lifecycleEvent('load'); return {};
+        if (typeof params.html !== 'string') throw new ProtocolError('Invalid parameters');
+        const target = params.frameId === undefined || params.frameId === page.frameId ? page : page.frames?.findFrame(params.frameId);
+        if (!target || target.closed) throw new ProtocolError('No frame for given id');
+        target.evaluate(`document.open(); document.write(${JSON.stringify(params.html)}); document.close();`);
+        // The actual parser/reset lifecycle forwards DCL/load after its real
+        // resource queues finish. This extension adds no premature completion.
+        return {};
       }
       case 'Runtime.evaluate':
       case 'Runtime.callFunctionOn': {
+        const invoking = method === 'Runtime.callFunctionOn';
+        if (invoking && [params.objectId, params.executionContextId, params.uniqueContextId].filter(value => value !== undefined).length > 1) {
+          throw new ProtocolError('ObjectId, executionContextId and uniqueContextId must mutually exclude each other');
+        }
+        if (invoking && params.objectId !== undefined) this.object(params.objectId);
+        const receiver = invoking ? this.objects.get(params.objectId) : undefined;
+        const group = params.objectGroup !== undefined ? params.objectGroup : receiver?.group;
+        const contextId = params.contextId ?? params.executionContextId ?? receiver?.contextId ?? page.executionContextId;
         let target = page, value;
         try {
-          const contextId = params.contextId ?? params.executionContextId ?? this.objects.get(params.objectId)?.contextId;
           target = this.executionPage(contextId);
           value = method === 'Runtime.evaluate' ? target.evaluate(params.expression) : target.callFunction(
             params.functionDeclaration,
-            params.objectId ? this.object(params.objectId) : target.dom.window,
-            (params.arguments ?? []).map(arg => this.argument(arg)),
+            params.objectId !== undefined ? this.object(params.objectId) : target.dom.window,
+            (params.arguments ?? []).map(arg => this.argument(arg, contextId, target.dom.window)),
           );
           if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), target.timeout);
         } catch (error) {
           if (protocolErrors.has(error)) throw error;
-          return { result: this.remote(error, params.returnByValue, params.objectGroup, target.executionContextId),
-            exceptionDetails: this.exception(error, target.executionContextId, params.objectGroup) };
+          return { result: this.remote(error, params.returnByValue, group, contextId),
+            exceptionDetails: this.exception(error, contextId, group) };
         }
-        return { result: this.remote(value, params.returnByValue, params.objectGroup, target.executionContextId) };
+        return { result: this.remote(value, params.returnByValue, group, contextId) };
       }
       case 'Runtime.getProperties': {
+        if (typeof params.objectId !== 'string') throw new ProtocolError('Invalid parameters');
         const object = this.object(params.objectId);
         const contextId = this.objects.get(params.objectId).contextId;
         const group = this.objects.get(params.objectId).group;
@@ -358,7 +380,8 @@ class Session {
             isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, group, contextId), writable: !!descriptor.writable } : {}),
             ...(descriptor.get ? { get: this.remote(descriptor.get, false, group, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, group, contextId) } : {}) };
         });
-        return { result, internalProperties: [] };
+        const prototype = object !== null && ['object', 'function'].includes(typeof object) && !types.isProxy(object) ? Object.getPrototypeOf(object) : null;
+        return { result, internalProperties: prototype === null ? [] : [{ name: '[[Prototype]]', value: this.remote(prototype, false, group, contextId) }] };
       }
       case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
       case 'Runtime.releaseObjectGroup': for (const [id, object] of this.objects) if (object.group === params.objectGroup) this.objects.delete(id); return {};

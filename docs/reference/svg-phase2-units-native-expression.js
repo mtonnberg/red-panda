@@ -1,0 +1,1 @@
+(()=>{const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('x','10');s.setAttribute('width','25%');document.body.append(s);return{x:{value:s.x.baseVal.value,unit:s.x.baseVal.unitType,text:s.x.baseVal.valueAsString},unitless:s.createSVGLength().unitType,ctor:String(SVGLength),width:s.width.baseVal.value,innerWidth}})()

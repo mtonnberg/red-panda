@@ -1,3 +1,5 @@
+import { randomBytes } from 'node:crypto';
+import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable, onReadableSettled, noteReadableOperation } from './request-stream-state.js';
 import { createRequire } from 'node:module';
 import { types } from 'node:util';
 import { installStreams } from './streams.js';
@@ -53,8 +55,8 @@ function safeHeader(name, value) {
  * no page can obtain those internal buffers. Network headers are immutable and
  * CORS-filtered. Opaque views expose neither status/URL/headers nor entity data.
  * Redirects needing another preflight or opaque-origin taint reject explicitly.
- * Streaming upload bodies reject explicitly; ordinary request bodies and all
- * network responses use the shared buffered transport.
+ * Stream upload bodies are extracted only after real source closure; queued
+ * data and ordinary request bodies use the shared buffered transport.
  * Returns an idempotent silent disposal hook.
  */
 export function installFetch(page, window) {
@@ -118,9 +120,6 @@ export function installFetch(page, window) {
   };
   function bodyValue(body, allowStream = false) {
     if (types.isSharedArrayBuffer(body)) throw new window.TypeError('SharedArrayBuffer bodies are not supported');
-    if (!allowStream && Object.prototype.toString.call(body) === '[object ReadableStream]') {
-      throw new window.TypeError('ReadableStream request bodies are unsupported by this buffered transport');
-    }
     if (DOMBlob.is(body)) {
       return new NativeBlob([new Uint8Array(implForWrapper(body)._buffer)], { type: body.type });
     }
@@ -142,6 +141,116 @@ export function installFetch(page, window) {
       return length ? new Uint8Array(buffer, (dataView ? viewOffset : typedOffset).call(body), length).slice() : new Uint8Array();
     }
     return body;
+  }
+  function bufferedInput(body) {
+    if (body == null || isReadableSource(body)) return { value: body, bytes: undefined };
+    if (DOMFormData.is(body)) {
+      const boundary = `----${randomBytes(10).toString('hex')}`, chunks = [];
+      const quoted = value => String(value).replace(/\r\n|\r|\n/g, '\r\n').replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+      for (const [name, value] of body) {
+        if (typeof value === 'string') chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${quoted(name)}"\r\n\r\n${value.replace(/\r\n|\r|\n/g, '\r\n')}\r\n`));
+        else chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${quoted(name)}"; filename="${quoted(value.name ?? 'blob')}"\r\nContent-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`), Buffer.from(implForWrapper(value)._buffer), Buffer.from('\r\n'));
+      }
+      chunks.push(Buffer.from(`--${boundary}--\r\n`));
+      const bytes = Buffer.concat(chunks); return { value: new NativeBlob([bytes], { type: `multipart/form-data; boundary=${boundary}` }), bytes };
+    }
+    const converted = bodyValue(body);
+    if (DOMBlob.is(body)) return { value: converted, bytes: Buffer.from(implForWrapper(body)._buffer) };
+    if (DOMURLSearchParams.is(body)) return { value: converted, bytes: Buffer.from(converted.toString(), 'utf8') };
+    if (types.isArrayBuffer(converted) || ArrayBuffer.isView(converted)) return { value: converted, bytes: Buffer.from(converted) };
+    if (typeof converted === 'symbol') return { value: converted, bytes: undefined };
+    const text = String(converted); return { value: text, bytes: Buffer.from(text, 'utf8') };
+  }
+  const bufferedFinalizer = new FinalizationRegistry(cleanup => cleanup());
+  const bufferedRecord = bytes => bytes === undefined ? undefined : { bytes: Buffer.from(bytes), stream: null, version: null };
+  function bufferedStream(s) {
+    const record = s.bufferedBody;
+    if (!record) return streams.adopt(s.raw.body);
+    if (!record.stream) {
+      let controller;
+      const bytes = record.bytes, bodySignal = s.signal;
+      record.stream = new window.ReadableStream({ start(value) { controller = value; if (bodySignal?.aborted) value.error(bodySignal.reason); else { if (bytes.length) value.enqueue(bytesInRealm(bytes)); value.close(); } } });
+      record.version = readableVersion(record.stream);
+      if (s.signal && !s.signal.aborted) {
+        const weak = new WeakRef(controller), token = {}, signal = s.signal;
+        const abort = () => { try { weak.deref()?.error(signal.reason); } catch {} };
+        const cleanup = () => { signal.removeEventListener('abort', abort); bodyCleanups.delete(cleanup); bufferedFinalizer.unregister(token); };
+        signal.addEventListener('abort', abort, { once: true }); bodyCleanups.add(cleanup);
+        bufferedFinalizer.register(record.stream, cleanup, token); onReadableSettled(record.stream, cleanup);
+      }
+      controller = null;
+    }
+    return record.stream;
+  }
+  function assertBufferedBodyUsable(s) {
+    if (!s.bufferedBody) return;
+    if (s.signal?.aborted) throw s.signal.reason;
+    if (s.raw.bodyUsed) throw new window.TypeError('Body has already been read');
+    const record = s.bufferedBody;
+    if (record.stream && (readableLocked(record.stream) || readableVersion(record.stream) !== record.version)) throw new window.TypeError('Body is disturbed or locked');
+  }
+  function lockBufferedBody(s) {
+    if (!s.bufferedBody) return;
+    assertBufferedBodyUsable(s);
+    const stream = bufferedStream(s), record = s.bufferedBody;
+    if (readableWasDrained(stream)) {
+      if (!lockDrainedReadable(stream, record.version)) throw new window.TypeError('Body is disturbed or locked');
+    } else if (!drainReadableSource(stream, streamChunkBytes, { keepLock: true })) throw new window.TypeError('Body is disturbed or locked');
+  }
+
+  function materializeResponseStream(s) {
+    if (!s.streamBody) return;
+    if (s.streamUsed) throw new window.TypeError('Body has already been read');
+    const source = s.streamBody;
+    if (readableLocked(source) || (readableVersion(source) ?? 0) > 0) throw new window.TypeError('Body is disturbed or locked');
+    const reader = nativeReader.call(source);
+    noteReadableOperation('ReadableStream', 'getReader', source, [], reader);
+    s.streamUsed = true;
+    let finished = false;
+    const release = () => { try { globalThis.ReadableStreamDefaultReader.prototype.releaseLock.call(reader); noteReadableOperation('ReadableStreamDefaultReader', 'releaseLock', reader, []); } catch {} };
+    const cleanup = () => bodyCleanups.delete(disposeBody);
+    const disposeBody = () => { if (finished) return; finished = true; cleanup(); try { const result = globalThis.ReadableStreamDefaultReader.prototype.cancel.call(reader); noteReadableOperation('ReadableStreamDefaultReader', 'cancel', reader, [], result); Promise.resolve(result).catch(() => {}); } catch {} release(); };
+    bodyCleanups.add(disposeBody);
+    const normalized = new globalThis.ReadableStream({
+      async pull(controller) {
+        try {
+          const reading = globalThis.ReadableStreamDefaultReader.prototype.read.call(reader);
+          noteReadableOperation('ReadableStreamDefaultReader', 'read', reader, [], reading);
+          const result = await reading;
+          if (finished) return;
+          if (result.done) { finished = true; cleanup(); controller.close(); return; }
+          if (!types.isUint8Array(result.value)) throw new window.TypeError('Response body chunk is not a Uint8Array');
+          controller.enqueue(bodyValue(result.value));
+        } catch (error) { if (finished) return; finished = true; cleanup(); release(); controller.error(error); }
+      },
+      async cancel(reason) { if (finished) return; finished = true; cleanup(); try { const result = globalThis.ReadableStreamDefaultReader.prototype.cancel.call(reader, reason); noteReadableOperation('ReadableStreamDefaultReader', 'cancel', reader, [reason], result); await result; } finally { release(); } },
+    }, { highWaterMark: 0 });
+    s.raw = new NativeResponse(normalized, { status: s.raw.status, statusText: s.raw.statusText, headers: getHeaders(s.headers).raw });
+  }
+
+  function streamChunkBytes(chunk) {
+    if (typeof chunk === 'string') return Buffer.from(chunk, 'utf8');
+    if (types.isArrayBuffer(chunk) || ArrayBuffer.isView(chunk)) return bodyValue(chunk);
+    return null;
+  }
+  function extractStreamBody(s, { keepLock = false, cache = false } = {}) {
+    if (s.streamUsed) throw new window.TypeError('Body has already been read');
+    if (s.streamBytes) {
+      if (readableLocked(s.streamBody) || readableVersion(s.streamBody) !== s.streamVersion) throw new window.TypeError('Body is disturbed or locked');
+      if (keepLock && !lockDrainedReadable(s.streamBody, s.streamVersion)) throw new window.TypeError('Body is disturbed or locked');
+      return s.streamBytes;
+    }
+    if (readableLocked(s.streamBody) && readableWasDrained(s.streamBody)) throw new window.TypeError('Body is disturbed or locked');
+    const extracted = drainReadableSource(s.streamBody, streamChunkBytes, { keepLock });
+    if (!extracted) throw new window.TypeError('Failed to read ReadableStream body');
+    if (cache) { s.streamBytes = extracted.bytes; s.streamVersion = extracted.version; }
+    return extracted.bytes;
+  }
+  function materializeStreamBody(s) {
+    if (!s.streamBody) return;
+    const bytes = extractStreamBody(s, { keepLock: true });
+    s.raw = new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw });
+    s.streamUsed = true;
   }
   function fillHeaders(init, guard = 'none') {
     const result = new Headers(); headersState.get(result).guard = guard;
@@ -197,7 +306,7 @@ export function installFetch(page, window) {
     const s = isResponse ? getResponse(owner) : getRequest(owner);
     const read = kind === 'json' ? 'text' : ['bytes', 'formData'].includes(kind) ? 'arrayBuffer' : kind;
     let reading;
-    try { reading = s.raw[read](); } catch (error) { reading = Promise.reject(error); }
+    try { if (isResponse) materializeResponseStream(s); lockBufferedBody(s); if (!isResponse) materializeStreamBody(s); reading = s.raw[read](); } catch (error) { reading = Promise.reject(error); }
     return promise(async () => {
       if (kind === 'json') return window.JSON.parse(await reading);
       if (kind === 'arrayBuffer' || kind === 'bytes') {
@@ -257,12 +366,12 @@ export function installFetch(page, window) {
       cursor = next + 2;
     }
   }
-  function wrapRequest(raw) {
+  function wrapRequest(raw, bufferedBytes) {
     const request = Object.create(Request.prototype);
     const headers = fillHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request');
     for (const name of [...raw.headers.keys()]) raw.headers.delete(name);
     for (const [name, value] of headers) raw.headers.set(name, value);
-    requestState.set(request, { raw, headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
+    requestState.set(request, { raw, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
     return request;
   }
   class Request {
@@ -270,10 +379,13 @@ export function installFetch(page, window) {
       if (arguments.length === 0) throw new window.TypeError('Request requires an input');
       init ??= {};
       try {
-        const source = requestState.get(input)?.raw ?? (input instanceof NativeRequest ? input : new URL(String(input), window.document.baseURI).href);
+        const sourceState = requestState.get(input);
+        const source = sourceState?.raw ?? (input instanceof NativeRequest ? input : new URL(String(input), window.document.baseURI).href);
         const mode = init.mode ?? (source instanceof NativeRequest ? source.mode : 'cors');
         const guarded = fillHeaders(init.headers ?? (source instanceof NativeRequest ? source.headers : undefined), mode === 'no-cors' ? 'request-no-cors' : 'request');
-        const prepared = { ...init, headers: getHeaders(guarded).raw };
+        const prepared = {};
+        for (const key of Reflect.ownKeys(Object(init))) if (key !== 'duplex' && Object.prototype.propertyIsEnumerable.call(init, key)) prepared[key] = init[key];
+        prepared.headers = getHeaders(guarded).raw;
         if (prepared.method !== undefined) {
           if (typeof prepared.method === 'symbol') throw new window.TypeError('Cannot convert a Symbol value to a string');
           prepared.method = String(prepared.method).toUpperCase();
@@ -282,16 +394,32 @@ export function installFetch(page, window) {
         if (mode === 'no-cors' && !SIMPLE_METHODS.has(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) {
           throw new window.TypeError(`'${prepared.method ?? source.method}' is unsupported in no-cors mode`);
         }
-        if (Object.hasOwn(init, 'body')) prepared.body = bodyValue(init.body);
+        let streamBody = sourceState?.streamBody;
+        let bufferedBytes = streamBody ? undefined : sourceState?.bufferedBody?.bytes;
+        if (Object.hasOwn(init, 'body')) {
+          if (prepared.body != null && isReadableSource(prepared.body)) { streamBody = prepared.body; prepared.body = null; }
+          else { if (prepared.body != null) { streamBody = undefined; const body = bufferedInput(prepared.body); prepared.body = body.value; bufferedBytes = body.bytes; } }
+        }
+        if (!streamBody && bufferedBytes !== undefined && prepared.body == null) { assertBufferedBodyUsable(sourceState); prepared.body = new Uint8Array(bufferedBytes); }
+        if (streamBody && ['GET', 'HEAD'].includes(prepared.method ?? (source instanceof NativeRequest ? source.method : 'GET'))) throw new window.TypeError('Request with GET/HEAD method cannot have body.');
         if (prepared.referrer && prepared.referrer !== 'about:client') prepared.referrer = new URL(String(prepared.referrer), window.document.baseURI).href;
-        const wrapped = wrapRequest(new NativeRequest(source, prepared));
-        requestState.set(this, requestState.get(wrapped));
+        const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes);
+        const state = requestState.get(wrapped);
+        if (streamBody) { state.streamBody = streamBody; state.streamUsed = false; if (streamBody === sourceState?.streamBody && sourceState.streamBytes) { state.streamBytes = sourceState.streamBytes; state.streamVersion = sourceState.streamVersion; } }
+        requestState.set(this, state);
       } catch (error) { throw realmError(error); }
     }
-    clone() { try { return wrapRequest(getRequest(this).raw.clone()); } catch (error) { throw realmError(error); } }
+    clone() {
+      try {
+        const s = getRequest(this);
+        if (s.streamBody) { const bytes = extractStreamBody(s, { cache: true }); return wrapRequest(new NativeRequest(s.raw, { body: bytes, headers: getHeaders(s.headers).raw }), bytes); }
+        assertBufferedBodyUsable(s);
+        return wrapRequest(s.raw.clone(), s.bufferedBody?.bytes);
+      } catch (error) { throw realmError(error); }
+    }
     get headers() { return getRequest(this).headers; }
-    get body() { return streams.adopt(getRequest(this).raw.body); }
-    get bodyUsed() { return getRequest(this).raw.bodyUsed; }
+    get body() { const s = getRequest(this); return s.streamBody ?? bufferedStream(s); }
+    get bodyUsed() { const s = getRequest(this); return s.streamBody ? s.streamUsed : s.raw.bodyUsed; }
     get [Symbol.toStringTag]() { return 'Request'; }
   }
   for (const name of ['url', 'method', 'mode', 'credentials', 'cache', 'redirect', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal', 'destination', 'duplex']) {
@@ -299,7 +427,8 @@ export function installFetch(page, window) {
   }
   function wrapResponse(raw, view = {}) {
     const response = Object.create(Response.prototype);
-    responseState.set(response, { raw, ...view, headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
+    const { bufferedBytes, ...metadata } = view;
+    responseState.set(response, { raw, ...metadata, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
     return response;
   }
   function abortableBody(raw, signal) {
@@ -372,8 +501,10 @@ export function installFetch(page, window) {
       try {
         const headers = fillHeaders(init.headers, 'response');
         const status = init.status, statusText = init.statusText;
-        const raw = new NativeResponse(bodyValue(body, true), { status, statusText, headers: getHeaders(headers).raw });
-        responseState.set(this, { raw, headers: wrapHeaders(raw.headers, 'response') });
+        const prepared = bufferedInput(body);
+        const streamBody = isReadableSource(prepared.value) ? prepared.value : undefined;
+        const raw = new NativeResponse(streamBody ? new Uint8Array() : prepared.value, { status, statusText, headers: getHeaders(headers).raw });
+        responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') });
       } catch (error) { throw realmError(error); }
     }
     static error() { return wrapResponse(NativeResponse.error()); }
@@ -391,7 +522,12 @@ export function installFetch(page, window) {
     }
     clone() {
       const s = getResponse(this);
-      const { raw, headers, ...view } = s;
+      if (s.streamBody) {
+        if (s.streamUsed || readableLocked(s.streamBody) || (readableVersion(s.streamBody) ?? 0) > 0) throw new window.TypeError('Body is disturbed or locked');
+        return wrapResponse(new NativeResponse(null, { status: s.raw.status, statusText: s.raw.statusText, headers: getHeaders(s.headers).raw }), { guard: getHeaders(s.headers).guard });
+      }
+      assertBufferedBodyUsable(s);
+      const { raw, headers, bufferedBody, ...view } = s;
       try {
         let cloned = raw.clone();
         if (s.signal) {
@@ -399,11 +535,11 @@ export function installFetch(page, window) {
           // is consumed. Give each unread branch its own abort algorithm.
           s.raw = abortableBody(raw, s.signal); cloned = abortableBody(cloned, s.signal);
         }
-        return wrapResponse(cloned, { ...view, headers: new NativeHeaders(getHeaders(headers).raw), guard: getHeaders(headers).guard });
+        return wrapResponse(cloned, { ...view, bufferedBytes: bufferedBody?.bytes, headers: new NativeHeaders(getHeaders(headers).raw), guard: getHeaders(headers).guard });
       }
       catch (error) { throw realmError(error); }
     }
-    textStream() { return textStream(getResponse(this).raw); }
+    textStream() { const s = getResponse(this); materializeResponseStream(s); lockBufferedBody(s); return textStream(s.raw); }
     get headers() { return getResponse(this).headers; }
     get status() { const s = getResponse(this); return s.status ?? s.raw.status; }
     get statusText() { const s = getResponse(this); return s.statusText ?? s.raw.statusText; }
@@ -411,8 +547,8 @@ export function installFetch(page, window) {
     get type() { const s = getResponse(this); return s.type ?? s.raw.type; }
     get redirected() { const s = getResponse(this); return s.redirected ?? s.raw.redirected; }
     get ok() { return this.status >= 200 && this.status < 300; }
-    get body() { return streams.adopt(getResponse(this).raw.body); }
-    get bodyUsed() { return getResponse(this).raw.bodyUsed; }
+    get body() { const s = getResponse(this); return s.streamBody ?? bufferedStream(s); }
+    get bodyUsed() { const s = getResponse(this); return s.streamBody ? s.streamUsed : s.raw.bodyUsed; }
     get [Symbol.toStringTag]() { return 'Response'; }
   }
   const OriginalParams = window.URLSearchParams;
@@ -427,7 +563,7 @@ export function installFetch(page, window) {
   }
   Object.defineProperty(Request.prototype, 'textStream', { configurable: true, writable: true,
     value: function () {
-      return textStream(getRequest(this).raw);
+      const s = getRequest(this); lockBufferedBody(s); materializeStreamBody(s); return textStream(s.raw);
     },
   });
   function cors(response, origin, credentials) {
@@ -470,7 +606,7 @@ export function installFetch(page, window) {
     const signal = AbortSignal.any([controller.signal, raw.signal]);
     try {
       const headers = new NativeHeaders(getHeaders(s.headers).raw);
-      const body = raw.body === null ? undefined : new Uint8Array(await raw.arrayBuffer());
+      const body = s.streamBody ? extractStreamBody(s) : raw.body === null ? undefined : new Uint8Array(await raw.arrayBuffer());
       if (!active()) return;
       if (raw.keepalive && body?.byteLength > 65536) throw new window.TypeError('Keepalive request body exceeds 64 KiB');
       const unsafe = [...headers].filter(([name, value]) => !safeHeader(name, value)).map(([name]) => name).sort();
@@ -525,7 +661,9 @@ export function installFetch(page, window) {
         return wrapResponse(NativeResponse.error(), { type: 'opaque', redirected: false });
       }
       if (raw.mode === 'cors' && cross(url)) cors(response, origin, credentials);
-      return wrapResponse(abortableBody(response, raw.signal), { headers: filtered(response, cross(url), credentials),
+      const bufferedBytes = response.body ? new Uint8Array(await response.arrayBuffer()) : undefined;
+      const bodyResponse = bufferedBytes === undefined ? response : new NativeResponse(bufferedBytes, { status: response.status, statusText: response.statusText, headers: response.headers });
+      return wrapResponse(abortableBody(bodyResponse, raw.signal), { bufferedBytes, headers: filtered(response, cross(url), credentials),
         type: cross(url) ? 'cors' : 'basic', url, redirected, signal: raw.signal });
     } finally { pending.delete(controller); }
   }

@@ -1,0 +1,481 @@
+--- /dev/null
++++ b/src/dom-events.js
+@@ -0,0 +1,56 @@
++import 'jsdom';
++import { createRequire } from 'node:module';
++const require=createRequire(import.meta.url);
++const{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
++const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
++const File=require('jsdom/lib/jsdom/living/generated/File.js');
++const FileList=require('jsdom/lib/jsdom/living/generated/FileList.js');
++const installed=new WeakMap();
++// Interface brands are shared across actual realms without replacing
++// instanceof or turning arbitrary lookalike objects into DOM interface values.
++const shared={transfers:new WeakMap(),items:new WeakMap(),itemLists:new WeakMap(),touches:new WeakMap(),touchLists:new WeakMap(),events:new WeakMap()};
++function factory(g,bridge){
++ const{transfers,items,itemLists,touches,touchLists,events}=bridge.shared;
++ const error=()=>new g.TypeError('invalid argument'),illegal=()=>{throw new g.TypeError('Illegal Constructor');};
++ const brand=(map,value)=>{const state=map.get(value);if(!state)throw new g.TypeError('Illegal invocation');return state;};
++ const dictionary=value=>{if(value==null)return{};if(!['object','function'].includes(typeof value))throw error();return value;};
++ const string=value=>{if(typeof value==='symbol')throw error();return String(value);};
++ const number=value=>+value;
++ const restricted=(value,single=false)=>{let result=number(value);if(single)result=Math.fround(result);if(!Number.isFinite(result))throw new g.TypeError('TouchInit member is not a finite number');return result;};
++ const index=value=>number(value)>>>0;
++ const tag=(Constructor,name)=>Object.defineProperty(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});
++ const normalize=value=>{const raw=string(value).replace(/[A-Z]/g,x=>x.toLowerCase());return raw==='text'?'text/plain':raw==='url'?'text/uri-list':raw;};
++ function indexed(Constructor,map,state,values,iterable=false){const object=Object.create(Constructor.prototype),isIndex=key=>typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<4294967295;
++  const proxy=new g.Proxy(object,{get(target,key,receiver){return isIndex(key)?values()[Number(key)]:Reflect.get(target,key,receiver);},has(target,key){return isIndex(key)?Number(key)<values().length:Reflect.has(target,key);},ownKeys(target){return [...values().map((_,i)=>String(i)),...Reflect.ownKeys(target)];},getOwnPropertyDescriptor(target,key){if(isIndex(key)&&Number(key)<values().length)return{value:values()[Number(key)],writable:false,enumerable:true,configurable:true};return Reflect.getOwnPropertyDescriptor(target,key);},set(target,key,value,receiver){return isIndex(key)||key==='length'?false:Reflect.set(target,key,value,receiver);},defineProperty(target,key,descriptor){return isIndex(key)?false:Reflect.defineProperty(target,key,descriptor);},deleteProperty(target,key){return isIndex(key)&&Number(key)<values().length?false:Reflect.deleteProperty(target,key);},preventExtensions(){return false;}});map.set(proxy,state);return proxy;
++ }
++ const updateFiles=state=>bridge.files(state.files,state.values.filter(item=>items.get(item).kind==='file').map(item=>items.get(item).file));
++ class DataTransferItem{constructor(){illegal();}get kind(){return brand(items,this).kind;}get type(){return brand(items,this).type;}getAsFile(){const s=brand(items,this);return s.kind==='file'?s.file:null;}getAsString(callback){const s=brand(items,this);if(callback==null)return;if(typeof callback!=='function')throw error();if(s.kind==='string'){const value=s.data;g.setTimeout(()=>callback(value),0);}}}
++ tag(DataTransferItem,'DataTransferItem');
++ function makeItem(state){const object=Object.create(DataTransferItem.prototype);items.set(object,state);return object;}
++ class DataTransferItemList{constructor(){illegal();}get length(){return brand(itemLists,this).values.length;}add(data,type){const s=brand(itemLists,this);let item;if(bridge.isFile(data))item=makeItem({kind:'file',type:bridge.fileType(data),file:data});else{if(arguments.length<2)throw error();item=makeItem({kind:'string',type:normalize(type),data:string(data)});}s.values.push(item);updateFiles(s);return item;}remove(at){if(!arguments.length)throw error();const s=brand(itemLists,this);s.values.splice(index(at),1);updateFiles(s);}clear(){const s=brand(itemLists,this);s.values.length=0;updateFiles(s);}[Symbol.iterator](){const state=brand(itemLists,this);let cursor=0;return{next(){return cursor<state.values.length?{done:false,value:state.values[cursor++]}:{done:true,value:undefined};},[Symbol.iterator](){return this;}};}}
++ tag(DataTransferItemList,'DataTransferItemList');
++ class DataTransfer{constructor(){const state={values:[],files:bridge.fileList(),dropEffect:'none',effectAllowed:'none'};state.list=indexed(DataTransferItemList,itemLists,state,()=>state.values,true);transfers.set(this,state);}get items(){return brand(transfers,this).list;}get files(){return brand(transfers,this).files;}get types(){const s=brand(transfers,this),result=s.values.filter(item=>items.get(item).kind==='string').map(item=>items.get(item).type);if(s.values.some(item=>items.get(item).kind==='file'))result.push('Files');return g.Array.from(result);}get dropEffect(){return brand(transfers,this).dropEffect;}set dropEffect(value){const s=brand(transfers,this);value=string(value);if(['none','copy','link','move'].includes(value))s.dropEffect=value;}get effectAllowed(){return brand(transfers,this).effectAllowed;}set effectAllowed(value){const s=brand(transfers,this);value=string(value);if(['none','copy','copyLink','copyMove','link','linkMove','move','all','uninitialized'].includes(value))s.effectAllowed=value;}
++  getData(format){if(!arguments.length)throw error();const s=brand(transfers,this),raw=string(format),type=normalize(raw),item=s.values.find(item=>{const x=items.get(item);return x.kind==='string'&&x.type===type;});let value=item?items.get(item).data:'';if(raw.toLowerCase()==='url')value=value.split(/\r\n|\r|\n/).find(line=>line&&!line.startsWith('#'))??'';return value;}
++  setData(format,data){if(arguments.length<2)throw error();const s=brand(transfers,this),type=normalize(format),value=string(data),item=s.values.find(item=>{const x=items.get(item);return x.kind==='string'&&x.type===type;});if(item)items.get(item).data=value;else s.values.push(makeItem({kind:'string',type,data:value}));}
++  clearData(format){const s=brand(transfers,this),type=arguments.length?normalize(format):null;s.values=s.values.filter(item=>{const x=items.get(item);return x.kind!=='string'||(type!==null&&x.type!==type);});updateFiles(s);}
++  setDragImage(element,x,y){const s=brand(transfers,this);if(arguments.length<3||!bridge.isElement(element))throw error();s.dragImage={element,x:number(x)|0,y:number(y)|0};}
++ }
++ tag(DataTransfer,'DataTransfer');
++ class DragEvent extends g.MouseEvent{constructor(type,init={}){if(!arguments.length)throw error();init=dictionary(init);const coordinates=new Map(),coordinateNames=new Set(['clientX','clientY','screenX','screenY']),proxy=new g.Proxy(init,{get(target,key){if(coordinateNames.has(key)){if(!coordinates.has(key)){const value=Reflect.get(target,key,target);coordinates.set(key,value===undefined?0:Math.floor(number(value)));}const value=coordinates.get(key);return Number.isFinite(value)?value:0;}return Reflect.get(target,key,target);}});super(type,proxy);for(const[key,value]of coordinates)bridge.coordinate(this,key,value);const value=init.dataTransfer??null;if(value!==null&&!transfers.has(value))throw error();events.set(this,{kind:'drag',dataTransfer:value});}get dataTransfer(){const s=brand(events,this);if(s.kind!=='drag')throw error();return s.dataTransfer;}}
++ tag(DragEvent,'DragEvent');
++ class TextEvent extends g.UIEvent{constructor(){illegal();}get data(){const s=brand(events,this);if(s.kind!=='text')throw error();return s.data;}initTextEvent(type,bubbles=false,cancelable=false,view=null,data='undefined'){const s=brand(events,this);if(s.kind!=='text')throw error();if(!arguments.length)throw error();if(bridge.dispatching(this))return;g.UIEvent.prototype.initUIEvent.call(this,type,bubbles,cancelable,view,0);s.data=data==null?'undefined':string(data);}}
++ tag(TextEvent,'TextEvent');
++ const createEvent=g.Document.prototype.createEvent;
++ Object.defineProperty(g.Document.prototype,'createEvent',{configurable:true,enumerable:true,writable:true,value:function(type){if(!arguments.length)throw error();const name=string(type).toLowerCase();if(!['textevent','dragevent','touchevent'].includes(name))return createEvent.call(this,type);const event=createEvent.call(this,name==='dragevent'?'MouseEvent':'UIEvent');if(name==='textevent'){Object.setPrototypeOf(event,TextEvent.prototype);events.set(event,{kind:'text',data:''});}else if(name==='dragevent'){Object.setPrototypeOf(event,DragEvent.prototype);events.set(event,{kind:'drag',dataTransfer:null});}else{Object.setPrototypeOf(event,TouchEvent.prototype);events.set(event,{kind:'touch',altKey:false,ctrlKey:false,metaKey:false,shiftKey:false,touches:touchList(),targetTouches:touchList(),changedTouches:touchList()});}return event;}});
++ class Touch{constructor(init){if(!arguments.length)throw error();init=dictionary(init);const state={};for(const key of['clientX','clientY','force','identifier','pageX','pageY','radiusX','radiusY','rotationAngle','screenX','screenY','target']){const value=init[key];if(key==='identifier'){if(value===undefined)throw error();state[key]=number(value)|0;}else if(key==='target'){if(!bridge.isEventTarget(value))throw error();state[key]=value;}else state[key]=value===undefined?0:restricted(value,['radiusX','radiusY','rotationAngle','force'].includes(key));}touches.set(this,state);}}
++ tag(Touch,'Touch');for(const key of['identifier','target','clientX','clientY','pageX','pageY','screenX','screenY','radiusX','radiusY','rotationAngle','force'])Object.defineProperty(Touch.prototype,key,{configurable:true,enumerable:true,get(){return brand(touches,this)[key];}});
++ class TouchList{constructor(){illegal();}get length(){return brand(touchLists,this).length;}item(at){if(!arguments.length)throw error();const value=number(at);if(!Number.isFinite(value)||value<0)throw error();return brand(touchLists,this)[Math.floor(value)]??null;}}
++ tag(TouchList,'TouchList');
++ function touchList(value){const array=[];if(value!==undefined){if(value===null||!['object','function'].includes(typeof value)||typeof value[Symbol.iterator]!=='function')throw error();for(const item of value){if(!touches.has(item))throw error();array.push(item);}}return indexed(TouchList,touchLists,array,()=>array);}
++ class TouchEvent extends g.UIEvent{constructor(type,init={}){if(!arguments.length)throw error();init=dictionary(init);super(type,init);const state={kind:'touch'};for(const key of['altKey','ctrlKey','metaKey','shiftKey'])state[key]=!!init[key];for(const key of['changedTouches','targetTouches','touches'])state[key]=touchList(init[key]);events.set(this,state);}}
++ tag(TouchEvent,'TouchEvent');for(const key of['touches','targetTouches','changedTouches','altKey','metaKey','ctrlKey','shiftKey'])Object.defineProperty(TouchEvent.prototype,key,{configurable:true,enumerable:true,get(){const s=brand(events,this);if(s.kind!=='touch')throw error();return s[key];}});
++ for(const Constructor of[DataTransferItem,DataTransferItemList,DataTransfer,DragEvent,TextEvent,TouchList])for(const key of Object.getOwnPropertyNames(Constructor.prototype)){if(key==='constructor')continue;const descriptor=Object.getOwnPropertyDescriptor(Constructor.prototype,key);Object.defineProperty(Constructor.prototype,key,{...descriptor,enumerable:true});}
++ for(const[name,value]of Object.entries({DataTransferItem,DataTransferItemList,DataTransfer,DragEvent,TextEvent,Touch,TouchList,TouchEvent}))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:false});return{DataTransfer,DragEvent,TextEvent,Touch,TouchEvent};
++}
++export function installDOMEvents(page,window){if(installed.has(window))return installed.get(window);const controller=window.eval(`(${factory.toString()})`)(window,{shared,isFile:File.is,isElement:Element.is,isEventTarget:EventTarget.is,fileType:file=>implForWrapper(file).type,fileList:()=>FileList.create(window,[],{}),files(list,values){const impl=implForWrapper(list);impl.length=0;for(const value of values)impl.push(implForWrapper(value));},coordinate(event,key,value){implForWrapper(event)[key]=value;},dispatching:event=>implForWrapper(event)._dispatchFlag});installed.set(window,controller);return controller;}
+--- /dev/null
++++ b/src/dom-idl.js
+@@ -0,0 +1,59 @@
++import 'jsdom';
++// Real DOM attributes and generated DOMTokenList objects, with native-observed
++// supported-token tables and PutForwards setters. No cloned surrogate elements.
++import { createRequire } from 'node:module';
++const require = createRequire(import.meta.url);
++const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const Element = require('jsdom/lib/jsdom/living/generated/Element.js');
++const Document = require('jsdom/lib/jsdom/living/generated/Document.js');
++const TokenList = require('jsdom/lib/jsdom/living/generated/DOMTokenList.js');
++const installed = new WeakMap(), lists = new WeakMap();
++const linkTokens = new Set(['stylesheet','modulepreload','preload','dns-prefetch','preconnect','prefetch']);
++const openerTokens = new Set(['noopener','noreferrer','opener']);
++const sandboxTokens = new Set(['allow-forms','allow-modals','allow-orientation-lock','allow-pointer-lock','allow-popups','allow-popups-to-escape-sandbox','allow-presentation','allow-same-origin','allow-scripts','allow-storage-access-by-user-activation','allow-top-navigation','allow-top-navigation-by-user-activation','allow-top-navigation-to-custom-protocols','allow-downloads']);
++function listFor(element, attribute, supportedTokens) {
++  let state = lists.get(element); if (!state) { state = new Map(); lists.set(element, state); }
++  if (!state.has(attribute)) {
++    const implementation = implForWrapper(element), global = implementation._globalObject;
++    const list = TokenList.create(global, [], { element: implementation, attributeLocalName: attribute, supportedTokens });
++    const value = implForWrapper(list), synchronize = value._syncWithElement;
++    // These extra reflected attributes are not in jsdom's attributeRegistry.
++    // Read the actual current attribute on every genuine token operation.
++    value._syncWithElement = function () { this._dirty = true; return synchronize.call(this); };
++    value._validationSteps = function (token) { if (!supportedTokens) throw new global.TypeError(''); return supportedTokens.has(token.replace(/[A-Z]/g, x=>x.toLowerCase())); };
++    state.set(attribute, list);
++  }
++  return state.get(attribute);
++}
++function factory(g, bridge) {
++  const attrGet=g.Element.prototype.getAttribute,attrSet=g.Element.prototype.setAttribute,bodyGet=Object.getOwnPropertyDescriptor(g.Document.prototype,'body').get;
++  const string = value => { if (typeof value === 'symbol') throw new g.TypeError('Cannot convert a Symbol value to a string'); return String(value); };
++  const define = (prototype, name, attribute, supported, interfaceName='Element') => {
++    Object.defineProperty(prototype, name, { configurable:true, enumerable:true,
++      get() { if (!bridge.valid(this,interfaceName)) throw new g.TypeError('Illegal invocation'); return bridge.list(this, attribute, supported); },
++      set(value) { if (!bridge.valid(this,interfaceName)) throw new g.TypeError('Illegal invocation'); bridge.list(this, attribute, supported).value = value; },
++    });
++  };
++  define(g.Element.prototype, 'part', 'part');
++  for (const [Constructor, property, attribute, supported] of [
++    [g.HTMLLinkElement,'relList','rel','link'],[g.HTMLLinkElement,'sizes','sizes'],
++    [g.HTMLAnchorElement,'relList','rel','opener'],[g.HTMLAreaElement,'relList','rel','opener'],
++    [g.HTMLFormElement,'relList','rel','opener'],[g.HTMLOutputElement,'htmlFor','for'],[g.HTMLIFrameElement,'sandbox','sandbox','sandbox'],
++    [g.SVGAElement,'relList','rel','opener'],
++  ]) if (Constructor) define(Constructor.prototype,property,attribute,supported,Constructor.name);
++  Object.defineProperty(g.HTMLFormElement.prototype,'rel',{configurable:true,enumerable:true,
++    get(){if(!bridge.isForm(this))throw new g.TypeError('Illegal invocation');return attrGet.call(this,'rel')??'';},
++    set(value){if(!bridge.isForm(this))throw new g.TypeError('Illegal invocation');attrSet.call(this,'rel',string(value));}});
++  for (const [name,attribute] of [['fgColor','text'],['linkColor','link'],['vlinkColor','vlink'],['alinkColor','alink'],['bgColor','bgcolor']]) {
++    Object.defineProperty(g.Document.prototype,name,{configurable:true,enumerable:true,
++      get(){if(!bridge.isDocument(this))throw new g.TypeError('Illegal invocation');const body=bodyGet.call(this);return body?attrGet.call(body,attribute)??'':'';},
++      set(value){if(!bridge.isDocument(this))throw new g.TypeError('Illegal invocation');value=value===null?'':string(value);const body=bodyGet.call(this);if(body)attrSet.call(body,attribute,value);}});
++  }
++}
++export function installDOMIDL(page, window) {
++  if (installed.has(window)) return installed.get(window);
++  const Form = require('jsdom/lib/jsdom/living/generated/HTMLFormElement.js');
++  window.eval(`(${factory.toString()})`)(window, { isElement:Element.is,isDocument:Document.is,isForm:Form.is,valid(element,name){if(name==='SVGAElement')return Element.is(element)&&implForWrapper(element)._namespaceURI==='http://www.w3.org/2000/svg'&&implForWrapper(element)._localName==='a';try{return require('jsdom/lib/jsdom/living/generated/'+name+'.js').is(element);}catch{return false;}},
++    list(element,attribute,supported){return listFor(element,attribute,({link:linkTokens,opener:openerTokens,sandbox:sandboxTokens})[supported]);} });
++  const controller = {}; installed.set(window,controller); return controller;
++}
+--- /dev/null
++++ b/src/dom-lifecycle.js
+@@ -0,0 +1,24 @@
++import 'jsdom';
++import { createRequire } from 'node:module';
++const require=createRequire(import.meta.url);
++const{implForWrapper,wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const Node=require('jsdom/lib/jsdom/living/generated/Node.js');
++const NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const ShadowRoot=require('jsdom/lib/jsdom/living/generated/ShadowRoot.js');
++const ShadowImpl=require('jsdom/lib/jsdom/living/nodes/ShadowRoot-impl.js').implementation;
++const Handler=require('jsdom/lib/jsdom/living/generated/EventHandlerNonNull.js');
++const{setupForSimpleEventAccessors}=require('jsdom/lib/jsdom/living/helpers/create-event-accessor.js');
++const{shadowIncludingInclusiveDescendantsIterator}=require('jsdom/lib/jsdom/living/helpers/shadow-dom.js');
++const contexts=new WeakMap(),installed=new WeakMap();let patched=false;
++const active=context=>context&&!context.signal?.aborted&&!context.page?.closed&&context.window.document===context.document;
++function preserveMoves(parent,nodes,operation){if(!parent?.isConnected||!active(contexts.get(parent._globalObject)))return operation();const definitions=new Map();for(const node of nodes){if(!node?.isConnected||node._ownerDocument!==parent._ownerDocument)continue;for(const element of shadowIncludingInclusiveDescendantsIterator(node)){if(element._ceState!=='custom'||!element._ceDefinition||definitions.has(element))continue;const definition=element._ceDefinition;definitions.set(element,definition);element._ceDefinition={...definition,lifecycleCallbacks:{...definition.lifecycleCallbacks,connectedCallback:null,disconnectedCallback:null}};}}
++ try{return operation();}finally{for(const[element,definition]of definitions)element._ceDefinition=definition;}}
++function patch(){if(patched)return;patched=true;setupForSimpleEventAccessors(ShadowImpl.prototype,['slotchange']);for(const name of['_preInsert','_replace']){const method=NodeImpl.prototype[name];NodeImpl.prototype[name]=function(node,...args){return preserveMoves(this,[node],()=>method.call(this,node,...args));};}}
++function factory(g,bridge){Object.defineProperty(g.ShadowRoot.prototype,'onslotchange',{configurable:true,enumerable:true,get(){return bridge.handler(this);},set(value){bridge.handler(this,typeof value==='function'?value:null,true);}});
++ for(const Constructor of[g.Element,g.Document,g.DocumentFragment])for(const name of['append','prepend','replaceChildren']){const method=Constructor.prototype[name];if(typeof method!=='function')continue;Object.defineProperty(Constructor.prototype,name,{configurable:true,enumerable:true,writable:true,value:function(...args){return bridge.parentMove(this,args,()=>method.apply(this,args));}});}
++ for(const Constructor of[g.Element,g.CharacterData,g.DocumentType])for(const name of['before','after','replaceWith']){const method=Constructor?.prototype[name];if(typeof method!=='function')continue;Object.defineProperty(Constructor.prototype,name,{configurable:true,enumerable:true,writable:true,value:function(...args){return bridge.siblingMove(this,args,()=>method.apply(this,args));}});}
++}
++export function installDOMLifecycle(page,window){if(installed.has(window))return installed.get(window);patch();const context={page,window,document:window.document,signal:page?.documentAbort?.signal};contexts.set(implForWrapper(window.document)._globalObject,context);
++ const nodes=values=>values.filter(Node.is).map(implForWrapper);
++ window.eval(`(${factory.toString()})`)(window,{parentMove(parent,args,operation){return Node.is(parent)?preserveMoves(implForWrapper(parent),nodes(args),operation):operation();},siblingMove(node,args,operation){return Node.is(node)?preserveMoves(implForWrapper(node).parentNode,nodes(args),operation):operation();},handler(root,value,set){if(!ShadowRoot.is(root))throw new window.TypeError('Illegal invocation');const impl=implForWrapper(root);if(set){impl.onslotchange=value===null?null:Handler.convert(window,value);return;}return impl.onslotchange?.objectReference??null;}});
++ const controller={};installed.set(window,controller);return controller;}
+--- /dev/null
++++ b/src/svg.js
+@@ -0,0 +1,89 @@
++import 'jsdom';
++// Independent live SVG IDL over actual jsdom SVG nodes and real DOMMatrix math.
++import { createRequire } from 'node:module';
++import { installGeometry } from './geometry.js';
++const require=createRequire(import.meta.url);
++const SVGElement=require('jsdom/lib/jsdom/living/generated/SVGElement.js');
++const Graphics=require('jsdom/lib/jsdom/living/generated/SVGGraphicsElement.js');
++const AnimatedString=require('jsdom/lib/jsdom/living/generated/SVGAnimatedString.js');
++const{implForWrapper,wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const installed=new WeakMap(),realms=new WeakMap();let patched=false;
++function patch(){if(patched)return;patched=true;const create=SVGElement.createImpl;SVGElement.createImpl=function(global,args,data){const record=realms.get(global),Constructor=record?.classes[data.localName];if(!Constructor)return create.call(this,global,args,data);const impl=record.graphics.has(data.localName)?Graphics.createImpl(global,args,data):create.call(this,global,args,data);Object.setPrototypeOf(wrapperForImpl(impl),Constructor.prototype);return impl;};}
++function factory(g,bridge){
++ const SVG='http://www.w3.org/2000/svg',NS='http://www.w3.org/1999/xlink',Matrix=g.DOMMatrix;
++ const matrixMethods=Object.fromEntries(Object.getOwnPropertyNames(Matrix.prototype).filter(name=>typeof Object.getOwnPropertyDescriptor(Matrix.prototype,name)?.value==='function').map(name=>[name,Object.getOwnPropertyDescriptor(Matrix.prototype,name).value]));
++ const attributeGet=g.Element.prototype.getAttribute,attributeSet=g.Element.prototype.setAttribute;const get=(el,name)=>attributeGet.call(el,name),set=(el,name,value)=>attributeSet.call(el,name,value);
++ const typeError=()=>new g.TypeError('Illegal invocation'),readonly=()=>{throw new g.DOMException('The object can not be modified','NoModificationAllowedError');};
++ const illegal=()=>{throw new g.TypeError('Illegal Constructor');};
++ const domString=value=>{if(typeof value==='symbol')throw new g.TypeError('Cannot convert a Symbol value to a string');return String(value);};
++ const numeric=value=>{const result=+value;if(!Number.isFinite(result))throw new g.TypeError('Value is not a finite number');return result;};
++ const f32=value=>{const result=Math.fround(numeric(value));if(!Number.isFinite(result))throw new g.TypeError('Value is not a finite number');return result;};
++ const floatString=value=>{if(!value)return '0';for(let digits=1;digits<=9;digits++){const text=String(Number(value.toPrecision(digits)));if(Math.fround(Number(text))===value)return text;}return String(value);};
++ const tag=(Constructor,name)=>Object.defineProperty(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});
++ const constant=(Constructor,name,value)=>{for(const object of[Constructor,Constructor.prototype])Object.defineProperty(object,name,{value,enumerable:true});};
++ const classes={},graphics=new Set();
++ const definitions=[['SVGGeometryElement','SVGGraphicsElement'],['SVGAElement','SVGGraphicsElement','a'],['SVGUseElement','SVGGraphicsElement','use'],['SVGImageElement','SVGGraphicsElement','image'],['SVGRectElement','SVGGeometryElement','rect'],['SVGCircleElement','SVGGeometryElement','circle'],['SVGEllipseElement','SVGGeometryElement','ellipse'],['SVGLineElement','SVGGeometryElement','line'],['SVGPathElement','SVGGeometryElement','path'],['SVGPolygonElement','SVGGeometryElement','polygon'],['SVGPolylineElement','SVGGeometryElement','polyline'],['SVGForeignObjectElement','SVGGraphicsElement','foreignObject'],['SVGViewElement','SVGElement','view'],['SVGGradientElement','SVGElement'],['SVGLinearGradientElement','SVGGradientElement','linearGradient'],['SVGRadialGradientElement','SVGGradientElement','radialGradient'],['SVGClipPathElement','SVGElement','clipPath'],['SVGMaskElement','SVGElement','mask'],['SVGMarkerElement','SVGElement','marker'],['SVGPatternElement','SVGElement','pattern'],['SVGStopElement','SVGElement','stop'],['SVGTextContentElement','SVGGraphicsElement'],['SVGTextPositioningElement','SVGTextContentElement'],['SVGTextElement','SVGTextPositioningElement','text'],['SVGTSpanElement','SVGTextPositioningElement','tspan'],['SVGTextPathElement','SVGTextContentElement','textPath']];
++ for(const[name,parent,local]of definitions){if(!g[name]){const Parent=g[parent],C={[name]:class extends Parent{constructor(){illegal();}}}[name];Object.defineProperty(g,name,{value:C,writable:true,configurable:true,enumerable:false});tag(C,name);}if(local){classes[local]=g[name];if(g.SVGGraphicsElement.prototype.isPrototypeOf(g[name].prototype))graphics.add(local);}}
++ for(const[name,local]of[['SVGSVGElement','svg'],['SVGGElement','g'],['SVGDefsElement','defs'],['SVGDescElement','desc'],['SVGTitleElement','title'],['SVGMetadataElement','metadata'],['SVGSymbolElement','symbol'],['SVGSwitchElement','switch']])if(g[name]){classes[local]=g[name];if(g.SVGGraphicsElement.prototype.isPrototypeOf(g[name].prototype))graphics.add(local);}
++ const brand=(element,Constructor)=>{if(!bridge.isSVG(element))throw typeError();const C=classes[bridge.local(element)];if(!C||!(C===Constructor||Constructor.prototype.isPrototypeOf(C.prototype)))throw typeError();return element;};
++ const cache=new WeakMap(),stateFor=element=>{let map=cache.get(element);if(!map){map=new Map();cache.set(element,map);}return map;};
++ const once=(element,key,create)=>{const map=stateFor(element);if(!map.has(key))map.set(key,create());return map.get(key);};
++ const elementProperty=(Constructor,name,create)=>Object.defineProperty(Constructor.prototype,name,{configurable:true,enumerable:true,get(){brand(this,Constructor);return once(this,name,()=>create(this));}});
++ const stringFor=element=>bridge.string(element);
++ for(const C of[g.SVGAElement,g.SVGUseElement,g.SVGImageElement,g.SVGGradientElement,g.SVGPatternElement,g.SVGTextPathElement])elementProperty(C,'href',stringFor);
++
++ const lengths=new WeakMap(),animatedLengths=new WeakMap(),numbers=new WeakMap(),enumerations=new WeakMap();
++ const unitNames=['','', '%','em','ex','px','cm','mm','in','pt','pc'];
++ const unitCodes=new Map(unitNames.map((value,index)=>[value,index]));unitCodes.set('',1);
++ const parseLength=value=>{const match=/^\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?)\s*(%|px|cm|mm|in|pt|pc|em|ex)?\s*$/i.exec(value??'');if(!match)return null;const number=Number(match[1]),unit=(match[2]??'').toLowerCase();return Number.isFinite(number)?{number,unit:unitCodes.get(unit)}:null;};
++ const lengthState=value=>{const state=lengths.get(value);if(!state)throw typeError();return state;};
++ const lengthData=state=>parseLength(state.element?get(state.element,state.attribute):state.raw)??parseLength(state.initial);
++ function viewport(element,axis){let root=element?.ownerSVGElement??(element?.localName==='svg'?element:null);if(!root)throw new g.DOMException('No SVG viewport is available','NotSupportedError');const resolve=(name)=>{const raw=parseLength(get(root,name));if(raw&&raw.unit!==2){return raw.number*factor({element:root,axis:name==='width'?'x':'y'},raw.unit);}const rect=root.getBoundingClientRect();if(Number.isFinite(rect[name])&&rect[name]>0)return rect[name];throw new g.DOMException('No resolved SVG viewport is available','NotSupportedError');};if(axis==='x')return resolve('width');if(axis==='y')return resolve('height');return Math.hypot(resolve('width'),resolve('height'))/Math.SQRT2;}
++ function factor(state,unit){if(unit===2)return viewport(state.element,state.axis)/100;if(unit===3||unit===4){const view=state.element?.ownerDocument.defaultView??g,font=Number.parseFloat(view.getComputedStyle(state.element??g.document.documentElement).fontSize);if(!Number.isFinite(font))throw new g.DOMException('No resolved font metrics are available','NotSupportedError');return unit===3?font:font/2;}return({1:1,5:1,6:96/2.54,7:96/25.4,8:96,9:96/72,10:16})[unit];}
++ function writeLength(state,number,unit){if(state.readonly)readonly();number=numeric(number);const text=String(number)+unitNames[unit];if(state.element)set(state.element,state.attribute,text);else state.raw=text;}
++ class SVGLength{constructor(){illegal();}get unitType(){return lengthData(lengthState(this)).unit;}get value(){const s=lengthState(this),v=lengthData(s);return v.number*factor(s,v.unit);}set value(value){const s=lengthState(this);if(s.readonly)readonly();const v=lengthData(s),ratio=factor(s,v.unit);if(ratio===0)throw new g.DOMException('The SVG unit reference is zero','NotSupportedError');writeLength(s,numeric(value)/ratio,v.unit);}get valueInSpecifiedUnits(){return lengthData(lengthState(this)).number;}set valueInSpecifiedUnits(value){const s=lengthState(this);writeLength(s,value,lengthData(s).unit);}get valueAsString(){const v=lengthData(lengthState(this));return String(v.number)+unitNames[v.unit];}set valueAsString(value){const s=lengthState(this);if(s.readonly)readonly();const parsed=parseLength(domString(value));if(!parsed)throw new g.DOMException('Invalid SVG length','SyntaxError');writeLength(s,parsed.number,parsed.unit);}newValueSpecifiedUnits(unit,value){const s=lengthState(this);if(s.readonly)readonly();unit=(numeric(unit)>>>0)&65535;if(unit<1||unit>10)throw new g.DOMException('Unsupported SVG length unit','NotSupportedError');writeLength(s,value,unit);}convertToSpecifiedUnits(unit){const s=lengthState(this);if(s.readonly)readonly();const value=this.value;unit=(numeric(unit)>>>0)&65535;if(unit<1||unit>10)throw new g.DOMException('Unsupported SVG length unit','NotSupportedError');writeLength(s,value/factor(s,unit),unit);}}
++ tag(SVGLength,'SVGLength');for(const[name,value]of Object.entries({UNKNOWN:0,NUMBER:1,PERCENTAGE:2,EMS:3,EXS:4,PX:5,CM:6,MM:7,IN:8,PT:9,PC:10}))constant(SVGLength,'SVG_LENGTHTYPE_'+name,value);
++ class SVGAnimatedLength{constructor(){illegal();}get baseVal(){const s=animatedLengths.get(this);if(!s)throw typeError();return s.base;}get animVal(){const s=animatedLengths.get(this);if(!s)throw typeError();return s.anim;}}
++ tag(SVGAnimatedLength,'SVGAnimatedLength');
++ const makeLength=state=>{const object=Object.create(SVGLength.prototype);lengths.set(object,state);return object;};
++ function animatedLength(element,attribute,initial='0',axis){const object=Object.create(SVGAnimatedLength.prototype),state={element,attribute,initial,axis:axis??(/^(?:y|cy|fy|ry|height|refY|markerHeight)$/.test(attribute)?'y':attribute==='r'?'other':'x')};animatedLengths.set(object,{base:makeLength(state),anim:makeLength({...state,readonly:true})});return object;}
++ const lengthProperties=(C,definitions)=>{for(const[attribute,initial]of Object.entries(definitions))elementProperty(C,attribute,el=>animatedLength(el,attribute,initial));};
++ lengthProperties(g.SVGSVGElement,{x:'0',y:'0',width:'100%',height:'100%'});lengthProperties(g.SVGRectElement,{x:'0',y:'0',width:'0',height:'0',rx:'0',ry:'0'});lengthProperties(g.SVGCircleElement,{cx:'0',cy:'0',r:'0'});lengthProperties(g.SVGEllipseElement,{cx:'0',cy:'0',rx:'0',ry:'0'});lengthProperties(g.SVGLineElement,{x1:'0',y1:'0',x2:'0',y2:'0'});lengthProperties(g.SVGForeignObjectElement,{x:'0',y:'0',width:'0',height:'0'});lengthProperties(g.SVGLinearGradientElement,{x1:'0%',y1:'0%',x2:'100%',y2:'0%'});lengthProperties(g.SVGRadialGradientElement,{cx:'50%',cy:'50%',r:'50%',fx:'50%',fy:'50%',fr:'0%'});lengthProperties(g.SVGMaskElement,{x:'-10%',y:'-10%',width:'120%',height:'120%'});lengthProperties(g.SVGMarkerElement,{refX:'0',refY:'0',markerWidth:'3',markerHeight:'3'});lengthProperties(g.SVGPatternElement,{x:'0',y:'0',width:'0',height:'0'});
++ class SVGAnimatedNumber{constructor(){illegal();}get baseVal(){const s=numbers.get(this);if(!s)throw typeError();const raw=get(s.element,s.attribute)??'';const value=/^\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?%?\s*$/i.test(raw)?Number.parseFloat(raw)/(raw.trim().endsWith('%')?100:1):0;return Math.fround(value);}set baseVal(value){const s=numbers.get(this);if(!s)throw typeError();set(s.element,s.attribute,floatString(f32(value)));}get animVal(){return Object.getOwnPropertyDescriptor(SVGAnimatedNumber.prototype,'baseVal').get.call(this);}}
++ tag(SVGAnimatedNumber,'SVGAnimatedNumber');const animatedNumber=(element,attribute)=>{const value=Object.create(SVGAnimatedNumber.prototype);numbers.set(value,{element,attribute});return value;};elementProperty(g.SVGStopElement,'offset',el=>animatedNumber(el,'offset'));elementProperty(g.SVGGeometryElement,'pathLength',el=>animatedNumber(el,'pathLength'));
++ class SVGAnimatedEnumeration{constructor(){illegal();}get baseVal(){const s=enumerations.get(this);if(!s)throw typeError();return s.values.indexOf(get(s.element,s.attribute))>0?s.values.indexOf(get(s.element,s.attribute)):s.initial;}set baseVal(value){const s=enumerations.get(this);if(!s)throw typeError();value=(numeric(value)>>>0)&65535;if(value<1||value>=s.values.length)throw new g.TypeError('invalid argument');set(s.element,s.attribute,s.values[value]);}get animVal(){return Object.getOwnPropertyDescriptor(SVGAnimatedEnumeration.prototype,'baseVal').get.call(this);}}
++ tag(SVGAnimatedEnumeration,'SVGAnimatedEnumeration');const enumeration=(C,name,values,initial)=>elementProperty(C,name,el=>{const o=Object.create(SVGAnimatedEnumeration.prototype);enumerations.set(o,{element:el,attribute:name,values,initial});return o;});
++ const units=['','userSpaceOnUse','objectBoundingBox'];enumeration(g.SVGGradientElement,'gradientUnits',units,2);enumeration(g.SVGGradientElement,'spreadMethod',['','pad','reflect','repeat'],1);enumeration(g.SVGClipPathElement,'clipPathUnits',units,1);enumeration(g.SVGMaskElement,'maskUnits',units,2);enumeration(g.SVGMaskElement,'maskContentUnits',units,1);enumeration(g.SVGMarkerElement,'markerUnits',['','userSpaceOnUse','strokeWidth'],2);enumeration(g.SVGPatternElement,'patternUnits',units,2);enumeration(g.SVGPatternElement,'patternContentUnits',units,1);
++ for(const[name,value]of Object.entries({UNKNOWN:0,PAD:1,REFLECT:2,REPEAT:3}))constant(g.SVGGradientElement,'SVG_SPREADMETHOD_'+name,value);for(const[name,value]of Object.entries({UNKNOWN:0,USERSPACEONUSE:1,STROKEWIDTH:2}))constant(g.SVGMarkerElement,'SVG_MARKERUNITS_'+name,value);
++
++ const transforms=new WeakMap(),transformLists=new WeakMap(),animatedTransforms=new WeakMap(),keys=['a','b','c','d','e','f'];
++ const identity=()=>[1,0,0,1,0,0],matrixOf=(type,args)=>{const m=new Matrix();if(type===1)return args.slice();if(type===2)m.translateSelf(args[0],args[1]??0);if(type===3)m.scaleSelf(args[0],args[1]??args[0]);if(type===4)m.translateSelf(args[1]??0,args[2]??0).rotateSelf(args[0]).translateSelf(-(args[1]??0),-(args[2]??0));if(type===5)m.skewXSelf(args[0]);if(type===6)m.skewYSelf(args[0]);return keys.map(key=>m[key]);};
++ function parseTransforms(text){const result=[],pattern=/\s*(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^()]*)\)\s*,?\s*/gy;let cursor=0;while(cursor<text.length){pattern.lastIndex=cursor;const m=pattern.exec(text);if(!m)return[];cursor=pattern.lastIndex;const args=m[2].trim().split(/[\s,]+/).map(Number),type=({matrix:1,translate:2,scale:3,rotate:4,skewX:5,skewY:6})[m[1]],count=({1:[6],2:[1,2],3:[1,2],4:[1,3],5:[1],6:[1]})[type];if(!count.includes(args.length)||!args.every(Number.isFinite)||!m[2].trim())return[];if(type===2&&args.length===1)args.push(0);if(type===3&&args.length===1)args.push(args[0]);if(type===4&&args.length===1)args.push(0,0);result.push({type,args,values:matrixOf(type,args),angle:type===4?args[0]:0});}return result;}
++ const transformState=object=>{const s=transforms.get(object);if(!s)throw typeError();if(s.list)syncList(s.list);return s;};
++ const serialize=s=>s.type===1?`matrix(${s.values.join(' ')})`:`${({2:'translate',3:'scale',4:'rotate',5:'skewX',6:'skewY'})[s.type]}(${s.args.join(' ')})`;
++ function commit(s){if(!s.list)return;const list=s.list;list.last=get(list.element,list.attribute)??'';const text=list.items.map(item=>serialize(transforms.get(item))).join(' ');set(list.element,list.attribute,text);list.last=text;}
++ function syncList(list){const raw=(list.element?get(list.element,list.attribute):'')??'';if(raw===list.last)return;for(const item of list.items){const state=transforms.get(item);state.list=null;}list.items=parseTransforms(raw).map(data=>makeTransform({...data,list,readonly:list.readonly}));list.last=raw;}
++ const matrixDescriptors=Object.fromEntries(keys.map(key=>[key,Object.getOwnPropertyDescriptor(Matrix.prototype,key)]));
++ function linkedMatrix(state){const matrix=new Matrix(state.values);const refresh=()=>{if(state.list)syncList(state.list);matrixMethods.setMatrixValue.call(matrix,`matrix(${state.values.join(',')})`);};const store=()=>{state.values=keys.map(key=>matrixDescriptors[key].get.call(matrix));state.type=1;state.angle=0;state.args=state.values.slice();commit(state);};
++  for(const key of keys)Object.defineProperty(matrix,key,{configurable:true,enumerable:true,get(){refresh();return matrixDescriptors[key].get.call(matrix);},set(value){if(state.readonly)readonly();refresh();matrixDescriptors[key].set.call(matrix,numeric(value));store();}});
++  for(const name of Object.getOwnPropertyNames(Matrix.prototype)){const method=Object.getOwnPropertyDescriptor(Matrix.prototype,name)?.value;if(typeof method!=='function'||name==='constructor')continue;Object.defineProperty(matrix,name,{configurable:true,writable:true,value:function(...args){const mutates=name.endsWith('Self')||name==='setMatrixValue';if(mutates&&state.readonly)readonly();refresh();const result=method.apply(this,args);if(mutates)store();return result;}});}return matrix;
++ }
++ class SVGTransform{constructor(){illegal();}get type(){return transformState(this).type;}get angle(){return transformState(this).angle;}get matrix(){const s=transformState(this);return s.matrix??=(linkedMatrix(s));}setMatrix(matrix){const s=transformState(this);if(s.readonly)readonly();const value=new Matrix(keys.map(key=>matrixDescriptors[key].get.call(matrix)));s.type=1;s.angle=0;s.values=keys.map(key=>value[key]);s.args=s.values.slice();commit(s);}setTranslate(x,y){setTransform(this,2,[f32(x),f32(y)]);}setScale(x,y){setTransform(this,3,[f32(x),f32(y)]);}setRotate(angle,cx,cy){setTransform(this,4,[f32(angle),f32(cx),f32(cy)]);}setSkewX(angle){setTransform(this,5,[f32(angle)]);}setSkewY(angle){setTransform(this,6,[f32(angle)]);}}
++ function setTransform(object,type,args){const s=transformState(object);if(s.readonly)readonly();s.type=type;s.args=args;s.values=matrixOf(type,args);s.angle=type===4?args[0]:0;commit(s);}
++ function makeTransform(data={type:0,args:[],values:identity(),angle:0}){const object=Object.create(SVGTransform.prototype);transforms.set(object,data);return object;}
++ tag(SVGTransform,'SVGTransform');for(const[name,value]of Object.entries({UNKNOWN:0,MATRIX:1,TRANSLATE:2,SCALE:3,ROTATE:4,SKEWX:5,SKEWY:6}))constant(SVGTransform,'SVG_TRANSFORM_'+name,value);
++ const listState=object=>{const state=transformLists.get(object);if(!state)throw typeError();syncList(state);return state;};const index=(value,length)=>{value=(numeric(value)>>>0);if(value>=length)throw new g.DOMException('Index or size is negative or greater than the allowed amount','IndexSizeError');return value;};
++ const listWrite=state=>{if(state.readonly)readonly();};const listCommit=state=>{const text=state.items.map(item=>serialize(transforms.get(item))).join(' ');set(state.element,state.attribute,text);state.last=text;};
++ function insertTransform(state,item,at,replace=false){listWrite(state);const entry=transformState(item);if(entry.readonly)readonly();if(entry.list){const previous=entry.list,position=previous.items.indexOf(item);if(position>=0){previous.items.splice(position,1);listCommit(previous);if(previous===state&&position<at)at--;}}entry.list=state;if(replace){const old=state.items[at];if(old)transforms.get(old).list=null;state.items.splice(at,1,item);}else state.items.splice(at,0,item);listCommit(state);return item;}
++ class SVGTransformList{constructor(){illegal();}get length(){return listState(this).items.length;}get numberOfItems(){return listState(this).items.length;}clear(){const s=listState(this);listWrite(s);for(const item of s.items)transforms.get(item).list=null;s.items=[];listCommit(s);}initialize(item){this.clear();return this.appendItem(item);}getItem(at){const s=listState(this);return s.items[index(at,s.items.length)];}insertItemBefore(item,at){const s=listState(this);return insertTransform(s,item,Math.min(numeric(at)>>>0,s.items.length));}replaceItem(item,at){const s=listState(this);return insertTransform(s,item,index(at,s.items.length),true);}removeItem(at){const s=listState(this);listWrite(s);const[item]=s.items.splice(index(at,s.items.length),1);transforms.get(item).list=null;listCommit(s);return item;}appendItem(item){const s=listState(this);return insertTransform(s,item,s.items.length);}consolidate(){const s=listState(this);listWrite(s);if(!s.items.length)return null;const matrix=new Matrix();for(const item of s.items)matrix.multiplySelf(new Matrix(transforms.get(item).values));const item=makeTransform({type:1,args:keys.map(key=>matrix[key]),values:keys.map(key=>matrix[key]),angle:0});return this.initialize(item);}}
++ tag(SVGTransformList,'SVGTransformList');class SVGAnimatedTransformList{constructor(){illegal();}get baseVal(){const s=animatedTransforms.get(this);if(!s)throw typeError();return s.base;}get animVal(){const s=animatedTransforms.get(this);if(!s)throw typeError();return s.anim;}}
++ tag(SVGAnimatedTransformList,'SVGAnimatedTransformList');const makeList=(element,attribute,readonly=false)=>{const list=Object.create(SVGTransformList.prototype);transformLists.set(list,{element,attribute,readonly,last:null,items:[]});return list;};const animatedTransform=(element,attribute)=>{const o=Object.create(SVGAnimatedTransformList.prototype);animatedTransforms.set(o,{base:makeList(element,attribute),anim:makeList(element,attribute,true)});return o;};
++ elementProperty(g.SVGGraphicsElement,'transform',el=>animatedTransform(el,'transform'));elementProperty(g.SVGClipPathElement,'transform',el=>animatedTransform(el,'transform'));elementProperty(g.SVGGradientElement,'gradientTransform',el=>animatedTransform(el,'gradientTransform'));elementProperty(g.SVGPatternElement,'patternTransform',el=>animatedTransform(el,'patternTransform'));
++ for(const[name,value]of Object.entries({SVGLength,SVGAnimatedLength,SVGAnimatedNumber,SVGAnimatedEnumeration,SVGTransform,SVGTransformList,SVGAnimatedTransformList}))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:false});
++ for(const[C,methods]of[[SVGLength,['unitType','value','valueInSpecifiedUnits','valueAsString','newValueSpecifiedUnits','convertToSpecifiedUnits']],[SVGAnimatedLength,['baseVal','animVal']],[SVGAnimatedNumber,['baseVal','animVal']],[SVGAnimatedEnumeration,['baseVal','animVal']],[SVGTransform,['type','matrix','angle','setMatrix','setTranslate','setScale','setRotate','setSkewX','setSkewY']],[SVGTransformList,['length','numberOfItems','clear','initialize','getItem','insertItemBefore','replaceItem','removeItem','appendItem','consolidate']],[SVGAnimatedTransformList,['baseVal','animVal']]])for(const name of methods){const descriptor=Object.getOwnPropertyDescriptor(C.prototype,name);Object.defineProperty(C.prototype,name,{...descriptor,enumerable:true});}
++ Object.defineProperty(g.SVGSVGElement.prototype,'createSVGLength',{configurable:true,enumerable:true,writable:true,value:function(){brand(this,g.SVGSVGElement);return makeLength({initial:'0',raw:'0',axis:'x'});}});
++ Object.defineProperty(g.SVGSVGElement.prototype,'createSVGTransform',{configurable:true,enumerable:true,writable:true,value:function(){brand(this,g.SVGSVGElement);return makeTransform();}});
++ Object.defineProperty(g.SVGSVGElement.prototype,'createSVGMatrix',{configurable:true,enumerable:true,writable:true,value:function(){brand(this,g.SVGSVGElement);return new Matrix();}});
++ return {classes,graphics};
++}
++export function installSVG(page,window){if(installed.has(window))return installed.get(window);installGeometry(window);patch();const attr={};for(const key of['getAttribute','getAttributeNS','hasAttribute','hasAttributeNS','setAttribute','setAttributeNS'])attr[key]=window.Element.prototype[key];const record=window.eval(`(${factory.toString()})`)(window,{isSVG:SVGElement.is,local:el=>implForWrapper(el)._localName,string(element){const impl=implForWrapper(element),object=AnimatedString.create(impl._globalObject,[],{element:impl,attribute:'href',attributeDeprecated:'href',attributeDeprecatedNamespace:'http://www.w3.org/1999/xlink'}),state=implForWrapper(object);Object.defineProperty(state,'baseVal',{get(){return attr.getAttribute.call(element,'href')??attr.getAttributeNS.call(element,'http://www.w3.org/1999/xlink','href')??attr.getAttribute.call(element,'xlink:href')??'';},set(value){if(attr.hasAttributeNS.call(element,null,'href'))attr.setAttribute.call(element,'href',value);else if(attr.hasAttributeNS.call(element,'http://www.w3.org/1999/xlink','href'))attr.setAttributeNS.call(element,'http://www.w3.org/1999/xlink','xlink:href',value);else if(attr.hasAttribute.call(element,'xlink:href'))attr.setAttribute.call(element,'xlink:href',value);else attr.setAttribute.call(element,'href',value);}});return object;}});realms.set(window,record);realms.set(implForWrapper(window.document)._globalObject,record);for(const node of window.document.querySelectorAll('*')){const C=record.classes[node.localName];if(node.namespaceURI==='http://www.w3.org/2000/svg'&&C)Object.setPrototypeOf(node,C.prototype);}installed.set(window,record);return record;}
+--- /dev/null
++++ b/test/dom-events.test.js
+@@ -0,0 +1,63 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import { installDOMEvents } from '../src/dom-events.js';
++
++function fixture(t) { const dom = new JSDOM('<body><main><button>target</button></main></body>', { runScripts: 'outside-only' }); installDOMEvents({}, dom.window); t.after(() => dom.window.close()); return dom.window; }
++const pause = () => new Promise(resolve => setTimeout(resolve, 15));
++
++test('DragEvent dispatches as a genuine cancelable MouseEvent with its actual retained store', t => {
++  const w = fixture(t), target = w.document.querySelector('button'), store = new w.DataTransfer();
++  store.setData('TEXT', 'dragged'); const event = new w.DragEvent('drop', { bubbles: true, cancelable: true, clientX: -1.9, clientY: 7.8, dataTransfer: store });
++  assert.ok(event instanceof w.MouseEvent); assert.equal(event.clientX, -2); assert.equal(event.clientY, 7); assert.equal(event.dataTransfer, store); assert.equal(event.isTrusted, false);
++  const seen = []; target.parentNode.addEventListener('drop', e => { seen.push(e.target); e.dataTransfer.setData('text/plain', 'handled'); e.preventDefault(); });
++  assert.equal(target.dispatchEvent(event), false); assert.deepEqual(seen, [target]); assert.equal(store.getData('text'), 'handled');
++  assert.throws(() => new w.DragEvent('x', { dataTransfer: {} }), e => e instanceof w.TypeError);
++  assert.equal(Number.isNaN(new w.DragEvent('x', { clientX: NaN }).clientX), true);
++});
++
++test('DataTransfer retains live genuine FileList, independent items and native-observed duplicate formats', async t => {
++  const w = fixture(t), store = new w.DataTransfer(), files = store.files, items = store.items;
++  const file = new w.File(['bytes'], 'actual.txt', { type: 'text/plain' });
++  const first = items.add('first', 'TEXT/PLAIN'), second = items.add('second', 'text/plain'), entry = items.add(file);
++  assert.ok(files instanceof w.FileList); assert.equal(store.files, files); assert.equal(store.items, items);
++  assert.deepEqual(Array.from(store.types), ['text/plain', 'text/plain', 'Files']); assert.equal(files[0], file); assert.equal(entry.getAsFile(), file);
++  assert.deepEqual([...items], [first, second, entry]); assert.notEqual(store.types, store.types); assert.equal(Object.isFrozen(store.types), false);
++  store.setData('TEXT', 'changed'); assert.equal(store.getData('text/plain'), 'changed');
++  const delivered = []; first.getAsString(value => delivered.push(value)); store.clearData();
++  await Promise.resolve(); assert.deepEqual(delivered, []); await pause(); assert.deepEqual(delivered, ['changed']);
++  assert.equal(first.kind, 'string'); assert.equal(first.type, 'text/plain'); assert.equal(files.length, 1); assert.equal(items.length, 1);
++  items.clear(); assert.equal(files.length, 0); assert.equal(entry.getAsFile(), file);
++  assert.equal(store.dropEffect, 'none'); store.dropEffect = 'move'; store.dropEffect = 'invalid'; assert.equal(store.dropEffect, 'move');
++  assert.throws(() => new w.DataTransferItem(), e => e instanceof w.TypeError); assert.throws(() => Object.getOwnPropertyDescriptor(w.DataTransfer.prototype, 'items').get.call({}), e => e instanceof w.TypeError);
++});
++
++test('legacy createEvent returns real uninitialized branded events with native default state', t => {
++  const w = fixture(t), target = w.document.querySelector('button');
++  for (const [name, Constructor] of [['DragEvent', w.DragEvent], ['dragevent', w.DragEvent], ['TouchEvent', w.TouchEvent], ['touchevent', w.TouchEvent], ['TextEvent', w.TextEvent], ['textevent', w.TextEvent]]) {
++    const event = w.document.createEvent(name); assert.ok(event instanceof Constructor); assert.equal(event.type, ''); assert.equal(event.isTrusted, false);
++    assert.throws(() => target.dispatchEvent(event), e => e.name === 'InvalidStateError');
++    event.initEvent('initialized', true, true); assert.equal(target.dispatchEvent(event), true);
++  }
++  assert.equal(w.document.createEvent('DragEvent').dataTransfer, null); assert.equal(w.document.createEvent('TouchEvent').touches.length, 0);
++  const text = w.document.createEvent('TextEvent'); assert.equal(text.data, '');
++  text.initTextEvent('textInput', true, true, w, 'real input'); assert.equal(text.data, 'real input'); assert.equal(text.view, w);
++  target.addEventListener('textInput', event => { event.initTextEvent('changed', false, false, null, 'ignored'); }); target.dispatchEvent(text);
++  assert.equal(text.type, 'textInput'); assert.equal(text.data, 'real input');
++  text.initTextEvent('x', false, false, null, null); assert.equal(text.data, 'undefined'); assert.throws(() => new w.TextEvent(), e => e instanceof w.TypeError);
++});
++
++test('Touch dictionaries preserve getter order, readonly coordinates and genuine TouchList identity', t => {
++  const w = fixture(t), order = [], values = { identifier: 4294967297, target: w.document, force: .3, radiusX: .3, clientX: .3 };
++  const touch = new w.Touch(new Proxy(values, { get(target, key) { order.push(key); return target[key]; } }));
++  assert.deepEqual(order, ['clientX', 'clientY', 'force', 'identifier', 'pageX', 'pageY', 'radiusX', 'radiusY', 'rotationAngle', 'screenX', 'screenY', 'target']);
++  assert.equal(touch.identifier, 1); assert.equal(touch.force, Math.fround(.3)); assert.equal(touch.clientX, .3); assert.equal(Reflect.set(touch, 'clientX', 9), false);
++  const event = new w.TouchEvent('touchstart', { touches: [touch], changedTouches: [touch], ctrlKey: true });
++  assert.equal(event.touches, event.touches); assert.equal(event.touches[0], touch); assert.equal(event.touches.item(0), touch); assert.equal(event.touches.item(1), null); assert.equal(event.touches.item(null), touch);
++  assert.equal(event.touches[Symbol.iterator], undefined); assert.equal(Reflect.set(event.touches, '0', {}), false); assert.deepEqual(Object.keys(event.touches), ['0']); assert.equal(event.ctrlKey, true);
++  for (const value of [-1, NaN, Infinity, undefined]) assert.throws(() => event.touches.item(value), e => e instanceof w.TypeError);
++  assert.throws(() => new w.TouchEvent('x', { touches: [{}] }), e => e instanceof w.TypeError);
++  assert.throws(() => new w.Touch({ identifier: 1, target: {}, clientX: 0 }), e => e instanceof w.TypeError);
++  assert.throws(() => new w.Touch({ identifier: 1, target: w.document, radiusX: 1e40 }), e => e instanceof w.TypeError);
++  for (const name of ['DragEvent', 'DataTransfer', 'TextEvent', 'Touch', 'TouchEvent']) assert.equal(Object.getOwnPropertyDescriptor(w, name).enumerable, false);
++});
+--- /dev/null
++++ b/test/dom-idl.test.js
+@@ -0,0 +1,55 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import { installSVG } from '../src/svg.js';
++import { installDOMIDL } from '../src/dom-idl.js';
++
++function fixture(t) {
++  const dom = new JSDOM('<!doctype html><head></head><body></body>', { runScripts: 'outside-only', beforeParse(w) { installSVG({}, w); installDOMIDL({}, w); } });
++  t.after(() => dom.window.close()); return dom.window;
++}
++
++test('part is a genuine SameObject DOMTokenList backed by the actual attribute and records', async t => {
++  const w = fixture(t), element = w.document.createElement('div'), records = [];
++  new w.MutationObserver(values => records.push(...values)).observe(element, { attributes: true, attributeOldValue: true });
++  const list = element.part;
++  assert.ok(list instanceof w.DOMTokenList); assert.equal(list, element.part);
++  element.setAttribute('part', 'header footer'); assert.deepEqual([...list], ['header', 'footer']);
++  list.add('selected'); assert.equal(element.getAttribute('part'), 'header footer selected');
++  element.part = 'active active'; assert.equal(list.value, 'active active'); assert.deepEqual([...list], ['active']);
++  list.toggle('active'); assert.equal(element.getAttribute('part'), '');
++  await Promise.resolve(); assert.ok(records.length >= 3); assert.equal(records[0].target, element);
++  assert.throws(() => list.add('two tokens'), e => e.name === 'InvalidCharacterError');
++  assert.throws(() => list.supports('header'), e => e instanceof w.TypeError && e.message === '');
++  assert.throws(() => Object.getOwnPropertyDescriptor(w.Element.prototype, 'part').get.call({}), e => e instanceof w.TypeError);
++});
++
++test('native-observed supported-token tables are case insensitive and not generic rel unions', t => {
++  const w = fixture(t), d = w.document;
++  const link = d.createElement('link'), anchor = d.createElement('a'), form = d.createElement('form');
++  assert.equal(link.relList.supports('STYLESHEET'), true); assert.equal(link.relList.supports('noopener'), false);
++  assert.equal(link.relList.supports('icon'), false); assert.equal(anchor.relList.supports('NOOPENER'), true);
++  assert.equal(form.relList.supports('opener'), true); assert.equal(form.relList.supports('stylesheet'), false);
++  form.rel = 'noopener'; assert.equal(form.relList.value, 'noopener'); form.relList.add('noreferrer'); assert.equal(form.rel, 'noopener noreferrer');
++  const iframe = d.createElement('iframe'); assert.equal(iframe.sandbox.supports('ALLOW-SCRIPTS'), true); assert.equal(iframe.sandbox.supports('allow-unknown'), false);
++  for (const [tag, property, attribute] of [['link', 'sizes', 'sizes'], ['output', 'htmlFor', 'for'], ['iframe', 'sandbox', 'sandbox'], ['area', 'relList', 'rel']]) {
++    const element = d.createElement(tag), list = element[property]; element[property] = 'one two';
++    assert.equal(element[property], list); assert.equal(element.getAttribute(attribute), 'one two');
++    element.setAttribute(attribute, 'changed'); assert.equal(list.value, 'changed');
++  }
++  const svg = d.createElementNS('http://www.w3.org/2000/svg', 'a'); svg.relList = 'noopener';
++  assert.ok(svg instanceof w.SVGAElement); assert.equal(svg.getAttribute('rel'), 'noopener');
++});
++
++test('legacy document color aliases reflect the current real body without authored-method interference', t => {
++  const w = fixture(t), d = w.document, first = d.body;
++  for (const [property, attribute] of [['fgColor', 'text'], ['linkColor', 'link'], ['vlinkColor', 'vlink'], ['alinkColor', 'alink'], ['bgColor', 'bgcolor']]) {
++    assert.equal(Object.hasOwn(w.Document.prototype, property), true);
++    d[property] = '#123'; assert.equal(first.getAttribute(attribute), '#123');
++    d[property] = null; assert.equal(first.getAttribute(attribute), ''); d[property] = undefined; assert.equal(first.getAttribute(attribute), 'undefined');
++  }
++  first.getAttribute = () => 'authored'; d.fgColor = 'real'; assert.equal(d.fgColor, 'real');
++  const replacement = d.createElement('body'); replacement.setAttribute('text', 'new'); d.body = replacement;
++  assert.equal(d.fgColor, 'new'); replacement.remove(); assert.equal(d.fgColor, ''); assert.doesNotThrow(() => { d.fgColor = 'no-body'; });
++  assert.throws(() => Object.getOwnPropertyDescriptor(w.Document.prototype, 'fgColor').get.call({}), e => e instanceof w.TypeError);
++});
+--- /dev/null
++++ b/test/dom-lifecycle.test.js
+@@ -0,0 +1,35 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import { installDOMLifecycle } from '../src/dom-lifecycle.js';
++
++function fixture(t) { const page = { closed: false, documentAbort: new AbortController() }; const dom = new JSDOM('<body><section id="a"></section><section id="b"></section></body>', { runScripts: 'outside-only', beforeParse(w) { installDOMLifecycle(page, w); } }); t.after(() => { page.closed = true; page.documentAbort.abort(); dom.window.close(); }); return dom.window; }
++function register(w) { const log = []; w.customElements.define('actual-move', class extends w.HTMLElement { connectedCallback() { log.push(['connected', this]); } disconnectedCallback() { log.push(['disconnected', this]); } adoptedCallback() { log.push(['adopted', this]); } }); return log; }
++
++test('same-document connected moves preserve actual identity and mutation records without lifecycle churn', async t => {
++  const w = fixture(t), d = w.document, log = register(w), a = d.getElementById('a'), b = d.getElementById('b'), node = d.createElement('actual-move'), child = d.createElement('actual-move'), records = [];
++  node.append(child); a.append(node); assert.deepEqual(log.map(x => x[0]), ['connected', 'connected']);
++  new w.MutationObserver(values => records.push(...values)).observe(d.body, { childList: true, subtree: true });
++  b.append(node); assert.equal(node.parentNode, b); assert.equal(node.firstChild, child); assert.equal(node.isConnected, true); assert.equal(log.length, 2);
++  a.prepend(node); b.replaceChildren(node); assert.equal(log.length, 2);
++  await Promise.resolve(); assert.ok(records.some(record => Array.from(record.removedNodes).includes(node))); assert.ok(records.some(record => Array.from(record.addedNodes).includes(node)));
++});
++
++test('genuine detach, fragment, disconnected and cross-document transitions retain lifecycle callbacks', t => {
++  const w = fixture(t), d = w.document, log = register(w), node = d.createElement('actual-move');
++  d.body.append(node); node.remove(); d.body.append(node); assert.deepEqual(log.map(x => x[0]), ['connected', 'disconnected', 'connected']);
++  const fragment = d.createDocumentFragment(); fragment.append(node); d.body.append(fragment); assert.deepEqual(log.slice(-2).map(x => x[0]), ['disconnected', 'connected']);
++  const detached = d.createElement('div'); detached.append(node); assert.equal(log.at(-1)[0], 'disconnected'); d.body.append(node); assert.equal(log.at(-1)[0], 'connected');
++  const other = d.implementation.createHTMLDocument('other'); other.body.append(node); assert.equal(node.ownerDocument, other); assert.deepEqual(log.slice(-3).map(x => x[0]), ['disconnected', 'adopted', 'connected']);
++});
++
++test('ShadowRoot onslotchange observes actual distribution, real targets and handler replacement', async t => {
++  const w = fixture(t), host = w.document.createElement('div'); w.document.body.append(host); const shadow = host.attachShadow({ mode: 'open' }); shadow.innerHTML = '<slot></slot>';
++  const slot = shadow.querySelector('slot'), seen = [], listener = [], targets = [];
++  shadow.addEventListener('slotchange', event => { listener.push(event); targets.push(event.target); });
++  const handler = function(event) { seen.push([this, event]); }; shadow.onslotchange = handler; assert.equal(shadow.onslotchange, handler);
++  const child = w.document.createElement('span'); host.append(child); await Promise.resolve(); await Promise.resolve();
++  assert.equal(seen.length, 1); assert.equal(listener.length, 1); assert.equal(seen[0][0], shadow); assert.equal(seen[0][1], listener[0]); assert.equal(targets[0], slot); assert.equal(listener[0].isTrusted, true); assert.deepEqual(slot.assignedNodes(), [child]);
++  shadow.onslotchange = null; child.remove(); await Promise.resolve(); await Promise.resolve(); assert.equal(seen.length, 1); assert.equal(listener.length, 2);
++  assert.throws(() => Object.getOwnPropertyDescriptor(w.ShadowRoot.prototype, 'onslotchange').get.call({}), e => e instanceof w.TypeError);
++});
+--- /dev/null
++++ b/test/svg.test.js
+@@ -0,0 +1,76 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { JSDOM } from 'jsdom';
++import { installSVG } from '../src/svg.js';
++
++const NS = 'http://www.w3.org/2000/svg', XLINK = 'http://www.w3.org/1999/xlink';
++function fixture(t) { const dom = new JSDOM('<body><svg width="200" height="100"><rect id="parsed"/><linearGradient id="gradient"/></svg></body>', { runScripts: 'outside-only', beforeParse(w) { installSVG({}, w); } }); t.after(() => dom.window.close()); return dom.window; }
++const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} differs from ${expected}`);
++
++test('typed SVG hierarchy belongs to actual parsed and newly-created nodes across clone and mutation', t => {
++  const w = fixture(t), d = w.document, parsed = d.getElementById('parsed');
++  assert.ok(parsed instanceof w.SVGRectElement); assert.ok(parsed instanceof w.SVGGeometryElement); assert.ok(parsed instanceof w.SVGGraphicsElement); assert.ok(parsed instanceof w.Element);
++  assert.ok(parsed.cloneNode() instanceof w.SVGRectElement);
++  for (const [name, Constructor, Parent] of [['linearGradient', w.SVGLinearGradientElement, w.SVGGradientElement], ['text', w.SVGTextElement, w.SVGTextPositioningElement], ['tspan', w.SVGTSpanElement, w.SVGTextContentElement], ['pattern', w.SVGPatternElement, w.SVGElement]]) {
++    const element = d.createElementNS(NS, name); assert.ok(element instanceof Constructor); assert.ok(element instanceof Parent); assert.equal(element.localName, name); assert.throws(() => new Constructor(), e => e instanceof w.TypeError);
++  }
++  assert.equal(d.createElementNS(NS, 'RECT').constructor, w.SVGElement); assert.equal(typeof w.SVGMatrix, 'undefined'); assert.equal(typeof w.SVGUnitTypes, 'undefined');
++  assert.equal(Object.getOwnPropertyDescriptor(w, 'SVGRectElement').enumerable, false);
++});
++
++test('animated href keeps SameObject identity and writes the real preferred backing attribute', t => {
++  const w = fixture(t), d = w.document, use = d.createElementNS(NS, 'use');
++  use.setAttributeNS(XLINK, 'xlink:href', '#old'); const href = use.href;
++  assert.ok(href instanceof w.SVGAnimatedString); assert.equal(href, use.href); assert.equal(href.baseVal, '#old');
++  href.baseVal = '#new'; assert.equal(use.getAttributeNS(XLINK, 'href'), '#new'); assert.equal(href.animVal, '#new');
++  use.setAttribute('href', '#modern'); assert.equal(href.baseVal, '#modern'); href.baseVal = '#actual';
++  assert.equal(use.getAttribute('href'), '#actual'); assert.equal(use.getAttributeNS(XLINK, 'href'), '#new');
++  use.removeAttribute('href'); use.removeAttributeNS(XLINK, 'href'); use.setAttribute('xlink:href', '#literal');
++  assert.equal(href.baseVal, '#literal'); href.baseVal = '#literal2'; assert.equal(use.getAttribute('xlink:href'), '#literal2');
++  const rawGet = w.Element.prototype.getAttribute; use.getAttribute = () => 'authored'; use.setAttribute = () => {};
++  assert.equal(href.baseVal, '#literal2'); href.baseVal = '#real-write'; assert.equal(rawGet.call(use, 'xlink:href'), '#real-write');
++});
++
++test('live SVG lengths convert actual units and enforce readonly animation values', async t => {
++  const w = fixture(t), d = w.document, root = d.querySelector('svg'), rectangle = d.getElementById('parsed'), changes = [];
++  new w.MutationObserver(records => changes.push(...records)).observe(rectangle, { attributes: true });
++  rectangle.setAttribute('width', '10%'); const animated = rectangle.width, value = animated.baseVal;
++  assert.equal(animated, rectangle.width); assert.equal(value, animated.baseVal); assert.equal(value.unitType, w.SVGLength.SVG_LENGTHTYPE_PERCENTAGE); assert.equal(value.value, 20);
++  value.value = 25; assert.equal(rectangle.getAttribute('width'), '12.5%'); value.valueInSpecifiedUnits = 75; assert.equal(value.value, 150);
++  value.valueAsString = '2cm'; near(value.value, 96 / 2.54 * 2); value.convertToSpecifiedUnits(w.SVGLength.SVG_LENGTHTYPE_PX); near(value.valueInSpecifiedUnits, 96 / 2.54 * 2);
++  rectangle.setAttribute('width', '7px'); assert.equal(animated.animVal.value, 7);
++  assert.throws(() => { animated.animVal.value = 8; }, e => e.name === 'NoModificationAllowedError');
++  assert.throws(() => { value.valueAsString = 'invalid'; }, e => e.name === 'SyntaxError');
++  const standalone = root.createSVGLength(); standalone.newValueSpecifiedUnits(8, 2); assert.equal(standalone.value, 192);
++  await Promise.resolve(); assert.ok(changes.length >= 5); assert.ok(changes.every(record => record.target === rectangle));
++});
++
++test('resource enums and numbers are live attribute values with native defaults and single precision', t => {
++  const w = fixture(t), d = w.document, gradient = d.getElementById('gradient'), stop = d.createElementNS(NS, 'stop');
++  assert.equal(gradient.gradientUnits.baseVal, 2); gradient.gradientUnits.baseVal = 1; assert.equal(gradient.getAttribute('gradientUnits'), 'userSpaceOnUse');
++  gradient.setAttribute('gradientUnits', 'objectBoundingBox'); assert.equal(gradient.gradientUnits.animVal, 2);
++  assert.throws(() => { gradient.gradientUnits.baseVal = 17; }, e => e instanceof w.TypeError);
++  assert.equal(gradient.x2.baseVal.valueAsString, '100%'); assert.equal(gradient.x2.baseVal.value, 200);
++  stop.setAttribute('offset', '120%'); assert.equal(stop.offset.baseVal, Math.fround(1.2));
++  stop.offset.baseVal = .3; assert.equal(stop.getAttribute('offset'), '0.3'); assert.equal(stop.offset.animVal, Math.fround(.3));
++  Object.defineProperty(stop.offset, 'baseVal', { value: 99 }); assert.equal(stop.offset.animVal, Math.fround(.3));
++  const mask = d.createElementNS(NS, 'mask'); assert.equal(mask.width.baseVal.valueAsString, '120%'); assert.equal(mask.maskUnits.baseVal, 2);
++});
++
++test('transform lists preserve real matrices, item ownership and actual attribute mutations', async t => {
++  const w = fixture(t), root = w.document.querySelector('svg'), rectangle = w.document.getElementById('parsed'), changes = [];
++  new w.MutationObserver(records => changes.push(...records)).observe(rectangle, { attributes: true });
++  rectangle.setAttribute('transform', 'translate(2 3) scale(3)'); const list = rectangle.transform.baseVal;
++  assert.equal(list, rectangle.transform.baseVal); const first = list.getItem(0), matrix = first.matrix;
++  assert.ok(matrix instanceof w.DOMMatrix); assert.equal(first.type, w.SVGTransform.SVG_TRANSFORM_TRANSLATE); assert.equal(matrix.e, 2); matrix.e = 12;
++  assert.equal(rectangle.getAttribute('transform'), 'matrix(1 0 0 1 12 3) scale(3 3)');
++  const old = rectangle.getAttribute('transform'); matrix.toString(); assert.equal(rectangle.getAttribute('transform'), old);
++  const consolidated = list.consolidate(); assert.equal(list.length, 1); assert.equal(consolidated.matrix.a, 3); assert.equal(consolidated.matrix.e, 12);
++  const standalone = root.createSVGTransform(); standalone.setRotate(30, 4, 5); near(standalone.matrix.a, Math.cos(Math.PI / 6)); near(standalone.angle, 30);
++  list.appendItem(standalone); const other = w.document.createElementNS(NS, 'rect'); other.transform.baseVal.appendItem(standalone);
++  assert.equal(list.length, 1); assert.equal(other.transform.baseVal.getItem(0), standalone);
++  rectangle.setAttribute('transform', 'translate(9)'); assert.notEqual(list.getItem(0), consolidated); assert.equal(list.getItem(0).matrix.e, 9);
++  const animation = rectangle.transform.animVal; assert.equal(animation.getItem(0).matrix.e, 9); assert.doesNotThrow(() => animation.getItem(0).matrix.toString());
++  assert.throws(() => { animation.getItem(0).matrix.e = 1; }, e => e.name === 'NoModificationAllowedError'); assert.throws(() => animation.clear(), e => e.name === 'NoModificationAllowedError');
++  await Promise.resolve(); assert.ok(changes.length >= 4);
++});

@@ -1,0 +1,612 @@
+--- a/src/messaging.js
++++ b/src/messaging.js
+@@ -1,3 +1,4 @@
++import { createPlatformCodec } from "./platform-codec.js";
+ import { MessageChannel as NativeChannel, MessagePort as NativePort } from 'node:worker_threads';
+ import { types } from 'node:util';
+ import { createRequire } from 'node:module';
+@@ -20,12 +21,14 @@
+  * additionally emits a MessageEvent. wrap/unwrap are host-only port adapters.
+  * clone implements genuine native structured clone/transfer plus realm adoption.
+  * dispose closes only ports still owned by this realm; transferred ports survive.
+- * Blob/File/SharedArrayBuffer and DOM platform objects currently reject rather
+- * than losing their native state while cloning.
++ * Blob/File preserve their immutable bytes and private metadata through graph
++ * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
+  */
+ export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {} } = {}) {
+   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
+     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
++  const codec = createPlatformCodec(realm);
++  const deliveryQueues = new WeakMap(), pendingDeliveries = new Set();
+   const EventTarget = realm.EventTarget;
+   const owned = new Set(), wrapped = new WeakMap(), channels = new WeakMap(), secret = {};
+   let disposed = false;
+@@ -71,7 +74,7 @@
+     native.on('close', state.close); native.unref();
+     return port;
+   }
+-  function encode(value, allowed, seen = new Map()) {
++  function encode(value, allowed, seen = new Map(), platforms) {
+     if (typeof value === 'function' || typeof value === 'symbol') throw cloneError('Value cannot be structured cloned');
+     if (value === null || typeof value !== 'object') return value;
+     if (types.isProxy(value)) throw cloneError('Proxy objects cannot be structured cloned');
+@@ -82,23 +85,25 @@
+     }
+     if (value instanceof NativePort) throw cloneError('Native MessagePort must be wrapped before sending');
+     if (seen.has(value)) return seen.get(value);
++    const platform = codec.serialize(value);
++    if (platform) { const placeholder = {}; seen.set(value, placeholder); platforms.set(placeholder, platform); return placeholder; }
+     if (types.isSharedArrayBuffer(value)) throw cloneError('SharedArrayBuffer messaging is not implemented');
+     if (types.isArrayBuffer(value) || ArrayBuffer.isView(value) || types.isDate(value) || types.isRegExp(value)) return value;
+     if (types.isNativeError(value)) {
+       const Constructor = ERROR_NAMES.includes(value.name) ? globalThis[value.name] : Error;
+       const result = new Constructor(value.message); seen.set(value, result);
+       if (value.stack !== undefined) result.stack = value.stack;
+-      if (Object.hasOwn(value, 'cause')) result.cause = encode(value.cause, allowed, seen);
++      if (Object.hasOwn(value, 'cause')) result.cause = encode(value.cause, allowed, seen, platforms);
+       return result;
+     }
+     if (types.isMap(value)) {
+       const result = new Map(); seen.set(value, result);
+-      for (const [key, item] of value) result.set(encode(key, allowed, seen), encode(item, allowed, seen));
++      for (const [key, item] of value) result.set(encode(key, allowed, seen, platforms), encode(item, allowed, seen, platforms));
+       return result;
+     }
+     if (types.isSet(value)) {
+       const result = new Set(); seen.set(value, result);
+-      for (const item of value) result.add(encode(item, allowed, seen)); return result;
++      for (const item of value) result.add(encode(item, allowed, seen, platforms)); return result;
+     }
+     if (implForWrapper(value) || types.isPromise(value) || types.isWeakMap(value) || types.isWeakSet(value) ||
+         !['[object Object]', '[object Array]'].includes(Object.prototype.toString.call(value))) {
+@@ -107,7 +112,7 @@
+     const result = Array.isArray(value) ? new Array(value.length) : {};
+     seen.set(value, result);
+     for (const key of Object.keys(value)) Object.defineProperty(result, key, {
+-      value: encode(value[key], allowed, seen), enumerable: true, configurable: true, writable: true,
++      value: encode(value[key], allowed, seen, platforms), enumerable: true, configurable: true, writable: true,
+     });
+     return result;
+   }
+@@ -130,23 +135,26 @@
+       } else if (types.isArrayBuffer(value)) transfer.push(value);
+       else throw cloneError('Transfer list contains a non-transferable value');
+     }
+-    const message = { data: encode(data, allowed), ports };
++    const platforms = new Map();
++    const message = { data: encode(data, allowed, new Map(), platforms), ports };
++    if (platforms.size) message.platforms = platforms;
+     let committed = false;
+     return { message, transfer, commit() {
+       if (committed) return;
+       committed = true; for (const state of moved) release(state, true);
+     } };
+   }
+-  function adopt(value, seen = new Map()) {
++  function adopt(value, seen = new Map(), platforms) {
+     if (value === null || typeof value !== 'object') return value;
+     if (seen.has(value)) return seen.get(value);
++    if (platforms?.has(value)) { const result = codec.deserialize(platforms.get(value)); seen.set(value, result); return result; }
+     if (value instanceof NativePort) { const result = wrap(value); seen.set(value, result); return result; }
+     if (types.isSharedArrayBuffer(value)) throw cloneError('SharedArrayBuffer messaging is not implemented');
+     if (types.isArrayBuffer(value)) {
+       Object.setPrototypeOf(value, I.ArrayBuffer.prototype); seen.set(value, value); return value;
+     }
+     if (ArrayBuffer.isView(value)) {
+-      const buffer = adopt(value.buffer, seen), name = Object.prototype.toString.call(value).slice(8, -1);
++      const buffer = adopt(value.buffer, seen, platforms), name = Object.prototype.toString.call(value).slice(8, -1);
+       if (!I[name]) throw cloneError(`Unsupported array view: ${name}`);
+       const result = name === 'DataView' ? new I.DataView(buffer, value.byteOffset, value.byteLength) : new I[name](buffer, value.byteOffset, value.length);
+       seen.set(value, result); return result;
+@@ -156,21 +164,21 @@
+     }
+     if (types.isNativeError(value)) {
+       Object.setPrototypeOf(value, (I[value.name] ?? I.Error).prototype); seen.set(value, value);
+-      if (Object.hasOwn(value, 'cause')) value.cause = adopt(value.cause, seen);
++      if (Object.hasOwn(value, 'cause')) value.cause = adopt(value.cause, seen, platforms);
+       return value;
+     }
+     if (types.isMap(value)) {
+       const result = new I.Map(); seen.set(value, result);
+-      for (const [key, item] of value) result.set(adopt(key, seen), adopt(item, seen)); return result;
++      for (const [key, item] of value) result.set(adopt(key, seen, platforms), adopt(item, seen, platforms)); return result;
+     }
+     if (types.isSet(value)) {
+       const result = new I.Set(); seen.set(value, result);
+-      for (const item of value) result.add(adopt(item, seen)); return result;
++      for (const item of value) result.add(adopt(item, seen, platforms)); return result;
+     }
+     const result = Array.isArray(value) ? new I.Array(value.length) : new I.Object();
+     seen.set(value, result);
+     for (const key of Object.keys(value)) I.Object.defineProperty(result, key, {
+-      value: adopt(value[key], seen), enumerable: true, configurable: true, writable: true,
++      value: adopt(value[key], seen, platforms), enumerable: true, configurable: true, writable: true,
+     });
+     return result;
+   }
+@@ -180,15 +188,49 @@
+       throw new realm.DOMException('The realm is disposed', 'InvalidStateError');
+     }
+     if (!message || !Array.isArray(message.ports) || message.ports.some(port => !(port instanceof NativePort))) throw cloneError('Malformed messaging envelope');
+-    const seen = new Map(), ports = new I.Array();
+-    for (const port of message.ports) ports.push(adopt(port, seen));
+-    return { data: adopt(message.data, seen), ports: I.Object.freeze(ports) };
++    const platforms = codec.records(message), seen = new Map(), ports = new I.Array(message.ports.length);
++    for (let index = 0; index < message.ports.length; index++) Object.defineProperty(ports, index, {value: adopt(message.ports[index], seen, platforms), enumerable: true, configurable: true, writable: true});
++    return { data: adopt(message.data, seen, platforms), ports: Object.freeze(ports) };
++  }
++  function dropMessage(message) { for (const port of message?.ports ?? []) if (port instanceof NativePort) port.close(); }
++  function deliver(target, message, callback, guard = () => true) {
++    const valid = () => { const port = PORTS.get(target); return live() && guard() && (!port || (!port.closed && !port.detached)); };
++    const previous = deliveryQueues.get(target);
++    if (!previous && !codec.needsAsync(message)) {
++      if (!valid()) { dropMessage(message); return; }
++      return callback(receive(message));
++    }
++    const work = { message }; pendingDeliveries.add(work);
++    let operation;
++    operation = (previous ?? Promise.resolve()).then(async () => {
++      if (!valid()) { dropMessage(message); return; }
++      await codec.hydrate(message);
++      if (!valid()) { dropMessage(message); return; }
++      callback(receive(message));
++    }).catch(error => {
++      dropMessage(message);
++      if (valid()) { try { emit(target, 'messageerror', null, I.Object.freeze(new I.Array())); } catch (eventError) { reportError(eventError); } }
++    }).finally(() => {
++      pendingDeliveries.delete(work);
++      if (deliveryQueues.get(target) === operation) deliveryQueues.delete(target);
++    });
++    deliveryQueues.set(target, operation); return operation;
++  }
++  function dispatchMessage(target, message, type = 'message', guard) {
++    return deliver(target, message, ({data, ports}) => emit(target, type, data, ports), guard);
+   }
+-  function dispatchMessage(target, message, type = 'message') {
+-    const { data, ports } = receive(message); emit(target, type, data, ports);
++  function prepareBroadcast(data) {
++    const prepared = prepare(data);
++    let message;
++    try { message = nativeClone(prepared.message); prepared.commit(); }
++    catch (error) { if(error?.name==='DataCloneError')throw cloneError(error.message);throw error; }
++    const pending = codec.needsBroadcastBytes(message);
++    if (!pending) codec.stripNativeHandles(message);
++    return {message, pending};
+   }
+   function clone(data, options) {
+     const prepared = prepare(data, options);
++    if (codec.needsAsync(prepared.message)) throw cloneError('Synchronous clone cannot asynchronously read an embedded native Blob');
+     try {
+       const message = nativeClone(prepared.message, { transfer: prepared.transfer }); prepared.commit(); return receive(message).data;
+     } catch (error) { if (error?.name === 'DataCloneError') throw cloneError(error.message); throw error; }
+@@ -245,9 +287,10 @@
+   function dispose() {
+     if (disposed) return;
+     disposed = true;
++    for (const work of pendingDeliveries) dropMessage(work.message); pendingDeliveries.clear();
+     for (const state of [...owned]) { state.closed = true; release(state); state.native.close(); }
+   }
+-  return { MessageChannel, MessagePort, prepare, receive, dispatchMessage, clone, discard, wrap,
++  return { MessageChannel, MessagePort, prepare, receive, deliver, prepareBroadcast, broadcastBody: codec.broadcastBody, dispatchMessage, clone, discard, wrap,
+     unwrap(port) { const state = record(port); if (state.detached) throw cloneError('MessagePort is detached'); return state.native; },
+     isPort: value => PORTS.has(value), dispose, get size() { return owned.size; } };
+ }
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,5 @@
++import { broadcastConfig } from "./broadcast-config.js";
++import { createBroadcastRealm, createBroadcastRelay } from "./broadcast-realm.js";
+ import vm from 'node:vm';
+ import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+@@ -8,8 +10,8 @@
+ 
+ // Dedicated worker support. Shared workers and nested workers fail explicitly.
+ // Channels and transferred ports use real Node endpoints with realm adapters.
+-// Blob/File/SharedArrayBuffer message cloning and
+-// importScripts has an 8MiB response limit.
++// Blob/File message values preserve native bytes and metadata through private codecs.
++// SharedArrayBuffer messages reject explicitly. importScripts has an 8MiB response limit.
+ // Worker networking is buffered, with per-fetch AbortSignal and document abort.
+ // The VM worker global is an API boundary, not a
+ // security sandbox for hostile code. HTTP CORS/CSP policy remains a browser gap.
+@@ -23,7 +25,7 @@
+   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
+   signal?.addEventListener('abort', dispose, { once: true });
+   class Worker extends window.EventTarget {
+-    #thread; #abort = new AbortController(); #terminated = false; #requests = new Map();
++    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map();
+     constructor(input, options = {}) {
+       super();
+       if (!active()) throw new window.DOMException('The document is disposed', 'InvalidStateError');
+@@ -39,16 +41,20 @@
+       // observed in native serve/fetch defaults; no script request is issued.
+       if (!enabled) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
++      this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
+       this.#thread = new ThreadWorker(new URL(import.meta.url), {
+         // File-backed workers must not inherit an embedding CLI's --input-type
+         // or --eval flags. Only the VM-module capability is needed here.
+         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
+-        redPandaWorker: true, url: url.href, type, name: String(options.name ?? ''),
++        redPandaWorker: true, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
+         navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
+           languages: [...window.navigator.languages], platform: window.navigator.platform },
+       } });
+       owned.add(this);
+       this.#thread.on('message', async message => {
++        if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
++        if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
++        if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
+         if (this.#terminated || !active()) { for (const port of message.ports ?? []) port.close(); return; }
+         if (message.kind === 'message') messaging.dispatchMessage(this, message);
+         else if (message.kind === 'error') {
+@@ -102,7 +108,7 @@
+       this.#thread.on('messageerror', () => {
+         if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
+       });
+-      this.#thread.once('exit', () => { owned.delete(this); this.#abort.abort(); this.#terminated = true; });
++      this.#thread.once('exit', () => { this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+       // Installing a message listener refs Node's underlying MessagePort; unref
+       // after installing listeners so workers cannot hold server shutdown open.
+       this.#thread.unref();
+@@ -140,7 +146,7 @@
+ 
+ async function runWorker() {
+   const pending = new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams;
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast;
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
+@@ -170,7 +176,7 @@
+       }
+     },
+     close() { if (!closed) {
+-      closed = true; lifetime.abort(); for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose();
++      closed = true; lifetime.abort(); for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose(); broadcast?.dispose();
+       for (const message of queued) for (const port of message.ports ?? []) port.close(); queued.length = 0;
+       parentPort.postMessage({ kind: 'close' }); parentPort.close();
+     } },
+@@ -251,7 +257,7 @@
+     const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
+     Object.assign(globalThis, { WorkerNavigator, navigator: nav });
+     globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
+-    const createTrustedMessage = (type, data, ports) => { const event = new MessageEvent(type, { data, ports }); trustedEvents.add(event); return event; };
++    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); trustedEvents.add(event); return event; };
+     globalThis.__createTrustedMessage = createTrustedMessage;
+     globalThis.__emitMessage = (data, ports) => dispatchEvent(createTrustedMessage('message', data, ports));
+   })();`, context);
+@@ -263,6 +269,8 @@
+     reportError: value => dispatchError(value),
+   });
+   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
++  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>target.dispatchEvent(createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
++  Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+   vm.runInContext(GEOMETRY_SOURCE, context);
+@@ -274,7 +282,7 @@
+       const entry = pending.get(message.id); if (!entry) return; pending.delete(message.id); entry.cleanup();
+       message.error ? entry.reject(new Error(message.error)) : entry.resolve(message.result);
+     } else if (message.kind === 'message') {
+-      if (!ready) queued.push(message); else { const event = messaging.receive(message); emit(event.data, event.ports); }
++      if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
+     }
+   });
+   process.on('unhandledRejection', dispatchError);
+@@ -329,7 +337,7 @@
+       });
+     }
+     ready = true;
+-    for (const message of queued) { if (!closed) { const event = messaging.receive(message); emit(event.data, event.ports); } }
++    for (const message of queued) { if (!closed) { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
+     queued.length = 0;
+   } catch (error) { dispatchError(error); }
+ }
+--- a/test/messaging.test.js
++++ b/test/messaging.test.js
+@@ -90,7 +90,8 @@
+   assert.throws(() => carrier.port1.postMessage(null, [{}]), { name: 'DataCloneError' });
+   assert.throws(() => carrier.port1.postMessage({ callback() {} }, [buffer, inner.port1]), { name: 'DataCloneError' }); assert.equal(buffer.byteLength, 4);
+   assert.throws(() => carrier.port1.postMessage(window.document.body), { name: 'DataCloneError' });
+-  assert.throws(() => carrier.port1.postMessage(new window.Blob(['unsupported'])), { name: 'DataCloneError' });
++  const clonedBlob = window.structuredClone(new window.Blob(['supported']));
++  assert.ok(clonedBlob instanceof window.Blob); assert.equal(clonedBlob.size, 9);
+   carrier.port1.close(); assert.throws(() => carrier.port1.postMessage(Symbol()), { name: 'DataCloneError' });
+   carrier.port1.postMessage(null, [inner.port1, buffer]); assert.equal(buffer.byteLength, 0);
+   assert.throws(() => carrier.port1.postMessage(null, [inner.port1]), { name: 'DataCloneError' });
+--- /dev/null
++++ b/src/platform-codec.js
+@@ -0,0 +1,80 @@
++import { Blob as NativeBlob, File as NativeFile } from 'node:buffer';
++import { createRequire } from 'node:module';
++import { types } from 'node:util';
++
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const BlobImpl=require('jsdom/lib/jsdom/living/file-api/Blob-impl.js').implementation;
++const FileImpl=require('jsdom/lib/jsdom/living/file-api/File-impl.js').implementation;
++const nativeType=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
++const nativeSize=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'size').get;
++const nativeName=Object.getOwnPropertyDescriptor(NativeFile.prototype,'name').get;
++const nativeModified=Object.getOwnPropertyDescriptor(NativeFile.prototype,'lastModified').get;
++const nativeBytes=NativeBlob.prototype.arrayBuffer;
++const hasInstance=Function.prototype[Symbol.hasInstance];
++
++/** This codec never recognizes authored object tags or marker properties.
++ * A private envelope Map associates genuine source platform objects' fresh
++ * graph placeholders with typed records. Native cloning preserves Map-key /
++ * payload aliases. NativeBlob carries immutable bytes across actual threads.
++ */
++export function createPlatformCodec(realm){
++ const Blob=realm.Blob,File=realm.File;
++ const probe=typeof Blob==='function'?new Blob([]):null;
++ const dom=probe&&implForWrapper(probe) instanceof BlobImpl;
++ const failure=message=>new realm.DOMException(message,'DataCloneError');
++ function serialize(value){
++  if(!probe)return null;
++  const implementation=implForWrapper(value);
++  if(implementation instanceof BlobImpl){
++   const bytes=new Uint8Array(implementation._buffer),isFile=implementation instanceof FileImpl;
++   return{kind:isFile?'File':'Blob',blob:new NativeBlob([bytes],{type:implementation.type}),type:implementation.type,bytes,
++    ...(isFile?{name:implementation.name,lastModified:implementation.lastModified}:{})};
++  }
++  if(hasInstance.call(NativeBlob,value)){
++   // Captured intrinsic getters validate the actual Node platform state and
++   // ignore authored own size/type/name overrides. No private symbols are read.
++   const type=nativeType.call(value);nativeSize.call(value);
++   const isFile=hasInstance.call(NativeFile,value);
++   return{kind:isFile?'File':'Blob',blob:value,type,
++    ...(isFile?{name:nativeName.call(value),lastModified:nativeModified.call(value)}:{})};
++  }
++  return null;
++ }
++ function records(message){
++  if(message.platforms===undefined)return null;
++  if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
++  for(const[placeholder,record]of message.platforms){
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File'].includes(record.kind))throw failure('Malformed platform node');
++   if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
++   else if(record.bytes===undefined||typeof record.type!=='string')throw failure('Platform node has no byte snapshot');
++   if(record.bytes!==undefined&&!ArrayBuffer.isView(record.bytes))throw failure('Invalid platform byte snapshot');
++   if(record.kind==='File'&&(typeof record.name!=='string'||typeof record.lastModified!=='number'))throw failure('Invalid File metadata');
++  }
++  return message.platforms;
++ }
++ function needsAsync(message){
++  const map=records(message);return !!(dom&&map&&[...map.values()].some(record=>record.bytes===undefined));
++ }
++ async function hydrate(message){
++  const map=records(message);if(!dom||!map)return;
++  await Promise.all([...map.values()].filter(record=>record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
++ }
++ function needsBroadcastBytes(message){const map=records(message);return!!(map&&[...map.values()].some(record=>record.bytes===undefined))}
++ function stripNativeHandles(message){const map=records(message);if(map)for(const record of map.values()){if(record.bytes===undefined)throw failure('Broadcast bytes are not ready');delete record.blob}return message}
++ async function broadcastBody(message){
++  const map=records(message);
++  if(map)await Promise.all([...map.values()].filter(record=>record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
++  return stripNativeHandles(message);
++ }
++ function deserialize(record){
++  if(!probe)throw failure('Receiver realm does not support Blob');
++  if(record.kind==='File'&&typeof File!=='function')throw failure('Receiver realm does not support File');
++  const type=record.type??nativeType.call(record.blob);
++  let parts;
++  if(dom){if(record.bytes===undefined)throw failure('Blob bytes require asynchronous event decoding');parts=[record.bytes]}
++  else parts=[record.blob??record.bytes];
++  return record.kind==='File'?new File(parts,record.name,{type,lastModified:record.lastModified}):new Blob(parts,{type});
++ }
++ return{serialize,records,needsAsync,hydrate,deserialize,needsBroadcastBytes,stripNativeHandles,broadcastBody};
++}
+--- /dev/null
++++ b/src/broadcast-config.js
+@@ -0,0 +1,22 @@
++import {randomUUID} from 'node:crypto';
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const CONTEXTS=new WeakMap(),OPAQUE=new WeakMap();
++const originOf=window=>implForWrapper(window.document)._origin??window.location.origin;
++
++// Standalone embedders without BrowserContext still get a private Page scope,
++// rather than joining a process-global default namespace.
++export const contextOf=page=>page.context??page.registry?.page.context??page.registry?.page??page;
++function opaqueKey(document){if(!OPAQUE.has(document))OPAQUE.set(document,randomUUID());return OPAQUE.get(document)}
++
++/** Host-only storage key. Worker realms receive this immutable configuration
++ * through workerData rather than exposing namespace tokens to page code. */
++export function broadcastConfig(page,window){
++ const context=contextOf(page);
++ if(!context||typeof context!=='object')throw new TypeError('BroadcastChannel requires a BrowserContext');
++ if(!CONTEXTS.has(context))CONTEXTS.set(context,randomUUID());
++ const origin=originOf(window),originKey=origin==='null'?opaqueKey(window.document):origin;
++ return Object.freeze({namespace:CONTEXTS.get(context),originKey,origin});
++}
++
+--- /dev/null
++++ b/src/broadcast-realm.js
+@@ -0,0 +1,103 @@
++import { BroadcastChannel as NativeBroadcastChannel } from 'node:worker_threads';
++import { createHash, randomUUID } from 'node:crypto';
++const CHANNELS=new WeakMap();
++function string(value,realm){if(typeof value==='symbol')throw new realm.TypeError('Cannot convert a Symbol to a DOMString');return String(value)}
++
++/** Native node:worker_threads BroadcastChannels provide real asynchronous
++ * clone/delivery across main and worker threads. The namespace binds Browser-
++ * Context plus security origin. Each receiver adopts its own realm intrinsics.
++ * This deliberately rejects unsupported Blob/File/SAB clone types through the
++ * shared messaging adapter rather than flattening their native state. */
++export const broadcastKey=(config,name)=>`red-panda:${createHash('sha256').update(JSON.stringify([config.namespace,config.originKey,name])).digest('hex')}`;
++
++/** A private native-BC publisher outlives the sending channel while immutable
++ * byte reads finish. Bodies contain bytes, avoiding Node's multi-recipient
++ * NativeBlob serialization failure. Only recipients of the actual reservation
++ * accept a later body; a late subscriber never receives the user's message. */
++export async function publishBroadcastBody(messaging,key,id,message){
++ const native=new NativeBroadcastChannel(key);native.unref();
++ try{const envelope=await messaging.broadcastBody(message);native.postMessage({kind:'body',id,envelope})}
++ catch(error){native.postMessage({kind:'failure',id})}
++ finally{native.close()}
++}
++
++/** Host relay owns the actual immutable Blob clone after a Worker exits.
++ * Ready follows reservation publication over the same actual parent port.
++ * Exit flushes staged jobs even if termination interrupts that ready signal. */
++export function createBroadcastRelay(messaging,config){
++ const jobs=new Map();let exited=false;
++ const flush=job=>{if(job.flushing)return;job.flushing=true;jobs.delete(job.id);void publishBroadcastBody(messaging,broadcastKey(config,job.name),job.id,job.message)};
++ return{
++  accept({id,name,message}){const job={id,name,message};jobs.set(id,job);if(exited)flush(job)},
++  ready(id){const job=jobs.get(id);if(job)flush(job)},
++  cancel(id){jobs.delete(id)},
++  exit(){exited=true;for(const job of jobs.values())flush(job)},
++  get size(){return jobs.size},
++ };
++}
++
++export function createBroadcastRealm(realm,{messaging,config,active:live=()=>true,dispatch,reportError=()=>{},relay}){
++ if(!messaging||!config?.namespace||!config.originKey)throw new TypeError('BroadcastChannel needs a messaging realm and storage key');
++ const owned=new Set();let disposed=false;
++ const usable=()=>!disposed&&live();
++ const brand=receiver=>{const state=CHANNELS.get(receiver);if(!state)throw new realm.TypeError('Illegal invocation');return state};
++ const emit=dispatch??((target,type,data,ports,origin)=>target.dispatchEvent(new realm.MessageEvent(type,{data,ports,origin})));
++ class BroadcastChannel extends realm.EventTarget{
++  constructor(name){
++   super();if(!arguments.length)throw new realm.TypeError('BroadcastChannel requires a name');name=string(name,realm);
++   if(!usable())throw new realm.DOMException('The realm is disposed','InvalidStateError');
++   const key=broadcastKey(config,name);
++   const native=new NativeBroadcastChannel(key),state={name,key,native,closed:false,handlers:new Map(),messaging,config,usable,owner:owned,slots:[],waiting:new Map(),relay};
++   CHANNELS.set(this,state);owned.add(state);
++   const drain=()=>{
++    while(state.slots[0]?.ready){
++     const slot=state.slots.shift();state.waiting.delete(slot.id);
++     if(slot.failed){emit(this,'messageerror',null,realm.Object.freeze(new realm.Array()),config.origin);continue}
++     messaging.deliver(this,slot.envelope,received=>emit(this,'message',received.data,received.ports,slot.envelope.origin),()=>usable()&&!state.closed);
++    }
++   };
++   native.onmessage=event=>{
++    if(!usable()||state.closed)return;
++    try{
++     const frame=event.data;
++     if(frame.kind==='message'){state.slots.push({id:frame.id,ready:true,envelope:frame.envelope});drain()}
++     else if(frame.kind==='reserve'){const slot={id:frame.id,ready:false};state.slots.push(slot);state.waiting.set(frame.id,slot)}
++     else if(frame.kind==='body'||frame.kind==='failure'){const slot=state.waiting.get(frame.id);if(!slot)return;slot.ready=true;slot.failed=frame.kind==='failure';slot.envelope=frame.envelope;drain()}
++    }catch(error){try{emit(this,'messageerror',null,realm.Object.freeze(new realm.Array()),config.origin)}catch(caught){reportError(caught)}}
++   };
++   native.onmessageerror=()=>{if(usable()&&!state.closed)emit(this,'messageerror',null,realm.Object.freeze(new realm.Array()),config.origin)};
++   native.unref();
++  }
++  get name(){return brand(this).name}
++  postMessage(data){
++   const state=brand(this);if(!arguments.length)throw new realm.TypeError('postMessage requires data');
++   if(state.closed||!state.usable())throw new realm.DOMException('BroadcastChannel is closed','InvalidStateError');
++   const prepared=state.messaging.prepareBroadcast(data),id=randomUUID();prepared.message.origin=state.config.origin;
++   if(state.closed)throw new realm.DOMException('BroadcastChannel was closed during serialization','InvalidStateError');
++   let staged=false,reserved=false;
++   try{
++    if(!prepared.pending)state.native.postMessage({kind:'message',id,envelope:prepared.message});
++    else{
++     // This real parent-port clone precedes the reservation, so forced Worker
++     // termination cannot destroy the only immutable copy of posted data.
++     if(state.relay){state.relay({kind:'broadcastRelay',id,name:state.name,message:prepared.message});staged=true}
++     state.native.postMessage({kind:'reserve',id});reserved=true;
++     if(state.relay)state.relay({kind:'broadcastReady',id});else void publishBroadcastBody(state.messaging,state.key,id,prepared.message);
++    }
++   }
++   catch(error){if(staged&&!reserved){try{state.relay({kind:'broadcastCancel',id})}catch{}}if(error?.name==='DataCloneError')throw new realm.DOMException(error.message,'DataCloneError');throw error}
++  }
++  close(){const state=brand(this);if(state.closed)return;state.closed=true;state.slots=[];state.waiting.clear();state.native.close();state.owner.delete(state)}
++  get [Symbol.toStringTag](){return 'BroadcastChannel'}
++ }
++ for(const type of ['message','messageerror'])Object.defineProperty(BroadcastChannel.prototype,`on${type}`,{
++  configurable:true,enumerable:true,
++  get(){return brand(this).handlers.get(type)??null},
++  set(value){const state=brand(this),previous=state.handlers.get(type);if(previous)this.removeEventListener(type,previous);state.handlers.delete(type);if(typeof value==='function'){state.handlers.set(type,value);this.addEventListener(type,value)}}
++ });
++ for(const key of ['name','postMessage','close']){const descriptor=Object.getOwnPropertyDescriptor(BroadcastChannel.prototype,key);Object.defineProperty(BroadcastChannel.prototype,key,{...descriptor,enumerable:true})}
++ Object.defineProperty(BroadcastChannel.prototype,Symbol.toStringTag,{value:'BroadcastChannel',configurable:true,enumerable:false,writable:false});
++ function dispose(){if(disposed)return;disposed=true;for(const state of owned){state.closed=true;state.slots=[];state.waiting.clear();state.native.close()}owned.clear()}
++ return{BroadcastChannel,dispose,get size(){return owned.size},get pending(){let count=0;for(const state of owned)count+=state.slots.length;return count}};
++}
++
+--- /dev/null
++++ b/src/window-messaging.js
+@@ -0,0 +1,76 @@
++import 'jsdom';
++import { types } from 'node:util';
++import { createRequire } from 'node:module';
++import { installMessaging } from './messaging.js';
++import { broadcastConfig, contextOf } from './broadcast-config.js';
++import { createBroadcastRealm } from './broadcast-realm.js';
++export { broadcastConfig, createBroadcastRealm };
++
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
++const MessageEvent=require('jsdom/lib/jsdom/living/generated/MessageEvent.js');
++const nativeClone=globalThis.structuredClone;
++const WINDOWS=new WeakMap(),BROADCASTS=new WeakMap();
++const active=record=>!record.disposed&&!record.signal?.aborted&&!record.page.closed&&record.window.document===record.document;
++
++export function installBroadcast(page,window){
++ if(BROADCASTS.has(window))return BROADCASTS.get(window);
++ const record={page,window,document:window.document,signal:page.documentAbort?.signal,disposed:false};
++ const controller=createBroadcastRealm(window,{messaging:installMessaging(page,window),config:broadcastConfig(page,window),active:()=>active(record),
++  dispatch:(target,type,data,ports,origin)=>fireAnEvent(type,implForWrapper(target),MessageEvent,{data,ports,origin,source:null,lastEventId:'',bubbles:false,cancelable:false}),
++  reportError:error=>page.emit?.('pageError',error)});
++ Object.defineProperty(window,'BroadcastChannel',{value:controller.BroadcastChannel,writable:true,configurable:true});
++ const previousClose=window.close;
++ function dispose(){if(record.disposed)return;record.disposed=true;controller.dispose();record.signal?.removeEventListener('abort',dispose);if(window.close===close)window.close=previousClose}
++ function close(...args){dispose();return previousClose.apply(this,args)}window.close=close;record.signal?.addEventListener('abort',dispose,{once:true});
++ const api={dispose,get size(){return controller.size},get pending(){return controller.pending}};BROADCASTS.set(window,api);return api;
++}
++
++/** Install a native entry function supplied by the version-checked V8 addon.
++ * source is captured from GetIncumbentContext BEFORE entering a JS callback.
++ * Unknown host callers fail explicitly: receiver, payload and stack strings
++ * are never used to guess a source. Target receiver branding remains separate.
++ */
++export function installWindowMessaging(page,window,{entry}){
++ if(WINDOWS.has(window))return WINDOWS.get(window).controller;
++ if(typeof entry?.createEntry!=='function')throw new TypeError('Window messaging requires native incumbent-context entry');
++ const record={page,window,document:window.document,signal:page.documentAbort?.signal,disposed:false,pending:new Set(),bridge:installMessaging(page,window)};
++ WINDOWS.set(window,record);
++ const nativeEntry=entry.createEntry((incumbent,receiver,args)=>{
++  const source=WINDOWS.get(incumbent),target=WINDOWS.get(receiver);
++  if(!target)throw new window.TypeError('Illegal invocation');
++  if(!source)throw new window.TypeError('Window.postMessage source is not a registered Window realm');
++  if(!args.length)throw new window.TypeError('postMessage requires a message');
++  if(!active(source))throw new window.DOMException('The source document is disposed','InvalidStateError');
++  if(contextOf(source.page)!==contextOf(target.page))throw new window.DOMException('Windows belong to different browser contexts','SecurityError');
++  // Pinned native behavior deliberately ignores targetOrigin, including its
++  // getters/coercion. The options overload reads only transfer. ArrayBuffer
++  // entries (including duplicates) are ignored rather than detached; actual
++  // MessagePorts transfer and remain identity-shared between data and ports.
++  let transfer=args[2];
++  if(args[1]!==null&&typeof args[1]==='object')transfer=args[1].transfer;
++  if(transfer==null)transfer=[];
++  if(typeof transfer?.[Symbol.iterator]!=='function')throw new window.TypeError('Transfer list must be iterable');
++  transfer=[...transfer].filter(value=>!types.isArrayBuffer(value));
++  const sourceOrigin=source.window.location.origin;
++  const prepared=source.bridge.prepare(args[0],{transfer});let envelope;
++  try{envelope=nativeClone(prepared.message,{transfer:prepared.transfer});prepared.commit()}
++  catch(error){if(error?.name==='DataCloneError')throw new window.DOMException(error.message,'DataCloneError');throw error}
++  const discard=()=>{for(const port of envelope.ports)port.close()};
++  if(!active(target)){discard();return}
++  const task={timer:null,discard};target.pending.add(task);
++  task.timer=target.window.setTimeout(()=>{
++   if(!active(target)){target.pending.delete(task);discard();return}
++   const delivered=target.bridge.deliver(target.window,envelope,result=>{
++    fireAnEvent('message',implForWrapper(target.window),MessageEvent,{data:result.data,ports:result.ports,origin:sourceOrigin,source:source.window,lastEventId:'',bubbles:false,cancelable:false});
++   },()=>active(target));
++   if(delivered?.then)void delivered.finally(()=>target.pending.delete(task));else target.pending.delete(task);
++  },0);
++ },window);
++ Object.defineProperty(window,'postMessage',{value:nativeEntry,writable:true,configurable:true,enumerable:true});
++ const previousClose=window.close;
++ function dispose(){if(record.disposed)return;record.disposed=true;for(const task of record.pending){window.clearTimeout(task.timer);task.discard()}record.pending.clear();record.signal?.removeEventListener('abort',dispose);if(window.close===close)window.close=previousClose}
++ function close(...args){dispose();return previousClose.apply(this,args)}window.close=close;record.signal?.addEventListener('abort',dispose,{once:true});
++ const controller={dispose,get pending(){return record.pending.size}};record.controller=controller;return controller;
++}

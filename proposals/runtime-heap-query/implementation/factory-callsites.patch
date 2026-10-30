@@ -1,0 +1,153 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -11,6 +11,7 @@
+ import vm from 'node:vm';
+ import { createRequire } from 'node:module';
+ import { JSDOM, CookieJar, ResourceLoader, VirtualConsole } from 'jsdom';
++import { installHeapFactories,prepareHeapRealm } from './heap-registry.js';
+ import { installInput } from './input.js';
+ import { installLayout } from './layout.js';
+ import { installIntersection } from './intersection.js';
+@@ -42,6 +43,7 @@
+ 
+ // Name root and frame VM contexts before any Window is constructed.
+ installVMContextNames();
++installHeapFactories();
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ let defaultCollectionsBinding;
+@@ -225,6 +227,7 @@
+         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+       });
+     });
++    prepareHeapRealm(this, window);
+     for (const { source } of this.newDocumentScripts.values()) {
+       try { window.eval(source); } catch (error) { this.emit('pageError', error); }
+     }
+--- a/src/collections.js
++++ b/src/collections.js
+@@ -1,3 +1,4 @@
++import { registerHeapWrapper } from './heap-registry.js';
+ import { createRequire } from 'node:module';
+ import { createHash } from 'node:crypto';
+ import { readFileSync } from 'node:fs';
+@@ -115,7 +116,7 @@
+       indices: () => Array.from({ length: state.elements.length }, (_, index) => index),
+       call: arguments_ => arguments_.length ? item(state, arguments_[0]) : null,
+     }, prototype);
+-    states.set(result, state); return result;
++    states.set(result, state); return registerHeapWrapper(result,window);
+   }
+   Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get() { return collection(this); } });
+   Object.defineProperty(window, 'HTMLAllCollection', { configurable: true, writable: true, value: HTMLAllCollection });
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -1,3 +1,4 @@
++import { registerHeapWrapper } from './heap-registry.js';
+ import { createRequire } from 'node:module';
+ import { types } from 'node:util';
+ import { installStreams } from './streams.js';
+@@ -152,11 +153,11 @@
+   }
+   function wrapHeaders(raw, guard) {
+     const result = Object.create(Headers.prototype);
+-    headersState.set(result, { raw, guard }); return result;
++    headersState.set(result, { raw, guard }); return registerHeapWrapper(result, window);
+   }
+   class Headers {
+     constructor(init) {
+-      try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); }
++      try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); registerHeapWrapper(this, window); }
+       catch (error) { throw headerError(error); }
+     }
+     append(name, value) { if (arguments.length < 2) throw new window.TypeError('append requires two arguments'); this._change('append', name, value); }
+@@ -263,7 +264,7 @@
+     for (const name of [...raw.headers.keys()]) raw.headers.delete(name);
+     for (const [name, value] of headers) raw.headers.set(name, value);
+     requestState.set(request, { raw, headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
+-    return request;
++    return registerHeapWrapper(request, window);
+   }
+   class Request {
+     constructor(input, init = {}) {
+@@ -285,7 +286,7 @@
+         if (Object.hasOwn(init, 'body')) prepared.body = bodyValue(init.body);
+         if (prepared.referrer && prepared.referrer !== 'about:client') prepared.referrer = new URL(String(prepared.referrer), window.document.baseURI).href;
+         const wrapped = wrapRequest(new NativeRequest(source, prepared));
+-        requestState.set(this, requestState.get(wrapped));
++        requestState.set(this, requestState.get(wrapped)); registerHeapWrapper(this, window);
+       } catch (error) { throw realmError(error); }
+     }
+     clone() { try { return wrapRequest(getRequest(this).raw.clone()); } catch (error) { throw realmError(error); } }
+@@ -300,7 +301,7 @@
+   function wrapResponse(raw, view = {}) {
+     const response = Object.create(Response.prototype);
+     responseState.set(response, { raw, ...view, headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
+-    return response;
++    return registerHeapWrapper(response, window);
+   }
+   function abortableBody(raw, signal) {
+     if (!raw.body) return raw;
+@@ -373,7 +374,7 @@
+         const headers = fillHeaders(init.headers, 'response');
+         const status = init.status, statusText = init.statusText;
+         const raw = new NativeResponse(bodyValue(body, true), { status, statusText, headers: getHeaders(headers).raw });
+-        responseState.set(this, { raw, headers: wrapHeaders(raw.headers, 'response') });
++        responseState.set(this, { raw, headers: wrapHeaders(raw.headers, 'response') }); registerHeapWrapper(this, window);
+       } catch (error) { throw realmError(error); }
+     }
+     static error() { return wrapResponse(NativeResponse.error()); }
+--- a/src/form-controls.js
++++ b/src/form-controls.js
+@@ -1,3 +1,4 @@
++import { registerHeapFactoryValue } from './heap-registry.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -54,6 +55,7 @@
+     ownKeys: target => Reflect.ownKeys(target),
+     preventExtensions: () => false,
+   });
++  registerHeapFactoryValue(wrapper,{implementation});
+   implementation[utils.wrapperSymbol] = wrapper;
+   return wrapper;
+ }
+--- a/src/runtime.js
++++ b/src/runtime.js
+@@ -1,3 +1,4 @@
++import { runHeapQuery } from './heap-query.js';
+ import { Session as InspectorSession } from 'node:inspector';
+ import { randomUUID } from 'node:crypto';
+ import { types } from 'node:util';
+@@ -6,7 +7,7 @@
+ import { withTimeout } from './browser.js';
+ 
+ const methods = new Set([
+-  'Runtime.awaitPromise', 'Runtime.compileScript', 'Runtime.runScript',
++  'Runtime.queryObjects', 'Runtime.awaitPromise', 'Runtime.compileScript', 'Runtime.runScript',
+   'Runtime.globalLexicalScopeNames', 'Runtime.getHeapUsage', 'Runtime.getIsolateId',
+   'Runtime.getExceptionDetails', 'Runtime.setMaxCallStackSizeToCapture',
+ ]);
+@@ -143,6 +144,7 @@
+ export async function runRuntime(session, method, params = {}) {
+   if (!supportsRuntime(method)) throw new RuntimeError(`Unsupported Runtime method: ${method}`, -32601);
+   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new RuntimeError('Parameters must be an object');
++  if (method === 'Runtime.queryObjects') return runHeapQuery(session, params);
+   prune(session);
+   if (params.executionContextId !== undefined && params.contextId !== undefined && params.executionContextId !== params.contextId) {
+     throw new RuntimeError('Conflicting execution context ids');
+--- a/src/streams.js
++++ b/src/streams.js
+@@ -1,3 +1,4 @@
++import { registerHeapWrapper } from './heap-registry.js';
+ import * as web from 'node:stream/web';
+ import { TextEncoder, TextDecoder } from 'node:util';
+ import { codecPair } from './stream-codecs.js';
+@@ -40,6 +41,7 @@
+   // tokens contain only WeakRefs, never the stream or a closure capturing it.
+   const finalization = new FinalizationRegistry(reference => references.delete(reference));
+   function tag(value, name) {
++    registerHeapWrapper(value);
+     owned.set(value, name);
+     const reference = new WeakRef(value);
+     references.add(reference);

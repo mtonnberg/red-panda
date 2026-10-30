@@ -1,0 +1,69 @@
+diff --git a/src/main-idl-prototypes.js b/src/main-idl-prototypes.js
+new file mode 100644
+--- /dev/null
++++ b/src/main-idl-prototypes.js
+@@ -0,0 +1,28 @@
++// Optional, bounded before-author correction for existing fresh IDL objects.
++// No Window/constructor/wrapper identity is replaced. Host [[Realm]] remains
++// unchanged except the explicitly realm-compiled sequence method below.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const interfaces=require('jsdom/lib/jsdom/living/interfaces.js');
++const installed=new WeakSet(),hostObject=Object.prototype,hostFunction=Function.prototype;
++const prototypeOf=Object.getPrototypeOf,setPrototype=Object.setPrototypeOf,descriptor=Object.getOwnPropertyDescriptor;
++export function alignMainIDLPrototypes(window){
++ if(installed.has(window))return;installed.add(window);
++ const registry=window[utils.ctorRegistrySymbol],objectPrototype=window.Object.prototype,functionPrototype=window.Function.prototype;
++ const functions=new Set(),prototypes=new Set();
++ for(const[name,constructor]of Object.entries(registry)){
++  // Only pinned generated interfaces installed freshly by Window bootstrap.
++  // CSS classes and host Abort/Fetch constructors are outside this registry.
++  if(typeof constructor!=='function'||!interfaces.getInterfaceWrapper(name))continue;
++  functions.add(constructor);const prototype=descriptor(constructor,'prototype')?.value;if(!prototype||prototypes.has(prototype))continue;prototypes.add(prototype);
++  if(prototypeOf(prototype)===hostObject)setPrototype(prototype,objectPrototype);
++  for(const key of Reflect.ownKeys(prototype)){const item=descriptor(prototype,key);for(const value of [item.value,item.get,item.set])if(typeof value==='function')functions.add(value);}
++ }
++ for(const fn of functions)if(prototypeOf(fn)===hostFunction)setPrototype(fn,functionPrototype);
++ const property=descriptor(window.Element.prototype,'getAttributeNames');
++ const context=utils.implForWrapper(window.document)._globalObject;
++ const wrapper=vm.compileFunction('return ({getAttributeNames(...args){const values=apply(original,this,args);return apply(from,ArrayConstructor,[values]);}}).getAttributeNames;',['original','apply','from','ArrayConstructor'],{parsingContext:context})(property.value,window.Reflect.apply,window.Array.from,window.Array);
++ for(const key of ['name','length'])Object.defineProperty(wrapper,key,descriptor(property.value,key));
++ Object.defineProperty(window.Element.prototype,'getAttributeNames',{...property,value:wrapper});
++}
+diff --git a/test/main-idl-prototypes.test.js b/test/main-idl-prototypes.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/main-idl-prototypes.test.js
+@@ -0,0 +1,15 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {JSDOM} from 'jsdom';
++import {alignMainIDLPrototypes} from '../src/main-idl-prototypes.js';
++
++test('measured main IDL shapes use actual prototype links without changing canonical identities or shared CSS',t=>{
++ let identities;const dom=new JSDOM('<p id=p x=one></p>',{runScripts:'dangerously',beforeParse(window){identities={Window:window.Window,EventTarget:window.EventTarget,document:window.document,objectBase:Object.getPrototypeOf(window.EventTarget.prototype),CSSStyleDeclaration:window.CSSStyleDeclaration,cssBase:Object.getPrototypeOf(window.CSSStyleDeclaration.prototype)};alignMainIDLPrototypes(window);}});t.after(()=>dom.window.close());const w=dom.window;assert.equal(w.Window,identities.Window);assert.equal(w.EventTarget,identities.EventTarget);assert.equal(w.document,identities.document);assert.equal(Object.getPrototypeOf(w.EventTarget.prototype),identities.objectBase);assert.equal(w.CSSStyleDeclaration,identities.CSSStyleDeclaration);assert.equal(Object.getPrototypeOf(w.CSSStyleDeclaration.prototype),identities.cssBase);
++ assert.deepEqual(JSON.parse(w.eval('JSON.stringify({documentObject:document instanceof Object,queryFunction:document.querySelector instanceof Function,nodeConstructor:Node instanceof Function,listObject:document.querySelectorAll("p") instanceof Object,listConstructor:NodeList instanceof Function,namesArray:document.querySelector("p").getAttributeNames() instanceof Array,navigatorObject:navigator instanceof Object})')),{documentObject:true,queryFunction:true,nodeConstructor:true,listObject:true,listConstructor:true,namesArray:true,navigatorObject:true});
++});
++
++test('sequence method is nonconstructable, keeps descriptors and returns its creation realm when borrowed or globals are poisoned',t=>{
++ const create=()=>new JSDOM('<p id=p x=one></p>',{runScripts:'dangerously',beforeParse:alignMainIDLPrototypes}),parent=create(),child=create();t.after(()=>{parent.window.close();child.window.close();});const pw=parent.window,cw=child.window,method=pw.Element.prototype.getAttributeNames,parentArray=pw.Array,childArray=cw.Array;
++ assert.equal(method.name,'getAttributeNames');assert.equal(method.length,0);assert.equal(Object.hasOwn(method,'prototype'),false);assert.throws(()=>new method(),TypeError);assert.equal(Object.getOwnPropertyDescriptor(pw.Element.prototype,'getAttributeNames').enumerable,true);const borrowed=Reflect.apply(method,cw.document.getElementById('p'),[]);assert.equal(borrowed instanceof parentArray,true);assert.equal(borrowed instanceof childArray,false);
++ pw.eval('Array={from(){throw new Error("poisoned from")}};Reflect.apply=()=>{throw new Error("poisoned apply")};');const names=Reflect.apply(method,pw.document.getElementById('p'),[]);assert.equal(names instanceof parentArray,true);assert.deepEqual(Array.from(names),['id','x']);
++});
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
+ import {createInvocationTrampoline} from './invocation.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+ import {installServiceWorkers} from './service-workers.js';
+@@ -196,6 +197,7 @@
+     captureProtocolRealm(window);
+     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
+     this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
++    alignMainIDLPrototypes(window);
+     const listenerOwnership = installListenerOwnership(window);
+     listenerOwnership.scope(() => {
+       installErrors(this, window);

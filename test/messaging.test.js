@@ -90,7 +90,8 @@ test('invalid clone/transfer fails atomically and closed ports still serialize/d
   assert.throws(() => carrier.port1.postMessage(null, [{}]), { name: 'DataCloneError' });
   assert.throws(() => carrier.port1.postMessage({ callback() {} }, [buffer, inner.port1]), { name: 'DataCloneError' }); assert.equal(buffer.byteLength, 4);
   assert.throws(() => carrier.port1.postMessage(window.document.body), { name: 'DataCloneError' });
-  assert.throws(() => carrier.port1.postMessage(new window.Blob(['unsupported'])), { name: 'DataCloneError' });
+  const clonedBlob = window.structuredClone(new window.Blob(['supported']));
+  assert.ok(clonedBlob instanceof window.Blob); assert.equal(clonedBlob.size, 9);
   carrier.port1.close(); assert.throws(() => carrier.port1.postMessage(Symbol()), { name: 'DataCloneError' });
   carrier.port1.postMessage(null, [inner.port1, buffer]); assert.equal(buffer.byteLength, 0);
   assert.throws(() => carrier.port1.postMessage(null, [inner.port1]), { name: 'DataCloneError' });

@@ -1,5 +1,7 @@
-import { selectorForSpecificity, getSelectorStateRevision } from './selectors.js';
-import { enhanceDeclaration, parseStyleSheet, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
+import {computedTransform,computedFontSize} from './computed-values.js';
+import {evaluateMedia} from './media.js';
+import { selectorForSpecificity, getSelectorStateRevision, matchesInScope } from './selectors.js';
+import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -16,7 +18,7 @@ const SVGElementImpl = require('jsdom/lib/jsdom/living/nodes/SVGElement-impl.js'
 const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
 const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
 const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
-const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\nnoscript { display: none; }\n');
+const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\narea,base,datalist,head,link,meta,noscript,param,script,source,style,template,title,track { display: none; } details:not([open]) > :not(summary) { display: none; } [popover]:not(:popover-open):not(dialog[open]) { display:none; } dialog:popover-open {display:block;}\n');
 const RECORDS = new WeakMap();
 const SHEETS = new WeakMap();
 const ADOPTED = new WeakMap();
@@ -30,6 +32,8 @@ const initial = {
   float: 'none', clear: 'none', overflow: 'visible', 'overflow-x': 'visible', 'overflow-y': 'visible',
   width: 'auto', height: 'auto', 'min-width': '0px', 'min-height': '0px', 'max-width': 'none', 'max-height': 'none',
   opacity: '1', 'background-color': 'rgba(0, 0, 0, 0)', 'background-image': 'none', 'background-blend-mode': 'normal',
+  'z-index': 'auto', 'flex-grow': '0', 'flex-shrink': '1', 'flex-basis': 'auto', content: 'normal', gap: 'normal', 'column-gap': 'normal', 'border-radius': '0px', 'border-width': '0px', 'border-style': 'none',
+  'border-top-left-radius': '0px', 'border-top-right-radius': '0px', 'border-bottom-left-radius': '0px', 'border-bottom-right-radius': '0px',
   'box-sizing': 'content-box', isolation: 'auto', transform: 'none', '-webkit-transform': 'none',
   'font-family': 'serif', 'font-size': '16px', 'font-style': 'normal', 'font-weight': '400', 'font-variant': 'normal',
   'line-height': 'normal', 'text-align': 'start', 'text-transform': 'none', 'text-indent': '0px', 'white-space': 'normal',
@@ -75,6 +79,13 @@ for (const name of ['HTMLInputElement', 'HTMLOptionElement', 'HTMLSelectElement'
     if (typeof original === 'function') prototype[method] = function (...args) { const result = original.apply(this, args); changed(this); return result; };
   }
 }
+
+const characterDataPrototype=require('jsdom/lib/jsdom/living/nodes/CharacterData-impl.js').implementation.prototype;
+const replaceCharacterData=characterDataPrototype.replaceData;
+characterDataPrototype.replaceData=function(...args){const result=replaceCharacterData.apply(this,args);const record=recordFor(wrapperForImpl(this._ownerDocument));if(record)record.stateRevision++;return result;};
+const registryPrototype=require('jsdom/lib/jsdom/living/custom-elements/CustomElementRegistry-impl.js').implementation.prototype;
+const defineCustomElement=registryPrototype.define;
+registryPrototype.define=function(...args){const result=defineCustomElement.apply(this,args);const record=recordFor(this._globalObject.document);if(record)record.stateRevision++;return result;};
 
 const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
 StyleElementImpl.prototype._updateAStyleBlock = function () {
@@ -163,6 +174,7 @@ function upgradeSheet(record, sheet, constructed = false) {
   if (!metadata) {
     metadata = { record, document: record.document, constructed, locked: false };
     SHEETS.set(sheet, metadata);
+    if(record.originalSheetPrototype&&Object.getPrototypeOf(sheet)===record.originalSheetPrototype)Object.setPrototypeOf(sheet,record.sheetPrototype);
     sheet.cssRules = asRuleList(sheet.cssRules);
     if (!sheet.media) sheet.media = new cssom.MediaList();
     if (sheet.disabled === undefined) sheet.disabled = false;
@@ -172,13 +184,13 @@ function upgradeSheet(record, sheet, constructed = false) {
       replaceSync: { configurable: true, writable: true, value(text) {
         if (this !== sheet) return operation(record, this, 'replaceSync', arguments);
         if (!arguments.length) throw new record.window.TypeError('replaceSync requires CSS text');
-        if (!metadata.constructed || metadata.locked) throw new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError');
+        if (metadata.locked) throw new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError');
         replaceRules(record, sheet, text);
       } },
       replace: { configurable: true, writable: true, value(text) {
         if (this !== sheet) return operation(record, this, 'replace', arguments);
         if (!arguments.length) return record.window.Promise.reject(new record.window.TypeError('replace requires CSS text'));
-        if (!metadata.constructed || metadata.locked) return record.window.Promise.reject(new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError'));
+        if (metadata.locked) return record.window.Promise.reject(new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError'));
         text = String(text); metadata.locked = true;
         return record.window.Promise.resolve().then(() => {
           try { replaceRules(record, sheet, text); return sheet; }
@@ -333,24 +345,7 @@ function specificity(selector) {
   return score;
 }
 
-function mediaMatches(record, text) {
-  if (!text || !text.trim()) return true;
-  return splitTopLevel(text.toLowerCase()).filter(Boolean).some(query => {
-    let negate = false; query = query.trim();
-    if (query.startsWith('not ')) { negate = true; query = query.slice(4).trim(); }
-    query = query.replace(/^only\s+/, '');
-    let matches = true;
-    const type = query.match(/^(all|screen|print)\b/);
-    if (type) { matches = type[1] !== 'print'; query = query.slice(type[0].length).trim().replace(/^and\s+/, ''); }
-    for (const condition of query.split(/\s+and\s+/).filter(Boolean)) {
-      const bound = condition.match(/^\((min-|max-)?(width|height)\s*:\s*(\d+(?:\.\d+)?)px\)$/);
-      if (!bound) { record.unsupported.add('Media queries beyond screen/print and pixel width/height bounds'); return false; }
-      const dimension = bound[2] === 'width' ? record.window.innerWidth : record.window.innerHeight;
-      const value = Number(bound[3]); matches &&= bound[1] === 'min-' ? dimension >= value : bound[1] === 'max-' ? dimension <= value : dimension === value;
-    }
-    return negate ? !matches : matches;
-  });
-}
+function mediaMatches(record,text) { return evaluateMedia(text,{width:record.window.innerWidth,height:record.window.innerHeight},{emptyMatches:true}); }
 
 function shadowStyleSheet(record, element) {
   const text = element.textContent;
@@ -395,7 +390,7 @@ function inheritanceParent(element) {
 }
 
 function localToken(record, element) {
-  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
   const roots = new Set();
   for (let current = element; current; current = inheritanceParent(current)) {
     const root = rootOf(current); roots.add(root);
@@ -432,7 +427,23 @@ function textTransformValue(value) {
 
 function cascade(record, element) {
   const values = new Map(); let order = 0;
-  const offer = (style, score, origin, inline = false) => {
+  const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
+  const registerLayer=(parent,name,key)=>{
+    if(!name){const node={children:new Map()};parent.children.set(key,node);return node;}
+    if(!/^[\w-]+(?:\.[\w-]+)*$/.test(name))return null;
+    for(const part of name.split('.')){if(!parent.children.has(part))parent.children.set(part,{children:new Map()});parent=parent.children.get(part);}return parent;
+  };
+  const collectLayers=(rules,parent=layerRoot,depth=0)=>{if(depth>32)return;for(const rule of rules){const group=nestedGroupContents(rule);
+    if(group?.kind==='layerStatement'){for(const name of group.names)registerLayer(parent,name,rule);}
+    else if(group?.kind==='layer'){const node=registerLayer(parent,group.name,rule);if(node){layerNodes.set(rule,node);collectLayers(group.rules,node,depth+1);}}
+    else if(group?.kind==='media'){if(mediaMatches(record,group.media))collectLayers(group.rules,parent,depth+1);}
+    else if(rule.type===4&&rule.cssRules){if(mediaMatches(record,rule.media?.mediaText??''))collectLayers(rule.cssRules,parent,depth+(rule.type===4?1:0));}
+    else if(rule.type===1&&rule.cssRules)collectLayers(rule.cssRules,parent,depth+(rule.type===4?1:0));
+  }};
+  const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
+  for(const{sheet}of authorSheets)collectLayers(sheet.cssRules);
+  let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
+  const offer = (style, score, origin, inline = false, layer=layerRoot) => {
     style = declaration(style);
     for (let index = 0; index < style.length; index++) {
       const property = style[index];
@@ -452,24 +463,46 @@ function cascade(record, element) {
       // expansions except overflow. Its independently expanded axes likewise
       // take part in source order, specificity and importance.
       for (const { name, entry, overflowPart } of entries) {
-        const key = [important ? 1 : 0, important && origin === 0 ? 2 : origin, inline ? 1 : 0, ...score, order++];
+        const key = [important ? 1 : 0, important && origin === 0 ? 2 : origin, inline ? 1 : 0, important?-layer.rank:layer.rank, ...score, order++];
         const list = values.get(name) ?? []; list.push({ value: entry, key, origin, overflowPart }); values.set(name, list);
       }
     }
   };
-  const walk = (rules, origin) => {
+  const resolveNested=(selector,parent)=>{
+    if(!parent)return selector;
+    let result='',ampersand=false,quote=null,brackets=0;
+    for(let i=0;i<selector.length;i++){
+      const c=selector[i];if(c==='\\'){result+=c+(selector[++i]??'');continue;}
+      if(quote){result+=c;if(c===quote)quote=null;continue;}
+      if(c==='"'||c==="'"){quote=c;result+=c;continue;}
+      if(c==='[')brackets++;if(c===']')brackets--;
+      if(c==='&'&&!brackets){result+=`:is(${parent})`;ampersand=true;}else result+=c;
+    }
+    return ampersand?result:`:is(${parent}) ${result}`;
+  };
+  const offerSelector=(selectorText,style,origin,layer=layerRoot)=>{
+    let highest=null;
+    for(const selector of splitTopLevel(selectorText)) {
+      if(/:host|::slotted|::part/.test(selector)){record.unsupported.add(':host, ::slotted and ::part selectors');continue;}
+      try{if(matchesInScope(element,selector,record.document.documentElement)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
+      catch{record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
+    }
+    if(highest)offer(style,highest,origin,false,layer);
+  };
+  const walk = (rules, origin, parent=null, layer=layerRoot, depth=0) => {
+    if(depth>32)return;
     for (const rule of rules) {
-      if (rule.selectorText && rule.style) {
-        let highest = null;
-        for (const selector of splitTopLevel(rule.selectorText)) {
-          if (/:host|::slotted|::part/.test(selector)) { record.unsupported.add(':host, ::slotted and ::part selectors'); continue; }
-          try { if (element.matches(selector)) { const score = specificity(selector); if (!highest || compare(score, highest) > 0) highest = score; } }
-          catch { record.unsupported.add('Selectors unsupported by the pinned DOM selector engine'); }
-        }
-        if (highest) offer(rule.style, highest, origin);
-      } else if (rule.type === 4 && rule.cssRules) {
-        if (mediaMatches(record, rule.media?.mediaText ?? rule.conditionText ?? '')) walk(rule.cssRules, origin);
-      } else if (rule.cssRules && rule.type !== 7) record.unsupported.add('Cascade layers, nesting, @supports and other grouping rules');
+      if(rule.selectorText&&rule.style) {
+        const selector=splitTopLevel(rule.selectorText).map(part=>resolveNested(part,parent)).join(', ');
+        offerSelector(selector,rule.style,origin,layer);
+        if(rule.cssRules?.length)walk(rule.cssRules,origin,selector,layer,depth);
+      } else if(nestedGroupContents(rule)) {
+        const group=nestedGroupContents(rule);
+        if(group.kind==='layer'){const child=layerNodes.get(rule);if(child){if(parent&&group.style)offerSelector(parent,group.style,origin,child);walk(group.rules,origin,parent,child,depth+1);}}
+        else if(group.kind==='media'&&parent&&mediaMatches(record,group.media)){offerSelector(parent,group.style,origin,layer);walk(group.rules,origin,parent,layer,depth+1);}
+      } else if(rule.type===4&&rule.cssRules) {
+        if(mediaMatches(record,rule.media?.mediaText??rule.conditionText??''))walk(rule.cssRules,origin,parent,layer,depth+1);
+      } else if(rule.cssRules&&rule.type!==7)record.unsupported.add('Cascade layers, @supports and other grouping rules');
     }
   };
   walk(UA.cssRules, 0);
@@ -477,7 +510,7 @@ function cascade(record, element) {
     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
   }
   const root = rootOf(element);
-  for (const { sheet, media } of scopeSheets(record, root)) if (!sheet.disabled && mediaMatches(record, media)) walk(sheet.cssRules, 1);
+  for(const{sheet}of authorSheets)walk(sheet.cssRules,1);
   offer(element.style, [0, 0, 0], 1, true);
   const chosen = new Map();
   for (const [property, candidates] of values) {
@@ -536,7 +569,7 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
     const next = new Set(stack); next.add(name);
     const value = substitute(custom.get(name), key => resolveCustom(key, next)); resolved.set(name, value); return value;
   };
-  for (const property of custom.keys()) { const value = resolveCustom(property); if (value !== null) result.setProperty(property, value); }
+  for (const [property,value] of custom) result.setProperty(property,value);
   const properties = [...new Set([...Object.keys(initial), ...chosen.keys()])].sort((a, b) => Number(shorthands.has(b)) - Number(shorthands.has(a)));
   const resolve = property => {
     const inheriting = inherited.has(property), fallback = initial[property] ?? '';
@@ -544,7 +577,7 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
     const selection = chosen.get(property);
     let value = typeof selection === 'object' ? selection.value : selection;
     if (value === undefined) value = inheriting ? parentValue : fallback;
-    if (property !== 'opacity' && /var\(/.test(value)) value = substitute(value, resolveCustom);
+    // Native exposes declared variable token streams without substitution.
     if (selection?.overflowPart !== undefined && value !== null) value = overflowAxes(value)?.[selection.overflowPart] ?? null;
     const keyword = value?.trim().toLowerCase();
     if (value === null || keyword === 'unset') value = inheriting ? parentValue : fallback;
@@ -558,11 +591,23 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
   for (const property of properties) {
     if (property === 'color' || property.startsWith('--')) continue;
     let value = resolve(property);
+    if (property === 'transform' || property === '-webkit-transform') value = computedTransform(value);
+    if (property === 'font-size') {
+      const rootElement = record.document.documentElement;
+      const rootSize = element === rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
+      value = computedFontSize(value,parentStyle?.fontSize,rootSize,{isRoot:element===rootElement});
+    }
+    if (['display','visibility','position','pointer-events','overflow','overflow-x','overflow-y','content-visibility'].includes(property)&&typeof value==='string')value=value.toLowerCase();
     if (property === 'font-weight') value = ({ normal: '400', bold: '700' })[value] ?? value;
     if (property.endsWith('color') && value) { try { value = getComputedOrUsedColor(value); } catch {} }
-    result.setProperty(property, inherited.has(property) ? parentStyle?.getPropertyValue(property) || initial[property] || '' : initial[property] || '');
-    if (property === 'opacity') result._setProperty(property, value);
-    else result.setProperty(property, value);
+    // Cascade declarations have already passed their property grammar. Store
+    // computed longhands directly: declaration setters can clear border widths
+    // while serializing border-style:none, which is invalid for computed state.
+    result._setProperty(property,value);
+  }
+  for(const shorthand of ['margin','padding','border-width','border-style','border-color']) {
+    const values=['top','right','bottom','left'].map(side=>result.getPropertyValue(shorthand.startsWith('border-')?'border-'+side+'-'+shorthand.slice(7):shorthand+'-'+side));
+    if(values.every(Boolean)){const [top,right,bottom,left]=values;result._setProperty(shorthand,top===right&&top===bottom&&top===left?top:top===bottom&&right===left?top+' '+right:right===left?top+' '+right+' '+bottom:values.join(' '));}
   }
   // CSS Overflow's computed-value coupling turns visible into auto and clip
   // into hidden when the opposite axis establishes a scrolling box.
@@ -581,7 +626,10 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
   return result;
 }
 
-function computedStyle(record, element) {
+function computedStyle(record, element, pseudo = '') {
+  record.views ??= new WeakMap();
+  let views = record.views.get(element); if (!views) { views = new Map(); record.views.set(element, views); }
+  if (views.has(pseudo)) return views.get(pseudo);
   let token, cached;
   const current = () => {
     const next = localToken(record, element);
@@ -589,7 +637,7 @@ function computedStyle(record, element) {
     return cached;
   };
   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
-  return new Proxy(new CSSStyleDeclaration(), {
+  const view = new Proxy(new CSSStyleDeclaration(), {
     get(target, property) {
       if (['setProperty', 'removeProperty'].includes(property)) return readonly;
       if (property === 'cssText') return '';
@@ -599,12 +647,13 @@ function computedStyle(record, element) {
     },
     set: readonly, deleteProperty: readonly, defineProperty: readonly,
   });
+  views.set(pseudo,view); return view;
 }
 
 export function getStyleRevision(window) {
   const record = recordFor(window?.document);
   if (!record) return 0;
-  const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
+  const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, record.window.location.href, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
   const visit = root => {
     tokens.push(id(root), implForWrapper(root)._version);
     for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
@@ -672,12 +721,15 @@ export function installStyles(page, window) {
     deleteRule(index) { return operation(record, this, 'deleteRule', arguments); }
     static [Symbol.hasInstance](sheet) { return sheet instanceof originalConstructor; }
   }
+  record.originalSheetPrototype=originalConstructor.prototype;record.sheetPrototype=CSSStyleSheet.prototype;
   window.CSSStyleSheet = CSSStyleSheet;
   window.getComputedStyle = function getComputedStyle(element, pseudo = null) {
     if (!ElementInterface.is(element)) throw new window.TypeError('getComputedStyle requires an Element');
-    if (pseudo !== null && pseudo !== undefined && String(pseudo) !== '') throw notSupported(record, 'Computed pseudo-element styles are not implemented');
+    let key = pseudo == null ? '' : String(pseudo).toLowerCase();
+    if (!key.startsWith(':')) key = '';
+    else key = key.replace(/^:(before|after|first-letter|first-line)$/, '::$1');
     const owner = recordFor(element.ownerDocument);
-    return owner ? computedStyle(owner, element) : record.originalGetComputedStyle.call(window, element);
+    return owner ? computedStyle(owner, element, key) : record.originalGetComputedStyle.call(window, element);
   };
   const dispose = () => {
     if (record.disposed) return;
@@ -687,6 +739,9 @@ export function installStyles(page, window) {
   };
   record.controller = { dispose, get revision() { return getStyleRevision(window); }, unsupported: record.unsupported };
   if (!record.signal?.aborted && !page.closed) RECORDS.set(document, record);
+  const indeterminate=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'indeterminate');
+  if(indeterminate?.set)Object.defineProperty(window.HTMLInputElement.prototype,'indeterminate',{...indeterminate,set(value){const result=indeterminate.set.call(this,value);const owner=recordFor(this.ownerDocument);if(owner)owner.stateRevision++;return result;}});
+
   record.close = function () { dispose(); return record.originalClose.call(window); }; window.close = record.close;
   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
   return record.controller;

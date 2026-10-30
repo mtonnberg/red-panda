@@ -16,14 +16,23 @@ function active(context) {
   return !context.disposed && !context.page.closed && !context.record.signal?.aborted &&
     implForWrapper(context.window.document) === context.document;
 }
+function freshBlank(context) {
+  return context && active(context) && !context.loaded && !context.current &&
+    context.page.registry && context.page.url === 'about:blank' &&
+    context.initialBlank && context.record.parserDone && context.record.parserOptions;
+}
 function eligible(context) {
-  return context && active(context) && context.loaded &&
-    (context.document.readyState === 'complete' || context.current?.kind === 'write');
+  return freshBlank(context) || context && active(context) &&
+    (context.current?.kind === 'write' || context.loaded && context.document.readyState === 'complete');
 }
 function reset(context, args) {
   const { record, document, window, ownership } = context;
   // This path deliberately does not apply to an initial loading/network parse.
   // Parser-script no-op and original XML/custom-element guards remain outside.
+  // A fresh blank frame's placeholder close may still be queued. Retire its
+  // real queues/listeners before new input, so they cannot set fresh readiness.
+  document._queue.paused = true; document._deferQueue.paused = true;
+  document._deferQueue.setListener(null); document._asyncQueue.setListener(null);
   context.current?.abort('Superseded write-created parser');
   record.stream?.abort('Superseded post-load parser');
   for (const manager of context.retired) if (!manager.size()) context.retired.delete(manager);
@@ -51,7 +60,7 @@ function reset(context, args) {
   });
   Object.defineProperties(cycle, Object.getOwnPropertyDescriptors(controller));
   context.current = cycle; record.stream = cycle;
-  if (!context.bridgeInstalled) {
+  if (context.loaded && !ownership.hasNativeLoadBridge && !context.bridgeInstalled) {
     context.bridgeInstalled = true;
     // The old unmarked jsdom bridge was erased. Initial Window load already
     // happened, so its pending nextTick registration cannot race this bridge.
@@ -68,6 +77,7 @@ function patch() {
   underlyingOpen = open;
   DocumentImpl.prototype.open = function (...args) {
     const context = contexts.get(this);
+    if (context && this._parsingMode === 'html' && !active(context)) return this;
     if (eligible(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
     if (!eligible(context) || context.record.parserScriptDepth > 0 || this._parsingMode !== 'html' || this._throwOnDynamicMarkupInsertionCounter) return open.apply(this, args);
     return reset(context, args);
@@ -75,6 +85,7 @@ function patch() {
   DocumentImpl.prototype.write = function (...args) {
     const context = contexts.get(this);
     if (this._parsingMode === 'xml' || this._throwOnDynamicMarkupInsertionCounter) return write.apply(this, args);
+    if (context && !active(context)) return;
     if (context && active(context)) {
       if ((!context.current || context.current.state.status === 'complete') &&
           eligible(context) && !this._writeAfterElement && args.join('')) reset(context, []);
@@ -86,6 +97,7 @@ function patch() {
   };
   DocumentImpl.prototype.close = function (...args) {
     const context = contexts.get(this), cycle = context?.current;
+    if (context && this._parsingMode === 'html' && !active(context)) return;
     if (cycle && active(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
     if (cycle && active(context)) {
       if (cycle.state.status === 'open') { context.record.closeRequested = args; cycle.close(); return; }
@@ -121,4 +133,22 @@ export function installDocumentReset(page, window, record, makeParser, finishPar
     context.current?.abort(); for (const manager of context.retired) manager.close(); context.retired.clear();
   };
   return context;
+}
+
+// Complete only the actual, parsed empty about:blank placeholder. Its queued
+// native close has not run yet; retire those queues and use the real synchronous
+// Document.close path. The native load-to-frame bridge still dispatches its real
+// initial load, and subsequent writes create an independent open parser.
+export function completeInitialBlankFrame(window) {
+  const context = contexts.get(implForWrapper(window.document));
+  if (!context || !active(context) || context.loaded || context.current || !context.record.parserDone ||
+      context.page.url !== 'about:blank' || context.document.scripts.length ||
+      context.document._requestManager.size() || context.record.styles.size) return false;
+  const document = context.document;
+  document._queue.paused = true; document._deferQueue.paused = true;
+  document._deferQueue.setListener(null); document._asyncQueue.setListener(null);
+  context.page.moduleScripts?.start();
+  document.close(true);
+  context.initialBlank = true;
+  return true;
 }

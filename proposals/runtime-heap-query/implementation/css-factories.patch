@@ -1,0 +1,195 @@
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -1,3 +1,4 @@
++import { registerHeapWrapper,privateHeapObject,publishHeapObject } from './heap-registry.js';
+ // Scoped CSSOM adaptation. Parsing is token based so strings, comments, URLs and
+ // balanced component values do not accidentally become declaration boundaries.
+ import { createRequire } from 'node:module';
+@@ -179,7 +180,7 @@
+   }
+ }
+ 
+-const COMPAT = Object.create(BASE);
++const COMPAT = privateHeapObject(Object.create(BASE));
+ for(const [name,descriptor] of Object.entries(Object.getOwnPropertyDescriptors(BASE))) {
+   if(!descriptor.set || ['cssText','length'].includes(name))continue;
+   const property=name==='cssFloat'?'float':camelToDashed(name);
+@@ -233,11 +234,11 @@
+ 
+ export function enhanceDeclaration(style, window) {
+   if(!DECLARATIONS.has(style)) {Object.setPrototypeOf(style,COMPAT);DECLARATIONS.add(style);}
+-  if(window)style._global=window;
++  if(window){style._global=window;registerHeapWrapper(style,window);}
+   return style;
+ }
+ export function createDeclaration(text='', options={}) {
+-  const style=enhanceDeclaration(new CSSStyleDeclaration(),options.window);
++  const style=enhanceDeclaration(privateHeapObject(new CSSStyleDeclaration()),options.window);
+   for(const item of parseDeclarations(text,options)) {
+     if(style.getPropertyPriority(item.property)==='important'&&item.priority!=='important')continue;
+     style.setProperty(item.property,item.value,item.priority);
+@@ -252,7 +253,7 @@
+       ownKeys(){return LISTS.get(list).map((_,i)=>String(i));},
+       getOwnPropertyDescriptor(target,key){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<LISTS.get(list).length)return{configurable:true,enumerable:true,value:LISTS.get(list)[Number(key)],writable:false};return Reflect.getOwnPropertyDescriptor(target,key);},
+       set(){return false;},deleteProperty(){return false;},defineProperty(){return false;}});
+-    LISTS.set(list,[...rules]);return list;
++    LISTS.set(list,[...rules]);return registerHeapWrapper(list);
+   }
+   get length(){return LISTS.get(this).length;}
+   *[Symbol.iterator](){for(let i=0;i<this.length;i++)yield this[i];}
+@@ -271,6 +272,12 @@
+     else if(c==='{'){const end=balancedEnd(text,i),prelude=text.slice(start,i).trim();if(prelude)result.push({prelude,body:text.slice(i+1,end),text:text.slice(start,Math.min(end+1,text.length)).trim()});i=end;start=i+1;}
+   }
+   return result;
++}
++
++export function heapCSSGraph(sheet,publish=false){
++ const tag=publish?publishHeapObject:privateHeapObject,seen=new WeakSet();
++ const visit=value=>{if(value===null||typeof value!=='object'||seen.has(value))return;seen.add(value);tag(value);for(const key of ['style','cssRules']){const descriptor=Object.getOwnPropertyDescriptor(value,key);if(!descriptor||!('value'in descriptor))continue;const child=descriptor.value;if(child===null||typeof child!=='object')continue;tag(child);if(key==='style')continue;const items=LISTS.get(child)??(Array.isArray(child)?child:[]);for(let i=0;i<items.length;i++)visit(items[i])}};
++ visit(sheet);return sheet;
+ }
+ 
+ export function parseStyleSheet(text,{window,onUnsupported}={}) {
+@@ -301,5 +308,5 @@
+     if(rule.type===1)Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,get(){return `${this.selectorText} {${this.style.length?` ${this.style.cssText} `:' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}});
+     rules.push(rule);
+   }
+-  sheet.cssRules=new CSSRuleList(rules);return sheet;
+-}
++  sheet.cssRules=new CSSRuleList(rules);return heapCSSGraph(sheet);
++}
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,4 @@
++import { registerHeapWrapper } from './heap-registry.js';
+ // Independent surrogate geometry for a headless DOM. This intentionally models
+ // the reference's measured simple boxes; it is not a CSS layout renderer.
+ import { getStyleRevision } from './styles.js';
+@@ -243,14 +244,14 @@
+       }
+       return original.getPropertyValue(name);
+     };
+-    return new Proxy(original, {
++    return registerHeapWrapper(new Proxy(original, {
+       get(target, property) {
+         if (property === 'width' || property === 'height') return computed(property);
+         if (property === 'getPropertyValue') return name => computed(name);
+         const value = Reflect.get(target, property, target);
+         return typeof value === 'function' ? value.bind(target) : value;
+       },
+-    });
++    }),window,original);
+   };
+   page.layout = layout;
+   return layout;
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,3 +1,5 @@
++import { heapCSSGraph } from './cssom.js';
++import { registerHeapWrapper,privateHeapObject } from './heap-registry.js';
+ import { selectorForSpecificity, getSelectorStateRevision } from './selectors.js';
+ import { enhanceDeclaration, parseStyleSheet, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
+ import { createRequire } from 'node:module';
+@@ -100,7 +102,7 @@
+ 
+ function declaration(style) {
+   if (style instanceof CSSStyleDeclaration) return enhanceDeclaration(style);
+-  const result = enhanceDeclaration(new CSSStyleDeclaration());
++  const result = enhanceDeclaration(privateHeapObject(new CSSStyleDeclaration()));
+   const listed = new Set(Array.from({ length: style.length ?? 0 }, (_, index) => style[index]));
+   const names = new Set(listed);
+   for (const key of Object.keys(style)) {
+@@ -144,6 +146,7 @@
+         });
+       }
+     }
++    if (SHEETS.has(sheet)) heapCSSGraph(rule,true);
+   }
+ }
+ 
+@@ -163,6 +166,7 @@
+   if (!metadata) {
+     metadata = { record, document: record.document, constructed, locked: false };
+     SHEETS.set(sheet, metadata);
++    if(record.originalSheetPrototype&&Object.getPrototypeOf(sheet)===record.originalSheetPrototype)Object.setPrototypeOf(sheet,record.sheetPrototype);
+     sheet.cssRules = asRuleList(sheet.cssRules);
+     if (!sheet.media) sheet.media = new cssom.MediaList();
+     if (sheet.disabled === undefined) sheet.disabled = false;
+@@ -210,7 +214,7 @@
+     });
+     metadata.operations = Object.fromEntries(['replaceSync', 'replace', 'insertRule', 'deleteRule'].map(name => [name, sheet[name]]));
+   }
+-  if (fresh) normalizeRules(sheet.cssRules, sheet);
++  if (fresh) { normalizeRules(sheet.cssRules, sheet); heapCSSGraph(sheet,true); }
+   return sheet;
+ }
+ 
+@@ -260,6 +264,7 @@
+       return Reflect.deleteProperty(array, property);
+     },
+   });
++  registerHeapWrapper(state.list,record.window);
+   state.replace = values => {
+     if (values == null || typeof values[Symbol.iterator] !== 'function') throw new record.window.TypeError('adoptedStyleSheets requires an iterable');
+     const next = [...values]; next.forEach(validate);
+@@ -439,7 +444,7 @@
+       let value = style.getPropertyValue(property);
+       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
+       const important = style.getPropertyPriority(property) === 'important';
+-      const expanded = new CSSStyleDeclaration(); expanded.setProperty(property, value);
++      const expanded = privateHeapObject(new CSSStyleDeclaration()); expanded.setProperty(property, value);
+       const entries = property === 'opacity' ? [{ name: property, entry: value }] : [...expanded._values].map(([name, entry]) => ({ name, entry }));
+       if (property === 'overflow') {
+         const axes = overflowAxes(value);
+@@ -474,7 +479,7 @@
+   };
+   walk(UA.cssRules, 0);
+   if (element.localName === 'a' && element.hasAttribute('href')) {
+-    const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
++    const link = privateHeapObject(new CSSStyleDeclaration()); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
+   }
+   const root = rootOf(element);
+   for (const { sheet, media } of scopeSheets(record, root)) if (!sheet.disabled && mediaMatches(record, media)) walk(sheet.cssRules, 1);
+@@ -490,6 +495,7 @@
+ }
+ 
+ normalizeRules(UA.cssRules, UA);
++heapCSSGraph(UA);
+ 
+ function substitute(text, resolve) {
+   let result = '', start = 0;
+@@ -522,7 +528,7 @@
+   if (retained?.token === token) return retained.style;
+   const parent = inheritanceParent(element);
+   const parentStyle = parent ? compute(record, parent, memo) : null;
+-  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, { token, style: result });
++  const chosen = cascade(record, element), result = privateHeapObject(new CSSStyleDeclaration()); memo.set(element, { token, style: result });
+   const custom = new Map(), resolved = new Map();
+   if (parentStyle) for (let index = 0; index < parentStyle.length; index++) if (parentStyle[index].startsWith('--')) custom.set(parentStyle[index], parentStyle.getPropertyValue(parentStyle[index]));
+   for (const [property, value] of chosen) if (property.startsWith('--')) {
+@@ -589,7 +595,7 @@
+     return cached;
+   };
+   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
+-  return new Proxy(new CSSStyleDeclaration(), {
++  return registerHeapWrapper(new Proxy(privateHeapObject(new CSSStyleDeclaration()), {
+     get(target, property) {
+       if (['setProperty', 'removeProperty'].includes(property)) return readonly;
+       if (property === 'cssText') return '';
+@@ -598,7 +604,7 @@
+       return typeof value === 'function' && property !== 'constructor' ? value.bind(current()) : value;
+     },
+     set: readonly, deleteProperty: readonly, defineProperty: readonly,
+-  });
++  }),record.window);
+ }
+ 
+ export function getStyleRevision(window) {
+@@ -672,6 +678,7 @@
+     deleteRule(index) { return operation(record, this, 'deleteRule', arguments); }
+     static [Symbol.hasInstance](sheet) { return sheet instanceof originalConstructor; }
+   }
++  record.originalSheetPrototype=originalConstructor.prototype;record.sheetPrototype=CSSStyleSheet.prototype;
+   window.CSSStyleSheet = CSSStyleSheet;
+   window.getComputedStyle = function getComputedStyle(element, pseudo = null) {
+     if (!ElementInterface.is(element)) throw new window.TypeError('getComputedStyle requires an Element');

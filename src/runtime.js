@@ -1,3 +1,4 @@
+import {invocationBindingFor} from './invocation.js';
 import { Session as InspectorSession } from 'node:inspector';
 import { randomUUID } from 'node:crypto';
 import { types } from 'node:util';
@@ -212,7 +213,10 @@ export async function runRuntime(session, method, params = {}) {
         return { result: session.remote(error, params.returnByValue, group, contextId), exceptionDetails: details(session, error, contextId) };
       }
     }
-    case 'Runtime.globalLexicalScopeNames': return inspector().lexicalNames();
+    case 'Runtime.globalLexicalScopeNames': {
+      const result=await inspector().lexicalNames(),owned=invocationBindingFor(page.dom.getInternalVMContext());
+      return {...result,names:result.names.filter(name=>name!==owned)};
+    }
     case 'Runtime.getHeapUsage': return inspector().post('Runtime.getHeapUsage');
     case 'Runtime.getIsolateId': return inspector().post('Runtime.getIsolateId');
     case 'Runtime.getExceptionDetails': {

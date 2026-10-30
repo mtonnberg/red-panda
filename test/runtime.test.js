@@ -109,6 +109,7 @@ test('global lexical names come from the selected VM and exclude other page and 
   assert.ok(result.names.includes('selectedLexical')); assert.ok(result.names.includes('selectedConstant')); assert.ok(result.names.includes('SelectedClass'));
   assert.ok(!result.names.includes('unrelatedOtherPage')); assert.ok(!result.names.includes('propertyOnly'));
   assert.ok(!result.names.includes('session')); assert.ok(!result.names.includes('browser'));
+  assert.equal(result.names.some(name=>name.startsWith('__redpanda_invocation_')),false);
   assert.equal(Object.getOwnPropertyNames(page.dom.window).some(key => key.startsWith('__redpanda_inspector_')), false);
 }));
 

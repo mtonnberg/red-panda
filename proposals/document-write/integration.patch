@@ -1,0 +1,204 @@
+--- a/src/shadow.js
++++ b/src/shadow.js
+@@ -326,6 +326,18 @@
+     if (permit) {
+       FORCED_FRAGMENTS.delete(context);
+       declarativeAdapter(options.treeAdapter, permit.record);
++      if (permit.executeScripts) {
++        const pop = options.treeAdapter.onItemPop;
++        options.treeAdapter.onItemPop = function (node, ...args) {
++          const script = node.localName === 'script' && node.namespaceURI === HTML && node._parserInserted;
++          const attached = node._attached;
++          // Written scripts are prepared during the real fragment parse, before
++          // its live-DOM splice. isConnected still reflects the detached tree.
++          if (script) node._attached = true;
++          try { return pop.call(this, node, ...args); }
++          finally { if (script) node._attached = attached || node.isConnected; }
++        };
++      }
+     }
+     return parseFragment.call(this, context, markup, options);
+   };
+@@ -415,3 +427,13 @@
+   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
+   return record.controller;
+ }
++
++// Scope one actual fragment-parser entry. Nested ordinary innerHTML parsing
++// remains inert after the permit is consumed, as with setHTMLUnsafe.
++export function parseDocumentWriteFragment(document, markup) {
++  patchHosts();
++  const context = document.createElement('div');
++  FORCED_FRAGMENTS.set(context, { record: recordFor(document), executeScripts: true });
++  try { return htmlParser.parseFragment(markup, context); }
++  finally { FORCED_FRAGMENTS.delete(context); }
++}
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -1,3 +1,4 @@
++import { parseDocumentWriteFragment } from './shadow.js';
+ import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
+ import { prepareInputParserAdapter } from './input-controls.js';
+ import { installDocumentReset } from './document-reset.js';
+@@ -140,6 +141,29 @@
+   return parser;
+ }
+ 
++// Queue ownership remains with the real loader. Drop only delivery into an
++// inactive Document; completed bytes/error cleanup still drain the retired
++// queue without dispatching late events or invoking its DOM callbacks.
++function fetchOwnedResource(record, loader, fetch, url, options) {
++  const names = ['_queue', '_deferQueue', '_asyncQueue'];
++  const previous = names.map(name => loader[name]);
++  for (let index = 0; index < names.length; index++) {
++    const queue = previous[index];
++    loader[names[index]] = Object.create(queue, { push: { value(request, loaded, failed, ...args) {
++      const guard = callback => typeof callback === 'function'
++        ? (...values) => {
++          if (active(record)) return callback(...values);
++          loader._requestManager.remove(request);
++          return Promise.resolve();
++        }
++        : callback;
++      return queue.push(request, guard(loaded), guard(failed), ...args);
++    } } });
++  }
++  try { return fetch.call(loader, url, options); }
++  finally { for (let index = 0; index < names.length; index++) loader[names[index]] = previous[index]; }
++}
++
+ function patch() {
+   if (patched) return;
+   patched = true;
+@@ -192,6 +216,22 @@
+   };
+   DocumentImpl.prototype.write = function (...args) {
+     const record = documents.get(this), anchor = this._writeAfterElement;
++    if (active(record) && anchor && this._parsingMode === 'html' && !this._throwOnDynamicMarkupInsertionCounter) {
++      const fragment = parseDocumentWriteFragment(this, args.join(''));
++      // Fragment scripts can remove the writing script while parsing. Preserve
++      // their actual effects and stop the splice if its live anchor vanished.
++      if (!active(record)) return;
++      const parent = anchor.parentNode;
++      if (!parent) return;
++      let cursor = anchor;
++      while (fragment.firstChild) {
++        const node = fragment.firstChild;
++        parent.insertBefore(node, cursor.parentNode === parent ? cursor.nextSibling : null);
++        cursor = node;
++      }
++      this._writeAfterElement = cursor;
++      return;
++    }
+     const parent = anchor?.parentNode, boundary = anchor?.nextSibling;
+     const result = writeDocument.apply(this, args);
+     // Follow the actual insertion boundary, including nodes produced by a
+@@ -276,11 +316,11 @@
+     const record = documents.get(this._document), element = options.element;
+     if (!record) return fetchResource.call(this, url, options);
+     if (element.localName === 'link' && (element.getAttributeNS(null, 'rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet')) {
+-      const request = fetchResource.call(this, url, options);
++      const request = fetchOwnedResource(record, this, fetchResource, url, options);
+       if (request?.then) record.styles.add(element);
+       return request;
+     }
+-    if (element.localName !== 'script') return fetchResource.call(this, url, options);
++    if (element.localName !== 'script') return fetchOwnedResource(record, this, fetchResource, url, options);
+     if (!active(record)) return null;
+     // jsdom classifies its queues using the async attribute only. Supply the
+     // actual force-async state during this synchronous classification, without
+@@ -301,7 +341,7 @@
+       overlay.fetch = () => adopted; this._resourceLoader = overlay;
+     }
+     try {
+-      request = fetchResource.call(this, url, { ...options, onLoad(data) {
++      request = fetchOwnedResource(record, this, fetchResource, url, { ...options, onLoad(data) {
+         return hostTask(() => {
+           if (!active(record)) return;
+           return duringParserScript(record, element, () => options.onLoad?.(data));
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -101,6 +101,36 @@
+     page.documentAbort.signal.addEventListener('abort', abort, { once: true });
+     return request;
+   };
++}
++
++// Keep retained inactive Documents as real DOM trees. Delegate every other
++// cleanup operation to the original close, including timers, requests and ports.
++function closeRetainingDocument(document, close) {
++  const view = document._defaultView;
++  // Registry teardown already discarded child browsing contexts. Remove their
++  // Window accessors before native close recurses; retained iframe DOM nodes
++  // no longer have a live contentWindow after their own teardown.
++  if (view) {
++    for (let index = 0; index < view._length; index++) Reflect.deleteProperty(view, String(index));
++    view._length = 0;
++  }
++  document._lastFocusedElement = null;
++  const body = document.body;
++  const descriptor = body && Object.getOwnPropertyDescriptor(body, '_replaceAll');
++  const replaceAll = body?._replaceAll;
++  let pending = true;
++  if (body) Object.defineProperty(body, '_replaceAll', { configurable: true, writable: true, value(node, ...args) {
++    // Pinned jsdom's native close clears body.innerHTML with an empty real
++    // fragment. Skip only that destructive teardown replacement, not parsing
++    // or public mutation methods, and restore the private method immediately.
++    if (pending && node?.nodeType === 11 && !node.firstChild) { pending = false; return; }
++    return replaceAll.call(this, node, ...args);
++  } });
++  try { return close(); }
++  finally {
++    if (body) { if (descriptor) Object.defineProperty(body, '_replaceAll', descriptor); else delete body._replaceAll; }
++    document._defaultView = null;
++  }
+ }
+ 
+ function stale() { return Object.assign(new Error('Frame document is detached or no longer current'), { code: -32602 }); }
+@@ -273,7 +303,10 @@
+     if (fresh) registry.announce('frameAttached', { frameId: record.id, parentFrameId: record.parentId });
+     registry.announce('frameNavigationStarted', { frameId: record.id, loaderId: framePage.loaderId, url: framePage.url });
+     const closed = childWindow.close.bind(childWindow);
+-    childWindow.close = () => { if (record.page === framePage) destroyDocument(record); return closed(); };
++    childWindow.close = () => {
++      if (record.page === framePage) destroyDocument(record);
++      return closeRetainingDocument(impl, closed);
++    };
+     installListenerOwnership(childWindow._globalProxy).scope(() => {
+     record.document.addEventListener('DOMContentLoaded', () => {
+       if (!framePage.closed) registry.announce('frameDOMContentLoaded', { frameId: record.id, loaderId: framePage.loaderId });
+@@ -381,6 +414,8 @@
+   registry.dispose = () => {
+     if (registry.disposed) return;
+     for (const child of children(root)) registry.detach(child.element);
++    for (let index = 0; index < window._length; index++) Reflect.deleteProperty(window, String(index));
++    window._length = 0;
+     registry.disposed = true; contexts.clear(); registry.frames.clear(); DOCUMENTS.delete(implForWrapper(document));
+     page.documentAbort?.signal.removeEventListener('abort', registry.dispose);
+   };
+--- a/src/document-reset.js
++++ b/src/document-reset.js
+@@ -77,6 +77,7 @@
+   underlyingOpen = open;
+   DocumentImpl.prototype.open = function (...args) {
+     const context = contexts.get(this);
++    if (context && this._parsingMode === 'html' && !active(context)) return this;
+     if (eligible(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
+     if (!eligible(context) || context.record.parserScriptDepth > 0 || this._parsingMode !== 'html' || this._throwOnDynamicMarkupInsertionCounter) return open.apply(this, args);
+     return reset(context, args);
+@@ -84,6 +85,7 @@
+   DocumentImpl.prototype.write = function (...args) {
+     const context = contexts.get(this);
+     if (this._parsingMode === 'xml' || this._throwOnDynamicMarkupInsertionCounter) return write.apply(this, args);
++    if (context && !active(context)) return;
+     if (context && active(context)) {
+       if ((!context.current || context.current.state.status === 'complete') &&
+           eligible(context) && !this._writeAfterElement && args.join('')) reset(context, []);
+@@ -95,6 +97,7 @@
+   };
+   DocumentImpl.prototype.close = function (...args) {
+     const context = contexts.get(this), cycle = context?.current;
++    if (context && this._parsingMode === 'html' && !active(context)) return;
+     if (cycle && active(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
+     if (cycle && active(context)) {
+       if (cycle.state.status === 'open') { context.record.closeRequested = args; cycle.close(); return; }

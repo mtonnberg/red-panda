@@ -1,10 +1,11 @@
+import { createReadableState, bindReadable, bindTransformPair, bindReadableController, failReadable, noteReadableOperation } from './request-stream-state.js';
 import * as web from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
 import { codecPair } from './stream-codecs.js';
 
 const NATIVES = { ...web, TextEncoder, TextDecoder };
 const SURFACE = {
-  ReadableStream: ['cancel', 'getReader', 'pipeThrough', 'pipeTo', 'locked', 'tee', Symbol.asyncIterator],
+  ReadableStream: ['cancel', 'getReader', 'pipeThrough', 'pipeTo', 'locked', Symbol.asyncIterator],
   ReadableStreamDefaultReader: ['read', 'cancel', 'releaseLock'],
   ReadableStreamDefaultController: ['enqueue', 'close', 'error', 'desiredSize'],
   WritableStream: ['getWriter', 'locked'],
@@ -103,17 +104,20 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     });
     return converted(value, record);
   }
-  function callbackDictionary(value, names, ignoreByteType = false) {
+  function callbackDictionary(value, names, ignoreByteType = false, readableState, controllerKind = 'ReadableStreamDefaultController') {
     if (value === null || !['object', 'function'].includes(typeof value)) return value;
     // Keep property access/getter order with Node's WebIDL converter: callbacks
     // are read when its implementation reads the corresponding dictionary key.
     return new Proxy(Object(value), { get(target, key) {
       if (ignoreByteType && key === 'type') return undefined;
       const callback = Reflect.get(target, key, target);
+      if (controllerKind === 'TransformStreamDefaultController' && key === 'transform' && callback === undefined) return (chunk, controller) => { bindReadableController(controller, readableState, controllerKind); const result = web.TransformStreamDefaultController.prototype.enqueue.call(controller, chunk); noteReadableOperation(controllerKind, 'enqueue', controller, [chunk], result); return result; };
       if (!names.includes(key) || typeof callback !== 'function') return callback;
       return (...args) => {
         if (!['cancel', 'abort'].includes(key)) assertActive();
-        return Reflect.apply(callback, value, ['cancel', 'abort'].includes(key) ? args : args.map(argument => converted(argument)));
+        if (readableState && ['start', 'pull', 'transform', 'flush'].includes(key)) bindReadableController(key === 'transform' ? args[1] : args[0], readableState, controllerKind);
+        try { return Reflect.apply(callback, value, ['cancel', 'abort'].includes(key) ? args : args.map(argument => converted(argument))); }
+        catch (error) { failReadable(readableState); throw error; }
       };
     } });
   }
@@ -121,10 +125,11 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     assertActive();
     if (ILLEGAL.has(name)) throw new realm.TypeError('Illegal Constructor');
     args = [...args];
-    if (name === 'ReadableStream') args[0] = callbackDictionary(args[0], ['start', 'pull', 'cancel'], true);
+    const readableState = ['ReadableStream', 'TransformStream'].includes(name) ? createReadableState() : null;
+    if (name === 'ReadableStream') args[0] = callbackDictionary(args[0], ['start', 'pull', 'cancel'], true, readableState);
     if (name === 'WritableStream') args[0] = callbackDictionary(args[0], ['start', 'write', 'close', 'abort']);
     if (name === 'TransformStream') {
-      args[0] = callbackDictionary(args[0], ['start', 'transform', 'flush', 'cancel']);
+      args[0] = callbackDictionary(args[0] ?? {}, ['start', 'transform', 'flush', 'cancel'], false, readableState, 'TransformStreamDefaultController');
       // Measured target transforms do not block writes on readable queue size,
       // including an explicitly requested zero readable highWaterMark.
       args[1] = undefined; args[2] = { highWaterMark: Infinity };
@@ -141,9 +146,11 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     if (name === 'TextEncoderStream') {
       // The target independently encodes each chunk; unlike Node's encoder
       // stream, it does not retain a trailing surrogate for the next chunk.
-      const transform = new web.TransformStream({ transform(chunk, controller) {
-        controller.enqueue(new TextEncoder().encode(String(chunk)));
+      const textState = createReadableState();
+      const transform = new web.TransformStream({ start(controller) { bindReadableController(controller, textState, 'TransformStreamDefaultController'); }, transform(chunk, controller) {
+        const bytes = new TextEncoder().encode(String(chunk)); controller.enqueue(bytes); noteReadableOperation('TransformStreamDefaultController', 'enqueue', controller, [bytes]);
       } }, undefined, { highWaterMark: Infinity });
+      bindTransformPair(transform.readable, transform.writable, textState);
       const result = Object.create(constructors[name].prototype);
       special.set(result, { encoding: 'utf-8', readable: transform.readable, writable: transform.writable });
       tag(result, name);
@@ -153,22 +160,25 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     if (name === 'TextDecoderStream') {
       let decoder;
       try { decoder = new TextDecoder(...args); } catch (error) { throw errorInRealm(error); }
-      const transform = new web.TransformStream({ transform(chunk, controller) {
+      const textState = createReadableState();
+      const transform = new web.TransformStream({ start(controller) { bindReadableController(controller, textState, 'TransformStreamDefaultController'); }, transform(chunk, controller) {
         let text;
         try { text = decoder.decode(chunk, { stream: true }); }
         catch (error) { throw errorInRealm(error); }
-        if (text) controller.enqueue(text);
+        if (text) { controller.enqueue(text); noteReadableOperation('TransformStreamDefaultController', 'enqueue', controller, [text]); }
       }, flush(controller) {
         let text;
         try { text = decoder.decode(); } catch (error) { throw errorInRealm(error); }
-        if (text) controller.enqueue(text);
+        if (text) { controller.enqueue(text); noteReadableOperation('TransformStreamDefaultController', 'enqueue', controller, [text]); }
       } }, undefined, { highWaterMark: Infinity });
+      bindTransformPair(transform.readable, transform.writable, textState);
       const result = Object.create(constructors[name].prototype);
       special.set(result, { encoding: decoder.encoding, fatal: decoder.fatal, ignoreBOM: decoder.ignoreBOM,
         readable: transform.readable, writable: transform.writable });
       tag(result, name); adopt(transform.readable); adopt(transform.writable); return result;
     }
-    try { return adopt(Reflect.construct(NATIVES[name], args)); }
+    try { const result = Reflect.construct(NATIVES[name], args); if (name === 'ReadableStream') bindReadable(result, readableState);
+      if (name === 'TransformStream') bindTransformPair(result.readable, result.writable, readableState); return adopt(result); }
     catch (error) { throw errorInRealm(error); }
   }
   for (const name of STREAM_CONSTRUCTORS) {
@@ -183,6 +193,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
   }
   function iteratorFor(stream, options) {
     const iterator = Reflect.apply(web.ReadableStream.prototype[Symbol.asyncIterator], stream, [options]);
+    noteReadableOperation('ReadableStream', Symbol.asyncIterator, stream, [], iterator);
     const result = new realm.Object();
     for (const key of ['next', 'return', 'throw']) if (typeof iterator[key] === 'function') {
       result[key] = functionInRealm((_, args) => {
@@ -222,6 +233,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
             assertActive();
             try {
               const result = Reflect.apply(descriptor.value, receiver, name === 'ReadableStream' && key === 'getReader' ? [] : args);
+              noteReadableOperation(name, key, receiver, args, result);
               if (name === 'ReadableStreamDefaultReader' && key === 'cancel') {
                 // Native releases synchronously, even while source.cancel's
                 // returned promise is still pending. Pending reads settle done.
@@ -260,12 +272,12 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
       if (codecDisposers.has(value)) ignore(() => codecDisposers.get(value)(disposalReason));
       if (name === 'ReadableStreamDefaultReader') ignore(() => web.ReadableStreamDefaultReader.prototype.cancel.call(value, disposalReason));
       if (name === 'WritableStreamDefaultWriter') ignore(() => web.WritableStreamDefaultWriter.prototype.abort.call(value, disposalReason));
-      if (name === 'ReadableStream' && !Reflect.get(web.ReadableStream.prototype, 'locked', value)) ignore(() => web.ReadableStream.prototype.cancel.call(value, disposalReason));
+      if (name === 'ReadableStream' && !Reflect.get(web.ReadableStream.prototype, 'locked', value)) ignore(() => { const result = web.ReadableStream.prototype.cancel.call(value, disposalReason); noteReadableOperation(name, 'cancel', value, [disposalReason], result); return result; });
       if (name === 'WritableStream' && !Reflect.get(web.WritableStream.prototype, 'locked', value)) ignore(() => web.WritableStream.prototype.abort.call(value, disposalReason));
     }
     for (const [value, name] of live) {
       if (['ReadableStreamDefaultController', 'TransformStreamDefaultController', 'WritableStreamDefaultController'].includes(name)) {
-        ignore(() => Reflect.apply(NATIVES[name].prototype.error, value, [disposalReason]));
+        ignore(() => { const result = Reflect.apply(NATIVES[name].prototype.error, value, [disposalReason]); noteReadableOperation(name, 'error', value, [disposalReason], result); return result; });
       }
     }
     for (const item of pending) item.reject(disposalReason);

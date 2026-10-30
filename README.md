@@ -26,6 +26,7 @@ No API keys, database, native browser, or rendering service is required.
 ```sh
 npm ci
 npm run build:native
+npm run prepare:reference
 python3 -m venv .cache/render
 .cache/render/bin/python -m pip install -r native/render-test-requirements.txt
 export PATH="$PWD/.cache/render/bin:$PATH"
@@ -33,10 +34,13 @@ npm run build:automation
 npm test
 ```
 
-Build the collection binding with the same Node executable used to run Red
-Panda. Rebuild after changing Node/V8 or the native source; startup verifies the
+Build both collection and runtime bindings with the same Node executable used
+to run Red Panda. Rebuild after changing Node/V8 or the native source; startup verifies the
 runtime versions and source/binary digests. See [native build instructions](native/README.md)
 for header discovery and overrides.
+The reference preparation command verifies the pinned upstream archive, all574
+HTML fixtures and the assertion harness in an ignored test-only cache. It
+preserves the upstream licenses and does not import its engine into Red Panda.
 
 Python dependencies are pinned with official wheel SHA-256 hashes for CPython
 3.12 on Linux x86_64. Production rendering only needs
@@ -106,11 +110,12 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | --- | --- |
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
-| Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
+| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket and FileReaderSync |
+| Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG attribute/transform values, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
+| Experimental storage | `--experimental-features serviceworker` enables secure-context Cache and threaded service-worker lifecycle; in-memory context storage |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
 | CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; by-reference serialization preserves thrown primitives/Symbols without calling authored getters |
@@ -130,10 +135,12 @@ Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), inclu
 simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
 semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
-CSS painting, canvas, service/shared workers, complete frame behavior and process
-isolation remain absent. Large HTML sources now feed the real parser in bounded
-tasks, allowing actual mutation delivery during loading. Complete parser
-checkpoints, early/inactive-frame document.open/write, frame POST
+CSS painting, canvas, shared workers, complete frame behavior and process
+isolation remain absent. Experimental service workers execute in real threads
+with registration/lifecycle, Cache and CookieStore operations; clients, control
+takeover, fetch interception, updates and persistence remain incomplete. Large HTML sources now feed the real parser in bounded
+tasks, allowing actual mutation delivery during loading. Classic scripts now drain actual queued microtasks before clearing currentScript,
+and loading/inactive-frame writes have bounded native controls. Frame POST
 navigation, advanced shadow CSS, flattened shadow/frame pointer/Tab input and full
 CSS behavior remain unfinished. Utility-world IDs share their owning frame's
 JS realm. Some configuration commands still
@@ -199,8 +206,15 @@ routes evaluation, navigation, handles and selected Runtime methods to them;
 cross-origin Window access restrictions and full frame history/input remain
 unfinished.
 
-CLI `fetch` now matches native defaults: no dump and a 5,000 ms page deadline.
-Use `--dump html` or another format explicitly. `--dump-selector`,
+CLI `fetch` uses the captured native option defaults: no dump and a5,000ms wait.
+Use bare `--dump` for HTML or select another format explicitly. Wait expressions
+can come from `--wait-script-file`; script/file flags take their last CLI-order
+value. Without explicit `--wait-until`, a wait predicate can finish before pending
+frame loads. Repeated `--http-header "Name: Value"` settings override page headers
+on every redirect hop; use `--user-agent` for User-Agent. Plain text dumps write
+their exact payload, including existing trailing newlines; JSON envelopes append
+one framing newline. Pending-navigation timeout/exit behavior and native process
+shutdown remain separate compatibility gaps. `--dump-selector`,
 `--dump-max-bytes`, repeated `--strip-mode` and `--with-base` affect dumps while
 leaving the live DOM intact. The [dump contract](docs/reference/dump-contract.md)
 records 47 exact native fixture outputs and remaining formatting limits.

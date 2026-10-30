@@ -1,3 +1,5 @@
+import { parseDocumentWriteFragment } from './shadow.js';
+import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
 import { prepareInputParserAdapter } from './input-controls.js';
 import { installDocumentReset } from './document-reset.js';
 import { createParserStream } from './parser-stream.js';
@@ -30,7 +32,7 @@ function duringParserScript(record, script, evaluate) {
   if (parserScript) record.parserScriptDepth = (record.parserScriptDepth ?? 0) + 1;
   const writeParser = parserScript && record.stream?.kind === 'write' ? record.stream : null;
   const entered = writeParser?.enterScript();
-  try { return evaluate(); }
+  try { return withClassicEvaluation(record, script, evaluate); }
   finally {
     if (entered) writeParser.leaveScript();
     if (parserScript) record.parserScriptDepth--;
@@ -103,11 +105,17 @@ function finishParser(record, parser) {
     record.document.close(...arguments_);
   }
 }
+function hostTask(run) {
+  return new Promise((resolve, reject) => setImmediate(() => {
+    try { resolve(run()); } catch (error) { reject(error); }
+  }));
+}
+
 function resumeAfterScript(record, script) {
   const blocker = record.blocker;
   if (!blocker || blocker.script !== script || blocker.scheduled) return;
   blocker.scheduled = true;
-  queueMicrotask(() => {
+  setImmediate(() => {
     if (!active(record) || record.blocker !== blocker) return;
     record.blocker = null;
     if (record.stream) record.stream.resume();
@@ -131,6 +139,29 @@ function makeParser(record, options) {
     parser.tokenizer.pause();
   });
   return parser;
+}
+
+// Queue ownership remains with the real loader. Drop only delivery into an
+// inactive Document; completed bytes/error cleanup still drain the retired
+// queue without dispatching late events or invoking its DOM callbacks.
+function fetchOwnedResource(record, loader, fetch, url, options) {
+  const names = ['_queue', '_deferQueue', '_asyncQueue'];
+  const previous = names.map(name => loader[name]);
+  for (let index = 0; index < names.length; index++) {
+    const queue = previous[index];
+    loader[names[index]] = Object.create(queue, { push: { value(request, loaded, failed, ...args) {
+      const guard = callback => typeof callback === 'function'
+        ? (...values) => {
+          if (active(record)) return callback(...values);
+          loader._requestManager.remove(request);
+          return Promise.resolve();
+        }
+        : callback;
+      return queue.push(request, guard(loaded), guard(failed), ...args);
+    } } });
+  }
+  try { return fetch.call(loader, url, options); }
+  finally { for (let index = 0; index < names.length; index++) loader[names[index]] = previous[index]; }
 }
 
 function patch() {
@@ -185,6 +216,22 @@ function patch() {
   };
   DocumentImpl.prototype.write = function (...args) {
     const record = documents.get(this), anchor = this._writeAfterElement;
+    if (active(record) && anchor && this._parsingMode === 'html' && !this._throwOnDynamicMarkupInsertionCounter) {
+      const fragment = parseDocumentWriteFragment(this, args.join(''));
+      // Fragment scripts can remove the writing script while parsing. Preserve
+      // their actual effects and stop the splice if its live anchor vanished.
+      if (!active(record)) return;
+      const parent = anchor.parentNode;
+      if (!parent) return;
+      let cursor = anchor;
+      while (fragment.firstChild) {
+        const node = fragment.firstChild;
+        parent.insertBefore(node, cursor.parentNode === parent ? cursor.nextSibling : null);
+        cursor = node;
+      }
+      this._writeAfterElement = cursor;
+      return;
+    }
     const parent = anchor?.parentNode, boundary = anchor?.nextSibling;
     const result = writeDocument.apply(this, args);
     // Follow the actual insertion boundary, including nodes produced by a
@@ -238,7 +285,7 @@ function patch() {
       }
     };
     if (record.blocker?.script === this && record.blocker.kind === 'styles') {
-      return document._queue.push(Promise.resolve(), () => { try { return execute(); } finally { resumeAfterScript(record, this); } }, null, false, this);
+      return document._queue.push(Promise.resolve(), () => hostTask(() => { if (!active(record)) return; try { return execute(); } finally { resumeAfterScript(record, this); } }), null, false, this);
     }
     return execute();
   };
@@ -269,11 +316,11 @@ function patch() {
     const record = documents.get(this._document), element = options.element;
     if (!record) return fetchResource.call(this, url, options);
     if (element.localName === 'link' && (element.getAttributeNS(null, 'rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet')) {
-      const request = fetchResource.call(this, url, options);
+      const request = fetchOwnedResource(record, this, fetchResource, url, options);
       if (request?.then) record.styles.add(element);
       return request;
     }
-    if (element.localName !== 'script') return fetchResource.call(this, url, options);
+    if (element.localName !== 'script') return fetchOwnedResource(record, this, fetchResource, url, options);
     if (!active(record)) return null;
     // jsdom classifies its queues using the async attribute only. Supply the
     // actual force-async state during this synchronous classification, without
@@ -294,10 +341,11 @@ function patch() {
       overlay.fetch = () => adopted; this._resourceLoader = overlay;
     }
     try {
-      request = fetchResource.call(this, url, { ...options, onLoad(data) {
-        // A disposed realm must not execute an already queued script callback.
-        if (!active(record)) return new Promise(() => {});
-        return duringParserScript(record, element, () => options.onLoad?.(data));
+      request = fetchOwnedResource(record, this, fetchResource, url, { ...options, onLoad(data) {
+        return hostTask(() => {
+          if (!active(record)) return;
+          return duringParserScript(record, element, () => options.onLoad?.(data));
+        });
       } });
     } finally {
       this._resourceLoader = originalLoader;
@@ -324,6 +372,7 @@ export function installClassicScripts(page, window) {
   if (previous && !previous.disposed) return previous.controller;
   const record = { page, window, document, signal: page.documentAbort?.signal, requests: new Set(), disposed: false,
     preloads: new Map(), preloadAbort: new AbortController(), styles: new Set() };
+  record.currentScriptCheckpoint = installCurrentScriptCheckpoint(record, () => active(record));
   const prototype = window.HTMLScriptElement.prototype;
   const script = value => {
     const implementation = implForWrapper(value);
@@ -340,7 +389,7 @@ export function installClassicScripts(page, window) {
   });
   const dispose = () => {
     if (record.disposed) return;
-    record.disposed = true; record.resetController?.dispose(); record.stream?.abort();
+    record.disposed = true; record.currentScriptCheckpoint.dispose(); record.resetController?.dispose(); record.stream?.abort();
     if (record.parser && !record.parserDone) { record.parser.tokenizer.pause(); record.parser.stopped = true; }
     record.blocker = null; record.closeRequested = null;
     record.preloadAbort.abort(); record.preloads.clear();

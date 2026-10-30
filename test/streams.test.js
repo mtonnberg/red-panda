@@ -28,7 +28,7 @@ test('measured stream constructors, illegal constructors and absent BYOB/Node ex
     for (const name of ['ReadableStreamDefaultReader', 'ReadableStreamDefaultController', 'WritableStreamDefaultWriter', 'WritableStreamDefaultController', 'TransformStreamDefaultController']) {
       assert.throws(() => new w[name](), error => error instanceof w.TypeError && error.message === 'Illegal Constructor');
     }
-    assert.equal(typeof w.ReadableStream.prototype.tee, 'function'); // Node Fetch clone needs this extension.
+    assert.equal(typeof w.ReadableStream.prototype.tee, 'undefined'); // Verified native public API; buffered clones keep private producers.
     assert.equal(typeof w.ReadableStream.prototype[Symbol.asyncIterator], 'function');
     assert.equal(new w.ReadableStream().getReader().closed, undefined);
     assert.equal(typeof w.WritableStream.prototype.abort, 'undefined');
@@ -212,9 +212,9 @@ test('Fetch response bodies retain native Node identity and adopt real realm met
     const synthetic = new w.Response(from(w, [new w.TextEncoder().encode('real stream body')]));
     assert.equal(await synthetic.text(), 'real stream body');
     const clone = new w.Response(from(w, [new w.TextEncoder().encode('clone')]));
-    // Fetch's internal tee remains available even though the public native
-    // reference does not expose ReadableStream.prototype.tee.
-    const clone2 = clone.clone(); assert.equal(await clone.text(), 'clone'); assert.equal(await clone2.text(), 'clone');
+    // Native explicit-stream Response cloning keeps the original source and
+    // creates an empty copy, independently from buffered-body cloning.
+    const clone2 = clone.clone(); assert.equal(await clone.text(), 'clone'); assert.equal(await clone2.text(), ''); assert.equal(clone2.body, null); assert.equal(clone2.bodyUsed, false);
   } finally { browser.close(); await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 

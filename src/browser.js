@@ -1,3 +1,15 @@
+import {createInvocationTrampoline} from './invocation.js';
+import {captureWorkerCreator} from './worker-apis.js';
+import {installServiceWorkers} from './service-workers.js';
+import { installDOMLifecycle } from './dom-lifecycle.js';
+import { installDOMEvents } from './dom-events.js';
+import { installSVG } from './svg.js';
+import { installDOMIDL } from './dom-idl.js';
+import { installMedia } from './media.js';
+import {installCache} from './cache.js';
+import { installWindowMessaging, installBroadcast } from './window-messaging.js';
+import { getRuntimeBinding } from './native-runtime.js';
+import { captureProtocolRealm } from './realm-values.js';
 import { installListenerOwnership } from './listener-ownership.js';
 import { installSelectors } from './selectors.js';
 import { installDialogs, isPopoverOpen, getDialogStateRevision } from './dialogs.js';
@@ -21,6 +33,7 @@ import { installWorkers } from './workers.js';
 import { installXHR } from './xhr.js';
 import { dumpDocument } from './dump.js';
 import { installShadowDOM } from './shadow.js';
+import { installSerialization } from './serialization.js';
 import { installFrames } from './frames.js';
 import { installFetch } from './fetch.js';
 import { loadCollectionsBinding, installCollections } from './collections.js';
@@ -98,6 +111,7 @@ export class Browser extends EventEmitter {
   constructor(options = {}) {
     super();
     this.options = options;
+    this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
     this.pages = new Map();
@@ -140,6 +154,7 @@ export class Page extends EventEmitter {
     this.acceptLanguage = 'en-US,en;q=0.9';
     this.platform = 'Linux x86_64';
     this.extraHTTPHeaders = new Headers();
+    this.cliHTTPHeaders = new Headers(browser.options.cliHTTPHeaders);
     this.timeout = browser.options.timeout ?? 10000;
     this.javascript = browser.options.javascript !== false;
     this.activeRequests = new Set();
@@ -178,6 +193,9 @@ export class Page extends EventEmitter {
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
+    captureProtocolRealm(window);
+    const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
+    this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
     const listenerOwnership = installListenerOwnership(window);
     listenerOwnership.scope(() => {
       installErrors(this, window);
@@ -186,6 +204,7 @@ export class Page extends EventEmitter {
       installCollections(window, { binding: this.browser.collectionsBinding });
       installInput(window);
       installShadowDOM(this, window);
+      installSerialization(this, window);
       installBlobURLs(this, window);
       installSelectors(this, window, { isPopoverOpen, getStateRevision: getDialogStateRevision });
       installStyles(this, window);
@@ -202,6 +221,11 @@ export class Page extends EventEmitter {
       installNavigator(this, window);
       installFonts(window);
       installFetch(this, window);
+      const creatorSnapshot=captureWorkerCreator(this,window);
+      const secure=creatorSnapshot().secure;
+      Object.defineProperty(window,'isSecureContext',{get:()=>creatorSnapshot().secure,configurable:true,enumerable:true});
+      installCache(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,baseURL:()=>creatorSnapshot().baseURL});
+
       installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
       if (main) this.installHistory(window, historyState);
       installNavigation(this, window);
@@ -211,8 +235,16 @@ export class Page extends EventEmitter {
       this.moduleScripts = installModuleScripts(this, window);
       installClassicScripts(this, window);
       installInputControls(this, window);
-      installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+      const workers=installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+      installServiceWorkers(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,spawn:workers.createService});
+      installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
+      installBroadcast(this, window);
       installGeometry(window);
+      installSVG(this, window);
+      installDOMIDL(this, window);
+      installDOMEvents(this, window);
+      installDOMLifecycle(this, window);
+      installMedia(this, window);
       installXHR(this, window);
       if (main) this.frames = installFrames(this, window, {
         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
@@ -442,6 +474,8 @@ export class Page extends EventEmitter {
         const cookies = await this.context.cookies.getCookieString(url);
         if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
       } else headers.delete('cookie');
+      // CLI headers retain precedence over page headers and cookie defaults on every hop.
+      this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
       const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId);
       try {
         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
@@ -591,12 +625,17 @@ export class Page extends EventEmitter {
       this.on('navigationRequested', captureRedirect);
       this.frameEventQueue = [];
       this.attachedFrames = new Set([this.frameId]); this.committedFrames = new Set([this.frameId]); this.createdFrameContexts.clear();
-      this.creatingDOM = true;
-      try {
-        this.dom = this.createDOM(html, state);
-        this.emit('navigated');
-        this.emit('contextCreated');
-      } finally { this.creatingDOM = false; }
+      await new Promise((resolve, reject) => setImmediate(() => {
+        if (generation !== this.navigationGeneration || this.closed) { reject(new Error('Navigation superseded')); return; }
+        this.creatingDOM = true;
+        try {
+          this.dom = this.createDOM(html, state);
+          this.emit('navigated');
+          this.emit('contextCreated');
+          resolve();
+        } catch (error) { reject(error); }
+        finally { this.creatingDOM = false; }
+      }));
       navigationWindow = this.dom.window;
       const moduleReady = this.moduleReady;
       this.flushFrameEvents();
@@ -611,7 +650,7 @@ export class Page extends EventEmitter {
       });
       documentReady.then(() => { if (generation === this.navigationGeneration && !redirect) this.emit('domContentLoaded'); });
       loaded.then(async () => { await moduleReady; if (generation === this.navigationGeneration && !redirect) this.emit('load'); });
-      const ready = waitUntil === 'domcontentloaded' ? documentReady : Promise.all([loaded, moduleReady]);
+      const ready = waitUntil === 'none' ? Promise.resolve() : waitUntil === 'domcontentloaded' ? documentReady : Promise.all([loaded, moduleReady]);
       await withTimeout(Promise.race([ready, requested]), remaining(), 'Page load timed out');
       if (redirect) await withTimeout(redirect.promise, remaining(), 'Page navigation chain timed out');
       if (waitUntil === 'networkidle0' || waitUntil === 'networkidle2') {
@@ -634,12 +673,13 @@ export class Page extends EventEmitter {
     finally { this.reconcileURL(); }
   }
   callFunction(declaration, thisArg, args) {
-    const key = `__redpanda_${randomUUID().replaceAll('-', '')}`;
-    this.dom.window[key] = { thisArg, args };
+    if (this.closed) throw new Error('Page is closed');
     try {
-      return this.evaluate(`(${declaration}\n).apply(globalThis[${JSON.stringify(key)}].thisArg, globalThis[${JSON.stringify(key)}].args)`);
-    } finally { delete this.dom.window[key]; }
+      return createInvocationTrampoline(this.dom.getInternalVMContext()).invokeDeclaration(declaration, thisArg, args,
+        { timeout: Math.min(this.timeout, 2000), displayErrors: false });
+    } finally { this.reconcileURL(); }
   }
+
   render(format = 'png', options = {}) {
     if (this.closed) throw new Error('Page is closed');
     return renderDocument(this.dom.window.document, { timeout: Math.min(this.timeout, 120000),

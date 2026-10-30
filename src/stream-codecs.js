@@ -1,3 +1,4 @@
+import { createReadableState, bindReadable, bindReadableController, cancelReadableState, noteReadableOperation } from './request-stream-state.js';
 import * as web from 'node:stream/web';
 import * as zlib from 'node:zlib';
 import { types } from 'node:util';
@@ -10,6 +11,7 @@ const typedArrayGetters = viewGetters(typedArrayPrototype), dataViewGetters = vi
 // separate readable/writable pair preserves the measured cancellation behavior.
 export function codecPair({ realm, format, decompress }) {
   let readableController, writableController, failure, failed = false, cancelled = false;
+  const readableState = createReadableState();
   let gzipHeader = Buffer.alloc(0), headerDone = !(decompress && format === 'gzip');
   let trailer = Buffer.alloc(0), crc = 0, size = 0, ended = false;
   const inflight = new Set();
@@ -23,7 +25,7 @@ export function codecPair({ realm, format, decompress }) {
     if (!failed) {
       failed = true;
       failure = error instanceof realm.TypeError ? error : new realm.TypeError(error?.message ?? String(error));
-      if (!cancelled) { try { readableController.error(failure); } catch {} }
+      if (!cancelled) { try { readableController.error(failure); noteReadableOperation('ReadableStreamDefaultController', 'error', readableController, [failure]); } catch {} }
       try { writableController.error(failure); } catch {}
       for (const reject of inflight) reject(failure);
       inflight.clear();
@@ -85,15 +87,16 @@ export function codecPair({ realm, format, decompress }) {
     try {
       if (cancelled) throw new realm.TypeError('The readable side is closed');
       const output = new realm.Uint8Array(chunk.length); output.set(chunk);
-      readableController.enqueue(output);
+      readableController.enqueue(output); noteReadableOperation('ReadableStreamDefaultController', 'enqueue', readableController, [output]);
     } catch (error) { fail(error); }
   });
   engine.on('error', error => fail(error));
   engine.on('end', () => { ended = true; });
   const readable = new web.ReadableStream({
-    start(controller) { readableController = controller; },
-    cancel() { cancelled = true; },
+    start(controller) { readableController = controller; bindReadableController(controller, readableState); },
+    cancel() { cancelled = true; cancelReadableState(readableState); },
   });
+  bindReadable(readable, readableState);
   const writable = new web.WritableStream({
     start(controller) { writableController = controller; },
     async write(chunk) {
@@ -130,7 +133,7 @@ export function codecPair({ realm, format, decompress }) {
         });
         if (failed) throw failure;
         if (decompress && format === 'gzip' && trailer.length !== 8) throw new realm.TypeError('Incomplete gzip trailer');
-        if (!cancelled) readableController.close();
+        if (!cancelled) { readableController.close(); noteReadableOperation('ReadableStreamDefaultController', 'close', readableController, []); }
       } catch (error) { throw fail(error); }
       finally { engine.destroy(); }
     },
@@ -139,7 +142,7 @@ export function codecPair({ realm, format, decompress }) {
   function dispose(reason) {
     if (failed) return;
     failed = true; failure = reason;
-    if (!cancelled) { try { readableController.error(reason); } catch {} }
+    if (!cancelled) { try { readableController.error(reason); noteReadableOperation('ReadableStreamDefaultController', 'error', readableController, [reason]); } catch {} }
     try { writableController.error(reason); } catch {}
     for (const reject of inflight) reject(reason);
     inflight.clear(); engine.destroy();

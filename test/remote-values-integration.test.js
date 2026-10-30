@@ -35,7 +35,7 @@ test('CDP retains hostile values without reading getters and survives by-value s
   assert.equal((await evaluate('getterHits', { returnByValue: true })).result.value, 1);
   assert.equal((await evaluate('6*7', { returnByValue: true })).result.value, 42);
   await send('Runtime.releaseObjectGroup', { objectGroup: 'adversarial' });
-  await assert.rejects(send('Runtime.getProperties', { objectId: thrown.result.objectId }), /Cannot find object/);
+  await assert.rejects(send('Runtime.getProperties', { objectId: thrown.result.objectId }), /Could not find object/);
 });
 
 test('CDP exception details retain original primitives, Symbols and rejected promises', async t => {
@@ -78,5 +78,5 @@ test('CDP classifies genuine DOM nodes and proxies without invoking authored met
   const properties = await send('Runtime.getProperties', { objectId: group.result.objectId });
   const child = properties.result.find(property => property.name === 'child').value;
   await send('Runtime.releaseObjectGroup', { objectGroup: 'properties' });
-  await assert.rejects(send('Runtime.getProperties', { objectId: child.objectId }), /Cannot find object/);
+  await assert.rejects(send('Runtime.getProperties', { objectId: child.objectId }), /Could not find object/);
 });

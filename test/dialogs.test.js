@@ -1,3 +1,4 @@
+import { upstreamTestRoot } from './upstream-reference.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -122,7 +123,7 @@ test('private state revision tracks actual modal and closed-shadow popover trans
 });
 
 test('unchanged upstream dialog fixture records real observations in the native harness branch',async t=>{
-  const root='/tmp/red-panda-upstream-reference/browser-948d77378/src/browser/tests',server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());
+  const root=await upstreamTestRoot(),server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());
   const browser=new Browser({userAgent:'Lightpanda/1.0'});t.after(()=>browser.close());const page=browser.createPage();
   page.newDocumentScripts.set('external',{source:'globalThis.__lp_external_runner=true;'});
   const path='element/html/dialog.html',source=await readFile(`${root}/${path}`);const diagnostics=[];page.on('console',event=>{if(event.type==='error')diagnostics.push(event.args.map(String).join(' '))});

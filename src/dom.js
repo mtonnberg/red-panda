@@ -223,7 +223,7 @@ export function runDOM(session, method, params = {}) {
         }
         const node = nodeFor(session, params, ['nodeId', 'backendNodeId']);
         if (params.executionContextId !== undefined && (node.ownerDocument ?? node) !== page.dom.window.document) throw error('Node belongs to a different frame');
-        return { object: session.remote(node, false, params.objectGroup, params.executionContextId === undefined ? undefined : page.executionContextId) };
+        return { object: session.remote(node, false, params.objectGroup, params.executionContextId) };
       }
       case 'DOM.getFrameOwner': {
         const frame = session.page.frames?.findFrame(params.frameId);

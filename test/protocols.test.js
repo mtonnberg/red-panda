@@ -160,7 +160,7 @@ test('CDP frame trees, contexts, node ownership and navigation use the real chil
     assert.equal(navigation.frameId, frameId); assert.equal(page.url, `${fixture.url}frames`);
     assert.equal(page.dom.window.document.getElementById('child').contentDocument.title, 'Next frame');
     await assert.rejects(send('Runtime.evaluate', { expression: '1', contextId: context.id }), /Cannot find context/);
-    await assert.rejects(send('Runtime.getProperties', { objectId: handle.objectId }), /Cannot find object/);
+    await assert.rejects(send('Runtime.getProperties', { objectId: handle.objectId }), /Could not find object/);
     const request = client.events.find(event => event.method === 'Network.requestWillBeSent' && event.params.request.url === `${fixture.url}frame-content`);
     assert.equal(request.params.frameId, frameId); assert.notEqual(request.params.loaderId, page.loaderId);
     await send('Runtime.evaluate', { expression: 'document.getElementById("child").remove()' });

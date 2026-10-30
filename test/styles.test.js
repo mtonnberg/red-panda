@@ -78,8 +78,8 @@ test('only constructed stylesheets from the same document can be adopted', async
     const regular = f.element('style').sheet;
     assert.equal(regular instanceof f.window.CSSStyleSheet, true);
     assert.throws(() => { f.document.adoptedStyleSheets = [regular]; }, error => error.name === 'NotAllowedError');
-    assert.throws(() => regular.replaceSync('div {}'), error => error.name === 'NotAllowedError');
-    await assert.rejects(regular.replace('div {}'), error => error.name === 'NotAllowedError');
+    regular.replaceSync('div {display:none}');assert.equal(regular.cssRules[0].style.display,'none');assert.equal(f.element('style').textContent,'div { color: red }');
+    assert.equal(await regular.replace('span {display:block}'),regular);assert.equal(regular.cssRules[0].selectorText,'span');
     const foreign = new other.window.CSSStyleSheet();
     assert.throws(() => { f.document.adoptedStyleSheets = [foreign]; }, error => error.name === 'NotAllowedError');
     assert.throws(() => { f.document.adoptedStyleSheets = null; }, error => error.name === 'TypeError');
@@ -158,9 +158,9 @@ test('overflow axes handle explicit inheritance, unset, and variable-valued shor
     child.style.overflow = 'unset';
     assert.deepEqual([computed.overflowX, computed.overflowY], ['visible', 'visible']);
     child.style.overflow = 'var(--overflow)';
-    assert.deepEqual([computed.overflowX, computed.overflowY], ['clip', 'visible']);
+    assert.deepEqual([computed.overflowX, computed.overflowY], ['var(--overflow)', 'var(--overflow)']);
     child.style.setProperty('--overflow', 'hidden auto');
-    assert.deepEqual([computed.overflowX, computed.overflowY], ['hidden', 'auto']);
+    assert.deepEqual([computed.overflowX, computed.overflowY], ['var(--overflow)', 'var(--overflow)']);
   } finally { f.close(); }
 });
 
@@ -196,15 +196,15 @@ test('inherited properties and CSS-wide keywords resolve through ancestors with 
   } finally { f.close(); }
 });
 
-test('custom properties inherit and substitute nested fallbacks while cycles and invalid values fall back soundly', () => {
+test('native custom property token streams inherit without substitution or cycle collapse', () => {
   const f = fixture('<div style="--size:23px;--tone:red"><span></span></div>');
   try {
     const sheet = new f.window.CSSStyleSheet(); sheet.replaceSync('span { width: var(--size); color: var(--tone); height: var(--missing, var(--fallback, 7px)); --a:var(--b); --b:var(--a); min-width:var(--a, 4px) }');
     f.document.adoptedStyleSheets = [sheet]; const span = f.element('span'), computed = f.window.getComputedStyle(span);
-    assert.equal(computed.width, '23px'); assert.equal(computed.color, 'rgb(255, 0, 0)'); assert.equal(computed.height, '7px'); assert.equal(computed.minWidth, '4px');
-    assert.equal(computed.getPropertyValue('--size'), '23px'); assert.equal(computed.getPropertyValue('--a'), '');
-    span.style.setProperty('--size', 'not-a-length'); assert.equal(computed.width, 'auto');
-    span.style.setProperty('--fallback', '9px'); assert.equal(computed.height, '9px');
+    assert.equal(computed.width, 'var(--size)'); assert.equal(computed.color, 'var(--tone)'); assert.equal(computed.height, 'var(--missing, var(--fallback, 7px))'); assert.equal(computed.minWidth, 'var(--a, 4px)');
+    assert.equal(computed.getPropertyValue('--size'), '23px'); assert.equal(computed.getPropertyValue('--a'), 'var(--b)');
+    span.style.setProperty('--size', 'not-a-length'); assert.equal(computed.width, 'var(--size)');assert.equal(computed.getPropertyValue('--size'),'not-a-length');
+    span.style.setProperty('--fallback', '9px'); assert.equal(computed.height, 'var(--missing, var(--fallback, 7px))');assert.equal(computed.getPropertyValue('--fallback'),'9px');
   } finally { f.close(); }
 });
 
@@ -249,7 +249,7 @@ test('computed declarations are readonly and style revisions track adopted sheet
     assert.throws(() => { computed.width = '100px'; }, error => error.name === 'NoModificationAllowedError');
     assert.throws(() => computed.setProperty('width', '100px'), error => error.name === 'NoModificationAllowedError');
     assert.equal(computed.width, '20px'); assert.equal(f.element('div').style.width, '');
-    assert.throws(() => f.window.getComputedStyle(f.element('div'), '::before'), error => error.name === 'NotSupportedError');
+    const before=f.window.getComputedStyle(f.element('div'),'::before');assert.equal(before,f.window.getComputedStyle(f.element('div'),':BEFORE'));assert.notEqual(before,computed);assert.throws(()=>{before.color='red'},error=>error.name==='NoModificationAllowedError');
   } finally { f.close(); }
 });
 

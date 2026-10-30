@@ -1,0 +1,957 @@
+--- a/src/cache.js
++++ b/src/cache.js
+@@ -0,0 +1,123 @@
++// Independent buffered Cache API. Data ownership is explicit so Window and real
++// worker realms can share an origin store without exposing its objects to JS.
++// This matches measured native matching (GET/URL/ignoreSearch); Vary comparison,
++// ignoreMethod, matchAll, disk persistence and quota eviction are not supported.
++const CONTEXT_STORES = new WeakMap();
++export function cacheStoreFor(page) {
++  const owner = page.context ?? page;
++  if (!CONTEXT_STORES.has(owner)) CONTEXT_STORES.set(owner, createCacheStore());
++  return CONTEXT_STORES.get(owner);
++}
++export function createCacheStore() {
++  const origins = new Map(), handles = new Map(); let next = 1;
++  const copy = value => structuredClone(value);
++  const matching = (entry, query, options = {}) => {
++    if (!query) return true;
++    if (query.method !== 'GET') return false;
++    const left = new URL(entry.url), right = new URL(query.url);
++    if (options.ignoreSearch) { left.search = ''; right.search = ''; }
++    return left.href === right.href;
++  };
++  return {
++    operate(origin, operation, args = []) {
++      let names = origins.get(origin);
++      if (!names) { names = new Map(); origins.set(origin, names); }
++      if (operation === 'open') {
++        const name = args[0];
++        if (!names.has(name)) { const cache = { id: next++, entries: [] }; names.set(name, cache); handles.set(cache.id, cache); }
++        return names.get(name).id;
++      }
++      if (operation === 'hasName') return names.has(args[0]);
++      if (operation === 'deleteName') return names.delete(args[0]);
++      if (operation === 'names') return [...names.keys()];
++      if (operation === 'storageMatch') {
++        const [query, options] = args;
++        const caches = options.cacheName === undefined ? [...names.values()] : [names.get(options.cacheName)].filter(Boolean);
++        for (const cache of caches) { const hit = cache.entries.find(entry => matching(entry, query, options)); if (hit) return copy(hit.response); }
++        return undefined;
++      }
++      const [id, query, options = {}] = args, cache = handles.get(id);
++      if (!cache) throw new Error('Unknown Cache handle');
++      if (operation === 'match') { const entry = cache.entries.find(value => matching(value, query, options)); return entry && copy(entry.response); }
++      if (operation === 'keys') return cache.entries.filter(value => matching(value, query, options)).map(value => value.url);
++      if (operation === 'delete') { const before = cache.entries.length; cache.entries = cache.entries.filter(value => !matching(value, query, options)); return cache.entries.length !== before; }
++      if (operation === 'putAll') {
++        // Input batches have already been fetched, validated and consumed.
++        const entries = copy(query), next = cache.entries.slice();
++        for (const entry of entries) { const index = next.findIndex(value => value.url === entry.url); if (index >= 0) next.splice(index, 1); next.push(entry); }
++        cache.entries = next; return undefined;
++      }
++      throw new Error(`Unsupported Cache operation: ${operation}`);
++    },
++    clear() { origins.clear(); handles.clear(); },
++  };
++}
++
++function cacheRealm(bridge, enabled) {
++  const Request=globalThis.Request,Response=globalThis.Response,URL=globalThis.URL,Uint8Array=globalThis.Uint8Array;
++  const secret = {}, caches = new WeakMap(), storages = new WeakSet();
++  const guard = () => { if (!bridge.active()) throw new DOMException('The Cache owner is disposed', 'InvalidStateError'); };
++  const cacheId = receiver => { if (!caches.has(receiver)) throw new TypeError('Illegal invocation'); return caches.get(receiver); };
++  const storage = receiver => { if (!storages.has(receiver)) throw new TypeError('Illegal invocation'); };
++  const options = input => ({ ignoreSearch: Boolean(input?.ignoreSearch), ...(input?.cacheName === undefined ? {} : {cacheName: String(input.cacheName)}) });
++  const requestURL=Object.getOwnPropertyDescriptor(Request.prototype,'url').get;
++  const requestMethod=Object.getOwnPropertyDescriptor(Request.prototype,'method').get;
++  const requestHeaders=Object.getOwnPropertyDescriptor(Request.prototype,'headers').get;
++  const requestCredentials=Object.getOwnPropertyDescriptor(Request.prototype,'credentials').get;
++  const request = input => {
++    let value=input;try{requestURL.call(value);}catch{value=new Request(new URL(String(input),bridge.baseURL()).href);}
++    const url=new URL(requestURL.call(value));url.hash='';
++    return{url:url.href,method:requestMethod.call(value),headers:Array.from(requestHeaders.call(value),pair=>Array.from(pair)),credentials:requestCredentials.call(value)};
++  };
++  const valid = query => { if (!/^https?:/.test(query.url) || query.method !== 'GET') throw new TypeError('Cache requires an HTTP(S) GET request'); };
++  const responseStatus=Object.getOwnPropertyDescriptor(Response.prototype,'status').get;
++  const responseStatusText=Object.getOwnPropertyDescriptor(Response.prototype,'statusText').get;
++  const responseHeaders=Object.getOwnPropertyDescriptor(Response.prototype,'headers').get;
++  const responseBytes=Response.prototype.arrayBuffer;
++  const responseSnapshot = async value => {
++    const status=responseStatus.call(value),statusText=responseStatusText.call(value),headers=responseHeaders.call(value);
++    if (status === 206 || headers.get('vary')?.split(',').some(token => token.trim() === '*')) throw new TypeError('Response is not cacheable');
++    if (status === 0) throw new TypeError('Opaque/error Response caching is not implemented');
++    const result = {status,statusText,headers:Array.from(headers, pair => Array.from(pair)),bytes:Array.from(new Uint8Array(await responseBytes.call(value)))};
++    guard(); return result;
++  };
++  const response = value => value === undefined ? undefined : new Response([204,205,304].includes(value.status)?null:new Uint8Array(value.bytes), {status:value.status,statusText:value.statusText,headers:value.headers});
++  const operate = async (name, args) => { guard(); const result = await bridge.operate(name,args); guard(); return result; };
++  const addBatch=async(receiver,inputs)=>{
++      const id=cacheId(receiver),queries=Array.from(inputs,request);queries.forEach(valid);
++      if(new Set(queries.map(query=>query.url)).size!==queries.length)throw new TypeError('Duplicate Cache request');
++      const entries=await Promise.all(queries.map(async query=>{const result=await bridge.fetch(query.url,{method:query.method,headers:query.headers,credentials:query.credentials});if(!result.ok)throw new TypeError('Cache add requires a successful response');return{url:query.url,response:await responseSnapshot(result)};}));
++      await operate('putAll',[id,entries]);
++  };
++  class Cache {
++    constructor(token,id) { if(token!==secret)throw new TypeError('Illegal Constructor');caches.set(this,id); }
++    async match(input, init) {const id=cacheId(this),query=request(input);return response(await operate('match',[id,query,options(init)]));}
++    async put(input, value) {const id=cacheId(this),query=request(input);valid(query);const bytes=await responseSnapshot(value);await operate('putAll',[id,[{url:query.url,response:bytes}]]);}
++    async add(input) {return addBatch(this,[input]);}
++    async addAll(inputs) {return addBatch(this,inputs);}
++    async delete(input,init) {return operate('delete',[cacheId(this),request(input),options(init)]);}
++    async keys(input,init) {const id=cacheId(this),query=input===undefined?undefined:request(input);return Array.from(await operate('keys',[id,query,options(init)]),url=>new Request(url));}
++  }
++  class CacheStorage {
++    constructor(token) {if(token!==secret)throw new TypeError('Illegal Constructor');storages.add(this);}
++    async open(name) {storage(this);if(!arguments.length)throw new TypeError('Cache name is required');return new Cache(secret,await operate('open',[String(name)]));}
++    async has(name) {storage(this);if(!arguments.length)throw new TypeError('Cache name is required');return operate('hasName',[String(name)]);}
++    async delete(name) {storage(this);if(!arguments.length)throw new TypeError('Cache name is required');return operate('deleteName',[String(name)]);}
++    async keys() {storage(this);return Array.from(await operate('names',[]),String);}
++    async match(input,init) {storage(this);return response(await operate('storageMatch',[request(input),options(init)]));}
++  }
++  for(const value of [Cache,CacheStorage])Object.defineProperty(value.prototype,Symbol.toStringTag,{value:value.name,configurable:true});
++  Object.assign(globalThis,{Cache,CacheStorage});
++  if(enabled) {const value=new CacheStorage(secret);Object.defineProperty(globalThis,'caches',{get:()=>value,configurable:true,enumerable:true});}
++}
++export const CACHE_REALM_SOURCE = `(${cacheRealm.toString()})`;
++
++export function installCache(page, realm, {enabled=false, secure=false, store=cacheStoreFor(page), baseURL=()=>page.url, evaluate=source=>realm.eval(source)}={}) {
++  const signal=page.documentAbort?.signal, generation=page.documentGeneration;let disposed=false;
++  const active=()=>!disposed&&!page.closed&&!signal?.aborted&&page.documentGeneration===generation;
++  const origin=()=>page.securityOrigin??new URL(page.url).origin;
++  const bridge={baseURL,active,operate:(operation,args)=>store.operate(origin(),operation,args),fetch:(input,init)=>realm.fetch(input,init)};
++  evaluate(CACHE_REALM_SOURCE)(bridge,Boolean(enabled&&secure));
++  const dispose=()=>{disposed=true;};signal?.addEventListener('abort',dispose,{once:true});
++  return{dispose,store};
++}
+--- a/src/service-workers.js
++++ b/src/service-workers.js
+@@ -0,0 +1,158 @@
++import {captureWorkerCreator} from './worker-apis.js';
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
++
++function serviceRealm(bridge, role) {
++  const secret={}, registrations=new Map(), workers=new Map(), registrationData=new WeakMap(),workerData=new WeakMap(),containers=new WeakSet();
++  const getRegistration=value=>{const state=registrationData.get(value);if(!state)throw new TypeError('Illegal invocation');return state;};
++  const getWorker=value=>{const state=workerData.get(value);if(!state)throw new TypeError('Illegal invocation');return state;};
++  const checkContainer=value=>{if(!containers.has(value))throw new TypeError('Illegal invocation');};
++  const active=()=>{if(!bridge.active())throw new DOMException('ServiceWorker owner disposed','InvalidStateError');};
++  const call=async(operation,args)=>{active();try{const result=await bridge.call(operation,args);active();return result;}catch(error){if(error?.name==='SecurityError'||error?.name==='NotSupportedError'||error?.name==='InvalidStateError')throw new DOMException(error.message,error.name);throw new TypeError(error?.message??String(error));}};
++  class ServiceWorker extends EventTarget {
++    constructor(token,id){super();if(token!==secret)throw new TypeError('Illegal Constructor');workerData.set(this,{id,state:'parsed',scriptURL:''});}
++    get scriptURL(){return getWorker(this).scriptURL;}
++    get state(){return getWorker(this).state;}
++    postMessage(data,transfer){const state=getWorker(this);if(!arguments.length)throw new TypeError('Message is required');active();return bridge.post(state.id,data,transfer);}
++  }
++  class ServiceWorkerRegistration extends EventTarget {
++    constructor(token,id){super();if(token!==secret)throw new TypeError('Illegal Constructor');registrationData.set(this,{id,scope:'',installing:null,waiting:null,active:null,updateViaCache:'imports'});}
++    get scope(){return getRegistration(this).scope;}
++    get installing(){return getRegistration(this).installing;}
++    get waiting(){return getRegistration(this).waiting;}
++    get active(){return getRegistration(this).active;}
++    get updateViaCache(){return getRegistration(this).updateViaCache;}
++    async update(){getRegistration(this);throw new DOMException('ServiceWorker update pipeline is not implemented','NotSupportedError');}
++    async unregister(){return call('unregister',[getRegistration(this).id]);}
++  }
++  const handler=(prototype,type)=>{const handlers=new WeakMap();Object.defineProperty(prototype,'on'+type,{configurable:true,enumerable:true,get(){return handlers.get(this)??null;},set(value){const previous=handlers.get(this);if(previous)this.removeEventListener(type,previous);value=typeof value==='function'?value:null;handlers.set(this,value);if(value)this.addEventListener(type,value);}});};
++  handler(ServiceWorker.prototype,'statechange');handler(ServiceWorkerRegistration.prototype,'updatefound');
++  function update(snapshot,notify=false){
++    let registration=registrations.get(snapshot.id);if(!registration){registration=new ServiceWorkerRegistration(secret,snapshot.id);registrations.set(snapshot.id,registration);}
++    let worker=workers.get(snapshot.workerId);if(!worker){worker=new ServiceWorker(secret,snapshot.workerId);workers.set(snapshot.workerId,worker);}
++    const state=getRegistration(registration),workerState=getWorker(worker),previous=workerState.state;
++    Object.assign(workerState,{state:snapshot.state,scriptURL:snapshot.scriptURL});
++    Object.assign(state,{scope:snapshot.scope,updateViaCache:snapshot.updateViaCache,installing:snapshot.installing?worker:null,waiting:snapshot.waiting?worker:null,active:snapshot.active?worker:null});
++    if(notify&&previous!==snapshot.state)bridge.dispatch(worker,'statechange');
++    if(notify&&snapshot.state==='installing')bridge.dispatch(registration,'updatefound');
++    return registration;
++  }
++  let resolveReady;const ready=new Promise(resolve=>{resolveReady=resolve;});
++  class ServiceWorkerContainer extends EventTarget {
++    constructor(token){super();if(token!==secret)throw new TypeError('Illegal Constructor');containers.add(this);}
++    get controller(){checkContainer(this);return null;}
++    get ready(){checkContainer(this);return ready;}
++    async register(scriptURL,options={}){checkContainer(this);options=options??{};if(!arguments.length)throw new TypeError('Script URL is required');return update(await call('register',[String(scriptURL),{scope:options.scope===undefined?undefined:String(options.scope),type:options.type===undefined?'classic':String(options.type),updateViaCache:options.updateViaCache===undefined?'imports':String(options.updateViaCache)}]));}
++    async getRegistration(clientURL){checkContainer(this);const snapshot=await call('getRegistration',[clientURL===undefined?undefined:String(clientURL)]);return snapshot===undefined?undefined:update(snapshot);}
++    async getRegistrations(){checkContainer(this);return Array.from(await call('getRegistrations',[]),snapshot=>update(snapshot));}
++    startMessages(){checkContainer(this);}
++  }
++  for(const value of [ServiceWorker,ServiceWorkerRegistration,ServiceWorkerContainer])Object.defineProperty(value.prototype,Symbol.toStringTag,{value:value.name,configurable:true});
++  Object.assign(globalThis,{ServiceWorker,ServiceWorkerRegistration,ServiceWorkerContainer});
++  const container=new ServiceWorkerContainer(secret);
++  if(role==='window')return{container,update:(snapshot,notify=true)=>update(snapshot,notify),resolveReady:snapshot=>resolveReady(update(snapshot))};
++
++  // This event state exists only for genuinely dispatched lifecycle events.
++  // A constructed ExtendableEvent has no active lifetime to extend.
++  const extensions=new WeakMap();
++  class ExtendableEvent extends Event {
++    constructor(type,options={}){super(type,options);}
++    waitUntil(value){const state=extensions.get(this);if(!state||(!state.dispatching&&!state.pending.size))throw new DOMException('The event lifetime cannot be extended','InvalidStateError');const promise=Promise.resolve(value);state.pending.add(promise);promise.then(()=>state.pending.delete(promise),error=>{state.failures.push(error);state.pending.delete(promise);});}
++  }
++  Object.defineProperty(ExtendableEvent.prototype,Symbol.toStringTag,{value:'ExtendableEvent',configurable:true});
++  class WorkerGlobalScope extends EventTarget {constructor(token){super();if(token!==secret)throw new TypeError('Illegal Constructor');}}
++  class ServiceWorkerGlobalScope extends WorkerGlobalScope {constructor(token){super(token);}}
++  Object.defineProperty(ServiceWorkerGlobalScope.prototype,Symbol.toStringTag,{value:'ServiceWorkerGlobalScope',configurable:true});
++  Object.setPrototypeOf(globalThis,new ServiceWorkerGlobalScope(secret));
++  Object.assign(globalThis,{WorkerGlobalScope,ServiceWorkerGlobalScope,ExtendableEvent});
++  const initial=bridge.initial(),registration=update(initial),worker=workers.get(initial.workerId);
++  Object.defineProperties(globalThis,{registration:{get:()=>registration,configurable:true,enumerable:true},serviceWorker:{get:()=>worker,configurable:true,enumerable:true}});
++  globalThis.skipWaiting=async()=>call('skipWaiting',[]);
++  delete globalThis.postMessage;delete globalThis.close;
++  const cookieBrand=new WeakSet();
++  const readCookies=async(receiver,input)=>{if(!cookieBrand.has(receiver))throw new TypeError('Illegal invocation');const options=typeof input==='string'?{name:input}:input??{};return Array.from(await call('cookies',['getAll',{name:options.name===undefined?undefined:String(options.name),url:options.url===undefined?undefined:String(options.url)}]),value=>Object.fromEntries(Object.entries(value)));};
++  class CookieStore extends EventTarget {
++    constructor(token){super();if(token!==secret)throw new TypeError('Illegal Constructor');cookieBrand.add(this);}
++    async getAll(input){return readCookies(this,input);}
++    async get(input){if(!arguments.length)throw new TypeError('Cookie selector is required');return(await readCookies(this,input))[0]??null;}
++    async set(name,value){
++      if(!cookieBrand.has(this))throw new TypeError('Illegal invocation');
++      let options;
++      if(typeof name==='object'&&name!==null){
++        if(name.name===undefined||name.value===undefined)throw new TypeError('Cookie name and value are required');
++        options={name:String(name.name),value:String(name.value)};
++        for(const key of ['domain','path','sameSite'])if(name[key]!==undefined)options[key]=String(name[key]);
++        if(name.expires!==undefined)options.expires=Number(name.expires);
++        if(name.partitioned!==undefined)options.partitioned=Boolean(name.partitioned);
++      }else{if(arguments.length<2)throw new TypeError('Cookie name and value are required');options={name:String(name),value:String(value)};}
++      await call('cookies',['set',options]);
++    }
++    async delete(input){if(!cookieBrand.has(this))throw new TypeError('Illegal invocation');const options=typeof input==='string'?{name:input}:input??{};await call('cookies',['delete',{...options}]);}
++  }
++  Object.defineProperty(CookieStore.prototype,Symbol.toStringTag,{value:'CookieStore',configurable:true});
++  Object.assign(globalThis,{CookieStore});Object.defineProperty(globalThis,'cookieStore',{value:new CookieStore(secret),enumerable:true,configurable:true});
++  return{update,async dispatch(type){const event=new ExtendableEvent(type),state={dispatching:true,pending:new Set(),failures:[]};extensions.set(event,state);bridge.trustEvent(event);try{globalThis.dispatchEvent(event);}finally{state.dispatching=false;}while(state.pending.size)await Promise.allSettled(Array.from(state.pending));if(state.failures.length)throw state.failures[0];}};
++}
++export const SERVICE_WORKER_REALM_SOURCE=`(${serviceRealm.toString()})`;
++
++// Actual per-document registrations, matching the measured target's ownership.
++// There is no request interception/controller/client API or background lifetime.
++export function installServiceWorkers(page,window,{enabled=false,secure=false,spawn}={}) {
++  const creatorSnapshot=captureWorkerCreator(page,window);
++  const signal=page.documentAbort?.signal,generation=page.documentGeneration,document=window.document;
++  const registrations=new Map(),byId=new Map();let next=1,disposed=false,api;
++  const active=()=>!disposed&&!page.closed&&!signal?.aborted&&page.documentGeneration===generation&&window.document===document;
++  const snapshot=record=>({id:record.id,workerId:record.id,scriptURL:record.scriptURL,scope:record.scope,state:record.state,updateViaCache:record.updateViaCache,installing:record.installing,waiting:false,active:record.active});
++  const checkReady=()=>{const match=[...registrations.values()].filter(record=>record.active&&record.state==='activated'&&page.url.startsWith(record.scope)).sort((a,b)=>b.scope.length-a.scope.length)[0];if(match)api.resolveReady(snapshot(match));};
++  const notify=record=>{if(!active())return;api.update(snapshot(record));record.command?.({kind:'serviceState',record:snapshot(record)});checkReady();};
++  const remove=record=>{if(registrations.get(record.scope)===record)registrations.delete(record.scope);record.state='redundant';record.installing=false;record.active=false;notify(record);record.stop?.();};
++  const cookies=(record,operation,options)=>{
++    const url=new URL(options.url??record.scriptURL,record.scriptURL);if(url.origin!==new URL(record.scriptURL).origin)throw new window.DOMException('Cookie URL must have the worker origin','SecurityError');
++    const jar=page.context.cookies;
++    if(operation==='getAll')return jar.getCookiesSync(url.href,{http:false}).filter(cookie=>options.name===undefined||cookie.key===options.name).map(cookie=>({name:cookie.key,value:cookie.value,domain:cookie.domain,path:cookie.path,expires:cookie.expires==='Infinity'?null:new Date(cookie.expires).getTime(),secure:cookie.secure,sameSite:cookie.sameSite??'lax',partitioned:false}));
++    const name=String(options.name??'');if(!name||/[;=\s\x00-\x1f\x7f]/.test(name))throw new window.TypeError('Invalid cookie name');
++    const value=operation==='delete'?'':String(options.value??'');if(/[;\x00-\x1f\x7f]/.test(value))throw new window.TypeError('Invalid cookie value');
++    if(options.partitioned)throw new window.DOMException('Partitioned CookieStore entries are not implemented','NotSupportedError');
++    const path=String(options.path??'/');if(!path.startsWith('/')||path.includes(';'))throw new window.TypeError('Invalid cookie path');
++    let text=`${name}=${value}; Path=${path}`;
++    if(options.domain!==undefined){const domain=String(options.domain);if(/[;\s]/.test(domain))throw new window.TypeError('Invalid cookie domain');text+=`; Domain=${domain}`;}
++    if(operation==='delete')text+='; Max-Age=0';else if(options.expires!==undefined)text+=`; Expires=${new Date(Number(options.expires)).toUTCString()}`;
++    if(options.sameSite!==undefined){if(!['strict','lax','none'].includes(options.sameSite))throw new window.TypeError('Invalid SameSite');text+=`; SameSite=${options.sameSite}`;}
++    if(url.protocol==='https:')text+='; Secure';jar.setCookieSync(text,url.href,{http:false});return undefined;
++  };
++  const call=(operation,args)=>{
++    if(!active())throw new window.DOMException('ServiceWorker owner disposed','InvalidStateError');
++    if(operation==='getRegistrations')return[...registrations.values()].map(snapshot);
++    if(operation==='getRegistration'){const url=new URL(args[0]??page.url,creatorSnapshot().baseURL).href;return[...registrations.values()].filter(record=>url.startsWith(record.scope)).sort((a,b)=>b.scope.length-a.scope.length).map(snapshot)[0];}
++    if(operation==='unregister'){const record=byId.get(args[0]);if(!record||registrations.get(record.scope)!==record)return false;remove(record);return true;}
++    if(operation!=='register')throw new window.DOMException('ServiceWorker operation is not implemented','NotSupportedError');
++    const[script,options]=args,scriptURL=new URL(script,creatorSnapshot().baseURL);
++    const origin=creatorSnapshot().origin;
++    if(!['http:','https:'].includes(scriptURL.protocol)||scriptURL.origin!==origin)throw new window.DOMException('The origin of the provided scriptURL does not match the current origin.','SecurityError');
++    if(!['classic','module'].includes(options.type)||!['imports','all','none'].includes(options.updateViaCache))throw new window.TypeError('invalid argument');
++    scriptURL.hash='';const scope=new URL(options.scope??'./',options.scope===undefined?scriptURL.href:creatorSnapshot().baseURL).href;
++    const previous=registrations.get(scope);if(previous&&previous.scriptURL===scriptURL.href&&previous.type===options.type)return snapshot(previous);
++    if(previous)remove(previous);
++    if(typeof spawn!=='function')throw new window.DOMException('ServiceWorker transport is unavailable','NotSupportedError');
++    const record={id:String(next++),scriptURL:scriptURL.href,scope,type:options.type,updateViaCache:options.updateViaCache,state:'parsed',installing:true,active:false};
++    registrations.set(scope,record);byId.set(record.id,record);
++    const configuration={initial:snapshot(record),setControls(command,stop,post){record.command=command;record.stop=stop;record.post=post;},ready(){if(!active()||registrations.get(scope)!==record)return;record.state='installing';notify(record);record.command({kind:'serviceLifecycle',type:'install'});},lifecycle(type,error){if(!active()||registrations.get(scope)!==record)return;if(error){remove(record);return;}if(type==='install'){record.state='installed';notify(record);record.state='activating';record.installing=false;record.active=true;notify(record);record.command({kind:'serviceLifecycle',type:'activate'});}else{record.state='activated';notify(record);}},error(){if(active())remove(record);},call(operation,args){if(operation==='skipWaiting'){record.skipWaiting=true;return undefined;}if(operation==='cookies')return cookies(record,...args);throw new window.DOMException('This service-worker operation is unavailable','NotSupportedError');}};
++    try{spawn(record.scriptURL,{type:record.type},configuration);}catch(error){registrations.delete(scope);byId.delete(record.id);throw error;}
++    return snapshot(record);
++  };
++  const bridge={active,call,post(id,data,transfer){const record=byId.get(id);if(record?.state!=='redundant')record?.post?.(data,transfer);},dispatch(target,type){fireAnEvent(type,implForWrapper(target));}};
++  api=window.eval(SERVICE_WORKER_REALM_SOURCE)(bridge,'window');
++  if(enabled&&secure)Object.defineProperty(window.Navigator.prototype,'serviceWorker',{get(){if(this!==window.navigator)throw new window.TypeError('Illegal invocation');return api.container;},enumerable:true,configurable:true});
++  function dispose(){if(disposed)return;for(const record of registrations.values())record.stop?.();registrations.clear();disposed=true;}
++  signal?.addEventListener('abort',dispose,{once:true});
++  const close=window.close.bind(window);window.close=(...args)=>{dispose();return close(...args);};
++  return{dispose,get size(){return registrations.size;}};
++}
++
++export function installServiceWorkerRealm(realm,{evaluate,initial,active,call,trustEvent}={}) {
++  return evaluate(SERVICE_WORKER_REALM_SOURCE)({initial:()=>initial,active,call,trustEvent,
++    post(){throw new realm.DOMException('ServiceWorker self messaging is not implemented','NotSupportedError');},
++    dispatch(target,type){const event=new realm.Event(type);trustEvent(event);target.dispatchEvent(event);}},'worker');
++}
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,7 @@
++import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
++import {completeWorkerSyncResponse,createSyncWorkerRequest} from './worker-sync-transport.js';
++import {installServiceWorkerRealm} from './service-workers.js';
++import {installCache,cacheStoreFor} from './cache.js';
+ import { broadcastConfig } from "./broadcast-config.js";
+ import { createBroadcastRealm, createBroadcastRelay } from "./broadcast-realm.js";
+ import vm from 'node:vm';
+@@ -17,21 +21,25 @@
+ // security sandbox for hostile code. HTTP CORS/CSP policy remains a browser gap.
+ const SYNC_BYTES = 8 * 1024 * 1024;
+ export function installWorkers(page, window, { enabled = true } = {}) {
++  const creatorSnapshot=captureWorkerCreator(page,window);
+   const signal = page.documentAbort?.signal, owned = new Set();
+   const messaging = installMessaging(page, window);
+   const clone = value => messaging.receive({ data: value, ports: [] }).data;
++  const serviceRequests=new Map();
+   let disposed = false;
+   const active = () => !disposed && !signal?.aborted && !page.closed;
+   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
+   signal?.addEventListener('abort', dispose, { once: true });
+   class Worker extends window.EventTarget {
+     #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map();
+-    constructor(input, options = {}) {
++    constructor(input, options = {}, serviceToken) {
+       super();
++      const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
+       if (!active()) throw new window.DOMException('The document is disposed', 'InvalidStateError');
+-      const url = new URL(String(input), window.document.baseURI);
++      const creator=creatorSnapshot();
++      const url = new URL(String(input), creator.baseURL);
+       if (!['http:', 'https:', 'data:', 'blob:'].includes(url.protocol)) throw new window.DOMException(`Unsupported worker URL: ${url.protocol}`, 'NotSupportedError');
+-      const origin = page.securityOrigin ?? window.location.origin;
++      const origin = creator.origin;
+       if (url.protocol !== 'data:' && origin !== 'null' && url.origin !== origin) throw new window.DOMException('Worker URL must have the document origin', 'SecurityError');
+       const type = options.type ?? 'classic';
+       if (!['classic', 'module'].includes(type)) throw new TypeError('Worker type must be classic or module');
+@@ -39,25 +47,37 @@
+       if (!['omit', 'same-origin', 'include'].includes(credentials)) throw new TypeError('Invalid worker credentials');
+       // A disabled resource policy intentionally creates an inert Worker, as
+       // observed in native serve/fetch defaults; no script request is issued.
+-      if (!enabled) return;
++      if (!enabled&&!service) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
+       this.#thread = new ThreadWorker(new URL(import.meta.url), {
+         // File-backed workers must not inherit an embedding CLI's --input-type
+         // or --eval flags. Only the VM-module capability is needed here.
+         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
+-        redPandaWorker: true, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
++        redPandaWorker: true, origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
+         navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
+           languages: [...window.navigator.languages], platform: window.navigator.platform },
+       } });
++      service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
+       owned.add(this);
+       this.#thread.on('message', async message => {
+         if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
+         if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
+         if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
+         if (this.#terminated || !active()) { for (const port of message.ports ?? []) port.close(); return; }
+-        if (message.kind === 'message') messaging.dispatchMessage(this, message);
++        if(message.kind==='serviceReady')service?.ready();
++        else if(message.kind==='serviceLifecycle')service?.lifecycle(message.type,message.error);
++        else if(message.kind==='serviceError')service?.error(message.error);
++        else if(message.kind==='serviceCall'){
++          try{const result=await service.call(message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'serviceResponse',id:message.id,result});}
++          catch(error){if(!this.#terminated&&active())this.#thread.postMessage({kind:'serviceResponse',id:message.id,error:{name:error.name,message:error.message}});}
++        }
++        else if (message.kind === 'cacheOperation') {
++          try { const result=await cacheStoreFor(page).operate(creator.origin,message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,result}); }
++          catch(error) {if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}});}
++        } else if (message.kind === 'message') messaging.dispatchMessage(this, message);
+         else if (message.kind === 'error') {
++          if(service){page.emit('console',{type:'error',args:[message.error.message]});return;}
+           const error = new window.Error(message.error.message); error.name = message.error.name; error.stack = message.error.stack;
+           const event = new window.ErrorEvent('error', { message: error.message, filename: message.error.filename || url.href, error, cancelable: true });
+           if (this.dispatchEvent(event)) page.emit('pageError', error);
+@@ -80,18 +100,20 @@
+               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
+               credentialsOrigin: url.origin,
+               ...(blobSnapshot ? { blobSnapshot } : {}),
+-            }, message.script ? 'Script' : 'Fetch');
++            }, message.script ? 'Script' : message.resourceType ?? 'Fetch');
+             const bytes = new Uint8Array(await response.arrayBuffer());
+             const result = { status: response.status, statusText: response.statusText,
+               headers: [...response.headers], url: response.url || message.url, bytes };
+-            if (message.sync) {
++            if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);
++            else if (message.sync) {
+               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
+               const encoded = new TextEncoder().encode(JSON.stringify({ ...result, bytes: undefined, source: new TextDecoder().decode(bytes) }));
+               if (encoded.length > destination.length) throw new Error('importScripts response exceeds 8MiB limit');
+               destination.set(encoded); Atomics.store(state, 1, encoded.length); Atomics.store(state, 0, 1); Atomics.notify(state, 0);
+             } else if (!this.#terminated && active()) this.#thread.postMessage({ kind: 'response', id: message.id, result }, [bytes.buffer]);
+           } catch (error) {
+-            if (message.sync) {
++            if(message.syncBinary)completeWorkerSyncResponse(message.sync,null,error);
++            else if (message.sync) {
+               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
+               const encoded = new TextEncoder().encode(JSON.stringify({ error: String(error.message ?? error) }));
+               destination.set(encoded.subarray(0, destination.length)); Atomics.store(state, 1, Math.min(encoded.length, destination.length)); Atomics.store(state, 0, 1); Atomics.notify(state, 0);
+@@ -101,6 +123,7 @@
+       });
+       this.#thread.on('error', error => {
+         if (!this.#terminated && active()) {
++          if(service){service.error({name:error.name,message:error.message});return;}
+           const event = new window.ErrorEvent('error', { message: error.message, error, filename: url.href, cancelable: true });
+           if (this.dispatchEvent(event)) page.emit('pageError', error);
+         }
+@@ -141,22 +164,22 @@
+   window.SharedWorker = class SharedWorker {
+     constructor() { throw new window.DOMException('SharedWorker is not implemented', 'NotSupportedError'); }
+   };
+-  return { dispose, get size() { return owned.size; } };
++  return { dispose, createService(input,options,configuration){const token=Symbol();serviceRequests.set(token,configuration);return new Worker(input,options,token);}, get size() { return owned.size; } };
+ }
+ 
+ async function runWorker() {
+-  const pending = new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast;
++  const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime;
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
+-  const request = (url, init = {}, script = false, signal) => new Promise((resolve, reject) => {
++  const request = (url, init = {}, script = false, signal, resourceType) => new Promise((resolve, reject) => {
+     if (signal?.aborted) { reject(signal.reason); return; }
+     const id = requestId++;
+     const abort = () => { pending.delete(id); parentPort.postMessage({ kind: 'cancel', id }); reject(signal.reason); };
+     signal?.addEventListener('abort', abort, { once: true });
+     pending.set(id, { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
+-    parentPort.postMessage({ kind: 'request', id, url, init, script });
++    parentPort.postMessage({ kind: 'request', id, url, init, script, resourceType });
+   });
+   const syncSource = url => {
+     const sync = new SharedArrayBuffer(SYNC_BYTES + 8), state = new Int32Array(sync, 0, 2);
+@@ -200,12 +223,12 @@
+         vm.runInContext(result.source, context, { filename: result.url });
+       }
+     },
+-    async fetch(input, init = {}) {
++    async fetch(input, init = {}, resourceType) {
+       const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), init);
+       const headers = [...new Headers(init.headers ?? original.headers)];
+       const method = init.method ?? original.method;
+       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
+-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal);
++      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal, resourceType);
+       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+       streams.adopt(response.body);
+       Object.defineProperty(response, 'url', { value: result.url }); return response;
+@@ -257,12 +280,14 @@
+     const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
+     Object.assign(globalThis, { WorkerNavigator, navigator: nav });
+     globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
++    globalThis.__trustWorkerEvent=event=>{trustedEvents.add(event);return event;};
+     const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); trustedEvents.add(event); return event; };
+     globalThis.__createTrustedMessage = createTrustedMessage;
+     globalThis.__emitMessage = (data, ports) => dispatchEvent(createTrustedMessage('message', data, ports));
+   })();`, context);
+   emit = vm.runInContext('__emitMessage', context);
+   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
++  const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
+   messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
+     active: () => !closed,
+     dispatch: (target, type, data, ports) => target.dispatchEvent(createTrustedMessage(type, data, ports)),
+@@ -274,11 +299,21 @@
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+   vm.runInContext(GEOMETRY_SOURCE, context);
+-  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;', context);
++  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
++  installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
++    store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
++
++  if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
++    call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
++  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
+   const dispatchError = value => vm.runInContext('__dispatchError', context)(value);
+   parentPort.on('message', message => {
+     if (closed) return;
+-    if (message.kind === 'response') {
++    if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
++    else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
++    else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
++    else if(message.kind==='cacheResponse') {const entry=cachePending.get(message.id);if(!entry)return;cachePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
++    else if (message.kind === 'response') {
+       const entry = pending.get(message.id); if (!entry) return; pending.delete(message.id); entry.cleanup();
+       message.error ? entry.reject(new Error(message.error)) : entry.resolve(message.result);
+     } else if (message.kind === 'message') {
+@@ -337,9 +372,10 @@
+       });
+     }
+     ready = true;
++    if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
+     for (const message of queued) { if (!closed) { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
+     queued.length = 0;
+-  } catch (error) { dispatchError(error); }
++  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else dispatchError(failure); }
+ }
+ 
+ if (!isMainThread && workerData?.redPandaWorker) void runWorker();
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,6 @@
++import {captureWorkerCreator} from './worker-apis.js';
++import {installServiceWorkers} from './service-workers.js';
++import {installCache} from './cache.js';
+ import { installWindowMessaging, installBroadcast } from './window-messaging.js';
+ import { getRuntimeBinding } from './native-runtime.js';
+ import { captureProtocolRealm } from './realm-values.js';
+@@ -210,6 +213,11 @@
+       installNavigator(this, window);
+       installFonts(window);
+       installFetch(this, window);
++      const creatorSnapshot=captureWorkerCreator(this,window);
++      const secure=creatorSnapshot().secure;
++      Object.defineProperty(window,'isSecureContext',{get:()=>creatorSnapshot().secure,configurable:true,enumerable:true});
++      installCache(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,baseURL:()=>creatorSnapshot().baseURL});
++
+       installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
+       if (main) this.installHistory(window, historyState);
+       installNavigation(this, window);
+@@ -219,7 +227,8 @@
+       this.moduleScripts = installModuleScripts(this, window);
+       installClassicScripts(this, window);
+       installInputControls(this, window);
+-      installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
++      const workers=installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
++      installServiceWorkers(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure:window.isSecureContext,spawn:workers.createService});
+       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
+       installBroadcast(this, window);
+       installGeometry(window);
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -322,6 +322,7 @@
+     if (finalURL) {
+       const documentImpl = implForWrapper(record.document);
+       documentImpl._URL = parseURL(finalURL); documentImpl._origin = new URL(finalURL).origin;
++      documentImpl._clearBaseURLCache();
+       record.window._origin = documentImpl._origin; record.page.url = finalURL;
+       const mimeType = request?.response?.headers?.['content-type']?.split(';')[0].trim();
+       if (mimeType) documentImpl.contentType = mimeType;
+--- a/src/worker-apis.js
++++ b/src/worker-apis.js
+@@ -0,0 +1,45 @@
++import { installFileReaderSync } from './file-reader-sync.js';
++import { installWebSocket } from './worker-websocket.js';
++import { installWorkerXHR } from './worker-xhr.js';
++import { createRequire } from 'node:module';
++const require = createRequire(import.meta.url);
++const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++
++export function isPotentiallyTrustworthy(input) {
++  try {
++    const url = new URL(input), host = url.hostname.toLowerCase();
++    return ['https:', 'wss:'].includes(url.protocol) ||
++      (['http:', 'ws:'].includes(url.protocol) && (host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(host)));
++  } catch { return false; }
++}
++
++/** Capture real Document identity before authored code. Resolve private current
++ * state at construction, so redirects/legitimate base elements remain live.
++ * Public origin/isSecureContext/baseURI overrides never select the principal.
++ */
++export function captureWorkerCreator(page, window) {
++  const document = implForWrapper(window.document), baseURL = document.baseURLSerialized;
++  return () => {
++    const origin = document._origin ?? 'null'; let secure = isPotentiallyTrustworthy(origin), owner = page;
++    const seen = new Set();
++    while (secure && owner?.parentFrameId && !seen.has(owner)) {
++      seen.add(owner); owner = owner.registry?.findFrame(owner.parentFrameId);
++      if (!owner?.dom?.window) { secure = false; break; }
++      const ancestor = implForWrapper(owner.dom.window.document);
++      secure = isPotentiallyTrustworthy(ancestor?._origin ?? 'null');
++    }
++    return Object.freeze({ origin, secure, baseURL: Reflect.apply(baseURL, document, []) });
++  };
++}
++
++/** Before authored worker code; secure is the real creator-context decision.
++ * Service-worker integration passes dedicated:false and receives sockets only.
++ */
++export function installWorkerAPIs(realm, options = {}) {
++  const { dedicated = true, secure = false, signal } = options;
++  Object.defineProperty(realm, 'isSecureContext', { get: () => Boolean(secure), enumerable: true, configurable: true });
++  const socket = installWebSocket(realm, options);
++  const xhr = dedicated ? (installFileReaderSync(realm, options), installWorkerXHR(realm, options)) : null;
++  const dispose = () => { socket.dispose(); xhr?.dispose(); signal?.removeEventListener('abort', dispose); };
++  signal?.addEventListener('abort', dispose, { once: true }); return { dispose };
++}
+--- a/src/file-reader-sync.js
++++ b/src/file-reader-sync.js
+@@ -0,0 +1,65 @@
++import { Worker, isMainThread } from 'node:worker_threads';
++import { createRequire } from 'node:module';
++const require = createRequire(import.meta.url), MIMEType = require('whatwg-mimetype');
++const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get;
++const blobType = Object.getOwnPropertyDescriptor(Blob.prototype, 'type').get;
++
++/** Dedicated-worker-only FileReaderSync with genuine public Blob byte reads.
++ * Limits are explicit: at most 8MiB per read and 5s helper completion by default.
++ * No Node private Blob fields or symbols are inspected.
++ */
++export function installFileReaderSync(realm, { evaluate, maxBytes = 8 * 1024 * 1024, timeoutMs = 5000 } = {}) {
++  if (isMainThread) throw new Error('FileReaderSync is only installed in a dedicated worker thread');
++  if (typeof evaluate !== 'function') throw new TypeError('The actual worker evaluator is required');
++  const read = blob => {
++    let size, type;
++    try { size = Reflect.apply(blobSize, blob, []); type = Reflect.apply(blobType, blob, []); }
++    catch { return { error: 'TypeError', message: 'invalid argument' }; }
++    if (size > maxBytes) return { error: 'NotReadableError', message: `Blob exceeds the ${maxBytes}-byte synchronous reader limit` };
++    const shared = new SharedArrayBuffer(size + 8), state = new Int32Array(shared, 0, 2);
++    let helper;
++    try {
++      helper = new Worker(new URL('./file-reader-sync-thread.js', import.meta.url), { workerData: { blob, shared }, execArgv: [] });
++      helper.on('error', () => {}); helper.unref();
++      const waited = Atomics.wait(state, 0, 0, timeoutMs), status = Atomics.load(state, 0);
++      if (waited === 'timed-out' || status !== 1) return { error: 'NotReadableError', message: 'Synchronous Blob read did not complete' };
++      return { bytes: new Uint8Array(shared, 8, Atomics.load(state, 1)).slice(), type };
++    } catch { return { error: 'NotReadableError', message: 'Cannot clone Blob into the reader thread' }; }
++    finally { if (helper) void helper.terminate(); }
++  };
++  const decode = (bytes, type, encoding) => {
++    let charset;
++    // File API BOM sniffing precedes the explicit label and MIME charset.
++    if(bytes[0]===0xef&&bytes[1]===0xbb&&bytes[2]===0xbf)charset='utf-8';
++    else if(bytes[0]===0xff&&bytes[1]===0xfe)charset='utf-16le';
++    else if(bytes[0]===0xfe&&bytes[1]===0xff)charset='utf-16be';
++    if(!charset)try { charset = new TextDecoder(String(encoding)).encoding; } catch {}
++    if (!charset) { try { charset = new MIMEType(type).parameters.get('charset'); new TextDecoder(charset); } catch { charset = undefined; } }
++    try { return new TextDecoder(charset || 'utf-8').decode(bytes); }
++    catch { return new TextDecoder().decode(bytes); }
++  };
++  const factory = evaluate(`(bridge => {
++    const readers = new WeakSet();
++    const data = (reader,blob) => {
++      if(!readers.has(reader))throw new TypeError('Illegal invocation');
++      const result=bridge.read(blob);
++      if(result.error){if(result.error==='TypeError')throw new TypeError(result.message);throw new DOMException(result.message,result.error)}
++      return result;
++    };
++    class FileReaderSync {
++      constructor(){readers.add(this)}
++      readAsArrayBuffer(blob){const result=data(this,blob),bytes=new Uint8Array(result.bytes.length);bytes.set(result.bytes);return bytes.buffer}
++      readAsText(blob,encoding){const result=data(this,blob);return bridge.decode(result.bytes,result.type,encoding)}
++      readAsBinaryString(blob){const result=data(this,blob);return bridge.binary(result.bytes)}
++      readAsDataURL(blob){const result=data(this,blob);return 'data:'+(result.type||'application/octet-stream')+';base64,'+bridge.base64(result.bytes)}
++      get [Symbol.toStringTag](){return 'FileReaderSync'}
++    }
++    return FileReaderSync;
++  })`);
++  const Constructor = factory({ read, decode,
++    binary(bytes) { let text = ''; for (let offset = 0; offset < bytes.length; offset += 4096) text += String.fromCharCode(...bytes.subarray(offset, offset + 4096)); return text; },
++    base64: bytes => Buffer.from(bytes).toString('base64'),
++  });
++  Object.defineProperty(realm, 'FileReaderSync', { value: Constructor, configurable: true, writable: true });
++  return Constructor;
++}
+--- a/src/file-reader-sync-thread.js
++++ b/src/file-reader-sync-thread.js
+@@ -0,0 +1,11 @@
++// The caller blocks only its dedicated worker. This separate actual thread
++// reads an immutable public Blob clone through Blob.arrayBuffer().
++import { workerData } from 'node:worker_threads';
++const state = new Int32Array(workerData.shared, 0, 2);
++try {
++  const bytes = new Uint8Array(await Blob.prototype.arrayBuffer.call(workerData.blob));
++  const destination = new Uint8Array(workerData.shared, 8);
++  if (bytes.length !== destination.length) throw new Error('Blob clone size changed');
++  destination.set(bytes); Atomics.store(state, 1, bytes.length); Atomics.store(state, 0, 1);
++} catch { Atomics.store(state, 0, 2); }
++finally { Atomics.notify(state, 0); }
+--- a/src/worker-websocket.js
++++ b/src/worker-websocket.js
+@@ -0,0 +1,105 @@
++import { WebSocket as Socket } from 'ws';
++
++/** Real dedicated/service-worker socket connections with realm event adapters.
++ * Cookie, proxy and redirect policy integration remain explicit limitations.
++ */
++export function installWebSocket(realm, { evaluate, origin, baseURL, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
++  if (typeof evaluate !== 'function') throw new TypeError('An actual realm evaluator is required');
++  const ownerActive = active; let disposed = false;
++  active = () => !disposed && ownerActive();
++  const states = new WeakMap(), live = new Set();
++  let emit;
++  const state = object => { const result = states.get(object); if (!result) throw new realm.TypeError('Illegal invocation'); return result; };
++  const bridge = {
++    open(object, input, protocols) {
++      let url;
++      try { url = new URL(String(input), typeof baseURL === 'function' ? baseURL() : baseURL ?? realm.location?.href); } catch { throw new realm.DOMException('Invalid WebSocket URL', 'SyntaxError'); }
++      if (url.protocol === 'http:') url.protocol = 'ws:';
++      if (url.protocol === 'https:') url.protocol = 'wss:';
++      if (!['ws:', 'wss:'].includes(url.protocol) || url.href.includes('#') || url.username || url.password) throw new realm.DOMException('Invalid WebSocket URL', 'SyntaxError');
++      const list = typeof protocols === 'string' ? [protocols] : Array.from(protocols ?? [], String);
++      if (list.some(value => !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value))) throw new realm.DOMException('Invalid WebSocket subprotocol', 'SyntaxError');
++      const s = { object, url: url.href, protocol: '', extensions: '', readyState: 0, binaryType: 'blob', pendingBytes: 0, queue: Promise.resolve() };
++      states.set(object, s);
++      if (!active()) throw new realm.DOMException('The worker is disposed', 'InvalidStateError');
++      let socket;
++      try { socket = new Socket(s.url, [...new Set(list)], {
++        origin: origin ?? realm.location?.origin ?? 'null', perMessageDeflate: false, maxPayload: 16 * 1024 * 1024,
++        // Native accepts duplicate offered protocols and sends them verbatim.
++        // ws validates a unique negotiation set; its public request hook lets
++        // the genuine HTTP upgrade retain the original ordered offer bytes.
++        finishRequest(request) { if (list.length) request.setHeader('Sec-WebSocket-Protocol', list.join(', ')); request.end(); },
++      }); }
++      catch (error) { throw new realm.DOMException(String(error.message), 'SyntaxError'); }
++      s.socket = socket; live.add(s);
++      socket.on('open', () => { if (!active()) { socket.terminate(); return; } s.readyState = 1; s.protocol = socket.protocol; s.extensions = socket.extensions; emit(object, 'open'); });
++      socket.on('message', (bytes, binary) => {
++        if (!active()) return;
++        let data = bytes.toString();
++        if (binary) {
++          const array = new realm.Uint8Array(bytes.length); array.set(bytes);
++          data = s.binaryType === 'arraybuffer' ? array.buffer : new realm.Blob([array.buffer]);
++        }
++        emit(object, 'message', { data, origin: '' });
++      });
++      socket.on('error', () => { if (active()) emit(object, 'error'); });
++      socket.on('close', (code, reason) => {
++        live.delete(s); s.readyState = 3;
++        if (active()) emit(object, 'close', { code, reason: reason.toString(), wasClean: code !== 1006 });
++      });
++    },
++    get(object, key) { const s = state(object); return key === 'bufferedAmount' ? s.pendingBytes + (s.socket?.bufferedAmount ?? 0) : s[key]; },
++    binaryType(object, value) { const s = state(object); value = String(value); if (['blob', 'arraybuffer'].includes(value)) s.binaryType = value; },
++    send(object, value) {
++      const s = state(object);
++      if (s.readyState === 0) throw new realm.DOMException('The object is in an invalid state', 'InvalidStateError');
++      let data = value, length, binary = false;
++      const blob = value instanceof Blob;
++      if (blob) { length = value.size; binary = true; }
++      else if (ArrayBuffer.isView(value)) { data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice(); length = data.byteLength; binary = true; }
++      else if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') { data = new Uint8Array(value).slice(); length = data.byteLength; binary = true; }
++      else { data = String(value); length = Buffer.byteLength(data); }
++      s.pendingBytes += length;
++      if (s.readyState >= 2) return;
++      s.queue = s.queue.then(async () => {
++        if (!active()) return;
++        if (blob) data = new Uint8Array(await Blob.prototype.arrayBuffer.call(value));
++        if (s.socket.readyState !== Socket.OPEN) return;
++        await new Promise(resolve => s.socket.send(data, { binary }, () => resolve()));
++      }).catch(() => { if (active()) emit(object, 'error'); }).finally(() => { s.pendingBytes -= length; });
++    },
++    close(object, code, reason = '') {
++      const s = state(object); reason = String(reason);
++      if (code !== undefined) { code = Number(code) >>> 0; if (code !== 1000 && (code < 3000 || code > 4999)) throw new realm.DOMException('The object does not support the operation or argument', 'InvalidAccessError'); }
++      if (Buffer.byteLength(reason) > 123) throw new realm.DOMException('WebSocket close reason is too long', 'SyntaxError');
++      if (s.readyState >= 2) return;
++      const connecting = s.readyState === 0; s.readyState = 2;
++      if (connecting) { s.socket.close(); return; }
++      void s.queue.then(() => { if (active()) s.socket.close(code, reason); });
++    },
++  };
++  const result = evaluate(`(bridge => {
++    class CloseEvent extends Event {
++      constructor(type, init={}){super(type,init);Object.defineProperties(this,{code:{value:Number(init.code??0)>>>0,enumerable:true},reason:{value:String(init.reason??''),enumerable:true},wasClean:{value:Boolean(init.wasClean),enumerable:true}})}
++      get [Symbol.toStringTag](){return 'CloseEvent'}
++    }
++    class WebSocket extends EventTarget {
++      constructor(url,protocols){super();if(arguments.length===0)throw new TypeError('A WebSocket URL is required');bridge.open(this,url,protocols)}
++      get url(){return bridge.get(this,'url')}get protocol(){return bridge.get(this,'protocol')}get extensions(){return bridge.get(this,'extensions')}
++      get readyState(){return bridge.get(this,'readyState')}get bufferedAmount(){return bridge.get(this,'bufferedAmount')}
++      get binaryType(){return bridge.get(this,'binaryType')}set binaryType(value){bridge.binaryType(this,value)}
++      send(data){if(arguments.length===0)throw new TypeError('A WebSocket payload is required');return bridge.send(this,data)}
++      close(code,reason){return bridge.close(this,code,reason)}
++      get [Symbol.toStringTag](){return 'WebSocket'}
++    }
++    const handlers=new WeakMap();
++    for(const type of ['open','message','error','close'])Object.defineProperty(WebSocket.prototype,'on'+type,{enumerable:true,configurable:true,get(){return handlers.get(this)?.[type]??null},set(value){let record=handlers.get(this);if(!record){record=Object.create(null);handlers.set(this,record)}if(record[type])this.removeEventListener(type,record[type]);record[type]=typeof value==='function'?value:null;if(record[type])this.addEventListener(type,record[type])}});
++    for(const [name,value]of Object.entries({CONNECTING:0,OPEN:1,CLOSING:2,CLOSED:3}))for(const target of[WebSocket,WebSocket.prototype])Object.defineProperty(target,name,{value,enumerable:true});
++    return {WebSocket,CloseEvent,emit(object,type,init){const event=type==='message'?new MessageEvent(type,init):type==='close'?new CloseEvent(type,init):new Event(type);object.dispatchEvent(bridge.trust(event))}};
++  })`)({ ...bridge, trust: trustEvent });
++  emit = result.emit;
++  Object.assign(realm, { WebSocket: result.WebSocket, CloseEvent: result.CloseEvent });
++  const dispose = () => { disposed = true; for (const s of live) { s.readyState = 3; s.socket.terminate(); } live.clear(); signal?.removeEventListener('abort', dispose); };
++  signal?.addEventListener('abort', dispose, { once: true });
++  return { dispose };
++}
+--- a/src/worker-xhr.js
++++ b/src/worker-xhr.js
+@@ -0,0 +1,150 @@
++const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
++const FORBIDDEN = new Set(['accept-charset','accept-encoding','access-control-request-headers','access-control-request-method','connection','content-length','cookie','cookie2','date','dnt','expect','host','keep-alive','origin','referer','te','trailer','transfer-encoding','upgrade','user-agent','via']);
++const SIMPLE_RESPONSE = new Set(['cache-control','content-language','content-length','content-type','expires','last-modified','pragma']);
++const TYPES = new Set(['','text','json','blob','arraybuffer','document']);
++
++/** Worker XHR over the same real parent request transport as worker fetch.
++ * Response bodies are buffered; progress represents actual buffered bytes.
++ */
++export function installWorkerXHR(realm, { evaluate, fetch, syncRequest, origin, baseURL, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
++  if (typeof evaluate !== 'function' || typeof fetch !== 'function') throw new TypeError('An actual realm evaluator and fetch transport are required');
++  const ownerActive = active; let disposed = false;
++  active = () => !disposed && ownerActive();
++  const states = new WeakMap(), live = new Set(); let emit;
++  const error = (message, name = 'InvalidStateError') => new realm.DOMException(message, name);
++  const state = object => { const s = states.get(object); if (!s) throw new realm.TypeError('Illegal invocation'); return s; };
++  const reset = s => { s.status=0;s.statusText='';s.responseURL='';s.headers=new Headers();s.bytes=new Uint8Array();s.text='';s.cached=undefined; };
++  const current = (s, op) => active() && s.op === op;
++  const fire = (target, type, loaded = 0, total = 0, lengthComputable = false) => emit(target,type,type==='readystatechange'?null:{loaded,total,lengthComputable});
++  const cancel = op => { if (op) { op.done=true;clearTimeout(op.timer);op.controller.abort();live.delete(op); } };
++  function terminal(object,s,op,kind) {
++    if (!current(s,op)||op.done)return;
++    cancel(op);s.sending=false;reset(s);s.readyState=kind==='abort'?0:4;
++    fire(object,'readystatechange');if(!current(s,op))return;
++    fire(object,kind);if(current(s,op))fire(object,'loadend');
++  }
++  function timeout(object,s,op) {
++    clearTimeout(op.timer);
++    if(s.timeout&&!op.done)op.timer=setTimeout(()=>terminal(object,s,op,'timeout'),Math.max(0,s.timeout-(Date.now()-op.started)));
++  }
++  function simpleHeader(name,value) {
++    if(value.length>128)return false;
++    if(['accept-language','content-language'].includes(name))return /^[0-9A-Za-z *,\-.;=]*$/.test(value);
++    if(name==='accept')return !/[\x00-\x08\x0a-\x1f\x7f"():<>?@[\]{}]/.test(value);
++    if(name==='content-type')return /^(?:application\/x-www-form-urlencoded|multipart\/form-data|text\/plain)(?:\s*;|$)/i.test(value)&&!/[\x00-\x08\x0a-\x1f\x7f"():<>?@[\]{}]/.test(value);
++    return false;
++  }
++  function allowed(response,credentials) {
++    const allow=response.headers.get('access-control-allow-origin');
++    if(allow!==origin&&!(allow==='*'&&!credentials))throw error('CORS origin is not allowed','NetworkError');
++    if(credentials&&response.headers.get('access-control-allow-credentials')!=='true')throw error('CORS credentials are not allowed','NetworkError');
++  }
++  function bodySync(value,headers) {
++    if(value==null)return undefined;
++    if(value instanceof Blob){const reader=new realm.FileReaderSync();if(value.type&&!headers.has('content-type'))headers.set('content-type',value.type);return new Uint8Array(reader.readAsArrayBuffer(value));}
++    if(ArrayBuffer.isView(value))return new Uint8Array(value.buffer,value.byteOffset,value.byteLength).slice();
++    if(Object.prototype.toString.call(value)==='[object ArrayBuffer]')return new Uint8Array(value).slice();
++    if(value instanceof FormData)throw error('Synchronous FormData encoding is not implemented','NotSupportedError');
++    if(!headers.has('content-type'))headers.set('content-type',value instanceof URLSearchParams?'application/x-www-form-urlencoded;charset=UTF-8':'text/plain;charset=UTF-8');
++    return String(value);
++  }
++  async function bodyAsync(value,headers) {
++    if(value instanceof Blob){if(value.type&&!headers.has('content-type'))headers.set('content-type',value.type);return new Uint8Array(await Blob.prototype.arrayBuffer.call(value));}
++    if(value instanceof FormData){const request=new Request('http://form.invalid/',{method:'POST',body:value});if(!headers.has('content-type'))headers.set('content-type',request.headers.get('content-type'));return new Uint8Array(await request.arrayBuffer());}
++    return bodySync(value,headers);
++  }
++  function finish(object,s,op,result) {
++    if(!current(s,op)||op.done)return;
++    const cross=['http:','https:'].includes(new URL(result.url).protocol)&&new URL(result.url).origin!==origin;
++    if(cross)allowed(result,s.withCredentials);
++    const exposed=new Set((result.headers.get('access-control-expose-headers')??'').split(',').map(value=>value.trim().toLowerCase()));
++    s.headers=new Headers([...result.headers].filter(([name])=>!['set-cookie','set-cookie2'].includes(name)&&(!cross||SIMPLE_RESPONSE.has(name)||exposed.has(name)||(exposed.has('*')&&!s.withCredentials))));
++    s.status=result.status;s.statusText=result.statusText;s.responseURL=result.url;s.bytes=new Uint8Array(result.bytes);s.mime=s.overrideMime??result.headers.get('content-type')??'';
++    let charset=s.responseType==='json'?'utf-8':/charset\s*=\s*"?([^;"\s]+)/i.exec(s.mime)?.[1]??'utf-8';
++    try{s.text=new TextDecoder(charset).decode(s.bytes)}catch{s.text=new TextDecoder().decode(s.bytes)}
++    const length=result.headers.get('content-length'),total=length!==null&&/^\d+$/.test(length)?Number(length):0;
++    if(s.async){
++      s.readyState=2;fire(object,'readystatechange');if(!current(s,op)||op.done)return;
++      fire(object,'loadstart',0,total,false);if(!current(s,op)||op.done)return;
++      s.readyState=3;fire(object,'readystatechange');if(!current(s,op)||op.done)return;
++      if(s.bytes.length){fire(object,'progress',s.bytes.length,total,false);if(!current(s,op)||op.done)return;}
++    }
++    cancel(op);s.sending=false;s.readyState=4;fire(object,'readystatechange');if(!current(s,op))return;
++    fire(object,'load',s.bytes.length,total,!s.async&&length!==null);if(current(s,op))fire(object,'loadend',s.bytes.length,total,!s.async&&length!==null);
++  }
++  async function perform(object,s,op,body) {
++    try {
++      const headers=new Headers(s.requestHeaders);if(!headers.has('accept'))headers.set('accept','*/*');
++      const bytes=['GET','HEAD'].includes(s.method)?undefined:await bodyAsync(body,headers);if(!current(s,op)||op.done)return;
++      const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;
++      const unsafe=[...headers].filter(([name,value])=>!simpleHeader(name,value)).map(([name])=>name).sort();
++      if(cross||!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
++      const init={method:s.method,headers,body:bytes,signal:op.controller.signal,credentials:s.withCredentials?'include':'same-origin'};
++      const preflight=cross&&(!['GET','HEAD','POST'].includes(s.method)||unsafe.length);
++      if(preflight){const h=new Headers({'origin':origin,'access-control-request-method':s.method});if(unsafe.length)h.set('access-control-request-headers',unsafe.join(', '));const r=await fetch(s.url,{method:'OPTIONS',headers:h,signal:op.controller.signal,credentials:'omit'});allowed(r,s.withCredentials);if(!r.ok)throw error('CORS preflight failed','NetworkError');const methods=(r.headers.get('access-control-allow-methods')??'').split(',').map(x=>x.trim());if(!methods.includes(s.method)&&!(methods.includes('*')&&!s.withCredentials))throw error('CORS method is not allowed','NetworkError');const names=(r.headers.get('access-control-allow-headers')??'').toLowerCase().split(',').map(x=>x.trim());if(unsafe.some(name=>!names.includes(name)&&!(names.includes('*')&&!s.withCredentials&&name!=='authorization')))throw error('CORS headers are not allowed','NetworkError');}
++      const response=await fetch(s.url,init),result={status:response.status,statusText:response.statusText,url:response.url||s.url,headers:response.headers,bytes:new Uint8Array(await response.arrayBuffer())};
++      if(preflight&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
++      finish(object,s,op,result);
++    }catch{terminal(object,s,op,'error')}
++  }
++  const bridge = {
++    init(object,upload){states.set(object,{readyState:0,responseType:'',withCredentials:false,timeout:0,requestHeaders:new Headers(),sending:false,upload,async:true});reset(state(object));},
++    open(object,args){
++      if(args.length<2)throw new realm.TypeError('open requires a method and URL');const s=state(object);let[method,input,async=true,username,password]=args;
++      method=String(method);if(!TOKEN.test(method))throw error('Invalid HTTP method','SyntaxError');if(['CONNECT','TRACE','TRACK'].includes(method.toUpperCase()))throw error('Forbidden HTTP method','SecurityError');
++      if(!active())throw error('The worker is disposed');
++      let url;try{url=new URL(String(input),typeof baseURL==='function'?baseURL():baseURL??realm.location.href)}catch{throw error('Invalid request URL','SyntaxError')}
++      if(username!=null)url.username=String(username);if(password!=null)url.password=String(password);
++      if(url.username||url.password)throw error('URL credentials are not yet supported by worker XHR','NotSupportedError');url.hash='';
++      cancel(s.op);s.op=null;s.sending=false;s.method=['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(method.toUpperCase())?method.toUpperCase():method;s.url=url.href;s.async=Boolean(async);s.requestHeaders=new Headers();s.overrideMime=undefined;reset(s);
++      if(s.readyState!==1){s.readyState=1;fire(object,'readystatechange')}
++    },
++    header(object,name,value){const s=state(object);if(s.readyState!==1||s.sending)throw error('Request is not OPENED');name=String(name);value=String(value).replace(/^[\t ]+|[\t ]+$/g,'');if(!TOKEN.test(name)||/[^\t\x20-\x7e\x80-\xff]/.test(value))throw error('Invalid HTTP header','SyntaxError');name=name.toLowerCase();if(FORBIDDEN.has(name)||name.startsWith('sec-')||name.startsWith('proxy-'))return;s.requestHeaders.append(name,value)},
++    send(object,body){
++      const s=state(object);if(s.readyState!==1||s.sending)throw error('Request is not OPENED or has already been sent');if(!active())throw error('The worker is disposed');s.sending=true;
++      const op={controller:new AbortController(),started:Date.now(),done:false};s.op=op;live.add(op);
++      if(s.async){timeout(object,s,op);void perform(object,s,op,body);return}
++      if(typeof syncRequest!=='function'){cancel(op);s.sending=false;throw error('Synchronous XHR transport is unavailable','NotSupportedError')}
++      try{
++        const headers=new Headers(s.requestHeaders);if(!headers.has('accept'))headers.set('accept','*/*');const bytes=['GET','HEAD'].includes(s.method)?undefined:bodySync(body,headers);
++        const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;if(cross)throw error('Synchronous cross-origin XHR is not implemented','NotSupportedError');
++        if(!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
++        const result=syncRequest(s.url,{method:s.method,headers:[...headers],body:bytes,credentials:s.withCredentials?'include':'same-origin'},s.timeout);
++        result.headers=new Headers(result.headers);finish(object,s,op,result);
++      }catch(cause){terminal(object,s,op,'error');throw cause}
++    },
++    abort(object){const s=state(object);if(s.sending&&s.op&&!s.op.done)terminal(object,s,s.op,'abort');else{cancel(s.op);s.op=null;s.sending=false;reset(s);s.readyState=0}},
++    override(object,value){const s=state(object);if([3,4].includes(s.readyState))throw error('Cannot override MIME type after loading starts');s.overrideMime=String(value)},
++    get(object,key){const s=state(object);if(key==='responseText'){if(!['','text'].includes(s.responseType))throw error('responseType is not text');return s.readyState>=3?s.text:''}
++      if(key==='responseXML'){if(s.readyState===4&&['','document'].includes(s.responseType))throw new realm.Error('NotSupportedInWorker');return null}
++      if(key!=='response')return s[key];if(['','text'].includes(s.responseType))return s.readyState>=3?s.text:'';if(s.readyState!==4||!s.status)return null;if(s.cached!==undefined)return s.cached;
++      if(s.responseType==='json'){try{s.cached=realm.JSON.parse(s.text)}catch{s.cached=null}}else if(s.responseType==='document')s.cached=null;else{const bytes=new realm.Uint8Array(s.bytes.length);bytes.set(s.bytes);s.cached=s.responseType==='blob'?new realm.Blob([bytes.buffer],{type:s.mime}):bytes.buffer}return s.cached;
++    },
++    set(object,key,value){const s=state(object);if(key==='responseType'){value=String(value);if(!TYPES.has(value))return;if([3,4].includes(s.readyState))throw error('Cannot change responseType after loading starts');s.responseType=value}
++      else if(key==='withCredentials'){if(![0,1].includes(s.readyState)||s.sending)throw error('Cannot change credentials after sending');s.withCredentials=Boolean(value)}
++      else if(key==='timeout'){const number=Number(value);s.timeout=Number.isFinite(number)?Math.trunc(number)>>>0:0;if(s.sending)timeout(object,s,s.op)}
++    },
++    responseHeader(object,name){const s=state(object);if(s.readyState<2)return null;try{return s.headers.get(String(name))}catch{return null}},
++    responseHeaders(object){const s=state(object);return s.readyState<2?'':[...s.headers].sort(([a],[b])=>a<b?-1:a>b?1:0).map(([name,value])=>name+': '+value+'\r\n').join('')},
++    trust: trustEvent,
++  };
++  const result=evaluate(`(bridge=>{
++    class ProgressEvent extends Event {constructor(type,init={}){super(type,init);Object.defineProperties(this,{loaded:{value:Number(init.loaded??0),enumerable:true},total:{value:Number(init.total??0),enumerable:true},lengthComputable:{value:Boolean(init.lengthComputable),enumerable:true}})}get [Symbol.toStringTag](){return 'ProgressEvent'}}
++    class XMLHttpRequestEventTarget extends EventTarget {get [Symbol.toStringTag](){return 'XMLHttpRequestEventTarget'}}
++    class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {get [Symbol.toStringTag](){return 'XMLHttpRequestUpload'}}
++    class XMLHttpRequest extends XMLHttpRequestEventTarget {
++      constructor(){super();bridge.init(this,new XMLHttpRequestUpload())}
++      open(...args){return bridge.open(this,args)}setRequestHeader(name,value){if(arguments.length<2)throw new TypeError('setRequestHeader requires two arguments');return bridge.header(this,name,value)}
++      send(body=null){return bridge.send(this,body)}abort(){return bridge.abort(this)}overrideMimeType(value){return bridge.override(this,value)}
++      getResponseHeader(name){return bridge.responseHeader(this,name)}getAllResponseHeaders(){return bridge.responseHeaders(this)}
++      get [Symbol.toStringTag](){return 'XMLHttpRequest'}
++    }
++    for(const key of ['readyState','status','statusText','responseURL','upload','responseText','responseXML','response'])Object.defineProperty(XMLHttpRequest.prototype,key,{get(){return bridge.get(this,key)},enumerable:true,configurable:true});
++    for(const key of ['responseType','timeout','withCredentials'])Object.defineProperty(XMLHttpRequest.prototype,key,{get(){return bridge.get(this,key)},set(value){bridge.set(this,key,value)},enumerable:true,configurable:true});
++    const handlers=new WeakMap();for(const type of ['readystatechange','loadstart','progress','load','error','timeout','abort','loadend'])Object.defineProperty(XMLHttpRequestEventTarget.prototype,'on'+type,{get(){return handlers.get(this)?.[type]??null},set(value){let entries=handlers.get(this);if(!entries){entries=Object.create(null);handlers.set(this,entries)}if(entries[type])this.removeEventListener(type,entries[type]);entries[type]=typeof value==='function'?value:null;if(entries[type])this.addEventListener(type,entries[type])},enumerable:true,configurable:true});
++    for(const[name,value]of Object.entries({UNSENT:0,OPENED:1,HEADERS_RECEIVED:2,LOADING:3,DONE:4}))for(const target of[XMLHttpRequest,XMLHttpRequest.prototype])Object.defineProperty(target,name,{value,enumerable:true});
++    return {XMLHttpRequest,XMLHttpRequestEventTarget,XMLHttpRequestUpload,ProgressEvent,emit(object,type,progress){const event=progress===null?new Event(type):new ProgressEvent(type,progress);object.dispatchEvent(bridge.trust(event))}};
++  })`)(bridge);
++  emit=result.emit;for(const key of ['XMLHttpRequest','XMLHttpRequestEventTarget','XMLHttpRequestUpload','ProgressEvent'])Object.defineProperty(realm,key,{value:result[key],configurable:true,writable:true});
++  const dispose=()=>{disposed=true;for(const op of live)cancel(op);signal?.removeEventListener('abort',dispose)};signal?.addEventListener('abort',dispose,{once:true});return{dispose};
++}
+--- a/src/worker-sync-transport.js
++++ b/src/worker-sync-transport.js
+@@ -0,0 +1,29 @@
++let requestId = 0;
++
++// Both ends use the existing worker request/parent Page.fetch channel. Only the
++// private synchronous envelope adds base64 to retain arbitrary bytes in JSON.
++export function completeWorkerSyncResponse(shared, result, error) {
++  const state = new Int32Array(shared, 0, 2), destination = new Uint8Array(shared, 8);
++  let encoded;
++  try {
++    encoded = new TextEncoder().encode(JSON.stringify(error ? { error: String(error.message ?? error) }
++      : { ...result, bytes: undefined, bodyBase64: Buffer.from(result.bytes).toString('base64') }));
++    if (encoded.length > destination.length) throw new Error('Synchronous worker response exceeds its 8MiB envelope limit');
++  } catch (cause) { encoded = new TextEncoder().encode(JSON.stringify({ error: String(cause.message) })); }
++  destination.set(encoded.subarray(0, destination.length)); Atomics.store(state, 1, Math.min(encoded.length, destination.length));
++  Atomics.store(state, 0, 1); Atomics.notify(state, 0);
++}
++
++export function createSyncWorkerRequest(port, { maxBytes = 8 * 1024 * 1024, timeoutMs = 5000 } = {}) {
++  return (url, init, requestTimeout = 0) => {
++    const shared = new SharedArrayBuffer(maxBytes + 8), state = new Int32Array(shared, 0, 2), id = `xhr-sync-${++requestId}`;
++    port.postMessage({ kind: 'request', id, url, init, script: false, resourceType: 'XHR', sync: shared, syncBinary: true });
++    const waited = Atomics.wait(state, 0, 0, requestTimeout > 0 ? Math.min(timeoutMs, requestTimeout) : timeoutMs);
++    if (waited === 'timed-out' || Atomics.load(state, 0) !== 1) {
++      port.postMessage({ kind: 'cancel', id }); throw new DOMException('Synchronous worker request did not complete', 'TimeoutError');
++    }
++    const result = JSON.parse(new TextDecoder().decode(new Uint8Array(shared, 8, Atomics.load(state, 1))));
++    if (result.error) throw new DOMException(result.error, 'NetworkError');
++    result.bytes = new Uint8Array(Buffer.from(result.bodyBase64, 'base64')); delete result.bodyBase64; return result;
++  };
++}

@@ -331,3 +331,7 @@ export function installGeometry(realm) {
   if (typeof realm?.eval !== 'function') throw new TypeError('Geometry installation requires a realm eval function; workers can evaluate GEOMETRY_SOURCE in their VM context');
   return realm.eval(GEOMETRY_SOURCE);
 }
+
+// A host-private kernel reuses the independent 4x4 implementation without
+// consulting authored Window constructors or altering public realm globals.
+export function createGeometryKernel() { return geometryFactory({ DOMException }); }

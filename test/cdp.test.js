@@ -34,7 +34,7 @@ test('flattened sessions navigate, evaluate, retain handles, cookies, dump and d
     const called = await send('Runtime.callFunctionOn', { objectId: handle, functionDeclaration: 'function (n) {return this.answer + n}', arguments: [{ value: 8 }], returnByValue: true });
     assert.equal(called.result.value, 50);
     await send('Runtime.releaseObject', { objectId: handle });
-    await assert.rejects(send('Runtime.getProperties', { objectId: handle }), /Cannot find object/);
+    await assert.rejects(send('Runtime.getProperties', { objectId: handle }), /Could not find object/);
     const error = await send('Runtime.evaluate', { expression: "throw new Error('expected')" });
     assert.equal(error.exceptionDetails.text, 'Uncaught'); assert.match(error.exceptionDetails.exception.description, /expected/);
     const deadline = await send('Runtime.evaluate', { expression: 'while(true){}' });

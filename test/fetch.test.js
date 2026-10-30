@@ -70,12 +70,12 @@ test('Request bodies and clones preserve Blob, multipart, URLSearchParams and ty
   const form = new window.FormData(); form.append('field', 'value'); form.append('file', new window.Blob(['file body'], { type: 'text/plain' }), 'sample.txt');
   const request = new window.Request('/echo', { method: 'POST', body: form }); const clone = request.clone();
   form.set('field', 'changed after request construction');
-  const sent = await window.fetch(request); assert.equal(request.bodyUsed, true);
+  const sent = await window.fetch(request); assert.equal(request.bodyUsed, false);
   const json = await sent.json(); assert.match(json.headers['content-type'], /^multipart\/form-data; boundary=/);
   assert.match(json.body, /name="field"\r\n\r\nvalue/); assert.doesNotMatch(json.body, /changed after/); assert.match(json.body, /filename="sample.txt"/);
   const cloned = await clone.formData(); assert.ok(cloned instanceof window.FormData); assert.equal(cloned.get('field'), 'value');
   assert.ok(cloned.get('file') instanceof window.File); assert.equal(cloned.get('file').name, 'sample.txt');
-  assert.throws(() => request.clone(), window.TypeError);
+  const afterUpload = await request.clone().formData(); assert.equal(afterUpload.get('field'), 'value'); assert.equal(await afterUpload.get('file').text(), 'file body');
   assert.equal(new window.Request('/echo').url, `${base}/echo`);
 }));
 
@@ -166,7 +166,7 @@ test('signals, malformed requests, HTTP errors and network failures preserve obs
   await assert.rejects(window.fetch('/disconnect'), window.TypeError);
   await assert.rejects(window.fetch(), window.TypeError);
   await assert.rejects(window.fetch('/echo', { method: 'GET', body: 'invalid' }), window.TypeError);
-  await assert.rejects(window.fetch('/echo', { method: 'POST', body: new window.Response('upload').body, duplex: 'half' }), /ReadableStream request bodies are unsupported/);
+  const uploaded = await (await window.fetch('/echo', { method: 'POST', body: new window.Response('upload').body, get duplex() { throw new Error('duplex getter must not run'); } })).json(); assert.equal(uploaded.body, 'upload'); assert.equal(uploaded.headers['content-type'] ?? null, null);
   const missing = await window.fetch('/missing'); assert.equal(missing.status, 404); assert.equal(missing.ok, false); assert.equal(await missing.text(), 'missing');
   const data = await window.fetch('data:text/plain;base64,aGVsbG8='); assert.equal(await data.text(), 'hello');
 }));

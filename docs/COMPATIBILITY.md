@@ -4,6 +4,18 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
+The current integration adds real classic-script microtask checkpoints, loading
+and retained-frame document writes, DOM serialization, Request/Response producer
+streams, cross-realm Blob/File messaging, SVG values, CSS media/computed values,
+and experimental Cache/service-worker lifecycle plus dedicated-worker blocking
+XHR/FileReaderSync and real WebSockets. Protocol invocation captures the actual
+realm apply intrinsic and enters through a private lexical trampoline with a VM
+timeout. These are bounded implementations: service-worker clients/controller,
+fetch interception, updates and persistence; full SVG/layout; worker network
+policy; runtime worlds/heap enumeration; and complete asynchronous execution
+deadlines remain unfinished. See the source proposals and retained observations
+in `proposals/`; isolated proposals are not automatically production features.
+
 ## Target and evidence boundaries
 
 - Binary: official Linux x86_64 Lightpanda
@@ -61,7 +73,7 @@ and reproducible outcomes for it, not a growing subset of smoke tests. At least:
 
 | Native surface | Historical Red Panda status and concrete gaps |
 | --- | --- |
-| `fetch` | Partial/bounded passes for HTML/Markdown, load/done/selector waits, JSON batches, error exits, preloads and cookie files. Native default is no dump and 5,000 ms; Red Panda defaults to HTML and 10,000 ms. Red Panda batches run sequentially. Native JSON diagnostic fields such as `page_status` and `bot_challenge` are missing. |
+| `fetch` | Partial/bounded passes for HTML/Markdown, load/done/selector waits, JSON batches, error exits, preloads and cookie files. Both default to no dump and a5,000ms wait option. Optional bare dump, wait-script files, predicate readiness, fixed HTTP headers and exact text-output framing have bounded real CLI controls; pending-navigation deadline outcomes remain different. Red Panda batches run sequentially. Native JSON diagnostic fields such as `page_status` and `bot_challenge` are missing. |
 | `serve` | Partial CDP on TCP. No advertised-host override, Unix sockets, connection/backlog limits, configurable origin allowlist, native `/json/protocol` or `/metrics` endpoints. Serve accepts some globally parsed cookie flags without implementing native daemon load/save semantics. |
 | `run` | Missing saved PandaScript execution and its browser interaction/extraction API. |
 | `agent` | Missing REPL, task mode, recording/save, attachments, provider configuration and tool loop. Local `--no-llm` and deterministic replay can be tested without credentials; live providers require separate access. |
@@ -70,13 +82,18 @@ and reproducible outcomes for it, not a growing subset of smoke tests. At least:
 | `help`, `version` | Red Panda has `--help` and its own version; native command/subcommand help contracts are not replicated. |
 | Automation protocols | Native serve supports CDP and WebDriver/BiDi on the same listener. Historical Red Panda has CDP only; newer transport work requires its own conformance results. |
 
-Native fetch options still lacking equivalent behavior include `--dump-max-bytes`,
-`--dump-selector`, `--markdown-alternate`, `--metrics`, `--strip-mode`,
-`--terminate-ms`, `--wait-script-file`, `--with-base`, and `--with-frames`.
-Native dump modes also include `png`, `pdf`, `semantic_tree` and
-`semantic_tree_text`; they are not equivalent to the prototype's extra `text`
-and `links` modes. `structured_data` exists on both but its full native schema,
-invalid inputs, redirects and document-source coverage are not yet compared.
+Dump selection, UTF-8 byte caps, Markdown alternates, strip groups and absolute
+base insertion have bounded implementations and native controls. HTML, Markdown,
+semantic JSON/text, structured metadata and text-rendered PNG/PDF are available;
+this does not establish complete payload/rendering parity. The new writer capture
+retains an existing semantic-tree-text article/name mismatch. Candidate-only
+`text` and `links` are additional formats with no native fetch counterpart.
+Missing or incomplete fetch options still include `--metrics`, real
+`--terminate-ms`, `--with-frames`, idle readiness modes, image loading and broader
+HTTP/locale controls. Native shutdown can linger after complete stdout; captured
+first-output times and watchdog signals remain distinct from operation deadlines.
+See [the CLI proposal evidence](reference/cli-proposal.md) for actual exit/output
+controls, unresolved errors and the optional-dump positional-value quirk.
 
 Native server options requiring coverage include `--advertise-host`,
 `--cdp-max-connections`, `--cdp-max-http-message-size`, `--cdp-max-message-size`,
@@ -581,3 +598,38 @@ misconfigured report is retained; these outcomes are not code regressions.
 The test helper now implements real `/echo_brotli` byte echo with HTTP decoding;
 the earlier broader native compression failure from its missing route remains
 recorded rather than being relabeled as a pass.
+
+The following independent integration checkpoint passes **861 JavaScript tests
+and 53 PureScript Puppeteer assertions**, syntax checks, the strict/pedantic
+PureScript build and all13 existing native differential groups. The development
+server was restarted and its health endpoint and PureScript example passed.
+The [validation record](reference/phase9-integration-validation.json) retains
+the exact checks and scoped limitations.
+
+It adds actual classic-script microtask checkpoints and incumbent-realm native
+entries, loading/retained-frame writes, DOM serialization, genuine producer
+stream consumption, Blob/File messaging across real threads, DOM/SVG values,
+CSS media/computed values, Cache and threaded service-worker registration and
+lifecycle. Dedicated workers have actual XHR, WebSocket and FileReaderSync
+transports. `--experimental-features serviceworker` enables the secure profile;
+an actual CLI service worker stores bytes that the page subsequently reads.
+Protocol function invocation uses a captured realm intrinsic and private lexical
+frame, with synchronous VM execution bounds; it is not a full async deadline.
+
+The [frozen default32 comparison](reference/conformance-phase9-checkpoint.json)
+uses unchanged fixtures/harness and the actual iframe/worker flags. Native
+passed32; candidate passed31 and timed out on `element/position.html`, which also
+reported a scroll-width assertion. The15-second instrumented budget and100ms
+settling procedure do not prove source2-second or native performance parity.
+All five enabled/disabled/teardown Cache/service-worker profiles pass within
+their source-specific budgets, with no missing routes.
+
+The earlier three unobserved stream cases and two messaging failures now pass
+in the [six-case recheck](reference/conformance-phase9-candidate-repaired6.json).
+Its Request failure used a random server port despite the fixture's hardcoded
+9582 requirement; the unchanged same-source [canonical-port recheck](reference/conformance-phase9-candidate-request-canonical.json)
+passes. The misconfigured report remains intact. These selected outcomes do not
+establish a full455-registration or WPT pass rate. Utility worlds and heap
+enumeration remain isolated proposals; layout/SVG, worker network policies,
+service-worker interception/updates/persistence and full execution deadlines
+remain incomplete.

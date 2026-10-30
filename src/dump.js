@@ -1,3 +1,4 @@
+import { serializeHTML as html } from './serialization.js';
 /** Independent DOM dumps. Rendering/image formats require an actual renderer. */
 export class DumpError extends Error {
   constructor(message, code = 'InvalidArgument') { super(message); this.name = 'DumpError'; this.code = code; }
@@ -6,23 +7,6 @@ export const STRIP_MODES = Object.freeze(['clutter', 'css', 'js', 'invisible', '
 export const DUMP_FORMATS = Object.freeze(['html', 'markdown', 'semantic_tree', 'semantic_tree_text', 'structured_data', 'text', 'links']);
 const text = node => (node.textContent ?? '').replace(/\s+/g, ' ').trim();
 const all = (root, selector) => [...(root.nodeType === 1 && root.matches(selector) ? [root] : []), ...root.querySelectorAll(selector)];
-const tags = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
-const booleanAttributes = new Set(['allowfullscreen', 'async', 'autofocus', 'autoplay', 'checked', 'controls', 'default', 'defer', 'disabled', 'formnovalidate', 'hidden', 'ismap', 'loop', 'multiple', 'muted', 'nomodule', 'novalidate', 'open', 'playsinline', 'readonly', 'required', 'reversed', 'selected']);
-const escapeText = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\u00a0', '&nbsp;');
-const escapeAttribute = value => value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('\u00a0', '&nbsp;');
-function html(node, parentTag = '') {
-  if (node.nodeType === 9 || node.nodeType === 11) return [...node.childNodes].map(child => html(child)).join('');
-  if (node.nodeType === 10) return `<!DOCTYPE ${node.name}${node.publicId ? ` PUBLIC "${node.publicId}"` : node.systemId ? ' SYSTEM' : ''}${node.systemId ? ` "${node.systemId}"` : ''}>\n`;
-  if (node.nodeType === 8) return `<!--${node.data}-->`;
-  if (node.nodeType === 3) return ['script', 'style', 'xmp', 'iframe', 'noembed', 'noframes', 'plaintext'].includes(parentTag) ? node.data : escapeText(node.data);
-  if (node.nodeType !== 1) return '';
-  const tag = node.localName, attributes = [...node.attributes].map(attribute =>
-    ` ${attribute.name}${booleanAttributes.has(attribute.name.toLowerCase()) && attribute.value === '' ? '' : `="${escapeAttribute(attribute.value)}"`}`).join('');
-  const start = `<${tag}${attributes}>`;
-  if (tags.has(tag) && node.namespaceURI === 'http://www.w3.org/1999/xhtml') return start;
-  const children = tag === 'template' ? node.content.childNodes : node.childNodes;
-  return start + [...children].map(child => html(child, tag)).join('') + `</${tag}>`;
-}
 function cloneWithSources(root) {
   const clone = root.cloneNode(true), sources = new WeakMap();
   const pair = (source, target) => {

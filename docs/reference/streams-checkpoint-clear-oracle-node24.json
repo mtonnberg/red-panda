@@ -1,0 +1,70 @@
+{
+  "fixtures": {
+    "error": "<!doctype html><script id=setup>globalThis.trace=[];window.addEventListener('error',e=>{trace.push({phase:'reported',message:e.message,id:document.currentScript?.id??null});e.preventDefault()})</script><script id=throwing>trace.push({phase:'sync',id:document.currentScript?.id??null});Promise.resolve().then(()=>trace.push({phase:'then',id:document.currentScript?.id??null}));queueMicrotask(()=>trace.push({phase:'queue',id:document.currentScript?.id??null}));throw new Error('owned script failure')</script><script id=after>trace.push({phase:'after',id:document.currentScript?.id??null})</script>",
+    "same": "<!doctype html><script id=setup>globalThis.trace=[];window.addEventListener('error',e=>{trace.push({phase:'reported',message:e.message,id:document.currentScript?.id??null});e.preventDefault()})</script><script id=outer>trace.push({phase:'outer-begin',id:document.currentScript?.id??null});Promise.resolve().then(()=>trace.push({phase:'outer-then',id:document.currentScript?.id??null}));const s=document.createElement('script');s.id='inner';s.text=\"trace.push({phase:'inner-sync',id:document.currentScript?.id??null});Promise.resolve().then(()=>trace.push({phase:'inner-then',id:document.currentScript?.id??null}));throw new Error('owned nested failure')\";document.head.append(s);trace.push({phase:'outer-end',id:document.currentScript?.id??null})</script><script id=after>trace.push({phase:'after',id:document.currentScript?.id??null})</script>",
+    "cross": "<!doctype html><script id=setup>globalThis.trace=[];window.addEventListener('error',e=>{trace.push({phase:'reported',message:e.message,id:document.currentScript?.id??null});e.preventDefault()})</script><iframe id=child></iframe><script id=outer>trace.push({phase:'outer-begin',id:document.currentScript?.id??null});Promise.resolve().then(()=>trace.push({phase:'outer-then',id:document.currentScript?.id??null}));const doc=child.contentDocument;if(!doc?.head){trace.push({phase:'missing-frame'})}else{child.contentWindow.addEventListener('error',e=>{trace.push({phase:'child-reported',message:e.message,id:doc.currentScript?.id??null,parentId:document.currentScript?.id??null});e.preventDefault()});const script=doc.createElement('script');script.id='inner';script.text=\"parent.trace.push({phase:'inner-sync',id:document.currentScript?.id??null,parentId:parent.document.currentScript?.id??null});Promise.resolve().then(()=>parent.trace.push({phase:'inner-then',id:document.currentScript?.id??null,parentId:parent.document.currentScript?.id??null}));\";doc.head.append(script)}trace.push({phase:'outer-end',id:document.currentScript?.id??null});</script><script id=after>trace.push({phase:'after',id:document.currentScript?.id??null})</script>",
+    "crossError": "<!doctype html><script id=setup>globalThis.trace=[];window.addEventListener('error',e=>{trace.push({phase:'reported',message:e.message,id:document.currentScript?.id??null});e.preventDefault()})</script><iframe id=child></iframe><script id=outer>trace.push({phase:'outer-begin',id:document.currentScript?.id??null});Promise.resolve().then(()=>trace.push({phase:'outer-then',id:document.currentScript?.id??null}));const doc=child.contentDocument;if(!doc?.head){trace.push({phase:'missing-frame'})}else{child.contentWindow.addEventListener('error',e=>{trace.push({phase:'child-reported',message:e.message,id:doc.currentScript?.id??null,parentId:document.currentScript?.id??null});e.preventDefault()});const script=doc.createElement('script');script.id='inner';script.text=\"parent.trace.push({phase:'inner-sync',id:document.currentScript?.id??null,parentId:parent.document.currentScript?.id??null});Promise.resolve().then(()=>parent.trace.push({phase:'inner-then',id:document.currentScript?.id??null,parentId:parent.document.currentScript?.id??null}));throw new Error('owned cross failure')\";doc.head.append(script)}trace.push({phase:'outer-end',id:document.currentScript?.id??null});</script><script id=after>trace.push({phase:'after',id:document.currentScript?.id??null})</script>"
+  },
+  "results": {
+    "error": {
+      "native": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"sync\",\"id\":\"throwing\"},{\"phase\":\"reported\",\"message\":\"Error: owned script failure\",\"id\":\"throwing\"},{\"phase\":\"then\",\"id\":\"throwing\"},{\"phase\":\"queue\",\"id\":\"throwing\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "clearCandidate": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"sync\",\"id\":\"throwing\"},{\"phase\":\"reported\",\"message\":\"Error: owned script failure\",\"id\":\"throwing\"},{\"phase\":\"then\",\"id\":\"throwing\"},{\"phase\":\"queue\",\"id\":\"throwing\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "equal": true
+    },
+    "same": {
+      "native": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"outer-begin\",\"id\":\"outer\"},{\"phase\":\"inner-sync\",\"id\":\"inner\"},{\"phase\":\"reported\",\"message\":\"Error: owned nested failure\",\"id\":\"inner\"},{\"phase\":\"outer-end\",\"id\":\"outer\"},{\"phase\":\"outer-then\",\"id\":\"outer\"},{\"phase\":\"inner-then\",\"id\":\"outer\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "clearCandidate": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"outer-begin\",\"id\":\"outer\"},{\"phase\":\"inner-sync\",\"id\":\"inner\"},{\"phase\":\"reported\",\"message\":\"Error: owned nested failure\",\"id\":\"inner\"},{\"phase\":\"outer-end\",\"id\":\"outer\"},{\"phase\":\"outer-then\",\"id\":\"outer\"},{\"phase\":\"inner-then\",\"id\":\"outer\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "equal": true
+    },
+    "cross": {
+      "native": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"outer-begin\",\"id\":\"outer\"},{\"phase\":\"inner-sync\",\"id\":\"inner\",\"parentId\":\"outer\"},{\"phase\":\"outer-end\",\"id\":\"outer\"},{\"phase\":\"outer-then\",\"id\":\"outer\"},{\"phase\":\"inner-then\",\"id\":null,\"parentId\":\"outer\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "clearCandidate": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"outer-begin\",\"id\":\"outer\"},{\"phase\":\"inner-sync\",\"id\":\"inner\",\"parentId\":\"outer\"},{\"phase\":\"outer-end\",\"id\":\"outer\"},{\"phase\":\"outer-then\",\"id\":\"outer\"},{\"phase\":\"inner-then\",\"id\":null,\"parentId\":\"outer\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "equal": true
+    },
+    "crossError": {
+      "native": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"outer-begin\",\"id\":\"outer\"},{\"phase\":\"inner-sync\",\"id\":\"inner\",\"parentId\":\"outer\"},{\"phase\":\"child-reported\",\"message\":\"Error: owned cross failure\",\"id\":\"inner\",\"parentId\":\"outer\"},{\"phase\":\"outer-end\",\"id\":\"outer\"},{\"phase\":\"outer-then\",\"id\":\"outer\"},{\"phase\":\"inner-then\",\"id\":null,\"parentId\":\"outer\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "clearCandidate": {
+        "result": {
+          "type": "string",
+          "value": "[{\"phase\":\"outer-begin\",\"id\":\"outer\"},{\"phase\":\"inner-sync\",\"id\":\"inner\",\"parentId\":\"outer\"},{\"phase\":\"child-reported\",\"message\":\"Error: owned cross failure\",\"id\":\"inner\",\"parentId\":\"outer\"},{\"phase\":\"outer-end\",\"id\":\"outer\"},{\"phase\":\"outer-then\",\"id\":\"outer\"},{\"phase\":\"inner-then\",\"id\":null,\"parentId\":\"outer\"},{\"phase\":\"after\",\"id\":\"after\"}]"
+        }
+      },
+      "equal": true
+    }
+  }
+}

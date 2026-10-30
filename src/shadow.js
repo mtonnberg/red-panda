@@ -326,6 +326,18 @@ function patchHosts() {
     if (permit) {
       FORCED_FRAGMENTS.delete(context);
       declarativeAdapter(options.treeAdapter, permit.record);
+      if (permit.executeScripts) {
+        const pop = options.treeAdapter.onItemPop;
+        options.treeAdapter.onItemPop = function (node, ...args) {
+          const script = node.localName === 'script' && node.namespaceURI === HTML && node._parserInserted;
+          const attached = node._attached;
+          // Written scripts are prepared during the real fragment parse, before
+          // its live-DOM splice. isConnected still reflects the detached tree.
+          if (script) node._attached = true;
+          try { return pop.call(this, node, ...args); }
+          finally { if (script) node._attached = attached || node.isConnected; }
+        };
+      }
     }
     return parseFragment.call(this, context, markup, options);
   };
@@ -414,4 +426,14 @@ export function installShadowDOM(page, window) {
   window.close = record.close;
   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
   return record.controller;
+}
+
+// Scope one actual fragment-parser entry. Nested ordinary innerHTML parsing
+// remains inert after the permit is consumed, as with setHTMLUnsafe.
+export function parseDocumentWriteFragment(document, markup) {
+  patchHosts();
+  const context = document.createElement('div');
+  FORCED_FRAGMENTS.set(context, { record: recordFor(document), executeScripts: true });
+  try { return htmlParser.parseFragment(markup, context); }
+  finally { FORCED_FRAGMENTS.delete(context); }
 }

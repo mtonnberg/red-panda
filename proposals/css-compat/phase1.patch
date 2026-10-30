@@ -1,0 +1,716 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installMedia} from './media.js';
+ import { getRuntimeBinding } from './native-runtime.js';
+ import { captureProtocolRealm } from './realm-values.js';
+ import { installListenerOwnership } from './listener-ownership.js';
+@@ -220,6 +221,7 @@
+       installInputControls(this, window);
+       installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+       installGeometry(window);
++    installMedia(this,window);
+       installXHR(this, window);
+       if (main) this.frames = installFrames(this, window, {
+         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+--- /dev/null
++++ b/src/computed-values.js
+@@ -0,0 +1,26 @@
++import {createGeometryKernel} from './geometry.js';
++const {DOMMatrix}=createGeometryKernel();
++const matrixFields=Array.from({length:16},(_,index)=>`m${Math.floor(index/4)+1}${index%4+1}`);
++const format=value=>value.toPrecision(6).replace(/(\.\d*?[1-9])0+(?=e|$)|\.0+(?=e|$)/g,'$1');
++
++/** Computed transform serialization uses real 4x4 arithmetic. Native's
++ * transform profile retains raw magnitudes for absolute-length/percent units,
++ * while em/rem and calc remain unsupported and resolve to none. */
++export function computedTransform(value){
++ if(!value||value.trim().toLowerCase()==='none')return'none';
++ try{
++  const input=value.replace(/([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(px|cm|mm|q|in|pt|pc|%)(?=\s|,|\))/gi,'$1px');
++  const matrix=new DOMMatrix(input),values=matrixFields.map(key=>matrix[key]);if(!values.every(Number.isFinite))return'none';
++  return matrix.is2D?`matrix(${[0,1,4,5,12,13].map(index=>format(values[index])).join(', ')})`:`matrix3d(${values.map(format).join(', ')})`;
++ }catch{return'none'}
++}
++
++export function computedFontSize(value,parent='16px',root='16px',{isRoot=false}={}){
++ const keyword=value.trim().toLowerCase(),parentPixels=Number.parseFloat(parent)||16,rootPixels=isRoot?16:Number.parseFloat(root)||16;
++ const keywords={'xx-small':9,'x-small':10,small:13,medium:16,large:18,'x-large':24,'xx-large':32,'xxx-large':48};
++ if(Object.hasOwn(keywords,keyword))return`${keywords[keyword]}px`;
++ if(keyword==='larger')return`${parentPixels*1.2}px`;if(keyword==='smaller')return`${parentPixels/1.2}px`;
++ const length=/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px|em|rem|%|pt|pc|in|cm|mm|q)$/i.exec(keyword);if(!length)return value;
++ const units={px:1,em:parentPixels,rem:rootPixels,'%':parentPixels/100,pt:96/72,pc:16,in:96,cm:96/2.54,mm:96/25.4,q:96/101.6};
++ return`${Number(length[1])*units[length[2]]}px`;
++}
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -179,6 +179,34 @@
+   }
+ }
+ 
++const AXES = new Map([['overflow',new Set(['auto','scroll','hidden','clip','visible','overlay'])],['overscroll-behavior',new Set(['auto','contain','none'])]]);
++const CSS_WIDE = new Set(['inherit','initial','unset','revert','revert-layer']);
++const canonicalProperty = property => { property=String(property);return property.startsWith('--')?property:property.toLowerCase(); };
++function axisValue(style,name) {
++  const x=BASE.getPropertyValue.call(style,name+'-x'), y=BASE.getPropertyValue.call(style,name+'-y');
++  if(!x||!y||BASE.getPropertyPriority.call(style,name+'-x')!==BASE.getPropertyPriority.call(style,name+'-y'))return '';
++  return x===y?x:x+' '+y;
++}
++function axisSet(style,name,value,priority='') {
++  if(value===''){BASE.removeProperty.call(style,name+'-x');BASE.removeProperty.call(style,name+'-y');return;}
++  const parts=value.toLowerCase().trim().split(/\s+/), allowed=AXES.get(name);
++  if(parts.length>2||parts.some(part=>!allowed.has(part)&&!CSS_WIDE.has(part)&&!/^var\([^\s()]*\)$/.test(part))||parts.length===2&&parts.some(part=>CSS_WIDE.has(part)))return;
++  style._setProperty(name+'-x',parts[0],priority);style._setProperty(name+'-y',parts[1]??parts[0],priority);
++  // _setProperty deliberately stores empty priority too: property assignment clears importance.
++  for(const axis of ['x','y']){if(priority)style._priorities.set(name+'-'+axis,priority);else style._priorities.delete(name+'-'+axis);}
++}
++function serializedDeclaration(style) {
++  if(style._computed)return '';
++  const output=[],done=new Set();
++  for(let i=0;i<style.length;i++) {
++    let name=style[i];if(done.has(name))continue;
++    const base=name.replace(/-[xy]$/,'');
++    if(AXES.has(base)&&axisValue(style,base)){done.add(base+'-x');done.add(base+'-y');name=base;}
++    const value=style.getPropertyValue(name),priority=style.getPropertyPriority(name);
++    output.push(`${name}: ${value}${priority?' !'+priority:''};`);
++  }
++  return output.join(' ');
++}
+ const COMPAT = Object.create(BASE);
+ for(const [name,descriptor] of Object.entries(Object.getOwnPropertyDescriptors(BASE))) {
+   if(!descriptor.set || ['cssText','length'].includes(name))continue;
+@@ -199,7 +227,7 @@
+     if(typeof value==='string')MUTATIONS.set(this,(MUTATIONS.get(this)??0)+1);
+     return BASE._setProperty.call(this,property,value,priority);
+   }},
+-  cssText:{configurable:true,enumerable:true,get:Object.getOwnPropertyDescriptor(BASE,'cssText').get,set(value){
++  cssText:{configurable:true,enumerable:true,get(){return serializedDeclaration(this);},set(value){
+     change(this,()=>{
+       this.length=0;this._values.clear();this._priorities.clear();
+       for(const item of parseDeclarations(value??'')) {
+@@ -208,16 +236,20 @@
+       }
+     },{explicit:true});
+   }},
++  getPropertyValue:{configurable:true,writable:true,value(property){property=canonicalProperty(property);return AXES.has(property)?axisValue(this,property):BASE.getPropertyValue.call(this,property);}},
++  getPropertyPriority:{configurable:true,writable:true,value(property){property=canonicalProperty(property);return AXES.has(property)?(axisValue(this,property)?BASE.getPropertyPriority.call(this,property+'-x'):''):BASE.getPropertyPriority.call(this,property);}},
+   removeProperty:{configurable:true,writable:true,value(property){
+-    property=String(property);if(!property.startsWith('--'))property=property.toLowerCase();
+-    return change(this,()=>BASE.removeProperty.call(this,property));
++    property=canonicalProperty(property);
++    return change(this,()=>{const previous=this.getPropertyValue(property);if(AXES.has(property)){BASE.removeProperty.call(this,property+'-x');BASE.removeProperty.call(this,property+'-y');return previous;}return BASE.removeProperty.call(this,property);});
+   }},
+   setProperty:{configurable:true,writable:true,value(property,value,priority=''){
+-    property=String(property);priority=priority==null?'':String(priority);
++    property=canonicalProperty(property);priority=priority==null?'':String(priority);
+     if(value != null && String(value) !== '' && priority && !/^important$/i.test(priority))return;
+     return change(this,()=>{
+       const normalized=normalizeCSSValue(property.startsWith('--')?property:property.toLowerCase(),value==null?'':String(value));
+       const before=MUTATIONS.get(this), previousPriority=this.getPropertyPriority(property);
++      if(AXES.has(property)){axisSet(this,property,normalized,priority.toLowerCase());return;}
++      if(property==='-webkit-border-radius'){if(normalized==='')this.removeProperty(property);else this._setProperty(property,normalized,priority.toLowerCase());return;}
+       if (property.toLowerCase() === 'opacity' && normalized !== '') this._setProperty('opacity', normalized, priority.toLowerCase());
+       else BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
+       if(MUTATIONS.get(this)===before && normalized!=='') {
+@@ -231,6 +263,17 @@
+   [Symbol.iterator]:{configurable:true,value:function*(){for(let i=0;i<this.length;i++)yield this[i];}},
+ });
+ 
++for(const [name,allowed] of AXES) {
++  for(const spelling of [name]) {
++    Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue(name);},set(value){return change(this,()=>axisSet(this,name,value==null?'':String(value)));}});
++  }
++  const camel=name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
++  Object.defineProperty(COMPAT,camel,{configurable:true,enumerable:true,get(){return this.getPropertyValue(name);},set(value){return change(this,()=>axisSet(this,name,value==null?'':String(value)));}});
++  for(const axis of ['x','y'])for(const spelling of [name+'-'+axis,camel+axis.toUpperCase()])Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue(name+'-'+axis);},set(value){return change(this,()=>{const input=value==null?'':String(value).toLowerCase().trim(),property=name+'-'+axis;if(input==='')BASE.removeProperty.call(this,property);else if(allowed.has(input)||CSS_WIDE.has(input)) {this._setProperty(property,input);this._priorities.delete(property);}});}});
++}
++for(const spelling of ['cssFloat','float'])Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue('float');},set(value){return change(this,()=>{if(value===null||value==='')BASE.removeProperty.call(this,'float');else {this._setProperty('float',String(value));this._priorities.delete('float');}});}});
++for(const spelling of ['-webkit-border-radius','webkitBorderRadius','WebkitBorderRadius'])Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue('-webkit-border-radius');},set(value){this.setProperty('-webkit-border-radius',value);}});
++
+ export function enhanceDeclaration(style, window) {
+   if(!DECLARATIONS.has(style)) {Object.setPrototypeOf(style,COMPAT);DECLARATIONS.add(style);}
+   if(window)style._global=window;
+@@ -273,15 +316,23 @@
+   return result;
+ }
+ 
+-export function parseStyleSheet(text,{window,onUnsupported}={}) {
++const NESTED_GROUPS=new WeakMap();
++export const nestedGroupContents=rule=>NESTED_GROUPS.get(rule);
++
++export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
+   const sheet=new cssom.CSSStyleSheet();const rules=[];
+   for(const entry of parseRuleBlocks(text)) {
+     const {prelude,body}=entry;let rule;
+     if(!prelude.startsWith('@') && body!==null) {
+-      rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=new CSSRuleList();
++      rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules;
+     } else if(/^@(?:-webkit-)?keyframes\s+/i.test(prelude) && body!==null) {
+       rule=new cssom.CSSKeyframesRule();rule.name=prelude.replace(/^@(?:-webkit-)?keyframes\s+/i,'');if(/^@-webkit-/i.test(prelude))rule._vendorPrefix='-webkit-';
+       rule.cssRules=new CSSRuleList(parseRuleBlocks(body).filter(item=>item.body!==null).map(item=>{const frame=new cssom.CSSKeyframeRule();frame.keyText=item.prelude;frame.style=createDeclaration(item.body,{window});return frame;}));
++    } else if(nested && /^@media\b/i.test(prelude) && body!==null) {
++      rule=new cssom.CSSRule();rule.type=4;
++      const media=prelude.replace(/^@media\s*/i,'');
++      NESTED_GROUPS.set(rule,{kind:'media',media,style:createDeclaration(body,{nesting:true,window}),rules:parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules});
++      Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+     } else if(/^@(?:media|supports)\b/i.test(prelude) && body!==null) {
+       if(/^@media\b/i.test(prelude)){rule=new cssom.CSSMediaRule();rule.media.mediaText=prelude.replace(/^@media\s*/i,'');}
+       else{rule=new cssom.CSSSupportsRule();rule.conditionText=prelude.replace(/^@supports\s*/i,'');}
+@@ -291,6 +342,10 @@
+       // Descriptor grammars differ from ordinary element properties. Keep the
+       // parser's declaration boundaries, including src and font descriptors.
+       for(const item of parseDeclarations(body))if(!rule.style.getPropertyValue(item.property))rule.style._setProperty(item.property,item.value,item.priority);
++    } else if(/^@layer(?:\s|$)/i.test(prelude)) {
++      rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
++      const names=prelude.replace(/^@layer\s*/i,'').trim();
++      NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
+     } else if(/^@import\b/i.test(prelude)&&body===null) {
+       try{rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
+     } else if(prelude.startsWith('@')) {
+@@ -298,7 +353,7 @@
+     }
+     if(!rule)continue;
+     if(rule.style){Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});}
+-    if(rule.type===1)Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,get(){return `${this.selectorText} {${this.style.length?` ${this.style.cssText} `:' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}});
++    if(rule.type===1)Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}});
+     rules.push(rule);
+   }
+   sheet.cssRules=new CSSRuleList(rules);return sheet;
+--- a/src/geometry.js
++++ b/src/geometry.js
+@@ -331,3 +331,7 @@
+   if (typeof realm?.eval !== 'function') throw new TypeError('Geometry installation requires a realm eval function; workers can evaluate GEOMETRY_SOURCE in their VM context');
+   return realm.eval(GEOMETRY_SOURCE);
+ }
++
++// A host-private kernel reuses the independent 4x4 implementation without
++// consulting authored Window constructors or altering public realm globals.
++export function createGeometryKernel() { return geometryFactory({ DOMException }); }
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,4 @@
++import {refreshMediaQueries} from './media.js';
+ // Independent surrogate geometry for a headless DOM. This intentionally models
+ // the reference's measured simple boxes; it is not a CSS layout renderer.
+ import { getStyleRevision } from './styles.js';
+@@ -59,10 +60,13 @@
+     };
+     function isHidden(node) {
+       if (hidden.has(node)) return hidden.get(node);
+-      const parent = node.parentNode ?? node.host;
+-      const ancestorHidden = parent && hidden.get(parent);
+-      const ownHidden = node.nodeType === 1 && (hiddenTags.has(node.localName) || node.hidden || style(node).display === 'none');
+-      const result = Boolean(ancestorHidden || ownHidden);
++      const implementation=implForWrapper(node),ordinaryParent=node.parentNode;
++      const assigned=implementation?._assignedSlot;
++      const parent=assigned?wrapperForImpl(assigned):ordinaryParent??node.host;
++      const outsideFlatTree=ordinaryParent?.nodeType===1&&!assigned&&(implForWrapper(ordinaryParent)._shadowRoot||(ordinaryParent.localName==='slot'&&implForWrapper(ordinaryParent)._assignedNodes?.length));
++      const ancestorHidden = parent && isHidden(parent);
++      const ownHidden = node.nodeType === 1 && (hiddenTags.has(node.localName) || style(node).display === 'none');
++      const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
+       hidden.set(node, result); return result;
+     }
+     function size(node) {
+@@ -196,7 +200,7 @@
+     setViewport(viewport) {
+       const nextWidth = optionDimension(viewport.width ?? width, 'Viewport width');
+       const nextHeight = optionDimension(viewport.height ?? height, 'Viewport height');
+-      width = nextWidth; height = nextHeight; scrollTo(scrollX, scrollY);
++      width = nextWidth; height = nextHeight; scrollTo(scrollX, scrollY); refreshMediaQueries(window);
+     },
+     // Used by the window adapter without recursively reading its own overrides.
+     rawComputedStyle,
+@@ -235,15 +239,18 @@
+   window.scrollBy = (x, y) => layout.scrollBy(...(typeof x === 'object' && x !== null ? [x.left ?? 0, x.top ?? 0] : [x, y]));
+   define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { layout.scrollIntoView(this); } });
+   define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { layout.scrollIntoView(this); } });
++  const computedViews = new WeakMap();
+   window.getComputedStyle = (node, pseudoElement) => {
+     const original = layout.rawComputedStyle(node, pseudoElement);
++    if (computedViews.has(original)) return computedViews.get(original);
+     const computed = name => {
+       if (name === 'width' || name === 'height') {
++        const specified = original.getPropertyValue(name); if (/var\(/.test(specified)) return specified;
+         return layout.rects(node).length ? `${layout.rect(node)[name]}px` : 'auto';
+       }
+       return original.getPropertyValue(name);
+     };
+-    return new Proxy(original, {
++    const view = new Proxy(original, {
+       get(target, property) {
+         if (property === 'width' || property === 'height') return computed(property);
+         if (property === 'getPropertyValue') return name => computed(name);
+@@ -251,6 +258,7 @@
+         return typeof value === 'function' ? value.bind(target) : value;
+       },
+     });
++    computedViews.set(original,view); return view;
+   };
+   page.layout = layout;
+   return layout;
+--- /dev/null
++++ b/src/media.js
+@@ -0,0 +1,82 @@
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const INSTALLED=new WeakMap(),LISTS=new WeakMap(),EVENTS=new WeakMap(),SCREENS=new WeakMap();
++
++function queries(text){let depth=0,start=0;const result=[];for(let i=0;i<text.length;i++){if(text[i]==='(')depth++;else if(text[i]===')')depth--;else if(text[i]===','&&depth===0){result.push(text.slice(start,i));start=i+1}if(depth<0)return[]}if(depth)return[];result.push(text.slice(start));return result}
++function condition(text,viewport){
++ const feature=/^\(\s*([\w-]+)\s*:\s*([^()]*)\)$/.exec(text);if(!feature)return false;
++ if(feature[1]==='orientation')return feature[2].trim()===(viewport.width>=viewport.height?'landscape':'portrait');
++ const name=/^(min-|max-)?(device-)?(width|height)$/.exec(feature[1]);if(!name)return false;
++ const length=/^\s*([+]?(?:\d+(?:\.\d*)?|\.\d+))(px|em|rem)\s*$/.exec(feature[2]);if(!length)return false;
++ const wanted=Number(length[1])*(length[2]==='px'?1:16);if(!Number.isFinite(wanted)||wanted>4294967295)return false;
++ const actual=viewport[name[3]];return name[1]==='min-'?actual>=wanted:name[1]==='max-'?actual<=wanted:actual===wanted;
++}
++
++/** The measured native profile supports screen/print/all, comma OR, and/not,
++ * orientation and px/em/rem dimensions. Unknown types and malformed grammar
++ * fail closed; unsupported features are false and may be negated. */
++export function evaluateMedia(text,viewport,{emptyMatches=false}={}){
++ text=String(text).replace(/\/\*[\s\S]*?\*\//g,' ').toLowerCase().trim();if(!text)return emptyMatches;
++ return queries(text).some(query=>{
++  query=query.trim();let negate=false;
++  if(/^not\s+/.test(query)){negate=true;query=query.replace(/^not\s+/,'')}
++  let only=false;if(/^only\s+/.test(query)){only=true;query=query.replace(/^only\s+/,'')}
++  let matches=true;const type=/^([a-z-]+)(?=\s|$)/.exec(query);
++  if(type){if(!['all','screen','print'].includes(type[1]))return false;matches=type[1]!=='print';query=query.slice(type[0].length).trim();if(query){if(!/^and\s+/.test(query))return false;query=query.replace(/^and\s+/,'')}}
++  else if(only)return false;
++  if(!query)return type?(negate?!matches:matches):false;
++  const parts=query.split(/\s+and\s+/);if(parts.some(part=>!/^\([^()]*\)$/.test(part.trim())))return false;
++  for(const part of parts)matches&&=condition(part.trim(),viewport);
++  return negate?!matches:matches;
++ });
++}
++
++function trusted(target,event){const impl=implForWrapper(event);impl.isTrusted=true;return implForWrapper(target)._dispatch(impl)}
++export function refreshMediaQueries(window){
++ const record=INSTALLED.get(window);if(!record||record.disposed)return;
++ const viewport={width:window.innerWidth,height:window.innerHeight};
++ for(const reference of record.queries){
++  const target=reference.deref();if(!target){record.queries.delete(reference);continue;}const item=LISTS.get(target);
++  const next=evaluateMedia(item.media,viewport);if(next===item.matches)continue;item.matches=next;
++  const timer=window.setTimeout(()=>{record.timers.delete(timer);if(!record.disposed&&!record.signal?.aborted)trusted(item.target,new window.MediaQueryListEvent('change',{matches:next,media:item.media}))},0);record.timers.add(timer);
++ }
++}
++
++function mediaInterfaces(window,record,secret,LISTS,EVENTS,evaluateMedia){
++ const EventTarget=window.EventTarget,Event=window.Event;
++ const domString=value=>{if(typeof value==='symbol')throw new window.TypeError('Cannot convert a Symbol to a DOMString');return String(value)};
++ const brand=target=>{const item=LISTS.get(target);if(!item)throw new window.TypeError('Illegal invocation');return item};
++ class MediaQueryList extends EventTarget{
++  constructor(token,media){super();if(token!==secret)throw new window.TypeError('Illegal Constructor');const item={target:this,record,media,matches:evaluateMedia(media,{width:window.innerWidth,height:window.innerHeight}),handler:null,listener:null};LISTS.set(this,item);record.queries.add(new WeakRef(this))}
++  get media(){return brand(this).media}
++  get matches(){const item=brand(this);return item.record.disposed?item.matches:evaluateMedia(item.media,{width:item.record.window.innerWidth,height:item.record.window.innerHeight})}
++  addListener(callback){brand(this);this.addEventListener('change',callback)}
++  removeListener(callback){brand(this);this.removeEventListener('change',callback)}
++  get onchange(){return brand(this).handler}
++  set onchange(callback){const item=brand(this),next=typeof callback==='function'?callback:null;if(item.handler&&next){item.handler=next;return}if(item.listener)this.removeEventListener('change',item.listener);item.handler=next;item.listener=next?event=>item.handler?.call(this,event):null;if(item.listener)this.addEventListener('change',item.listener)}
++ }
++ Object.defineProperty(MediaQueryList,'length',{value:0,configurable:true});
++ Object.defineProperty(MediaQueryList.prototype,Symbol.toStringTag,{value:'MediaQueryList',configurable:true});
++ for(const key of['media','matches','addListener','removeListener','onchange']){const descriptor=Object.getOwnPropertyDescriptor(MediaQueryList.prototype,key);Object.defineProperty(MediaQueryList.prototype,key,{...descriptor,enumerable:true})}
++ class MediaQueryListEvent extends Event{
++  constructor(type,init={}){if(!arguments.length)throw new window.TypeError('MediaQueryListEvent requires an event type');init=init??{};super(type,init);EVENTS.set(this,{matches:!!init.matches,media:init.media===undefined?'':domString(init.media)})}
++  get matches(){if(!EVENTS.has(this))throw new window.TypeError('Illegal invocation');return EVENTS.get(this).matches}
++  get media(){if(!EVENTS.has(this))throw new window.TypeError('Illegal invocation');return EVENTS.get(this).media}
++ }
++ Object.defineProperty(MediaQueryListEvent.prototype,Symbol.toStringTag,{value:'MediaQueryListEvent',configurable:true});
++ for(const key of['media','matches']){const descriptor=Object.getOwnPropertyDescriptor(MediaQueryListEvent.prototype,key);Object.defineProperty(MediaQueryListEvent.prototype,key,{...descriptor,enumerable:true})}
++ const matchMedia=function matchMedia(query){if(!arguments.length)throw new window.TypeError('matchMedia requires a query');if(record.disposed||record.signal?.aborted)throw new window.DOMException('Document is disposed','InvalidStateError');return new MediaQueryList(secret,domString(query))};
++ return {MediaQueryList,MediaQueryListEvent,matchMedia};
++}
++
++export function installMedia(page,window){
++ if(INSTALLED.has(window))return INSTALLED.get(window).controller;
++ const record={page,window,queries:new Set(),timers:new Set(),disposed:false,signal:page.documentAbort?.signal};
++ const interfaces=window.eval(`(${mediaInterfaces.toString()})`)(window,record,{},LISTS,EVENTS,evaluateMedia);
++ Object.assign(window,interfaces);
++ SCREENS.set(window.screen,record);
++ for(const[key,dimension]of[['width','width'],['height','height']]){const original=Object.getOwnPropertyDescriptor(window.Screen.prototype,key);if(original?.get)Object.defineProperty(window.Screen.prototype,key,{...original,get(){const fallback=original.get.call(this),owner=SCREENS.get(this);return owner?owner.window[dimension==='width'?'innerWidth':'innerHeight']:fallback}})}
++ const previous=window.close;function dispose(){if(record.disposed)return;record.disposed=true;for(const timer of record.timers)window.clearTimeout(timer);record.timers.clear();record.queries.clear();record.signal?.removeEventListener('abort',dispose);if(window.close===close)window.close=previous}function close(...args){dispose();return previous.apply(this,args)}window.close=close;record.signal?.addEventListener('abort',dispose,{once:true});
++ record.controller={dispose,refresh:()=>refreshMediaQueries(window)};INSTALLED.set(window,record);return record.controller;
++}
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -134,6 +134,8 @@
+       if(name!=='is'&&name!=='where')fail(window,'Selector function cannot be empty');
+       compiled+=emitPredicate({kind:'never'});effective+=`:${name}()`;
+      }else{const nested=list(arg,name,name==='has');compiled+=`:${name}(${nested.compiled})`;effective+=`:${name}(${nested.effective})`;}
++    }else if(name==='empty'){
++     if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'empty'});effective+=value.slice(i,end);
+     }else if(name==='modal'||name==='popover-open'||name==='popover'){
+      if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:name==='modal'?'modal':'popover'});effective+=value.slice(i,end);
+     }else{
+@@ -162,6 +164,7 @@
+ 
+ function predicate(record,element,item) {
+  if(item.kind==='never')return false;
++ if(item.kind==='empty'){for(const child of element.childNodes)if(child.nodeType===1||child.nodeType===3&&child.data.length)return false;return true;}
+  // Native parses :modal but its observed public predicate stays false.
+  if(item.kind==='modal')return record.providers.matchesModal?.(element)===true;
+  if(item.kind==='popover')return record.providers.isPopoverOpen?.(element)===true;
+@@ -240,3 +243,10 @@
+  if(!Number.isSafeInteger(revision)||revision<0)throw new TypeError('Selector state revision must be a nonnegative safe integer');
+  return revision;
+ }
++
++// Host stylesheet matching has the document root as its scoping root.
++export function matchesInScope(element,selector,scope=element.ownerDocument.documentElement) {
++ const record=RECORDS.get(implForWrapper(element.ownerDocument));
++ if(!record)return element.matches(selector);
++ try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}
++}
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,5 +1,7 @@
+-import { selectorForSpecificity, getSelectorStateRevision } from './selectors.js';
+-import { enhanceDeclaration, parseStyleSheet, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
++import {computedTransform,computedFontSize} from './computed-values.js';
++import {evaluateMedia} from './media.js';
++import { selectorForSpecificity, getSelectorStateRevision, matchesInScope } from './selectors.js';
++import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -16,7 +18,7 @@
+ const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
+ const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
+ const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
+-const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\nnoscript { display: none; }\n');
++const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\narea,base,datalist,head,link,meta,noscript,param,script,source,style,template,title,track { display: none; } details:not([open]) > :not(summary) { display: none; } [popover]:not(:popover-open):not(dialog[open]) { display:none; } dialog:popover-open {display:block;}\n');
+ const RECORDS = new WeakMap();
+ const SHEETS = new WeakMap();
+ const ADOPTED = new WeakMap();
+@@ -30,6 +32,8 @@
+   float: 'none', clear: 'none', overflow: 'visible', 'overflow-x': 'visible', 'overflow-y': 'visible',
+   width: 'auto', height: 'auto', 'min-width': '0px', 'min-height': '0px', 'max-width': 'none', 'max-height': 'none',
+   opacity: '1', 'background-color': 'rgba(0, 0, 0, 0)', 'background-image': 'none', 'background-blend-mode': 'normal',
++  'z-index': 'auto', 'flex-grow': '0', 'flex-shrink': '1', 'flex-basis': 'auto', content: 'normal', gap: 'normal', 'column-gap': 'normal', 'border-radius': '0px', 'border-width': '0px', 'border-style': 'none',
++  'border-top-left-radius': '0px', 'border-top-right-radius': '0px', 'border-bottom-left-radius': '0px', 'border-bottom-right-radius': '0px',
+   'box-sizing': 'content-box', isolation: 'auto', transform: 'none', '-webkit-transform': 'none',
+   'font-family': 'serif', 'font-size': '16px', 'font-style': 'normal', 'font-weight': '400', 'font-variant': 'normal',
+   'line-height': 'normal', 'text-align': 'start', 'text-transform': 'none', 'text-indent': '0px', 'white-space': 'normal',
+@@ -75,6 +79,13 @@
+     if (typeof original === 'function') prototype[method] = function (...args) { const result = original.apply(this, args); changed(this); return result; };
+   }
+ }
++
++const characterDataPrototype=require('jsdom/lib/jsdom/living/nodes/CharacterData-impl.js').implementation.prototype;
++const replaceCharacterData=characterDataPrototype.replaceData;
++characterDataPrototype.replaceData=function(...args){const result=replaceCharacterData.apply(this,args);const record=recordFor(wrapperForImpl(this._ownerDocument));if(record)record.stateRevision++;return result;};
++const registryPrototype=require('jsdom/lib/jsdom/living/custom-elements/CustomElementRegistry-impl.js').implementation.prototype;
++const defineCustomElement=registryPrototype.define;
++registryPrototype.define=function(...args){const result=defineCustomElement.apply(this,args);const record=recordFor(this._globalObject.document);if(record)record.stateRevision++;return result;};
+ 
+ const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
+ StyleElementImpl.prototype._updateAStyleBlock = function () {
+@@ -163,6 +174,7 @@
+   if (!metadata) {
+     metadata = { record, document: record.document, constructed, locked: false };
+     SHEETS.set(sheet, metadata);
++    if(record.originalSheetPrototype&&Object.getPrototypeOf(sheet)===record.originalSheetPrototype)Object.setPrototypeOf(sheet,record.sheetPrototype);
+     sheet.cssRules = asRuleList(sheet.cssRules);
+     if (!sheet.media) sheet.media = new cssom.MediaList();
+     if (sheet.disabled === undefined) sheet.disabled = false;
+@@ -172,13 +184,13 @@
+       replaceSync: { configurable: true, writable: true, value(text) {
+         if (this !== sheet) return operation(record, this, 'replaceSync', arguments);
+         if (!arguments.length) throw new record.window.TypeError('replaceSync requires CSS text');
+-        if (!metadata.constructed || metadata.locked) throw new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError');
++        if (metadata.locked) throw new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError');
+         replaceRules(record, sheet, text);
+       } },
+       replace: { configurable: true, writable: true, value(text) {
+         if (this !== sheet) return operation(record, this, 'replace', arguments);
+         if (!arguments.length) return record.window.Promise.reject(new record.window.TypeError('replace requires CSS text'));
+-        if (!metadata.constructed || metadata.locked) return record.window.Promise.reject(new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError'));
++        if (metadata.locked) return record.window.Promise.reject(new record.window.DOMException('Only unlocked constructed stylesheets can be replaced', 'NotAllowedError'));
+         text = String(text); metadata.locked = true;
+         return record.window.Promise.resolve().then(() => {
+           try { replaceRules(record, sheet, text); return sheet; }
+@@ -333,24 +345,7 @@
+   return score;
+ }
+ 
+-function mediaMatches(record, text) {
+-  if (!text || !text.trim()) return true;
+-  return splitTopLevel(text.toLowerCase()).filter(Boolean).some(query => {
+-    let negate = false; query = query.trim();
+-    if (query.startsWith('not ')) { negate = true; query = query.slice(4).trim(); }
+-    query = query.replace(/^only\s+/, '');
+-    let matches = true;
+-    const type = query.match(/^(all|screen|print)\b/);
+-    if (type) { matches = type[1] !== 'print'; query = query.slice(type[0].length).trim().replace(/^and\s+/, ''); }
+-    for (const condition of query.split(/\s+and\s+/).filter(Boolean)) {
+-      const bound = condition.match(/^\((min-|max-)?(width|height)\s*:\s*(\d+(?:\.\d+)?)px\)$/);
+-      if (!bound) { record.unsupported.add('Media queries beyond screen/print and pixel width/height bounds'); return false; }
+-      const dimension = bound[2] === 'width' ? record.window.innerWidth : record.window.innerHeight;
+-      const value = Number(bound[3]); matches &&= bound[1] === 'min-' ? dimension >= value : bound[1] === 'max-' ? dimension <= value : dimension === value;
+-    }
+-    return negate ? !matches : matches;
+-  });
+-}
++function mediaMatches(record,text) { return evaluateMedia(text,{width:record.window.innerWidth,height:record.window.innerHeight},{emptyMatches:true}); }
+ 
+ function shadowStyleSheet(record, element) {
+   const text = element.textContent;
+@@ -395,7 +390,7 @@
+ }
+ 
+ function localToken(record, element) {
+-  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
++  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+   const roots = new Set();
+   for (let current = element; current; current = inheritanceParent(current)) {
+     const root = rootOf(current); roots.add(root);
+@@ -432,7 +427,23 @@
+ 
+ function cascade(record, element) {
+   const values = new Map(); let order = 0;
+-  const offer = (style, score, origin, inline = false) => {
++  const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
++  const registerLayer=(parent,name,key)=>{
++    if(!name){const node={children:new Map()};parent.children.set(key,node);return node;}
++    if(!/^[\w-]+(?:\.[\w-]+)*$/.test(name))return null;
++    for(const part of name.split('.')){if(!parent.children.has(part))parent.children.set(part,{children:new Map()});parent=parent.children.get(part);}return parent;
++  };
++  const collectLayers=(rules,parent=layerRoot,depth=0)=>{if(depth>32)return;for(const rule of rules){const group=nestedGroupContents(rule);
++    if(group?.kind==='layerStatement'){for(const name of group.names)registerLayer(parent,name,rule);}
++    else if(group?.kind==='layer'){const node=registerLayer(parent,group.name,rule);if(node){layerNodes.set(rule,node);collectLayers(group.rules,node,depth+1);}}
++    else if(group?.kind==='media'){if(mediaMatches(record,group.media))collectLayers(group.rules,parent,depth+1);}
++    else if(rule.type===4&&rule.cssRules){if(mediaMatches(record,rule.media?.mediaText??''))collectLayers(rule.cssRules,parent,depth+(rule.type===4?1:0));}
++    else if(rule.type===1&&rule.cssRules)collectLayers(rule.cssRules,parent,depth+(rule.type===4?1:0));
++  }};
++  const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
++  for(const{sheet}of authorSheets)collectLayers(sheet.cssRules);
++  let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
++  const offer = (style, score, origin, inline = false, layer=layerRoot) => {
+     style = declaration(style);
+     for (let index = 0; index < style.length; index++) {
+       const property = style[index];
+@@ -452,24 +463,46 @@
+       // expansions except overflow. Its independently expanded axes likewise
+       // take part in source order, specificity and importance.
+       for (const { name, entry, overflowPart } of entries) {
+-        const key = [important ? 1 : 0, important && origin === 0 ? 2 : origin, inline ? 1 : 0, ...score, order++];
++        const key = [important ? 1 : 0, important && origin === 0 ? 2 : origin, inline ? 1 : 0, important?-layer.rank:layer.rank, ...score, order++];
+         const list = values.get(name) ?? []; list.push({ value: entry, key, origin, overflowPart }); values.set(name, list);
+       }
+     }
+   };
+-  const walk = (rules, origin) => {
++  const resolveNested=(selector,parent)=>{
++    if(!parent)return selector;
++    let result='',ampersand=false,quote=null,brackets=0;
++    for(let i=0;i<selector.length;i++){
++      const c=selector[i];if(c==='\\'){result+=c+(selector[++i]??'');continue;}
++      if(quote){result+=c;if(c===quote)quote=null;continue;}
++      if(c==='"'||c==="'"){quote=c;result+=c;continue;}
++      if(c==='[')brackets++;if(c===']')brackets--;
++      if(c==='&'&&!brackets){result+=`:is(${parent})`;ampersand=true;}else result+=c;
++    }
++    return ampersand?result:`:is(${parent}) ${result}`;
++  };
++  const offerSelector=(selectorText,style,origin,layer=layerRoot)=>{
++    let highest=null;
++    for(const selector of splitTopLevel(selectorText)) {
++      if(/:host|::slotted|::part/.test(selector)){record.unsupported.add(':host, ::slotted and ::part selectors');continue;}
++      try{if(matchesInScope(element,selector,record.document.documentElement)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
++      catch{record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
++    }
++    if(highest)offer(style,highest,origin,false,layer);
++  };
++  const walk = (rules, origin, parent=null, layer=layerRoot, depth=0) => {
++    if(depth>32)return;
+     for (const rule of rules) {
+-      if (rule.selectorText && rule.style) {
+-        let highest = null;
+-        for (const selector of splitTopLevel(rule.selectorText)) {
+-          if (/:host|::slotted|::part/.test(selector)) { record.unsupported.add(':host, ::slotted and ::part selectors'); continue; }
+-          try { if (element.matches(selector)) { const score = specificity(selector); if (!highest || compare(score, highest) > 0) highest = score; } }
+-          catch { record.unsupported.add('Selectors unsupported by the pinned DOM selector engine'); }
+-        }
+-        if (highest) offer(rule.style, highest, origin);
+-      } else if (rule.type === 4 && rule.cssRules) {
+-        if (mediaMatches(record, rule.media?.mediaText ?? rule.conditionText ?? '')) walk(rule.cssRules, origin);
+-      } else if (rule.cssRules && rule.type !== 7) record.unsupported.add('Cascade layers, nesting, @supports and other grouping rules');
++      if(rule.selectorText&&rule.style) {
++        const selector=splitTopLevel(rule.selectorText).map(part=>resolveNested(part,parent)).join(', ');
++        offerSelector(selector,rule.style,origin,layer);
++        if(rule.cssRules?.length)walk(rule.cssRules,origin,selector,layer,depth);
++      } else if(nestedGroupContents(rule)) {
++        const group=nestedGroupContents(rule);
++        if(group.kind==='layer'){const child=layerNodes.get(rule);if(child){if(parent&&group.style)offerSelector(parent,group.style,origin,child);walk(group.rules,origin,parent,child,depth+1);}}
++        else if(group.kind==='media'&&parent&&mediaMatches(record,group.media)){offerSelector(parent,group.style,origin,layer);walk(group.rules,origin,parent,layer,depth+1);}
++      } else if(rule.type===4&&rule.cssRules) {
++        if(mediaMatches(record,rule.media?.mediaText??rule.conditionText??''))walk(rule.cssRules,origin,parent,layer,depth+1);
++      } else if(rule.cssRules&&rule.type!==7)record.unsupported.add('Cascade layers, @supports and other grouping rules');
+     }
+   };
+   walk(UA.cssRules, 0);
+@@ -477,7 +510,7 @@
+     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
+   }
+   const root = rootOf(element);
+-  for (const { sheet, media } of scopeSheets(record, root)) if (!sheet.disabled && mediaMatches(record, media)) walk(sheet.cssRules, 1);
++  for(const{sheet}of authorSheets)walk(sheet.cssRules,1);
+   offer(element.style, [0, 0, 0], 1, true);
+   const chosen = new Map();
+   for (const [property, candidates] of values) {
+@@ -536,7 +569,7 @@
+     const next = new Set(stack); next.add(name);
+     const value = substitute(custom.get(name), key => resolveCustom(key, next)); resolved.set(name, value); return value;
+   };
+-  for (const property of custom.keys()) { const value = resolveCustom(property); if (value !== null) result.setProperty(property, value); }
++  for (const [property,value] of custom) result.setProperty(property,value);
+   const properties = [...new Set([...Object.keys(initial), ...chosen.keys()])].sort((a, b) => Number(shorthands.has(b)) - Number(shorthands.has(a)));
+   const resolve = property => {
+     const inheriting = inherited.has(property), fallback = initial[property] ?? '';
+@@ -544,7 +577,7 @@
+     const selection = chosen.get(property);
+     let value = typeof selection === 'object' ? selection.value : selection;
+     if (value === undefined) value = inheriting ? parentValue : fallback;
+-    if (property !== 'opacity' && /var\(/.test(value)) value = substitute(value, resolveCustom);
++    // Native exposes declared variable token streams without substitution.
+     if (selection?.overflowPart !== undefined && value !== null) value = overflowAxes(value)?.[selection.overflowPart] ?? null;
+     const keyword = value?.trim().toLowerCase();
+     if (value === null || keyword === 'unset') value = inheriting ? parentValue : fallback;
+@@ -558,11 +591,23 @@
+   for (const property of properties) {
+     if (property === 'color' || property.startsWith('--')) continue;
+     let value = resolve(property);
++    if (property === 'transform' || property === '-webkit-transform') value = computedTransform(value);
++    if (property === 'font-size') {
++      const rootElement = record.document.documentElement;
++      const rootSize = element === rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
++      value = computedFontSize(value,parentStyle?.fontSize,rootSize,{isRoot:element===rootElement});
++    }
++    if (['display','visibility','position','pointer-events','overflow','overflow-x','overflow-y','content-visibility'].includes(property)&&typeof value==='string')value=value.toLowerCase();
+     if (property === 'font-weight') value = ({ normal: '400', bold: '700' })[value] ?? value;
+     if (property.endsWith('color') && value) { try { value = getComputedOrUsedColor(value); } catch {} }
+-    result.setProperty(property, inherited.has(property) ? parentStyle?.getPropertyValue(property) || initial[property] || '' : initial[property] || '');
+-    if (property === 'opacity') result._setProperty(property, value);
+-    else result.setProperty(property, value);
++    // Cascade declarations have already passed their property grammar. Store
++    // computed longhands directly: declaration setters can clear border widths
++    // while serializing border-style:none, which is invalid for computed state.
++    result._setProperty(property,value);
++  }
++  for(const shorthand of ['margin','padding','border-width','border-style','border-color']) {
++    const values=['top','right','bottom','left'].map(side=>result.getPropertyValue(shorthand.startsWith('border-')?'border-'+side+'-'+shorthand.slice(7):shorthand+'-'+side));
++    if(values.every(Boolean)){const [top,right,bottom,left]=values;result._setProperty(shorthand,top===right&&top===bottom&&top===left?top:top===bottom&&right===left?top+' '+right:right===left?top+' '+right+' '+bottom:values.join(' '));}
+   }
+   // CSS Overflow's computed-value coupling turns visible into auto and clip
+   // into hidden when the opposite axis establishes a scrolling box.
+@@ -581,7 +626,10 @@
+   return result;
+ }
+ 
+-function computedStyle(record, element) {
++function computedStyle(record, element, pseudo = '') {
++  record.views ??= new WeakMap();
++  let views = record.views.get(element); if (!views) { views = new Map(); record.views.set(element, views); }
++  if (views.has(pseudo)) return views.get(pseudo);
+   let token, cached;
+   const current = () => {
+     const next = localToken(record, element);
+@@ -589,7 +637,7 @@
+     return cached;
+   };
+   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
+-  return new Proxy(new CSSStyleDeclaration(), {
++  const view = new Proxy(new CSSStyleDeclaration(), {
+     get(target, property) {
+       if (['setProperty', 'removeProperty'].includes(property)) return readonly;
+       if (property === 'cssText') return '';
+@@ -599,12 +647,13 @@
+     },
+     set: readonly, deleteProperty: readonly, defineProperty: readonly,
+   });
++  views.set(pseudo,view); return view;
+ }
+ 
+ export function getStyleRevision(window) {
+   const record = recordFor(window?.document);
+   if (!record) return 0;
+-  const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
++  const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, record.window.location.href, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
+   const visit = root => {
+     tokens.push(id(root), implForWrapper(root)._version);
+     for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
+@@ -672,12 +721,15 @@
+     deleteRule(index) { return operation(record, this, 'deleteRule', arguments); }
+     static [Symbol.hasInstance](sheet) { return sheet instanceof originalConstructor; }
+   }
++  record.originalSheetPrototype=originalConstructor.prototype;record.sheetPrototype=CSSStyleSheet.prototype;
+   window.CSSStyleSheet = CSSStyleSheet;
+   window.getComputedStyle = function getComputedStyle(element, pseudo = null) {
+     if (!ElementInterface.is(element)) throw new window.TypeError('getComputedStyle requires an Element');
+-    if (pseudo !== null && pseudo !== undefined && String(pseudo) !== '') throw notSupported(record, 'Computed pseudo-element styles are not implemented');
++    let key = pseudo == null ? '' : String(pseudo).toLowerCase();
++    if (!key.startsWith(':')) key = '';
++    else key = key.replace(/^:(before|after|first-letter|first-line)$/, '::$1');
+     const owner = recordFor(element.ownerDocument);
+-    return owner ? computedStyle(owner, element) : record.originalGetComputedStyle.call(window, element);
++    return owner ? computedStyle(owner, element, key) : record.originalGetComputedStyle.call(window, element);
+   };
+   const dispose = () => {
+     if (record.disposed) return;
+@@ -687,6 +739,9 @@
+   };
+   record.controller = { dispose, get revision() { return getStyleRevision(window); }, unsupported: record.unsupported };
+   if (!record.signal?.aborted && !page.closed) RECORDS.set(document, record);
++  const indeterminate=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'indeterminate');
++  if(indeterminate?.set)Object.defineProperty(window.HTMLInputElement.prototype,'indeterminate',{...indeterminate,set(value){const result=indeterminate.set.call(this,value);const owner=recordFor(this.ownerDocument);if(owner)owner.stateRevision++;return result;}});
++
+   record.close = function () { dispose(); return record.originalClose.call(window); }; window.close = record.close;
+   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
+   return record.controller;
+--- /dev/null
++++ b/test/css-compat.test.js
+@@ -0,0 +1,42 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {EventEmitter} from 'node:events';
++import {JSDOM} from 'jsdom';
++const load=name=>import('../src/'+name+'.js');
++const [{installStyles,getStyleRevision},{installSelectors},{installDialogs,isPopoverOpen,getDialogStateRevision},{installGeometry},{installMedia},{installLayout},{installCheckVisibility}]=await Promise.all(['styles','selectors','dialogs','geometry','media','layout','check-visibility'].map(load));
++function fixture(t,html='<body></body>'){
++ const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});
++ const dom=new JSDOM('<!doctype html>'+html,{url:'https://example.test/one',runScripts:'dangerously',beforeParse(w){installSelectors(page,w,{isPopoverOpen,getStateRevision:getDialogStateRevision});installStyles(page,w);installDialogs(page,w);installGeometry(w);installMedia(page,w);installLayout(page,w);installCheckVisibility(page,w);}});
++ t.after(()=>{page.documentAbort.abort();dom.window.close()});return{page,w:dom.window,d:dom.window.document};
++}
++test('native computed matrix arithmetic and font bases use actual declarations, not public constructor hooks',t=>{
++ const {w,d}=fixture(t,'<body><section style="font-size:20px"><div style="transform:translateX(10px) scale(2);font-size:1.5em"></div></section>');const e=d.querySelector('div'),c=w.getComputedStyle(e);w.DOMMatrix=class{constructor(){throw Error('authored constructor')}};
++ assert.equal(c.transform,'matrix(2, 0, 0, 2, 10, 0)');assert.equal(c.fontSize,'30px');e.style.transform='rotate(45deg)';assert.equal(c.transform,'matrix(0.707107, 0.707107, -0.707107, 0.707107, 0, 0)');e.style.transform='translateX(50%)';assert.equal(c.transform,'matrix(1, 0, 0, 1, 50, 0)');e.style.fontSize='2rem';assert.equal(c.fontSize,'32px');d.documentElement.style.fontSize='20px';assert.equal(c.fontSize,'40px');
++});
++test('declared variable token streams, inherited aliases and cycles remain raw native values',t=>{
++ const {w,d}=fixture(t,'<body><div style="--base:4px;--alias:var(--base);--cycle:var(--cycle, 7px)"><span style="--base:9px;width:var(--alias)"></span></div>');const c=w.getComputedStyle(d.querySelector('span'));assert.equal(c.getPropertyValue('--alias'),'var(--base)');assert.equal(c.getPropertyValue('--base'),'9px');assert.equal(c.getPropertyValue('--cycle'),'var(--cycle, 7px)');assert.equal(c.width,'var(--alias)');
++});
++test('axis declarations expand real indexed longhands, preserve importance and commit one mutation',t=>{
++ const {w,d}=fixture(t),e=d.createElement('div'),s=e.style,observer=new w.MutationObserver(()=>{});observer.observe(e,{attributes:true,attributeOldValue:true});s.setProperty('OVERFLOW','hidden scroll','important');assert.equal(observer.takeRecords().length,1);assert.equal(s.length,2);assert.deepEqual([...s],['overflow-x','overflow-y']);assert.equal(s.cssText,'overflow: hidden scroll !important;');s.overflowY='auto';assert.equal(observer.takeRecords().length,1);assert.equal(s.overflow,'');assert.equal(s.cssText,'overflow-x: hidden !important; overflow-y: auto;');s.removeProperty('Overflow');assert.equal(s.length,0);s.overscrollBehavior='contain auto';s.overscrollBehaviorY='contain';assert.equal(s.cssText,'overscroll-behavior: contain;');s.setProperty('background-color','blue','important');assert.equal(s.getPropertyValue('BACKGROUND-COLOR'),'blue');assert.equal(s.getPropertyPriority('Background-Color'),'important');observer.disconnect();
++});
++test('float null removal and independent prefixed border radius retain actual style state',t=>{
++ const{d}=fixture(t),s=d.createElement('div').style;s.cssFloat='right';s.cssFloat=undefined;assert.equal(s.cssFloat,'undefined');s.cssFloat=null;assert.equal(s.cssText,'');s.webkitBorderRadius='5px';assert.equal(s.borderRadius,'');assert.equal(s.getPropertyValue('-webkit-border-radius'),'5px');assert.equal(s.cssText,'-webkit-border-radius: 5px;');
++});
++test('computed style and canonical pseudo views retain identity and remain live readonly views',t=>{
++ const{w,d}=fixture(t,'<body><div></div>');const e=d.querySelector('div'),c=w.getComputedStyle(e),p=w.getComputedStyle(e,':before');assert.equal(c,w.getComputedStyle(e));assert.equal(p,w.getComputedStyle(e,'::BEFORE'));assert.notEqual(c,p);assert.equal(c,w.getComputedStyle(e,'before'));assert.throws(()=>c.setProperty('width','3px'),{name:'NoModificationAllowedError'});e.style.width='23px';assert.equal(c.width,'23px');assert.equal(c.borderTopWidth,'0px');assert.equal(c.borderStyle,'none');assert.equal(c.flexBasis,'auto');
++});
++test('stylesheet root scope, nesting and owning sheet mutations affect genuine elements',t=>{
++ const{w,d}=fixture(t,'<head><style>:scope:not(html){visibility:hidden}.box{visibility:hidden;&.ready{visibility:visible}>span{display:none}@media screen{&.hidden{display:none}}}</style></head><body><div class="box ready"><span></span></div>');const e=d.querySelector('div'),sheet=d.styleSheets[0];assert.equal(w.getComputedStyle(d.body).visibility,'visible');assert.equal(w.getComputedStyle(e).visibility,'visible');assert.equal(e.firstChild.checkVisibility(),false);assert.equal(sheet.cssRules[1].cssRules.length,3);assert.equal(sheet.cssRules[1].cssRules[2].type,4);assert.equal(Object.getPrototypeOf(sheet),w.CSSStyleSheet.prototype);const identity=sheet.cssRules;sheet.replaceSync('.box{&.ready{display:none}}');assert.equal(sheet.cssRules,identity);assert.equal(e.checkVisibility(),false);
++});
++test('cascade layers preserve declaration order, nested ranks, importance and measured grouping cap',t=>{
++ const{w,d}=fixture(t,'<head><style>@layer a,b;@layer b{.x{display:block}}@layer a{#x{display:none}}@layer a{#x{visibility:hidden!important}}.x{visibility:visible!important}</style></head><body><div id="x" class="x"></div>');const e=d.querySelector('div'),c=w.getComputedStyle(e);assert.equal(c.display,'block');assert.equal(c.visibility,'hidden');const sheet=d.styleSheets[0];for(const depth of[32,33]){sheet.replaceSync('@layer a{'.repeat(depth)+'.x{display:none}'+'}'.repeat(depth));assert.equal(c.display,depth===32?'none':'block');}
++});
++test('form, character, custom element, target and private popover changes invalidate retained styles',t=>{
++ const{w,d}=fixture(t,'<head><style>input:indeterminate+span,.badge:empty,x-unit:not(:defined),#anchor:target+span{display:none}</style></head><body><input type="checkbox"><span></span><b class="badge">x</b><x-unit></x-unit><div id="anchor"></div><span id="target"></span><div popover></div>');const input=d.querySelector('input'),panel=input.nextElementSibling,c=w.getComputedStyle(panel);assert.equal(c.display,'inline');input.indeterminate=true;assert.equal(c.display,'none');input.indeterminate=false;assert.equal(c.display,'inline');const b=d.querySelector('b');b.firstChild.data='';assert.equal(b.matches(':empty'),true);assert.equal(b.checkVisibility(),false);b.firstChild.appendData('x');assert.equal(b.checkVisibility(),true);const unit=d.querySelector('x-unit');assert.equal(unit.checkVisibility(),false);w.customElements.define('x-unit',class extends w.HTMLElement{});assert.equal(unit.checkVisibility(),true);w.location.hash='anchor';assert.equal(d.getElementById('target').checkVisibility(),false);const pop=d.querySelector('[popover]');const revision=getStyleRevision(w);assert.equal(pop.checkVisibility(),false);pop.showPopover();assert.equal(pop.checkVisibility(),true);assert.ok(getStyleRevision(w)>revision);pop.hidePopover();assert.equal(pop.checkVisibility(),false);
++});
++test('flat tree geometry follows actual private slot assignment and fallback state',t=>{
++ const{d}=fixture(t),h=d.createElement('div'),a=d.createElement('span');h.append(a);d.body.append(h);assert.ok(a.offsetWidth>0);const r=h.attachShadow({mode:'closed'});assert.equal(a.offsetWidth,0);const slot=d.createElement('slot'),fallback=d.createElement('i');slot.append(fallback);r.append(slot);assert.ok(a.offsetWidth>0);assert.equal(fallback.offsetWidth,0);a.remove();assert.ok(fallback.offsetWidth>0);
++});
++test('media lists are branded targets with genuine viewport changes, event order and cleanup',async t=>{
++ const{page,w}=fixture(t),m=w.matchMedia('(max-width:1000px)'),events=[];assert.equal(m instanceof w.EventTarget,true);assert.equal(Object.prototype.toString.call(m),'[object MediaQueryList]');assert.throws(()=>new w.MediaQueryList(),{name:'TypeError'});assert.equal(m.matches,false);m.addListener(e=>events.push([e.matches,e.media,e.isTrusted]));page.layout.setViewport({width:800,height:600});assert.equal(m.matches,true);assert.equal(w.screen.width,800);await new Promise(r=>w.setTimeout(r,10));assert.deepEqual(events,[[true,'(max-width:1000px)',true]]);assert.equal(w.matchMedia('not unknown').matches,false);assert.equal(w.matchMedia('not (unknown:x)').matches,true);assert.equal(w.matchMedia('(width:50em)').matches,true);page.layout.setViewport({width:900});assert.equal(events.length,1);page.documentAbort.abort();page.layout.setViewport({width:1200});await new Promise(r=>setTimeout(r,10));assert.equal(events.length,1);
++});

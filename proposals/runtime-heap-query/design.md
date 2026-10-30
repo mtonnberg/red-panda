@@ -1,3 +1,7 @@
+> Historical source-only design. The later isolated implementation, executed controls,
+> discarded-guard evidence and remaining parity gaps are in
+> [implementation/README.md](implementation/README.md). Production enablement remains separate.
+
 # Direct heap-query binding: integration design, not enabled
 
 Production Runtime.queryObjects is still unsupported. This document proposes a
@@ -6,6 +10,11 @@ loader, build command or default test glob is changed here. Root's later validat
 passed 586 JavaScript tests, 50 PureScript tests, 13 reference groups and the frozen
 41-fixture cohort. This proposal remains source-only; future runtime/build work
 requires a separately scheduled isolated diagnostic stage.
+
+The concrete selected-realm anchor, factory-owned DOM wrapper canonicalization,
+nontruncating bound/cleanup plan and pending oracle matrix are specified in
+[canonicalization.md](canonicalization.md). This remains source-only while root
+integrates the separately reviewed runtime checkpoint/task entry binding.
 
 ## Evidence and its limits
 

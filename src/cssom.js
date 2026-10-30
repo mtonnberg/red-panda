@@ -179,6 +179,34 @@ function change(style, callback, { explicit = false } = {}) {
   }
 }
 
+const AXES = new Map([['overflow',new Set(['auto','scroll','hidden','clip','visible','overlay'])],['overscroll-behavior',new Set(['auto','contain','none'])]]);
+const CSS_WIDE = new Set(['inherit','initial','unset','revert','revert-layer']);
+const canonicalProperty = property => { property=String(property);return property.startsWith('--')?property:property.toLowerCase(); };
+function axisValue(style,name) {
+  const x=BASE.getPropertyValue.call(style,name+'-x'), y=BASE.getPropertyValue.call(style,name+'-y');
+  if(!x||!y||BASE.getPropertyPriority.call(style,name+'-x')!==BASE.getPropertyPriority.call(style,name+'-y'))return '';
+  return x===y?x:x+' '+y;
+}
+function axisSet(style,name,value,priority='') {
+  if(value===''){BASE.removeProperty.call(style,name+'-x');BASE.removeProperty.call(style,name+'-y');return;}
+  const parts=value.toLowerCase().trim().split(/\s+/), allowed=AXES.get(name);
+  if(parts.length>2||parts.some(part=>!allowed.has(part)&&!CSS_WIDE.has(part)&&!/^var\([^\s()]*\)$/.test(part))||parts.length===2&&parts.some(part=>CSS_WIDE.has(part)))return;
+  style._setProperty(name+'-x',parts[0],priority);style._setProperty(name+'-y',parts[1]??parts[0],priority);
+  // _setProperty deliberately stores empty priority too: property assignment clears importance.
+  for(const axis of ['x','y']){if(priority)style._priorities.set(name+'-'+axis,priority);else style._priorities.delete(name+'-'+axis);}
+}
+function serializedDeclaration(style) {
+  if(style._computed)return '';
+  const output=[],done=new Set();
+  for(let i=0;i<style.length;i++) {
+    let name=style[i];if(done.has(name))continue;
+    const base=name.replace(/-[xy]$/,'');
+    if(AXES.has(base)&&axisValue(style,base)){done.add(base+'-x');done.add(base+'-y');name=base;}
+    const value=style.getPropertyValue(name),priority=style.getPropertyPriority(name);
+    output.push(`${name}: ${value}${priority?' !'+priority:''};`);
+  }
+  return output.join(' ');
+}
 const COMPAT = Object.create(BASE);
 for(const [name,descriptor] of Object.entries(Object.getOwnPropertyDescriptors(BASE))) {
   if(!descriptor.set || ['cssText','length'].includes(name))continue;
@@ -199,7 +227,7 @@ Object.defineProperties(COMPAT, {
     if(typeof value==='string')MUTATIONS.set(this,(MUTATIONS.get(this)??0)+1);
     return BASE._setProperty.call(this,property,value,priority);
   }},
-  cssText:{configurable:true,enumerable:true,get:Object.getOwnPropertyDescriptor(BASE,'cssText').get,set(value){
+  cssText:{configurable:true,enumerable:true,get(){return serializedDeclaration(this);},set(value){
     change(this,()=>{
       this.length=0;this._values.clear();this._priorities.clear();
       for(const item of parseDeclarations(value??'')) {
@@ -208,16 +236,20 @@ Object.defineProperties(COMPAT, {
       }
     },{explicit:true});
   }},
+  getPropertyValue:{configurable:true,writable:true,value(property){property=canonicalProperty(property);return AXES.has(property)?axisValue(this,property):BASE.getPropertyValue.call(this,property);}},
+  getPropertyPriority:{configurable:true,writable:true,value(property){property=canonicalProperty(property);return AXES.has(property)?(axisValue(this,property)?BASE.getPropertyPriority.call(this,property+'-x'):''):BASE.getPropertyPriority.call(this,property);}},
   removeProperty:{configurable:true,writable:true,value(property){
-    property=String(property);if(!property.startsWith('--'))property=property.toLowerCase();
-    return change(this,()=>BASE.removeProperty.call(this,property));
+    property=canonicalProperty(property);
+    return change(this,()=>{const previous=this.getPropertyValue(property);if(AXES.has(property)){BASE.removeProperty.call(this,property+'-x');BASE.removeProperty.call(this,property+'-y');return previous;}return BASE.removeProperty.call(this,property);});
   }},
   setProperty:{configurable:true,writable:true,value(property,value,priority=''){
-    property=String(property);priority=priority==null?'':String(priority);
+    property=canonicalProperty(property);priority=priority==null?'':String(priority);
     if(value != null && String(value) !== '' && priority && !/^important$/i.test(priority))return;
     return change(this,()=>{
       const normalized=normalizeCSSValue(property.startsWith('--')?property:property.toLowerCase(),value==null?'':String(value));
       const before=MUTATIONS.get(this), previousPriority=this.getPropertyPriority(property);
+      if(AXES.has(property)){axisSet(this,property,normalized,priority.toLowerCase());return;}
+      if(property==='-webkit-border-radius'){if(normalized==='')this.removeProperty(property);else this._setProperty(property,normalized,priority.toLowerCase());return;}
       if (property.toLowerCase() === 'opacity' && normalized !== '') this._setProperty('opacity', normalized, priority.toLowerCase());
       else BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
       if(MUTATIONS.get(this)===before && normalized!=='') {
@@ -230,6 +262,17 @@ Object.defineProperties(COMPAT, {
   }},
   [Symbol.iterator]:{configurable:true,value:function*(){for(let i=0;i<this.length;i++)yield this[i];}},
 });
+
+for(const [name,allowed] of AXES) {
+  for(const spelling of [name]) {
+    Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue(name);},set(value){return change(this,()=>axisSet(this,name,value==null?'':String(value)));}});
+  }
+  const camel=name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
+  Object.defineProperty(COMPAT,camel,{configurable:true,enumerable:true,get(){return this.getPropertyValue(name);},set(value){return change(this,()=>axisSet(this,name,value==null?'':String(value)));}});
+  for(const axis of ['x','y'])for(const spelling of [name+'-'+axis,camel+axis.toUpperCase()])Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue(name+'-'+axis);},set(value){return change(this,()=>{const input=value==null?'':String(value).toLowerCase().trim(),property=name+'-'+axis;if(input==='')BASE.removeProperty.call(this,property);else if(allowed.has(input)||CSS_WIDE.has(input)) {this._setProperty(property,input);this._priorities.delete(property);}});}});
+}
+for(const spelling of ['cssFloat','float'])Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue('float');},set(value){return change(this,()=>{if(value===null||value==='')BASE.removeProperty.call(this,'float');else {this._setProperty('float',String(value));this._priorities.delete('float');}});}});
+for(const spelling of ['-webkit-border-radius','webkitBorderRadius','WebkitBorderRadius'])Object.defineProperty(COMPAT,spelling,{configurable:true,enumerable:true,get(){return this.getPropertyValue('-webkit-border-radius');},set(value){this.setProperty('-webkit-border-radius',value);}});
 
 export function enhanceDeclaration(style, window) {
   if(!DECLARATIONS.has(style)) {Object.setPrototypeOf(style,COMPAT);DECLARATIONS.add(style);}
@@ -273,15 +316,23 @@ function parseRuleBlocks(text) {
   return result;
 }
 
-export function parseStyleSheet(text,{window,onUnsupported}={}) {
+const NESTED_GROUPS=new WeakMap();
+export const nestedGroupContents=rule=>NESTED_GROUPS.get(rule);
+
+export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
   const sheet=new cssom.CSSStyleSheet();const rules=[];
   for(const entry of parseRuleBlocks(text)) {
     const {prelude,body}=entry;let rule;
     if(!prelude.startsWith('@') && body!==null) {
-      rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=new CSSRuleList();
+      rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules;
     } else if(/^@(?:-webkit-)?keyframes\s+/i.test(prelude) && body!==null) {
       rule=new cssom.CSSKeyframesRule();rule.name=prelude.replace(/^@(?:-webkit-)?keyframes\s+/i,'');if(/^@-webkit-/i.test(prelude))rule._vendorPrefix='-webkit-';
       rule.cssRules=new CSSRuleList(parseRuleBlocks(body).filter(item=>item.body!==null).map(item=>{const frame=new cssom.CSSKeyframeRule();frame.keyText=item.prelude;frame.style=createDeclaration(item.body,{window});return frame;}));
+    } else if(nested && /^@media\b/i.test(prelude) && body!==null) {
+      rule=new cssom.CSSRule();rule.type=4;
+      const media=prelude.replace(/^@media\s*/i,'');
+      NESTED_GROUPS.set(rule,{kind:'media',media,style:createDeclaration(body,{nesting:true,window}),rules:parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules});
+      Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
     } else if(/^@(?:media|supports)\b/i.test(prelude) && body!==null) {
       if(/^@media\b/i.test(prelude)){rule=new cssom.CSSMediaRule();rule.media.mediaText=prelude.replace(/^@media\s*/i,'');}
       else{rule=new cssom.CSSSupportsRule();rule.conditionText=prelude.replace(/^@supports\s*/i,'');}
@@ -291,6 +342,10 @@ export function parseStyleSheet(text,{window,onUnsupported}={}) {
       // Descriptor grammars differ from ordinary element properties. Keep the
       // parser's declaration boundaries, including src and font descriptors.
       for(const item of parseDeclarations(body))if(!rule.style.getPropertyValue(item.property))rule.style._setProperty(item.property,item.value,item.priority);
+    } else if(/^@layer(?:\s|$)/i.test(prelude)) {
+      rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+      const names=prelude.replace(/^@layer\s*/i,'').trim();
+      NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
     } else if(/^@import\b/i.test(prelude)&&body===null) {
       try{rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
     } else if(prelude.startsWith('@')) {
@@ -298,7 +353,7 @@ export function parseStyleSheet(text,{window,onUnsupported}={}) {
     }
     if(!rule)continue;
     if(rule.style){Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});}
-    if(rule.type===1)Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,get(){return `${this.selectorText} {${this.style.length?` ${this.style.cssText} `:' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}});
+    if(rule.type===1)Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}});
     rules.push(rule);
   }
   sheet.cssRules=new CSSRuleList(rules);return sheet;

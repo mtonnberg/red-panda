@@ -1,3 +1,4 @@
+import {refreshMediaQueries} from './media.js';
 // Independent surrogate geometry for a headless DOM. This intentionally models
 // the reference's measured simple boxes; it is not a CSS layout renderer.
 import { getStyleRevision } from './styles.js';
@@ -59,10 +60,13 @@ export function createLayout(window, options = {}) {
     };
     function isHidden(node) {
       if (hidden.has(node)) return hidden.get(node);
-      const parent = node.parentNode ?? node.host;
-      const ancestorHidden = parent && hidden.get(parent);
-      const ownHidden = node.nodeType === 1 && (hiddenTags.has(node.localName) || node.hidden || style(node).display === 'none');
-      const result = Boolean(ancestorHidden || ownHidden);
+      const implementation=implForWrapper(node),ordinaryParent=node.parentNode;
+      const assigned=implementation?._assignedSlot;
+      const parent=assigned?wrapperForImpl(assigned):ordinaryParent??node.host;
+      const outsideFlatTree=ordinaryParent?.nodeType===1&&!assigned&&(implForWrapper(ordinaryParent)._shadowRoot||(ordinaryParent.localName==='slot'&&implForWrapper(ordinaryParent)._assignedNodes?.length));
+      const ancestorHidden = parent && isHidden(parent);
+      const ownHidden = node.nodeType === 1 && (hiddenTags.has(node.localName) || style(node).display === 'none');
+      const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
       hidden.set(node, result); return result;
     }
     function size(node) {
@@ -196,7 +200,7 @@ export function createLayout(window, options = {}) {
     setViewport(viewport) {
       const nextWidth = optionDimension(viewport.width ?? width, 'Viewport width');
       const nextHeight = optionDimension(viewport.height ?? height, 'Viewport height');
-      width = nextWidth; height = nextHeight; scrollTo(scrollX, scrollY);
+      width = nextWidth; height = nextHeight; scrollTo(scrollX, scrollY); refreshMediaQueries(window);
     },
     // Used by the window adapter without recursively reading its own overrides.
     rawComputedStyle,
@@ -235,15 +239,18 @@ export function installLayout(page, window, options = {}) {
   window.scrollBy = (x, y) => layout.scrollBy(...(typeof x === 'object' && x !== null ? [x.left ?? 0, x.top ?? 0] : [x, y]));
   define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { layout.scrollIntoView(this); } });
   define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { layout.scrollIntoView(this); } });
+  const computedViews = new WeakMap();
   window.getComputedStyle = (node, pseudoElement) => {
     const original = layout.rawComputedStyle(node, pseudoElement);
+    if (computedViews.has(original)) return computedViews.get(original);
     const computed = name => {
       if (name === 'width' || name === 'height') {
+        const specified = original.getPropertyValue(name); if (/var\(/.test(specified)) return specified;
         return layout.rects(node).length ? `${layout.rect(node)[name]}px` : 'auto';
       }
       return original.getPropertyValue(name);
     };
-    return new Proxy(original, {
+    const view = new Proxy(original, {
       get(target, property) {
         if (property === 'width' || property === 'height') return computed(property);
         if (property === 'getPropertyValue') return name => computed(name);
@@ -251,6 +258,7 @@ export function installLayout(page, window, options = {}) {
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
+    computedViews.set(original,view); return view;
   };
   page.layout = layout;
   return layout;

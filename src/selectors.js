@@ -134,6 +134,8 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
       if(name!=='is'&&name!=='where')fail(window,'Selector function cannot be empty');
       compiled+=emitPredicate({kind:'never'});effective+=`:${name}()`;
      }else{const nested=list(arg,name,name==='has');compiled+=`:${name}(${nested.compiled})`;effective+=`:${name}(${nested.effective})`;}
+    }else if(name==='empty'){
+     if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'empty'});effective+=value.slice(i,end);
     }else if(name==='modal'||name==='popover-open'||name==='popover'){
      if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:name==='modal'?'modal':'popover'});effective+=value.slice(i,end);
     }else{
@@ -162,6 +164,7 @@ export function selectorForSpecificity(source) { try{return parseSelector(source
 
 function predicate(record,element,item) {
  if(item.kind==='never')return false;
+ if(item.kind==='empty'){for(const child of element.childNodes)if(child.nodeType===1||child.nodeType===3&&child.data.length)return false;return true;}
  // Native parses :modal but its observed public predicate stays false.
  if(item.kind==='modal')return record.providers.matchesModal?.(element)===true;
  if(item.kind==='popover')return record.providers.isPopoverOpen?.(element)===true;
@@ -239,4 +242,11 @@ export function getSelectorStateRevision(window) {
  const revision=record.providers.getStateRevision(window);
  if(!Number.isSafeInteger(revision)||revision<0)throw new TypeError('Selector state revision must be a nonnegative safe integer');
  return revision;
+}
+
+// Host stylesheet matching has the document root as its scoping root.
+export function matchesInScope(element,selector,scope=element.ownerDocument.documentElement) {
+ const record=RECORDS.get(implForWrapper(element.ownerDocument));
+ if(!record)return element.matches(selector);
+ try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}
 }
