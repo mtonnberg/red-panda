@@ -32,6 +32,8 @@ class Session {
     this.id = id;
     this.domains = new Set();
     this.objects = new Map();
+    this.streams = new Map();
+    this.nextStreamId = 1;
     this.worlds = new Map();
     this.frameWorlds = new Map();
     this.nodeContexts = new Map();
@@ -216,18 +218,19 @@ class Session {
   remote(value, byValue = false, group, contextId = this.valueContext(value)) {
     if (value === undefined) return { type: 'undefined' };
     if (value === null) return { type: 'object', subtype: 'null', value: null };
-    const type = typeof value;
+    const htmlDDA = typeof value === 'undefined'; // Actual undefined returned above; this is [[IsHTMLDDA]].
+    const type = htmlDDA ? 'function' : typeof value;
     if (type === 'number' && (!Number.isFinite(value) || Object.is(value, -0))) return { type, unserializableValue: Object.is(value, -0) ? '-0' : String(value), description: String(value) };
     if (type === 'bigint') return { type, unserializableValue: `${value}n`, description: `${value}n` };
     if (['string', 'number', 'boolean'].includes(type)) return { type, value };
     if (type === 'symbol') return { type, description: String(value) };
-    if (byValue) return { type, value: JSON.parse(JSON.stringify(value)) };
+    if (byValue) return { type, value: type === 'function' ? {} : JSON.parse(JSON.stringify(value)) };
     const objectId = randomUUID();
     const page = this.executionPage(contextId);
     this.objects.set(objectId, { value, group, contextId });
-    const subtype = value.nodeType ? 'node' : Array.isArray(value) ? 'array' : value instanceof page.dom.window.Promise ? 'promise' : undefined;
+    const subtype = !htmlDDA && value.nodeType ? 'node' : Array.isArray(value) ? 'array' : value instanceof page.dom.window.Promise ? 'promise' : undefined;
     return { type, ...(subtype ? { subtype } : {}), className: value.constructor?.name ?? 'Object',
-      description: value.nodeName ?? value.constructor?.name ?? type, objectId };
+      description: htmlDDA ? 'function () { [native code] }' : value.nodeName ?? value.constructor?.name ?? type, objectId };
   }
   object(id) {
     if (!this.objects.has(id)) throw new ProtocolError('Cannot find object with given id');
@@ -383,6 +386,47 @@ class Session {
       }
       case 'Network.setExtraHTTPHeaders': page.setExtraHTTPHeaders(params.headers); return {};
       case 'Network.setUserAgentOverride': page.setUserAgentOverride(params); return {};
+      case 'Page.captureScreenshot': {
+        if (params.format !== undefined && params.format !== 'png') throw new ProtocolError('unsupported screenshot format.', -32000);
+        const { width, height } = page.layout.viewport;
+        let rendered;
+        try { rendered = await page.render('png', { width, height, fullPage: params.captureBeyondViewport ?? false, clip: params.clip }); }
+        catch (error) { throw new ProtocolError(error.code === 'RENDER_SCREENSHOT_OPTIONS' ? 'InvalidScreenshotOptions' : error.message, error.code === 'RENDER_SCREENSHOT_OPTIONS' ? -31998 : -32000); }
+        return { data: rendered.bytes.toString('base64') };
+      }
+      case 'Page.printToPDF': {
+        if (params.transferMode !== undefined && !['ReturnAsBase64', 'ReturnAsStream'].includes(params.transferMode)) throw new ProtocolError('Invalid transferMode');
+        for (const name of ['paperWidth', 'paperHeight', 'marginTop', 'marginBottom', 'marginLeft', 'marginRight', 'scale']) {
+          if (params[name] !== undefined && (!Number.isFinite(params[name]) || params[name] < 0)) throw new ProtocolError('invalid print parameters');
+        }
+        if (params.scale !== undefined && (params.scale < .1 || params.scale > 2) || params.paperWidth === 0 || params.paperHeight === 0) throw new ProtocolError('invalid print parameters');
+        // The measured native renderer ignores header/footer templates.
+        let rendered;
+        try { rendered = await page.render('pdf', { paperWidth: (params.paperWidth ?? 8.5) * 72,
+          paperHeight: (params.paperHeight ?? 11) * 72, landscape: params.landscape ?? false,
+          PDFscale: params.scale ?? 1, pageRanges: params.pageRanges ?? '',
+          marginTop: (params.marginTop ?? .4) * 72, marginBottom: (params.marginBottom ?? .4) * 72,
+          marginLeft: (params.marginLeft ?? .4) * 72, marginRight: (params.marginRight ?? .4) * 72 }); }
+        catch (error) { throw new ProtocolError(error.message, error.code === 'RENDER_BOUNDS' ? -32602 : -32000); }
+        if (params.transferMode === 'ReturnAsStream') {
+          const handle = String(this.nextStreamId++); this.streams.set(handle, { bytes: rendered.bytes, offset: 0 });
+          return { data: '', stream: handle };
+        }
+        return { data: rendered.bytes.toString('base64') };
+      }
+      case 'IO.read': {
+        const stream = this.streams.get(params.handle);
+        if (!stream) throw new ProtocolError('Invalid stream handle', -32000);
+        for (const key of ['offset', 'size']) if (params[key] !== undefined && (!Number.isSafeInteger(params[key]) || params[key] < (key === 'size' ? 1 : 0))) throw new ProtocolError(`Invalid ${key}`);
+        const offset = params.offset ?? stream.offset, size = params.size ?? 65536;
+        const end = Math.min(stream.bytes.length, offset + size);
+        const data = stream.bytes.subarray(offset, end); stream.offset = end;
+        return { base64Encoded: true, data: data.toString('base64'), eof: end >= stream.bytes.length };
+      }
+      case 'IO.close': {
+        if (!this.streams.delete(params.handle)) throw new ProtocolError('Invalid stream handle', -32000);
+        return {};
+      }
       case 'LP.dump': {
         const format = params.format ?? 'html';
         if (params.strip !== undefined && (!params.strip || typeof params.strip !== 'object' || Array.isArray(params.strip))) throw new ProtocolError('strip must be an object');
@@ -390,6 +434,10 @@ class Session {
         const rootNode = params.backendNodeId === undefined ? undefined : this.nodes?.get(params.backendNodeId);
         if (params.backendNodeId !== undefined && !rootNode) throw new ProtocolError('Unknown DOM node');
         try {
+          if (['png', 'pdf'].includes(format)) {
+            const rendered = await page.render(format, { selector: params.selector, node: rootNode, stripModes });
+            return { format, content: rendered.bytes.toString('base64') };
+          }
           return { format, content: page.dump(format, { selector: params.selector, rootNode, maxBytes: params.maxBytes,
             stripModes, nodeIdFor: node => this.backendId(node) }) };
         } catch (error) { throw new ProtocolError(error.message, error.code === 'UnsupportedDumpFormat' ? -32601 : -32602); }
@@ -416,7 +464,7 @@ class Session {
     resetDOM(this);
     resetRuntime(this);
     for (const [event, callback] of this.listeners) this.page.off(event, callback);
-    this.objects.clear(); this.nodes?.clear();
+    this.objects.clear(); this.nodes?.clear(); this.streams.clear();
     for (const id of this.scripts.keys()) this.page.newDocumentScripts.delete(id);
   }
 }

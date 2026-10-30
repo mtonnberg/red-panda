@@ -46,7 +46,7 @@ test('flattened sessions navigate, evaluate, retain handles, cookies, dump and d
     assert.match(dump.content, /external script ran/);
     assert.ok(client.events.some(event => event.method === 'Page.loadEventFired'));
     assert.ok(client.events.some(event => event.method === 'Network.responseReceived' && event.params.response.status === 200));
-    await assert.rejects(send('Page.captureScreenshot'), error => error.code === -32601);
+    await assert.rejects(send('Page.notImplemented'), error => error.code === -32601);
     const badUrl = await send('Page.navigate', { url: 'file:///etc/passwd' });
     assert.match(badUrl.errorText, /Unsupported URL/);
     await client.send('Target.disposeBrowserContext', { browserContextId: contextId }); contextId = undefined;
@@ -93,6 +93,28 @@ test('invalid header updates return errors without partially changing request co
       expression: "fetch('/header-api').then(r=>r.json()).then(data=>data['x-client'])", returnByValue: true, awaitPromise: true,
     });
     assert.equal(result.result.value, 'retained');
+  } finally { await client.send('Target.closeTarget', { targetId }); await client.close(); }
+});
+
+test('CDP navigator metadata updates remain live and reject malformed changes atomically', async () => {
+  const client = await connect(`ws://127.0.0.1:${service.port}/`);
+  const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+  try {
+    const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+    const send = (method, params) => client.send(method, params, sessionId);
+    await send('Page.navigate', { url: `${fixture.url}next` });
+    const defaults = await send('Runtime.evaluate', { expression: `fetch('/header-api').then(response=>response.json()).then(headers=>JSON.stringify({
+      language:navigator.language,languages:navigator.languages,own:Object.hasOwn(navigator,'languages'),header:headers['accept-language']}))`, returnByValue: true, awaitPromise: true });
+    assert.deepEqual(JSON.parse(defaults.result.value), { language: 'en-US', languages: ['en-US', 'en'], own: false, header: 'en-US,en;q=0.9' });
+    const metadata = { brands: [{ brand: 'Configured', version: '42' }], fullVersion: '42.1', platform: 'TestOS',
+      platformVersion: '2', architecture: 'arm', model: 'test', mobile: true, bitness: '64', wow64: false };
+    await send('Network.setUserAgentOverride', { userAgent: 'Configured/42', userAgentMetadata: metadata });
+    const result = await send('Runtime.evaluate', { expression: `navigator.userAgentData.getHighEntropyValues(['architecture']).then(value=>JSON.stringify({ua:navigator.userAgent,low:navigator.userAgentData.toJSON(),value}))`, returnByValue: true, awaitPromise: true });
+    const observed = JSON.parse(result.result.value);
+    assert.equal(observed.ua, 'Configured/42'); assert.equal(observed.low.platform, 'TestOS'); assert.deepEqual(observed.low.brands, metadata.brands);
+    assert.equal(observed.value.architecture, 'arm'); assert.equal(observed.value.bitness, '64');
+    await assert.rejects(send('Network.setUserAgentOverride', { userAgent: 'discarded', userAgentMetadata: { brands: [{ brand: 'Invalid', version: 42 }] } }), error => error.code === -32602);
+    const after = await send('Runtime.evaluate', { expression: 'navigator.userAgent', returnByValue: true }); assert.equal(after.result.value, 'Configured/42');
   } finally { await client.send('Target.closeTarget', { targetId }); await client.close(); }
 });
 

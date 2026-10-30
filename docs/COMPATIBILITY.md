@@ -247,10 +247,55 @@ proof of the launched engine's identity/version. With `--binary`, reports also
 bind the selected executable or launcher file's path and SHA-256. Imported
 modules/shared libraries are not included in that file hash.
 
-The current fixture server implements static files only, not upstream
-`test_routes.zig`'s stateful HTTP/WebSocket endpoints. Those routes must be ported
-before their dependent fixtures can be interpreted as engine conformance tests.
-No unavailable route or unobserved assertion is converted into a pass.
+The default fixture profile remains static files only. The independent test
+helper `scripts/upstream-fixture-server.mjs` exports
+`startFixtureServer(root, {port, profile})`. Its explicit `xhr-subset` profile
+implements selected observable endpoint contracts from the exact upstream
+`src/test_routes.zig`: XHR bodies/MIME/status/reason/duplicate headers, deliberate
+bad gzip, redirects, scoped cookies and header echo. It imports no engine code.
+`/__fixture_metadata` lists implemented routes, provenance and unsupported route
+groups; it explicitly reports `completeUpstreamServer:false`. Node HTTP automatic
+headers/framing are not byte-for-byte copies of the Zig server. Raw-wire, SSE,
+WebSocket, CORS-specific, compression, resource-timing and counter endpoints
+remain unsupported. Unknown routes return an explicit error, not an empty
+successful response. Five focused transport, safety and shutdown tests pass.
+
+Use `--fixture-profile xhr-subset` to select that owned server explicitly.
+Alternatively, `--fixture-origin http://127.0.0.1:9582` uses a caller-owned server
+and never stops it. Local `--root` is still required: externally served
+`testing.js` and selected HTML documents must match their local SHA-256 hashes.
+Transitive resources are not hash-verified. External request visibility is
+unknown, so reports retain `unavailableRoutes:null`, not a fabricated empty list.
+For an owned server, intentional implemented error statuses remain known routes;
+missing files and unknown endpoints are recorded separately. Neither missing
+routes nor unobserved assertions are converted into passes.
+
+The unchanged demo `runner/main.go -serve` is not a substitute for the browser
+fixture server: its `/xhr/get` and `/xhr/post` routes do not provide the browser
+fixtures' `/xhr` contract. The local `/usr/bin/go` executable is also a board
+game, not a Go compiler; no Go toolchain was installed for this test transport.
+
+```sh
+node scripts/conformance.mjs \
+  --root /tmp/red-panda-upstream-reference/browser-948d77378/src/browser/tests \
+  --binary /workspace/shared/lightpanda-reference/lightpanda-x86_64-linux \
+  --test worker/worker.html --isolate --fixture-profile xhr-subset \
+  --browser-arg=--load-resources --browser-arg=iframe \
+  --browser-arg=--load-resources --browser-arg=worker --timeout 10000 \
+  --report /tmp/native-worker-new.json
+```
+
+With the correct `/xhr` route, the unchanged `worker/worker.html` passes the
+verified native binary (177 ms). The candidate snapshot fails (347 ms) with
+`MessageChannel is not defined`; additional captured exceptions identify missing
+`URL.createObjectURL`. Both execute the native harness branch with identical
+resource flags. This is a real candidate gap rather than the earlier static
+server's missing-route failure. Reports are
+`/tmp/red-panda-native-worker-xhr-profile-v1.json` and
+`/tmp/red-panda-candidate-worker-xhr-profile-v1.json`. A separate native run using
+`--fixture-origin` also passes and verifies that the caller-owned fixture server
+remains running after the runner exits; its request visibility stays unknown in
+`/tmp/red-panda-native-worker-external-origin-v1.json`.
 
 ## Next test groups
 
@@ -387,13 +432,13 @@ must not be interpreted as their current full-suite result.
 
 The subsequent expanded checkpoint is retained in
 [conformance-expanded-checkpoint.json](reference/conformance-expanded-checkpoint.json):
-12/18 candidate fixtures passed, compared with17/18 native controls. This is a
-different selection with explicit iframe/worker loading and a5,000ms budget.
+12/18 candidate fixtures passed, compared with 17/18 native controls. This is a
+different selection with explicit iframe/worker loading and a 5,000 ms budget.
 The native worker fixture also needs a dynamic `/xhr` route absent from the
 static server; its failure cannot establish an engine incompatibility.
 
-The latest implemented checkpoint passes299 JavaScript tests and47 PureScript
-Puppeteer assertions, plus13 differential scenarios and a strict PureScript
+The `9b2d613` checkpoint passes 299 JavaScript tests and 47 PureScript
+Puppeteer assertions, plus 13 differential scenarios and a strict PureScript
 build. It adds browser-facing Fetch wrappers/CORS, real frame realm dispatch and
 lifecycles, declarative/serializable/clonable shadow roots and manual slots,
 native-shaped dump formats/flags, and the native CLI no-dump/5-second defaults.
@@ -401,8 +446,34 @@ Both unchanged upstream shadow serialization/declarative fixtures pass on
 candidate and native, recorded in
 [conformance-shadow-checkpoint.json](reference/conformance-shadow-checkpoint.json).
 
+Those results are historical. The current independent work adds an owned V8
+binding for genuine HTMLDDA collections, constructed/adopted stylesheets,
+transferable MessagePorts, Blob URLs and worker scripts, geometry constructors,
+navigator/font metadata, author Markdown alternates, and real PNG/PDF text
+rendering. Rendering includes CDP screenshots, streamed PDFs and MCP screenshots;
+it uses pinned Pillow/ReportLab/fonttools dependencies and fixed DejaVu fonts.
+The [render contract](reference/render-contract.md) records measured native
+behavior and remaining pixel/font/page-break differences. No upstream production
+engine code is imported.
+
 These results remain bounded. Missing protocol methods, separate utility realms,
-full frame input/history/POST, constructed/adopted stylesheets, MessagePorts,
-network streaming/cache, many HTML/WebAPI contracts, rendering dumps and runtime
-isolation still prevent full replication. More recent work must be validated
-independently before updating the checkpoint figures.
+full frame input/history/POST, window message transfer, network streaming/cache,
+many HTML/WebAPI contracts, complete rendering behavior and runtime isolation
+still prevent full replication.
+
+The independent WebAPI/rendering checkpoint passes 427 JavaScript tests and 49
+PureScript Puppeteer assertions, including actual PNG/PDF transport checks, plus
+the strict/pedantic PureScript build and 13 native/candidate differential groups.
+The development server was restarted and its health endpoint and PureScript
+example were exercised with the updated runtime.
+
+The separate unchanged-fixture cohort is retained in
+[conformance-webapi-checkpoint.json](reference/conformance-webapi-checkpoint.json).
+It records 43 source/native/package hashes, including the exact Node 24.22.1
+collection binding and Python backend. Native passed 11/11; the frozen candidate
+passed 10/11. Classic/module workers, three collection fixtures, three geometry
+fixtures and both font fixtures pass. `css/stylesheet.html` still fails CSSOM
+iteration, parsing and serialization/normalization assertions. This bounded
+selection does not supersede the earlier 178-case cohort or establish full
+browser parity. Navigator metadata identifies Red Panda; native-function
+fingerprints and many remaining API contracts are not replicated.

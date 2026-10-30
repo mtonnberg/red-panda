@@ -127,7 +127,7 @@ class FramePage extends EventEmitter {
       if (!vm.isContext(global)) throw new Error('Frame does not have a JavaScript VM context');
       return global;
     }, serialize: () => window.document.documentElement?.outerHTML ?? '' };
-    for (const name of ['browser', 'context', 'userAgent', 'acceptLanguage', 'platform', 'timeout', 'javascript',
+    for (const name of ['browser', 'context', 'userAgent', 'acceptLanguage', 'platform', 'userAgentMetadata', 'timeout', 'javascript',
       'extraHTTPHeaders', 'activeRequests', 'lastActivity', 'newDocumentScripts']) {
       Object.defineProperty(this, name, { enumerable: true, get: () => registry.page[name] });
     }

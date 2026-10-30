@@ -15,9 +15,17 @@ import { dumpDocument } from './dump.js';
 import { installShadowDOM } from './shadow.js';
 import { installFrames } from './frames.js';
 import { installFetch } from './fetch.js';
+import { loadCollectionsBinding, installCollections } from './collections.js';
+import { installStyles } from './styles.js';
+import { installGeometry } from './geometry.js';
+import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
+import { renderDocument } from './render.js';
+import { installNavigator } from './navigator.js';
+import { installFonts } from './fonts.js';
 
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+let defaultCollectionsBinding;
 
 export const VERSION = '0.1.0';
 const now = () => performance.now() / 1000;
@@ -74,6 +82,7 @@ export class Browser extends EventEmitter {
   constructor(options = {}) {
     super();
     this.options = options;
+    this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
     this.pages = new Map();
     this.nextExecutionContext = 1;
@@ -112,7 +121,7 @@ export class Page extends EventEmitter {
     this.url = 'about:blank';
     this.mimeType = 'text/html';
     this.userAgent = browser.options.userAgent ?? `RedPanda/${VERSION}`;
-    this.acceptLanguage = 'en-US';
+    this.acceptLanguage = 'en-US,en;q=0.9';
     this.platform = 'Linux x86_64';
     this.extraHTTPHeaders = new Headers();
     this.timeout = browser.options.timeout ?? 10000;
@@ -154,25 +163,27 @@ export class Page extends EventEmitter {
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
     if (main) implForWrapper(window.document).contentType = this.mimeType;
+    installCollections(window, { binding: this.browser.collectionsBinding });
     installInput(window);
     installShadowDOM(this, window);
+    installBlobURLs(this, window);
+    installStyles(this, window);
     installIntersection(this, window, installLayout(this, window, this.viewport));
     window.AbortController = AbortController;
     window.AbortSignal = AbortSignal;
     window.TextEncoder = TextEncoder;
     window.TextDecoder = TextDecoder;
     window.structuredClone = structuredClone;
+    installNavigator(this, window);
+    installFonts(window);
     installFetch(this, window);
     if (main) this.installHistory(window, historyState);
     installNavigation(this, window);
     installForms(this, window);
     installModuleScripts(this, window);
     installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
+    installGeometry(window);
     installXHR(this, window);
-    Object.defineProperty(window.navigator, 'userAgent', { get: () => this.userAgent });
-    Object.defineProperty(window.navigator, 'language', { get: () => this.acceptLanguage.split(',')[0].split(';')[0].trim() });
-    Object.defineProperty(window.navigator, 'languages', { get: () => Object.freeze(this.acceptLanguage.split(',').map(value => value.split(';')[0].trim()).filter(Boolean)) });
-    Object.defineProperty(window.navigator, 'platform', { get: () => this.platform });
     if (main) this.frames = installFrames(this, window, {
       prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
     });
@@ -318,14 +329,23 @@ export class Page extends EventEmitter {
     this.extraHTTPHeaders = headers;
   }
 
-  setUserAgentOverride({ userAgent, acceptLanguage, platform }) {
+  setUserAgentOverride({ userAgent, acceptLanguage, platform, userAgentMetadata }) {
     if (typeof userAgent !== 'string' || (acceptLanguage !== undefined && typeof acceptLanguage !== 'string') ||
         (platform !== undefined && typeof platform !== 'string')) throw new Error('Invalid user agent override');
     // Validate HTTP values before changing any live state.
     new Headers({ 'user-agent': userAgent, ...(acceptLanguage !== undefined ? { 'accept-language': acceptLanguage } : {}) });
+    if (userAgentMetadata !== undefined) {
+      if (!userAgentMetadata || typeof userAgentMetadata !== 'object' || Array.isArray(userAgentMetadata)) throw new Error('Invalid user agent metadata');
+      for (const key of ['brands', 'fullVersionList']) if (userAgentMetadata[key] !== undefined &&
+        (!Array.isArray(userAgentMetadata[key]) || userAgentMetadata[key].some(value => !value || typeof value.brand !== 'string' || typeof value.version !== 'string'))) throw new Error('Invalid user agent metadata');
+      for (const key of ['mobile', 'wow64']) if (userAgentMetadata[key] !== undefined && typeof userAgentMetadata[key] !== 'boolean') throw new Error('Invalid user agent metadata');
+      for (const key of ['fullVersion', 'platform', 'platformVersion', 'architecture', 'model', 'bitness']) if (userAgentMetadata[key] !== undefined && typeof userAgentMetadata[key] !== 'string') throw new Error('Invalid user agent metadata');
+    }
+    const metadata = userAgentMetadata === undefined ? undefined : structuredClone(userAgentMetadata);
     this.userAgent = userAgent;
     if (acceptLanguage !== undefined) this.acceptLanguage = acceptLanguage;
     if (platform !== undefined) this.platform = platform;
+    if (metadata !== undefined) this.userAgentMetadata = metadata;
   }
 
   referrerFor(target, source = this.url) {
@@ -340,6 +360,29 @@ export class Page extends EventEmitter {
   async fetch(input, init = {}, type = 'Fetch') {
     const inputUrl = input instanceof Request ? input.url : String(input);
     let url = new URL(inputUrl, this.url).href;
+    if (new URL(url).protocol === 'blob:') {
+      const owner = init.frameId ? this.frames?.findFrame(init.frameId) : this;
+      if (!owner) throw new TypeError('Object URL frame is no longer available');
+      // Snapshot before any await: revocation affects future reads, not this one.
+      const snapshot = init.blobSnapshot ?? resolveBlobURL(owner, url);
+      const method = init.method ?? (input instanceof Request ? input.method : 'GET');
+      if (method.toUpperCase() !== 'GET') throw new TypeError('Object URL fetch supports GET only');
+      init.signal?.throwIfAborted();
+      const id = this.requestStarted(url, type, method, {}, undefined, init.frameId, init.loaderId);
+      try {
+        const response = new Response(snapshot.bytes, { status: 200, statusText: 'OK',
+          headers: snapshot.mimeType ? { 'content-type': snapshot.mimeType } : {},
+        });
+        for (const [key, value] of Object.entries({ url: snapshot.url, finalUrl: snapshot.url, requestId: id,
+          redirected: false, requestMethod: method, requestBody: undefined, requestHeaders: {},
+        })) Object.defineProperty(response, key, { value });
+        this.responseBodies ??= new Map();
+        if (this.responseBodies.size >= 100) this.responseBodies.delete(this.responseBodies.keys().next().value);
+        this.responseBodies.set(id, Buffer.from(snapshot.bytes).toString('utf8'));
+        this.requestFinished(id, snapshot.url, 200, snapshot.bytes.byteLength, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
+        return response;
+      } catch (error) { this.requestFailed(id, error); throw error; }
+    }
     if (!['http:', 'https:', 'data:'].includes(new URL(url).protocol)) {
       throw new Error('Only HTTP, HTTPS and data URLs are supported');
     }
@@ -564,6 +607,11 @@ export class Page extends EventEmitter {
     try {
       return this.evaluate(`(${declaration}\n).apply(globalThis[${JSON.stringify(key)}].thisArg, globalThis[${JSON.stringify(key)}].args)`);
     } finally { delete this.dom.window[key]; }
+  }
+  render(format = 'png', options = {}) {
+    if (this.closed) throw new Error('Page is closed');
+    return renderDocument(this.dom.window.document, { timeout: Math.min(this.timeout, 120000),
+      signal: this.documentAbort.signal, ...options, format });
   }
   dump(format = 'html', options = {}) {
     this.dumpNodeIds ??= new WeakMap();

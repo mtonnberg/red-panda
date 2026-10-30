@@ -28,7 +28,7 @@ test('MCP initialization, discovery, validation and pre-navigation errors are st
     assert.equal((await handler.handle({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'getUrl' } })).error.code, -32604);
     assert.equal((await handler.handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'goto', arguments: {} } })).result.isError, true);
     assert.equal((await handler.handle({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'missing' } })).error.code, -32601);
-    assert.equal((await handler.callTool('screenshot')).isError, true);
+    await assert.rejects(handler.callTool('screenshot'), /FrameNotLoaded/);
     assert.equal((await handler.callTool('session_list')).isError, true);
   } finally { handler.close(); }
 });

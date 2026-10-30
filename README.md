@@ -6,7 +6,8 @@ and Chrome DevTools Protocol (CDP) behavior. Puppeteer automation, the example,
 and integration assertions are written in PureScript.
 
 The independent runtime uses Node's V8 and **jsdom** for HTML, DOM and page
-scripts. It does not import Lightpanda's production engine or launch Chromium.
+scripts, plus a small owned C++ binding for `document.all`'s HTMLDDA behavior.
+It does not import Lightpanda's production engine or launch Chromium.
 Full independent replication is the goal; the [compatibility ledger](docs/COMPATIBILITY.md)
 records substantial remaining gaps. No engine or performance parity is claimed.
 
@@ -18,14 +19,30 @@ connections are rejected, but that does not provide process isolation.
 
 ## Run
 
-Requires Node.js 24.19+ and Git. No API keys, database, native browser, or rendering
-service is required.
+Requires Linux, Node.js 24.19+, Git, `g++` with C++20 support and matching Node
+headers. PNG/PDF rendering also requires Python 3.12 and installed DejaVu fonts.
+No API keys, database, native browser, or rendering service is required.
 
 ```sh
 npm ci
+npm run build:native
+python3 -m venv .cache/render
+.cache/render/bin/python -m pip install -r native/render-test-requirements.txt
+export PATH="$PWD/.cache/render/bin:$PATH"
 npm run build:automation
 npm test
 ```
+
+Build the collection binding with the same Node executable used to run Red
+Panda. Rebuild after changing Node/V8 or the native source; startup verifies the
+runtime versions and source/binary digests. See [native build instructions](native/README.md)
+for header discovery and overrides.
+
+Python dependencies are pinned with official wheel SHA-256 hashes for CPython
+3.12 on Linux x86_64. Production rendering only needs
+`native/render-requirements.txt`; the test requirements also install a PDF
+inspector. The renderer uses fixed system DejaVu Sans/Mono regular, bold and
+oblique fonts. See [rendering contracts and limits](docs/reference/render-contract.md).
 
 The PureScript compiler and Spago are pinned in `package-lock.json`. Dependencies
 use Spago's supported custom package-set format with exact upstream GitHub
@@ -87,21 +104,23 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 
 | Surface | Supported |
 | --- | --- |
-| Fetch | HTTP(S)/data, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
+| Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Classic scripts, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with messaging, imports, timers and fetch |
+| Forms / workers | Validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
+| Web APIs | Real HTMLDDA collections, geometry matrices/points/quads, constructed/adopted stylesheets and scoped CSS cascade |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
-| Dumps | HTML, Markdown, semantic JSON/text, structured metadata, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
+| Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
 | CDP page/runtime | Document/fragment/history navigation, reload, frame tree, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads |
 | CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
-| Extension | `LP.dump` returns `{format, content}` |
+| Rendering | Text-only CLI dumps, CDP screenshots/PDF streams and MCP screenshots, with real font rasterization and selectable PDF text |
+| Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64 |
 | WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
 | MCP / saved scripts | Stdio and HTTP MCP sessions, extraction/actions/waits/cookies/downloads; saved scripts with top-level await/return and synchronous browser actions |
-| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, responses, preloads, headers, waits, keyboard/text input, coordinate clicks, cookies and `content` |
+| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, responses, preloads, headers, waits, keyboard/text input, coordinate clicks, cookies, screenshots, PDFs and `content` |
 
 Unsupported commands return a CDP error with code `-32601`. HTTP discovery
 provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
@@ -110,9 +129,10 @@ connect with `defaultViewport: null` (already configured by the PureScript FFI).
 Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), including
 simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
-semantics remain incomplete. Screenshots, PDF, canvas, service/shared workers,
-complete frame behavior and process isolation remain absent. Frame POST
-navigation, shadow stylesheet adoption, flattened shadow/frame input and full
+semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
+CSS painting, canvas, service/shared workers, complete frame behavior and process
+isolation remain absent. Frame POST
+navigation, advanced shadow CSS, flattened shadow/frame input and full
 CSS behavior remain unfinished. Utility-world IDs share their owning frame's
 JS realm. Some configuration commands still
 only acknowledge requests. Markdown and structured metadata are subsets, not byte-identical

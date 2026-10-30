@@ -65,13 +65,14 @@ test('cookies survive redirects and contexts isolate them', async () => {
 });
 
 test('HTTP error documents are usable and navigation failures reject', async () => {
-  const browser = new Browser({ timeout: 150 });
+  const browser = new Browser({ timeout: 1500 });
   try {
     const page = browser.createPage();
     await page.navigate(`${fixture.url}missing`);
     assert.equal(page.status, 404);
     assert.match(page.dump(), /Not found/);
     await assert.rejects(page.navigate(`${fixture.url}loop`), /Too many redirects/);
+    page.timeout = 150;
     await assert.rejects(page.navigate(`${fixture.url}slow`), /abort|timeout/i);
     await assert.rejects(page.navigate('file:///etc/passwd'), /Only HTTP/);
   } finally { browser.close(); }
@@ -113,7 +114,7 @@ test('CLI JSON exposes the DOM dump and HTTP status; HTTP errors exit 22', async
 });
 
 test('CLI rejects invalid formats, deadlines and commands', async () => {
-  for (const args of [['fetch', '--dump', 'pdf', fixture.url], ['fetch', '--wait-ms', 'NaN', fixture.url], ['unexpected']]) {
+  for (const args of [['fetch', '--dump', 'unsupported', fixture.url], ['fetch', '--wait-ms', 'NaN', fixture.url], ['unexpected']]) {
     await assert.rejects(exec(process.execPath, ['bin/red-panda.js', ...args]), error => error.code === 1);
   }
 });

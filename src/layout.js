@@ -1,5 +1,6 @@
 // Independent surrogate geometry for a headless DOM. This intentionally models
 // the reference's measured simple boxes; it is not a CSS layout renderer.
+import { getStyleRevision } from './styles.js';
 const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
 const hiddenTags = new Set(['head', 'style', 'script', 'template', 'meta', 'link', 'title', 'base']);
 const blockTags = new Set(['html', 'body', 'div', 'p', 'main', 'section', 'article', 'aside', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'blockquote']);
@@ -31,7 +32,7 @@ export function createLayout(window, options = {}) {
   function snapshot() {
     const document = window.document;
     const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
-    const stack = [document], tokens = [width, height];
+    const stack = [document], tokens = [width, height, getStyleRevision(window)];
     while (stack.length) {
       const node = stack.pop();
       if (!identities.has(node)) identities.set(node, nextIdentity++);

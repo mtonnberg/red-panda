@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import { Browser, VERSION, until, withTimeout } from './browser.js';
 import { exportCookies, cookieToCDP } from './cookies.js';
 import { runInput } from './input.js';
+import { alternateMarkdown } from './markdown-alternate.js';
 
 const string = { type: 'string' }, integer = { type: 'integer' }, boolean = { type: 'boolean' };
 const loadState = { type: 'string', enum: ['load', 'domcontentloaded', 'networkalmostidle', 'networkidle', 'done'] };
@@ -17,6 +18,7 @@ const definitions = [
   ['goto', 'Navigate the current page', { url: string, timeout: integer, waitUntil: loadState }, ['url']],
   ['markdown', 'Read page or subtree as Markdown', { ...scope, ...reading, maxBytes: integer, strip: stripping, alternate: boolean }],
   ['html', 'Read document or node HTML', { ...scope, ...reading, maxBytes: integer, strip: stripping }],
+  ['screenshot', 'Render page or subtree as a text-only PNG', { ...scope, ...reading, path: string, fullPage: boolean, strip: stripping }],
   ['links', 'List document links', { ...reading, limit: integer }],
   ['evaluate', 'Evaluate JavaScript in the page', { ...reading, script: string, save: string }, ['script']],
   ['extract', 'Extract structured values using CSS selector specifications', { schema: string, save: string }, ['schema']],
@@ -49,8 +51,8 @@ const tools = definitions.map(([name, description, properties, required = []]) =
   name, title: description, description, inputSchema: { type: 'object', properties, ...(required.length ? { required } : {}) },
 }));
 const toolMap = new Map(tools.map(tool => [tool.name, tool]));
-const unsupportedTools = new Set(['search', 'screenshot', 'scroll']);
-const urlReadTools = new Set(['goto', 'markdown', 'html', 'links', 'evaluate', 'tree', 'interactiveElements', 'structuredData', 'detectForms']);
+const unsupportedTools = new Set(['search', 'scroll']);
+const urlReadTools = new Set(['goto', 'markdown', 'html', 'screenshot', 'links', 'evaluate', 'tree', 'interactiveElements', 'structuredData', 'detectForms']);
 
 class MCPError extends Error {
   constructor(message, code = -32604) { super(message); this.code = code; }
@@ -294,14 +296,30 @@ export function createMCPHandler({ browser, browserOptions = {}, cwd = process.c
     if (name === 'save') {
       const path = await outputPath(cwd, args.path); await atomicWrite(path, args.script); return textResult(`Saved script to ${path}`);
     }
+    const readDeadline = urlReadTools.has(name) ? Date.now() + timeout(args, page.timeout) : undefined;
     if (urlReadTools.has(name) && args.url) await navigate(args);
     requirePage();
     const document = page.dom.window.document, window = page.dom.window;
     switch (name) {
       case 'goto': return textResult(`Navigated. HTTP ${page.status} ${page.status >= 400 ? 'error' : 'OK'}.`, metadata());
       case 'getUrl': return textResult(page.url);
+      case 'screenshot': {
+        if (args.selector !== undefined && args.backendNodeId !== undefined) throw new MCPError('Choose selector or backendNodeId', -32602);
+        const path = args.path === undefined ? undefined : await outputPath(cwd, args.path);
+        const rendered = await page.render('png', { node: selected(args, true), fullPage: args.fullPage ?? false,
+          inline: !path, strip: args.strip, timeout: Math.min(Math.max(1, readDeadline - Date.now()), 120000) });
+        if (path) { await atomicWrite(path, rendered.bytes); return textResult(`Saved ${rendered.width}x${rendered.height} PNG to ${path}`); }
+        return { content: [{ type: 'image', mimeType: 'image/png', data: rendered.bytes.toString('base64') },
+          { type: 'text', text: `PNG, ${rendered.width}x${rendered.height}` }], isError: false };
+      }
       case 'html': return textResult(render(args, 'html'));
-      case 'markdown': return textResult(render(args, 'markdown'));
+      case 'markdown': {
+        if (!args.alternate) return textResult(render(args, 'markdown'));
+        if (args.selector !== undefined || args.backendNodeId !== undefined) throw new MCPError('Alternate Markdown cannot be scoped to a node', -32602);
+        const result = await alternateMarkdown(page, { deadline: readDeadline, maxBytes: args.maxBytes,
+          stripModes: Object.entries(args.strip ?? {}).filter(([, enabled]) => enabled).map(([name]) => name) });
+        return textResult(result.content);
+      }
       case 'links': {
         let links = [...document.querySelectorAll('a[href]')].map(node => ({ backendNodeId: idFor(node), text: cleanText(node), href: node.href }));
         if (args.limit !== undefined) { if (args.limit < 0) throw new MCPError('limit must be non-negative', -32602); links = links.slice(0, args.limit); }

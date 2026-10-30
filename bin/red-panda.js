@@ -8,6 +8,7 @@ import { runMCPStdio } from '../src/mcp.js';
 import { serveMCPHTTP } from '../src/mcp-http.js';
 import { runScript } from '../src/script.js';
 import { DUMP_FORMATS, STRIP_MODES } from '../src/dump.js';
+import { alternateMarkdown } from '../src/markdown-alternate.js';
 import { readCookieFile, writeCookieFile, setCookie, exportCookies } from '../src/cookies.js';
 
 // Re-exec in place so module scripts share the page VM and server ownership
@@ -16,7 +17,7 @@ if (typeof vm.SourceTextModule !== 'function' && typeof process.execve === 'func
   process.execve(process.execPath, [process.execPath, '--experimental-vm-modules', ...process.execArgv, ...process.argv.slice(1)], process.env);
 }
 
-const help = `Red Panda ${VERSION} — experimental headless browser (no rendering)
+const help = `Red Panda ${VERSION} — experimental headless browser
 
 Usage:
   red-panda fetch [options] <URL>...   Multiple URLs require --json
@@ -27,11 +28,12 @@ Usage:
 
 Fetch options:
   --dump FORMAT          html, markdown, semantic_tree, semantic_tree_text,
-                         structured_data, text or links (default no dump)
+                         structured_data, text, links, png or pdf (default no dump)
   --dump-selector CSS    Dump the first matching element
   --dump-max-bytes N     Soft UTF-8 cap for HTML/Markdown, with truncation marker
   --strip-mode GROUP     js, css, ui, invisible, shell or clutter (repeatable)
   --with-base            Insert an absolute base URL into full-document HTML
+  --markdown-alternate   Prefer an authored Markdown alternate within the page deadline
   --json                 Wrap the dump and HTTP metadata in JSON
   --wait-until load|domcontentloaded|done          Readiness (default load)
   --wait-ms N             Maximum page wait in milliseconds (default 5000)
@@ -63,6 +65,7 @@ export async function main(argv = process.argv.slice(2)) {
     dump: { type: 'string', default: '' }, json: { type: 'boolean' },
     'dump-selector': { type: 'string' }, 'dump-max-bytes': { type: 'string' },
     'strip-mode': { type: 'string', multiple: true }, 'with-base': { type: 'boolean' },
+    'markdown-alternate': { type: 'boolean' },
     host: { type: 'string', default: '127.0.0.1' }, port: { type: 'string', default: '9222' },
     'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
     'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' },
@@ -139,7 +142,10 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (command !== 'fetch' || !rest.length) throw new Error('Expected fetch <URL>..., serve, mcp, run, or version');
   if (rest.length > 1 && !values.json) throw new Error('Fetching multiple URLs requires --json');
-  if (values.dump && !DUMP_FORMATS.includes(values.dump)) throw new Error('Unsupported --dump format');
+  const binaryDump = ['png', 'pdf'].includes(values.dump);
+  if (values.dump && !binaryDump && !DUMP_FORMATS.includes(values.dump)) throw new Error('Unsupported --dump format');
+  if (values['markdown-alternate'] && values.dump !== 'markdown') throw new Error('--markdown-alternate requires --dump markdown');
+  if (values['markdown-alternate'] && values['dump-selector'] !== undefined) throw new Error('--markdown-alternate cannot be combined with --dump-selector');
   const dumpOptions = { selector: values['dump-selector'], withBase: values['with-base'] ?? false,
     maxBytes: values['dump-max-bytes'] === undefined ? undefined : integer(values['dump-max-bytes'], '--dump-max-bytes', 0),
     stripModes: values['strip-mode'] ?? [],
@@ -170,6 +176,7 @@ export async function main(argv = process.argv.slice(2)) {
       const page = browser.createPage(contextId);
       for (const [index, source] of preloads.entries()) page.newDocumentScripts.set(`cli:${index}`, { source });
       let error = null;
+      const deadline = Date.now() + timeout;
       try {
         // Lightpanda's wait-ms is a deadline, not an unconditional delay.
         await page.navigate(url, {
@@ -190,13 +197,23 @@ export async function main(argv = process.argv.slice(2)) {
       }
       try {
         let content = '';
-        try { if (values.dump) content = page.dump(values.dump, dumpOptions); }
+        let selected;
+        try {
+          if (values['markdown-alternate']) {
+            selected = await alternateMarkdown(page, { ...dumpOptions, deadline, format: 'markdown' });
+            content = selected.content;
+          } else if (binaryDump) {
+            const rendered = await page.render(values.dump, dumpOptions);
+            content = rendered.bytes.toString('base64');
+          } else if (values.dump) content = page.dump(values.dump, dumpOptions);
+        }
         catch (cause) {
           failed = true; error ??= cause.code ?? cause.message;
           if (!values.json) console.error(`red-panda: ${error}`);
         }
-        results.push({ url: page.status ? page.url : url, http_status: page.status ?? 0,
-          headers: page.responseHeaders ?? [], dump: values.dump, content, error });
+        results.push({ url: selected?.usedAlternate ? selected.url : page.status ? page.url : url,
+          http_status: selected?.usedAlternate ? selected.httpStatus : page.status ?? 0,
+          headers: selected?.usedAlternate ? selected.headers : page.responseHeaders ?? [], dump: values.dump, content, error });
         httpError ||= page.status >= 400;
         if (values['cookie-jar']) for (const cookie of await exportCookies(context.cookies)) {
           collectedCookies.set(`${cookie.domain}|${cookie.path}|${cookie.name}`, cookie);
@@ -205,6 +222,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     if (values['cookie-jar']) await writeCookieFile(values['cookie-jar'], [...collectedCookies.values()]);
     if (values.json) console.log(JSON.stringify(results.length === 1 ? results[0] : { results }));
+    else if (binaryDump) process.stdout.write(Buffer.from(results[0].content, 'base64'));
     else if (values.dump) console.log(results[0].content);
     process.exitCode = failed ? 1 : values['fail-on-http-error'] && httpError ? 22 : 0;
   } finally { browser.close(); }

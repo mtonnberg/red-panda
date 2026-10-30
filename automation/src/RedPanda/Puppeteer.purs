@@ -1,9 +1,10 @@
 module RedPanda.Puppeteer
-  ( Browser, BrowserContext, Page, Frame, Response, PreloadScript, Header
+  ( Browser, BrowserContext, Page, Frame, Response, PreloadScript, Header, ByteArray
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText
   , withNavigation, goBack, goForward, reload, pageUrl
   , childFrame, evaluateFrameString, gotoFrame
+  , screenshot, pdf, byteLength, signature
   , evaluateOnNewDocument, removePreload
   , setExtraHTTPHeaders, setUserAgent
   , click, focus, typeText, pressKey, insertText
@@ -25,6 +26,7 @@ foreign import data Page :: Type
 foreign import data Frame :: Type
 foreign import data Response :: Type
 foreign import data PendingNavigation :: Type
+foreign import data ByteArray :: Type
 
 newtype PreloadScript = PreloadScript String
 
@@ -56,6 +58,10 @@ foreign import pageUrlImpl :: Page -> Effect String
 foreign import childFrameImpl :: Page -> Int -> Async Frame
 foreign import evaluateFrameStringImpl :: Frame -> String -> Async String
 foreign import gotoFrameImpl :: Frame -> String -> Async Int
+foreign import screenshotImpl :: Page -> Boolean -> Async ByteArray
+foreign import pdfImpl :: Page -> Async ByteArray
+foreign import byteLength :: ByteArray -> Int
+foreign import signature :: ByteArray -> String
 foreign import responseStatus :: Response -> Int
 foreign import responseTextImpl :: Response -> Async String
 foreign import evaluateOnNewDocumentImpl :: Page -> String -> Async String
@@ -127,6 +133,12 @@ evaluateFrameString frame expression = fromAsync $ evaluateFrameStringImpl frame
 
 gotoFrame :: Frame -> String -> Aff Int
 gotoFrame frame url = fromAsync $ gotoFrameImpl frame url
+
+screenshot :: Page -> Boolean -> Aff ByteArray
+screenshot page fullPage = fromAsync $ screenshotImpl page fullPage
+
+pdf :: Page -> Aff ByteArray
+pdf page = fromAsync $ pdfImpl page
 
 responseText :: Response -> Aff String
 responseText response = fromAsync $ responseTextImpl response

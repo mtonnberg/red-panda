@@ -4,6 +4,7 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 
 function cli(args, input = '') {
   return new Promise((resolve, reject) => {
@@ -70,4 +71,34 @@ test('fetch dump flags preserve Unicode boundaries and remove requested groups',
   assert.doesNotMatch(JSON.parse(stripped.stdout).content, /<(?:style|script)/);
   const semantic = await cli(['fetch', '--json', '--dump', 'semantic_tree', url]);
   assert.equal(semantic.code, 0, semantic.stderr); assert.ok(JSON.parse(JSON.parse(semantic.stdout).content));
+});
+
+test('Markdown alternate CLI selects authored response metadata and preserves failed-origin status', async t => {
+  const requested = [];
+  const server = http.createServer((req, res) => {
+    requested.push(req.url);
+    if (req.url === '/docs/note.md') {
+      res.writeHead(206, { 'content-type': 'text/plain', 'x-source': 'alternate' }); res.end('# Authored Markdown\n');
+    } else {
+      res.writeHead(req.url === '/origin-failed' ? 404 : 200, { 'content-type': 'text/html', 'x-source': 'html' });
+      res.end('<!doctype html><base href="/docs/"><h1>DOM fallback</h1><link rel="alternate" type="text/markdown" href="note.md">');
+    }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const flags = ['fetch', '--json', '--dump', 'markdown', '--markdown-alternate'];
+  const selected = await cli([...flags, `${base}/article`]);
+  assert.equal(selected.code, 0, selected.stderr);
+  const output = JSON.parse(selected.stdout);
+  assert.equal(output.content, '# Authored Markdown\n'); assert.equal(output.url, `${base}/docs/note.md`);
+  assert.equal(output.http_status, 206); assert.equal(output.headers.find(header => header.name === 'x-source').value, 'alternate');
+  const count = requested.length;
+  const conflict = await cli([...flags, '--dump-selector', 'h1', `${base}/never`]);
+  assert.equal(conflict.code, 1); assert.equal(requested.length, count);
+  const failed = await cli([...flags, '--fail-on-http-error', `${base}/origin-failed`]);
+  assert.equal(failed.code, 22); const preserved = JSON.parse(failed.stdout);
+  assert.equal(preserved.url, `${base}/origin-failed`); assert.equal(preserved.http_status, 404);
+  assert.match(preserved.content, /# DOM fallback/); assert.equal(preserved.error, null);
+  assert.equal(requested.filter(path => path === '/docs/note.md').length, 1);
 });

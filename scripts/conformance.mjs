@@ -1,10 +1,10 @@
 import { parseArgs } from 'node:util';
-import http from 'node:http';
-import { readFile, realpath, stat, writeFile } from 'node:fs/promises';
-import { resolve, relative, isAbsolute, extname, join, sep } from 'node:path';
+import { readFile, realpath, writeFile } from 'node:fs/promises';
+import { resolve, relative, isAbsolute, join, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { connect } from '../test/cdp-client.js';
 import { startReference } from './reference-server.mjs';
+import { startFixtureServer } from './upstream-fixture-server.mjs';
 
 const usage = `Usage: node scripts/conformance.mjs --root /path/to/upstream/src/browser/tests
   (--endpoint ws://127.0.0.1:9222/ | --binary /path/to/browser)
@@ -12,45 +12,21 @@ const usage = `Usage: node scripts/conformance.mjs --root /path/to/upstream/src/
   [--tests-file /path/to/selection.json] [--isolate]
   [--browser-arg=--load-resources --browser-arg=iframe]
   [--timeout 5000] [--port 9582] [--report /new/report.json]
+  [--fixture-profile static|xhr-subset | --fixture-origin http://127.0.0.1:9582]
 
 Runs unchanged upstream fixture assertions through raw CDP. Both targets use
 Lightpanda/1.0 solely within this runner so testing.js takes identical branches.
-Only static HTTP fixtures are served; dynamic upstream test routes are not ported.
+The default owned server serves static files. xhr-subset enables documented test
+routes. --fixture-origin uses a caller-owned server, which this runner never stops.
+The native harness requires origin http://127.0.0.1:9582 for its dynamic routes.
 `;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const inside = (root, path) => { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)); };
-const mimeTypes = { '.html':'text/html', '.xhtml':'application/xhtml+xml', '.js':'text/javascript', '.mjs':'text/javascript', '.css':'text/css', '.json':'application/json', '.xml':'application/xml', '.txt':'text/plain', '.svg':'image/svg+xml', '.png':'image/png', '.gif':'image/gif', '.jpg':'image/jpeg', '.webp':'image/webp', '.wasm':'application/wasm' };
-
-async function fixtureServer(root, port) {
-  const requests = [];
-  const server = http.createServer(async (request, response) => {
-    const entry = { method: request.method, path: request.url, status: 0 };
-    if (requests.length < 5000) requests.push(entry);
-    const finish = (status, text) => { entry.status = status; response.writeHead(status, { 'content-type':'text/plain', 'cache-control':'no-store' }); response.end(text); };
-    try {
-      if (!['GET','HEAD'].includes(request.method)) return finish(405, 'Static fixture server supports GET and HEAD only');
-      const path = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
-      const prefix = '/src/browser/tests/';
-      if (!path.startsWith(prefix) || path.includes('\\')) return finish(404, 'Upstream dynamic test route is not implemented');
-      const candidate = resolve(root, path.slice(prefix.length));
-      if (!inside(root, candidate)) return finish(403, 'Outside fixture root');
-      const canonical = await realpath(candidate);
-      if (!inside(root, canonical)) return finish(403, 'Symlink escapes fixture root');
-      if (!(await stat(canonical)).isFile()) return finish(404, 'Not a fixture file');
-      const bytes = await readFile(canonical);
-      entry.status = 200;
-      response.writeHead(200, { 'content-type':mimeTypes[extname(canonical)] ?? 'application/octet-stream', 'cache-control':'no-store', 'content-length':bytes.length });
-      response.end(request.method === 'HEAD' ? undefined : bytes);
-    } catch (error) { finish(error instanceof URIError ? 400 : 404, 'Fixture unavailable'); }
-  });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
-  return { requests, origin:`http://127.0.0.1:${server.address().port}`, close:() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }) };
-}
 
 async function runFixture(client, server, selection, timeout) {
   const started = Date.now();
   const deadline = started + timeout;
-  const requestOffset = server.requests.length;
+  const requestOffset = server.requests?.length ?? 0;
   let context;
   let session;
   let polls = 0;
@@ -121,7 +97,8 @@ async function runFixture(client, server, selection, timeout) {
     assertOkPolls:polls, nonzeroObservationsEnforced:status==='passed',
     observationCount:null, observationCountNote:'Private upstream harness state; passing assertOk enforces nonzero observations and no pending async blocks.',
     diagnostics:logs, runtimeExceptions:events.filter(event => event.method === 'Runtime.exceptionThrown').map(event => event.params.exceptionDetails?.text),
-    unavailableRoutes:server.requests.slice(requestOffset).filter(request => request.status !== 200) };
+    unavailableRoutes:server.requests ? server.requests.slice(requestOffset).filter(request => !request.routeKnown) : null,
+    requestObservation:server.requests ? 'Owned fixture server request log; capped at 10000 entries.' : 'Unknown: external server request logs are not available to this runner.' };
 }
 
 async function main() {
@@ -129,11 +106,15 @@ async function main() {
     root:{type:'string'}, endpoint:{type:'string'}, binary:{type:'string'}, test:{type:'string',multiple:true},
     'tests-file':{type:'string'}, isolate:{type:'boolean'}, 'browser-arg':{type:'string',multiple:true},
     timeout:{type:'string',default:'5000'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
+    'fixture-origin':{type:'string'}, 'fixture-profile':{type:'string'},
   } });
   if (values.help) { console.log(usage); return; }
   if (!values.root || Boolean(values.endpoint) === Boolean(values.binary)) throw new Error(usage);
   if (values.isolate && !values.binary) throw new Error('--isolate requires --binary (the runner never kills an externally owned endpoint)');
   if (values['browser-arg']?.length && !values.binary) throw new Error('--browser-arg requires --binary');
+  if (values['fixture-origin'] && (values['fixture-profile'] || values.port !== '9582')) throw new Error('--fixture-origin cannot be combined with --fixture-profile or a custom --port');
+  const profile = values['fixture-profile'] ?? 'static';
+  if (!['static','xhr-subset'].includes(profile)) throw new Error('--fixture-profile must be static or xhr-subset');
   let fromFile = [];
   if (values['tests-file']) {
     const text = await readFile(values['tests-file'],'utf8');
@@ -157,7 +138,19 @@ async function main() {
   const browserArgs = values['browser-arg'] ?? [];
   let browser, server, client;
   try {
-    server = await fixtureServer(root,port);
+    if (values['fixture-origin']) {
+      const parsed = new URL(values['fixture-origin']);
+      if (!['http:','https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) throw new Error('--fixture-origin must be an HTTP(S) origin without credentials, path, query or fragment');
+      server = { origin:parsed.origin, requests:null, owned:false, metadata:null, close:async()=>{} };
+      // Verify the actual main documents and harness served externally, rather
+      // than claiming that local hashes prove unchanged remote source.
+      const files = [{path:'testing.js',sha256:createHash('sha256').update(harness).digest('hex')},...selections];
+      for (const file of files) {
+        const url = `${server.origin}/src/browser/tests/${file.path.split('/').map(encodeURIComponent).join('/')}`;
+        const response = await fetch(url,{signal:AbortSignal.timeout(timeout)});
+        if (!response.ok || createHash('sha256').update(Buffer.from(await response.arrayBuffer())).digest('hex') !== file.sha256) throw new Error(`External fixture bytes differ or are unavailable: ${file.path}`);
+      }
+    } else server = await startFixtureServer(root,{port,profile});
     let endpoint = values.endpoint ?? null;
     const binaryIdentity = values.binary ? {
       path:resolve(values.binary), sha256:createHash('sha256').update(await readFile(resolve(values.binary))).digest('hex'),
@@ -205,9 +198,12 @@ async function main() {
         sourceHtmlRunnerDefaults:['--load-resources','iframe','--load-resources','worker'],
         sourceDefaultsNote:'src/testing.zig HtmlRunnerOpts enables iframe and worker; individual registrations may override resources, experimental features or injected scripts.',
         fixtureSpecificOptionsVerified:false,
-        unrunConfigurationDimensions:['Per-fixture native registration overrides not audited','Stateful HTTP/WebSocket test_routes not implemented'],
+        unrunConfigurationDimensions:['Per-fixture native registration overrides not audited','Full upstream test_routes server not implemented; see fixture server metadata or external server contract'],
       },
-      fixtureOrigin:server.origin, staticRoutesOnly:true, results, counts };
+      fixtureOrigin:server.origin, fixtureServerOwnership:server.owned?'runner-owned':'caller-owned; caller must stop it',
+      fixtureServerMetadata:server.metadata, staticRoutesOnly:server.owned ? profile==='static' : null,
+      sourceVerification:server.owned?'Local fixture files served directly':'External main fixture documents and testing.js hash-verified; transitive resource bytes not verified',
+      results, counts };
     const json = `${JSON.stringify(report,null,2)}\n`;
     if (values.report) await writeFile(values.report,json,{flag:'wx'});
     console.log(json);

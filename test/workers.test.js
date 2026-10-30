@@ -34,6 +34,9 @@ function message(worker) { return deadline(new Promise((resolve, reject) => {
   worker.addEventListener('message', event => resolve(event.data), { once: true });
   worker.addEventListener('error', event => reject(event.error ?? new Error(event.message)), { once: true });
 })); }
+function portMessage(port) { return deadline(new Promise(resolve => {
+  port.addEventListener('message', resolve, { once: true }); port.start();
+})); }
 
 test('dedicated workers run in isolated threads and deliver queued messages in both directions', async t => {
   const f = fixture(t, { 'https://example.test/app/echo.js': `self.workerOnly = true;
@@ -63,6 +66,35 @@ test('structured clone preserves cycles, Map/Set, typed views and transferred Ar
   assert.equal(data.data.self, data.data); assert.equal(data.data.map instanceof f.window.Map, true);
   assert.equal(data.data.map.get('x'), 2); assert.equal(data.data.set.has(3), true); assert.equal(data.data.date.getTime(), 123);
   worker.terminate();
+});
+
+test('workers expose geometry constructors and clone geometry in their own realm', async t => {
+  const f = fixture(t, { 'https://example.test/app/geometry.js': `
+    const matrix = new DOMMatrix().translate(5, 7).scale(2);
+    const point = new DOMPoint(3, 4).matrixTransform(matrix);
+    const cloned = structuredClone({ point, matrix, rect: new DOMRect(1, 2, 3, 4) });
+    postMessage({ point: cloned.point.toJSON(), rect: cloned.rect.toJSON(),
+      ownRealm: [cloned.point instanceof DOMPoint, cloned.matrix instanceof DOMMatrix,
+        cloned.rect instanceof DOMRect], matrix: Array.from(cloned.matrix.toFloat64Array()) });
+  ` });
+  const worker = new f.window.Worker('./geometry.js');
+  const data = await message(worker);
+  assert.deepEqual({ ...data.point }, { x: 11, y: 15, z: 0, w: 1 });
+  assert.deepEqual([...data.ownRealm], [true, true, true]);
+  assert.equal(data.rect.width, 3); assert.equal(data.rect.bottom, 6);
+  assert.equal(data.matrix[12], 5); assert.deepEqual(f.errors, []);
+  worker.terminate();
+});
+
+test('worker dynamic imports reject HTTP failures with the native load error contract', async t => {
+  const f = fixture(t, { 'https://example.test/app/missing-import.js': `
+    import('./not-found.js').then(() => postMessage('unexpected success'),
+      error => postMessage({ name: error.name, message: error.message, string: String(error) }));
+  ` });
+  const worker = new f.window.Worker('./missing-import.js');
+  assert.deepEqual({ ...(await message(worker)) }, { name: 'TypeError', message: 'Abort', string: 'TypeError: Abort' });
+  assert.equal(f.requests.find(request => request.url.endsWith('/not-found.js')).type, 'Script');
+  assert.deepEqual(f.errors, []); worker.terminate();
 });
 
 test('classic importScripts fetches and executes synchronously in supplied order', async t => {
@@ -137,10 +169,21 @@ test('numeric timers bind this to worker self, pass arguments, support strings a
   const f = fixture(t, { 'https://example.test/app/timers.js': `let count = 0;
     const interval = setInterval(() => count++, 1); const invalid = setTimeout(undefined);
     self.stringValue = 0; setTimeout('self.stringValue = 3;', 1);
-    const id = setTimeout(function(a, b) { clearInterval(interval); postMessage({ numeric: typeof id, same: this === self, sum: a+b, count: count > 0, stringValue }); }, 15, 2, 4);` });
+    const id = setTimeout(function(a, b) { clearInterval(interval); postMessage({ numeric: typeof id, same: this === self, sum: a+b, count: count > 0, stringValue, timeoutLength:setTimeout.length, intervalLength:setInterval.length }); }, 15, 2, 4);` });
   const worker = new f.window.Worker('./timers.js'), data = await message(worker);
   assert.equal(data.numeric, 'number'); assert.equal(data.same, true); assert.equal(data.sum, 6);
   assert.equal(data.count, true); assert.equal(data.stringValue, 3); worker.terminate();
+  assert.equal(data.timeoutLength, 1); assert.equal(data.intervalLength, 1);
+});
+
+test('classic workers dynamically import actual cached modules in their own realm', async t => {
+  const f = fixture(t, {
+    'https://example.test/app/classic-import.js': `(async()=>{const first=await import('./dynamic.js');const second=await import('./dynamic.js');postMessage({value:first.multiply(6,7),same:first===second,leaked:typeof moduleOnly})})().catch(error=>postMessage({error:error.message}));`,
+    'https://example.test/app/dynamic.js': 'const moduleOnly=true;export const multiply=(a,b)=>a*b;',
+  });
+  const worker = new f.window.Worker('./classic-import.js'); const data = await message(worker);
+  assert.equal(data.value, 42, data.error); assert.equal(data.same, true); assert.equal(data.leaked, 'undefined');
+  assert.equal(f.requests.filter(request => request.url.endsWith('/dynamic.js')).length, 1); worker.terminate();
 });
 
 test('worker errors dispatch cancelable ErrorEvents and allow recovery from callback exceptions', async t => {
@@ -171,14 +214,86 @@ test('worker close prevents later messages and terminates its timers', async t =
   assert.deepEqual(messages, ['before']);
 });
 
-test('unsupported workers, URL origins and non-buffer transfers fail explicitly', t => {
+test('unsupported workers, URL origins and non-transferable values fail explicitly', t => {
   const f = fixture(t);
   assert.throws(() => new f.window.SharedWorker('./shared.js'), error => error.name === 'NotSupportedError');
   assert.throws(() => new f.window.Worker('https://elsewhere.test/a.js'), error => error.name === 'SecurityError');
-  assert.throws(() => new f.window.Worker('blob:example'), error => error.name === 'NotSupportedError');
+  assert.throws(() => new f.window.Worker('file:///not-a-worker.js'), error => error.name === 'NotSupportedError');
   assert.throws(() => new f.window.Worker('./x.js', { type: 'bad' }), /Worker type/);
   const worker = new f.window.Worker('./x.js');
   assert.throws(() => worker.postMessage('x', [{}]), error => error.name === 'DataCloneError'); worker.terminate();
+});
+
+test('dedicated workers receive transferred native ports with realm values and trusted events exactly once', async t => {
+  const f = fixture(t, { 'https://example.test/app/ports.js': `
+    onmessage = event => {
+      const port = event.data.port; let count = 0;
+      port.onmessage = message => port.postMessage({ echoed: message.data, count: ++count,
+        trusted: message.isTrusted, currentTarget: message.currentTarget === port,
+        realm: message.data.bytes instanceof Uint8Array });
+      postMessage({ ready: true, samePort: event.ports[0] === port, portType: port instanceof MessagePort,
+        trusted: event.isTrusted, portsArray: event.ports instanceof Array, frozen: Object.isFrozen(event.ports),
+        hidden: [typeof __createTrustedMessage, typeof __emitMessage, typeof trustedEvents] });
+    };` });
+  const worker = new f.window.Worker('./ports.js'), channel = new f.window.MessageChannel();
+  let workerEvent;
+  worker.addEventListener('message', event => { workerEvent = event; }, { once: true });
+  const ready = message(worker); worker.postMessage({ port: channel.port2 }, [channel.port2]);
+  const startup = await ready;
+  assert.equal(startup.samePort, true); assert.equal(startup.portType, true); assert.equal(startup.trusted, true);
+  assert.equal(startup.portsArray, true); assert.equal(startup.frozen, true); assert.deepEqual([...startup.hidden], ['undefined', 'undefined', 'undefined']);
+  assert.equal(workerEvent.isTrusted, true);
+  let delivered = 0; channel.port1.addEventListener('message', () => delivered++);
+  const echoed = portMessage(channel.port1); channel.port1.postMessage({ bytes: new f.window.Uint8Array([4, 5]) });
+  const result = (await echoed).data;
+  assert.equal(result.count, 1); assert.equal(result.trusted, true); assert.equal(result.currentTarget, true); assert.equal(result.realm, true);
+  assert.ok(result.echoed.bytes instanceof f.window.Uint8Array); assert.deepEqual([...result.echoed.bytes], [4, 5]);
+  await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(delivered, 1); assert.deepEqual(f.errors, []); worker.terminate();
+});
+
+test('worker-created channels transfer their endpoints back to the page and remain entangled across threads', async t => {
+  const f = fixture(t, { 'https://example.test/app/created-port.js': `
+    const channel = new MessageChannel();
+    channel.port2.onmessage = event => channel.port2.postMessage({ echoed: event.data, createdInWorker: true });
+    postMessage({ port: channel.port1 }, { transfer: [channel.port1] });` });
+  const worker = new f.window.Worker('./created-port.js');
+  const received = await deadline(new Promise((resolve, reject) => {
+    worker.onmessage = resolve; worker.onerror = event => reject(event.error);
+  }));
+  assert.equal(received.ports.length, 1); assert.equal(received.data.port, received.ports[0]);
+  assert.ok(received.data.port instanceof f.window.MessagePort); assert.equal(received.isTrusted, true);
+  const reply = portMessage(received.data.port); received.data.port.postMessage('actual worker endpoint');
+  assert.equal((await reply).data.echoed, 'actual worker endpoint'); worker.terminate();
+});
+
+test('worker structuredClone transfers ports locally and reports detached-port clone errors', async t => {
+  const f = fixture(t, { 'https://example.test/app/local-port.js': `
+    const channel = new MessageChannel();
+    const cloned = structuredClone({ port: channel.port2 }, { transfer: [channel.port2] });
+    let failure;
+    try { postMessage('invalid transfer', [channel.port2]); } catch(error) { failure = error.name; }
+    channel.port1.onmessage = event => postMessage({ value: event.data, cloneType: cloned.port instanceof MessagePort, failure });
+    cloned.port.postMessage('local native channel');` });
+  const worker = new f.window.Worker('./local-port.js'), result = await message(worker);
+  assert.equal(result.value, 'local native channel'); assert.equal(result.cloneType, true); assert.equal(result.failure, 'DataCloneError');
+  assert.deepEqual(f.errors, []); worker.terminate();
+});
+
+test('separate actual workers communicate directly through transferred channel endpoints', async t => {
+  const f = fixture(t, {
+    'https://example.test/app/port-a.js': `onmessage = event => { const port = event.ports[0];port.onmessage = reply => postMessage({ reply: reply.data });port.postMessage('from worker A'); };`,
+    'https://example.test/app/port-b.js': `onmessage = event => { const port = event.ports[0];port.onmessage = message => port.postMessage(message.data + ' through worker B'); };`,
+  });
+  const first = new f.window.Worker('./port-a.js'), second = new f.window.Worker('./port-b.js'), channel = new f.window.MessageChannel();
+  const result = message(first); first.postMessage(null, [channel.port1]); second.postMessage(null, [channel.port2]);
+  assert.equal((await result).reply, 'from worker A through worker B'); assert.deepEqual(f.errors, []); first.terminate(); second.terminate();
+});
+
+test('disabled worker resources still serialize and detach transferable ports and buffers', t => {
+  const f = fixture(t); const disabled = installWorkers(f.page, f.window, { enabled: false }); t.after(() => disabled.dispose());
+  const worker = new f.window.Worker('./disabled.js'), channel = new f.window.MessageChannel(), bytes = new f.window.Uint8Array([1, 2]);
+  worker.postMessage({ port: channel.port1, bytes }, [channel.port1, bytes.buffer]); assert.equal(bytes.byteLength, 0);
+  assert.throws(() => worker.postMessage(null, [channel.port1]), { name: 'DataCloneError' }); assert.equal(f.requests.length, 0);
 });
 
 test('an owned worker does not keep an otherwise idle browser process alive', async () => {

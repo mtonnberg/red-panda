@@ -100,6 +100,11 @@ test('CDP geometry, viewport overrides and persisted scripts operate on the sele
     await send('Emulation.setDeviceMetricsOverride', { width: 800, height: 600, deviceScaleFactor: 1, mobile: false });
     await send('Page.navigate', { url: 'data:text/html,<!doctype html><button id="target" style="width:20px;height:10px">Target</button>' });
     assert.equal((await send('Page.getLayoutMetrics')).cssLayoutViewport.clientWidth, 800);
+    const legacy = (await send('Runtime.evaluate', { expression: 'document.all' })).result;
+    assert.equal(legacy.type, 'function'); assert.equal(legacy.className, 'HTMLAllCollection');
+    assert.equal(legacy.description, 'function () { [native code] }'); assert.ok(legacy.objectId);
+    assert.deepEqual((await send('Runtime.evaluate', { expression: 'document.all', returnByValue: true })).result, { type: 'function', value: {} });
+    assert.deepEqual((await send('Runtime.evaluate', { expression: '[typeof document.all,!!document.all,document.all==null]', returnByValue: true })).result.value, ['undefined', false, true]);
     const { root } = await send('DOM.getDocument');
     const { nodeId } = await send('DOM.querySelector', { nodeId: root.nodeId, selector: '#target' });
     const { model } = await send('DOM.getBoxModel', { nodeId });

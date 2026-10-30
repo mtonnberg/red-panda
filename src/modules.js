@@ -123,7 +123,7 @@ export function installModuleScripts(page, window) {
     resolved ??= mappedSpecifier(normalized, imports);
     if (resolved === undefined && !candidate) throw new TypeError(`Unmapped bare module specifier: ${specifier}`);
     const url = new URL(resolved ?? candidate.href);
-    if (!['http:', 'https:', 'data:'].includes(url.protocol)) throw new TypeError(`Unsupported module URL scheme: ${url.protocol}`);
+    if (!['http:', 'https:', 'data:', 'blob:'].includes(url.protocol)) throw new TypeError(`Unsupported module URL scheme: ${url.protocol}`);
     return url.href;
   }
   function compile(source, url, identifier = url, base = url) {

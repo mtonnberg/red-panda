@@ -1,57 +1,22 @@
 import vm from 'node:vm';
 import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { createMessagingRealm, installMessaging } from './messaging.js';
+import { resolveBlobURL } from './blob-urls.js';
+import { GEOMETRY_SOURCE } from './geometry.js';
+import { installNavigator } from './navigator.js';
 
-// Dedicated worker support. Shared workers, nested workers and MessagePort
-// transfer fail explicitly. Blob/File/SharedArrayBuffer message cloning and
-// blob: worker URLs are unsupported. importScripts has an 8MiB response limit.
+// Dedicated worker support. Shared workers and nested workers fail explicitly.
+// Channels and transferred ports use real Node endpoints with realm adapters.
+// Blob/File/SharedArrayBuffer message cloning and
+// importScripts has an 8MiB response limit.
 // Worker networking is buffered, with per-fetch AbortSignal and document abort.
 // The VM worker global is an API boundary, not a
 // security sandbox for hostile code. HTTP CORS/CSP policy remains a browser gap.
 const SYNC_BYTES = 8 * 1024 * 1024;
-const cloneSource = `(${function realmClone(value, seen = new Map()) {
-  if (value === null || typeof value !== 'object') return value;
-  if (seen.has(value)) return seen.get(value);
-  const tag = Object.prototype.toString.call(value);
-  let result;
-  if (tag === '[object ArrayBuffer]') { result = new ArrayBuffer(value.byteLength); new Uint8Array(result).set(new Uint8Array(value)); }
-  else if (ArrayBuffer.isView(value)) {
-    const buffer = realmClone(value.buffer, seen);
-    result = tag === '[object DataView]' ? new DataView(buffer, value.byteOffset, value.byteLength) : new globalThis[value.constructor.name](buffer, value.byteOffset, value.length);
-  } else if (tag === '[object Date]') result = new Date(value.getTime());
-  else if (tag === '[object RegExp]') result = new RegExp(value.source, value.flags);
-  else if (tag === '[object Map]') { result = new Map(); seen.set(value, result); for (const [key, item] of value) result.set(realmClone(key, seen), realmClone(item, seen)); }
-  else if (tag === '[object Set]') { result = new Set(); seen.set(value, result); for (const item of value) result.add(realmClone(item, seen)); }
-  else if (tag === '[object Error]') result = Object.assign(new Error(value.message), { name: value.name, stack: value.stack });
-  else if (Array.isArray(value)) { result = []; seen.set(value, result); for (const item of value) result.push(realmClone(item, seen)); }
-  else { result = {}; seen.set(value, result); for (const key of Object.keys(value)) Object.defineProperty(result, key, { value: realmClone(value[key], seen), enumerable: true, writable: true, configurable: true }); }
-  seen.set(value, result); return result;
-}})`;
-
-function transfers(value) {
-  const list = Array.isArray(value) ? value : value?.transfer ?? [];
-  if (!Array.isArray(list)) throw new TypeError('Transfer list must be an array');
-  for (const item of list) if (Object.prototype.toString.call(item) !== '[object ArrayBuffer]') {
-    throw new DOMException('Only ArrayBuffer transfer is supported', 'DataCloneError');
-  }
-  return list;
-}
-
-function validateClone(value, seen = new Set()) {
-  if (value === null || typeof value !== 'object' || seen.has(value)) return;
-  seen.add(value);
-  const tag = Object.prototype.toString.call(value);
-  if (ArrayBuffer.isView(value)) validateClone(value.buffer, seen);
-  else if (tag === '[object Map]') { for (const [key, item] of value) { validateClone(key, seen); validateClone(item, seen); } }
-  else if (tag === '[object Set]') { for (const item of value) validateClone(item, seen); }
-  else if (tag === '[object Object]' || tag === '[object Array]') { for (const key of Object.keys(value)) validateClone(value[key], seen); }
-  else if (!ArrayBuffer.isView(value) && !['[object ArrayBuffer]', '[object Date]', '[object RegExp]', '[object Error]'].includes(tag)) {
-    throw new DOMException(`Unsupported worker structured clone type: ${tag}`, 'DataCloneError');
-  }
-}
-
 export function installWorkers(page, window, { enabled = true } = {}) {
   const signal = page.documentAbort?.signal, owned = new Set();
-  const clone = window.eval(cloneSource);
+  const messaging = installMessaging(page, window);
+  const clone = value => messaging.receive({ data: value, ports: [] }).data;
   let disposed = false;
   const active = () => !disposed && !signal?.aborted && !page.closed;
   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
@@ -62,8 +27,9 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       super();
       if (!active()) throw new window.DOMException('The document is disposed', 'InvalidStateError');
       const url = new URL(String(input), window.document.baseURI);
-      if (!['http:', 'https:', 'data:'].includes(url.protocol)) throw new window.DOMException(`Unsupported worker URL: ${url.protocol}`, 'NotSupportedError');
-      if (url.protocol !== 'data:' && window.location.origin !== 'null' && url.origin !== window.location.origin) throw new window.DOMException('Worker URL must have the document origin', 'SecurityError');
+      if (!['http:', 'https:', 'data:', 'blob:'].includes(url.protocol)) throw new window.DOMException(`Unsupported worker URL: ${url.protocol}`, 'NotSupportedError');
+      const origin = page.securityOrigin ?? window.location.origin;
+      if (url.protocol !== 'data:' && origin !== 'null' && url.origin !== origin) throw new window.DOMException('Worker URL must have the document origin', 'SecurityError');
       const type = options.type ?? 'classic';
       if (!['classic', 'module'].includes(type)) throw new TypeError('Worker type must be classic or module');
       const credentials = options.credentials ?? 'same-origin';
@@ -71,18 +37,19 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       // A disabled resource policy intentionally creates an inert Worker, as
       // observed in native serve/fetch defaults; no script request is issued.
       if (!enabled) return;
+      let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
       this.#thread = new ThreadWorker(new URL(import.meta.url), {
         // File-backed workers must not inherit an embedding CLI's --input-type
         // or --eval flags. Only the VM-module capability is needed here.
         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
         redPandaWorker: true, url: url.href, type, name: String(options.name ?? ''),
-        navigator: { userAgent: window.navigator.userAgent, language: window.navigator.language,
+        navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
           languages: [...window.navigator.languages], platform: window.navigator.platform },
       } });
       owned.add(this);
       this.#thread.on('message', async message => {
-        if (this.#terminated || !active()) return;
-        if (message.kind === 'message') this.dispatchEvent(new window.MessageEvent('message', { data: clone(message.data) }));
+        if (this.#terminated || !active()) { for (const port of message.ports ?? []) port.close(); return; }
+        if (message.kind === 'message') messaging.dispatchMessage(this, message);
         else if (message.kind === 'error') {
           const error = new window.Error(message.error.message); error.name = message.error.name; error.stack = message.error.stack;
           const event = new window.ErrorEvent('error', { message: error.message, filename: message.error.filename || url.href, error, cancelable: true });
@@ -100,9 +67,12 @@ export function installWorkers(page, window, { enabled = true } = {}) {
               if (referrer) headers.set('referer', referrer);
             }
             const combined = AbortSignal.any([...(signal ? [signal] : []), this.#abort.signal, requestAbort.signal]);
+            const blobSnapshot = message.script && message.url === url.href ? startupBlob : undefined;
+            if (blobSnapshot) startupBlob = undefined;
             const response = await page.fetch(message.url, { ...message.init, headers, signal: combined,
               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
               credentialsOrigin: url.origin,
+              ...(blobSnapshot ? { blobSnapshot } : {}),
             }, message.script ? 'Script' : 'Fetch');
             const bytes = new Uint8Array(await response.arrayBuffer());
             const result = { status: response.status, statusText: response.statusText,
@@ -128,6 +98,9 @@ export function installWorkers(page, window, { enabled = true } = {}) {
           if (this.dispatchEvent(event)) page.emit('pageError', error);
         }
       });
+      this.#thread.on('messageerror', () => {
+        if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
+      });
       this.#thread.once('exit', () => { owned.delete(this); this.#abort.abort(); this.#terminated = true; });
       // Installing a message listener refs Node's underlying MessagePort; unref
       // after installing listeners so workers cannot hold server shutdown open.
@@ -135,9 +108,11 @@ export function installWorkers(page, window, { enabled = true } = {}) {
     }
     postMessage(data, transfer) {
       if (!this.#terminated && active()) {
-        validateClone(data);
-        if (this.#thread) this.#thread.postMessage({ kind: 'message', data }, transfers(transfer));
-        else structuredClone(data, { transfer: transfers(transfer) });
+        if (this.#thread) {
+          const prepared = messaging.prepare(data, transfer);
+          try { this.#thread.postMessage({ kind: 'message', ...prepared.message }, prepared.transfer); prepared.commit(); }
+          catch (error) { if (error?.name === 'DataCloneError') throw new window.DOMException(error.message, 'DataCloneError'); throw error; }
+        } else messaging.discard(data, transfer);
       }
     }
     terminate() {
@@ -164,7 +139,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
 
 async function runWorker() {
   const pending = new Map(), queued = [];
-  let requestId = 1, ready = false, closed = false, context, emit, clone;
+  let requestId = 1, ready = false, closed = false, context, emit, messaging;
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
   const request = (url, init = {}, script = false, signal) => new Promise((resolve, reject) => {
@@ -186,8 +161,17 @@ async function runWorker() {
   };
   const timers = new Map(); let timerId = 1;
   const bridge = {
-    postMessage(data, transfer) { if (!closed) { validateClone(data); parentPort.postMessage({ kind: 'message', data }, transfers(transfer)); } },
-    close() { if (!closed) { closed = true; for (const handle of timers.values()) clearTimeout(handle); timers.clear(); parentPort.postMessage({ kind: 'close' }); parentPort.close(); } },
+    postMessage(data, transfer) {
+      if (!closed) {
+        const prepared = messaging.prepare(data, transfer);
+        parentPort.postMessage({ kind: 'message', ...prepared.message }, prepared.transfer); prepared.commit();
+      }
+    },
+    close() { if (!closed) {
+      closed = true; for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose();
+      for (const message of queued) for (const port of message.ports ?? []) port.close(); queued.length = 0;
+      parentPort.postMessage({ kind: 'close' }); parentPort.close();
+    } },
     report,
     timer(callback, delay, args, repeat) {
       const id = timerId++;
@@ -217,7 +201,7 @@ async function runWorker() {
       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
       Object.defineProperty(response, 'url', { value: result.url }); return response;
     },
-    structuredClone(value, options) { validateClone(value); return clone(structuredClone(value, { transfer: transfers(options) })); },
+    structuredClone(value, options) { return messaging.clone(value, options); },
     console(type, args) { parentPort.postMessage({ kind: 'console', type, args }); },
   };
   const sandbox = { __bridge: bridge, __url: workerData.url, __name: workerData.name, __navigator: workerData.navigator,
@@ -225,9 +209,10 @@ async function runWorker() {
     AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
     atob, btoa };
   context = vm.createContext(sandbox);
-  vm.runInContext(`
+  vm.runInContext(`(function () {
+    const trustedEvents = new WeakSet();
     class Event {
-      constructor(type, init = {}) { this.type = String(type); this.bubbles = Boolean(init.bubbles); this.cancelable = Boolean(init.cancelable); this.defaultPrevented = false; this.target = null; this.currentTarget = null; }
+      constructor(type, init = {}) { this.type = String(type); this.bubbles = Boolean(init.bubbles); this.cancelable = Boolean(init.cancelable); this.defaultPrevented = false; this.target = null; this.currentTarget = null; Object.defineProperty(this, 'isTrusted', { enumerable: true, get: () => trustedEvents.has(this) }); }
       preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
       stopPropagation() {} stopImmediatePropagation() { this.__stopped = true; }
     }
@@ -237,10 +222,11 @@ async function runWorker() {
       constructor() { this.__listeners = new Map(); }
       addEventListener(type, callback, options = {}) { if (!callback) return; type = String(type); const list = this.__listeners.get(type) ?? []; if (!list.some(item => item.callback === callback)) list.push({ callback, once: Boolean(options?.once), signal: options?.signal }); this.__listeners.set(type, list); }
       removeEventListener(type, callback) { const list = this.__listeners.get(String(type)); if (list) this.__listeners.set(String(type), list.filter(item => item.callback !== callback)); }
-      dispatchEvent(event) { const receiver = this.__globalRoot ?? this; event.target = receiver; event.currentTarget = receiver; for (const item of [...this.__listeners.get(event.type) ?? []]) { if (item.signal?.aborted) continue; if (item.once) this.removeEventListener(event.type, item.callback); try { typeof item.callback === 'function' ? item.callback.call(receiver, event) : item.callback.handleEvent(event); } catch(error) { __dispatchError(error); } if (event.__stopped) break; } const handler = this['on' + event.type]; if (typeof handler === 'function' && !event.__stopped) { try { if (handler.call(receiver, event) === true && event.type === 'error') event.preventDefault(); } catch(error) { __dispatchError(error); } } return !event.defaultPrevented; }
+      dispatchEvent(event) { const receiver = this.__globalRoot ?? this; event.target = receiver; event.currentTarget = receiver; for (const item of [...this.__listeners.get(event.type) ?? []]) { if (item.signal?.aborted) continue; if (item.once) this.removeEventListener(event.type, item.callback); try { typeof item.callback === 'function' ? item.callback.call(receiver, event) : item.callback.handleEvent(event); } catch(error) { __dispatchError(error); } if (event.__stopped) break; } const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (typeof handler === 'function' && !event.__stopped) { try { if (handler.call(receiver, event) === true && event.type === 'error') event.preventDefault(); } catch(error) { __dispatchError(error); } } event.currentTarget = null; return !event.defaultPrevented; }
     }
     Object.assign(globalThis, { Event, MessageEvent, ErrorEvent, EventTarget });
     globalThis.self = globalThis; globalThis.name = __name;
+    Object.assign(globalThis, { onmessage: null, onmessageerror: null, onerror: null });
     const target = new EventTarget(); target.__globalRoot = globalThis;
     for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = target[name].bind(target);
     globalThis.dispatchEvent = event => { for (const key of ['onmessage', 'onmessageerror', 'onerror']) target[key] = globalThis[key]; return target.dispatchEvent(event); };
@@ -249,8 +235,8 @@ async function runWorker() {
     globalThis.postMessage = (data, transfer) => __bridge.postMessage(data, transfer);
     globalThis.close = () => __bridge.close();
     globalThis.importScripts = (...urls) => __bridge.importScripts(...urls);
-    globalThis.setTimeout = function(callback, delay, ...args) { return __bridge.timer(callback, delay, args, false); };
-    globalThis.setInterval = function(callback, delay, ...args) { return __bridge.timer(callback, delay, args, true); };
+    globalThis.setTimeout = function(callback, delay = 0, ...args) { return __bridge.timer(callback, delay, args, false); };
+    globalThis.setInterval = function(callback, delay = 0, ...args) { return __bridge.timer(callback, delay, args, true); };
     globalThis.clearTimeout = globalThis.clearInterval = id => __bridge.clear(id);
     globalThis.queueMicrotask = callback => __bridge.microtask(callback);
     globalThis.fetch = async (input, init) => __bridge.fetch(input, init);
@@ -262,11 +248,21 @@ async function runWorker() {
     const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
     Object.assign(globalThis, { WorkerNavigator, navigator: nav });
     globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
-    globalThis.MessageChannel = class MessageChannel { constructor() { throw new DOMException('MessagePort transfer is not implemented', 'NotSupportedError'); } };
-    globalThis.__emitMessage = data => dispatchEvent(new MessageEvent('message', { data }));
-  `, context);
-  clone = vm.runInContext(cloneSource, context);
+    const createTrustedMessage = (type, data, ports) => { const event = new MessageEvent(type, { data, ports }); trustedEvents.add(event); return event; };
+    globalThis.__createTrustedMessage = createTrustedMessage;
+    globalThis.__emitMessage = (data, ports) => dispatchEvent(createTrustedMessage('message', data, ports));
+  })();`, context);
   emit = vm.runInContext('__emitMessage', context);
+  const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
+  messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
+    active: () => !closed,
+    dispatch: (target, type, data, ports) => target.dispatchEvent(createTrustedMessage(type, data, ports)),
+    reportError: value => dispatchError(value),
+  });
+  Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
+  installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+  vm.runInContext(GEOMETRY_SOURCE, context);
+  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;', context);
   const dispatchError = value => vm.runInContext('__dispatchError', context)(value);
   parentPort.on('message', message => {
     if (closed) return;
@@ -274,7 +270,7 @@ async function runWorker() {
       const entry = pending.get(message.id); if (!entry) return; pending.delete(message.id); entry.cleanup();
       message.error ? entry.reject(new Error(message.error)) : entry.resolve(message.result);
     } else if (message.kind === 'message') {
-      if (!ready) queued.push(message.data); else emit(clone(message.data));
+      if (!ready) queued.push(message); else { const event = messaging.receive(message); emit(event.data, event.ports); }
     }
   });
   process.on('unhandledRejection', dispatchError);
@@ -285,8 +281,7 @@ async function runWorker() {
     context.__resolvedURL = result.url;
     vm.runInContext('globalThis.location = new WorkerLocation(new URL(__resolvedURL)); delete globalThis.__resolvedURL;', context);
     const source = new TextDecoder().decode(result.bytes);
-    if (workerData.type === 'module') {
-      if (!vm.SourceTextModule) throw new Error('Module workers require Node --experimental-vm-modules');
+    {
       const modules = new Map(), evaluations = new WeakMap();
       let linking = Promise.resolve();
       const validateModule = result => {
@@ -298,12 +293,17 @@ async function runWorker() {
         return new URL(specifier, parent.identifier).href;
       };
       const attributes = value => { if (Object.keys(value?.attributes ?? value ?? {}).length) throw new TypeError('Worker module import attributes are not supported'); };
-      const compile = (source, url) => new vm.SourceTextModule(source, { context, identifier: url,
-        initializeImportMeta(meta) { meta.url = url; },
-        importModuleDynamically: async (specifier, parent, extra) => { attributes(extra); const module = await load(specifierURL(specifier, parent)); await evaluate(module); return module; } });
+      const dynamicImport = async (specifier, parent, extra) => {
+        attributes(extra); const module = await load(specifierURL(specifier, parent)); await evaluate(module); return module;
+      };
+      const compile = (source, url) => {
+        if (!vm.SourceTextModule) throw new Error('Worker module imports require Node --experimental-vm-modules');
+        return new vm.SourceTextModule(source, { context, identifier: url,
+          initializeImportMeta(meta) { meta.url = url; }, importModuleDynamically: dynamicImport });
+      };
       const load = url => {
         if (!modules.has(url)) modules.set(url, request(url, {}, true).then(result => {
-          if (result.status < 200 || result.status >= 300) throw new Error(`Worker module load failed (${result.status}): ${url}`);
+          if (result.status < 200 || result.status >= 300) throw new TypeError('Abort', { cause: new Error(`Worker module load failed (${result.status}): ${url}`) });
           validateModule(result);
           return compile(new TextDecoder().decode(result.bytes), result.url);
         }));
@@ -316,13 +316,16 @@ async function runWorker() {
         if (!evaluations.has(module)) evaluations.set(module, module.evaluate());
         return evaluations.get(module);
       };
-      validateModule(result);
-      const root = compile(source, workerData.url); modules.set(workerData.url, Promise.resolve(root));
-      await evaluate(root);
-    } else vm.runInContext(source, context, { filename: workerData.url,
-      importModuleDynamically() { throw new TypeError('Dynamic imports in classic workers are not implemented'); } });
+      if (workerData.type === 'module') {
+        validateModule(result);
+        const root = compile(source, workerData.url); modules.set(workerData.url, Promise.resolve(root));
+        await evaluate(root);
+      } else vm.runInContext(source, context, { filename: workerData.url,
+        importModuleDynamically: (specifier, _script, extra) => dynamicImport(specifier, { identifier: workerData.url }, extra),
+      });
+    }
     ready = true;
-    for (const data of queued) { if (!closed) emit(clone(data)); }
+    for (const message of queued) { if (!closed) { const event = messaging.receive(message); emit(event.data, event.ports); } }
     queued.length = 0;
   } catch (error) { dispatchError(error); }
 }
