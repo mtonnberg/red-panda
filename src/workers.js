@@ -1,5 +1,6 @@
+import {workerSocketPolicy} from './worker-socket-policy.js';
 import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
-import {completeWorkerSyncResponse,createSyncWorkerRequest} from './worker-sync-transport.js';
+import {completeWorkerSyncResponse,createSyncWorkerRequest,completeWorkerSocketPolicy,createSyncWorkerSocketPolicy} from './worker-sync-transport.js';
 import {installServiceWorkerRealm} from './service-workers.js';
 import {installCache,cacheStoreFor} from './cache.js';
 import { broadcastConfig } from "./broadcast-config.js";
@@ -84,6 +85,10 @@ export function installWorkers(page, window, { enabled = true } = {}) {
         } else if (message.kind === 'console') page.emit('console', { type: message.type, args: clone(message.args) });
         else if (message.kind === 'close') this.terminate();
         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
+        else if(message.kind==='socketPolicy'){
+          try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(page,message.url));}
+          catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
+        }
         else if (message.kind === 'request') {
           const requestAbort = new AbortController();
           this.#requests.set(message.id, requestAbort);
@@ -299,7 +304,7 @@ async function runWorker() {
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
   vm.runInContext(GEOMETRY_SOURCE, context);
-  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
 

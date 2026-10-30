@@ -1,0 +1,461 @@
+--- /dev/null
++++ b/src/element-scroll.js
+@@ -0,0 +1,15 @@
++// Real Element scroll state is kept in the pinned DOM implementation. Clamp
++// only axes with resolvable explicit sizes, matching the native surrogate.
++import {resolveFlowLength} from './flow-metrics.js';
++function interfaces(window,bridge){
++ const number=value=>{const n=Number(value);return Number.isFinite(n)?n:0};
++ function perform(element,x,y,relative){bridge.brand(element);const current=bridge.read(element);let left=current.left,top=current.top;if(x!==null&&typeof x==='object'){if(x.left!==undefined)left=(relative?left:0)+number(x.left);if(x.top!==undefined)top=(relative?top:0)+number(x.top);}else{if(x!==undefined)left=(relative?left:0)+number(x);if(y!==undefined)top=(relative?top:0)+number(y);}bridge.write(element,left,top);}
++ return{scroll:function scroll(x=undefined,y=undefined){perform(this,x,y,false)},scrollTo:function scrollTo(x=undefined,y=undefined){perform(this,x,y,false)},scrollBy:function scrollBy(x=undefined,y=undefined){perform(this,x,y,true)}};
++}
++export function installElementScroll(window,ownerLayout){
++ const proto=window.Element.prototype,top=Object.getOwnPropertyDescriptor(proto,'scrollTop'),left=Object.getOwnPropertyDescriptor(proto,'scrollLeft');
++ const clamp=(element,value,axis)=>{value=Number.isFinite(value)?Math.max(0,value):0;const layout=ownerLayout(element),css=layout.rawComputedStyle(element),explicit=resolveFlowLength(css[axis==='left'?'width':'height'],layout.viewport);if(explicit!==undefined){const extent=axis==='left'?layout.scrollWidth(element):layout.scrollHeight(element),size=layout.dimension(element,axis==='left'?'width':'height');value=Math.min(value,Math.max(0,extent-size));}return value;};
++ const bridge={brand:element=>top.get.call(element),read:element=>({top:top.get.call(element),left:left.get.call(element)}),write(element,x,y){left.set.call(element,clamp(element,x,'left'));top.set.call(element,clamp(element,y,'top'));}};
++ for(const[axis,descriptor]of[['top',top],['left',left]])Object.defineProperty(proto,axis==='top'?'scrollTop':'scrollLeft',{...descriptor,set(value){descriptor.set.call(this,value);descriptor.set.call(this,clamp(this,descriptor.get.call(this),axis));}});
++ const methods=window.eval(`(${interfaces.toString()})`)(window,bridge);for(const[name,value]of Object.entries(methods))Object.defineProperty(proto,name,{configurable:true,enumerable:true,writable:true,value});
++}
+--- /dev/null
++++ b/src/flow-metrics.js
+@@ -0,0 +1,5 @@
++// Measured native surrogate length and text-height arithmetic. Text contributes
++// a measured line height only when the element has a resolvable explicit width;
++// words are indivisible and line-height declarations are not used by this model.
++export function resolveFlowLength(value,viewport={},basis){const m=/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px|%|pt|pc|in|cm|mm|q|vw|vh)?$/i.exec(value?.trim()??'');if(!m)return undefined;const unit=(m[2]??'px').toLowerCase(),factors={px:1,pt:96/72,pc:16,in:96,cm:96/2.54,mm:96/25.4,q:96/101.6,vw:viewport.width/100,vh:viewport.height/100,'%':basis===undefined?undefined:basis/100};const factor=factors[unit];return factor===undefined?undefined:Math.fround(Number(m[1])*factor);}
++export function nativeTextHeight(text,width,fontSize,nowrap=false){const words=String(text).trim().split(/\s+/).filter(Boolean);if(!words.length||width===undefined||width<=0)return 0;let lines=1,line=0;const unit=fontSize*0.6;for(const word of words){const advance=word.length*unit;if(!nowrap&&line&&line+unit+advance>width){lines++;line=advance;}else line+=line?unit+advance:advance;}return Math.ceil(lines*fontSize*1.2);}
+--- /dev/null
++++ b/src/horizontal-layout.js
+@@ -0,0 +1,54 @@
++import{resolveFlowLength}from './flow-metrics.js';
++// Independent horizontal model of the measured headless native layout. Intrinsic
++// advances, used box widths and scrollable extents are deliberately separate:
++// the target does not implement a general CSS rendering/layout engine.
++import {createRequire} from 'node:module';
++import {hasSpecifiedStyle,getSpecifiedStyle} from './styles.js';
++const require=createRequire(import.meta.url);
++const {implForWrapper,wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const blocks=new Set(['block','flow-root','flex','grid','list-item']);
++const replaced=new Set(['img','input','textarea','select','button','video','audio','canvas','iframe','object','embed']);
++const clipped=value=>value&&!['visible','clip'].includes(value);
++
++function physicalParent(node){const impl=implForWrapper(node);return impl?._assignedSlot?wrapperForImpl(impl._assignedSlot):node.parentElement??node.getRootNode().host??null;}
++function visualChildren(node){const impl=implForWrapper(node);if(impl?._shadowRoot)return [...wrapperForImpl(impl._shadowRoot).children];if(node.localName==='slot'&&impl?._assignedNodes?.length)return impl._assignedNodes.filter(n=>n.nodeType===1).map(wrapperForImpl);return [...(node.children??[])];}
++export function rawTranslation(value){let x=0;for(const match of String(value??'').matchAll(/([\w-]+)\(([^()]*)\)/g)){const name=match[1].toLowerCase(),args=match[2].trim().split(/\s*,\s*|\s+/);let part;if(name==='matrix'&&args.length===6)part=/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(args[4])?Number(args[4]):undefined;else if(name==='matrix3d'&&args.length===16)part=Number(args[12]);else if((name==='translatex'&&args.length===1)||(name==='translate'&&args.length<=2)||(name==='translate3d'&&args.length===3)){const token=args[0];if(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)px$/i.test(token)||/^[+-]?0(?:\.0+)?$/.test(token))part=Number.parseFloat(token);}if(Number.isFinite(part))x+=part;}return x;}
++
++export function createHorizontalLayout(window,{style,hidden,viewportWidth}){
++ const length=(value,basis)=>resolveFlowLength(value,{width:viewportWidth,height:window.innerHeight},basis);
++ const widths=new WeakMap(),intrinsics=new WeakMap(),floors=new WeakMap(),allocations=new WeakMap(),scrolls=new WeakMap(),advances=new WeakMap();
++ const css=node=>style(node),outOfFlow=node=>['absolute','fixed'].includes(css(node).position),isFlex=node=>['flex','inline-flex'].includes(css(node).display),isRow=node=>isFlex(node)&&!String(css(node).flexDirection).startsWith('column');
++ function children(node){const result=[];for(const child of visualChildren(node)){if(hidden(child)||outOfFlow(child))continue;if(css(child).display==='contents')result.push(...children(child));else result.push(child);}return result;}
++ function layoutParent(node){let p=physicalParent(node);while(p&&css(p).display==='contents')p=physicalParent(p);return p;}
++ function isItem(node){const p=layoutParent(node);return p&&(isFlex(p)||['grid','inline-grid'].includes(css(p).display))&&!outOfFlow(node);}
++ function isContainer(node){const s=css(node);return s.display!=='contents'&&(s.display!=='inline'||(s.float&&s.float!=='none')||outOfFlow(node)||isItem(node));}
++ function containingBlock(node){for(let p=physicalParent(node);p;p=physicalParent(p))if(isContainer(p))return p;return null;}
++ function margins(node,basis){const s=css(node);return(length(s.marginLeft,basis)??0)+(length(s.marginRight,basis)??0);}
++ function clamp(node,value,basis){const s=css(node),min=length(s.minWidth,basis)??0,max=length(s.maxWidth,basis);return Math.max(min,Math.min(max??Infinity,Math.max(0,value)));}
++ function content(node,measure){let maximum=0,line=0;const row=isRow(node);for(const child of children(node)){const v=measure(child);if(!row&&blocks.has(css(child).display)){maximum=Math.max(maximum,line,v);line=0;}else line+=v;}return Math.max(maximum,line);}
++ function intrinsic(node,floor=false){if(hidden(node))return 0;const cache=floor?floors:intrinsics;if(cache.has(node))return cache.get(node);const s=css(node);let value=length(s.width);if(value===undefined){if(floor&&clipped(s.overflowX))value=5;else value=Math.max(5,content(node,child=>intrinsic(child,floor)+margins(child)));}value=clamp(node,value);cache.set(node,value);return value;}
++ function baseWidth(node,basis){const s=css(node),fixed=length(s.width,basis);return clamp(node,fixed??intrinsic(node),basis);}
++ function allocate(row){if(allocations.has(row))return allocations.get(row);const result=new WeakMap();allocations.set(row,result);const available=width(row),items=children(row),bases=items.map(item=>{const s=css(item),grow=Math.max(0,Number.parseFloat(s.flexGrow)||0),explicit=length(s.width,available);return {node:item,grow,shrink:s.flexShrink!=='0',base:grow>0&&explicit===undefined?0:baseWidth(item,available),margin:margins(item,available),floor:hasSpecifiedStyle(item,'min-width')||clipped(s.overflowX)?0:content(item,child=>intrinsic(child,true)+margins(child))||5};});
++  let free=available-bases.reduce((sum,item)=>sum+item.base+item.margin,0);const totalGrow=bases.reduce((sum,item)=>sum+item.grow,0);const sizes=bases.map(item=>item.base);
++  if(free>0&&totalGrow)for(let i=0;i<bases.length;i++)sizes[i]+=free*bases[i].grow/totalGrow;
++  else if(free<0&&!['wrap','wrap-reverse'].includes(css(row).flexWrap)){
++   let active=bases.map((item,i)=>item.shrink&&item.base>item.floor?i:-1).filter(i=>i>=0),deficit=-free;
++   for(let pass=0;active.length&&deficit>1e-9&&pass<=bases.length;pass++){
++    const total=active.reduce((sum,i)=>sum+bases[i].base,0);if(!total)break;let removed=0;
++    for(const i of active){const amount=Math.min(sizes[i]-bases[i].floor,deficit*bases[i].base/total);sizes[i]-=amount;removed+=amount;}
++    deficit-=removed;active=active.filter(i=>sizes[i]>bases[i].floor+1e-9);if(!removed)break;
++   }
++  }
++  for(let i=0;i<bases.length;i++){const item=bases[i];let value=sizes[i];if(item.grow&&value<=0)value=intrinsic(item.node);result.set(item.node,clamp(item.node,value,available));}return result;
++ }
++ function width(node){if(widths.has(node))return widths.get(node);if(hidden(node)){widths.set(node,0);return 0;}const s=css(node);if(s.display==='contents'){widths.set(node,0);return 0;}if(node===window.document.documentElement||node===window.document.body){const value=length(s.width,viewportWidth)??viewportWidth;widths.set(node,value);return value;}
++  const parent=layoutParent(node);if(parent&&isRow(parent)&&!outOfFlow(node)){const value=allocate(parent).get(node);if(value!==undefined){widths.set(node,value);return value;}}
++  const cb=containingBlock(node),basis=cb?width(cb):viewportWidth,explicit=length(s.width,basis);let value=explicit;
++  if(value===undefined){const shrink=replaced.has(node.localName)||['inline','inline-block','inline-flex','inline-grid','table','inline-table'].includes(s.display)||(s.float&&s.float!=='none')||outOfFlow(node)||['max-content','min-content','fit-content'].includes(s.width);value=shrink?intrinsic(node):Math.max(0,basis-margins(node,basis));}
++  value=clamp(node,value,basis);widths.set(node,value);return value;
++ }
++ function advance(node){if(advances.has(node))return advances.get(node);const value=hidden(node)?0:length(css(node).width)??5;advances.set(node,value);return value;}
++ function scroll(node){if(scrolls.has(node))return scrolls.get(node);if(hidden(node))return 0;const own=width(node);if(node===window.document.body||node===window.document.documentElement)return own;const basis=own||undefined;const extent=content(node,child=>{const s=css(child),nominal=length(s.width,basis)??width(child),overflow=clipped(s.overflowX)?nominal:scroll(child);return Math.max(nominal,overflow)+margins(child,basis);});const value=Math.max(own,extent);scrolls.set(node,value);return value;}
++ function translation(node){return rawTranslation(getSpecifiedStyle(node,'transform')??'none');}
++ return{width,intrinsic,advance,scroll,translation};
++}
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,10 +1,15 @@
++import{installElementScroll}from './element-scroll.js';
++import {resolveFlowLength,nativeTextHeight} from './flow-metrics.js';
++import {createHorizontalLayout} from './horizontal-layout.js';
+ import {refreshMediaQueries} from './media.js';
+ // Independent surrogate geometry for a headless DOM. This intentionally models
+ // the reference's measured simple boxes; it is not a CSS layout renderer.
+-import { getStyleRevision } from './styles.js';
++import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision } from './styles.js';
+ import { createRequire } from 'node:module';
+ const require = createRequire(import.meta.url);
++const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
+ const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const LAYOUTS=new WeakMap(),COMPUTED_VIEWS=new WeakMap();
+ const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
+ const hiddenTags = new Set(['head', 'style', 'script', 'template', 'meta', 'link', 'title', 'base']);
+ const blockTags = new Set(['html', 'body', 'div', 'p', 'main', 'section', 'article', 'aside', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'blockquote']);
+@@ -29,14 +34,17 @@
+   let width = optionDimension(options.width ?? 1920, 'Viewport width');
+   let height = optionDimension(options.height ?? 1080, 'Viewport height');
+   let scrollX = 0, scrollY = 0;
+-  let cachedKey, cached;
++  let cachedKey, cached, cachedFastKey;
++  const dimension=value=>resolveFlowLength(value,{width,height});
+   const identities = new WeakMap();
+   let nextIdentity = 1;
+ 
+   function snapshot() {
+     const document = window.document;
++    const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,implForWrapper(document)._version,width,height]);
++    if(fastKey!==null&&cachedFastKey===fastKey)return cached;
+     const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
+-    const stack = [document], shadowRoots = [], tokens = [width, height, getStyleRevision(window)];
++    const stack = [document], shadowRoots = [], tokens = [width, height, styleRevision??getStyleRevision(window)];
+     while (stack.length || shadowRoots.length) {
+       if (!stack.length) stack.push(shadowRoots.shift());
+       const node = stack.pop();
+@@ -55,7 +63,7 @@
+     if (key === cachedKey) return cached;
+     let documentHeight = nodes.length * 5;
+     const style = node => {
+-      if (!computed.has(node)) computed.set(node, rawComputedStyle(node));
++      if(!computed.has(node)){const projected=getLayoutStyle(node);if(projected)computed.set(node,projected);else{const raw=rawComputedStyle(node);computed.set(node,new Proxy(raw,{get(target,key){if(key==='display')return target.display||'inline';if(key==='float')return target.float||'none';if(key==='position')return target.position||'static';return Reflect.get(target,key,target);}}));}}
+       return computed.get(node);
+     };
+     function isHidden(node) {
+@@ -69,6 +77,8 @@
+       const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
+       hidden.set(node, result); return result;
+     }
++    const textHeight=node=>nativeTextHeight([...node.childNodes].filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(style(node).width),Number.parseFloat(style(node).fontSize)||16,style(node).whiteSpace==='nowrap'||style(node).textWrap==='nowrap'||style(node).textWrapMode==='nowrap');
++    const horizontal=createHorizontalLayout(window,{style,hidden:isHidden,viewportWidth:width});
+     function size(node) {
+       if (sizes.has(node)) return sizes.get(node);
+       let value;
+@@ -80,15 +90,15 @@
+         const explicitWidth = dimension(declaration.width);
+         const explicitHeight = dimension(declaration.height);
+         let childHeight = 0;
+-        for (const child of node.childNodes) childHeight += sizes.get(child)?.height ?? 0;
+-        childHeight = Math.max(5, childHeight);
++        for(const child of node.children??[])if(!isHidden(child))childHeight+=dimension(style(child).height)??5;
++        childHeight = Math.max(5, childHeight,textHeight(node));
+         let advance = 0;
+         for (const child of node.childNodes) advance += sizes.get(child)?.advance ?? sizes.get(child)?.width ?? 0;
+         advance = explicitWidth ?? Math.max(5, advance);
+         const block = blockTags.has(node.localName) && !['inline', 'inline-block'].includes(declaration.display);
+         value = {
+-          advance,
+-          width: explicitWidth ?? (block ? width : advance),
++          advance: horizontal.advance(node),
++          width: horizontal.width(node),
+           height: explicitHeight ?? (['html', 'body'].includes(node.localName) ? documentHeight : childHeight),
+         };
+       }
+@@ -98,13 +108,14 @@
+       if (positions.has(node)) return positions.get(node);
+       if (isHidden(node)) { positions.set(node, ZERO); return ZERO; }
+       const parent = node.parentNode ?? node.host;
+-      const parentX = parent ? positions.get(parent).x : 0;
++      const parentX = parent ? position(parent).x : 0;
+       let x = parentX;
+       for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) x += size(sibling).advance ?? size(sibling).width;
++      if(node.nodeType===1)x+=horizontal.translation(node);
+       const value = rectValue(x, order.get(node) * 5, size(node).width, size(node).height);
+       positions.set(node, value); return value;
+     }
+-    for (const node of nodes) isHidden(node);
++
+     // Native document extents differ from individual computed boxes. The
+     // measured root uses inline child advances and nested inline overflow;
+     // stylesheet-only dimensions still affect individual element rectangles.
+@@ -119,14 +130,13 @@
+         documentHeight = Math.max(documentHeight, order.get(node) * 5 + inlineHeight);
+       }
+     }
+-    for (let index = nodes.length - 1; index >= 0; index--) size(nodes[index]);
+-    for (const node of nodes) position(node);
++
+     function record(node) {
+       if (!order.has(node) || isHidden(node)) return { rect: rectValue(0, 0, 0, 0), rendered: false };
+       return { rect: position(node), rendered: true };
+     }
+-    cachedKey = key;
+-    cached = { nodes, style, record };
++    cachedKey = key;cachedFastKey=fastKey;
++    cached = { nodes, style, record, horizontal, isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of node.children??[])if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
+     return cached;
+   }
+ 
+@@ -193,6 +203,11 @@
+   }
+   return {
+     rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollIntoView,
++    absoluteRect:node=>snapshot().record(node).rect,
++    dimension:(node,axis)=>snapshot().dimension(node,axis),
++    rendered:node=>snapshot().isRendered(node),
++    scrollWidth:node=>snapshot().nodes.includes(node)?snapshot().horizontal.scroll(node):0,
++    scrollHeight:node=>snapshot().nodes.includes(node)&&snapshot().record(node).rendered?snapshot().contentHeight(node):0,
+     scrollBy(x, y) { scrollTo(scrollX + Number(x || 0), scrollY + Number(y || 0)); },
+     get scroll() { return { x: scrollX, y: scrollY }; },
+     get documentSize() { return documentSize(); },
+@@ -216,19 +231,27 @@
+ 
+ export function installLayout(page, window, options = {}) {
+   const layout = createLayout(window, options);
+-  const domRect = value => new window.DOMRect(value.x, value.y, value.width, value.height);
++  LAYOUTS.set(implForWrapper(window.document),layout);
++  const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
++  const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
++  installElementScroll(window,ownedLayout);
++  const Rect=window.DOMRect;
++  const domRect=value=>new Rect(value.x,value.y,value.width,value.height);
+   const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
+-  define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(layout.rect(this)); } });
+-  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(window, layout.rects(this).map(domRect)); } });
++  define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
++  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(window, ownedLayout(this).rects(this).map(domRect)); } });
+   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
+-    define(window.HTMLElement.prototype, name, { get() { return Math.trunc(layout.rect(this)[dimension]); } });
++    define(window.HTMLElement.prototype, name, { get() { return ownedLayout(this).dimension(this,dimension); } });
+   }
+   for (const [name, dimension] of [['clientWidth', 'width'], ['clientHeight', 'height']]) {
+-    define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement ? layout.viewport[dimension] : layout.rect(this)[dimension]); } });
++    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).viewport[dimension] : ownedLayout(this).dimension(this,dimension)); } });
+   }
+   for (const [name, dimension] of [['scrollWidth', 'width'], ['scrollHeight', 'height']]) {
+-    define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement ? layout.documentSize[dimension] : layout.rect(this)[dimension]); } });
+-  }
++    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):ownedLayout(this).scrollHeight(this)); } });
++  }
++  define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
++  define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
++  define(window.HTMLElement.prototype,'offsetLeft',{get(){return ownedLayout(this).absoluteRect(this).x;}});
+   define(window.Document.prototype, 'elementFromPoint', { writable: true, value(x, y) { return layout.hitTest(Number(x), Number(y)); } });
+   define(window.Document.prototype, 'elementsFromPoint', { writable: true, value(x, y) { return layout.elementsFromPoint(Number(x), Number(y)); } });
+   define(window, 'innerWidth', { get: () => layout.viewport.width });
+@@ -237,16 +260,17 @@
+   const scrollArguments = (x, y) => typeof x === 'object' && x !== null ? [x.left ?? layout.scroll.x, x.top ?? layout.scroll.y] : [x, y];
+   window.scroll = window.scrollTo = (x, y) => layout.scrollTo(...scrollArguments(x, y));
+   window.scrollBy = (x, y) => layout.scrollBy(...(typeof x === 'object' && x !== null ? [x.left ?? 0, x.top ?? 0] : [x, y]));
+-  define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { layout.scrollIntoView(this); } });
+-  define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { layout.scrollIntoView(this); } });
+-  const computedViews = new WeakMap();
++  define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { ownedLayout(this).scrollIntoView(this); } });
++  define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { ownedLayout(this).scrollIntoView(this); } });
++  const computedViews = COMPUTED_VIEWS;
+   window.getComputedStyle = (node, pseudoElement) => {
+-    const original = layout.rawComputedStyle(node, pseudoElement);
++    const model=ownedLayout(node);
++    const original = model.rawComputedStyle(node, pseudoElement);
+     if (computedViews.has(original)) return computedViews.get(original);
+     const computed = name => {
+       if (name === 'width' || name === 'height') {
+-        const specified = original.getPropertyValue(name); if (/var\(/.test(specified)) return specified;
+-        return layout.rects(node).length ? `${layout.rect(node)[name]}px` : 'auto';
++        const specified = original.getPropertyValue(name); if(specified&&specified!=='auto')return specified;
++        return model.rendered(node) ? `${model.dimension(node,name)}px` : 'auto';
+       }
+       return original.getPropertyValue(name);
+     };
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -188,10 +188,10 @@
+ }
+ function compiled(record,source) {
+  let parsed=record.cache.get(source);if(parsed)return parsed;
+- parsed=parseSelector(source,{window:record.window,emitPredicate(item){const index=record.predicates.push(item)-1;return `:${internal}(${index})`;}});record.cache.set(source,parsed);return parsed;
++ const emitted=[];parsed=parseSelector(source,{window:record.window,emitPredicate(item){const index=record.predicates.push(item)-1,text=`:${internal}(${index})`;emitted.push({item,text});return text;}});if(emitted.length===1&&parsed.compiled===emitted[0].text)parsed.primitive=emitted[0].item;record.cache.set(source,parsed);return parsed;
+ }
+ function matcher(record){
+- if(record.matcher){record.matcher.Snapshot.root=record.document.documentElement;return record.matcher;}
++ if(record.matcher){record.matcher.Snapshot.root=wrapperForImpl(record.documentImpl.documentElement);return record.matcher;}
+  const engine=nwsapi({document:record.document,DOMException:record.window.DOMException});engine.configure({LOGERRORS:false,VERBOSITY:true,IDS_DUPES:true,MIXEDCASE:true,FORGIVING:false});
+  engine.Snapshot.rpPredicate=(element,index)=>predicate(record,element,record.predicates[index]);
+  engine.registerSelector(internal,new RegExp('^:'+internal+'\\((\\d+)\\)(.*)'),(match,source)=>({source:`if(s.rpPredicate(e,${Number(match[1])})){${source}}`,status:true}));
+@@ -199,7 +199,7 @@
+  record.matcher=engine;return engine;
+ }
+ function match(record,selector,element,scope=element){
+- const parsed=compiled(record,selector);if(!record.document.documentElement)return false;
++ const parsed=compiled(record,selector);if(!record.documentImpl.documentElement)return false;if(parsed.primitive)return predicate(record,element,parsed.primitive);
+  const engine=matcher(record),previous=engine.Snapshot.from;engine.Snapshot.from=scope;
+  try{return engine.match(parsed.compiled,element);}finally{engine.Snapshot.from=previous;}
+ }
+@@ -228,7 +228,7 @@
+  const document=implForWrapper(window.document);const current=RECORDS.get(document);if(current)return current.controller;
+  const signal=page?.documentAbort?.signal;
+  if(page?.closed||signal?.aborted)throw new window.DOMException('Cannot register selectors on a closed document','InvalidStateError');
+- const record={window,document:window.document,providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
++ const record={window,document:window.document,documentImpl:document,providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
+  const dispose=()=>{if(record.disposed)return;record.disposed=true;if(RECORDS.get(document)===record)RECORDS.delete(document);signal?.removeEventListener('abort',dispose);page?.off?.('close',dispose);};
+  if(signal)signal.addEventListener('abort',dispose,{once:true});else page?.once?.('close',dispose);
+  record.controller={dispose,selectorForSpecificity};return record.controller;
+@@ -250,3 +250,6 @@
+  if(!record)return element.matches(selector);
+  try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}
+ }
++
++// Host cascade code may reuse its genuine document record and scoping root.
++export function createScopedMatcher(document,scope=document.documentElement){const record=RECORDS.get(implForWrapper(document));if(!record)return(selector,element)=>element.matches(selector);return(selector,element)=>{try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}};}
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,6 +1,6 @@
+ import {computedTransform,computedFontSize} from './computed-values.js';
+ import {evaluateMedia} from './media.js';
+-import { selectorForSpecificity, getSelectorStateRevision, matchesInScope } from './selectors.js';
++import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher } from './selectors.js';
+ import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
+ import { createRequire } from 'node:module';
+ 
+@@ -23,6 +23,8 @@
+ const SHEETS = new WeakMap();
+ const ADOPTED = new WeakMap();
+ const STYLE_NODES = new WeakMap();
++const SELECTOR_PARTS=new WeakMap();
++function ruleSelectorParts(rule){let retained=SELECTOR_PARTS.get(rule);if(!retained||retained.text!==rule.selectorText){retained={text:rule.selectorText,parts:splitTopLevel(rule.selectorText)};SELECTOR_PARTS.set(rule,retained);}return retained.parts;}
+ const IDENTITIES = new WeakMap();
+ let identity = 0;
+ const id = value => { if (!IDENTITIES.has(value)) IDENTITIES.set(value, ++identity); return IDENTITIES.get(value); };
+@@ -86,6 +88,10 @@
+ const registryPrototype=require('jsdom/lib/jsdom/living/custom-elements/CustomElementRegistry-impl.js').implementation.prototype;
+ const defineCustomElement=registryPrototype.define;
+ registryPrototype.define=function(...args){const result=defineCustomElement.apply(this,args);const record=recordFor(this._globalObject.document);if(record)record.stateRevision++;return result;};
++
++const elementBackend=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation.prototype;
++const attachShadowBackend=elementBackend.attachShadow;
++elementBackend.attachShadow=function(...args){const result=attachShadowBackend.apply(this,args);const record=recordFor(wrapperForImpl(this._ownerDocument));if(record)record.scopeRevision=(record.scopeRevision??0)+1;return result;};
+ 
+ const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
+ StyleElementImpl.prototype._updateAStyleBlock = function () {
+@@ -427,6 +433,7 @@
+ 
+ function cascade(record, element) {
+   const values = new Map(); let order = 0;
++  const matchSelector=createScopedMatcher(record.document,record.document.documentElement);record.badStyleSelectors??=new Set();
+   const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
+   const registerLayer=(parent,name,key)=>{
+     if(!name){const node={children:new Map()};parent.children.set(key,node);return node;}
+@@ -482,10 +489,12 @@
+   };
+   const offerSelector=(selectorText,style,origin,layer=layerRoot)=>{
+     let highest=null;
+-    for(const selector of splitTopLevel(selectorText)) {
++    record.selectorParts??=new Map();let parts=record.selectorParts.get(selectorText);if(!parts){parts=splitTopLevel(selectorText);record.selectorParts.set(selectorText,parts);}
++    for(const selector of parts) {
+       if(/:host|::slotted|::part/.test(selector)){record.unsupported.add(':host, ::slotted and ::part selectors');continue;}
+-      try{if(matchesInScope(element,selector,record.document.documentElement)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
+-      catch{record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
++      if(record.badStyleSelectors.has(selector))continue;
++      try{if(matchSelector(selector,element)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
++      catch(error){if(error?.name==='SyntaxError')record.badStyleSelectors.add(selector);record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
+     }
+     if(highest)offer(style,highest,origin,false,layer);
+   };
+@@ -493,7 +502,7 @@
+     if(depth>32)return;
+     for (const rule of rules) {
+       if(rule.selectorText&&rule.style) {
+-        const selector=splitTopLevel(rule.selectorText).map(part=>resolveNested(part,parent)).join(', ');
++        const selector=parent?ruleSelectorParts(rule).map(part=>resolveNested(part,parent)).join(', '):rule.selectorText;
+         offerSelector(selector,rule.style,origin,layer);
+         if(rule.cssRules?.length)walk(rule.cssRules,origin,selector,layer,depth);
+       } else if(nestedGroupContents(rule)) {
+@@ -512,12 +521,12 @@
+   const root = rootOf(element);
+   for(const{sheet}of authorSheets)walk(sheet.cssRules,1);
+   offer(element.style, [0, 0, 0], 1, true);
+-  const chosen = new Map();
++  const chosen = new Map();chosen.orderKeys=new Map();
+   for (const [property, candidates] of values) {
+     candidates.sort((a, b) => compare(b.key, a.key));
+     let winner = candidates[0];
+     if (winner.value.toLowerCase() === 'revert' || winner.value.toLowerCase() === 'revert-layer') winner = candidates.find(candidate => candidate.origin === 0);
+-    if (winner) chosen.set(property, winner.overflowPart === undefined ? winner.value : { value: winner.value, overflowPart: winner.overflowPart });
++    if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key);}
+   }
+   return chosen;
+ }
+@@ -555,7 +564,7 @@
+   if (retained?.token === token) return retained.style;
+   const parent = inheritanceParent(element);
+   const parentStyle = parent ? compute(record, parent, memo) : null;
+-  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, { token, style: result });
++  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, { token, style: result, specified: chosen });
+   const custom = new Map(), resolved = new Map();
+   if (parentStyle) for (let index = 0; index < parentStyle.length; index++) if (parentStyle[index].startsWith('--')) custom.set(parentStyle[index], parentStyle.getPropertyValue(parentStyle[index]));
+   for (const [property, value] of chosen) if (property.startsWith('--')) {
+@@ -654,15 +663,13 @@
+   const record = recordFor(window?.document);
+   if (!record) return 0;
+   const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, record.window.location.href, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
+-  const visit = root => {
+-    tokens.push(id(root), implForWrapper(root)._version);
+-    for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
+-    for (const element of root.querySelectorAll('*')) {
+-      const shadow = implForWrapper(element)._shadowRoot;
+-      if (shadow) visit(wrapperForImpl(shadow));
+-    }
+-  };
+-  visit(record.document);
++  const discoveryKey=JSON.stringify([record.scopeRevision??0,implForWrapper(record.document)._version,...(record.scopeRoots??[]).map(root=>[id(root),implForWrapper(root)._version])]);
++  if(discoveryKey!==record.scopeDiscoveryKey){
++    const roots=[],slots=[];const discover=root=>{roots.push(root);for(const element of root.querySelectorAll('*')){const implementation=implForWrapper(element);if(element.localName==='slot')slots.push(implementation);if(implementation._shadowRoot)discover(wrapperForImpl(implementation._shadowRoot));}};discover(record.document);record.scopeRoots=roots;record.scopeSlots=slots;
++    record.scopeDiscoveryKey=JSON.stringify([record.scopeRevision??0,implForWrapper(record.document)._version,...roots.map(root=>[id(root),implForWrapper(root)._version])]);
++  }
++  for(const root of record.scopeRoots){tokens.push(id(root),implForWrapper(root)._version);for(const{sheet,media}of scopeSheets(record,root))tokens.push(media,sheetFingerprint(sheet));}
++  for(const slot of record.scopeSlots)tokens.push(id(slot),(slot._assignedNodes??[]).map(id));
+   const signature = JSON.stringify(tokens);
+   if (signature !== record.signature) { record.signature = signature; record.revision++; }
+   return record.revision;
+@@ -746,3 +753,27 @@
+   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
+   return record.controller;
+ }
++
++// Host-only projection over the same real cascade, used while building all
++// surrogate boxes. It avoids allocating a full public CSS declaration for
++// every node when only flow properties are needed.
++const FLOW_PROPERTIES=['display','position','float','width','height','min-width','max-width','margin-left','margin-right','flex-grow','flex-shrink','flex-direction','flex-wrap','overflow-x','overflow-y','visibility','pointer-events','opacity','direction','font-size','white-space','text-wrap','text-wrap-mode'];
++export function getLayoutStyle(element){
++ const record=recordFor(element.ownerDocument);if(!record)return null;
++ const token=localToken(record,element);record.layoutMemo??=new WeakMap();const retained=record.layoutMemo.get(element);if(retained?.token===token)return retained.style;
++ const parent=inheritanceParent(element),parentStyle=parent?getLayoutStyle(parent):null,chosen=cascade(record,element),style=Object.create(null);
++ const propertyKey=name=>name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
++ for(const name of FLOW_PROPERTIES){const key=propertyKey(name),fallback=initial[name]??'',parentValue=parentStyle?.[key]||fallback;let value=chosen.get(name);if(typeof value==='object')value=value.value;const keyword=value?.toLowerCase();if(value===undefined||keyword==='unset')value=inherited.has(name)?parentValue:fallback;else if(keyword==='inherit')value=parentValue;else if(keyword==='initial')value=fallback;if(['display','position','float','visibility','pointer-events'].includes(name))value=value.toLowerCase();style[key]=value;}
++ const fontRoot=element===record.document.documentElement?'16px':record.layoutMemo.get(record.document.documentElement)?.style.fontSize??'16px';style.fontSize=computedFontSize(style.fontSize,parentStyle?.fontSize,fontRoot,{isRoot:element===record.document.documentElement});
++ const flow=chosen.get('flex-flow');if(typeof flow==='string'){const parts=flow.toLowerCase().split(/\s+/),directions=['row','row-reverse','column','column-reverse'],wraps=['wrap','wrap-reverse','nowrap'];if(parts.length<=2&&parts.every(p=>directions.includes(p)||wraps.includes(p))){for(const[property,key,value]of[['flex-direction','flexDirection',parts.find(p=>directions.includes(p))??'row'],['flex-wrap','flexWrap',parts.find(p=>wraps.includes(p))??'nowrap']]){const explicit=chosen.orderKeys.get(property);if(!explicit||compare(chosen.orderKeys.get('flex-flow'),explicit)>0)style[key]=value;}}}
++ const directions=style.direction==='rtl'?['marginRight','marginLeft']:['marginLeft','marginRight'];
++ const physicalKeys={marginLeft:chosen.orderKeys.get('margin-left'),marginRight:chosen.orderKeys.get('margin-right')};
++ for(const name of ['margin-inline','margin-inline-start','margin-inline-end']){const value=chosen.get(name);if(typeof value!=='string')continue;const parts=splitTopLevel(value.replace(/\t|\n|\r|\f/g,' '),' ').filter(Boolean);if(!parts.length||parts.length>2)continue;const pairs=name==='margin-inline'?[[directions[0],parts[0]],[directions[1],parts[1]??parts[0]]]:[[directions[name.endsWith('start')?0:1],parts[0]]];for(const[key,entry]of pairs){const order=chosen.orderKeys.get(name);if(!physicalKeys[key]||compare(order,physicalKeys[key])>0){style[key]=entry;physicalKeys[key]=order;}}}
++ let x=style.overflowX==='overlay'?'auto':style.overflowX,y=style.overflowY==='overlay'?'auto':style.overflowY;if(![x,y].every(v=>v==='visible'||v==='clip')){x=x==='visible'?'auto':x==='clip'?'hidden':x;y=y==='visible'?'auto':y==='clip'?'hidden':y;}style.overflowX=x;style.overflowY=y;
++ if(element===record.document.documentElement)style.display=({inline:'block','inline-block':'block','inline-flex':'flex','inline-grid':'grid',contents:'block'})[style.display]??style.display;
++ record.layoutMemo.set(element,{token,style,specified:chosen});return style;
++}
++export function getSpecifiedStyle(element,name){const record=recordFor(element.ownerDocument);if(!record)return element.style?.getPropertyValue(name)||undefined;getLayoutStyle(element);return record.layoutMemo.get(element)?.specified.get(name);}
++export function hasSpecifiedStyle(element,name){const record=recordFor(element.ownerDocument);if(!record)return !!element.style?.getPropertyValue(name);getLayoutStyle(element);return record.layoutMemo.get(element)?.specified.has(name)??false;}
++
++export function getLayoutCacheRevision(window){return recordFor(window.document)?getStyleRevision(window):undefined;}
+--- /dev/null
++++ b/test/flow-layout.test.js
+@@ -0,0 +1,14 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{EventEmitter}from'node:events';import{JSDOM}from'jsdom';
++const load=name=>import('../src/'+name+'.js');const[{installStyles},{installSelectors},{installGeometry},{installMedia},{installLayout},{installShadowDOM}]=await Promise.all(['styles','selectors','geometry','media','layout','shadow'].map(load));
++function fixture(t){const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});const dom=new JSDOM('<!doctype html><head><style>.preset{color:green}.preset::before{color:red;content:"before"}</style></head><body></body>',{url:'https://example.test/',runScripts:'dangerously',beforeParse(w){installShadowDOM(page,w);installSelectors(page,w);installStyles(page,w);installGeometry(w);installMedia(page,w);installLayout(page,w);}});t.after(()=>{page.documentAbort.abort();dom.window.close()});return{w:dom.window,d:dom.window.document,page};}
++for(const[name,source,evidence]of[['horizontal','controls.js','native-controls.json'],['vertical','vertical-controls.js','vertical-native-controls.json'],['raw sibling advances','advance-controls.js','advance-native-controls.json'],['word metrics, CSS units, flex shorthands and scroll state','additional-controls.js','additional-native-controls.json']])test('actual '+name+' matches bounded public native observations',async t=>{const{w}=fixture(t),expression=await readFile(new URL('../proposals/css-layout/'+source,import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../proposals/css-layout/'+evidence,import.meta.url),'utf8'));const actual=w.eval(expression);assert.deepEqual(JSON.parse(JSON.stringify(actual)),expected.result);});
++
++test('intrinsic floors redistribute shrinking while explicit min widths clamp the resulting box',t=>{const{d}=fixture(t),row=d.createElement('div'),a=d.createElement('div'),b=d.createElement('div'),child=d.createElement('div');row.style.cssText='display:flex;width:600px';a.style.width='400px';b.style.width='400px';child.style.width='350px';a.append(child);row.append(a,b);d.body.append(row);assert.deepEqual([a.offsetWidth,b.offsetWidth],[350,250]);child.remove();a.style.minWidth='350px';assert.deepEqual([a.offsetWidth,b.offsetWidth],[350,300]);a.style.minWidth='0px';b.style.flexShrink='0';assert.deepEqual([a.offsetWidth,b.offsetWidth],[200,400]);});
++test('actual display:contents and logical margins participate in one row allocation',t=>{const{d}=fixture(t),row=d.createElement('div'),wrap=d.createElement('div'),fixed=d.createElement('div'),pane=d.createElement('div');row.style.cssText='display:flex;width:700px';wrap.style.display='contents';fixed.style.cssText='width:80px;flex-shrink:0;margin-inline:10px 20px';pane.style.flex='1';wrap.append(fixed);row.append(wrap,pane);d.body.append(row);assert.equal(wrap.offsetWidth,0);assert.equal(pane.offsetWidth,590);fixed.style.marginLeft='0px';assert.equal(pane.offsetWidth,600);});
++test('borrowed scrolling methods mutate the actual receiving document and honor independent extents',t=>{const first=fixture(t),second=fixture(t),a=first.d.createElement('div'),b=second.d.createElement('div');for(const[box,d,size]of[[a,first.d,450],[b,second.d,700]]){box.style.cssText='width:100px;height:100px';const child=d.createElement('div');child.style.cssText='width:'+size+'px;height:'+size+'px';box.append(child);d.body.append(box);}first.w.Element.prototype.scrollTo.call(b,9999,9999);assert.deepEqual([b.scrollLeft,b.scrollTop],[600,600]);assert.deepEqual([a.scrollLeft,a.scrollTop],[0,0]);first.w.Element.prototype.scrollBy.call(b,{left:-10,top:-20});assert.deepEqual([b.scrollLeft,b.scrollTop],[590,580]);b.scrollTop=-3;assert.equal(b.scrollTop,0);assert.equal(first.w.Element.prototype.scrollTo instanceof first.w.Function,true);});
++test('offset ancestry uses actual positioned/table/hidden/shadow ancestors',t=>{const{d}=fixture(t),host=d.createElement('div'),child=d.createElement('div');d.body.append(host);host.attachShadow({mode:'closed'}).append(child);assert.equal(child.offsetParent,d.body);host.style.position='relative';assert.equal(child.offsetParent,host);child.style.position='fixed';assert.equal(child.offsetParent,null);child.style.position='';host.style.display='none';assert.equal(child.offsetParent,null);});
++test('surrogate word wrapping uses real font and width changes without measuring free text',t=>{const{d}=fixture(t),e=d.createElement('div');e.textContent='alpha beta gamma delta epsilon zeta';d.body.append(e);assert.equal(e.clientHeight,5);e.style.width='100px';const wrapped=e.clientHeight;assert.ok(wrapped>20);e.style.whiteSpace='nowrap';assert.equal(e.clientHeight,20);e.style.fontSize='8px';assert.equal(e.clientHeight,10);e.style.height='0px';assert.equal(e.clientHeight,0);assert.equal(e.scrollHeight,10);});
++
++test('cached boxes invalidate for CharacterData and private manual slot changes without synthetic attributes',t=>{const{d}=fixture(t),text=d.createElement('div');text.style.width='100px';text.textContent='alpha';d.body.append(text);assert.equal(text.clientHeight,20);text.firstChild.data='alpha beta gamma delta epsilon zeta';assert.ok(text.clientHeight>20);const host=d.createElement('div'),child=d.createElement('span');host.append(child);d.body.append(host);const root=host.attachShadow({mode:'closed',slotAssignment:'manual'}),a=d.createElement('slot'),b=d.createElement('slot');b.style.display='none';root.append(a,b);a.assign(child);assert.equal(child.offsetWidth,5);b.assign(child);assert.equal(child.offsetWidth,0);a.assign(child);assert.equal(child.offsetWidth,5);assert.equal(child.attributes.length,0);});
++
++test('borrowed geometry/computed getters use actual owner boxes and preserve measured realm allocation',t=>{const a=fixture(t),b=fixture(t),p=b.d.createElement('div'),e=b.d.createElement('div');p.style.width='640px';p.append(e);b.d.body.append(p);const getter=Object.getOwnPropertyDescriptor(a.w.HTMLElement.prototype,'offsetWidth').get;assert.equal(getter.call(e),640);const own=b.w.getComputedStyle(e),borrowed=a.w.getComputedStyle(e);assert.equal(borrowed.width,'640px');assert.equal(borrowed,own);const r=a.w.Element.prototype.getBoundingClientRect.call(e);assert.equal(r.width,640);assert.equal(r instanceof a.w.DOMRect,true);assert.equal(r instanceof b.w.DOMRect,false);assert.throws(()=>getter.call({}),error=>error instanceof a.w.TypeError);});

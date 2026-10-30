@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
-import {Browser} from '../src/browser.js';
+import { Browser } from '../src/browser.js';
 import vm from 'node:vm';
-import {installWebSocket} from '../src/worker-websocket.js';
-import {installWorkerXHR} from '../src/worker-xhr.js';
+import { installWebSocket } from '../src/worker-websocket.js';
+import { installWorkerXHR } from '../src/worker-xhr.js';
 
 const plain=value=>JSON.parse(JSON.stringify(value));
 const deadline=(promise,ms=7000)=>new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Owned worker probe deadline')),ms);Promise.resolve(promise).then(value=>{clearTimeout(timer);resolve(value)},error=>{clearTimeout(timer);reject(error)})});
@@ -23,9 +23,15 @@ async function fixture(t,{host='127.0.0.1'}={}){
     if(url.pathname==='/empty'){response.setHeader('content-length','0');response.end();return}
     if(url.pathname==='/network-failure'){response.destroy();return}
     if(url.pathname==='/cors'){
-      response.setHeader('access-control-allow-origin',request.headers.origin??'null');response.setHeader('access-control-allow-methods','PUT');response.setHeader('access-control-allow-headers','x-real');
+      response.setHeader('access-control-allow-origin',url.searchParams.has('wildcard')?'*':request.headers.origin??'null');response.setHeader('access-control-allow-credentials','true');response.setHeader('access-control-allow-methods','PUT');response.setHeader('access-control-allow-headers','x-real');
       if(request.method==='OPTIONS'){response.writeHead(204);response.end();return}
+      if(url.searchParams.has('report')){response.setHeader('content-type','application/json');response.end(JSON.stringify({cookie:request.headers.cookie??'',origin:request.headers.origin,method:request.method,bytes:[...body]}));return}
       response.setHeader('content-type','application/octet-stream');response.setHeader('x-hidden','actual-but-not-exposed');response.end(body);return;
+    }
+    if(url.pathname==='/multipart'){
+      const form=await new Request('http://owned.test/multipart',{method:'POST',headers:request.headers,body}).formData(),entries=[];
+      for(const[name,value]of form)entries.push(typeof value==='string'?{name,text:value}:{name,filename:value.name,type:value.type,bytes:[...new Uint8Array(await value.arrayBuffer())]});
+      response.setHeader('content-type','application/json');response.end(JSON.stringify({entries}));return;
     }
     if(url.pathname==='/cors-denied'){response.end('actual but forbidden response bytes');return}
     if(url.pathname==='/slow'){const timer=setTimeout(()=>{timers.delete(timer);if(!response.destroyed)response.end('actual late bytes')},120);timers.add(timer);return}
@@ -33,15 +39,16 @@ async function fixture(t,{host='127.0.0.1'}={}){
   });
   server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket))});
   const wss=new WebSocketServer({noServer:true,handleProtocols:list=>list.has('actual')?'actual':false});
+  wss.on('headers',headers=>headers.push('Set-Cookie: handshake_cookie=ignored; Path=/; HttpOnly'));
   server.on('upgrade',(request,socket,head)=>{upgrades.push({url:request.url,headers:request.headers});if(request.url==='/reject'){socket.end('HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n');return}wss.handleUpgrade(request,socket,head,client=>wss.emit('connection',client,request))});
   wss.on('connection',(socket,request)=>{connections.push({socket,headers:request.headers});socket.on('message',(bytes,binary)=>socket.send(bytes,{binary}))});
   server.listen(0,'0.0.0.0');await once(server,'listening');const origin=`http://${host}:${server.address().port}`;
   const browser=new Browser(),page=browser.createPage(),errors=[];page.on('pageError',error=>errors.push(String(error.message)));await page.navigate(origin);
   t.after(async()=>{browser.close();for(const timer of timers)clearTimeout(timer);for(const socket of wss.clients)socket.terminate();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve))});
   let next=0;
-  async function run(source,input){
+  async function run(source,input,owner=page){
     const id=String(++next);sources.set(id,`(async()=>{${source}})().then(value=>postMessage({value}),error=>postMessage({failure:{name:error.name,message:error.message,stack:error.stack}}));`);
-    const worker=new page.dom.window.Worker(`/worker.js?id=${id}`);
+    const worker=new owner.dom.window.Worker(`/worker.js?id=${id}`);
     const message=deadline(new Promise((resolve,reject)=>{worker.onmessage=event=>event.data.failure?reject(Object.assign(new Error(event.data.failure.message),event.data.failure)):resolve(event.data.value);worker.onerror=event=>reject(event.error??new Error(event.message))}));
     if(input!==undefined)worker.postMessage(input);
     try{return await message}finally{worker.terminate()}
@@ -154,4 +161,59 @@ test('explicit API controller disposal silently cancels real requests and preven
   sockets.dispose();xhr.dispose();assert.equal(signal.aborted,false);assert.equal(fetches[0].signal.aborted,true);
   assert.throws(()=>new realm.WebSocket('/socket'),error=>error.name==='InvalidStateError');assert.throws(()=>new realm.XMLHttpRequest().open('GET','/bytes'),error=>error.name==='InvalidStateError');
   await new Promise(resolve=>setTimeout(resolve,150));assert.deepEqual(events,[]);assert.equal(f.upgrades.length,0);
+});
+
+test('sync/async cross-origin XHR uses actual credentials and cookie-free preflight requests',async t=>{
+  const f=await fixture(t),cross=f.origin.replace('127.0.0.1','0.0.0.0');
+  // Cookie host must match the destination; ports do not participate in cookie scope.
+  await f.page.context.cookies.setCookie('destination=actual; HttpOnly; Path=/',cross);
+  const actual=await f.run(`const results=[];for(const sync of[false,true])for(const credentials of[false,true]){const x=new XMLHttpRequest();x.open('PUT',${JSON.stringify(cross)}+'/cors?report=1',!sync);x.withCredentials=credentials;x.responseType='json';x.setRequestHeader('x-real','actual');const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(new Uint8Array([0,128,255]));if(done)await done;results.push({sync,credentials,status:x.status,response:x.response})}return results`);
+  for(const result of actual){assert.equal(result.status,200);assert.equal(result.response.cookie,result.credentials?'destination=actual':'');assert.equal(result.response.origin,f.origin);assert.equal(result.response.method,'PUT');assert.deepEqual([...result.response.bytes],[0,128,255])}
+  const preflights=f.requests.filter(request=>request.method==='OPTIONS');assert.equal(preflights.length,4);assert.ok(preflights.every(request=>!request.headers.cookie));
+});
+
+test('denied synchronous credentialed CORS throws a genuine NetworkError without terminal callbacks',async t=>{
+  const f=await fixture(t),cross=f.origin.replace('127.0.0.1','0.0.0.0');
+  const actual=await f.run(`const x=new XMLHttpRequest(),events=[];x.open('GET',${JSON.stringify(cross)}+'/cors?report=1&wildcard=1',false);x.withCredentials=true;for(const type of['load','error','timeout','abort','loadend'])x.addEventListener(type,()=>events.push(type));let failure,message;try{x.send()}catch(error){failure=error.name;message=error.message}return{failure,message,status:x.status,events}`);
+  assert.deepEqual(plain(actual),{failure:'NetworkError',message:'A network error occurred',status:0,events:[]});
+});
+
+test('sync/async multipart upload preserves binary File bytes, duplicate keys and actual line endings',async t=>{
+  const f=await fixture(t),actual=await f.run(`const results=[];for(const sync of[false,true]){const form=new FormData();form.append('line','a\\nb\\rc\\r\\nd');form.append('duplicate','one');form.append('duplicate','two');form.append('file',new File([new Uint8Array([0,128,255])],'café"\\r\\n.bin',{type:'application/octet-stream'}));const x=new XMLHttpRequest();x.open('POST','/multipart',!sync);x.responseType='json';const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(form);if(done)await done;results.push({sync,status:x.status,response:x.response})}return results`);
+  const entries=[{name:'line',text:'a\r\nb\r\nc\r\nd'},{name:'duplicate',text:'one'},{name:'duplicate',text:'two'},{name:'file',filename:'café"\r\n.bin',type:'application/octet-stream',bytes:[0,128,255]}];
+  for(const result of actual){assert.equal(result.status,200);assert.deepEqual(plain(result.response),{entries})}
+  for(const request of f.requests.filter(request=>request.url==='/multipart')){assert.match(request.headers['content-type'],/^multipart\/form-data; boundary=/);const bytes=Buffer.from(request.bytes);assert.ok(bytes.includes(Buffer.from([0,128,255])));assert.ok(bytes.toString('utf8').includes('filename="café%22%0D%0A.bin"'))}
+});
+
+test('binary Blob uploads bypass authored reader method overrides and retain their real bytes',async t=>{
+  const f=await fixture(t),actual=await f.run(`const blob=new Blob([new Uint8Array([0,128,255])],{type:'application/octet-stream'});Object.defineProperty(blob,'type',{value:'text/fake'});Blob.prototype.arrayBuffer=async()=>new Uint8Array([99]).buffer;FileReaderSync.prototype.readAsArrayBuffer=()=>new Uint8Array([88]).buffer;const results=[];for(const sync of[false,true]){const x=new XMLHttpRequest();x.open('POST','/echo',!sync);x.responseType='arraybuffer';const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(blob);if(done)await done;results.push([...new Uint8Array(x.response)])}return results`);
+  assert.deepEqual(plain(actual),[[0,128,255],[0,128,255]]);
+  assert.ok(f.requests.filter(request=>request.url==='/echo').every(request=>request.headers['content-type']==='application/octet-stream'));
+});
+
+test('socket headers use actual cookies and UA/language while ignoring extra and CLI HTTP headers',async t=>{
+  const f=await fixture(t);await f.page.context.cookies.setCookie('root_cookie=actual; Path=/',f.origin);await f.page.context.cookies.setCookie('root_http=hidden; HttpOnly; Path=/',f.origin);
+  f.page.userAgent='phase-two-agent';f.page.acceptLanguage='zz-ZZ';f.page.extraHTTPHeaders.set('x-policy','from-cdp');f.page.extraHTTPHeaders.set('accept-language','xx-XX');f.page.cliHTTPHeaders.set('x-policy','forced');
+  const result=await f.run(`navigator.userAgent='fake';const socket=new WebSocket('/socket');return await new Promise(resolve=>{socket.onopen=()=>socket.send('real');socket.onmessage=event=>{socket.close();resolve(event.data)}})`);
+  assert.equal(result,'real');const headers=f.connections[0].headers;assert.equal(headers.cookie,'root_cookie=actual; root_http=hidden');assert.equal(headers['user-agent'],'phase-two-agent');assert.equal(headers['accept-language'],'zz-ZZ');assert.equal(headers['x-policy'],undefined);assert.equal(headers.origin,f.origin);
+  const cookies=await f.page.context.cookies.getCookieString(f.origin);assert.equal(cookies,'root_cookie=actual; root_http=hidden');
+});
+
+test('socket policy ignores CLI/CDP Cookie overrides and reads the actual scoped cookie jar',async t=>{
+  const f=await fixture(t);await f.page.context.cookies.setCookie('private_cookie=actual; HttpOnly; Path=/',f.origin);f.page.cliHTTPHeaders.set('cookie','cli_cookie=forced');
+  await f.run(`const socket=new WebSocket('/socket');return await new Promise(resolve=>{socket.onopen=()=>{socket.close();resolve(true)}})`);
+  assert.equal(f.connections[0].headers.cookie,'private_cookie=actual');assert.match(await f.page.context.cookies.getCookieString(f.origin),/private_cookie=actual/);
+});
+
+test('socket CookieJar policy remains scoped to the real BrowserContext',async t=>{
+  const f=await fixture(t),context=f.browser.createContext(),second=f.browser.createPage(context);await second.navigate(f.origin);
+  await f.page.context.cookies.setCookie('context_cookie=one; HttpOnly; Path=/',f.origin);await second.context.cookies.setCookie('context_cookie=two; HttpOnly; Path=/',f.origin);
+  const source=`const socket=new WebSocket('/socket');return await new Promise(resolve=>{socket.onopen=()=>{socket.close();resolve(true)}})`;
+  await f.run(source);await f.run(source,undefined,second);
+  assert.deepEqual(f.connections.map(value=>value.headers.cookie),['context_cookie=one','context_cookie=two']);
+});
+
+test('socket Blob uploads use captured public byte readers and preserve actual immutable bytes',async t=>{
+  const f=await fixture(t),actual=await f.run(`const blob=new Blob([new Uint8Array([0,128,255])]);Blob.prototype.arrayBuffer=async()=>new Uint8Array([99]).buffer;const socket=new WebSocket('/socket');socket.binaryType='arraybuffer';return await new Promise(resolve=>{socket.onopen=()=>socket.send(blob);socket.onmessage=event=>{socket.close();resolve([...new Uint8Array(event.data)])}})`);
+  assert.deepEqual(plain(actual),[0,128,255]);
 });

@@ -1,10 +1,15 @@
+import{installElementScroll}from './element-scroll.js';
+import {resolveFlowLength,nativeTextHeight} from './flow-metrics.js';
+import {createHorizontalLayout} from './horizontal-layout.js';
 import {refreshMediaQueries} from './media.js';
 // Independent surrogate geometry for a headless DOM. This intentionally models
 // the reference's measured simple boxes; it is not a CSS layout renderer.
-import { getStyleRevision } from './styles.js';
+import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision } from './styles.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
+const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const LAYOUTS=new WeakMap(),COMPUTED_VIEWS=new WeakMap();
 const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
 const hiddenTags = new Set(['head', 'style', 'script', 'template', 'meta', 'link', 'title', 'base']);
 const blockTags = new Set(['html', 'body', 'div', 'p', 'main', 'section', 'article', 'aside', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'blockquote']);
@@ -29,14 +34,17 @@ export function createLayout(window, options = {}) {
   let width = optionDimension(options.width ?? 1920, 'Viewport width');
   let height = optionDimension(options.height ?? 1080, 'Viewport height');
   let scrollX = 0, scrollY = 0;
-  let cachedKey, cached;
+  let cachedKey, cached, cachedFastKey;
+  const dimension=value=>resolveFlowLength(value,{width,height});
   const identities = new WeakMap();
   let nextIdentity = 1;
 
   function snapshot() {
     const document = window.document;
+    const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,implForWrapper(document)._version,width,height]);
+    if(fastKey!==null&&cachedFastKey===fastKey)return cached;
     const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
-    const stack = [document], shadowRoots = [], tokens = [width, height, getStyleRevision(window)];
+    const stack = [document], shadowRoots = [], tokens = [width, height, styleRevision??getStyleRevision(window)];
     while (stack.length || shadowRoots.length) {
       if (!stack.length) stack.push(shadowRoots.shift());
       const node = stack.pop();
@@ -55,7 +63,7 @@ export function createLayout(window, options = {}) {
     if (key === cachedKey) return cached;
     let documentHeight = nodes.length * 5;
     const style = node => {
-      if (!computed.has(node)) computed.set(node, rawComputedStyle(node));
+      if(!computed.has(node)){const projected=getLayoutStyle(node);if(projected)computed.set(node,projected);else{const raw=rawComputedStyle(node);computed.set(node,new Proxy(raw,{get(target,key){if(key==='display')return target.display||'inline';if(key==='float')return target.float||'none';if(key==='position')return target.position||'static';return Reflect.get(target,key,target);}}));}}
       return computed.get(node);
     };
     function isHidden(node) {
@@ -69,6 +77,8 @@ export function createLayout(window, options = {}) {
       const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
       hidden.set(node, result); return result;
     }
+    const textHeight=node=>nativeTextHeight([...node.childNodes].filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(style(node).width),Number.parseFloat(style(node).fontSize)||16,style(node).whiteSpace==='nowrap'||style(node).textWrap==='nowrap'||style(node).textWrapMode==='nowrap');
+    const horizontal=createHorizontalLayout(window,{style,hidden:isHidden,viewportWidth:width});
     function size(node) {
       if (sizes.has(node)) return sizes.get(node);
       let value;
@@ -80,15 +90,15 @@ export function createLayout(window, options = {}) {
         const explicitWidth = dimension(declaration.width);
         const explicitHeight = dimension(declaration.height);
         let childHeight = 0;
-        for (const child of node.childNodes) childHeight += sizes.get(child)?.height ?? 0;
-        childHeight = Math.max(5, childHeight);
+        for(const child of node.children??[])if(!isHidden(child))childHeight+=dimension(style(child).height)??5;
+        childHeight = Math.max(5, childHeight,textHeight(node));
         let advance = 0;
         for (const child of node.childNodes) advance += sizes.get(child)?.advance ?? sizes.get(child)?.width ?? 0;
         advance = explicitWidth ?? Math.max(5, advance);
         const block = blockTags.has(node.localName) && !['inline', 'inline-block'].includes(declaration.display);
         value = {
-          advance,
-          width: explicitWidth ?? (block ? width : advance),
+          advance: horizontal.advance(node),
+          width: horizontal.width(node),
           height: explicitHeight ?? (['html', 'body'].includes(node.localName) ? documentHeight : childHeight),
         };
       }
@@ -98,13 +108,14 @@ export function createLayout(window, options = {}) {
       if (positions.has(node)) return positions.get(node);
       if (isHidden(node)) { positions.set(node, ZERO); return ZERO; }
       const parent = node.parentNode ?? node.host;
-      const parentX = parent ? positions.get(parent).x : 0;
+      const parentX = parent ? position(parent).x : 0;
       let x = parentX;
       for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) x += size(sibling).advance ?? size(sibling).width;
+      if(node.nodeType===1)x+=horizontal.translation(node);
       const value = rectValue(x, order.get(node) * 5, size(node).width, size(node).height);
       positions.set(node, value); return value;
     }
-    for (const node of nodes) isHidden(node);
+
     // Native document extents differ from individual computed boxes. The
     // measured root uses inline child advances and nested inline overflow;
     // stylesheet-only dimensions still affect individual element rectangles.
@@ -119,14 +130,13 @@ export function createLayout(window, options = {}) {
         documentHeight = Math.max(documentHeight, order.get(node) * 5 + inlineHeight);
       }
     }
-    for (let index = nodes.length - 1; index >= 0; index--) size(nodes[index]);
-    for (const node of nodes) position(node);
+
     function record(node) {
       if (!order.has(node) || isHidden(node)) return { rect: rectValue(0, 0, 0, 0), rendered: false };
       return { rect: position(node), rendered: true };
     }
-    cachedKey = key;
-    cached = { nodes, style, record };
+    cachedKey = key;cachedFastKey=fastKey;
+    cached = { nodes, style, record, horizontal, isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of node.children??[])if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
     return cached;
   }
 
@@ -193,6 +203,11 @@ export function createLayout(window, options = {}) {
   }
   return {
     rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollIntoView,
+    absoluteRect:node=>snapshot().record(node).rect,
+    dimension:(node,axis)=>snapshot().dimension(node,axis),
+    rendered:node=>snapshot().isRendered(node),
+    scrollWidth:node=>snapshot().nodes.includes(node)?snapshot().horizontal.scroll(node):0,
+    scrollHeight:node=>snapshot().nodes.includes(node)&&snapshot().record(node).rendered?snapshot().contentHeight(node):0,
     scrollBy(x, y) { scrollTo(scrollX + Number(x || 0), scrollY + Number(y || 0)); },
     get scroll() { return { x: scrollX, y: scrollY }; },
     get documentSize() { return documentSize(); },
@@ -216,19 +231,27 @@ function clientRectList(window, values) {
 
 export function installLayout(page, window, options = {}) {
   const layout = createLayout(window, options);
-  const domRect = value => new window.DOMRect(value.x, value.y, value.width, value.height);
+  LAYOUTS.set(implForWrapper(window.document),layout);
+  const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
+  const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
+  installElementScroll(window,ownedLayout);
+  const Rect=window.DOMRect;
+  const domRect=value=>new Rect(value.x,value.y,value.width,value.height);
   const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
-  define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(layout.rect(this)); } });
-  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(window, layout.rects(this).map(domRect)); } });
+  define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
+  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(window, ownedLayout(this).rects(this).map(domRect)); } });
   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
-    define(window.HTMLElement.prototype, name, { get() { return Math.trunc(layout.rect(this)[dimension]); } });
+    define(window.HTMLElement.prototype, name, { get() { return ownedLayout(this).dimension(this,dimension); } });
   }
   for (const [name, dimension] of [['clientWidth', 'width'], ['clientHeight', 'height']]) {
-    define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement ? layout.viewport[dimension] : layout.rect(this)[dimension]); } });
+    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).viewport[dimension] : ownedLayout(this).dimension(this,dimension)); } });
   }
   for (const [name, dimension] of [['scrollWidth', 'width'], ['scrollHeight', 'height']]) {
-    define(window.Element.prototype, name, { get() { return Math.trunc(this === window.document.documentElement ? layout.documentSize[dimension] : layout.rect(this)[dimension]); } });
+    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):ownedLayout(this).scrollHeight(this)); } });
   }
+  define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
+  define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
+  define(window.HTMLElement.prototype,'offsetLeft',{get(){return ownedLayout(this).absoluteRect(this).x;}});
   define(window.Document.prototype, 'elementFromPoint', { writable: true, value(x, y) { return layout.hitTest(Number(x), Number(y)); } });
   define(window.Document.prototype, 'elementsFromPoint', { writable: true, value(x, y) { return layout.elementsFromPoint(Number(x), Number(y)); } });
   define(window, 'innerWidth', { get: () => layout.viewport.width });
@@ -237,16 +260,17 @@ export function installLayout(page, window, options = {}) {
   const scrollArguments = (x, y) => typeof x === 'object' && x !== null ? [x.left ?? layout.scroll.x, x.top ?? layout.scroll.y] : [x, y];
   window.scroll = window.scrollTo = (x, y) => layout.scrollTo(...scrollArguments(x, y));
   window.scrollBy = (x, y) => layout.scrollBy(...(typeof x === 'object' && x !== null ? [x.left ?? 0, x.top ?? 0] : [x, y]));
-  define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { layout.scrollIntoView(this); } });
-  define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { layout.scrollIntoView(this); } });
-  const computedViews = new WeakMap();
+  define(window.Element.prototype, 'scrollIntoView', { writable: true, value() { ownedLayout(this).scrollIntoView(this); } });
+  define(window.Element.prototype, 'scrollIntoViewIfNeeded', { writable: true, value() { ownedLayout(this).scrollIntoView(this); } });
+  const computedViews = COMPUTED_VIEWS;
   window.getComputedStyle = (node, pseudoElement) => {
-    const original = layout.rawComputedStyle(node, pseudoElement);
+    const model=ownedLayout(node);
+    const original = model.rawComputedStyle(node, pseudoElement);
     if (computedViews.has(original)) return computedViews.get(original);
     const computed = name => {
       if (name === 'width' || name === 'height') {
-        const specified = original.getPropertyValue(name); if (/var\(/.test(specified)) return specified;
-        return layout.rects(node).length ? `${layout.rect(node)[name]}px` : 'auto';
+        const specified = original.getPropertyValue(name); if(specified&&specified!=='auto')return specified;
+        return model.rendered(node) ? `${model.dimension(node,name)}px` : 'auto';
       }
       return original.getPropertyValue(name);
     };

@@ -1,5 +1,21 @@
 let requestId = 0;
 
+export function completeWorkerSocketPolicy(shared,policy,error) {
+  const state=new Int32Array(shared,0,2),destination=new Uint8Array(shared,8);
+  let encoded=new TextEncoder().encode(JSON.stringify(error?{error:String(error.message??error)}:{policy}));
+  if(encoded.length>destination.length)encoded=new TextEncoder().encode(JSON.stringify({error:'Socket policy exceeds its metadata limit'}));
+  destination.set(encoded.subarray(0,destination.length));Atomics.store(state,1,Math.min(encoded.length,destination.length));Atomics.store(state,0,1);Atomics.notify(state,0);
+}
+export function createSyncWorkerSocketPolicy(port,{maxBytes=1024*1024,timeoutMs=5000}={}) {
+  return url=>{
+    const shared=new SharedArrayBuffer(maxBytes+8),state=new Int32Array(shared,0,2);
+    port.postMessage({kind:'socketPolicy',url,sync:shared});
+    if(Atomics.wait(state,0,0,timeoutMs)==='timed-out'||Atomics.load(state,0)!==1)throw new DOMException('Socket policy did not complete','TimeoutError');
+    const result=JSON.parse(new TextDecoder().decode(new Uint8Array(shared,8,Atomics.load(state,1))));
+    if(result.error)throw new DOMException(result.error,'NetworkError');return result.policy;
+  };
+}
+
 // Both ends use the existing worker request/parent Page.fetch channel. Only the
 // private synchronous envelope adds base64 to retain arbitrary bytes in JSON.
 export function completeWorkerSyncResponse(shared, result, error) {

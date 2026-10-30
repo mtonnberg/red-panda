@@ -1,0 +1,360 @@
+diff --git a/src/worker-xhr.js b/src/worker-xhr.js
+--- a/src/worker-xhr.js
++++ b/src/worker-xhr.js
+@@ -1,3 +1,4 @@
++import { encodeWorkerMultipart, encodeWorkerMultipartSync, readWorkerBlobBytes, workerBlobType } from './worker-multipart.js';
+ const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+ const FORBIDDEN = new Set(['accept-charset','accept-encoding','access-control-request-headers','access-control-request-method','connection','content-length','cookie','cookie2','date','dnt','expect','host','keep-alive','origin','referer','te','trailer','transfer-encoding','upgrade','user-agent','via']);
+ const SIMPLE_RESPONSE = new Set(['cache-control','content-language','content-length','content-type','expires','last-modified','pragma']);
+@@ -10,6 +11,8 @@
+   if (typeof evaluate !== 'function' || typeof fetch !== 'function') throw new TypeError('An actual realm evaluator and fetch transport are required');
+   const ownerActive = active; let disposed = false;
+   active = () => !disposed && ownerActive();
++  const Reader = realm.FileReaderSync, readAsArrayBuffer = Reader?.prototype.readAsArrayBuffer;
++  const readBlobSync = blob => Reflect.apply(readAsArrayBuffer,new Reader(),[blob]);
+   const states = new WeakMap(), live = new Set(); let emit;
+   const error = (message, name = 'InvalidStateError') => new realm.DOMException(message, name);
+   const state = object => { const s = states.get(object); if (!s) throw new realm.TypeError('Illegal invocation'); return s; };
+@@ -39,18 +42,35 @@
+     if(allow!==origin&&!(allow==='*'&&!credentials))throw error('CORS origin is not allowed','NetworkError');
+     if(credentials&&response.headers.get('access-control-allow-credentials')!=='true')throw error('CORS credentials are not allowed','NetworkError');
+   }
++  function preflightPlan(s,headers) {
++    const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;
++    const unsafe=[...headers].filter(([name,value])=>!simpleHeader(name,value)).map(([name])=>name).sort();
++    if(cross||!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
++    if(!cross||(['GET','HEAD','POST'].includes(s.method)&&!unsafe.length))return null;
++    const requestHeaders=new Headers({'origin':origin,'access-control-request-method':s.method});
++    if(unsafe.length)requestHeaders.set('access-control-request-headers',unsafe.join(', '));
++    return {unsafe,init:{method:'OPTIONS',headers:[...requestHeaders],credentials:'omit'}};
++  }
++  function validatePreflight(response,s,plan) {
++    allowed(response,s.withCredentials);
++    if(response.status<200||response.status>299)throw error('CORS preflight failed','NetworkError');
++    const methods=(response.headers.get('access-control-allow-methods')??'').split(',').map(value=>value.trim());
++    if(!methods.includes(s.method)&&!(methods.includes('*')&&!s.withCredentials))throw error('CORS method is not allowed','NetworkError');
++    const names=(response.headers.get('access-control-allow-headers')??'').toLowerCase().split(',').map(value=>value.trim());
++    if(plan.unsafe.some(name=>!names.includes(name)&&!(names.includes('*')&&!s.withCredentials&&name!=='authorization')))throw error('CORS headers are not allowed','NetworkError');
++  }
+   function bodySync(value,headers) {
+     if(value==null)return undefined;
+-    if(value instanceof Blob){const reader=new realm.FileReaderSync();if(value.type&&!headers.has('content-type'))headers.set('content-type',value.type);return new Uint8Array(reader.readAsArrayBuffer(value));}
++    if(value instanceof Blob){const type=workerBlobType(value);if(type&&!headers.has('content-type'))headers.set('content-type',type);return new Uint8Array(readBlobSync(value));}
+     if(ArrayBuffer.isView(value))return new Uint8Array(value.buffer,value.byteOffset,value.byteLength).slice();
+     if(Object.prototype.toString.call(value)==='[object ArrayBuffer]')return new Uint8Array(value).slice();
+-    if(value instanceof FormData)throw error('Synchronous FormData encoding is not implemented','NotSupportedError');
++    if(value instanceof FormData){const result=encodeWorkerMultipartSync(value,readBlobSync);if(!headers.has('content-type'))headers.set('content-type',result.contentType);return result.bytes;}
+     if(!headers.has('content-type'))headers.set('content-type',value instanceof URLSearchParams?'application/x-www-form-urlencoded;charset=UTF-8':'text/plain;charset=UTF-8');
+     return String(value);
+   }
+   async function bodyAsync(value,headers) {
+-    if(value instanceof Blob){if(value.type&&!headers.has('content-type'))headers.set('content-type',value.type);return new Uint8Array(await Blob.prototype.arrayBuffer.call(value));}
+-    if(value instanceof FormData){const request=new Request('http://form.invalid/',{method:'POST',body:value});if(!headers.has('content-type'))headers.set('content-type',request.headers.get('content-type'));return new Uint8Array(await request.arrayBuffer());}
++    if(value instanceof Blob){const type=workerBlobType(value);if(type&&!headers.has('content-type'))headers.set('content-type',type);return new Uint8Array(await readWorkerBlobBytes(value));}
++    if(value instanceof FormData){const result=await encodeWorkerMultipart(value);if(!headers.has('content-type'))headers.set('content-type',result.contentType);return result.bytes;}
+     return bodySync(value,headers);
+   }
+   function finish(object,s,op,result) {
+@@ -76,14 +96,11 @@
+     try {
+       const headers=new Headers(s.requestHeaders);if(!headers.has('accept'))headers.set('accept','*/*');
+       const bytes=['GET','HEAD'].includes(s.method)?undefined:await bodyAsync(body,headers);if(!current(s,op)||op.done)return;
+-      const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;
+-      const unsafe=[...headers].filter(([name,value])=>!simpleHeader(name,value)).map(([name])=>name).sort();
+-      if(cross||!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
++      const plan=preflightPlan(s,headers);
+       const init={method:s.method,headers,body:bytes,signal:op.controller.signal,credentials:s.withCredentials?'include':'same-origin'};
+-      const preflight=cross&&(!['GET','HEAD','POST'].includes(s.method)||unsafe.length);
+-      if(preflight){const h=new Headers({'origin':origin,'access-control-request-method':s.method});if(unsafe.length)h.set('access-control-request-headers',unsafe.join(', '));const r=await fetch(s.url,{method:'OPTIONS',headers:h,signal:op.controller.signal,credentials:'omit'});allowed(r,s.withCredentials);if(!r.ok)throw error('CORS preflight failed','NetworkError');const methods=(r.headers.get('access-control-allow-methods')??'').split(',').map(x=>x.trim());if(!methods.includes(s.method)&&!(methods.includes('*')&&!s.withCredentials))throw error('CORS method is not allowed','NetworkError');const names=(r.headers.get('access-control-allow-headers')??'').toLowerCase().split(',').map(x=>x.trim());if(unsafe.some(name=>!names.includes(name)&&!(names.includes('*')&&!s.withCredentials&&name!=='authorization')))throw error('CORS headers are not allowed','NetworkError');}
++      if(plan){const response=await fetch(s.url,{...plan.init,signal:op.controller.signal});validatePreflight(response,s,plan);if(!current(s,op)||op.done)return;}
+       const response=await fetch(s.url,init),result={status:response.status,statusText:response.statusText,url:response.url||s.url,headers:response.headers,bytes:new Uint8Array(await response.arrayBuffer())};
+-      if(preflight&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
++      if(plan&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
+       finish(object,s,op,result);
+     }catch{terminal(object,s,op,'error')}
+   }
+@@ -107,11 +124,12 @@
+       if(typeof syncRequest!=='function'){cancel(op);s.sending=false;throw error('Synchronous XHR transport is unavailable','NotSupportedError')}
+       try{
+         const headers=new Headers(s.requestHeaders);if(!headers.has('accept'))headers.set('accept','*/*');const bytes=['GET','HEAD'].includes(s.method)?undefined:bodySync(body,headers);
+-        const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;if(cross)throw error('Synchronous cross-origin XHR is not implemented','NotSupportedError');
+-        if(!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
++        const plan=preflightPlan(s,headers);
++        if(plan){const response=syncRequest(s.url,plan.init,s.timeout);response.headers=new Headers(response.headers);validatePreflight(response,s,plan);}
+         const result=syncRequest(s.url,{method:s.method,headers:[...headers],body:bytes,credentials:s.withCredentials?'include':'same-origin'},s.timeout);
++        if(plan&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
+         result.headers=new Headers(result.headers);finish(object,s,op,result);
+-      }catch(cause){terminal(object,s,op,'error');throw cause}
++      }catch(cause){cancel(op);s.sending=false;reset(s);s.readyState=4;if(cause?.name==='NetworkError')throw error('A network error occurred','NetworkError');throw cause}
+     },
+     abort(object){const s=state(object);if(s.sending&&s.op&&!s.op.done)terminal(object,s,s.op,'abort');else{cancel(s.op);s.op=null;s.sending=false;reset(s);s.readyState=0}},
+     override(object,value){const s=state(object);if([3,4].includes(s.readyState))throw error('Cannot override MIME type after loading starts');s.overrideMime=String(value)},
+diff --git a/src/worker-websocket.js b/src/worker-websocket.js
+--- a/src/worker-websocket.js
++++ b/src/worker-websocket.js
+@@ -1,9 +1,10 @@
+ import { WebSocket as Socket } from 'ws';
++import { readWorkerBlobBytes, workerBlobSize } from './worker-multipart.js';
+ 
+ /** Real dedicated/service-worker socket connections with realm event adapters.
+  * Cookie, proxy and redirect policy integration remain explicit limitations.
+  */
+-export function installWebSocket(realm, { evaluate, origin, baseURL, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
++export function installWebSocket(realm, { evaluate, origin, baseURL, socketPolicy, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
+   if (typeof evaluate !== 'function') throw new TypeError('An actual realm evaluator is required');
+   const ownerActive = active; let disposed = false;
+   active = () => !disposed && ownerActive();
+@@ -22,13 +23,14 @@
+       const s = { object, url: url.href, protocol: '', extensions: '', readyState: 0, binaryType: 'blob', pendingBytes: 0, queue: Promise.resolve() };
+       states.set(object, s);
+       if (!active()) throw new realm.DOMException('The worker is disposed', 'InvalidStateError');
++      const policy=socketPolicy?.(s.url),policyHeaders=new Headers(policy?.headers);
+       let socket;
+       try { socket = new Socket(s.url, [...new Set(list)], {
+         origin: origin ?? realm.location?.origin ?? 'null', perMessageDeflate: false, maxPayload: 16 * 1024 * 1024,
+         // Native accepts duplicate offered protocols and sends them verbatim.
+         // ws validates a unique negotiation set; its public request hook lets
+         // the genuine HTTP upgrade retain the original ordered offer bytes.
+-        finishRequest(request) { if (list.length) request.setHeader('Sec-WebSocket-Protocol', list.join(', ')); request.end(); },
++        finishRequest(request) { if (list.length) request.setHeader('Sec-WebSocket-Protocol', list.join(', '));for(const[name,value]of policyHeaders)request.setHeader(name,value);request.end(); },
+       }); }
+       catch (error) { throw new realm.DOMException(String(error.message), 'SyntaxError'); }
+       s.socket = socket; live.add(s);
+@@ -55,7 +57,7 @@
+       if (s.readyState === 0) throw new realm.DOMException('The object is in an invalid state', 'InvalidStateError');
+       let data = value, length, binary = false;
+       const blob = value instanceof Blob;
+-      if (blob) { length = value.size; binary = true; }
++      if (blob) { length = workerBlobSize(value); binary = true; }
+       else if (ArrayBuffer.isView(value)) { data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice(); length = data.byteLength; binary = true; }
+       else if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') { data = new Uint8Array(value).slice(); length = data.byteLength; binary = true; }
+       else { data = String(value); length = Buffer.byteLength(data); }
+@@ -63,7 +65,7 @@
+       if (s.readyState >= 2) return;
+       s.queue = s.queue.then(async () => {
+         if (!active()) return;
+-        if (blob) data = new Uint8Array(await Blob.prototype.arrayBuffer.call(value));
++        if (blob) data = new Uint8Array(await readWorkerBlobBytes(value));
+         if (s.socket.readyState !== Socket.OPEN) return;
+         await new Promise(resolve => s.socket.send(data, { binary }, () => resolve()));
+       }).catch(() => { if (active()) emit(object, 'error'); }).finally(() => { s.pendingBytes -= length; });
+diff --git a/src/worker-sync-transport.js b/src/worker-sync-transport.js
+--- a/src/worker-sync-transport.js
++++ b/src/worker-sync-transport.js
+@@ -1,4 +1,20 @@
+ let requestId = 0;
++
++export function completeWorkerSocketPolicy(shared,policy,error) {
++  const state=new Int32Array(shared,0,2),destination=new Uint8Array(shared,8);
++  let encoded=new TextEncoder().encode(JSON.stringify(error?{error:String(error.message??error)}:{policy}));
++  if(encoded.length>destination.length)encoded=new TextEncoder().encode(JSON.stringify({error:'Socket policy exceeds its metadata limit'}));
++  destination.set(encoded.subarray(0,destination.length));Atomics.store(state,1,Math.min(encoded.length,destination.length));Atomics.store(state,0,1);Atomics.notify(state,0);
++}
++export function createSyncWorkerSocketPolicy(port,{maxBytes=1024*1024,timeoutMs=5000}={}) {
++  return url=>{
++    const shared=new SharedArrayBuffer(maxBytes+8),state=new Int32Array(shared,0,2);
++    port.postMessage({kind:'socketPolicy',url,sync:shared});
++    if(Atomics.wait(state,0,0,timeoutMs)==='timed-out'||Atomics.load(state,0)!==1)throw new DOMException('Socket policy did not complete','TimeoutError');
++    const result=JSON.parse(new TextDecoder().decode(new Uint8Array(shared,8,Atomics.load(state,1))));
++    if(result.error)throw new DOMException(result.error,'NetworkError');return result.policy;
++  };
++}
+ 
+ // Both ends use the existing worker request/parent Page.fetch channel. Only the
+ // private synchronous envelope adds base64 to retain arbitrary bytes in JSON.
+diff --git a/src/worker-socket-policy.js b/src/worker-socket-policy.js
+new file mode 100644
+--- /dev/null
++++ b/src/worker-socket-policy.js
+@@ -0,0 +1,15 @@
++// Host-only browser-context policy. The reply stays in worker host state and
++// supplies the genuine physical upgrade; it is never exposed to authored JS.
++export async function workerSocketPolicy(page, input) {
++  const url=new URL(input);
++  if(!['ws:','wss:'].includes(url.protocol))throw new TypeError('Socket policy requires ws or wss');
++  const cookieURL=new URL(url);cookieURL.protocol=url.protocol==='wss:'?'https:':'http:';
++  // Measured Native upgrade policy ignores both CLI headers and CDP extra
++  // headers, while honoring actual UA/language overrides and the cookie jar.
++  const headers=new Headers({'accept':'*/*'});
++  if(page.userAgent)headers.set('user-agent',page.userAgent);
++  if(!headers.has('accept-language')&&page.acceptLanguage)headers.set('accept-language',page.acceptLanguage);
++  const cookies=await page.context?.cookies.getCookieString(cookieURL.href);
++  if(cookies)headers.set('cookie',cookies);else headers.delete('cookie');
++  return {headers:[...headers]};
++}
+diff --git a/src/worker-multipart.js b/src/worker-multipart.js
+new file mode 100644
+--- /dev/null
++++ b/src/worker-multipart.js
+@@ -0,0 +1,41 @@
++import { randomBytes } from 'node:crypto';
++const entries = FormData.prototype.entries;
++const blobType = Object.getOwnPropertyDescriptor(Blob.prototype, 'type').get;
++const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get;
++const fileName = Object.getOwnPropertyDescriptor(File.prototype, 'name').get;
++const blobBytes = Blob.prototype.arrayBuffer;
++export const readWorkerBlobBytes = blob => Reflect.apply(blobBytes,blob,[]);
++export const workerBlobType = blob => Reflect.apply(blobType,blob,[]);
++export const workerBlobSize = blob => Reflect.apply(blobSize,blob,[]);
++const normalize = value => String(value).replace(/\r\n|\r|\n/g, '\r\n');
++const escape = value => normalize(value).replaceAll('\r','%0D').replaceAll('\n','%0A').replaceAll('"','%22');
++
++function parts(form) {
++  const boundary = `----redpanda-${randomBytes(12).toString('hex')}`, values = [];
++  for (const [name,value] of Reflect.apply(entries,form,[])) {
++    let header=`--${boundary}\r\nContent-Disposition: form-data; name="${escape(name)}"`;
++    if(typeof value==='string') values.push({header:header+'\r\n\r\n',text:normalize(value)});
++    else {
++      header+=`; filename="${escape(Reflect.apply(fileName,value,[]))}"\r\nContent-Type: ${Reflect.apply(blobType,value,[])||'application/octet-stream'}\r\n\r\n`;
++      values.push({header,blob:value});
++    }
++  }
++  return {boundary,values};
++}
++function collect(boundary,values,maxBytes) {
++  const chunks=[];let length=0;
++  const append=value=>{const bytes=typeof value==='string'?Buffer.from(value):value;length+=bytes.length;if(length>maxBytes)throw new DOMException('Multipart upload exceeds its buffered byte limit','QuotaExceededError');chunks.push(bytes)};
++  for(const value of values){append(value.header);append(value.bytes??value.text);append('\r\n')}
++  append(`--${boundary}--\r\n`);
++  return {bytes:new Uint8Array(Buffer.concat(chunks,length)),contentType:`multipart/form-data; boundary=${boundary}`};
++}
++export function encodeWorkerMultipartSync(form,readBlob,{maxBytes=8*1024*1024}={}) {
++  const {boundary,values}=parts(form);
++  for(const value of values)if(value.blob)value.bytes=new Uint8Array(readBlob(value.blob));
++  return collect(boundary,values,maxBytes);
++}
++export async function encodeWorkerMultipart(form,{maxBytes=64*1024*1024}={}) {
++  const {boundary,values}=parts(form);
++  for(const value of values)if(value.blob)value.bytes=new Uint8Array(await readWorkerBlobBytes(value.blob));
++  return collect(boundary,values,maxBytes);
++}
+diff --git a/src/workers.js b/src/workers.js
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -8,7 +8,8 @@
+ import { installNavigator } from './navigator.js';
+ import { installStreams } from './streams.js';
+ import { installWorkerAPIs, captureWorkerCreator } from './worker-apis.js';
+-import { completeWorkerSyncResponse, createSyncWorkerRequest } from './worker-sync-transport.js';
++import { completeWorkerSyncResponse, createSyncWorkerRequest, completeWorkerSocketPolicy, createSyncWorkerSocketPolicy } from './worker-sync-transport.js';
++import { workerSocketPolicy } from './worker-socket-policy.js';
+ 
+ // Dedicated worker support. Shared workers and nested workers fail explicitly.
+ // Channels and transferred ports use real Node endpoints with realm adapters.
+@@ -69,6 +70,10 @@
+         } else if (message.kind === 'console') page.emit('console', { type: message.type, args: clone(message.args) });
+         else if (message.kind === 'close') this.terminate();
+         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
++        else if(message.kind==='socketPolicy'){
++          try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(page,message.url));}
++          catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
++        }
+         else if (message.kind === 'request') {
+           const requestAbort = new AbortController();
+           this.#requests.set(message.id, requestAbort);
+@@ -287,6 +292,7 @@
+     evaluate: source => vm.runInContext(source, context),
+     fetch: (input, init) => bridge.fetch(input, init, 'XHR'),
+     syncRequest: createSyncWorkerRequest(parentPort),
++    socketPolicy: createSyncWorkerSocketPolicy(parentPort),
+     origin: workerData.origin, baseURL: () => workerData.url, secure: workerData.secure, signal: lifetime.signal,
+     active: () => !closed, trustEvent,
+   });
+diff --git a/test/worker-apis.test.js b/test/worker-apis.test.js
+--- a/test/worker-apis.test.js
++++ b/test/worker-apis.test.js
+@@ -23,9 +23,15 @@
+     if(url.pathname==='/empty'){response.setHeader('content-length','0');response.end();return}
+     if(url.pathname==='/network-failure'){response.destroy();return}
+     if(url.pathname==='/cors'){
+-      response.setHeader('access-control-allow-origin',request.headers.origin??'null');response.setHeader('access-control-allow-methods','PUT');response.setHeader('access-control-allow-headers','x-real');
++      response.setHeader('access-control-allow-origin',url.searchParams.has('wildcard')?'*':request.headers.origin??'null');response.setHeader('access-control-allow-credentials','true');response.setHeader('access-control-allow-methods','PUT');response.setHeader('access-control-allow-headers','x-real');
+       if(request.method==='OPTIONS'){response.writeHead(204);response.end();return}
++      if(url.searchParams.has('report')){response.setHeader('content-type','application/json');response.end(JSON.stringify({cookie:request.headers.cookie??'',origin:request.headers.origin,method:request.method,bytes:[...body]}));return}
+       response.setHeader('content-type','application/octet-stream');response.setHeader('x-hidden','actual-but-not-exposed');response.end(body);return;
++    }
++    if(url.pathname==='/multipart'){
++      const form=await new Request('http://owned.test/multipart',{method:'POST',headers:request.headers,body}).formData(),entries=[];
++      for(const[name,value]of form)entries.push(typeof value==='string'?{name,text:value}:{name,filename:value.name,type:value.type,bytes:[...new Uint8Array(await value.arrayBuffer())]});
++      response.setHeader('content-type','application/json');response.end(JSON.stringify({entries}));return;
+     }
+     if(url.pathname==='/cors-denied'){response.end('actual but forbidden response bytes');return}
+     if(url.pathname==='/slow'){const timer=setTimeout(()=>{timers.delete(timer);if(!response.destroyed)response.end('actual late bytes')},120);timers.add(timer);return}
+@@ -33,15 +39,16 @@
+   });
+   server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket))});
+   const wss=new WebSocketServer({noServer:true,handleProtocols:list=>list.has('actual')?'actual':false});
++  wss.on('headers',headers=>headers.push('Set-Cookie: handshake_cookie=ignored; Path=/; HttpOnly'));
+   server.on('upgrade',(request,socket,head)=>{upgrades.push({url:request.url,headers:request.headers});if(request.url==='/reject'){socket.end('HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n');return}wss.handleUpgrade(request,socket,head,client=>wss.emit('connection',client,request))});
+   wss.on('connection',(socket,request)=>{connections.push({socket,headers:request.headers});socket.on('message',(bytes,binary)=>socket.send(bytes,{binary}))});
+   server.listen(0,'0.0.0.0');await once(server,'listening');const origin=`http://${host}:${server.address().port}`;
+   const browser=new Browser(),page=browser.createPage(),errors=[];page.on('pageError',error=>errors.push(String(error.message)));await page.navigate(origin);
+   t.after(async()=>{browser.close();for(const timer of timers)clearTimeout(timer);for(const socket of wss.clients)socket.terminate();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve))});
+   let next=0;
+-  async function run(source,input){
++  async function run(source,input,owner=page){
+     const id=String(++next);sources.set(id,`(async()=>{${source}})().then(value=>postMessage({value}),error=>postMessage({failure:{name:error.name,message:error.message,stack:error.stack}}));`);
+-    const worker=new page.dom.window.Worker(`/worker.js?id=${id}`);
++    const worker=new owner.dom.window.Worker(`/worker.js?id=${id}`);
+     const message=deadline(new Promise((resolve,reject)=>{worker.onmessage=event=>event.data.failure?reject(Object.assign(new Error(event.data.failure.message),event.data.failure)):resolve(event.data.value);worker.onerror=event=>reject(event.error??new Error(event.message))}));
+     if(input!==undefined)worker.postMessage(input);
+     try{return await message}finally{worker.terminate()}
+@@ -155,3 +162,58 @@
+   assert.throws(()=>new realm.WebSocket('/socket'),error=>error.name==='InvalidStateError');assert.throws(()=>new realm.XMLHttpRequest().open('GET','/bytes'),error=>error.name==='InvalidStateError');
+   await new Promise(resolve=>setTimeout(resolve,150));assert.deepEqual(events,[]);assert.equal(f.upgrades.length,0);
+ });
++
++test('sync/async cross-origin XHR uses actual credentials and cookie-free preflight requests',async t=>{
++  const f=await fixture(t),cross=f.origin.replace('127.0.0.1','0.0.0.0');
++  // Cookie host must match the destination; ports do not participate in cookie scope.
++  await f.page.context.cookies.setCookie('destination=actual; HttpOnly; Path=/',cross);
++  const actual=await f.run(`const results=[];for(const sync of[false,true])for(const credentials of[false,true]){const x=new XMLHttpRequest();x.open('PUT',${JSON.stringify(cross)}+'/cors?report=1',!sync);x.withCredentials=credentials;x.responseType='json';x.setRequestHeader('x-real','actual');const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(new Uint8Array([0,128,255]));if(done)await done;results.push({sync,credentials,status:x.status,response:x.response})}return results`);
++  for(const result of actual){assert.equal(result.status,200);assert.equal(result.response.cookie,result.credentials?'destination=actual':'');assert.equal(result.response.origin,f.origin);assert.equal(result.response.method,'PUT');assert.deepEqual([...result.response.bytes],[0,128,255])}
++  const preflights=f.requests.filter(request=>request.method==='OPTIONS');assert.equal(preflights.length,4);assert.ok(preflights.every(request=>!request.headers.cookie));
++});
++
++test('denied synchronous credentialed CORS throws a genuine NetworkError without terminal callbacks',async t=>{
++  const f=await fixture(t),cross=f.origin.replace('127.0.0.1','0.0.0.0');
++  const actual=await f.run(`const x=new XMLHttpRequest(),events=[];x.open('GET',${JSON.stringify(cross)}+'/cors?report=1&wildcard=1',false);x.withCredentials=true;for(const type of['load','error','timeout','abort','loadend'])x.addEventListener(type,()=>events.push(type));let failure,message;try{x.send()}catch(error){failure=error.name;message=error.message}return{failure,message,status:x.status,events}`);
++  assert.deepEqual(plain(actual),{failure:'NetworkError',message:'A network error occurred',status:0,events:[]});
++});
++
++test('sync/async multipart upload preserves binary File bytes, duplicate keys and actual line endings',async t=>{
++  const f=await fixture(t),actual=await f.run(`const results=[];for(const sync of[false,true]){const form=new FormData();form.append('line','a\\nb\\rc\\r\\nd');form.append('duplicate','one');form.append('duplicate','two');form.append('file',new File([new Uint8Array([0,128,255])],'café"\\r\\n.bin',{type:'application/octet-stream'}));const x=new XMLHttpRequest();x.open('POST','/multipart',!sync);x.responseType='json';const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(form);if(done)await done;results.push({sync,status:x.status,response:x.response})}return results`);
++  const entries=[{name:'line',text:'a\r\nb\r\nc\r\nd'},{name:'duplicate',text:'one'},{name:'duplicate',text:'two'},{name:'file',filename:'café"\r\n.bin',type:'application/octet-stream',bytes:[0,128,255]}];
++  for(const result of actual){assert.equal(result.status,200);assert.deepEqual(plain(result.response),{entries})}
++  for(const request of f.requests.filter(request=>request.url==='/multipart')){assert.match(request.headers['content-type'],/^multipart\/form-data; boundary=/);const bytes=Buffer.from(request.bytes);assert.ok(bytes.includes(Buffer.from([0,128,255])));assert.ok(bytes.toString('utf8').includes('filename="café%22%0D%0A.bin"'))}
++});
++
++test('binary Blob uploads bypass authored reader method overrides and retain their real bytes',async t=>{
++  const f=await fixture(t),actual=await f.run(`const blob=new Blob([new Uint8Array([0,128,255])],{type:'application/octet-stream'});Object.defineProperty(blob,'type',{value:'text/fake'});Blob.prototype.arrayBuffer=async()=>new Uint8Array([99]).buffer;FileReaderSync.prototype.readAsArrayBuffer=()=>new Uint8Array([88]).buffer;const results=[];for(const sync of[false,true]){const x=new XMLHttpRequest();x.open('POST','/echo',!sync);x.responseType='arraybuffer';const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(blob);if(done)await done;results.push([...new Uint8Array(x.response)])}return results`);
++  assert.deepEqual(plain(actual),[[0,128,255],[0,128,255]]);
++  assert.ok(f.requests.filter(request=>request.url==='/echo').every(request=>request.headers['content-type']==='application/octet-stream'));
++});
++
++test('socket headers use actual cookies and UA/language while ignoring extra and CLI HTTP headers',async t=>{
++  const f=await fixture(t);await f.page.context.cookies.setCookie('root_cookie=actual; Path=/',f.origin);await f.page.context.cookies.setCookie('root_http=hidden; HttpOnly; Path=/',f.origin);
++  f.page.userAgent='phase-two-agent';f.page.acceptLanguage='zz-ZZ';f.page.extraHTTPHeaders.set('x-policy','from-cdp');f.page.extraHTTPHeaders.set('accept-language','xx-XX');f.page.cliHTTPHeaders.set('x-policy','forced');
++  const result=await f.run(`navigator.userAgent='fake';const socket=new WebSocket('/socket');return await new Promise(resolve=>{socket.onopen=()=>socket.send('real');socket.onmessage=event=>{socket.close();resolve(event.data)}})`);
++  assert.equal(result,'real');const headers=f.connections[0].headers;assert.equal(headers.cookie,'root_cookie=actual; root_http=hidden');assert.equal(headers['user-agent'],'phase-two-agent');assert.equal(headers['accept-language'],'zz-ZZ');assert.equal(headers['x-policy'],undefined);assert.equal(headers.origin,f.origin);
++  const cookies=await f.page.context.cookies.getCookieString(f.origin);assert.equal(cookies,'root_cookie=actual; root_http=hidden');
++});
++
++test('socket policy ignores CLI/CDP Cookie overrides and reads the actual scoped cookie jar',async t=>{
++  const f=await fixture(t);await f.page.context.cookies.setCookie('private_cookie=actual; HttpOnly; Path=/',f.origin);f.page.cliHTTPHeaders.set('cookie','cli_cookie=forced');
++  await f.run(`const socket=new WebSocket('/socket');return await new Promise(resolve=>{socket.onopen=()=>{socket.close();resolve(true)}})`);
++  assert.equal(f.connections[0].headers.cookie,'private_cookie=actual');assert.match(await f.page.context.cookies.getCookieString(f.origin),/private_cookie=actual/);
++});
++
++test('socket CookieJar policy remains scoped to the real BrowserContext',async t=>{
++  const f=await fixture(t),context=f.browser.createContext(),second=f.browser.createPage(context);await second.navigate(f.origin);
++  await f.page.context.cookies.setCookie('context_cookie=one; HttpOnly; Path=/',f.origin);await second.context.cookies.setCookie('context_cookie=two; HttpOnly; Path=/',f.origin);
++  const source=`const socket=new WebSocket('/socket');return await new Promise(resolve=>{socket.onopen=()=>{socket.close();resolve(true)}})`;
++  await f.run(source);await f.run(source,undefined,second);
++  assert.deepEqual(f.connections.map(value=>value.headers.cookie),['context_cookie=one','context_cookie=two']);
++});
++
++test('socket Blob uploads use captured public byte readers and preserve actual immutable bytes',async t=>{
++  const f=await fixture(t),actual=await f.run(`const blob=new Blob([new Uint8Array([0,128,255])]);Blob.prototype.arrayBuffer=async()=>new Uint8Array([99]).buffer;const socket=new WebSocket('/socket');socket.binaryType='arraybuffer';return await new Promise(resolve=>{socket.onopen=()=>socket.send(blob);socket.onmessage=event=>{socket.close();resolve([...new Uint8Array(event.data)])}})`);
++  assert.deepEqual(plain(actual),[0,128,255]);
++});

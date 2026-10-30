@@ -1,9 +1,10 @@
 import { WebSocket as Socket } from 'ws';
+import { readWorkerBlobBytes, workerBlobSize } from './worker-multipart.js';
 
 /** Real dedicated/service-worker socket connections with realm event adapters.
  * Cookie, proxy and redirect policy integration remain explicit limitations.
  */
-export function installWebSocket(realm, { evaluate, origin, baseURL, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
+export function installWebSocket(realm, { evaluate, origin, baseURL, socketPolicy, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
   if (typeof evaluate !== 'function') throw new TypeError('An actual realm evaluator is required');
   const ownerActive = active; let disposed = false;
   active = () => !disposed && ownerActive();
@@ -22,13 +23,14 @@ export function installWebSocket(realm, { evaluate, origin, baseURL, signal, act
       const s = { object, url: url.href, protocol: '', extensions: '', readyState: 0, binaryType: 'blob', pendingBytes: 0, queue: Promise.resolve() };
       states.set(object, s);
       if (!active()) throw new realm.DOMException('The worker is disposed', 'InvalidStateError');
+      const policy=socketPolicy?.(s.url),policyHeaders=new Headers(policy?.headers);
       let socket;
       try { socket = new Socket(s.url, [...new Set(list)], {
         origin: origin ?? realm.location?.origin ?? 'null', perMessageDeflate: false, maxPayload: 16 * 1024 * 1024,
         // Native accepts duplicate offered protocols and sends them verbatim.
         // ws validates a unique negotiation set; its public request hook lets
         // the genuine HTTP upgrade retain the original ordered offer bytes.
-        finishRequest(request) { if (list.length) request.setHeader('Sec-WebSocket-Protocol', list.join(', ')); request.end(); },
+        finishRequest(request) { if (list.length) request.setHeader('Sec-WebSocket-Protocol', list.join(', '));for(const[name,value]of policyHeaders)request.setHeader(name,value);request.end(); },
       }); }
       catch (error) { throw new realm.DOMException(String(error.message), 'SyntaxError'); }
       s.socket = socket; live.add(s);
@@ -55,7 +57,7 @@ export function installWebSocket(realm, { evaluate, origin, baseURL, signal, act
       if (s.readyState === 0) throw new realm.DOMException('The object is in an invalid state', 'InvalidStateError');
       let data = value, length, binary = false;
       const blob = value instanceof Blob;
-      if (blob) { length = value.size; binary = true; }
+      if (blob) { length = workerBlobSize(value); binary = true; }
       else if (ArrayBuffer.isView(value)) { data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice(); length = data.byteLength; binary = true; }
       else if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') { data = new Uint8Array(value).slice(); length = data.byteLength; binary = true; }
       else { data = String(value); length = Buffer.byteLength(data); }
@@ -63,7 +65,7 @@ export function installWebSocket(realm, { evaluate, origin, baseURL, signal, act
       if (s.readyState >= 2) return;
       s.queue = s.queue.then(async () => {
         if (!active()) return;
-        if (blob) data = new Uint8Array(await Blob.prototype.arrayBuffer.call(value));
+        if (blob) data = new Uint8Array(await readWorkerBlobBytes(value));
         if (s.socket.readyState !== Socket.OPEN) return;
         await new Promise(resolve => s.socket.send(data, { binary }, () => resolve()));
       }).catch(() => { if (active()) emit(object, 'error'); }).finally(() => { s.pendingBytes -= length; });

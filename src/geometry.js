@@ -7,6 +7,7 @@ function geometryFactory(g) {
   const installation = Symbol.for('red-panda.geometry');
   if (g[installation]) return g[installation];
   const points = new WeakMap(), matrices = new WeakMap(), quads = new WeakMap(), rects = new WeakMap();
+  const pointLinks = new WeakMap(), matrixLinks = new WeakMap();
   const number = value => +value;
   const dictionary = value => {
     if (value == null) return {};
@@ -55,9 +56,9 @@ function geometryFactory(g) {
     static fromPoint(point = {}) { return new DOMPoint(...pointValues(point)); }
   }
   for (const [index, key] of ['x', 'y', 'z', 'w'].entries()) {
-    const get = function () { return brand(points, this)[index]; };
+    const get = function () { const values = brand(points, this), link = pointLinks.get(this); link?.beforeRead?.(); return values[index]; };
     Object.defineProperty(DOMPointReadOnly.prototype, key, { configurable: true, enumerable: true, get });
-    Object.defineProperty(DOMPoint.prototype, key, { configurable: true, enumerable: true, get, set(value) { brand(points, this)[index] = number(value); } });
+    Object.defineProperty(DOMPoint.prototype, key, { configurable: true, enumerable: true, get, set(value) { const values = brand(points, this), link = pointLinks.get(this); if (link?.readonly) throw error('NoModificationAllowedError', 'The object can not be modified'); value = number(value); if (link?.restricted && !Number.isFinite(value)) throw new TypeError(''); link?.beforeRead?.(); values[index] = value; link?.afterWrite?.(index, value); } });
   }
 
   class DOMRectReadOnlyFallback {
@@ -238,7 +239,8 @@ function geometryFactory(g) {
       token.lastIndex = cursor; const match = token.exec(source); if (!match) return fail(); cursor = token.lastIndex;
       const name = match[1].toLowerCase(), body = match[2].trim();
       if (!body || (body.includes(',') && body.split(',').some(value => !value.trim()))) return fail();
-      const args = body.split(/[\s,]+/);
+      const args = body.split(',').map(value => value.trim());
+      if (args.some(value => /\s/.test(value))) return fail();
       const arity = (...counts) => { if (!counts.includes(args.length)) fail(); };
       const n = index => scalar(args[index]), l = index => scalar(args[index], 'length'), a = index => scalar(args[index], 'angle');
       if (name === 'matrix' || name === 'matrix3d') { arity(name === 'matrix' ? 6 : 16); result.multiplySelf(new DOMMatrix(args.map(value => scalar(value)))); }
@@ -321,7 +323,32 @@ function geometryFactory(g) {
       return decode(payload.value);
     };
   }
-  const controller = { DOMPointReadOnly, DOMPoint, DOMQuad, DOMMatrixReadOnly, DOMMatrix, DOMRect: g.DOMRect, DOMRectReadOnly: g.DOMRectReadOnly };
+  function accessMatrix(object, operation, write = false) {
+    const state = brand(matrices, object), link = matrixLinks.get(object);
+    if (!link || link.busy) return operation();
+    if (write && link.readonly) throw error('NoModificationAllowedError', 'The object can not be modified');
+    link.busy = true;
+    try {
+      const before = link.beforeRead?.(); if (before) { state.values = [...before]; state.is2D = true; }
+      const result = operation();
+      if (write) { const after = link.afterWrite?.([...brand(matrices, object).values]); if (after) { const updated = brand(matrices, object); updated.values = [...after]; updated.is2D = true; } }
+      return result;
+    } finally { link.busy = false; }
+  }
+  for (const Prototype of [DOMMatrixReadOnly.prototype, DOMMatrix.prototype]) for (const key of Reflect.ownKeys(Prototype)) {
+    if (key === 'constructor') continue; const descriptor = Object.getOwnPropertyDescriptor(Prototype, key), next = { ...descriptor };
+    if (descriptor.get) next.get = function () { return accessMatrix(this, () => descriptor.get.call(this)); };
+    if (descriptor.set) next.set = function (value) { return accessMatrix(this, () => descriptor.set.call(this, value), true); };
+    if (typeof descriptor.value === 'function') next.value = function (...args) { return accessMatrix(this, () => descriptor.value.apply(this, args), typeof key === 'string' && (key.endsWith('Self') || key === 'setMatrixValue')); };
+    Object.defineProperty(Prototype, key, next);
+  }
+  const controller = { DOMPointReadOnly, DOMPoint, DOMQuad, DOMMatrixReadOnly, DOMMatrix, DOMRect: g.DOMRect, DOMRectReadOnly: g.DOMRectReadOnly,
+    bindPoint(object, link) { brand(points, object); if (!(object instanceof DOMPoint)) throw new TypeError('invalid argument'); pointLinks.set(object, link); },
+    pointValues(object) { const values = brand(points, object); pointLinks.get(object)?.beforeRead?.(); return [...values]; },
+    updatePoint(object, values) { const state = brand(points, object); for (let i = 0; i < 4; i++) state[i] = values[i]; },
+    isMutablePoint(object) { return points.has(object) && object instanceof DOMPoint; },
+    bindMatrix(object, link) { brand(matrices, object); if (!(object instanceof DOMMatrix)) throw new TypeError('invalid argument'); matrixLinks.set(object, link); },
+  };
   Object.defineProperty(g, installation, { value: controller }); return controller;
 }
 

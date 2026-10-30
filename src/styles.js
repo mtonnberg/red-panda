@@ -1,6 +1,6 @@
 import {computedTransform,computedFontSize} from './computed-values.js';
 import {evaluateMedia} from './media.js';
-import { selectorForSpecificity, getSelectorStateRevision, matchesInScope } from './selectors.js';
+import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher } from './selectors.js';
 import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
 import { createRequire } from 'node:module';
 
@@ -23,6 +23,8 @@ const RECORDS = new WeakMap();
 const SHEETS = new WeakMap();
 const ADOPTED = new WeakMap();
 const STYLE_NODES = new WeakMap();
+const SELECTOR_PARTS=new WeakMap();
+function ruleSelectorParts(rule){let retained=SELECTOR_PARTS.get(rule);if(!retained||retained.text!==rule.selectorText){retained={text:rule.selectorText,parts:splitTopLevel(rule.selectorText)};SELECTOR_PARTS.set(rule,retained);}return retained.parts;}
 const IDENTITIES = new WeakMap();
 let identity = 0;
 const id = value => { if (!IDENTITIES.has(value)) IDENTITIES.set(value, ++identity); return IDENTITIES.get(value); };
@@ -86,6 +88,10 @@ characterDataPrototype.replaceData=function(...args){const result=replaceCharact
 const registryPrototype=require('jsdom/lib/jsdom/living/custom-elements/CustomElementRegistry-impl.js').implementation.prototype;
 const defineCustomElement=registryPrototype.define;
 registryPrototype.define=function(...args){const result=defineCustomElement.apply(this,args);const record=recordFor(this._globalObject.document);if(record)record.stateRevision++;return result;};
+
+const elementBackend=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation.prototype;
+const attachShadowBackend=elementBackend.attachShadow;
+elementBackend.attachShadow=function(...args){const result=attachShadowBackend.apply(this,args);const record=recordFor(wrapperForImpl(this._ownerDocument));if(record)record.scopeRevision=(record.scopeRevision??0)+1;return result;};
 
 const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
 StyleElementImpl.prototype._updateAStyleBlock = function () {
@@ -427,6 +433,7 @@ function textTransformValue(value) {
 
 function cascade(record, element) {
   const values = new Map(); let order = 0;
+  const matchSelector=createScopedMatcher(record.document,record.document.documentElement);record.badStyleSelectors??=new Set();
   const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
   const registerLayer=(parent,name,key)=>{
     if(!name){const node={children:new Map()};parent.children.set(key,node);return node;}
@@ -482,10 +489,12 @@ function cascade(record, element) {
   };
   const offerSelector=(selectorText,style,origin,layer=layerRoot)=>{
     let highest=null;
-    for(const selector of splitTopLevel(selectorText)) {
+    record.selectorParts??=new Map();let parts=record.selectorParts.get(selectorText);if(!parts){parts=splitTopLevel(selectorText);record.selectorParts.set(selectorText,parts);}
+    for(const selector of parts) {
       if(/:host|::slotted|::part/.test(selector)){record.unsupported.add(':host, ::slotted and ::part selectors');continue;}
-      try{if(matchesInScope(element,selector,record.document.documentElement)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
-      catch{record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
+      if(record.badStyleSelectors.has(selector))continue;
+      try{if(matchSelector(selector,element)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
+      catch(error){if(error?.name==='SyntaxError')record.badStyleSelectors.add(selector);record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
     }
     if(highest)offer(style,highest,origin,false,layer);
   };
@@ -493,7 +502,7 @@ function cascade(record, element) {
     if(depth>32)return;
     for (const rule of rules) {
       if(rule.selectorText&&rule.style) {
-        const selector=splitTopLevel(rule.selectorText).map(part=>resolveNested(part,parent)).join(', ');
+        const selector=parent?ruleSelectorParts(rule).map(part=>resolveNested(part,parent)).join(', '):rule.selectorText;
         offerSelector(selector,rule.style,origin,layer);
         if(rule.cssRules?.length)walk(rule.cssRules,origin,selector,layer,depth);
       } else if(nestedGroupContents(rule)) {
@@ -512,12 +521,12 @@ function cascade(record, element) {
   const root = rootOf(element);
   for(const{sheet}of authorSheets)walk(sheet.cssRules,1);
   offer(element.style, [0, 0, 0], 1, true);
-  const chosen = new Map();
+  const chosen = new Map();chosen.orderKeys=new Map();
   for (const [property, candidates] of values) {
     candidates.sort((a, b) => compare(b.key, a.key));
     let winner = candidates[0];
     if (winner.value.toLowerCase() === 'revert' || winner.value.toLowerCase() === 'revert-layer') winner = candidates.find(candidate => candidate.origin === 0);
-    if (winner) chosen.set(property, winner.overflowPart === undefined ? winner.value : { value: winner.value, overflowPart: winner.overflowPart });
+    if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key);}
   }
   return chosen;
 }
@@ -555,7 +564,7 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
   if (retained?.token === token) return retained.style;
   const parent = inheritanceParent(element);
   const parentStyle = parent ? compute(record, parent, memo) : null;
-  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, { token, style: result });
+  const chosen = cascade(record, element), result = new CSSStyleDeclaration(); memo.set(element, { token, style: result, specified: chosen });
   const custom = new Map(), resolved = new Map();
   if (parentStyle) for (let index = 0; index < parentStyle.length; index++) if (parentStyle[index].startsWith('--')) custom.set(parentStyle[index], parentStyle.getPropertyValue(parentStyle[index]));
   for (const [property, value] of chosen) if (property.startsWith('--')) {
@@ -654,15 +663,13 @@ export function getStyleRevision(window) {
   const record = recordFor(window?.document);
   if (!record) return 0;
   const tokens = [getSelectorStateRevision(window), window.innerWidth, window.innerHeight, record.stateRevision, record.window.location.href, id(implForWrapper(record.document)._lastFocusedElement ?? record.document)];
-  const visit = root => {
-    tokens.push(id(root), implForWrapper(root)._version);
-    for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
-    for (const element of root.querySelectorAll('*')) {
-      const shadow = implForWrapper(element)._shadowRoot;
-      if (shadow) visit(wrapperForImpl(shadow));
-    }
-  };
-  visit(record.document);
+  const discoveryKey=JSON.stringify([record.scopeRevision??0,implForWrapper(record.document)._version,...(record.scopeRoots??[]).map(root=>[id(root),implForWrapper(root)._version])]);
+  if(discoveryKey!==record.scopeDiscoveryKey){
+    const roots=[],slots=[];const discover=root=>{roots.push(root);for(const element of root.querySelectorAll('*')){const implementation=implForWrapper(element);if(element.localName==='slot')slots.push(implementation);if(implementation._shadowRoot)discover(wrapperForImpl(implementation._shadowRoot));}};discover(record.document);record.scopeRoots=roots;record.scopeSlots=slots;
+    record.scopeDiscoveryKey=JSON.stringify([record.scopeRevision??0,implForWrapper(record.document)._version,...roots.map(root=>[id(root),implForWrapper(root)._version])]);
+  }
+  for(const root of record.scopeRoots){tokens.push(id(root),implForWrapper(root)._version);for(const{sheet,media}of scopeSheets(record,root))tokens.push(media,sheetFingerprint(sheet));}
+  for(const slot of record.scopeSlots)tokens.push(id(slot),(slot._assignedNodes??[]).map(id));
   const signature = JSON.stringify(tokens);
   if (signature !== record.signature) { record.signature = signature; record.revision++; }
   return record.revision;
@@ -746,3 +753,38 @@ export function installStyles(page, window) {
   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
   return record.controller;
 }
+
+// Internal SVG metrics resolve relative font values against actual ancestors.
+// This exposes the existing cascade winner without changing CSSOM behavior.
+export function getCascadedStyleValue(element, property) {
+  if (!ElementInterface.is(element)) return undefined;
+  const record = recordFor(element.ownerDocument);
+  if (!record) return element.style?.getPropertyValue(property) || undefined;
+  const value = cascade(record, element).get(property);
+  if (typeof value === 'string' && /var\(/.test(value)) return computedStyle(record, element).getPropertyValue(property);
+  return typeof value === 'object' ? value.value : value;
+}
+
+// Host-only projection over the same real cascade, used while building all
+// surrogate boxes. It avoids allocating a full public CSS declaration for
+// every node when only flow properties are needed.
+const FLOW_PROPERTIES=['display','position','float','width','height','min-width','max-width','margin-left','margin-right','flex-grow','flex-shrink','flex-direction','flex-wrap','overflow-x','overflow-y','visibility','pointer-events','opacity','direction','font-size','white-space','text-wrap','text-wrap-mode'];
+export function getLayoutStyle(element){
+ const record=recordFor(element.ownerDocument);if(!record)return null;
+ const token=localToken(record,element);record.layoutMemo??=new WeakMap();const retained=record.layoutMemo.get(element);if(retained?.token===token)return retained.style;
+ const parent=inheritanceParent(element),parentStyle=parent?getLayoutStyle(parent):null,chosen=cascade(record,element),style=Object.create(null);
+ const propertyKey=name=>name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
+ for(const name of FLOW_PROPERTIES){const key=propertyKey(name),fallback=initial[name]??'',parentValue=parentStyle?.[key]||fallback;let value=chosen.get(name);if(typeof value==='object')value=value.value;const keyword=value?.toLowerCase();if(value===undefined||keyword==='unset')value=inherited.has(name)?parentValue:fallback;else if(keyword==='inherit')value=parentValue;else if(keyword==='initial')value=fallback;if(['display','position','float','visibility','pointer-events'].includes(name))value=value.toLowerCase();style[key]=value;}
+ const fontRoot=element===record.document.documentElement?'16px':record.layoutMemo.get(record.document.documentElement)?.style.fontSize??'16px';style.fontSize=computedFontSize(style.fontSize,parentStyle?.fontSize,fontRoot,{isRoot:element===record.document.documentElement});
+ const flow=chosen.get('flex-flow');if(typeof flow==='string'){const parts=flow.toLowerCase().split(/\s+/),directions=['row','row-reverse','column','column-reverse'],wraps=['wrap','wrap-reverse','nowrap'];if(parts.length<=2&&parts.every(p=>directions.includes(p)||wraps.includes(p))){for(const[property,key,value]of[['flex-direction','flexDirection',parts.find(p=>directions.includes(p))??'row'],['flex-wrap','flexWrap',parts.find(p=>wraps.includes(p))??'nowrap']]){const explicit=chosen.orderKeys.get(property);if(!explicit||compare(chosen.orderKeys.get('flex-flow'),explicit)>0)style[key]=value;}}}
+ const directions=style.direction==='rtl'?['marginRight','marginLeft']:['marginLeft','marginRight'];
+ const physicalKeys={marginLeft:chosen.orderKeys.get('margin-left'),marginRight:chosen.orderKeys.get('margin-right')};
+ for(const name of ['margin-inline','margin-inline-start','margin-inline-end']){const value=chosen.get(name);if(typeof value!=='string')continue;const parts=splitTopLevel(value.replace(/\t|\n|\r|\f/g,' '),' ').filter(Boolean);if(!parts.length||parts.length>2)continue;const pairs=name==='margin-inline'?[[directions[0],parts[0]],[directions[1],parts[1]??parts[0]]]:[[directions[name.endsWith('start')?0:1],parts[0]]];for(const[key,entry]of pairs){const order=chosen.orderKeys.get(name);if(!physicalKeys[key]||compare(order,physicalKeys[key])>0){style[key]=entry;physicalKeys[key]=order;}}}
+ let x=style.overflowX==='overlay'?'auto':style.overflowX,y=style.overflowY==='overlay'?'auto':style.overflowY;if(![x,y].every(v=>v==='visible'||v==='clip')){x=x==='visible'?'auto':x==='clip'?'hidden':x;y=y==='visible'?'auto':y==='clip'?'hidden':y;}style.overflowX=x;style.overflowY=y;
+ if(element===record.document.documentElement)style.display=({inline:'block','inline-block':'block','inline-flex':'flex','inline-grid':'grid',contents:'block'})[style.display]??style.display;
+ record.layoutMemo.set(element,{token,style,specified:chosen});return style;
+}
+export function getSpecifiedStyle(element,name){const record=recordFor(element.ownerDocument);if(!record)return element.style?.getPropertyValue(name)||undefined;getLayoutStyle(element);return record.layoutMemo.get(element)?.specified.get(name);}
+export function hasSpecifiedStyle(element,name){const record=recordFor(element.ownerDocument);if(!record)return !!element.style?.getPropertyValue(name);getLayoutStyle(element);return record.layoutMemo.get(element)?.specified.has(name)??false;}
+
+export function getLayoutCacheRevision(window){return recordFor(window.document)?getStyleRevision(window):undefined;}

@@ -1,0 +1,1 @@
+(()=>{const root=document.createElementNS('http://www.w3.org/2000/svg','svg'),t=root.createSVGTransform(),m=t.matrix;t.setTranslate(7,8);try{const copy=structuredClone(m);return{ctor:copy.constructor.name,e:copy.e,f:copy.f,source:m.e}}catch(e){return{error:{name:e.name,message:e.message},source:m.e}}})()

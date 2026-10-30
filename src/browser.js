@@ -1,3 +1,4 @@
+import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
 import {createInvocationTrampoline} from './invocation.js';
 import {captureWorkerCreator} from './worker-apis.js';
 import {installServiceWorkers} from './service-workers.js';
@@ -196,6 +197,7 @@ export class Page extends EventEmitter {
     captureProtocolRealm(window);
     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
     this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
+    alignMainIDLPrototypes(window);
     const listenerOwnership = installListenerOwnership(window);
     listenerOwnership.scope(() => {
       installErrors(this, window);

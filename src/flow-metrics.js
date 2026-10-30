@@ -1,0 +1,5 @@
+// Measured native surrogate length and text-height arithmetic. Text contributes
+// a measured line height only when the element has a resolvable explicit width;
+// words are indivisible and line-height declarations are not used by this model.
+export function resolveFlowLength(value,viewport={},basis){const m=/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px|%|pt|pc|in|cm|mm|q|vw|vh)?$/i.exec(value?.trim()??'');if(!m)return undefined;const unit=(m[2]??'px').toLowerCase(),factors={px:1,pt:96/72,pc:16,in:96,cm:96/2.54,mm:96/25.4,q:96/101.6,vw:viewport.width/100,vh:viewport.height/100,'%':basis===undefined?undefined:basis/100};const factor=factors[unit];return factor===undefined?undefined:Math.fround(Number(m[1])*factor);}
+export function nativeTextHeight(text,width,fontSize,nowrap=false){const words=String(text).trim().split(/\s+/).filter(Boolean);if(!words.length||width===undefined||width<=0)return 0;let lines=1,line=0;const unit=fontSize*0.6;for(const word of words){const advance=word.length*unit;if(!nowrap&&line&&line+unit+advance>width){lines++;line=advance;}else line+=line?unit+advance:advance;}return Math.ceil(lines*fontSize*1.2);}

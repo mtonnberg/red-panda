@@ -1,0 +1,585 @@
+{
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "probeSHA256": "45dea80db6ebb3c8b8aa4730afda11bb2e534811ffa4e941f597c66b898cc464",
+  "coreLimit": 0,
+  "originA": "http://127.0.0.1:44161",
+  "originB": "http://127.0.0.1:39409",
+  "source": "const report=(phase,data)=>postMessage({phase,data});\nconst failure=error=>({name:error.name,message:error.message});\nconst xhr=(url,{sync=false,credentials=false,method='GET',body=null,headers={}}={})=>{\nconst x=new XMLHttpRequest(),events=[];x.open(method,url,!sync);x.withCredentials=credentials;x.responseType='json';for(const[name,value]of Object.entries(headers))x.setRequestHeader(name,value);for(const type of['load','error','timeout','abort'])x.addEventListener(type,e=>events.push(type));\nif(sync){try{x.send(body);return{status:x.status,response:x.response,events}}catch(error){return{status:x.status,error:failure(error),events}}}\nreturn new Promise(resolve=>{x.onloadend=()=>resolve({status:x.status,response:x.response,events});x.send(body)})};\n(async()=>{const mode=new URL(location.href).searchParams.get('mode'),cross=__CROSS__;\nif(mode==='cors'||mode==='cors-sync')for(const credentials of[false,true]){\nconst sync=mode==='cors-sync';report('simple-'+credentials,await xhr(cross+'/cors?credentials='+credentials,{credentials,sync}));\nreport('preflight-'+credentials,await xhr(cross+'/cors?credentials='+credentials,{credentials,sync,method:'PUT',headers:{'x-actual':'real'},body:new Uint8Array([0,128,255])}));\n} \nif(mode==='cors'||mode==='cors-sync')report('denied',await xhr(cross+'/cors?wildcard=1',{credentials:true,sync:mode==='cors-sync'}));\nif(mode==='forms')for(const sync of[false,true]){const form=new FormData();form.append('line','a\\nb\\rc\\r\\nd');form.append('duplicate','one');form.append('duplicate','two');form.append('file',new File([new Uint8Array([0,128,255])],'café\"\\r\\n.bin',{type:'application/octet-stream'}));report('form-'+sync,await xhr('/form',{sync,method:'POST',body:form}));}\nif(mode==='socket'||mode==='socket-cli'||mode==='socket-cookie'){\nconst socket=new WebSocket('/socket'),events=[];await new Promise(resolve=>{socket.onopen=()=>{events.push('open');socket.send('real')};socket.onmessage=e=>{events.push(e.data);socket.close(1000,'done')};socket.onerror=()=>events.push('error');socket.onclose=()=>resolve()});report('socket',{events,after:await xhr('/cookies')});\n}\nreport('complete',{});\n})().catch(error=>{report('failure',failure(error));report('complete',{})});",
+  "results": [
+    {
+      "mode": "cors-sync",
+      "args": [
+        "fetch",
+        "--load-resources",
+        "worker",
+        "--wait-script",
+        "globalThis.__done===true",
+        "--wait-ms",
+        "1500",
+        "--dump",
+        "html",
+        "--json",
+        "http://127.0.0.1:44161/?mode=cors-sync"
+      ],
+      "elapsedMs": 202.03325600000005,
+      "exitCode": 0,
+      "signal": null,
+      "killedByWatchdog": false,
+      "stdout": "{\"url\":\"http://127.0.0.1:44161/?mode=cors-sync\",\"http_status\":200,\"headers\":[{\"name\":\"set-cookie\",\"value\":\"root_cookie=actual; Path=/\"},{\"name\":\"set-cookie\",\"value\":\"root_http=hidden; HttpOnly; Path=/\"},{\"name\":\"content-type\",\"value\":\"text/html\"},{\"name\":\"date\",\"value\":\"Fri, 30 Oct 2026 21:29:05 GMT\"},{\"name\":\"connection\",\"value\":\"keep-alive\"},{\"name\":\"keep-alive\",\"value\":\"timeout=5\"},{\"name\":\"content-length\",\"value\":\"469\"}],\"dump\":\"html\",\"content\":\"<!DOCTYPE html><html><head><script>globalThis.reports=[];globalThis.__done=false;const worker=new Worker('/worker.js?mode=cors-sync');worker.onmessage=event=>{reports.push(event.data);document.getElementById('result').textContent=JSON.stringify(reports);if(event.data.phase==='complete')globalThis.__done=true};worker.onerror=event=>{reports.push({error:event.message});globalThis.__done=true;document.getElementById('result').textContent=JSON.stringify(reports)};</script></head><body><pre id=\\\"result\\\">[{\\\"phase\\\":\\\"simple-false\\\",\\\"data\\\":{\\\"status\\\":200,\\\"response\\\":{\\\"cookie\\\":\\\"\\\",\\\"origin\\\":\\\"http://127.0.0.1:44161\\\",\\\"method\\\":\\\"GET\\\",\\\"bytes\\\":[],\\\"custom\\\":\\\"\\\"},\\\"events\\\":[\\\"load\\\"]}},{\\\"phase\\\":\\\"preflight-false\\\",\\\"data\\\":{\\\"status\\\":200,\\\"response\\\":{\\\"cookie\\\":\\\"\\\",\\\"origin\\\":\\\"http://127.0.0.1:44161\\\",\\\"method\\\":\\\"PUT\\\",\\\"bytes\\\":[0,128,255],\\\"custom\\\":\\\"real\\\"},\\\"events\\\":[\\\"load\\\"]}},{\\\"phase\\\":\\\"simple-true\\\",\\\"data\\\":{\\\"status\\\":200,\\\"response\\\":{\\\"cookie\\\":\\\"root_cookie=actual; root_http=hidden\\\",\\\"origin\\\":\\\"http://127.0.0.1:44161\\\",\\\"method\\\":\\\"GET\\\",\\\"bytes\\\":[],\\\"custom\\\":\\\"\\\"},\\\"events\\\":[\\\"load\\\"]}},{\\\"phase\\\":\\\"preflight-true\\\",\\\"data\\\":{\\\"status\\\":200,\\\"response\\\":{\\\"cookie\\\":\\\"root_cookie=actual; root_http=hidden\\\",\\\"origin\\\":\\\"http://127.0.0.1:44161\\\",\\\"method\\\":\\\"PUT\\\",\\\"bytes\\\":[0,128,255],\\\"custom\\\":\\\"real\\\"},\\\"events\\\":[\\\"load\\\"]}},{\\\"phase\\\":\\\"denied\\\",\\\"data\\\":{\\\"status\\\":0,\\\"error\\\":{\\\"name\\\":\\\"NetworkError\\\",\\\"message\\\":\\\"A network error occurred\\\"},\\\"events\\\":[]}},{\\\"phase\\\":\\\"complete\\\",\\\"data\\\":{}}]</pre></body></html>\",\"error\":null,\"bot_challenge\":null,\"page_status\":{\"js_errors\":0,\"skipped\":{\"iframe\":0,\"worker\":0,\"image\":0,\"stylesheet\":0,\"beacon\":0},\"unsupported\":{\"webgl\":0,\"canvas2d\":0},\"failed\":{\"script\":0,\"fetch\":0,\"xhr\":0},\"blocked\":{\"script\":0,\"fetch\":0,\"xhr\":0},\"resource_challenge\":null,\"missing_globals\":[]}}\n",
+      "stderr": "",
+      "observations": [
+        {
+          "phase": "simple-false",
+          "data": {
+            "status": 200,
+            "response": {
+              "cookie": "",
+              "origin": "http://127.0.0.1:44161",
+              "method": "GET",
+              "bytes": [],
+              "custom": ""
+            },
+            "events": [
+              "load"
+            ]
+          }
+        },
+        {
+          "phase": "preflight-false",
+          "data": {
+            "status": 200,
+            "response": {
+              "cookie": "",
+              "origin": "http://127.0.0.1:44161",
+              "method": "PUT",
+              "bytes": [
+                0,
+                128,
+                255
+              ],
+              "custom": "real"
+            },
+            "events": [
+              "load"
+            ]
+          }
+        },
+        {
+          "phase": "simple-true",
+          "data": {
+            "status": 200,
+            "response": {
+              "cookie": "root_cookie=actual; root_http=hidden",
+              "origin": "http://127.0.0.1:44161",
+              "method": "GET",
+              "bytes": [],
+              "custom": ""
+            },
+            "events": [
+              "load"
+            ]
+          }
+        },
+        {
+          "phase": "preflight-true",
+          "data": {
+            "status": 200,
+            "response": {
+              "cookie": "root_cookie=actual; root_http=hidden",
+              "origin": "http://127.0.0.1:44161",
+              "method": "PUT",
+              "bytes": [
+                0,
+                128,
+                255
+              ],
+              "custom": "real"
+            },
+            "events": [
+              "load"
+            ]
+          }
+        },
+        {
+          "phase": "denied",
+          "data": {
+            "status": 0,
+            "error": {
+              "name": "NetworkError",
+              "message": "A network error occurred"
+            },
+            "events": []
+          }
+        },
+        {
+          "phase": "complete",
+          "data": {}
+        }
+      ],
+      "parseError": null,
+      "requests": [
+        {
+          "server": "a",
+          "url": "/?mode=cors-sync",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document"
+          },
+          "bytes": []
+        },
+        {
+          "server": "a",
+          "url": "/worker.js?mode=cors-sync",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "same-origin",
+            "sec-fetch-dest": "worker"
+          },
+          "bytes": []
+        },
+        {
+          "server": "b",
+          "url": "/cors?credentials=false",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "http://127.0.0.1:44161",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty"
+          },
+          "bytes": []
+        },
+        {
+          "server": "b",
+          "url": "/cors?credentials=false",
+          "method": "OPTIONS",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "http://127.0.0.1:44161",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "access-control-request-method": "PUT",
+            "access-control-request-headers": "x-actual"
+          },
+          "bytes": []
+        },
+        {
+          "server": "b",
+          "url": "/cors?credentials=false",
+          "method": "PUT",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "x-actual": "real",
+            "origin": "http://127.0.0.1:44161",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "content-length": "3"
+          },
+          "bytes": [
+            0,
+            128,
+            255
+          ]
+        },
+        {
+          "server": "b",
+          "url": "/cors?credentials=true",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "referer": "http://127.0.0.1:44161/",
+            "origin": "http://127.0.0.1:44161",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty"
+          },
+          "bytes": []
+        },
+        {
+          "server": "b",
+          "url": "/cors?credentials=true",
+          "method": "OPTIONS",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "http://127.0.0.1:44161",
+            "referer": "http://127.0.0.1:44161/",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "access-control-request-method": "PUT",
+            "access-control-request-headers": "x-actual"
+          },
+          "bytes": []
+        },
+        {
+          "server": "b",
+          "url": "/cors?credentials=true",
+          "method": "PUT",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "x-actual": "real",
+            "referer": "http://127.0.0.1:44161/",
+            "origin": "http://127.0.0.1:44161",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "content-length": "3"
+          },
+          "bytes": [
+            0,
+            128,
+            255
+          ]
+        },
+        {
+          "server": "b",
+          "url": "/cors?wildcard=1",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:39409",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "referer": "http://127.0.0.1:44161/",
+            "origin": "http://127.0.0.1:44161",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty"
+          },
+          "bytes": []
+        }
+      ]
+    },
+    {
+      "mode": "socket-cli",
+      "args": [
+        "fetch",
+        "--load-resources",
+        "worker",
+        "--wait-script",
+        "globalThis.__done===true",
+        "--wait-ms",
+        "1500",
+        "--dump",
+        "html",
+        "--json",
+        "--http-header",
+        "X-Policy: forced",
+        "--user-agent",
+        "phase-two-agent",
+        "http://127.0.0.1:44161/?mode=socket-cli"
+      ],
+      "elapsedMs": 5021.817437000001,
+      "exitCode": null,
+      "signal": "SIGKILL",
+      "killedByWatchdog": true,
+      "stdout": "{\"url\":\"http://127.0.0.1:44161/?mode=socket-cli\",\"http_status\":200,\"headers\":[{\"name\":\"set-cookie\",\"value\":\"root_cookie=actual; Path=/\"},{\"name\":\"set-cookie\",\"value\":\"root_http=hidden; HttpOnly; Path=/\"},{\"name\":\"content-type\",\"value\":\"text/html\"},{\"name\":\"date\",\"value\":\"Fri, 30 Oct 2026 21:29:05 GMT\"},{\"name\":\"connection\",\"value\":\"keep-alive\"},{\"name\":\"keep-alive\",\"value\":\"timeout=5\"},{\"name\":\"content-length\",\"value\":\"470\"}],\"dump\":\"html\",\"content\":\"<!DOCTYPE html><html><head><script>globalThis.reports=[];globalThis.__done=false;const worker=new Worker('/worker.js?mode=socket-cli');worker.onmessage=event=>{reports.push(event.data);document.getElementById('result').textContent=JSON.stringify(reports);if(event.data.phase==='complete')globalThis.__done=true};worker.onerror=event=>{reports.push({error:event.message});globalThis.__done=true;document.getElementById('result').textContent=JSON.stringify(reports)};</script></head><body><pre id=\\\"result\\\">[{\\\"phase\\\":\\\"socket\\\",\\\"data\\\":{\\\"events\\\":[\\\"open\\\",\\\"real\\\"],\\\"after\\\":{\\\"status\\\":200,\\\"response\\\":{\\\"cookie\\\":\\\"root_cookie=actual; root_http=hidden\\\",\\\"agent\\\":\\\"phase-two-agent\\\",\\\"policy\\\":\\\"forced\\\"},\\\"events\\\":[\\\"load\\\"]}}},{\\\"phase\\\":\\\"complete\\\",\\\"data\\\":{}}]</pre></body></html>\",\"error\":null,\"bot_challenge\":null,\"page_status\":{\"js_errors\":0,\"skipped\":{\"iframe\":0,\"worker\":0,\"image\":0,\"stylesheet\":0,\"beacon\":0},\"unsupported\":{\"webgl\":0,\"canvas2d\":0},\"failed\":{\"script\":0,\"fetch\":0,\"xhr\":0},\"blocked\":{\"script\":0,\"fetch\":0,\"xhr\":0},\"resource_challenge\":null,\"missing_globals\":[]}}\n",
+      "stderr": "",
+      "observations": [
+        {
+          "phase": "socket",
+          "data": {
+            "events": [
+              "open",
+              "real"
+            ],
+            "after": {
+              "status": 200,
+              "response": {
+                "cookie": "root_cookie=actual; root_http=hidden",
+                "agent": "phase-two-agent",
+                "policy": "forced"
+              },
+              "events": [
+                "load"
+              ]
+            }
+          }
+        },
+        {
+          "phase": "complete",
+          "data": {}
+        }
+      ],
+      "parseError": null,
+      "requests": [
+        {
+          "server": "a",
+          "url": "/?mode=socket-cli",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "phase-two-agent",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "x-policy": "forced",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document"
+          },
+          "bytes": []
+        },
+        {
+          "server": "a",
+          "url": "/worker.js?mode=socket-cli",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "phase-two-agent",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "x-policy": "forced",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "same-origin",
+            "sec-fetch-dest": "worker"
+          },
+          "bytes": []
+        },
+        {
+          "websocket": true,
+          "url": "/socket",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "upgrade": "websocket",
+            "sec-websocket-version": "13",
+            "sec-websocket-key": "QNrh1vZOxRfvQ4QDZUe0aA==",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "phase-two-agent",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "http://127.0.0.1:44161",
+            "connection": "Upgrade"
+          }
+        },
+        {
+          "server": "a",
+          "url": "/cookies",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "phase-two-agent",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "x-policy": "forced",
+            "referer": "http://127.0.0.1:44161/?mode=socket-cli",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty"
+          },
+          "bytes": []
+        }
+      ]
+    },
+    {
+      "mode": "socket-cookie",
+      "args": [
+        "fetch",
+        "--load-resources",
+        "worker",
+        "--wait-script",
+        "globalThis.__done===true",
+        "--wait-ms",
+        "1500",
+        "--dump",
+        "html",
+        "--json",
+        "--http-header",
+        "Cookie: cli_cookie=forced",
+        "http://127.0.0.1:44161/?mode=socket-cookie"
+      ],
+      "elapsedMs": 5033.409279,
+      "exitCode": null,
+      "signal": "SIGKILL",
+      "killedByWatchdog": true,
+      "stdout": "{\"url\":\"http://127.0.0.1:44161/?mode=socket-cookie\",\"http_status\":200,\"headers\":[{\"name\":\"set-cookie\",\"value\":\"root_cookie=actual; Path=/\"},{\"name\":\"set-cookie\",\"value\":\"root_http=hidden; HttpOnly; Path=/\"},{\"name\":\"content-type\",\"value\":\"text/html\"},{\"name\":\"date\",\"value\":\"Fri, 30 Oct 2026 21:29:10 GMT\"},{\"name\":\"connection\",\"value\":\"keep-alive\"},{\"name\":\"keep-alive\",\"value\":\"timeout=5\"},{\"name\":\"content-length\",\"value\":\"473\"}],\"dump\":\"html\",\"content\":\"<!DOCTYPE html><html><head><script>globalThis.reports=[];globalThis.__done=false;const worker=new Worker('/worker.js?mode=socket-cookie');worker.onmessage=event=>{reports.push(event.data);document.getElementById('result').textContent=JSON.stringify(reports);if(event.data.phase==='complete')globalThis.__done=true};worker.onerror=event=>{reports.push({error:event.message});globalThis.__done=true;document.getElementById('result').textContent=JSON.stringify(reports)};</script></head><body><pre id=\\\"result\\\">[{\\\"phase\\\":\\\"socket\\\",\\\"data\\\":{\\\"events\\\":[\\\"open\\\",\\\"real\\\"],\\\"after\\\":{\\\"status\\\":200,\\\"response\\\":{\\\"cookie\\\":\\\"cli_cookie=forced\\\",\\\"agent\\\":\\\"Lightpanda/1.0\\\",\\\"policy\\\":\\\"\\\"},\\\"events\\\":[\\\"load\\\"]}}},{\\\"phase\\\":\\\"complete\\\",\\\"data\\\":{}}]</pre></body></html>\",\"error\":null,\"bot_challenge\":null,\"page_status\":{\"js_errors\":0,\"skipped\":{\"iframe\":0,\"worker\":0,\"image\":0,\"stylesheet\":0,\"beacon\":0},\"unsupported\":{\"webgl\":0,\"canvas2d\":0},\"failed\":{\"script\":0,\"fetch\":0,\"xhr\":0},\"blocked\":{\"script\":0,\"fetch\":0,\"xhr\":0},\"resource_challenge\":null,\"missing_globals\":[]}}\n",
+      "stderr": "",
+      "observations": [
+        {
+          "phase": "socket",
+          "data": {
+            "events": [
+              "open",
+              "real"
+            ],
+            "after": {
+              "status": 200,
+              "response": {
+                "cookie": "cli_cookie=forced",
+                "agent": "Lightpanda/1.0",
+                "policy": ""
+              },
+              "events": [
+                "load"
+              ]
+            }
+          }
+        },
+        {
+          "phase": "complete",
+          "data": {}
+        }
+      ],
+      "parseError": null,
+      "requests": [
+        {
+          "server": "a",
+          "url": "/?mode=socket-cookie",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "cookie": "cli_cookie=forced",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document"
+          },
+          "bytes": []
+        },
+        {
+          "server": "a",
+          "url": "/worker.js?mode=socket-cookie",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "cookie": "cli_cookie=forced",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "same-origin",
+            "sec-fetch-dest": "worker"
+          },
+          "bytes": []
+        },
+        {
+          "websocket": true,
+          "url": "/socket",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "upgrade": "websocket",
+            "sec-websocket-version": "13",
+            "sec-websocket-key": "2NWvUWUVH2D/JV1+ICo7Rw==",
+            "cookie": "root_cookie=actual; root_http=hidden",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "http://127.0.0.1:44161",
+            "connection": "Upgrade"
+          }
+        },
+        {
+          "server": "a",
+          "url": "/cookies",
+          "method": "GET",
+          "headers": {
+            "host": "127.0.0.1:44161",
+            "accept": "*/*",
+            "accept-encoding": "deflate, gzip, br, zstd",
+            "user-agent": "Lightpanda/1.0",
+            "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+            "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+            "accept-language": "en-US,en;q=0.9",
+            "cookie": "cli_cookie=forced",
+            "referer": "http://127.0.0.1:44161/?mode=socket-cookie",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty"
+          },
+          "bytes": []
+        }
+      ]
+    }
+  ]
+}

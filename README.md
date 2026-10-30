@@ -111,7 +111,7 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket and FileReaderSync |
-| Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG attribute/transform values, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
+| Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
@@ -132,7 +132,7 @@ provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
 connect with `defaultViewport: null` (already configured by the PureScript FFI).
 
 Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), including
-simple boxes, hit testing and scrolling. It is not a CSS renderer. Intersection
+flow/flex width calculations, word wrapping, boxes, hit testing and actual scroll state. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
 semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
 CSS painting, canvas, shared workers, complete frame behavior and process

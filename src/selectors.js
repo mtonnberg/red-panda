@@ -171,7 +171,7 @@ function predicate(record,element,item) {
  const impl=implForWrapper(element);
  if(item.kind==='type'){
   if(item.namespace===''&&impl._namespaceURI!==null)return false;
-  const fold=impl._namespaceURI===HTML&&impl._ownerDocument._parsingMode==='html';
+  const fold=(impl._namespaceURI===HTML||impl._namespaceURI==='http://www.w3.org/2000/svg')&&impl._ownerDocument._parsingMode==='html';
   return item.name==='*'||(fold?lower(impl._localName)===lower(item.name):impl._localName===item.name);
  }
  if(item.kind==='id'||item.kind==='class'){
@@ -188,10 +188,10 @@ function predicate(record,element,item) {
 }
 function compiled(record,source) {
  let parsed=record.cache.get(source);if(parsed)return parsed;
- parsed=parseSelector(source,{window:record.window,emitPredicate(item){const index=record.predicates.push(item)-1;return `:${internal}(${index})`;}});record.cache.set(source,parsed);return parsed;
+ const emitted=[];parsed=parseSelector(source,{window:record.window,emitPredicate(item){const index=record.predicates.push(item)-1,text=`:${internal}(${index})`;emitted.push({item,text});return text;}});if(emitted.length===1&&parsed.compiled===emitted[0].text)parsed.primitive=emitted[0].item;record.cache.set(source,parsed);return parsed;
 }
 function matcher(record){
- if(record.matcher){record.matcher.Snapshot.root=record.document.documentElement;return record.matcher;}
+ if(record.matcher){record.matcher.Snapshot.root=wrapperForImpl(record.documentImpl.documentElement);return record.matcher;}
  const engine=nwsapi({document:record.document,DOMException:record.window.DOMException});engine.configure({LOGERRORS:false,VERBOSITY:true,IDS_DUPES:true,MIXEDCASE:true,FORGIVING:false});
  engine.Snapshot.rpPredicate=(element,index)=>predicate(record,element,record.predicates[index]);
  engine.registerSelector(internal,new RegExp('^:'+internal+'\\((\\d+)\\)(.*)'),(match,source)=>({source:`if(s.rpPredicate(e,${Number(match[1])})){${source}}`,status:true}));
@@ -199,7 +199,7 @@ function matcher(record){
  record.matcher=engine;return engine;
 }
 function match(record,selector,element,scope=element){
- const parsed=compiled(record,selector);if(!record.document.documentElement)return false;
+ const parsed=compiled(record,selector);if(!record.documentImpl.documentElement)return false;if(parsed.primitive)return predicate(record,element,parsed.primitive);
  const engine=matcher(record),previous=engine.Snapshot.from;engine.Snapshot.from=scope;
  try{return engine.match(parsed.compiled,element);}finally{engine.Snapshot.from=previous;}
 }
@@ -228,7 +228,7 @@ export function installSelectors(page,window,providers={}) {
  const document=implForWrapper(window.document);const current=RECORDS.get(document);if(current)return current.controller;
  const signal=page?.documentAbort?.signal;
  if(page?.closed||signal?.aborted)throw new window.DOMException('Cannot register selectors on a closed document','InvalidStateError');
- const record={window,document:window.document,providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
+ const record={window,document:window.document,documentImpl:document,providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
  const dispose=()=>{if(record.disposed)return;record.disposed=true;if(RECORDS.get(document)===record)RECORDS.delete(document);signal?.removeEventListener('abort',dispose);page?.off?.('close',dispose);};
  if(signal)signal.addEventListener('abort',dispose,{once:true});else page?.once?.('close',dispose);
  record.controller={dispose,selectorForSpecificity};return record.controller;
@@ -250,3 +250,6 @@ export function matchesInScope(element,selector,scope=element.ownerDocument.docu
  if(!record)return element.matches(selector);
  try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}
 }
+
+// Host cascade code may reuse its genuine document record and scoping root.
+export function createScopedMatcher(document,scope=document.documentElement){const record=RECORDS.get(implForWrapper(document));if(!record)return(selector,element)=>element.matches(selector);return(selector,element)=>{try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}};}

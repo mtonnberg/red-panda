@@ -1,3 +1,4 @@
+import { encodeWorkerMultipart, encodeWorkerMultipartSync, readWorkerBlobBytes, workerBlobType } from './worker-multipart.js';
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const FORBIDDEN = new Set(['accept-charset','accept-encoding','access-control-request-headers','access-control-request-method','connection','content-length','cookie','cookie2','date','dnt','expect','host','keep-alive','origin','referer','te','trailer','transfer-encoding','upgrade','user-agent','via']);
 const SIMPLE_RESPONSE = new Set(['cache-control','content-language','content-length','content-type','expires','last-modified','pragma']);
@@ -10,6 +11,8 @@ export function installWorkerXHR(realm, { evaluate, fetch, syncRequest, origin, 
   if (typeof evaluate !== 'function' || typeof fetch !== 'function') throw new TypeError('An actual realm evaluator and fetch transport are required');
   const ownerActive = active; let disposed = false;
   active = () => !disposed && ownerActive();
+  const Reader = realm.FileReaderSync, readAsArrayBuffer = Reader?.prototype.readAsArrayBuffer;
+  const readBlobSync = blob => Reflect.apply(readAsArrayBuffer,new Reader(),[blob]);
   const states = new WeakMap(), live = new Set(); let emit;
   const error = (message, name = 'InvalidStateError') => new realm.DOMException(message, name);
   const state = object => { const s = states.get(object); if (!s) throw new realm.TypeError('Illegal invocation'); return s; };
@@ -39,18 +42,35 @@ export function installWorkerXHR(realm, { evaluate, fetch, syncRequest, origin, 
     if(allow!==origin&&!(allow==='*'&&!credentials))throw error('CORS origin is not allowed','NetworkError');
     if(credentials&&response.headers.get('access-control-allow-credentials')!=='true')throw error('CORS credentials are not allowed','NetworkError');
   }
+  function preflightPlan(s,headers) {
+    const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;
+    const unsafe=[...headers].filter(([name,value])=>!simpleHeader(name,value)).map(([name])=>name).sort();
+    if(cross||!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
+    if(!cross||(['GET','HEAD','POST'].includes(s.method)&&!unsafe.length))return null;
+    const requestHeaders=new Headers({'origin':origin,'access-control-request-method':s.method});
+    if(unsafe.length)requestHeaders.set('access-control-request-headers',unsafe.join(', '));
+    return {unsafe,init:{method:'OPTIONS',headers:[...requestHeaders],credentials:'omit'}};
+  }
+  function validatePreflight(response,s,plan) {
+    allowed(response,s.withCredentials);
+    if(response.status<200||response.status>299)throw error('CORS preflight failed','NetworkError');
+    const methods=(response.headers.get('access-control-allow-methods')??'').split(',').map(value=>value.trim());
+    if(!methods.includes(s.method)&&!(methods.includes('*')&&!s.withCredentials))throw error('CORS method is not allowed','NetworkError');
+    const names=(response.headers.get('access-control-allow-headers')??'').toLowerCase().split(',').map(value=>value.trim());
+    if(plan.unsafe.some(name=>!names.includes(name)&&!(names.includes('*')&&!s.withCredentials&&name!=='authorization')))throw error('CORS headers are not allowed','NetworkError');
+  }
   function bodySync(value,headers) {
     if(value==null)return undefined;
-    if(value instanceof Blob){const reader=new realm.FileReaderSync();if(value.type&&!headers.has('content-type'))headers.set('content-type',value.type);return new Uint8Array(reader.readAsArrayBuffer(value));}
+    if(value instanceof Blob){const type=workerBlobType(value);if(type&&!headers.has('content-type'))headers.set('content-type',type);return new Uint8Array(readBlobSync(value));}
     if(ArrayBuffer.isView(value))return new Uint8Array(value.buffer,value.byteOffset,value.byteLength).slice();
     if(Object.prototype.toString.call(value)==='[object ArrayBuffer]')return new Uint8Array(value).slice();
-    if(value instanceof FormData)throw error('Synchronous FormData encoding is not implemented','NotSupportedError');
+    if(value instanceof FormData){const result=encodeWorkerMultipartSync(value,readBlobSync);if(!headers.has('content-type'))headers.set('content-type',result.contentType);return result.bytes;}
     if(!headers.has('content-type'))headers.set('content-type',value instanceof URLSearchParams?'application/x-www-form-urlencoded;charset=UTF-8':'text/plain;charset=UTF-8');
     return String(value);
   }
   async function bodyAsync(value,headers) {
-    if(value instanceof Blob){if(value.type&&!headers.has('content-type'))headers.set('content-type',value.type);return new Uint8Array(await Blob.prototype.arrayBuffer.call(value));}
-    if(value instanceof FormData){const request=new Request('http://form.invalid/',{method:'POST',body:value});if(!headers.has('content-type'))headers.set('content-type',request.headers.get('content-type'));return new Uint8Array(await request.arrayBuffer());}
+    if(value instanceof Blob){const type=workerBlobType(value);if(type&&!headers.has('content-type'))headers.set('content-type',type);return new Uint8Array(await readWorkerBlobBytes(value));}
+    if(value instanceof FormData){const result=await encodeWorkerMultipart(value);if(!headers.has('content-type'))headers.set('content-type',result.contentType);return result.bytes;}
     return bodySync(value,headers);
   }
   function finish(object,s,op,result) {
@@ -76,14 +96,11 @@ export function installWorkerXHR(realm, { evaluate, fetch, syncRequest, origin, 
     try {
       const headers=new Headers(s.requestHeaders);if(!headers.has('accept'))headers.set('accept','*/*');
       const bytes=['GET','HEAD'].includes(s.method)?undefined:await bodyAsync(body,headers);if(!current(s,op)||op.done)return;
-      const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;
-      const unsafe=[...headers].filter(([name,value])=>!simpleHeader(name,value)).map(([name])=>name).sort();
-      if(cross||!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
+      const plan=preflightPlan(s,headers);
       const init={method:s.method,headers,body:bytes,signal:op.controller.signal,credentials:s.withCredentials?'include':'same-origin'};
-      const preflight=cross&&(!['GET','HEAD','POST'].includes(s.method)||unsafe.length);
-      if(preflight){const h=new Headers({'origin':origin,'access-control-request-method':s.method});if(unsafe.length)h.set('access-control-request-headers',unsafe.join(', '));const r=await fetch(s.url,{method:'OPTIONS',headers:h,signal:op.controller.signal,credentials:'omit'});allowed(r,s.withCredentials);if(!r.ok)throw error('CORS preflight failed','NetworkError');const methods=(r.headers.get('access-control-allow-methods')??'').split(',').map(x=>x.trim());if(!methods.includes(s.method)&&!(methods.includes('*')&&!s.withCredentials))throw error('CORS method is not allowed','NetworkError');const names=(r.headers.get('access-control-allow-headers')??'').toLowerCase().split(',').map(x=>x.trim());if(unsafe.some(name=>!names.includes(name)&&!(names.includes('*')&&!s.withCredentials&&name!=='authorization')))throw error('CORS headers are not allowed','NetworkError');}
+      if(plan){const response=await fetch(s.url,{...plan.init,signal:op.controller.signal});validatePreflight(response,s,plan);if(!current(s,op)||op.done)return;}
       const response=await fetch(s.url,init),result={status:response.status,statusText:response.statusText,url:response.url||s.url,headers:response.headers,bytes:new Uint8Array(await response.arrayBuffer())};
-      if(preflight&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
+      if(plan&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
       finish(object,s,op,result);
     }catch{terminal(object,s,op,'error')}
   }
@@ -107,11 +124,12 @@ export function installWorkerXHR(realm, { evaluate, fetch, syncRequest, origin, 
       if(typeof syncRequest!=='function'){cancel(op);s.sending=false;throw error('Synchronous XHR transport is unavailable','NotSupportedError')}
       try{
         const headers=new Headers(s.requestHeaders);if(!headers.has('accept'))headers.set('accept','*/*');const bytes=['GET','HEAD'].includes(s.method)?undefined:bodySync(body,headers);
-        const cross=['http:','https:'].includes(new URL(s.url).protocol)&&new URL(s.url).origin!==origin;if(cross)throw error('Synchronous cross-origin XHR is not implemented','NotSupportedError');
-        if(!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
+        const plan=preflightPlan(s,headers);
+        if(plan){const response=syncRequest(s.url,plan.init,s.timeout);response.headers=new Headers(response.headers);validatePreflight(response,s,plan);}
         const result=syncRequest(s.url,{method:s.method,headers:[...headers],body:bytes,credentials:s.withCredentials?'include':'same-origin'},s.timeout);
+        if(plan&&new URL(result.url).origin!==new URL(s.url).origin)throw error('Redirect requires a fresh CORS preflight','NetworkError');
         result.headers=new Headers(result.headers);finish(object,s,op,result);
-      }catch(cause){terminal(object,s,op,'error');throw cause}
+      }catch(cause){cancel(op);s.sending=false;reset(s);s.readyState=4;if(cause?.name==='NetworkError')throw error('A network error occurred','NetworkError');throw cause}
     },
     abort(object){const s=state(object);if(s.sending&&s.op&&!s.op.done)terminal(object,s,s.op,'abort');else{cancel(s.op);s.op=null;s.sending=false;reset(s);s.readyState=0}},
     override(object,value){const s=state(object);if([3,4].includes(s.readyState))throw error('Cannot override MIME type after loading starts');s.overrideMime=String(value)},

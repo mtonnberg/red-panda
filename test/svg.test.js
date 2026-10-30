@@ -14,7 +14,7 @@ test('typed SVG hierarchy belongs to actual parsed and newly-created nodes acros
   for (const [name, Constructor, Parent] of [['linearGradient', w.SVGLinearGradientElement, w.SVGGradientElement], ['text', w.SVGTextElement, w.SVGTextPositioningElement], ['tspan', w.SVGTSpanElement, w.SVGTextContentElement], ['pattern', w.SVGPatternElement, w.SVGElement]]) {
     const element = d.createElementNS(NS, name); assert.ok(element instanceof Constructor); assert.ok(element instanceof Parent); assert.equal(element.localName, name); assert.throws(() => new Constructor(), e => e instanceof w.TypeError);
   }
-  assert.equal(d.createElementNS(NS, 'RECT').constructor, w.SVGElement); assert.equal(typeof w.SVGMatrix, 'undefined'); assert.equal(typeof w.SVGUnitTypes, 'undefined');
+  assert.equal(d.createElementNS(NS, 'RECT').constructor, w.SVGGenericElement); assert.equal(typeof w.SVGMatrix, 'undefined'); assert.equal(typeof w.SVGUnitTypes, 'undefined');
   assert.equal(Object.getOwnPropertyDescriptor(w, 'SVGRectElement').enumerable, false);
 });
 
@@ -68,7 +68,7 @@ test('transform lists preserve real matrices, item ownership and actual attribut
   const consolidated = list.consolidate(); assert.equal(list.length, 1); assert.equal(consolidated.matrix.a, 3); assert.equal(consolidated.matrix.e, 12);
   const standalone = root.createSVGTransform(); standalone.setRotate(30, 4, 5); near(standalone.matrix.a, Math.cos(Math.PI / 6)); near(standalone.angle, 30);
   list.appendItem(standalone); const other = w.document.createElementNS(NS, 'rect'); other.transform.baseVal.appendItem(standalone);
-  assert.equal(list.length, 1); assert.equal(other.transform.baseVal.getItem(0), standalone);
+  assert.equal(list.length, 2); assert.notEqual(other.transform.baseVal.getItem(0), standalone);
   rectangle.setAttribute('transform', 'translate(9)'); assert.notEqual(list.getItem(0), consolidated); assert.equal(list.getItem(0).matrix.e, 9);
   const animation = rectangle.transform.animVal; assert.equal(animation.getItem(0).matrix.e, 9); assert.doesNotThrow(() => animation.getItem(0).matrix.toString());
   assert.throws(() => { animation.getItem(0).matrix.e = 1; }, e => e.name === 'NoModificationAllowedError'); assert.throws(() => animation.clear(), e => e.name === 'NoModificationAllowedError');

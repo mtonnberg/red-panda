@@ -580,6 +580,32 @@ removes authored listeners and keeps explicit engine listeners and module maps.
 Initial loading/inactive-frame writes and synchronous written external scripts
 remain incomplete.
 
+The next independent DOM/flow/worker integration passes **900 JavaScript tests
+and 53 PureScript Puppeteer assertions**, syntax and strict/pedantic builds, and
+the same13 differential groups. Its [source-bound validation](reference/phase10-integration-validation.json)
+records88 production source hashes and24 additional native/package files. Real
+scoped socket cookies and UA/language policy, worker sync CORS/preflight and
+multipart, main IDL prototype links and borrowed sequence-array realms, SVG
+paths/bounds/text/list values and actual flow/scroll calculations are integrated.
+
+The formerly failing [position fixture](reference/conformance-phase10-position-candidate.json)
+passes on the frozen integrated graph within15seconds (12.4seconds including
+owned process startup/cleanup). Separate isolated layout captures retain a15s
+timeout and30s pass; an earlier9.1s result belongs to a different pre-freeze graph.
+No2s source-budget or performance-equivalence claim follows. SVG controls cover
+all9 unchanged SVG fixtures, but two large quadratic length controls differ by
+about0.0001604/0.0000480, and geometry clone/prototype contracts remain incomplete.
+
+The [broader48-fixture report](../proposals/coverage48/report.json) belongs to the
+earlier frozen integration graph: native48 valid positive controls; candidate
+11passed,36failed and1timed out. A missing method-echo route was separately fixed
+in the owned test transport and rerun; its original transport failure is retained.
+AbortSignal listener exceptions can terminate that candidate process, named-frame
+POST navigation is unsupported, and substantial custom-element/frame/control/
+encoding/XPath behavior remains different. These results are separate from the
+900-test development suite. Actual utility worlds and heap enumeration are still
+unmerged proposals; their acceptance and lifecycle gaps remain explicit.
+
 The full suite passes **687 JavaScript tests and 53 PureScript Puppeteer
 assertions**. Syntax, strict/pedantic PureScript builds and all13 bounded native
 comparisons pass. The [frozen73-fixture comparison](reference/conformance-dom-values-checkpoint.json)
