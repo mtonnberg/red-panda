@@ -26,14 +26,24 @@ export function withTimeout(promise, timeout, message = 'Operation timed out') {
 
 class PageResources extends ResourceLoader {
   constructor(page) { super({ userAgent: page.userAgent }); this.page = page; }
-  fetch(url, options) {
-    const request = super.fetch(url, options);
-    if (!request) return request;
-    const id = this.page.requestStarted(url, options.element?.localName === 'script' ? 'Script' : 'Other');
-    request.then(
-      buffer => this.page.requestFinished(id, url, request.response?.statusCode ?? 200, buffer.length),
-      error => this.page.requestFailed(id, error),
-    );
+  fetch(url, options = {}) {
+    const abort = new AbortController();
+    const headers = new Headers();
+    if (options.accept) headers.set('accept', options.accept);
+    const referrer = this.page.referrerFor(url, options.referrer);
+    if (referrer) headers.set('referer', referrer);
+    const type = options.element?.localName === 'script' ? 'Script' : options.element?.localName === 'link' ? 'Stylesheet' : 'Other';
+    const request = this.page.fetch(url, { headers, signal: abort.signal }, type).then(async response => {
+      request.response = { statusCode: response.status, headers: Object.fromEntries(response.headers) };
+      request.href = response.url;
+      // The shared transport already updated the CookieJar, including separate
+      // Set-Cookie headers. Avoid jsdom re-importing their combined header value.
+      delete request.response.headers['set-cookie'];
+      if (!response.ok) throw new Error(`Resource was not loaded. Status: ${response.status}`);
+      return Buffer.from(await response.arrayBuffer());
+    });
+    request.abort = () => abort.abort();
+    request.getHeader = name => headers.get(name) ?? this.page.extraHTTPHeaders.get(name);
     return request;
   }
 }
@@ -79,6 +89,9 @@ export class Page extends EventEmitter {
     this.executionContextId = browser.nextExecutionContext++;
     this.url = 'about:blank';
     this.userAgent = browser.options.userAgent ?? `RedPanda/${VERSION}`;
+    this.acceptLanguage = 'en-US';
+    this.platform = 'Linux x86_64';
+    this.extraHTTPHeaders = new Headers();
     this.timeout = browser.options.timeout ?? 10000;
     this.javascript = browser.options.javascript !== false;
     this.activeRequests = new Set();
@@ -127,6 +140,9 @@ export class Page extends EventEmitter {
         window.TextDecoder = TextDecoder;
         window.structuredClone = structuredClone;
         Object.defineProperty(window.navigator, 'userAgent', { get: () => this.userAgent });
+        Object.defineProperty(window.navigator, 'language', { get: () => this.acceptLanguage.split(',')[0].split(';')[0].trim() });
+        Object.defineProperty(window.navigator, 'languages', { get: () => Object.freeze(this.acceptLanguage.split(',').map(value => value.split(';')[0].trim()).filter(Boolean)) });
+        Object.defineProperty(window.navigator, 'platform', { get: () => this.platform });
         for (const { source } of this.newDocumentScripts.values()) {
           try { window.eval(source); } catch (error) { this.emit('pageError', error); }
         }
@@ -152,15 +168,53 @@ export class Page extends EventEmitter {
     this.emit('requestFailed', { id, message: error.message, timestamp: now() });
   }
 
+  setExtraHTTPHeaders(values) {
+    if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error('Headers must be an object');
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(values)) {
+      if (typeof value !== 'string') throw new Error('Header values must be strings');
+      headers.set(name, value);
+    }
+    this.extraHTTPHeaders = headers;
+  }
+
+  setUserAgentOverride({ userAgent, acceptLanguage, platform }) {
+    if (typeof userAgent !== 'string' || (acceptLanguage !== undefined && typeof acceptLanguage !== 'string') ||
+        (platform !== undefined && typeof platform !== 'string')) throw new Error('Invalid user agent override');
+    // Validate HTTP values before changing any live state.
+    new Headers({ 'user-agent': userAgent, ...(acceptLanguage !== undefined ? { 'accept-language': acceptLanguage } : {}) });
+    this.userAgent = userAgent;
+    if (acceptLanguage !== undefined) this.acceptLanguage = acceptLanguage;
+    if (platform !== undefined) this.platform = platform;
+  }
+
+  referrerFor(target, source = this.url) {
+    let origin, destination;
+    try { origin = new URL(source); destination = new URL(target); } catch { return null; }
+    if (!['http:', 'https:'].includes(origin.protocol) || !['http:', 'https:'].includes(destination.protocol) ||
+        (origin.protocol === 'https:' && destination.protocol === 'http:')) return null;
+    origin.hash = ''; origin.username = ''; origin.password = '';
+    return origin.origin === destination.origin ? origin.href : `${origin.origin}/`;
+  }
+
   async fetch(input, init = {}, type = 'Fetch') {
     const inputUrl = input instanceof Request ? input.url : String(input);
     let url = new URL(inputUrl, this.url).href;
     if (!['http:', 'https:', 'data:'].includes(new URL(url).protocol)) {
       throw new Error('Only HTTP, HTTPS and data URLs are supported');
     }
-    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    const headers = new Headers();
+    if (input instanceof Request) input.headers.forEach((value, key) => headers.set(key, value));
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+    // CDP defaults override conflicting page-supplied headers, as observed in
+    // the reference browser after Network.enable.
+    this.extraHTTPHeaders.forEach((value, key) => headers.set(key, value));
     headers.set('user-agent', this.userAgent);
+    if (!headers.has('accept-language')) headers.set('accept-language', this.acceptLanguage);
+    if (type === 'Fetch' && !headers.has('referer')) {
+      const referrer = this.referrerFor(url);
+      if (referrer) headers.set('referer', referrer);
+    }
     let method = init.method ?? (input instanceof Request ? input.method : 'GET');
     let body = init.body ?? (input instanceof Request && !['GET', 'HEAD'].includes(method) ? await input.arrayBuffer() : undefined);
     const useCookies = init.credentials !== 'omit';
@@ -185,6 +239,10 @@ export class Page extends EventEmitter {
           if (!['http:', 'https:'].includes(next.protocol)) throw new Error('Unsupported redirect protocol');
           if (next.origin !== new URL(url).origin) {
             headers.delete('authorization'); headers.delete('cookie');
+          }
+          if (headers.has('referer')) {
+            const referrer = this.referrerFor(next.href, headers.get('referer'));
+            if (referrer) headers.set('referer', referrer); else headers.delete('referer');
           }
           if (response.status === 303 || ([301, 302].includes(response.status) && method.toUpperCase() === 'POST')) {
             method = 'GET'; body = undefined; headers.delete('content-type'); headers.delete('content-length');

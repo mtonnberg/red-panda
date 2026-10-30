@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { once } from 'node:events';
-import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -12,6 +10,8 @@ import { createFixture } from '../test/fixture.js';
 import { connect } from '../test/cdp-client.js';
 import { serve } from '../src/cdp.js';
 import { until } from '../src/browser.js';
+import { startReference } from './reference-server.mjs';
+import { probeRequestHeaders } from '../test/header-probe.js';
 
 const exec = promisify(execFile);
 const binary = process.argv[2];
@@ -105,14 +105,7 @@ try {
       dom.window.close(); return value;
     });
 
-  const portProbe = http.createServer(); portProbe.listen(0, '127.0.0.1'); await once(portProbe, 'listening');
-  const port = portProbe.address().port; await new Promise(resolve => portProbe.close(resolve));
-  official = spawn(reference, ['serve', '--host', '127.0.0.1', '--port', String(port)], { stdio: ['ignore', 'ignore', 'pipe'] });
-  official.stderr.on('data', () => {});
-  await until(async () => {
-    if (official.exitCode !== null) throw new Error('Reference CDP server exited before readiness');
-    try { return (await fetch(`http://127.0.0.1:${port}/json/version`)).ok; } catch { return false; }
-  }, { timeout: 10000 });
+  official = await startReference(reference);
   service = await serve({ port: 0 });
   const probe = async endpoint => {
     const client = await connect(endpoint);
@@ -138,13 +131,19 @@ try {
       await client.close();
     }
   };
-  assert.deepEqual(await probe(`ws://127.0.0.1:${service.port}/`), await probe(`ws://127.0.0.1:${port}/`));
+  assert.deepEqual(await probe(`ws://127.0.0.1:${service.port}/`), await probe(official.endpoint));
   results.push({ name: 'CDP contexts, navigation, evaluation, DOM clicks and cookies', passed: true });
   console.log('PASS CDP contexts, navigation, evaluation, DOM clicks and cookies');
+  assert.deepEqual(
+    await probeRequestHeaders(`ws://127.0.0.1:${service.port}/`, fixture.url, { enableNetwork: true }),
+    await probeRequestHeaders(official.endpoint, fixture.url, { enableNetwork: true }),
+  );
+  results.push({ name: 'CDP extra headers, user agent, language, referrers and clearing', passed: true });
+  console.log('PASS CDP extra headers, user agent, language, referrers and clearing');
   console.log(JSON.stringify({ referenceSHA256: sha256, checks: results }, null, 2));
 } finally {
   await service?.close();
-  if (official && official.exitCode === null) { const stopped = once(official, 'exit'); official.kill('SIGTERM'); await stopped; }
+  await official?.close();
   await fixture.close();
   await rm(temporary, { recursive: true, force: true });
 }

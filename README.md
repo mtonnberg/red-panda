@@ -93,9 +93,9 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | CLI | Batch `fetch`, `serve`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export, `--no-javascript`, `--wait-ms`, `--fail-on-http-error` |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
 | CDP page/runtime | Navigation and lifecycle events, reload, frame tree, evaluation, functions/arguments, promises, remote handles/properties, preload scripts, DOM node resolution |
-| CDP network/storage | Request/response events, response bodies, cookies, user agent |
+| CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
 | Extension | `LP.dump` returns `{format, content}` |
-| PureScript / Puppeteer | Connect/disconnect, context/page lifetime, `goto`, response status/body, preload install/removal, evaluation, selector waiting, DOM click dispatch, cookies and `content` |
+| PureScript / Puppeteer | Connect/disconnect, context/page lifetime, `goto`, response status/body, preload install/removal, headers/user agent, evaluation, selector waiting, DOM click dispatch, cookies and `content` |
 
 Unsupported commands return a CDP error with code `-32601`. HTTP discovery
 provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
@@ -110,6 +110,14 @@ Lightpanda output. `done` does not track every future timer. Documents are decod
 as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly.
 No speed or memory parity is claimed.
 
+Request configuration covers navigation, classic external resources, and
+`window.fetch`. Extra CDP headers override conflicting page-supplied headers;
+passing an empty header list clears them. Configuration is per page and survives
+navigation. Automatic referrers use the full URL for the same origin, only the
+origin across origins, and are omitted on HTTPS-to-HTTP downgrades. Cross-origin
+redirects remove authorization. Custom referrer policies and applying these
+header overrides to XMLHttpRequest are not yet supported.
+
 ## PureScript automation
 
 See `automation/src/RedPanda/Puppeteer.purs` for the typed `Aff` API and
@@ -120,23 +128,30 @@ returns a typed `PreloadScript` that `removePreload` can unregister.
 `gotoResponse`, `responseStatus` and `responseText` expose the original HTTP
 response independently of the executed DOM.
 
-`automation/test/Test/Main.purs` runs 17 assertions against a real Puppeteer
+Configure Puppeteer requests from PureScript:
+
+```purescript
+Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
+Browser.setUserAgent page "RedPandaAutomation/1"
+```
+
+`automation/test/Test/Main.purs` runs 22 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` runs
-22 browser, CLI, cookie-file and raw-CDP tests, including error paths and evaluation timeouts.
+27 browser, CLI, cookie-file and raw-CDP tests, including error paths and evaluation timeouts.
 The tests start and stop their own services; none require external sites.
 
 ## REA investigation and comparison
 
 REA 6.8.0 captured behavior from the official Lightpanda
 `1.1.0-nightly.11326+948d77378` binary. Its SHA-256 was checked against the
-official GitHub release asset's published digest. The complete twelve Evidence
+official GitHub release asset's published digest. The complete fourteen Evidence
 records, an index, fixtures and observed limitations are in
 [`docs/reference/FINDINGS.md`](docs/reference/FINDINGS.md).
 
-Eleven differential checks compare this implementation with that binary on the
+Twelve differential checks compare this implementation with that binary on the
 same local fixture: async scripts, selectors, Markdown, error exits, ordered
 batches, preloads, cookie isolation/export/import, plain-text documents, and
-CDP navigation/evaluation/clicks/cookies/dump structure.
+CDP navigation/evaluation/clicks/cookies/dump structure and request configuration.
 
 ```sh
 npm run test:reference -- /path/to/verified/lightpanda

@@ -198,3 +198,47 @@ test('plain-text and JSON responses display text rather than executing or parsin
     assert.equal(page.evaluate('document.querySelector("pre").textContent'), '{"message":"async data"}');
   } finally { browser.close(); }
 });
+
+test('external scripts retain headers, redirects and separate Set-Cookie values through the shared transport', async () => {
+  const browser = new Browser();
+  try {
+    const page = browser.createPage();
+    page.setExtraHTTPHeaders({ 'X-Client': 'resource-test' });
+    const requests = []; page.on('request', request => requests.push(request));
+    await page.navigate(`${fixture.url}resource-redirect-page`);
+    assert.equal(page.evaluate("JSON.parse(document.querySelector('#resource').textContent)['x-client']"), 'resource-test');
+    assert.match(page.evaluate('document.cookie'), /resource-one=a/);
+    assert.match(page.evaluate('document.cookie'), /resource-two=b/);
+    assert.ok(requests.filter(request => request.type === 'Script').every(request => request.headers['x-client'] === 'resource-test'));
+  } finally { browser.close(); }
+});
+
+test('HTTP script failures report a page error while the document finishes loading', async () => {
+  const browser = new Browser();
+  try {
+    const page = browser.createPage();
+    const errors = []; page.on('pageError', error => errors.push(error));
+    await page.navigate(`${fixture.url}resource-error-page`);
+    assert.equal(page.evaluate("document.querySelector('h1').textContent"), 'Document survived');
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].message, /Could not load script/);
+  } finally { browser.close(); }
+});
+
+test('cross-origin redirects remove authorization and reduce automatic referrers to the origin', async () => {
+  const destination = await createFixture();
+  const received = [];
+  destination.server.on('request', request => received.push(request.headers));
+  const browser = new Browser();
+  try {
+    const page = browser.createPage();
+    await page.navigate(`${fixture.url}next?private=fixture-only`);
+    page.setExtraHTTPHeaders({ Authorization: 'fixture-authorization' });
+    const response = await page.fetch(`${fixture.url}redirect-to?url=${encodeURIComponent(`${destination.url}header-api`)}`);
+    const data = await response.json();
+    assert.equal(data.referer, fixture.url);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].authorization, undefined);
+    assert.equal(page.referrerFor('http://elsewhere.test/', 'https://origin.test/private'), null);
+  } finally { browser.close(); await destination.close(); }
+});

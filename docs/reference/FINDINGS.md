@@ -83,3 +83,28 @@ The additional scenarios contain their original ephemeral fixture address.
 `scripts/compare-lightpanda.mjs` creates a fresh local fixture and temporary files
 to repeat these comparisons portably. Its Netscape-import and plain-text checks
 are direct differential tests, separate from these four REA captures.
+
+## Request header and user-agent observations
+
+`request-headers-enabled-evidence.json`
+(`ev_23564527302e119617db2274509e5565aa54bce07b335623e5abc54ace9403d9`)
+captures the verified binary through an owned CDP server and local HTTP fixture.
+Navigation, an external script, and a page fetch all received configured extra
+headers, a user-agent override, and `Accept-Language: sv-SE`. The page's navigator
+reported the same user agent and language. Extra headers took precedence over a
+conflicting header passed to fetch. Setting an empty header object removed them
+on the following navigation. Resources and fetches sent the page URL as their
+same-origin referrer; navigation did not.
+
+The preliminary `request-headers-evidence.json`
+(`ev_d811640c326e85a3594c0eee3bb88be87ee794e208e93d9242da76928ce17e9d`)
+omitted `Network.enable`: user-agent/language overrides worked but the native
+browser did not apply extra headers. The enabled capture tests this diagnosis;
+the differential suite uses an enabled Network domain, as Puppeteer does. These
+results do not establish native behavior for every domain enable/disable order.
+
+Both captures finished with exit 0 and no truncation. The wrapper prints the
+SHA-256 of the reference binary it launches; its process Evidence describes the
+Node wrapper and resulting observations rather than a decompilation of the native
+browser. `request-headers-probe.mjs` accepts the verified binary path and an
+optional `enable-network` argument for reproduction.

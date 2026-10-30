@@ -258,7 +258,8 @@ class Session {
         if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
         return { body: page.responseBodies.get(params.requestId), base64Encoded: false };
       }
-      case 'Network.setUserAgentOverride': page.userAgent = params.userAgent; return {};
+      case 'Network.setExtraHTTPHeaders': page.setExtraHTTPHeaders(params.headers); return {};
+      case 'Network.setUserAgentOverride': page.setUserAgentOverride(params); return {};
       case 'DOM.getDocument': {
         const id = this.backendId(page.dom.window.document);
         return { root: { nodeId: id, backendNodeId: id, nodeType: 9, nodeName: '#document', localName: '', nodeValue: '' } };

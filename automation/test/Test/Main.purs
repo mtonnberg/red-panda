@@ -70,5 +70,26 @@ main = launchAff_ $
         assert "response bytes remain distinct from the executed DOM" $ mutated == "mutated"
         removedPreload <- Browser.evaluateString page "typeof globalThis.fixturePreload"
         assert "removed preload is absent in the next document" $ removedPreload == "undefined"
+        Browser.setExtraHTTPHeaders page
+          [ { name: "X-Client", value: "purescript" }, { name: "X-Shared", value: "extra" } ]
+        Browser.setUserAgent page "RedPandaPureScript/1"
+        void $ Browser.goto page $ url <> "request-headers"
+        Browser.waitForSelector page "#fetch:not(:empty)"
+        sent <- Browser.evaluateString page "JSON.stringify(['navigation','resource','fetch'].map(id => JSON.parse(document.getElementById(id).textContent)['x-client']))"
+        assert "extra headers reach navigation, external scripts and fetch" $ sent == "[\"purescript\",\"purescript\",\"purescript\"]"
+        overridden <- Browser.evaluateString page "JSON.parse(document.getElementById('fetch').textContent)['x-shared']"
+        assert "CDP headers override a conflicting page fetch header" $ overridden == "extra"
+        agents <- Browser.evaluateString page "JSON.stringify([navigator.userAgent,...['navigation','resource','fetch'].map(id => JSON.parse(document.getElementById(id).textContent)['user-agent'])])"
+        assert "user agent matches both navigator and outgoing requests" $ agents == "[\"RedPandaPureScript/1\",\"RedPandaPureScript/1\",\"RedPandaPureScript/1\",\"RedPandaPureScript/1\"]"
+        Browser.setExtraHTTPHeaders page []
+        void $ Browser.goto page $ url <> "request-headers"
+        Browser.waitForSelector page "#fetch:not(:empty)"
+        cleared <- Browser.evaluateString page "JSON.stringify(['navigation','resource','fetch'].map(id => JSON.parse(document.getElementById(id).textContent)['x-client']))"
+        assert "clearing headers removes them from subsequent requests" $ cleared == "[null,null,null]"
+        bracket (Browser.newPage context) Browser.closePage \otherPage -> do
+          void $ Browser.goto otherPage $ url <> "request-headers"
+          Browser.waitForSelector otherPage "#fetch:not(:empty)"
+          independent <- Browser.evaluateString otherPage "String(navigator.userAgent !== 'RedPandaPureScript/1' && JSON.parse(document.getElementById('navigation').textContent)['x-client'] === null)"
+          assert "another page has independent request configuration" $ independent == "true"
         Browser.closePage page
-        log "PureScript Puppeteer integration: 17 checks passed"
+        log "PureScript Puppeteer integration: 22 checks passed"

@@ -1,8 +1,9 @@
 module RedPanda.Puppeteer
-  ( Browser, BrowserContext, Page, Response, PreloadScript
+  ( Browser, BrowserContext, Page, Response, PreloadScript, Header
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText
   , evaluateOnNewDocument, removePreload
+  , setExtraHTTPHeaders, setUserAgent
   , evaluateString, textContent, waitForSelector, dispatchClick, content, cookieNames, setCookie
   , Async, fromAsync, quote
   ) where
@@ -21,6 +22,8 @@ foreign import data Page :: Type
 foreign import data Response :: Type
 
 newtype PreloadScript = PreloadScript String
+
+type Header = { name :: String, value :: String }
 
 -- The FFI only adapts promises. Resource lifetime and the workflow live here.
 type Async a = (Error -> Effect Unit) -> (a -> Effect Unit) -> Effect (Effect Unit)
@@ -42,6 +45,8 @@ foreign import responseStatus :: Response -> Int
 foreign import responseTextImpl :: Response -> Async String
 foreign import evaluateOnNewDocumentImpl :: Page -> String -> Async String
 foreign import removePreloadImpl :: Page -> String -> Async Unit
+foreign import setExtraHTTPHeadersImpl :: Page -> Array Header -> Async Unit
+foreign import setUserAgentImpl :: Page -> String -> Async Unit
 foreign import evaluateStringImpl :: Page -> String -> Async String
 foreign import waitForSelectorImpl :: Page -> String -> Async Unit
 foreign import contentImpl :: Page -> Async String
@@ -80,6 +85,12 @@ evaluateOnNewDocument page source = PreloadScript <$> fromAsync (evaluateOnNewDo
 
 removePreload :: Page -> PreloadScript -> Aff Unit
 removePreload page (PreloadScript identifier) = fromAsync $ removePreloadImpl page identifier
+
+setExtraHTTPHeaders :: Page -> Array Header -> Aff Unit
+setExtraHTTPHeaders page headers = fromAsync $ setExtraHTTPHeadersImpl page headers
+
+setUserAgent :: Page -> String -> Aff Unit
+setUserAgent page userAgent = fromAsync $ setUserAgentImpl page userAgent
 
 evaluateString :: Page -> String -> Aff String
 evaluateString page expression = fromAsync $ evaluateStringImpl page expression

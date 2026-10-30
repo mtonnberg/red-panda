@@ -1,6 +1,10 @@
 import http from 'node:http';
 
 export async function createFixture() {
+  const headersFor = request => Object.fromEntries(
+    ['x-client', 'x-shared', 'x-page', 'user-agent', 'accept-language', 'referer']
+      .map(name => [name, request.headers[name] ?? null]),
+  );
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://fixture.test');
     if (url.pathname === '/') {
@@ -30,8 +34,30 @@ export async function createFixture() {
     } else if (url.pathname === '/plain-text') {
       response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
       response.end('\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
+    } else if (url.pathname === '/request-headers') {
+      const headers = JSON.stringify(headersFor(request)).replaceAll('&', '&amp;').replaceAll('<', '&lt;');
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end(`<!doctype html><title>Request headers</title><pre id="navigation">${headers}</pre>
+        <pre id="resource"></pre><pre id="fetch"></pre><script src="/header-script.js"></script>
+        <script>fetch('/header-api', {headers: {'x-page':'page-value','x-shared':'page'}})
+          .then(r => r.json()).then(data => document.querySelector('#fetch').textContent = JSON.stringify(data));</script>`);
+    } else if (url.pathname === '/header-script.js') {
+      response.writeHead(200, { 'content-type': 'text/javascript' });
+      response.end(`document.querySelector('#resource').textContent=${JSON.stringify(JSON.stringify(headersFor(request))).replaceAll('<', '\\u003c')}`);
+    } else if (url.pathname === '/header-api') {
+      response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(headersFor(request)));
     } else if (url.pathname === '/redirect') {
       response.writeHead(302, { location: '/next', 'set-cookie': 'redirect=kept; Path=/' }); response.end();
+    } else if (url.pathname === '/redirect-to') {
+      response.writeHead(302, { location: url.searchParams.get('url') }); response.end();
+    } else if (url.pathname === '/resource-redirect-page') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<pre id="resource"></pre><script src="/redirecting-script"></script>');
+    } else if (url.pathname === '/redirecting-script') {
+      response.writeHead(302, { location: '/header-script.js', 'set-cookie': ['resource-one=a; Path=/', 'resource-two=b; Path=/'] }); response.end();
+    } else if (url.pathname === '/resource-error-page') {
+      response.writeHead(200, { 'content-type': 'text/html' });
+      response.end('<h1>Document survived</h1><script src="/missing-script"></script>');
     } else if (url.pathname === '/loop') {
       response.writeHead(302, { location: '/loop' }); response.end();
     } else if (url.pathname === '/slow') {

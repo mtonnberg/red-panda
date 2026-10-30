@@ -32,6 +32,10 @@ export const responseStatus = response => response.status();
 export const responseTextImpl = response => async(() => response.text());
 export const evaluateOnNewDocumentImpl = page => source => async(async () => (await page.evaluateOnNewDocument(source)).identifier);
 export const removePreloadImpl = page => identifier => async(async () => { await page.removeScriptToEvaluateOnNewDocument(identifier); });
+export const setExtraHTTPHeadersImpl = page => headers => async(async () => {
+  await page.setExtraHTTPHeaders(Object.fromEntries(headers.map(({ name, value }) => [name, value])));
+});
+export const setUserAgentImpl = page => userAgent => async(async () => { await page.setUserAgent(userAgent); });
 export const evaluateStringImpl = page => expression => async(async () => {
   const result = await page.evaluate(expression);
   if (typeof result !== 'string') throw new TypeError('Expected a string from page.evaluate');

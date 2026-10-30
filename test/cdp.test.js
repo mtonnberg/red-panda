@@ -4,6 +4,7 @@ import { WebSocket } from 'ws';
 import { serve } from '../src/cdp.js';
 import { createFixture } from './fixture.js';
 import { connect } from './cdp-client.js';
+import { probeRequestHeaders } from './header-probe.js';
 
 let fixture, service;
 before(async () => { fixture = await createFixture(); service = await serve({ port: 0 }); });
@@ -59,4 +60,38 @@ test('flattened sessions navigate, evaluate, retain handles, cookies, dump and d
 test('cross-origin WebSocket requests are rejected', async () => {
   const socket = new WebSocket(`ws://127.0.0.1:${service.port}/`, { origin: 'https://untrusted.test' });
   await assert.rejects(new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); }), /403/);
+});
+
+test('CDP request configuration reaches navigation, resources and fetch, and can be cleared', async () => {
+  const { configured, cleared } = await probeRequestHeaders(`ws://127.0.0.1:${service.port}/`, fixture.url, { enableNetwork: true });
+  for (const [type, request] of Object.entries(configured).filter(([key]) => ['navigation', 'resource', 'fetch'].includes(key))) {
+    assert.equal(request['x-client'], 'cdp-probe');
+    assert.equal(request['x-shared'], 'extra');
+    assert.equal(request['user-agent'], 'RedPandaProbe/1');
+    assert.equal(request['accept-language'], 'sv-SE');
+    assert.equal(request.referer, type === 'navigation' ? null : `${fixture.url}request-headers`);
+  }
+  assert.equal(configured.userAgent, 'RedPandaProbe/1');
+  assert.equal(configured.language, 'sv-SE');
+  for (const type of ['navigation', 'resource', 'fetch']) assert.equal(cleared[type]['x-client'], null);
+  assert.equal(cleared.fetch['x-shared'], 'page');
+});
+
+test('invalid header updates return errors without partially changing request configuration', async () => {
+  const client = await connect(`ws://127.0.0.1:${service.port}/`);
+  const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+  try {
+    const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+    const send = (method, params) => client.send(method, params, sessionId);
+    await send('Network.setExtraHTTPHeaders', { headers: { 'X-Client': 'retained' } });
+    for (const headers of [null, [], { 'X-Client': 'changed', other: 42 }, { 'bad name': 'value' }, { 'X-Client': 'line\r\nbreak' }]) {
+      await assert.rejects(send('Network.setExtraHTTPHeaders', { headers }), error => error.code === -32602);
+    }
+    await assert.rejects(send('Network.setUserAgentOverride', { userAgent: 'invalid\r\nagent' }), error => error.code === -32602);
+    await send('Page.navigate', { url: `${fixture.url}next` });
+    const result = await send('Runtime.evaluate', {
+      expression: "fetch('/header-api').then(r=>r.json()).then(data=>data['x-client'])", returnByValue: true, awaitPromise: true,
+    });
+    assert.equal(result.result.value, 'retained');
+  } finally { await client.send('Target.closeTarget', { targetId }); await client.close(); }
 });
