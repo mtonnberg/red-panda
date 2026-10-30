@@ -518,12 +518,37 @@ both the startup-affected `subtree` fixture and `report_error`, whose initial
 100 ms callback assertion missed the posted-message event. The original
 outcomes are retained; no timing cause is established. This supplies passing
 evidence for 40 distinct candidate fixtures across those runs, rather than a
-40/41 primary-run result. `element/html/form.html` still fails direct named form
-access, named collection enumerability and disconnected form association.
+40/41 primary-run result. At that checkpoint `element/html/form.html` still
+failed direct named form access, named collection enumerability and disconnected
+form association.
+
+The next independent checkpoint fixes those form-property failures, sequential
+document-write insertion order and parser-script `document.open()` guards. It
+also selects actual root/frame VM contexts by registered identity rather than
+executing marker probes in candidate contexts. The full suite passes **586
+JavaScript tests and 50 PureScript assertions**, syntax/strict/pedantic checks,
+and all 13 existing bounded reference comparisons.
+
+The [new frozen 41-fixture run](reference/conformance-properties-runtime-checkpoint.json)
+passes **41/41** candidate fixtures without failure or timeout. Its 55
+runtime/native/package file hashes match the working implementation. It reuses
+the earlier 41/41 native controls with the same binary identity, fixture/harness
+hashes, resource flags, routing profile and budgets. This is functional evidence,
+not a contemporaneous performance comparison or a replacement for the broader
+historical 178-fixture cohort. The
+[form-property contract](reference/form-controls-contract.md) and
+[parser-reset findings](reference/parser-reset-NOTES.md) preserve scoped results
+and remaining post-load reset/nested-external-script gaps.
 
 Heap enumeration remains unsupported. Both inspector and owned native-profiler
 experiments crashed under lifecycle stress; further controls isolated older
-closed-context probing after heap activity as a trigger. Experimental sources
-are quarantined outside production builds/default tests, with
-[negative evidence and limits](reference/runtime-query-contract.md). No empty or
-partial successful query result substitutes for actual heap enumeration.
+closed-context probing after heap activity as a trigger. With named selection,
+both [snapshot](reference/runtime-query-named-snapshot-summary.json) and
+[direct profiler](reference/runtime-query-named-direct-summary.json) experiments
+pass four lifecycle cycles, 28 selections and 41 actual queries on each of Node
+24.22.1 and 26.13.0, including retained old contexts and real object/group
+identity. These experiments do not enable the production command; selected-realm
+ownership, bridge prototypes, bounded failure behavior and protocol contracts
+still need integration. Experimental sources remain outside production/default
+tests, with [negative evidence and limits](reference/runtime-query-contract.md).
+No empty or partial successful query result substitutes for actual enumeration.

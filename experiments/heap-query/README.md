@@ -1,5 +1,12 @@
 # Unsafe heap-enumeration experiments — not browser functionality
 
+Later changed-diagnosis evidence is preserved in
+[named-lifecycle/README.md](named-lifecycle/README.md): an exact named VM-context
+selector replaced marker execution in an isolated frozen copy. Both snapshot and
+direct backends then passed bounded navigation/teardown workloads on Node24/26.
+The original failures below remain historical evidence. Production heap querying
+is still unsupported; the successful diagnostic sources are not production code.
+
 **Do not integrate or load these into a browser/server process.** Both attempted
 implementations crashed in owned subprocesses using the application's real Page,
 Runtime inspector and repeated navigation/teardown. Runtime.queryObjects remains

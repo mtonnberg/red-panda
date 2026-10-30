@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { installNavigation, requestNavigation } from './navigation.js';
+import { installFormControls } from './form-controls.js';
 
 const require = createRequire(import.meta.url);
 const FormImpl = require('jsdom/lib/jsdom/living/nodes/HTMLFormElement-impl.js').implementation;
@@ -318,6 +319,7 @@ export function installForms(page, window) {
   record.controller = { dispose };
   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
   DOCUMENTS.set(implementation, record);
+  installFormControls(window, () => !!documentRecord(implementation));
   installFormData(window);
   record.close = function () { dispose(); return record.originalClose.call(window); };
   window.close = record.close;

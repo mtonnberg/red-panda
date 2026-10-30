@@ -1,4 +1,4 @@
-# Heap-query crash counterfactuals and a paused next experiment
+# Heap-query crash counterfactuals and subsequent named-selector evidence
 
 These Node 24.22.1 diagnostics used an ignored frozen copy of the application's
 sources, package metadata, collection source, native binary and manifest under
@@ -48,15 +48,15 @@ eval, which does not retain that lexical declaration after the eval. That setup
 was corrected to vm.Script.runInContext before recording the passing lexical-only
 control. It was not treated as a crash or a successful semantic result.
 
-## Named-context experiment: designed, not executed
+## Historical preparation milestone
 
 Further native work was paused during the root conformance run. All owned heap
 probe children had already completed; a process-path check found no active Node
 processes for .cache/heap-query* or experiments/heap-query*. Nothing required
 termination, and no partially running native result was promoted to success.
-No named-context module, build or test has started at this checkpoint.
+After the parser handoff, preparation was authorized while runtime stress stayed paused. The named-context helper, diagnostic selector and multi-page/frame probe are now written only under ignored .cache/heap-query-named. Syntax checks passed, but no module execution, native build or runtime test has started. runtime-query-named-prepared.json pins the prepared sources and exact copied binary manifests.
 
-The proposed diagnostic change will be confined to another frozen ignored copy:
+The prepared diagnostic change is confined to another frozen ignored copy:
 
 1. Install a wrapper around the host vm.createContext factory before the first
    Browser Window is created. Give each newly created context a unique private
@@ -81,6 +81,29 @@ The proposed diagnostic change will be confined to another frozen ignored copy:
 
 This could eventually reduce the production integration to a context-name helper,
 initialization before Window creation, and a name lookup replacing RealmInspector's
-marker scan. That is a proposal, not an implemented or validated fix. The process-
-wide vm factory interception, pre-existing contexts, frames, mapping cleanup and
-missing-name failures must be reviewed explicitly before any production change.
+marker scan. At this preparation milestone the change existed only in the ignored diagnostic
+copy. Process-wide vm factory interception, pre-existing contexts, frames, mapping
+cleanup and missing-name failures still required explicit review.
+
+## Later isolated results and preservation
+
+After separate parent releases, named mapping controls passed6cycles/42 selections
+on both exact runtimes without loading a heap addon. Snapshot-backed and direct
+V8-profiler lifecycle runs then each passed4cycles/28 tracked selections/41 actual
+queries per runtime. The same backend source/binary digests that failed with the
+old marker scan were retained; this is a changed-selector diagnostic rather than
+a retry that concealed earlier failures. Exact logs and manifests are in
+runtime-query-named-{mapping,snapshot,direct}-node{24,26}.json and the summaries.
+
+Root applied the reviewed selector-only proposal and later reported586 JavaScript
+and50 PureScript tests,13 reference groups, and the frozen41-fixture cohort passing.
+The production heap route remains explicitly unsupported. Public DOM bridge
+identity, trusted array construction in the selected realm, and bounded backend
+integration remain separately scoped work.
+
+The exact positive executed sources, runners and frozen overlays now live under
+experiments/heap-query/named-lifecycle. Its preservation manifest verifies all six
+successful raw artifacts' source hashes. The original setup used ad-hoc tool
+calls, so a new reconstruction helper is labeled unexecuted rather than presented
+as the historical preparer. No runtime tests or native builds were rerun to
+preserve these files; no production heap source/builder was enabled.

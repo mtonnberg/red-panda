@@ -1,0 +1,232 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,4 +1,5 @@
+ import { EventEmitter } from 'node:events';
++import { installVMContextNames } from './context-names.js';
+ import { randomUUID } from 'node:crypto';
+ import vm from 'node:vm';
+ import { createRequire } from 'node:module';
+@@ -29,6 +30,8 @@
+ import { installClassicScripts } from './classic-scripts.js';
+ import { installMutations } from './mutations.js';
+ 
++// Name root and frame VM contexts before any Window is constructed.
++installVMContextNames();
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ let defaultCollectionsBinding;
+diff --git a/src/runtime.js b/src/runtime.js
+--- a/src/runtime.js
++++ b/src/runtime.js
+@@ -2,6 +2,7 @@
+ import { randomUUID } from 'node:crypto';
+ import { types } from 'node:util';
+ import vm from 'node:vm';
++import { nameForVMContext, isOwnedVMContextName } from './context-names.js';
+ import { withTimeout } from './browser.js';
+ 
+ const methods = new Set([
+@@ -43,10 +44,12 @@
+ class RealmInspector {
+   constructor(page) {
+     this.page = page; this.inspector = new InspectorSession(); this.inspector.connect();
+-    this.contexts = new Set(); this.enabled = false; this.selected = undefined; this.closed = false;
++    this.contexts = new Map(); this.enabled = false; this.selected = undefined; this.closed = false;
+     this.inspector.on('Runtime.executionContextCreated', ({ params }) => {
+       // Never evaluate anything in Node's default execution context.
+-      if (params.context.auxData?.isDefault === false) this.contexts.add(params.context.id);
++      if (params.context.auxData?.isDefault === false && isOwnedVMContextName(params.context.name)) {
++        this.contexts.set(params.context.id, params.context.name);
++      }
+     });
+     this.inspector.on('Runtime.executionContextDestroyed', ({ params }) => this.contexts.delete(params.executionContextId));
+   }
+@@ -60,26 +63,13 @@
+     });
+   }
+   async realm() {
+-    if (this.selected !== undefined) return this.selected;
+-    const window = this.page.dom.window;
+-    const key = `__redpanda_inspector_${randomUUID().replaceAll('-', '')}`, value = randomUUID();
+-    Object.defineProperty(window, key, { value, configurable: true });
+-    try {
+-      if (!this.enabled) { await this.post('Runtime.enable'); this.enabled = true; }
+-      const matches = [];
+-      for (const contextId of this.contexts) {
+-        // Non-default VM contexts are asked only about this unpredictable marker.
+-        try {
+-          const reply = await this.post('Runtime.callFunctionOn', {
+-            functionDeclaration: 'function(key,value){return this[key]===value}', executionContextId: contextId,
+-            arguments: [{ value: key }, { value }], returnByValue: true, silent: true,
+-          });
+-          if (reply.result?.value === true) matches.push(contextId);
+-        } catch { /* A context may disappear while the inspector enumerates it. */ }
+-      }
+-      if (matches.length !== 1) throw new RuntimeError('Could not identify one selected page execution context', -32000);
+-      this.selected = matches[0]; return this.selected;
+-    } finally { delete window[key]; }
++    const name = nameForVMContext(this.page.dom.getInternalVMContext());
++    if (!name) throw new RuntimeError('Selected page VM context has no registered name', -32000);
++    if (this.selected !== undefined && this.contexts.get(this.selected) === name) return this.selected;
++    if (!this.enabled) { await this.post('Runtime.enable'); this.enabled = true; }
++    const matches = [...this.contexts].filter(([, candidate]) => candidate === name).map(([id]) => id);
++    if (matches.length !== 1) throw new RuntimeError('Could not identify one named page execution context', -32000);
++    this.selected = matches[0]; return this.selected;
+   }
+   async lexicalNames() { return this.post('Runtime.globalLexicalScopeNames', { executionContextId: await this.realm() }); }
+   close() {
+@@ -143,7 +133,7 @@
+ /** Route supported Runtime commands here; resetRuntime(session, contextId?)
+  * releases one context or the entire Session. Session.executionPage(id) selects
+  * an actual page/frame facade; old unit fixtures may omit it for root fallback.
+- * Inspector operations are scoped to the selected jsdom VM by a random marker.
++ * Inspector operations select the actual VM context through its registered name.
+  * Heap usage/isolate IDs describe the shared Node V8 isolate, not a separate page
+  * process. Heap object enumeration is deliberately unsupported: Node/V8
+  * queryObjects crashed during teardown/recreation of jsdom VM contexts.
+diff --git a/src/context-names.js b/src/context-names.js
+new file mode 100644
+--- /dev/null
++++ b/src/context-names.js
+@@ -0,0 +1,44 @@
++// Private VM context identity for inspector selection; no page-global markers.
++import vm from 'node:vm';
++import { randomUUID } from 'node:crypto';
++
++const HOOK = Symbol.for('red-panda.vm-context-name-registry.v1');
++let registry;
++export function installVMContextNames() {
++  if (registry) return;
++  // Duplicate module instances must share the actual factory's association;
++  // stacked name overrides would otherwise invalidate the outer module's map.
++  if (vm.createContext[HOOK]) { registry = vm.createContext[HOOK]; return; }
++  const original = vm.createContext, names = new WeakMap();
++  const prefix = `red-panda-vm-${randomUUID()}-`;
++  let sequence = 0;
++  function createContext(contextObject, options) {
++    const objectInput = contextObject !== null && ['object', 'function'].includes(typeof contextObject);
++    // Calling the original factory on an already contextified object does not
++    // rename it. Never invent an association for a pre-existing unknown context.
++    if (objectInput && vm.isContext(contextObject)) return Reflect.apply(original, this, arguments);
++    // Preserve native validation for malformed options instead of normalizing
++    // them into accepted options merely to attach a name.
++    if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) {
++      return Reflect.apply(original, this, arguments);
++    }
++    const name = `${prefix}${++sequence}`;
++    const sourceOptions = options ?? {};
++    // A fresh proxy target avoids violating an existing frozen options.name
++    // descriptor while preserving other option getter receivers.
++    const namedOptions = new Proxy({}, {
++      get(_, key) { return key === 'name' ? name : Reflect.get(sourceOptions, key, sourceOptions); },
++      has(_, key) { return key === 'name' || Reflect.has(sourceOptions, key); },
++    });
++    const context = Reflect.apply(original, this, [contextObject, namedOptions]);
++    names.set(context, name);
++    return context;
++  }
++  Object.defineProperty(createContext, 'name', { value: original.name, configurable: true });
++  Object.defineProperty(createContext, 'length', { value: original.length, configurable: true });
++  registry = { names, prefix };
++  Object.defineProperty(createContext, HOOK, { value: registry });
++  vm.createContext = createContext;
++}
++export function nameForVMContext(context) { return registry?.names.get(context); }
++export function isOwnedVMContextName(name) { return typeof name === 'string' && !!registry && name.startsWith(registry.prefix); }
+diff --git a/test/context-names.test.js b/test/context-names.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/context-names.test.js
+@@ -0,0 +1,91 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import vm from 'node:vm';
++import { Session as InspectorSession } from 'node:inspector';
++import { Browser, until } from '../src/browser.js';
++import { nameForVMContext, isOwnedVMContextName } from '../src/context-names.js';
++import { runRuntime, resetRuntime } from '../src/runtime.js';
++
++const post = (inspector, method, params = {}) => new Promise((resolve, reject) => inspector.post(method, params, (error, result) => error ? reject(error) : resolve(result)));
++function sessionFor(page) {
++  return { page, objects: new Map(), worlds: new Map(), remote(value) { return { value }; }, exception(error) { return { text: String(error) }; },
++    executionPage(id = page.executionContextId) {
++      const selected = page.frames.findContext(id)?.page;
++      if (!selected || selected.closed) throw Object.assign(new Error('Cannot find context with specified id'), { code: -32602 });
++      return selected;
++    } };
++}
++async function frame(page, title) {
++  const element = page.dom.window.document.createElement('iframe');
++  element.srcdoc = `<title>${title}</title>`; page.dom.window.document.body.append(element);
++  await until(() => page.frames.findElement(element)?.dom.window.document.title === title, { timeout: 2500 });
++  return { element, page: page.frames.findElement(element) };
++}
++function declare(page, marker) { new vm.Script(`let ${marker}=1`).runInContext(page.dom.getInternalVMContext()); }
++
++test('VM names preserve actual context identity and native code-generation options', () => {
++  let receiver;
++  const options = Object.freeze({ name: 'external-name', get codeGeneration() { receiver = this; return { strings: false, wasm: false }; } });
++  const context = vm.createContext({}, options), name = nameForVMContext(context);
++  assert.equal(receiver, options); assert.equal(typeof name, 'string'); assert.equal(isOwnedVMContextName(name), true);
++  assert.throws(() => vm.runInContext('eval("1")', context), /code generation from strings disallowed/i);
++  assert.equal(vm.createContext(context, { name: 'attempted-rename' }), context);
++  assert.equal(nameForVMContext(context), name);
++  assert.throws(() => vm.createContext({}, null), TypeError);
++});
++
++test('actual page/frame context names match unique non-default inspector notifications', async () => {
++  const inspector = new InspectorSession(), observed = new Map();
++  inspector.on('Runtime.executionContextCreated', ({ params }) => observed.set(params.context.name, params.context));
++  inspector.connect(); const browser = new Browser({ loadResources: ['iframe'] });
++  try {
++    await post(inspector, 'Runtime.enable');
++    const first = browser.createPage(), second = browser.createPage();
++    await second.navigate('data:text/html,<title>second</title>'); await first.navigate('data:text/html,<title>first</title>');
++    const one = await frame(first, 'one'), two = await frame(first, 'two');
++    const names = [first, second, one.page, two.page].map(page => {
++      page.dom.window.name = 'ordinary-window-name';
++      const name = nameForVMContext(page.dom.getInternalVMContext());
++      assert.equal(isOwnedVMContextName(name), true); assert.notEqual(name, page.dom.window.name);
++      assert.equal(observed.get(name)?.auxData?.isDefault, false); return name;
++    });
++    assert.equal(new Set(names).size, 4);
++    assert.notEqual(observed.get(names[1]).id, Math.max(...[...observed.values()].filter(context => isOwnedVMContextName(context.name)).map(context => context.id)));
++  } finally { inspector.disconnect(); browser.close(); }
++});
++
++test('Runtime selects reordered pages/frames and successors without probing old/default candidates', async () => {
++  const originalPost = InspectorSession.prototype.post, calls = [];
++  InspectorSession.prototype.post = function (method, ...args) { calls.push(method); return Reflect.apply(originalPost, this, [method, ...args]); };
++  const browser = new Browser({ loadResources: ['iframe'] }), sessions = [], retained = [];
++  try {
++    const first = browser.createPage(), second = browser.createPage();
++    await second.navigate('data:text/html,<title>second</title>'); await first.navigate('data:text/html,<title>first</title>');
++    const one = await frame(first, 'one'), two = await frame(first, 'two');
++    const a = sessionFor(first), b = sessionFor(second); sessions.push(a, b);
++    const cleanup = ({ executionContextId }) => resetRuntime(a, executionContextId); first.on('frameContextDestroyed', cleanup);
++    const realms = [[second, b, '__onlySecond'], [two.page, a, '__onlyFrameTwo'], [first, a, '__onlyFirst'], [one.page, a, '__onlyFrameOne']];
++    for (const [page, , marker] of realms) { declare(page, marker); retained.push(page.dom.getInternalVMContext()); }
++    for (const [page, session, marker] of realms) {
++      const result = await runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: page.executionContextId });
++      assert.ok(result.names.includes(marker));
++      for (const [, , other] of realms) if (other !== marker) assert.ok(!result.names.includes(other));
++    }
++    const oldFrameId = one.page.executionContextId, oldName = nameForVMContext(one.page.dom.getInternalVMContext());
++    one.element.srcdoc = '<title>replacement</title>';
++    await until(() => { const page = first.frames.findElement(one.element); return page && page.executionContextId !== oldFrameId && page.dom.window.document.title === 'replacement'; }, { timeout: 2500 });
++    const replacement = first.frames.findElement(one.element); declare(replacement, '__onlyReplacement');
++    assert.notEqual(nameForVMContext(replacement.dom.getInternalVMContext()), oldName);
++    assert.ok((await runRuntime(a, 'Runtime.globalLexicalScopeNames', { executionContextId: two.page.executionContextId })).names.includes('__onlyFrameTwo'));
++    assert.ok((await runRuntime(a, 'Runtime.globalLexicalScopeNames', { executionContextId: replacement.executionContextId })).names.includes('__onlyReplacement'));
++    await assert.rejects(runRuntime(a, 'Runtime.globalLexicalScopeNames', { executionContextId: oldFrameId }), /Cannot find context/);
++    resetRuntime(b); await second.navigate('data:text/html,<title>successor</title>'); declare(second, '__onlySuccessor');
++    assert.ok((await runRuntime(b, 'Runtime.globalLexicalScopeNames', { executionContextId: second.executionContextId })).names.includes('__onlySuccessor'));
++    assert.ok(retained.length >= 4); assert.ok(calls.includes('Runtime.globalLexicalScopeNames'));
++    assert.equal(calls.includes('Runtime.callFunctionOn'), false);
++    assert.equal(calls.includes('Runtime.evaluate'), false);
++    first.off('frameContextDestroyed', cleanup);
++  } finally {
++    for (const session of sessions) resetRuntime(session); browser.close(); InspectorSession.prototype.post = originalPost;
++  }
++});

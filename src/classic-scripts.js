@@ -18,6 +18,17 @@ const scriptTypes = new Set(['application/ecmascript', 'application/javascript',
   'text/livescript', 'text/x-ecmascript', 'text/x-javascript', 'module', 'importmap']);
 
 function active(record) { return record && !record.disposed && !record.signal?.aborted && !record.page.closed && implForWrapper(record.window.document) === record.document; }
+// Track only scripts actually being evaluated on behalf of the active parser.
+// A dynamic nested inline script inherits that nesting; an unrelated async
+// script executing while the parser is waiting does not acquire it.
+function duringParserScript(record, script, evaluate) {
+  const parserScript = record.parser && !record.parserDone &&
+    (record.parserScriptDepth > 0 || (script._parserInserted &&
+      (record.parser.tokenizer.inLoop || record.blocker?.script === script)));
+  if (parserScript) record.parserScriptDepth = (record.parserScriptDepth ?? 0) + 1;
+  try { return evaluate(); }
+  finally { if (parserScript) record.parserScriptDepth--; }
+}
 function state(script) {
   if (!flags.has(script)) flags.set(script, { forceAsync: !(script._parserInserted && script._alreadyStarted) });
   return flags.get(script);
@@ -108,6 +119,7 @@ function patch() {
   const fetchResource = ResourceLoader.prototype.fetch;
   const parse = parse5.parse;
   const closeDocument = DocumentImpl.prototype.close;
+  const openDocument = DocumentImpl.prototype.open, writeDocument = DocumentImpl.prototype.write;
   const attachLink = LinkImpl.prototype._attach, modifyLink = LinkImpl.prototype._attrModified, dispatchLink = LinkImpl.prototype._dispatch;
   LinkImpl.prototype._dispatch = function (...args) {
     const result = dispatchLink.apply(this, args), record = documents.get(this._ownerDocument);
@@ -148,6 +160,29 @@ function patch() {
     record.stream.start();
     return parser.document;
   };
+  DocumentImpl.prototype.open = function (...args) {
+    const record = documents.get(this);
+    // The HTML open algorithm returns the current document while a parser
+    // script is on the stack. Do not apply this new no-op branch to XML or
+    // custom-element dynamic-markup scopes; their existing behavior is retained.
+    if (active(record) && record.parserScriptDepth > 0 &&
+        this._parsingMode !== 'xml' && !this._throwOnDynamicMarkupInsertionCounter) return this;
+    return openDocument.apply(this, args);
+  };
+  DocumentImpl.prototype.write = function (...args) {
+    const record = documents.get(this), anchor = this._writeAfterElement;
+    const parent = anchor?.parentNode, boundary = anchor?.nextSibling;
+    const result = writeDocument.apply(this, args);
+    // Follow the actual insertion boundary, including nodes produced by a
+    // nested written script. The next write must follow the preceding write.
+    // If page code detached the old boundary/anchor, leave its mutation intact.
+    if (active(record) && parent && anchor.parentNode === parent &&
+        (!boundary || boundary.parentNode === parent)) {
+      const cursor = boundary ? boundary.previousSibling : parent.lastChild;
+      if (cursor?.parentNode === parent) this._writeAfterElement = cursor;
+    }
+    return result;
+  };
   DocumentImpl.prototype.close = function (...args) {
     const record = documents.get(this);
     if (active(record) && record.parser && !record.parserDone) { record.closeRequested = args; return; }
@@ -181,7 +216,7 @@ function patch() {
       try {
         // Delegate to the current evaluator, including any module-loader wrapper.
         // Do not replace _innerEval or maintain a second JavaScript execution path.
-        return this._innerEval(this.text, document.URL);
+        return duringParserScript(record, this, () => this._innerEval(this.text, document.URL));
       } finally {
         document._currentScript = current;
         if (hadWriteAfter) document._writeAfterElement = writeAfter;
@@ -248,7 +283,7 @@ function patch() {
       request = fetchResource.call(this, url, { ...options, onLoad(data) {
         // A disposed realm must not execute an already queued script callback.
         if (!active(record)) return new Promise(() => {});
-        return options.onLoad?.(data);
+        return duringParserScript(record, element, () => options.onLoad?.(data));
       } });
     } finally {
       this._resourceLoader = originalLoader;

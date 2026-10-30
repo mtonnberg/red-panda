@@ -105,8 +105,8 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Surface | Supported |
 | --- | --- |
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
-| HTML / JS | Parser-blocking and dynamic classic scripts, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
+| HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
+| Forms / workers | Live named controls, trusted FormData events, guarded form reset, validated/cancelable GET and POST forms, URL-encoded/multipart/text bodies, dedicated workers with transferable MessagePorts, Blob scripts, imports, timers and fetch |
 | Web APIs | Real HTMLDDA collections, geometry matrices/points/quads, constructed/adopted stylesheets, scoped CSS cascade, streams/codecs/compression, resize/performance observers and trusted error reporting |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |

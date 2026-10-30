@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { installVMContextNames } from './context-names.js';
 import { randomUUID } from 'node:crypto';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
@@ -29,6 +30,8 @@ import { installPerformance } from './performance.js';
 import { installClassicScripts } from './classic-scripts.js';
 import { installMutations } from './mutations.js';
 
+// Name root and frame VM contexts before any Window is constructed.
+installVMContextNames();
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
 let defaultCollectionsBinding;

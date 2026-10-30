@@ -2,6 +2,7 @@ import { Session as InspectorSession } from 'node:inspector';
 import { randomUUID } from 'node:crypto';
 import { types } from 'node:util';
 import vm from 'node:vm';
+import { nameForVMContext, isOwnedVMContextName } from './context-names.js';
 import { withTimeout } from './browser.js';
 
 const methods = new Set([
@@ -43,10 +44,12 @@ function details(session, error, contextId) {
 class RealmInspector {
   constructor(page) {
     this.page = page; this.inspector = new InspectorSession(); this.inspector.connect();
-    this.contexts = new Set(); this.enabled = false; this.selected = undefined; this.closed = false;
+    this.contexts = new Map(); this.enabled = false; this.selected = undefined; this.closed = false;
     this.inspector.on('Runtime.executionContextCreated', ({ params }) => {
       // Never evaluate anything in Node's default execution context.
-      if (params.context.auxData?.isDefault === false) this.contexts.add(params.context.id);
+      if (params.context.auxData?.isDefault === false && isOwnedVMContextName(params.context.name)) {
+        this.contexts.set(params.context.id, params.context.name);
+      }
     });
     this.inspector.on('Runtime.executionContextDestroyed', ({ params }) => this.contexts.delete(params.executionContextId));
   }
@@ -60,26 +63,13 @@ class RealmInspector {
     });
   }
   async realm() {
-    if (this.selected !== undefined) return this.selected;
-    const window = this.page.dom.window;
-    const key = `__redpanda_inspector_${randomUUID().replaceAll('-', '')}`, value = randomUUID();
-    Object.defineProperty(window, key, { value, configurable: true });
-    try {
-      if (!this.enabled) { await this.post('Runtime.enable'); this.enabled = true; }
-      const matches = [];
-      for (const contextId of this.contexts) {
-        // Non-default VM contexts are asked only about this unpredictable marker.
-        try {
-          const reply = await this.post('Runtime.callFunctionOn', {
-            functionDeclaration: 'function(key,value){return this[key]===value}', executionContextId: contextId,
-            arguments: [{ value: key }, { value }], returnByValue: true, silent: true,
-          });
-          if (reply.result?.value === true) matches.push(contextId);
-        } catch { /* A context may disappear while the inspector enumerates it. */ }
-      }
-      if (matches.length !== 1) throw new RuntimeError('Could not identify one selected page execution context', -32000);
-      this.selected = matches[0]; return this.selected;
-    } finally { delete window[key]; }
+    const name = nameForVMContext(this.page.dom.getInternalVMContext());
+    if (!name) throw new RuntimeError('Selected page VM context has no registered name', -32000);
+    if (this.selected !== undefined && this.contexts.get(this.selected) === name) return this.selected;
+    if (!this.enabled) { await this.post('Runtime.enable'); this.enabled = true; }
+    const matches = [...this.contexts].filter(([, candidate]) => candidate === name).map(([id]) => id);
+    if (matches.length !== 1) throw new RuntimeError('Could not identify one named page execution context', -32000);
+    this.selected = matches[0]; return this.selected;
   }
   async lexicalNames() { return this.post('Runtime.globalLexicalScopeNames', { executionContextId: await this.realm() }); }
   close() {
@@ -143,7 +133,7 @@ async function awaitInState(state, value) {
 /** Route supported Runtime commands here; resetRuntime(session, contextId?)
  * releases one context or the entire Session. Session.executionPage(id) selects
  * an actual page/frame facade; old unit fixtures may omit it for root fallback.
- * Inspector operations are scoped to the selected jsdom VM by a random marker.
+ * Inspector operations select the actual VM context through its registered name.
  * Heap usage/isolate IDs describe the shared Node V8 isolate, not a separate page
  * process. Heap object enumeration is deliberately unsupported: Node/V8
  * queryObjects crashed during teardown/recreation of jsdom VM contexts.

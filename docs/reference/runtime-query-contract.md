@@ -1,4 +1,4 @@
-# Runtime.queryObjects: native contract and unsuccessful independent experiments
+# Runtime.queryObjects: native contract and isolated lifecycle experiments
 
 Status: **unsupported in Red Panda**. No heap-query implementation is integrated.
 Neither a partial result nor a canned object count is supplied. Experimental
@@ -75,8 +75,8 @@ Node 24 failure established that it was unsuitable.
 
 The crash's precise native cause is not established. These results do not prove
 an upstream Node/V8 defect or isolate the failure to one GC/profiler operation.
-They do establish that neither approach can safely back this browser's API in
-the tested environment. No attempt was made to hide the failure behind a partial
+They established that neither approach was safe with the old marker selector in
+the tested environment; later changed-selector evidence is recorded below. No attempt was made to hide the failure behind a partial
 array, count, retry or fabricated success.
 
 ## Limits and reproducibility
@@ -110,6 +110,25 @@ A later controlled minimization is recorded in runtime-query-counterfactuals.md.
 It rules out HTMLDDA/full Browser installation as necessary and isolates the
 reproduced trigger to marker function calls into older closed inspector contexts
 after heap activity. Current-context-only and lexical-only controls pass their
-bounded runs. This does not change the unsupported status: a proposed named-
-context selector has not been implemented or stress-tested, and its native work
-is paused for the root conformance run.
+bounded runs. The next named-context selector avoided all marker execution and instead matched
+an exact host WeakMap context/name association to inspector notifications. Mapping
+controls passed six cycles and 42 exact selections on each pinned runtime. With
+that changed selector, snapshot and direct-backend diagnostics each passed four
+cycles, 28 tracked selections and 41 real queries on both Node24.22.1 and26.13.0.
+Snapshot elapsed times were117.271s/109.650s; direct times were29.247s/32.985s. These
+are bounded isolated results with retained old contexts, actual identity/mutation,
+foreign-realm descendants, Proxy stopping and real object-group lifecycle. They do
+not establish universal GC safety or implement the public queryObjects route.
+
+Root subsequently integrated only the independently reviewed name selector and
+reported 586 JavaScript tests, 50 PureScript tests, 13 reference groups and the
+frozen41-fixture cohort passing. Production heap enumeration remains unsupported.
+Actual DOM/Fetch bridge ownership, Proxy-backed public form-wrapper identity and
+selected-realm array-anchor cases remain open before production heap integration.
+
+Exact executed positive probes/drivers and diagnostic overlays are preserved in
+experiments/heap-query/named-lifecycle with SHA provenance and reconstruction
+instructions. Its new preparer is explicitly unexecuted. The source-only binding
+proposal is proposals/runtime-heap-query/design.md. Historical preparation and
+negative-provenance manifests remain unchanged; the newer named result summaries
+record subsequent milestones.
