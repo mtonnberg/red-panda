@@ -26,6 +26,7 @@ function fixture(html = '', { register = true } = {}) {
 test('Location.assign and href setters queue full navigation without changing public descriptors', async () => {
   const f = fixture();
   try {
+    await tick();
     const descriptor = Object.getOwnPropertyDescriptor(f.window.location, 'href');
     assert.equal(descriptor.configurable, false);
     assert.equal(f.window.location.assign('/next'), undefined);

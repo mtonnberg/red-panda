@@ -4,8 +4,8 @@ import {navigatorProfile} from './navigator.js';
 // Only captured browser API producers can attach context. Authored init fields
 // and mutable Window.origin/location metadata do not authenticate a principal.
 const contexts = new WeakMap();
-export function withRequestMetadata(init, {origin, mode = 'cors', destination = 'empty'}) {
-  contexts.set(init, {origin, mode, destination});
+export function withRequestMetadata(init, {origin, mode = 'cors', destination = 'empty', redirects = []}) {
+  contexts.set(init, {origin, mode, destination, redirects:[...redirects]});
   return init;
 }
 export function forwardRequestMetadata(source, destination) {
@@ -34,6 +34,7 @@ export function requestMetadataPolicy(init) {
     headers.set('sec-ch-ua', quote(navigatorProfile.brand) + ';v=' + quote(navigatorProfile.version.split('.')[0]));
     headers.set('sec-ch-ua-full-version-list', quote(navigatorProfile.brand) + ';v=' + quote(navigatorProfile.version));
     if (!context) return;
+    for(const previous of context.redirects){const value=relation(context.origin,new URL(previous));if(rank[value]>rank[site])site=value;}
     const current = relation(context.origin, target);
     if (rank[current] > rank[site]) site = current;
     headers.set('sec-fetch-site', site);

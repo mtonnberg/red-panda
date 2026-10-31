@@ -1,12 +1,16 @@
 // Host-private backing for the original generated Event wrappers. No symbols,
 // extra fronts, reflected-key filters or authored object tags confer authority.
 import vm from 'node:vm';
+import {ownsWorkerRuntime} from './owned-worker-context.js';
 import {createRequire} from 'node:module';
 import {readFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
-import {domWrapperGlobal} from './dom-factory-scope.js';
+import {domWrapperGlobal} from './dom-wrapper-globals.js';
 
 const require=createRequire(import.meta.url);
+// Preserve the former DOM-factory dependency's genuine CJS bootstrap order
+// for all Host embeddings, including direct EventTarget/WebSocket imports.
+if(!ownsWorkerRuntime)require('jsdom');
 const utils=require('jsdom/lib/jsdom/living/generated/utils.js');
 if(require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(readFileSync(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'))).digest('hex')!=='3dce521ab525a11eb5d817a78bf3308a8ab2e16b73c5c288f81c8d6ad496fa2e')throw new Error('Pinned jsdom Event utilities source changed');
 const EventImpl=require('jsdom/lib/jsdom/living/events/Event-impl.js').implementation;

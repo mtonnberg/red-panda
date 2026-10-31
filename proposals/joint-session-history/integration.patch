@@ -1,0 +1,390 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation} from './joint-history.js';
+ import {installSelectControls} from './select-controls.js';
+ import {installMediaElements} from './media-elements.js';
+ import {installPaymentRequest} from './payment-request.js';
+@@ -282,7 +283,7 @@
+       installCache(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,baseURL:()=>creatorSnapshot().baseURL});
+ 
+       installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
+-      if (main) this.installHistory(window, historyState);
++      installJointHistory(this,window,historyState);
+       installNavigation(this, window);
+       installDialogs(this, window);
+       installForms(this, window);
+@@ -381,53 +382,13 @@
+     return id;
+   }
+ 
+-  installHistory(window, state) {
+-    const nativePush = window.history.pushState.bind(window.history);
+-    const nativeReplace = window.history.replaceState.bind(window.history);
+-    const nativeState = Object.getOwnPropertyDescriptor(window.History.prototype, 'state').get.bind(window.history);
+-    if (state !== null) nativeReplace(structuredClone(state), '', window.location.href);
+-    this.nativeHistoryReplace = nativeReplace;
+-    Object.defineProperty(window.history, 'length', { get: () => Math.max(1, this.history.length) });
+-    Object.defineProperty(window.history, 'state', { get: () => nativeState() ?? null });
+-    for (const [name, native] of [['pushState', nativePush], ['replaceState', nativeReplace]]) {
+-      window.history[name] = (...args) => {
+-        const input = [...args];
+-        if (input.length) input[0] = structuredClone(input[0]);
+-        const result = native(...input);
+-        this.commitHistory(window.location.href, window.history.state, name === 'pushState' ? 'push' : 'replace');
+-        this.url = window.location.href;
+-        this.emit('withinDocument', { url: this.url, navigationType: 'historyApi' });
+-        return result;
+-      };
+-    }
+-    window.addEventListener('hashchange', () => this.reconcileURL(window));
+-    for (const [name, fixedDelta] of [['back', -1], ['forward', 1], ['go', undefined]]) {
+-      window.history[name] = (delta = 0) => {
+-        const distance = fixedDelta ?? Math.trunc(Number(delta) || 0);
+-        if (!Number.isFinite(distance)) return;
+-        window.setTimeout(() => {
+-          if (this.closed || this.dom.window !== window) return;
+-          const action = distance === 0 ? this.navigate(this.url, { historyMode: 'reload' }) : this.traverseHistory(this.historyIndex + distance);
+-          action.catch(error => this.emit('pageError', error));
+-        }, 0);
+-      };
+-    }
+-  }
+-
+-  commitHistory(url, state = null, mode = 'push') {
+-    const entry = { id: this.nextHistoryId++, url, state: structuredClone(state), documentId: this.documentId };
+-    if (mode === 'replace' && this.historyIndex >= 0) this.history[this.historyIndex] = entry;
+-    else {
+-      this.history.splice(this.historyIndex + 1);
+-      this.history.push(entry);
+-      this.historyIndex = this.history.length - 1;
+-    }
+-  }
++  installHistory(window,state){return installJointHistory(this,window,state);}
++  commitHistory(url,state=null,mode='push'){return commitJointHistory(this,url,state,mode);}
+ 
+   reconcileURL(window = this.dom.window, { historyMode = 'push' } = {}) {
+     if (this.closed || window !== this.dom.window || window.location.href === this.url) return;
+     this.url = window.location.href;
+-    this.commitHistory(this.url, window.history.state, historyMode);
++    this.commitHistory(this.url, null, historyMode);
+     this.emit('withinDocument', { url: this.url, navigationType: 'fragment' });
+   }
+ 
+@@ -435,24 +396,7 @@
+     return { currentIndex: this.historyIndex, entries: this.history.map(({ id, url }) => ({ id, url, userTypedURL: url, title: '', transitionType: 'other' })) };
+   }
+ 
+-  async traverseHistory(index, { forceReload = false } = {}) {
+-    if (!Number.isInteger(index) || index < 0 || index >= this.history.length) return false;
+-    const entry = this.history[index];
+-    if (!forceReload && entry.documentId === this.documentId) {
+-      const previousURL = this.url;
+-      this.nativeHistoryReplace(structuredClone(entry.state), '', entry.url);
+-      this.historyIndex = index;
+-      this.url = entry.url;
+-      const hashChanged = new URL(previousURL).hash !== new URL(this.url).hash;
+-      this.emit('withinDocument', { url: this.url, navigationType: hashChanged ? 'fragment' : 'historyApi' });
+-      const window = this.dom.window;
+-      window.dispatchEvent(new window.PopStateEvent('popstate', { state: structuredClone(entry.state) }));
+-      if (hashChanged) {
+-        window.dispatchEvent(new window.HashChangeEvent('hashchange', { oldURL: previousURL, newURL: this.url }));
+-      }
+-    } else await this.navigate(entry.url, { historyMode: 'traverse', historyIndex: index });
+-    return true;
+-  }
++  async traverseHistory(index,options={}){return traverseJointHistory(this,index,options);}
+   requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId) {
+     this.activeRequests.delete(id);
+     this.lastActivity = Date.now();
+@@ -634,8 +578,8 @@
+     const target = new URL(url, this.url).href;
+     const rememberedRequest = (historyMode === 'reload' ? this.history[this.historyIndex] : historyMode === 'traverse' ? this.history[historyIndex] : null)?.request;
+     const requestMethod = method ?? rememberedRequest?.method ?? 'GET';
+-    const requestBody = body ?? rememberedRequest?.body;
+-    const requestHeaders = new Headers(headers ?? rememberedRequest?.headers);
++    const requestBody = body ?? (method===undefined?rememberedRequest?.body:undefined);
++    const requestHeaders = new Headers(headers ?? (method===undefined?rememberedRequest?.headers:undefined));
+     let navigationWindow, redirect, captureRedirect;
+     this.performanceNavigationType = historyMode === 'reload' ? 'reload' : historyMode === 'traverse' ? 'back_forward' : 'navigate';
+     this.loaderId = randomUUID();
+@@ -685,12 +629,13 @@
+       this.emit('contextsCleared');
+       this.documentId = randomUUID();
+       let state = null;
++      historyMode=normalizeHistoryNavigation(this,historyMode);
+       if (historyMode === 'traverse' || (historyMode === 'reload' && this.historyIndex >= 0)) {
+         const index = historyMode === 'reload' ? this.historyIndex : historyIndex;
+         const entry = this.history[index];
+         if (!entry) throw new Error('History entry no longer exists');
+         const oldDocumentId = entry.documentId;
+-        for (const candidate of this.history) if (candidate.documentId === oldDocumentId) candidate.documentId = this.documentId;
++        for (const candidate of this.history) if (candidate.documentId === oldDocumentId) {candidate.documentId = this.documentId;candidate.frameId=this.frameId;}
+         this.historyIndex = index;
+         entry.url = this.url;
+         state = structuredClone(entry.state);
+diff --git a/src/frames.js b/src/frames.js
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -1,3 +1,4 @@
++import {commitFrameHistory} from './joint-history.js';
+ import {disposeBrowsingWindow} from './popup-pages.js';
+ import {retireFrameActivity} from './frame-activity.js';
+ import { completeInitialBlankFrame } from './document-reset.js';
+@@ -103,7 +104,7 @@
+       const controller=new AbortController(),headers=new Headers(navigation.headers);
+       const referrer=page.referrerFor(destination,navigation.referrer??'');if(referrer)headers.set('referer',referrer);
+       const request=page.fetch(destination,{method:navigation.method??'GET',body:navigation.body,headers,signal:controller.signal,skipDefaultReferrer:!headers.has('referer')},'Document').then(async response=>{
+-        request.response={statusCode:response.status,headers:Object.fromEntries(response.headers)};delete request.response.headers['set-cookie'];request.href=response.finalUrl??response.url;request.documentReferrer=response.requestHeaders?.referer??'';
++        request.response={statusCode:response.status,headers:Object.fromEntries(response.headers)};delete request.response.headers['set-cookie'];request.href=response.finalUrl??response.url;request.documentReferrer=response.requestHeaders?.referer??'';request.historyRequest={method:response.requestMethod??navigation.method??'GET',body:structuredClone(response.requestBody),headers:Object.fromEntries([...new Headers(response.requestHeaders)].filter(([name])=>!['cookie','authorization','user-agent','accept-language'].includes(name)))};
+         return Buffer.from(await response.arrayBuffer());
+       });request.abort=()=>controller.abort();request.getHeader=name=>headers.get(name)??page.extraHTTPHeaders.get(name);return request;
+     }});
+@@ -313,6 +314,7 @@
+     childWindow._virtualConsole = parentWindow._virtualConsole;
+     record.window = childWindow; record.document = childWindow.document;
+     record.navigationRequest = operation.navigationRequest;
++    record.historyOperation = operation.navigationRequest;
+     const framePage = record.page = new FramePage(registry, record, childWindow);
+     registry.frames.set(record.id, framePage);
+     const impl = implForWrapper(record.document);
+@@ -397,7 +399,7 @@
+       const mimeType = request?.response?.headers?.['content-type']?.split(';')[0].trim();
+       if (mimeType) documentImpl.contentType = mimeType;
+     }
+-    record.waitingResource = false; registry.committed(record);
++    record.waitingResource = false; commitFrameHistory(record.page,record.historyOperation,request);registry.committed(record);
+   };
+   registry.findFrame = id => !registry.disposed ? registry.frames.get(id) : undefined;
+   registry.findContext = id => !registry.disposed ? contexts.get(id) : undefined;
+@@ -413,7 +415,7 @@
+     };
+     return tree(root);
+   };
+-  registry.navigate = async (id, input, { waitUntil = 'load', onCommit, method, body, headers, historyMode, referrer } = {}) => {
++  registry.navigate = async (id, input, { waitUntil = 'load', onCommit, method, body, headers, historyMode, historyIndex, referrer } = {}) => {
+     const record = records.get(id);
+     if (!record || record.root || !record.page) throw stale();
+     if (!['load', 'domcontentloaded'].includes(waitUntil)) throw new TypeError('Unsupported frame navigation wait condition');
+@@ -427,7 +429,7 @@
+     const implementation = record.element;
+     // Trigger native loadFrame without altering reflected iframe.src/srcdoc.
+     frameOperation(implementation, () => nativeAttrModified.call(implementation,
+-      'src', url.href, implementation.getAttributeNS(null, 'src')), { url: url.href, srcdoc: undefined, ignoreSrcdoc: true, navigationRequest: {method,body,headers,referrer:referrer??record.page.url} });
++      'src', url.href, implementation.getAttributeNS(null, 'src')), { url: url.href, srcdoc: undefined, ignoreSrcdoc: true, navigationRequest: {method,body,headers,historyMode,historyIndex,referrer:referrer??record.page.url} });
+     const current = record.page; onCommit?.();
+     const loaded = new Promise(resolve => {
+       if (current.dom.window.document.readyState === 'complete') resolve();
+diff --git a/src/joint-history.js b/src/joint-history.js
+new file mode 100644
+--- /dev/null
++++ b/src/joint-history.js
+@@ -0,0 +1,120 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {getRuntimeBinding} from './native-runtime.js';
++import {requestNavigation} from './navigation.js';
++import {subscribePlatformFactories,platformFactoryRecord} from './platform-factories.js';
++import {captureDOMExceptionFactory} from './worker-dom-exception.js';
++import {onFrameRetirement} from './frame-activity.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const HistoryImpl=require('jsdom/lib/jsdom/living/window/History-impl.js').implementation;
++const implementationMethods=Object.freeze(Object.assign(Object.create(null),{pushState:HistoryImpl.prototype.pushState,replaceState:HistoryImpl.prototype.replaceState}));
++const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
++const PopStateEvent=require('jsdom/lib/jsdom/living/generated/PopStateEvent.js'),HashChangeEvent=require('jsdom/lib/jsdom/living/generated/HashChangeEvent.js');
++const conversions=require('webidl-conversions'),{serializeURL}=createRequire(require.resolve('jsdom/lib/jsdom/living/window/History-impl.js'))('whatwg-url');
++const WINDOWS=new WeakMap(),HISTORIES=new WeakMap(),PAGES=new WeakMap(),SESSIONS=new WeakMap(),PAYLOADS=new WeakMap();
++const apply=Reflect.apply,define=Object.defineProperty,stringify=JSON.stringify,parse=JSON.parse,record=value=>Object.assign(Object.create(null),value);
++const session=page=>page.parentFrameId?page.registry.page:page;
++const sessionState=page=>{const root=session(page);let state=SESSIONS.get(root);if(!state){state=record({initial:true});SESSIONS.set(root,state)}return state};
++export function normalizeHistoryNavigation(page,mode){const state=sessionState(page),initial=state.initial;state.initial=false;return initial?'replace':mode}
++const current=page=>{const root=session(page);return root.history[root.historyIndex]};
++const active=state=>!state.page.closed&&!state.page.retired&&!state.signal?.aborted;
++function json(value,window){try{return stringify(value)??'undefined'}catch{throw (WINDOWS.get(window)?.exception??captureDOMExceptionFactory(window))('The object can not be cloned','DataCloneError')}}
++function value(state,text){return apply(state.parse,undefined,[text])}
++function implementationValue(text){if(text==='undefined')return undefined;const copy=parse(text);if(copy!==null&&typeof copy==='object')PAYLOADS.set(copy,text);return copy}
++// Only actual privately serialized payload identities are translated at this
++// successful real PopStateEvent producer seam. Authored objects/lookalikes stay
++// untouched, and no VM clone is retained as internal history state.
++subscribePlatformFactories((_wrapper,provenance)=>{if(provenance.kind!=='PopStateEvent')return;const implementation=provenance.implementation,text=PAYLOADS.get(implementation.state),realm=WINDOWS.get(provenance.globalRef?.deref());if(text!==undefined&&realm)implementation.state=value(realm,text)});
++function stored(entry){return entry?.stateJSON??(stringify(entry?.state??null)??'undefined')}
++export function historyState(page,window){const state=WINDOWS.get(window);if(!state)throw new Error('History realm is not installed');return value(state,stored(current(page)))}
++export function commitJointHistory(page,url,state=null,mode='push',stateJSON){
++ const root=session(page),text=stateJSON??json(state,PAGES.get(page)?.window??page.dom?.window??root.dom?.window);
++ const entry=record({id:root.nextHistoryId++,url,state:text==='undefined'?undefined:parse(text),stateJSON:text,documentId:page.documentId,frameId:page.frameId});
++ if(mode==='replace'&&root.historyIndex>=0)root.history[root.historyIndex]=entry;
++ else{root.history.splice(root.historyIndex+1);root.history.push(entry);root.historyIndex=root.history.length-1}
++ return entry;
++}
++function writeImplementation(state,name,data,title,url,exception=state.exception){
++ const implementation=state.implementation,document=implementation._document,current=document._URL;
++ if(typeof current.path!=='string'||!implementation._window)return apply(implementationMethods[name],implementation,[data,title,url]);
++ // Pinned jsdom assumes every URL path is an Array. Real opaque URL records
++ // have a String path; use their genuine session history for the permitted
++ // fragment-only rewrite, preserving the actual opaque record throughout.
++ const destination=url===null||url===''?current:document.encodingParseAURL(url);
++ if(!destination||serializeURL(destination,true)!==serializeURL(current,true))throw exception('The history URL cannot update this document','SecurityError');
++ const history=implementation._window._sessionHistory;
++ if(name==='pushState'){history.removeAllEntriesAfterCurrentEntry();history.clearHistoryTraversalTasks();const entry={document,stateObject:data,url:destination};history.addEntryAfterCurrentEntry(entry);history.updateCurrentEntry(entry)}
++ else{history.currentEntry.stateObject=data;history.currentEntry.url=destination}
++ document._URL=destination;document._clearBaseURLCache();implementation._state=data;document._latestEntry=history.currentEntry;
++}
++function restore(state,entry,url=entry.url){return writeImplementation(state,'replaceState',implementationValue(stored(entry)),'',url)}
++export function installJointHistory(page,window,initialState=null){
++ if(WINDOWS.has(window))return;
++ if(page.parentFrameId){const root=session(page);for(const key of ['history','historyIndex','nextHistoryId'])define(page,key,{get:()=>root[key],set:next=>{root[key]=next},configurable:true});page.commitHistory=(...args)=>commitJointHistory(page,...args);page.traverseHistory=(...args)=>traverseJointHistory(page,...args)}
++ const history=window.history,prototype=window.History.prototype,provenance=platformFactoryRecord(history);if(provenance?.kind!=='History')throw new Error('Actual History factory provenance is required');
++ const state=record({page,window,history,implementation:provenance.implementation,windowImpl:utils.implForWrapper(window),parse:window.JSON.parse,globals:record({TypeError:window.TypeError,String:window.String,Number:window.Number}),setTimeout:window.setTimeout.bind(window),clearTimeout:window.clearTimeout.bind(window),tasks:new Set(),TypeError:window.TypeError,exception:captureDOMExceptionFactory(window),signal:page.documentAbort?.signal,scrollRestoration:'auto'});
++ WINDOWS.set(window,state);WINDOWS.set(state.windowImpl._globalObject,state);HISTORIES.set(history,state);PAGES.set(page,state);
++ sessionState(page);if(!page.parentFrameId&&!page.history.length)commitJointHistory(page,window.location.href);
++ const cancel=()=>{for(const timer of state.tasks)state.clearTimeout(timer);state.tasks.clear()};const unsubscribe=onFrameRetirement(window,cancel);state.signal?.addEventListener('abort',()=>{cancel();unsubscribe()},{once:true});
++ page.nativeHistoryReplace=(data,title,url)=>writeImplementation(state,'replaceState',implementationValue(json(data,window)),title,url);
++ if(initialState!==null){const entry=current(page);if(entry)restore(state,entry,window.location.href)}
++ const binding=page.browser?.runtimeBinding??getRuntimeBinding();
++ const entry=(name,length,callback)=>{const fn=binding.createEntry((incumbent,receiver,args)=>{const target=HISTORIES.get(receiver);if(!target)throw new state.TypeError('Illegal invocation');return callback(target,WINDOWS.get(incumbent),args)},window.Object);define(fn,'name',{value:name,configurable:true});define(fn,'length',{value:length,configurable:true});return fn};
++ const method=(name,length,callback)=>define(prototype,name,{value:entry(name,length,callback),writable:true,enumerable:true,configurable:true});
++ define(prototype,'length',{get:entry('get length',0,target=>session(target.page).history.length),enumerable:true,configurable:true});
++ define(prototype,'state',{get:entry('get state',0,target=>value(state,stored(current(target.page)))),enumerable:true,configurable:true});
++ define(prototype,'scrollRestoration',{get:entry('get scrollRestoration',0,target=>target.scrollRestoration),set:entry('set scrollRestoration',1,(target,_source,args)=>{const next=conversions.DOMString(args.length?args[0]:undefined,{globals:state.globals,context:'History.scrollRestoration'});if(next==='auto'||next==='manual')target.scrollRestoration=next}),enumerable:true,configurable:true});
++ for(const name of ['pushState','replaceState'])method(name,2,(target,_source,args)=>{
++  if(args.length<2)throw new state.TypeError(`Failed to execute '${name}' on 'History': 2 arguments required, but only ${args.length} present.`);
++  const globals=state.globals,context=`Failed to execute '${name}' on 'History'`;
++  const title=conversions.DOMString(args[1],{globals,context:context+': parameter 2'}),rawURL=args.length>2?args[2]:undefined;
++  const url=rawURL===null||rawURL===undefined?null:conversions.USVString(rawURL,{globals,context:context+': parameter 3'});
++  const text=json(args[0],window),copy=implementationValue(text);
++  // Invoke the actual captured implementation after genuine IDL conversion.
++  // Public implementation symbols cannot redirect this owned receiver.
++  const result=writeImplementation(target,name,copy,title,url,state.exception);
++  const next=target.window.location.href;
++  commitJointHistory(target.page,next,copy,name==='pushState'?'push':'replace',text);
++  target.page.url=next;target.page.emit?.('withinDocument',{url:next,navigationType:'historyApi'});return result;
++ });
++ const navigate=(target,source,args,distance)=>{
++  if(!source)throw new state.TypeError('History navigation requires a registered incumbent realm');
++  if(!active(source))return;
++  if(source.page.context!==target.page.context)throw state.exception('History contexts belong to different browser contexts','SecurityError');
++  const delta=distance??(!args.length||args[0]===undefined?0:conversions.long(args[0],{globals:state.globals,context:"Failed to execute 'go' on 'History': parameter 1"}));
++  const root=session(source.page),index=root.historyIndex+delta;
++  if(delta===0){requestNavigation(source.page,source.window,source.window.location.href,{historyMode:'reload',method:'GET'});return}
++  if(index<0||index>=root.history.length)return;
++  const selected=root.history[index];
++  if(selected.documentId===source.page.documentId){void traverseJointHistory(source.page,index).catch(error=>source.page.emit?.('pageError',error));return}
++  requestNavigation(source.page,source.window,selected.url,{historyMode:'traverse',historyIndex:index,method:'GET'});
++ };
++ method('back',0,(target,source,args)=>navigate(target,source,args,-1));method('forward',0,(target,source,args)=>navigate(target,source,args,1));method('go',0,(target,source,args)=>navigate(target,source,args));
++ // All retained controller records and serialized payloads are Host allocations.
++ return state;
++}
++export async function traverseJointHistory(page,index,{forceReload=false}={}){
++ page.current?.();const root=session(page);if(!Number.isInteger(index)||index<0||index>=root.history.length)return false;
++ const selected=root.history[index],state=PAGES.get(page);
++ if(!forceReload&&selected.documentId===page.documentId){
++  const old=page.url;restore(state,selected);root.historyIndex=index;page.url=selected.url;
++  const changed=new URL(old).hash!==new URL(selected.url).hash;
++  const target=state.windowImpl;
++  // Own the queued hash task before entering any driver/authored callback.
++  // VM termination can bypass finally; retirement/abort still clears this task.
++  if(changed){const next=page.url;let timer;timer=state.setTimeout(()=>{state.tasks.delete(timer);if(active(state))fireAnEvent('hashchange',target,HashChangeEvent,{oldURL:old,newURL:next})},0);state.tasks.add(timer);}
++  page.emit?.('withinDocument',{url:page.url,navigationType:changed?'fragment':'historyApi'});
++  fireAnEvent('popstate',target,PopStateEvent,{state:value(state,stored(selected))});
++ }else await page.navigate(selected.url,{historyMode:'traverse',historyIndex:index,method:'GET'});
++ return true;
++}
++export function commitFrameHistory(page,{historyMode='push',historyIndex}={},request){
++ if(!PAGES.has(page))return;const root=session(page);if(['about:blank','about:srcdoc'].includes(page.url)||page.url.startsWith('blob:'))return;historyMode=normalizeHistoryNavigation(page,historyMode);
++ if(historyMode==='traverse'||(historyMode==='reload'&&root.historyIndex>=0)){
++  const index=historyMode==='reload'?root.historyIndex:historyIndex,entry=root.history[index];if(!entry)throw new Error('History entry no longer exists');
++  const previous=entry.documentId;for(const item of root.history)if(item.documentId===previous){item.documentId=page.documentId;item.frameId=page.frameId;}
++  root.historyIndex=index;entry.url=page.url;entry.frameId=page.frameId;restore(PAGES.get(page),entry);
++ }else commitJointHistory(page,page.url,null,historyMode==='replace'?'replace':'push');
++ if(request?.historyRequest)current(page).request=request.historyRequest;
++}
++export function commitBlankPopupHistory(page){if(page.url==='about:blank'&&sessionState(page).initial){normalizeHistoryNavigation(page,'replace');commitJointHistory(page,'about:blank',null,'replace')}}
+diff --git a/src/navigation.js b/src/navigation.js
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -134,7 +134,7 @@
+   LocationImpl.prototype.reload = function () {
+     const record = DOCUMENTS.get(this._relevantDocument);
+     if (!record || !active(record)) return locationReload.call(this);
+-    schedule(record, whatwgURL.serializeURL(this._url), { historyMode: 'reload', referrer: record.window.location.href });
++    schedule(record, whatwgURL.serializeURL(this._url), { historyMode: 'reload', method:'GET', referrer: record.window.location.href });
+   };
+ 
+   AnchorImpl.prototype._followAHyperlink = function () {
+diff --git a/src/popup-pages.js b/src/popup-pages.js
+--- a/src/popup-pages.js
++++ b/src/popup-pages.js
+@@ -1,3 +1,4 @@
++import {commitBlankPopupHistory} from './joint-history.js';
+ // Real Page/VM/Document popup contexts owned by an existing CDP Page. Public
+ // handles are the actual jsdom Window globals, never popup facades or Proxies.
+ import vm from 'node:vm';
+@@ -21,7 +22,7 @@
+ }
+ function frame(page){const w=page.dom.window;return{id:page.frameId,loaderId:page.loaderId,url:page.url,name:NAMES.get(page)??'',securityOrigin:implForWrapper(w.document)._origin,mimeType:page.mimeType}}
+ function announce(page,name,payload){const state=PAGES.get(page);state.root.emitFrameEvent(name,payload)}
+-function commit(page){const state=PAGES.get(page);if(page.closed)return;state.announced=true;state.lastContextId=page.executionContextId;state.root.attachedFrames.add(page.frameId);announce(page,'frameNavigated',{frame:frame(page),page});announce(page,'frameContextCreated',{frameId:page.frameId,page})}
++function commit(page){const state=PAGES.get(page);if(page.closed)return;commitBlankPopupHistory(page);state.announced=true;state.lastContextId=page.executionContextId;state.root.attachedFrames.add(page.frameId);announce(page,'frameNavigated',{frame:frame(page),page});announce(page,'frameContextCreated',{frameId:page.frameId,page})}
+ export function bindPopupPage(page){
+  const state=PAGES.get(page),root=state.root;
+  page.on('navigationStarted',()=>{if(!state.closed){root.attachedFrames.add(page.frameId);announce(page,'frameNavigationStarted',{frameId:page.frameId,loaderId:page.loaderId,url:state.pendingURL??page.url})}});
+diff --git a/test/form-target-routing.test.js b/test/form-target-routing.test.js
+--- a/test/form-target-routing.test.js
++++ b/test/form-target-routing.test.js
+@@ -4,7 +4,7 @@
+ function form(w,target,path='/submitted/actual'){const f=w.document.createElement('form');f.method='post';f.action=origin+path;f.target=target;f.innerHTML='<input name="q" value="a & b"><button name="go" value="yes">send</button>';w.document.body.append(f);return f}
+ const delay=ms=>new Promise(r=>setTimeout(r,ms));
+ 
+-test('named frame POST navigates its actual document, retains frame identity and leaves source history alone',async t=>{const{page,w,outer,outerPage}=await fixture(t),oldDocument=outer.contentDocument,oldContext=outerPage.executionContextId,parentGeneration=page.documentGeneration,parentHistory=page.history.length,network=[];page.on('request',r=>network.push(r));const offset=posts.length,f=form(w,'outer');f.addEventListener('formdata',e=>e.formData.append('added','real'));f.requestSubmit(f.lastChild);const pending=outerPage.pendingNavigation;assert.ok(pending);assert.equal(page.pendingNavigation,undefined);await pending.promise;const next=page.frames.findElement(outer);assert.equal(next.frameId,outerPage.frameId);assert.notEqual(next.executionContextId,oldContext);assert.notEqual(next.dom.window.document,oldDocument);assert.equal(next.dom.window.document.title,'Actual response');assert.equal(next.dom.window.document.referrer,origin+'/start');assert.equal(outer.getAttribute('src'),'/outer');assert.equal(page.documentGeneration,parentGeneration);assert.equal(page.history.length,parentHistory);assert.equal(page.url,origin+'/start');const sent=posts[offset];assert.equal(sent.method,'POST');assert.equal(sent.body,'q=a+%26+b&go=yes&added=real');assert.equal(sent.headers['content-type'],'application/x-www-form-urlencoded');assert.equal(sent.headers.origin,origin);assert.equal(sent.headers.referer,origin+'/start');assert.equal(sent.headers.cookie,'routing-cookie=actual');const request=network.find(r=>r.url===origin+'/submitted/actual');assert.equal(request.frameId,next.frameId);assert.equal(request.loaderId,next.loaderId)});
++test('named frame POST navigates its actual document, retains frame identity and appends an actual joint entry without navigating source',async t=>{const{page,w,outer,outerPage}=await fixture(t),oldDocument=outer.contentDocument,oldContext=outerPage.executionContextId,parentGeneration=page.documentGeneration,parentHistory=page.history.length,network=[];page.on('request',r=>network.push(r));const offset=posts.length,f=form(w,'outer');f.addEventListener('formdata',e=>e.formData.append('added','real'));f.requestSubmit(f.lastChild);const pending=outerPage.pendingNavigation;assert.ok(pending);assert.equal(page.pendingNavigation,undefined);await pending.promise;const next=page.frames.findElement(outer);assert.equal(next.frameId,outerPage.frameId);assert.notEqual(next.executionContextId,oldContext);assert.notEqual(next.dom.window.document,oldDocument);assert.equal(next.dom.window.document.title,'Actual response');assert.equal(next.dom.window.document.referrer,origin+'/start');assert.equal(outer.getAttribute('src'),'/outer');assert.equal(page.documentGeneration,parentGeneration);assert.equal(page.history.length,parentHistory+1);assert.equal(page.url,origin+'/start');const sent=posts[offset];assert.equal(sent.method,'POST');assert.equal(sent.body,'q=a+%26+b&go=yes&added=real');assert.equal(sent.headers['content-type'],'application/x-www-form-urlencoded');assert.equal(sent.headers.origin,origin);assert.equal(sent.headers.referer,origin+'/start');assert.equal(sent.headers.cookie,'routing-cookie=actual');const request=network.find(r=>r.url===origin+'/submitted/actual');assert.equal(request.frameId,next.frameId);assert.equal(request.loaderId,next.loaderId)});
+ 
+ test('submitter target/action/method overrides route GET with the real mutable entry list into a nested frame',async t=>{const{page,w,inner,innerPage}=await fixture(t),f=form(w,'_self'),b=f.lastChild,offset=posts.length;b.formTarget='inner';b.formAction=origin+'/submitted/override?old=1';b.formMethod='get';b.formEnctype='text/plain';f.addEventListener('formdata',e=>e.formData.set('q','changed'));f.requestSubmit(b);await innerPage.pendingNavigation.promise;const sent=posts[offset];assert.equal(sent.url,'/submitted/override?go=yes&q=changed');assert.equal(sent.method,'GET');assert.equal(sent.body,'');assert.equal(sent.headers.origin,undefined);assert.equal(page.frames.findElement(inner).url,origin+sent.url);assert.equal(inner.contentDocument.referrer,origin+'/start');assert.equal(page.url,origin+'/start')});
+ 
+diff --git a/test/history.test.js b/test/history.test.js
+--- a/test/history.test.js
++++ b/test/history.test.js
+@@ -31,7 +31,7 @@
+   try {
+     const page = browser.createPage(); await page.navigate(`${fixture.url}history`);
+     assert.throws(() => page.evaluate("history.pushState({},'', 'https://other.test/')"), /cannot update history/);
+-    assert.throws(() => page.evaluate("history.pushState({fn:()=>1},'', '#bad')"), /could not be cloned/);
++    assert.throws(() => page.evaluate("history.pushState(1n,'', '#bad')"), error=>error.name==='DataCloneError');
+     assert.equal(page.history.length, 1); assert.equal(page.historyIndex, 0);
+     assert.equal(page.url, `${fixture.url}history`);
+   } finally { browser.close(); }
+diff --git a/test/joint-history.test.js b/test/joint-history.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/joint-history.test.js
+@@ -0,0 +1,29 @@
++import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{Browser,until}from'../src/browser.js';import{createRequire}from'node:module';const require=createRequire(import.meta.url),{implSymbol}=require('jsdom/lib/jsdom/living/generated/utils.js');
++let server,origin,requests=[],sequence=0;before(async()=>{server=http.createServer(async(q,s)=>{let body='';for await(const part of q)body+=part;const token=++sequence;requests.push({url:q.url,method:q.method,body,token,headers:q.headers});s.setHeader('content-type','text/html');s.setHeader('Cache-Control',q.url==='/cached'?'public,max-age=3600':'no-store');if(q.url==='/cached')s.setHeader('ETag','owned-cache');const children=q.url==='/root'?'<iframe name="outer" src="/outer"></iframe>':q.url==='/outer'?'<iframe name="inner" src="/inner"></iframe>':'';s.end('<!doctype html><title>'+q.url+'</title><script>globalThis.actualToken='+token+';globalThis.actualAuthored={token:actualToken}</script><body>'+children)});server.listen(0,'127.0.0.1');await once(server,'listening');origin='http://127.0.0.1:'+server.address().port});after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r))});
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate(origin+'/root');const w=page.dom.window,outer=w.document.querySelector('iframe'),inner=outer.contentDocument.querySelector('iframe');return{browser,page,w,outer,inner,outerPage:page.frames.findElement(outer),innerPage:page.frames.findElement(inner)}}
++const values=page=>page.history.map(entry=>entry.url),delay=ms=>new Promise(r=>setTimeout(r,ms));
++
++test('actual network documents append ordered shared entries; initial blank and srcdoc frames append none',async t=>{const{page,w,innerPage}=await fixture(t);assert.deepEqual(values(page),['/root','/outer','/inner'].map(path=>origin+path));assert.equal(page.historyIndex,2);assert.equal(page.history[2].documentId,innerPage.documentId);assert.equal(w.history.length,3);assert.equal(innerPage.dom.window.history.length,3);for(const srcdoc of[false,true]){const f=w.document.createElement('iframe');if(srcdoc)f.srcdoc='<p>actual inline';w.document.body.append(f)}await delay(20);assert.equal(w.history.length,3);assert.deepEqual(values(page),['/root','/outer','/inner'].map(path=>origin+path));assert.equal(new Set(page.history.map(entry=>entry.id)).size,3)});
++
++test('borrowed child back uses actual native incumbent realm and performs a real GET in main',async t=>{const{page,inner}=await fixture(t);inner.src='/inner-next';await until(()=>inner.contentDocument?.URL===origin+'/inner-next'&&inner.contentDocument.readyState==='complete');const before=requests.length;page.evaluate("document.querySelector('iframe').contentDocument.querySelector('iframe').contentWindow.history.back()");assert.ok(page.pendingNavigation);await page.pendingNavigation.promise;assert.equal(page.url,origin+'/inner');assert.equal(page.frames.getTree().childFrames,undefined);assert.equal(page.history.length,4);assert.equal(page.historyIndex,2);assert.equal(requests[before].method,'GET');assert.equal(requests[before].url,'/inner');assert.equal(page.evaluate('actualToken'),requests[before].token)});
++
++test('direct child same-document traversal retains actual Document/VM and synchronously dispatches trusted realm-correct state',async t=>{const{page,innerPage}=await fixture(t),doc=innerPage.dom.window.document,object=innerPage.dom.window.Object,token=innerPage.evaluate('actualToken'),before=requests.length;innerPage.evaluate("globalThis.events=[];addEventListener('popstate',e=>events.push({state:e.state,trusted:e.isTrusted,realm:e.state===null||Object.getPrototypeOf(e.state)===Object.prototype}));history.pushState({one:1},'','/state-one');history.pushState({two:2},'','/state-two')");assert.equal(page.history.length,5);assert.equal(page.dom.window.history.state.two,2);const result=JSON.parse(innerPage.evaluate("history.back();JSON.stringify({url:document.URL,state:history.state,events})"));assert.equal(result.url,origin+'/state-one');assert.deepEqual(result.state,{one:1});assert.deepEqual(result.events,[{state:{one:1},trusted:true,realm:true}]);assert.equal(innerPage.dom.window.document,doc);assert.equal(innerPage.dom.window.Object,object);assert.equal(innerPage.evaluate('actualToken'),token);assert.equal(requests.length,before);assert.equal(page.historyIndex,3)});
++
++test('state snapshots use Native JSON semantics, fresh selected-realm values and immutable intrinsics without touching authored lookalikes',async t=>{const{page,w,innerPage}=await fixture(t);const result=JSON.parse(page.evaluate(`(()=>{const child=document.querySelector('iframe').contentDocument.querySelector('iframe').contentWindow,h=child.history,parse=child.JSON.parse,Exception=child.DOMException;globalThis.authoredLookalike={page:1,window:2,signal:3};const event=new child.PopStateEvent('authored',{state:authoredLookalike});const ownIdentity=event.state===authoredLookalike;h.pushState({nested:{real:1},fn(){},map:new Map([['key',1]])},'','/state');const first=h.state,second=h.state;child.JSON.parse=()=>{throw Error('authored parse')};child.DOMException=function(){throw Error('authored exception')};let invalid;try{h.replaceState(1n,'')}catch(e){invalid={name:e.name,message:e.message,realm:e instanceof Exception}}const out={ownIdentity,clone:h.state,firstRealm:Object.getPrototypeOf(first)===child.Object.prototype,fresh:first!==second,nestedFresh:first.nested!==second.nested,invalid,lookalike:{prototype:Object.getPrototypeOf(authoredLookalike)===Object.prototype,keys:Object.keys(authoredLookalike)}};child.JSON.parse=parse;child.DOMException=Exception;return JSON.stringify(out)})()`));assert.deepEqual(result.clone,{nested:{real:1},map:{}});assert.equal(result.ownIdentity,true);assert.equal(result.firstRealm,true);assert.equal(result.fresh,true);assert.equal(result.nestedFresh,true);assert.deepEqual(result.invalid,{name:'DataCloneError',message:'The object can not be cloned',realm:true});assert.deepEqual(result.lookalike,{prototype:true,keys:['page','window','signal']});assert.equal(w.history.state.nested.real,1);assert.equal(innerPage.dom.window.history.state.nested.real,1)});
++
++test('full ancestor traversal follows the shared historical URL with real HTTP and fresh document state',async t=>{const{page,inner}=await fixture(t);inner.src='/inner-next';await until(()=>inner.contentDocument?.URL===origin+'/inner-next'&&inner.contentDocument.readyState==='complete');await page.navigate(origin+'/next');assert.equal(page.history.length,5);const token=page.evaluate('actualToken'),before=requests.length;page.evaluate('history.back()');await page.pendingNavigation.promise;assert.equal(page.url,origin+'/inner-next');assert.equal(page.history.length,5);assert.equal(page.historyIndex,3);assert.equal(requests[before].url,'/inner-next');assert.notEqual(page.evaluate('actualToken'),token);assert.equal(page.evaluate('document.querySelectorAll("iframe").length'),0)});
++
++test('popup network/state entries form a separate real session and same-document popup back retains its VM',async t=>{const{page,w}=await fixture(t),length=page.history.length;w.open('/popup','independent');await until(()=>page.frames.executionPages().some(p=>p.url===origin+'/popup'&&p.dom.window.document.readyState==='complete'));const popup=page.frames.executionPages().find(p=>p.url===origin+'/popup'),doc=popup.dom.window.document,object=popup.dom.window.Object;assert.equal(popup.history.length,1);popup.evaluate("history.pushState({popup:1},'','/popup-state')");assert.equal(popup.history.length,2);assert.equal(page.history.length,length);popup.evaluate('history.back()');assert.equal(popup.url,origin+'/popup');assert.equal(popup.dom.window.document,doc);assert.equal(popup.dom.window.Object,object);assert.equal(page.history.length,length);const explicit=w.open('about:blank','blank-entry'),blank=page.frames.executionPages().find(p=>p.dom.window===explicit);assert.equal(blank.history.length,1);assert.equal(blank.history[0].url,'about:blank')});
++
++test('public Location reload after frame POST sends actual GET with no replayed form body and preserves the joint index',async t=>{const{page,innerPage,inner}=await fixture(t);page.evaluate("const f=document.createElement('form');f.target='inner';f.method='post';f.action='/posted';f.innerHTML='<input name=real value=body>';document.body.append(f);f.submit()");await innerPage.pendingNavigation.promise;const posted=page.frames.findElement(inner),before=requests.length,length=page.history.length,index=page.historyIndex,oldDoc=inner.contentDocument;page.evaluate("document.querySelector('iframe').contentDocument.querySelector('iframe').contentWindow.location.reload()");await posted.pendingNavigation.promise;assert.equal(requests[before].method,'GET');assert.equal(requests[before].body,'');assert.equal(requests[before].headers['content-type'],undefined);assert.equal(page.history.length,length);assert.equal(page.historyIndex,index);assert.notEqual(inner.contentDocument,oldDoc);assert.equal(inner.contentDocument.URL,origin+'/posted')});
++
++test('cacheable history traversal and reload really refetch data; removed pending targets cancel before transport',async t=>{const{page,inner,innerPage}=await fixture(t);innerPage.evaluate('history.back()');const pending=innerPage.pendingNavigation,before=requests.length;inner.remove();await assert.rejects(pending.promise,error=>error.name==='AbortError');await delay(20);assert.equal(requests.length,before);assert.equal(page.historyIndex,2);await page.navigate(origin+'/cached');const first=page.evaluate('actualToken');await page.navigate(origin+'/next');page.evaluate('history.back()');await page.pendingNavigation.promise;const second=page.evaluate('actualToken');assert.notEqual(second,first);page.evaluate('location.reload()');await page.pendingNavigation.promise;assert.notEqual(page.evaluate('actualToken'),second);assert.equal(requests.at(-1).url,'/cached')});
++
++test('same-document traversal dispatches popstate synchronously and hashchange as a genuine owned task',async t=>{const{page}=await fixture(t);const immediate=JSON.parse(page.evaluate(`(()=>{globalThis.order=[];addEventListener('popstate',e=>order.push([e.type,e.isTrusted]));addEventListener('hashchange',e=>order.push([e.type,e.isTrusted]));history.pushState({one:1},'','/same#one');history.pushState({two:2},'','/same#two');globalThis.setTimeout=()=>{throw Error('authored timer')};history.back();return JSON.stringify({url:location.href,state:history.state,events:order.slice()})})()`));assert.deepEqual(immediate,{url:origin+'/same#one',state:{one:1},events:[['popstate',true]]});await until(()=>page.evaluate('order.length')===2);assert.deepEqual(JSON.parse(page.evaluate('JSON.stringify(order)')),[['popstate',true],['hashchange',true]])});
++
++test('actual History ownership survives authored implementation-symbol getters and copied-symbol lookalikes remain unbranded',async t=>{const{page,innerPage}=await fixture(t),w=innerPage.dom.window,h=w.history,implementation=Object.getOwnPropertyDescriptor(h,implSymbol).value;Object.defineProperty(h,implSymbol,{get(){throw Error('authored implementation getter')},configurable:true});innerPage.evaluate("history.pushState({real:1},'','/owned-state')");assert.equal(innerPage.evaluate('history.state.real'),1);assert.equal(innerPage.evaluate('history.length'),4);const fake=w.Object.create(w.History.prototype);Object.defineProperty(fake,implSymbol,{value:implementation});w.actualLookalike=fake;const result=JSON.parse(innerPage.evaluate("(()=>{let error;try{History.prototype.pushState.call(actualLookalike,{},'','/forged')}catch(e){error={name:e.name,realm:e instanceof TypeError}}return JSON.stringify({error,prototype:Object.getPrototypeOf(actualLookalike)===History.prototype,url:document.URL})})()"));assert.deepEqual(result,{error:{name:'TypeError',realm:true},prototype:true,url:origin+'/owned-state'});assert.equal(page.history.length,4)});
++
++test('scroll restoration is genuine independent per-History state and invalid values preserve its actual enum',async t=>{const{w,innerPage}=await fixture(t),h=innerPage.dom.window.history;assert.equal(w.history.scrollRestoration,'auto');assert.equal(h.scrollRestoration,'auto');h.scrollRestoration='manual';assert.equal(h.scrollRestoration,'manual');assert.equal(w.history.scrollRestoration,'auto');for(const value of['Manual','invalid','',null,undefined,1]){h.scrollRestoration=value;assert.equal(h.scrollRestoration,'manual')}h.scrollRestoration={toString(){return'auto'}};assert.equal(h.scrollRestoration,'auto')});
++test('retirement cancels the owned hash task even when a popstate callback is interrupted by the VM deadline',async t=>{const{page,innerPage}=await fixture(t);page.timeout=60;innerPage.evaluate("globalThis.hashes=0;addEventListener('hashchange',()=>hashes++);history.pushState({one:1},'','/same#one');history.pushState({two:2},'','/same#two');addEventListener('popstate',()=>{top.document.querySelector('iframe').remove();for(;;){}},{once:true})");assert.throws(()=>innerPage.evaluate('history.back()'),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});assert.equal(innerPage.retired,true);await delay(30);assert.equal(innerPage.evaluate('hashes'),0);assert.equal(page.activeRequests.size,0)});
++
++test('initial about:blank is an actual entry; the first committed document replaces the shared current entry',async t=>{const browser=new Browser({loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();assert.equal(page.history.length,1);assert.equal(page.history[0].url,'about:blank');assert.equal(page.dom.window.history.length,1);page.evaluate("history.pushState({initial:1},'','#one')");assert.equal(page.history.length,2);await page.navigate(origin+'/first');assert.deepEqual(values(page),['about:blank',origin+'/first']);const childFirst=browser.createPage(),w=childFirst.dom.window;const frame=w.document.createElement('iframe');frame.src=origin+'/child-first';w.document.body.append(frame);await until(()=>frame.contentDocument?.readyState==='complete'&&frame.contentDocument?.URL===origin+'/child-first');assert.deepEqual(values(childFirst),[origin+'/child-first']);await childFirst.navigate(origin+'/first');assert.deepEqual(values(childFirst),[origin+'/child-first',origin+'/first'])});

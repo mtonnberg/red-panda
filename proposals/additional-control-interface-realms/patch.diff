@@ -1,0 +1,61 @@
+--- /dev/null
++++ b/src/additional-control-interface-realms.js
+@@ -0,0 +1,29 @@
++// Three further original generated public installers. Only their public class
++// definitions execute in the selected VM; private generated factories and the
++// Select ProxyHandler/cache remain on the same canonical Host module graph.
++import {createRequire} from 'node:module';
++import {createHash} from 'node:crypto';
++const require=createRequire(import.meta.url);
++const definitions=Object.freeze({
++ HTMLTextAreaElement:{sha:'799ee17e382f9e2352bc13bbe7795c7b54488a61cb61b76670c26812d058d6a0',names:['exports','conversions','utils','HTMLConstructor_helpers_html_constructor','SelectionMode','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','parseNonNegativeInteger_helpers_strings','create_DOMException','implSymbol','ctorRegistrySymbol','HTMLElement','interfaceName','exposed','Impl']},
++ HTMLSelectElement:{sha:'c414c96dea79a10812673a08c1ec7159c8ebe91ae1a0d9b7cd024969345f60f5',names:['exports','conversions','utils','HTMLConstructor_helpers_html_constructor','HTMLOptionElement','HTMLOptGroupElement','HTMLElement','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','parseNonNegativeInteger_helpers_strings','implSymbol','ctorRegistrySymbol','interfaceName','exposed','Impl']},
++ HTMLOptionElement:{sha:'821b44d734cbfbf00b839ec26189337d35abff46ec38da9304166e664e9e1d2f',names:['exports','conversions','utils','HTMLConstructor_helpers_html_constructor','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','implSymbol','ctorRegistrySymbol','HTMLElement','interfaceName','exposed','Impl']}
++});
++export function isAdditionalControlInterface(kind){return Object.hasOwn(definitions,kind)}
++function bodyOf(source,kind){
++ const signature='exports.install = (globalObject, globalNames) => {\n';
++ // Select has private Host ProxyHandler definitions AFTER its public installer.
++ // They are deliberately excluded rather than moved into the public VM.
++ const footer=kind==='HTMLSelectElement'?'};\n\nconst proxyHandlerCache = new WeakMap();':'};\n\nconst Impl = require(';
++ const start=source.indexOf(signature),end=source.indexOf(footer,start);
++ if(start<0||end<start||source.split(signature).length!==2||source.split(footer).length!==2)throw new Error('Unexpected generated additional control installer: '+kind);
++ return source.slice(start+signature.length,end);
++}
++export function transformAdditionalControlInterface(source,kind,originalSource){
++ const definition=definitions[kind];
++ if(!definition||require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(originalSource).digest('hex')!==definition.sha)throw new Error('Pinned generated additional control interface source changed: '+kind);
++ const body=bodyOf(source,kind);
++ if(body!==bodyOf(originalSource,kind))throw new Error('Generated additional public control body changed: '+kind);
++ const names=definition.names;
++ return source+'\nconst originalAdditionalControlInstall = exports.install;\nexports.install = (globalObject, globalNames) => installControlInterface(globalObject, globalNames, originalAdditionalControlInstall, '+JSON.stringify(body)+', '+JSON.stringify(names)+', ['+names.join(', ')+'], __filename);\n';
++}
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
+ import {assertControlInterfaceSource,installControlInterface,transformControlInterfaceInstall,installValidityStateInterfaceRealm} from './control-interface-realms.js';
+ import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+ import {transformPrivateEventSource} from './dom-event-state.js';
+@@ -97,6 +98,7 @@
+    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
+   }
+   if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
++  if(isAdditionalControlInterface(kind))source=transformAdditionalControlInterface(source,kind,originalSource);
+   if(event)source=transformPrivateEventSource(source,kind);
+   if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
+   candidates.push({factory,kind,full,originalSource,source});
+--- /dev/null
++++ b/test/additional-control-interface-realms.test.js
+@@ -0,0 +1,11 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{createRequire}from'node:module';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{JSDOM}from'jsdom';
++import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{observeDOMWrapperProxy}from'../src/dom-wrapper-realms.js';import{platformFactoryRecord}from'../src/platform-factories.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{installUtilityFormControlParity}from'../src/form-control-parity.js';import{transformAdditionalControlInterface}from'../src/additional-control-interface-realms.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),binding=getHeapBinding(),kinds=['HTMLTextAreaElement','HTMLSelectElement','HTMLOptionElement'];
++function realm(value,anchor,selected=true){const old=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,anchor),selected);assert.equal(binding.sameRealm(value,[]),!selected);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><textarea id=t>actual</textarea><select id=s><option id=o value=one>One</option></select><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('three original public interfaces and untouched members are genuinely created in the owning VM',async t=>{const{w}=await fixture(t),a=w.eval('[]');for(const name of kinds){realm(w[name],a);realm(w[name].prototype,a);assert.equal(w[name].prototype.constructor,w[name]);assert.throws(()=>w[name](),e=>e instanceof w.TypeError)}for(const value of[Object.getOwnPropertyDescriptor(w.HTMLTextAreaElement.prototype,'cols').get,w.HTMLSelectElement.prototype.add,Object.getOwnPropertyDescriptor(w.HTMLSelectElement.prototype,'value').get,Object.getOwnPropertyDescriptor(w.HTMLOptionElement.prototype,'text').get])realm(value,a);realm(w.HTMLInputElement.prototype,a);realm(w.ValidityState.prototype,a);realm(w.Option,a,false);assert.equal(w.Option.prototype,w.HTMLOptionElement.prototype);});
++test('Select retains the sole original public Proxy and Host handler over actual live backend/cache state',async t=>{const{w}=await fixture(t),seen=[],factory=require('jsdom/lib/jsdom/living/generated/HTMLSelectElement.js'),setup=factory.setup;const stop=observeDOMWrapperProxy('HTMLSelectElement',(target,handler,globalObject)=>seen.push({target,handler,globalObject}));try{const s=w.document.createElement('select');assert.equal(seen.length,1);assert.equal(factory.setup,setup);assert.equal(utils.implForWrapper(s),utils.implForWrapper(seen[0].target));assert.equal(utils.wrapperForImpl(utils.implForWrapper(s)),s);assert.equal(platformFactoryRecord(s).implementation,utils.implForWrapper(s));realm(s,w.eval('[]'));realm(seen[0].target,w.eval('[]'));realm(seen[0].handler,w.eval('[]'),false);const one=new w.Option('One','one'),two=w.document.createElement('option');two.text='Two';two.value='two';s.add(one);s.add(two);const options=s.options;s.value='two';assert.equal(options,s.options);assert.equal(options[1],two);assert.equal(s.selectedIndex,1);s.remove(0);assert.equal(options.length,1);assert.equal(options[0],two)}finally{stop()}});
++test('actual customized factory construction matches Native while direct customized construction remains rejected',async t=>{const{w}=await fixture(t);const result=JSON.parse(w.eval(`JSON.stringify((()=>{const out=[];for(const[name,tag]of[['HTMLTextAreaElement','textarea'],['HTMLSelectElement','select'],['HTMLOptionElement','option']]){let calls=0;class Actual extends globalThis[name]{constructor(){super();calls++;this.owned=tag}}customElements.define('owned-'+tag,Actual,{extends:tag});const e=document.createElement(tag,{is:'owned-'+tag});let direct;try{new Actual();direct={accepted:true}}catch(e){direct={accepted:false,error:e.name,message:e.message}}out.push({name,calls,prototype:Object.getPrototypeOf(e)===Actual.prototype,owned:e.owned,direct})}return out})())`));assert.deepEqual(result,kinds.map((name,index)=>({name,calls:1,prototype:true,owned:['textarea','select','option'][index],direct:{accepted:false,error:'TypeError',message:''}})));});
++test('frame and utility interfaces keep distinct real realms and canonical shared backends through adoption',async t=>{const{w,page}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;for(const name of kinds)realm(c[name].prototype,c.eval('[]'));const s=c.document.body.appendChild(c.document.createElement('select')),p=Object.getPrototypeOf(s),backend=utils.implForWrapper(s),options=s.options;w.document.adoptNode(s);assert.equal(s.ownerDocument,w.document);assert.equal(Object.getPrototypeOf(s),p);assert.equal(utils.implForWrapper(s),backend);assert.equal(s.options,options);realm(s,c.eval('[]'));const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());installUtilityFormControlParity(world,w);for(const name of kinds)realm(world.global[name].prototype,world.evaluate('[]'));const main=w.document.getElementById('s'),front=world.evaluate('document.getElementById("s")');assert.equal(canonicalUtilityValue(front),main);assert.equal(platformFactoryRecord(front).implementation,platformFactoryRecord(main).implementation);assert.equal(front.options[0].value,'one');});
++test('genuine non-scriptable Host Windows retain their original interfaces and functioning values',()=>{const dom=new JSDOM('<textarea>actual</textarea><select><option value=one>One</option></select>');try{const w=dom.window;for(const name of kinds)assert.equal(binding.sameRealm(w[name].prototype,[]),true);assert.equal(w.document.querySelector('textarea').value,'actual');assert.equal(w.document.querySelector('select').value,'one');assert.equal(new w.Option('Two','two').value,'two')}finally{dom.window.close()}});
++test('exact templates and original public installer bodies are guarded; frozen Input helper is unchanged',()=>{assert.equal(createHash('sha256').update(readFileSync(new URL('../src/control-interface-realms.js',import.meta.url))).digest('hex'),'9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f');for(const kind of kinds){const s=readFileSync(require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),'utf8');assert.doesNotThrow(()=>transformAdditionalControlInterface(s,kind,s));assert.throws(()=>transformAdditionalControlInterface(s,kind,s+'\n'),/Pinned generated additional control interface source changed/);assert.throws(()=>transformAdditionalControlInterface(s.replace('  const ctorRegistry =','  /* changed */const ctorRegistry ='),kind,s),/Generated additional public control body changed/)}});

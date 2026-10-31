@@ -1,3 +1,4 @@
+import {types} from 'node:util';
 import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-parity.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
@@ -178,3 +179,19 @@ export function installErrors(page, window) {
   record.signal?.addEventListener('abort', record.controller.dispose, { once: true });
   return record.controller;
 }
+
+// Trusted Host callers reuse the actual registered realm's ErrorEvent path.
+// Host VM-control errors keep their existing protocol diagnostic path.
+// Return only reporting status; private records and Host errors stay outside the VM.
+const hostErrorPrototype=Error.prototype;
+function hostError(value){
+ if(!types.isNativeError(value))return false;
+ let prototype=getPrototypeOf(value);
+ for(let depth=0;prototype&&depth<32;depth++){
+  if(types.isProxy(prototype))return false;
+  if(prototype===hostErrorPrototype)return true;
+  prototype=getPrototypeOf(prototype);
+ }
+ return false;
+}
+export function reportWindowException(window,value){const record=records.get(window);if(!record||hostError(value))return false;report(record,value);return true;}

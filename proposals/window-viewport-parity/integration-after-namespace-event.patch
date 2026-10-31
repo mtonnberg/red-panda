@@ -1,0 +1,2640 @@
+--- /dev/null
++++ b/src/dom-event-target-state.js
+@@ -0,0 +1,21 @@
++import vm from 'node:vm';
++// Private backing for canonical EventTarget wrappers. Inherited Node targets
++// use successful factory provenance, never authored implementation symbols.
++import {createRequire}from'node:module';
++import {platformFactoryRecord}from'./platform-factories.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),EventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
++const ordinaryHasInstance=Function.prototype[Symbol.hasInstance],apply=Reflect.apply;
++const isTarget=implementation=>apply(ordinaryHasInstance,EventTargetImpl,[implementation]);
++const values=new WeakMap(),backends=new WeakSet(),installed=new WeakSet();
++export function hasEventTargetImplementation(value){return eventTargetImplementation(value)!==undefined}
++export function directEventTargetImplementation(value){return values.get(value)}
++export function eventTargetImplementation(value){const own=values.get(value);if(own)return own;const implementation=platformFactoryRecord(value)?.implementation;return isTarget(implementation)?implementation:undefined}
++export function bindEventTargetImplementation(value,implementation,globalObject){if(!isTarget(implementation))throw new TypeError('A genuine EventTarget implementation is required');values.set(value,implementation);if(value===globalObject&&vm.isContext(globalObject))values.set(vm.runInContext('globalThis',globalObject),implementation);backends.add(implementation);return implementation}
++export function installPrivateEventTargetUtils(target=utils){if(installed.has(target))return;installed.add(target);const original=target.implForWrapper;target.implForWrapper=value=>{const implementation=values.get(value);if(implementation)return implementation;const legacy=original(value);return backends.has(legacy)?null:legacy};target.tryImplForWrapper=value=>target.implForWrapper(value)??value;target.eventTargetImplementation=eventTargetImplementation;target.hasEventTargetImplementation=hasEventTargetImplementation;target.bindEventTargetImplementation=bindEventTargetImplementation}
++installPrivateEventTargetUtils();
++export function transformPrivateEventTargetSource(source){
++ const setup='Object.defineProperty(wrapper, implSymbol, {\n    value: new Impl.implementation(globalObject, constructorArgs, privateData),\n    configurable: true\n  });',allocate='Object.defineProperty(wrapper, implSymbol, {\n    value: Object.create(Impl.implementation.prototype),\n    configurable: true\n  });',brand='utils.isObject(value) && utils.hasOwn(value, implSymbol) && value[implSymbol] instanceof Impl.implementation';
++ for(const expression of[setup,allocate,brand])if(source.split(expression).length!==2)throw new Error('Pinned generated EventTarget backing changed');
++ source=source.replace(setup,'utils.bindEventTargetImplementation(wrapper, new Impl.implementation(globalObject, constructorArgs, privateData), globalObject);\n  if (wrapper === globalObject) Object.defineProperty(wrapper, implSymbol, {value: utils.eventTargetImplementation(wrapper), configurable: true});').replace(allocate,'utils.bindEventTargetImplementation(wrapper, Object.create(Impl.implementation.prototype));').replace(brand,'utils.isObject(value) && utils.hasEventTargetImplementation(value)');
++ for(const name of['wrapper','esValue','value'])source=source.replaceAll(name+'[implSymbol]','utils.eventTargetImplementation('+name+')');return source;
++}
+--- /dev/null
++++ b/src/scroll-events.js
+@@ -0,0 +1,22 @@
++// Real queued DOM delivery over actual document/element scroll state. Private
++// records are bound to an immutable owning Document, never an authored global.
++import {createRequire}from'node:module';
++import {implementationForWrapper}from'./dom-event-state.js';
++const require=createRequire(import.meta.url),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const documents=new WeakMap(),elements=new WeakMap(),schedule=setTimeout,cancel=clearTimeout;
++function dispatch(record,target,type,bubbles){if(record.disposed||record.signal?.aborted)return;const event=EventIDL.create(record.globalObject,[type,{bubbles}],{isTrusted:true});implementationForWrapper(target)._dispatch(implementationForWrapper(event))}
++function later(record,callback,delay){const token=schedule(()=>{record.timers.delete(token);if(!record.disposed&&!record.signal?.aborted)callback()},delay);record.timers.add(token);return token}
++export function installScrollEvents(page,window){
++ const document=implementationForWrapper(window.document),prior=documents.get(document);if(prior)return prior;
++ const record=Object.assign(Object.create(null),{document,globalObject:implementationForWrapper(window)._globalObject,signal:page.documentAbort?.signal,disposed:false,timers:new Set(),windowState:'done'});
++ record.windowScroll=()=>{if(record.disposed)return;record.windowState='scroll';later(record,()=>{if(record.windowState!=='scroll')return;dispatch(record,utils.wrapperForImpl(document),'scroll',true);record.windowState='end'},10);const end=()=>{if(record.windowState==='scroll'){later(record,end,10);return}if(record.windowState==='end'){dispatch(record,utils.wrapperForImpl(document),'scrollend',true);record.windowState='done'}};later(record,end,20)};
++ record.dispose=()=>{if(record.disposed)return;record.disposed=true;for(const timer of record.timers)cancel(timer);record.timers.clear();record.windowState='done';record.signal?.removeEventListener('abort',record.dispose)};
++ documents.set(document,record);record.signal?.addEventListener('abort',record.dispose,{once:true});return record;
++}
++export function queueElementScroll(implementation){
++ const record=documents.get(implementation._ownerDocument);if(!record||record.disposed)return;
++ let state=elements.get(implementation);if(!state||state.owner!==record){state=Object.assign(Object.create(null),{phase:'done',owner:record});elements.set(implementation,state)}
++ const active=state.phase!=='done';state.phase='scroll';if(active)return;
++ const run=()=>{const root=implementation===record.document.documentElement,target=utils.wrapperForImpl(root?record.document:implementation);if(state.phase==='scroll'){state.phase='end';dispatch(record,target,'scroll',root);later(record,run,10)}else if(state.phase==='end'){state.phase='done';dispatch(record,target,'scrollend',root)}};
++ later(record,run,10);
++}
+--- a/src/element-scroll.js
++++ b/src/element-scroll.js
+@@ -1,15 +1,22 @@
+-// Real Element scroll state is kept in the pinned DOM implementation. Clamp
+-// only axes with resolvable explicit sizes, matching the native surrogate.
+-import {resolveFlowLength} from './flow-metrics.js';
+-function interfaces(window,bridge){
+- const number=value=>{const n=Number(value);return Number.isFinite(n)?n:0};
+- function perform(element,x,y,relative){bridge.brand(element);const current=bridge.read(element);let left=current.left,top=current.top;if(x!==null&&typeof x==='object'){if(x.left!==undefined)left=(relative?left:0)+number(x.left);if(x.top!==undefined)top=(relative?top:0)+number(x.top);}else{if(x!==undefined)left=(relative?left:0)+number(x);if(y!==undefined)top=(relative?top:0)+number(y);}bridge.write(element,left,top);}
+- return{scroll:function scroll(x=undefined,y=undefined){perform(this,x,y,false)},scrollTo:function scrollTo(x=undefined,y=undefined){perform(this,x,y,false)},scrollBy:function scrollBy(x=undefined,y=undefined){perform(this,x,y,true)}};
++// Genuine per-element state writes, conversion and event scheduling. The
++// original Element implementation owns offsets; no alternate front is made.
++import{resolveFlowLength}from'./flow-metrics.js';
++import{platformFactoryRecord}from'./platform-factories.js';
++import{queueElementScroll}from'./scroll-events.js';
++import{createRequire}from'node:module';
++const require=createRequire(import.meta.url),conversions=require('webidl-conversions'),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const ordinaryHasInstance=Function.prototype[Symbol.hasInstance],apply=Reflect.apply;
++const installed=new WeakSet(),has=(value,key)=>value!=null&&key in value?value[key]:undefined;
++function interfaces(bridge){'use strict';return{scroll:function scroll(){bridge.perform(this,arguments,false)},scrollTo:function scrollTo(){bridge.perform(this,arguments,false)},scrollBy:function scrollBy(){bridge.perform(this,arguments,true)},top:Object.getOwnPropertyDescriptor({get scrollTop(){return bridge.read(this,'top')},set scrollTop(value){bridge.set(this,'top',value)}},'scrollTop'),left:Object.getOwnPropertyDescriptor({get scrollLeft(){return bridge.read(this,'left')},set scrollLeft(value){bridge.set(this,'left',value)}},'scrollLeft')}}
++export function installElementScroll(window,ownerLayout,{evaluate=source=>window.eval(source)}={}){
++ if(installed.has(window.Element.prototype))return;installed.add(window.Element.prototype);
++ const intrinsics={TypeError:window.TypeError,Number:window.Number,String:window.String},integer=value=>conversions.long(value,{globals:intrinsics}),string=value=>conversions.DOMString(value,{globals:intrinsics});
++ const brand=value=>{const impl=platformFactoryRecord(value)?.implementation;if(!apply(ordinaryHasInstance,ElementImpl,[impl]))throw new intrinsics.TypeError('Illegal invocation');return impl};
++ const read=(impl,axis)=>ownerLayout(impl)?impl[axis==='left'?'scrollLeft':'scrollTop']:0;
++ const clamp=(impl,value,axis)=>{value=Math.min(4294967295,Math.max(0,value));const layout=ownerLayout(impl);if(!layout)return 0;const node=utils.wrapperForImpl(impl),doc=impl._ownerDocument;if(impl===doc.documentElement||impl===doc.body)return value;const css=layout.rawComputedStyle(node),explicit=resolveFlowLength(css[axis==='left'?'width':'height'],layout.viewport);if(explicit!==undefined){const extent=axis==='left'?layout.scrollWidth(node):layout.scrollHeight(node),size=layout.dimension(node,axis==='left'?'width':'height');if(extent>size)value=Math.min(value,Math.max(0,Math.floor(extent-size)))}return value};
++ const write=(impl,x,y)=>{if(!ownerLayout(impl))return;const oldX=impl.scrollLeft,oldY=impl.scrollTop;if(x!==undefined)impl.scrollLeft=clamp(impl,x,'left');if(y!==undefined)impl.scrollTop=clamp(impl,y,'top');if(oldX!==impl.scrollLeft||oldY!==impl.scrollTop)queueElementScroll(impl)};
++ const bridge={read(value,axis){return read(brand(value),axis)},set(value,axis,next){const impl=brand(value),number=integer(next);write(impl,axis==='left'?number:undefined,axis==='top'?number:undefined)},perform(value,args,relative){const impl=brand(value);let x,y;const first=args[0];if(first!=null&&(typeof first==='object'||typeof first==='function')){const behavior=has(first,'behavior');if(behavior!==undefined)string(behavior);const left=has(first,'left'),top=has(first,'top');if(left!==undefined)x=integer(left);if(top!==undefined)y=integer(top);if(args[1]!=null)integer(args[1])}else if(first!=null){x=integer(first);y=args[1]==null?0:integer(args[1])}else if(args[1]!=null)integer(args[1]);if(relative){if(x!==undefined)x+=read(impl,'left');if(y!==undefined)y+=read(impl,'top')}write(impl,x,y)}};
++ const methods=evaluate('('+interfaces.toString()+')')(bridge),proto=window.Element.prototype;
++ for(const name of['scroll','scrollTo','scrollBy'])Object.defineProperty(proto,name,{value:methods[name],writable:true,enumerable:true,configurable:true});
++ for(const[name,key]of[['scrollTop','top'],['scrollLeft','left']])Object.defineProperty(proto,name,{...methods[key],enumerable:true,configurable:true});
+ }
+-export function installElementScroll(window,ownerLayout){
+- const proto=window.Element.prototype,top=Object.getOwnPropertyDescriptor(proto,'scrollTop'),left=Object.getOwnPropertyDescriptor(proto,'scrollLeft');
+- const clamp=(element,value,axis)=>{value=Number.isFinite(value)?Math.max(0,value):0;const layout=ownerLayout(element),css=layout.rawComputedStyle(element),explicit=resolveFlowLength(css[axis==='left'?'width':'height'],layout.viewport);if(explicit!==undefined){const extent=axis==='left'?layout.scrollWidth(element):layout.scrollHeight(element),size=layout.dimension(element,axis==='left'?'width':'height');value=Math.min(value,Math.max(0,extent-size));}return value;};
+- const bridge={brand:element=>top.get.call(element),read:element=>({top:top.get.call(element),left:left.get.call(element)}),write(element,x,y){left.set.call(element,clamp(element,x,'left'));top.set.call(element,clamp(element,y,'top'));}};
+- for(const[axis,descriptor]of[['top',top],['left',left]])Object.defineProperty(proto,axis==='top'?'scrollTop':'scrollLeft',{...descriptor,set(value){descriptor.set.call(this,value);descriptor.set.call(this,clamp(this,descriptor.get.call(this),axis));}});
+- const methods=window.eval(`(${interfaces.toString()})`)(window,bridge);for(const[name,value]of Object.entries(methods))Object.defineProperty(proto,name,{configurable:true,enumerable:true,writable:true,value});
+-}
+--- /dev/null
++++ b/src/window-viewport.js
+@@ -0,0 +1,76 @@
++import{installElementScroll}from'./element-scroll.js';
++// Metrics are read from captured real layout/viewport records. A public global
++// proxy is never used as authority for retained state after navigation.
++import vm from'node:vm';
++import{createRequire}from'node:module';
++import{implementationForWrapper}from'./dom-event-state.js';
++import{eventTargetImplementation,bindEventTargetImplementation}from'./dom-event-target-state.js';
++import{createDOMWrapperShell}from'./dom-wrapper-realms.js';
++import{registerPlatformFactory,platformFactoryRecord}from'./platform-factories.js';
++import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';
++import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
++const require=createRequire(import.meta.url),Target=require('jsdom/lib/jsdom/living/generated/EventTarget.js'),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),conversions=require('webidl-conversions'),DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation,ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const contexts=new WeakMap(),documents=new WeakMap(),pages=new WeakMap(),windows=new WeakMap(),targets=new WeakMap(),devices=new WeakMap();
++const names=['VisualViewport','Screen','ScreenOrientation'],windowKeys=['visualViewport','screen','innerWidth','innerHeight','outerWidth','outerHeight','devicePixelRatio','scrollX','scrollY','pageXOffset','pageYOffset'];
++for(const name of names)registerPlatformFactoryKind(name);
++const ordinaryHasInstance=Function.prototype[Symbol.hasInstance],apply=Reflect.apply,define=Object.defineProperty,member=(o,k)=>o!=null&&k in o?o[k]:undefined,object=v=>v!==null&&(typeof v==='object'||typeof v==='function');
++function publicDefinitions(bridge,EventTarget,TypeError){
++ 'use strict';const define=Object.defineProperty,setPrototype=Object.setPrototypeOf;
++ function VisualViewport(){throw new TypeError('Illegal Constructor')}function Screen(){throw new TypeError('Illegal Constructor')}function ScreenOrientation(){throw new TypeError('Illegal Constructor')}
++ const constructors=[VisualViewport,Screen,ScreenOrientation];
++ for(let index=0;index<constructors.length;index++){const C=constructors[index],kind=['VisualViewport','Screen','ScreenOrientation'][index];setPrototype(C,EventTarget);setPrototype(C.prototype,EventTarget.prototype);delete C.prototype.constructor;
++  const fields=kind==='VisualViewport'?['offsetLeft','offsetTop','pageLeft','pageTop','width','height','scale']:kind==='Screen'?['width','height','availWidth','availHeight','colorDepth','pixelDepth','orientation']:['angle','type'];
++  for(const key of fields){let constant;if(key==='offsetLeft'||key==='offsetTop')constant=0;else if(key==='scale')constant=1;else if(key==='availHeight')constant=1040;else if(key==='colorDepth'||key==='pixelDepth')constant=24;
++   if(constant!==undefined)define(C.prototype,key,{value:constant,enumerable:true});else define(C.prototype,key,{get:Object.getOwnPropertyDescriptor({get [key](){return bridge.read(this,kind,key)}},key).get,enumerable:true,configurable:true});
++  }
++  if(kind==='ScreenOrientation'){const methods={lock(orientation){return bridge.lock(this,arguments)},unlock(){bridge.unlock(this)}};for(const key of['lock','unlock'])define(C.prototype,key,{value:methods[key],writable:true,enumerable:true,configurable:true});const handlers={get onchange(){return bridge.read(this,kind,'onchange')},set onchange(value){bridge.handler(this,value)}};define(C.prototype,'onchange',{...Object.getOwnPropertyDescriptor(handlers,'onchange'),enumerable:true,configurable:true})}
++  define(C.prototype,'constructor',{value:C,writable:true,configurable:true});define(C.prototype,Symbol.toStringTag,{value:kind,configurable:true});define(C,'prototype',{writable:false});
++ }
++ const methods={scroll(x){bridge.scroll(this,arguments,false)},scrollTo(x){bridge.scroll(this,arguments,false)},scrollBy(x){bridge.scroll(this,arguments,true)}};
++ const getters=['visualViewport','screen','innerWidth','innerHeight','outerWidth','outerHeight','devicePixelRatio','scrollX','scrollY','pageXOffset','pageYOffset'].map(key=>Object.getOwnPropertyDescriptor({get [key](){return bridge.windowMetric(key)}},key).get);
++ const fullscreen={get fullscreenElement(){return bridge.fullscreen(this,false)},exitFullscreen(){return bridge.fullscreen(this,true)},requestFullscreen(){return bridge.requestFullscreen(this)}};
++ return [...constructors,methods.scroll,methods.scrollTo,methods.scrollBy,...getters,Object.getOwnPropertyDescriptor(fullscreen,'fullscreenElement').get,fullscreen.exitFullscreen,fullscreen.requestFullscreen];
++}
++function makeTarget(record,kind){const value=createDOMWrapperShell(record.context,record.constructors[kind].prototype,kind);Target.setup(value,record.globalObject,[]);const impl=eventTargetImplementation(value),slot=Object.assign(Object.create(null),{kind,base:record.base,handler:null,listener:null});targets.set(impl,slot);registerPlatformFactory(value,{kind,implementation:impl,globalObject:record.context});return value}
++export function viewportTargetInterface(implementation){return targets.get(implementation)?.kind}
++export function wrapViewportTarget(context,implementation){const record=contexts.get(context),slot=targets.get(implementation);if(!record||!slot)return undefined;const value=createDOMWrapperShell(context,record.constructors[slot.kind].prototype,slot.kind);bindEventTargetImplementation(value,implementation);registerPlatformFactory(value,{kind:slot.kind,implementation,globalObject:context});return value}
++export function isViewportScreen(value){return targets.get(eventTargetImplementation(value))?.kind==='Screen'}
++function getObject(record,kind,base=record.base){if(!base.objects[kind])base.objects[kind]=makeTarget(base,kind);
++ if(!record.utility)return base.objects[kind];
++ return record.wrap(eventTargetImplementation(base.objects[kind]));
++}
++function installRecord(page,globalObject,layout,{context,base,utility=false,wrap}={}){
++ context??=implementationForWrapper(globalObject)._globalObject;const prior=contexts.get(context);if(prior)return prior;
++ const record=Object.assign(Object.create(null),{page,globalObject,context,layout,utility,wrap,constructors:Object.create(null),objects:Object.create(null),TypeError:globalObject.TypeError,Number:globalObject.Number,String:globalObject.String,Promise:globalObject.Promise,reject:globalObject.Promise.reject,exception:captureDOMExceptionFactory(vm.isContext(context)&&!utility?context:globalObject),add:globalObject.EventTarget.prototype.addEventListener,remove:globalObject.EventTarget.prototype.removeEventListener,models:new Set(),metrics:{scale:1,screenWidth:undefined,screenHeight:undefined,orientation:undefined}});record.base=base??record;
++ const reject=error=>apply(record.reject,record.Promise,[error]),brand=(value,kind)=>{const slot=targets.get(eventTargetImplementation(value));if(!slot||slot.kind!==kind)throw new record.TypeError('Illegal invocation');return slot},integer=value=>conversions.long(value,{globals:record}),string=value=>conversions.DOMString(value,{globals:record});
++ const owner=receiver=>{if(receiver==null)return record;const result=windows.get(eventTargetImplementation(receiver));if(!result)throw new record.TypeError('Illegal invocation');return result};
++ const bridge={
++  read(value,kind,key){const slot=brand(value,kind),base=slot.base,viewport=base.metrics,metrics=base.metrics;if(kind==='VisualViewport')return key==='pageLeft'?base.layout.scroll.x:key==='pageTop'?base.layout.scroll.y:viewport[key];if(kind==='Screen')return key==='orientation'?getObject(record,'ScreenOrientation',slot.base):key==='height'?(metrics.screenHeight??viewport.height):(metrics.screenWidth??viewport.width);if(key==='onchange')return slot.handler;if(key==='angle')return metrics.orientation?.angle??0;return metrics.orientation?.type??((metrics.screenHeight??viewport.height)>(metrics.screenWidth??viewport.width)?'portrait-primary':'landscape-primary')},
++  lock(value,args){try{brand(value,'ScreenOrientation');if(!args.length)throw new record.TypeError('invalid argument');const next=string(args[0]);if(!['any','natural','landscape','portrait','portrait-primary','portrait-secondary','landscape-primary','landscape-secondary'].includes(next))throw new record.TypeError('invalid argument');return reject(record.exception('The operation is not supported','NotSupportedError'))}catch(error){return reject(error)}},
++  unlock(value){brand(value,'ScreenOrientation')},
++  handler(value,next){const slot=brand(value,'ScreenOrientation');slot.handler=typeof next==='function'?next:null;if(!slot.listener&&slot.handler){slot.listener=function(event){const callback=slot.handler;if(callback)apply(callback,this,[event])};apply(record.add,value,['change',slot.listener])}else if(slot.listener&&!slot.handler){apply(record.remove,value,['change',slot.listener]);slot.listener=null}},
++  windowMetric(key){if(key==='screen')return getObject(record,'Screen');if(key==='visualViewport')return getObject(record,'VisualViewport');if(key==='devicePixelRatio')return record.base.metrics.scale;if(key==='innerWidth'||key==='outerWidth')return record.base.metrics.width;if(key==='innerHeight'||key==='outerHeight')return record.base.metrics.height;return key==='scrollX'||key==='pageXOffset'?record.layout.scroll.x:record.layout.scroll.y},
++  scroll(receiver,args,relative){const target=owner(receiver);if(!args.length)throw new record.TypeError('invalid argument');let x,y;const first=args[0];if(object(first)){const behavior=member(first,'behavior');if(behavior!==undefined)string(behavior);const left=member(first,'left'),top=member(first,'top');if(left!==undefined)x=integer(left);if(top!==undefined)y=integer(top);if(args[1]!=null)integer(args[1])}else{x=integer(first);y=args[1]==null?0:integer(args[1])}if(relative){if(x!==undefined)x+=target.layout.scroll.x;if(y!==undefined)y+=target.layout.scroll.y}target.layout.scrollAxes(x,y)},
++  fullscreen(value,exit){try{if(!(apply(ordinaryHasInstance,DocumentImpl,[platformFactoryRecord(value)?.implementation])))throw new record.TypeError('Illegal invocation');return exit?reject(new record.TypeError('The operation is not supported')):null}catch(error){if(exit)return reject(error);throw error}},
++  requestFullscreen(value){if(!(apply(ordinaryHasInstance,ElementImpl,[platformFactoryRecord(value)?.implementation])))return reject(new record.TypeError('Illegal invocation'));return reject(new record.TypeError('The operation is not supported'))},
++ };
++ const result=vm.compileFunction('return ('+publicDefinitions.toString()+')(bridge,EventTarget,TypeError)',['bridge','EventTarget','TypeError'],vm.isContext(context)?{parsingContext:context}:{})(bridge,globalObject.EventTarget,record.TypeError);contexts.set(context,record);
++ const registry=utils.initCtorRegistry(globalObject);for(let n=0;n<names.length;n++){record.constructors[names[n]]=result[n];define(globalObject,names[n],{value:result[n],writable:true,configurable:true});registry[names[n]]=result[n]}
++ for(let n=0;n<3;n++)define(globalObject,['scroll','scrollTo','scrollBy'][n],{value:result[n+3],writable:true,enumerable:true,configurable:true});
++ for(let n=0;n<windowKeys.length;n++)define(globalObject,windowKeys[n],{get:result[n+6],enumerable:true,configurable:true});
++ const offset=6+windowKeys.length;for(const key of['fullscreen','fullscreenEnabled'])if(!Object.getOwnPropertyDescriptor(globalObject.Document.prototype,key))define(globalObject.Document.prototype,key,{value:false,enumerable:true});
++ define(globalObject.Document.prototype,'fullscreenElement',{get:result[offset],enumerable:true,configurable:true});define(globalObject.Document.prototype,'exitFullscreen',{value:result[offset+1],writable:true,enumerable:true,configurable:true});define(globalObject.Element.prototype,'requestFullscreen',{value:result[offset+2],writable:true,enumerable:true,configurable:true});if(utility)installElementScroll(globalObject,implementation=>documents.get(implementation._ownerDocument)?.layout,{evaluate:source=>vm.runInContext(source,context)});return record;
++}
++export function installWindowViewport(page,window,layout){
++ const document=implementationForWrapper(window.document),rootPage=page.registry?.page??page,base=rootPage===page?undefined:pages.get(rootPage),record=installRecord(page,window,layout,{base});documents.set(document,record);windows.set(eventTargetImplementation(window),record);if(rootPage===page){pages.set(rootPage,record);const key=page.browser??page;let physical=devices.get(key);if(!physical){physical=Object.assign(Object.create(null),{width:layout.viewport.width,height:layout.viewport.height,scale:1,screenWidth:undefined,screenHeight:undefined,orientation:undefined,records:new Set()});devices.set(key,physical)}record.metrics=physical;record.deviceKey=key;record.deviceReference=new WeakRef(record);physical.records.add(record.deviceReference);page.documentAbort?.signal.addEventListener('abort',()=>physical.records.delete(record.deviceReference),{once:true})}const modelReference=new WeakRef(layout);record.base.models.add(modelReference);page.documentAbort?.signal.addEventListener('abort',()=>record.base.models.delete(modelReference),{once:true});
++ if(record===record.base)layout.setViewportObserver(()=>{record.metrics.width=layout.viewport.width;record.metrics.height=layout.viewport.height;for(const reference of record.models){const model=reference.deref();if(!model){record.models.delete(reference);continue}if(model!==layout)model.setViewport(layout.viewport)}});layout.setViewport({width:record.base.metrics.width,height:record.base.metrics.height});
++ return record;
++}
++export function installUtilityViewport(global,context,mainWindow,wrap){const owner=documents.get(implementationForWrapper(mainWindow.document));if(!owner)return;return installRecord(owner.page,global,owner.layout,{context,base:owner.base,utility:true,wrap})}
++export function setWindowDeviceMetrics(page,metrics,{clear=false}={}){
++ const record=pages.get(page.registry?.page??page);if(!record){page.layout.setViewport(metrics);return}
++ const state=record.metrics;
++ if(clear){state.width=1920;state.height=1080;state.scale=1;state.screenWidth=undefined;state.screenHeight=undefined}
++ else{if(metrics.width>0)state.width=metrics.width;if(metrics.height>0)state.height=metrics.height;const scale=Math.fround(metrics.deviceScaleFactor??0);if(scale>0)state.scale=scale;if(metrics.screenWidth>0)state.screenWidth=metrics.screenWidth;if(metrics.screenHeight>0)state.screenHeight=metrics.screenHeight}
++ for(const reference of state.records){const target=reference.deref();if(!target){state.records.delete(reference);continue}target.page.viewport=clear?undefined:{width:state.width,height:state.height,deviceScaleFactor:state.scale,screenWidth:state.screenWidth,screenHeight:state.screenHeight};target.layout.setViewport({width:state.width,height:state.height})}
++}
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {transformPrivateEventTargetSource} from './dom-event-target-state.js';
+ import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+ import {transformPrivateEventSource} from './dom-event-state.js';
+ import {registerDOMAllocationKind,registerDOMAllocationRealm,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
+@@ -96,6 +97,7 @@
+    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
+   }
+   if(event)source=transformPrivateEventSource(source,kind);
++  if(Implementation===EventTargetImpl)source=transformPrivateEventTargetSource(source);
+   if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
+   candidates.push({factory,kind,full,originalSource,source});
+  }
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,5 @@
++import{viewportTargetInterface,wrapViewportTarget,installUtilityViewport}from'./window-viewport.js';
++import {installPrivateEventTargetUtils,transformPrivateEventTargetSource,eventTargetImplementation,directEventTargetImplementation,bindEventTargetImplementation} from './dom-event-target-state.js';
+ import {installEventAPIParity,configureEventDictionary,customEventInterface,wrapCustomEvent} from './event-api-parity.js';
+ import {installPrivateEventUtils,transformPrivateEventSource,isPrivateEventKind,eventImplementation,bindEventImplementation} from './dom-event-state.js';
+ import {captureDOMWrapperRealm} from './dom-wrapper-realms.js';
+@@ -30,7 +32,7 @@
+  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
+  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+- const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
++ const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);installPrivateEventTargetUtils(localUtils);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
+  const metadata={context,global,mainWindow,signal,disposed:false};const pendingFactories=[];let factoryReady=false;
+  const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);registerPlatformFactory(wrapper,{kind:interfaceName,implementation:impl,globalObject:global});if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
+  const utilityPrototypes=new Map();
+@@ -45,11 +47,12 @@
+   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
+   const cached=wrappers.get(impl);if(cached)return cached;
+   const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
++  const metric=viewportTargetInterface(impl);if(metric){const wrapper=wrapViewportTarget(context,impl);wrappers.set(impl,wrapper);register(wrapper,impl,metric);return wrapper;}
+   const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
+   const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+-  if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
++  if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(eventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+   wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);
+   return wrapper;
+  }
+@@ -57,11 +60,11 @@
+   if(!objectLike(value))return value;if(value===mainWindow||value===mainWindow._globalProxy)return global;if(value===global||wrapperImpls.has(value))return value;const otherWindow=resolveWindow?.(value);if(otherWindow)return otherWindow;
+   const known=mainWrappers.get(value);if(known)return wrapImpl(known);
+   if(types.isProxy(value))return value;
+-  const privateEvent=eventImplementation(value);if(privateEvent)return wrapImpl(privateEvent);
++  const privateEvent=eventImplementation(value);if(privateEvent)return wrapImpl(privateEvent);const privateTarget=directEventTargetImplementation(value);if(privateTarget)return wrapImpl(privateTarget);
+   const candidate=own(value,hostUtils.implSymbol)?.value;
+   if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
+   const canonical=own(value,hostUtils.wrapperSymbol)?.value;
+-  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical);if(event?event===value:own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
++  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical),target=directEventTargetImplementation(canonical);if(event?event===value:target?target===value:own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
+   if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
+   return value;
+  }
+@@ -72,13 +75,13 @@
+   // wrapper. Never replace an existing implementation's main wrapper to enter a world.
+   const hostGenerated=require(join(generatedRoot,name+'.js'));
+   if(typeof hostGenerated.new==='function'&&mainWindow[name]){
+-   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
++   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else if(eventTargetImplementation(canonical))bindEventTargetImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
+   }
+   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
+  }
+  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
+   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
+-  let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
++  let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);if(interfaceName==='EventTarget')source=transformPrivateEventTargetSource(source);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
+   configureEventDictionary(interfaceName,module.exports);
+   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
+    // Measured native producer quirk: MO arguments are real main-world values,
+@@ -94,12 +97,13 @@
+  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
+  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
+  Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
+- const windowImpl=hostUtils.implForWrapper(mainWindow);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
++ const windowImpl=hostUtils.implForWrapper(mainWindow);bindEventTargetImplementation(global,windowImpl);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
+  global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);restoreWindowGlobalInheritance(global,context,originalGlobalPrototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
+  const add=global.EventTarget.prototype.addEventListener,remove=global.EventTarget.prototype.removeEventListener;
+  const removeImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype.removeEventListener;
+  global.EventTarget.prototype.addEventListener=realmFunction(function(...args){requireLive();const impl=wrapperImpls.get(this),before=new Set(Object.values(impl?._eventListeners??{}).flat());const result=Reflect.apply(add,this,args);for(const[type,entries]of Object.entries(impl._eventListeners))for(const entry of entries)if(!before.has(entry))listeners.push({impl:new WeakRef(impl),type,entry:new WeakRef(entry)});return result;});
+  global.EventTarget.prototype.removeEventListener=realmFunction(function(...args){return Reflect.apply(remove,this,args);});
++ installUtilityViewport(global,context,mainWindow,wrap);
+  let nextTimerId=0;const timerHandles=new Map();
+  const timerBridge=(repeating,callback,ms,...args)=>{requireLive();if(typeof callback!=='function')throw new global.TypeError('Prototype timers require a function');const id=++nextTimerId;const invoke=()=>{if(!repeating){timers.delete(id);timerHandles.delete(id);}if(!disposed)try{invocation.invoke(callback,global,args,{timeout,displayErrors:false});}catch(error){if(onError)onError(error);else global.dispatchEvent(new global.ErrorEvent('error',{error}));}};timerHandles.set(id,(repeating?setInterval:setTimeout)(invoke,ms));timers.add(id);return id;};
+  const clearTimer=id=>{const handle=timerHandles.get(id);if(handle!==undefined){clearTimeout(handle);clearInterval(handle);}timerHandles.delete(id);timers.delete(id);};
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,5 @@
++import{installWindowViewport}from'./window-viewport.js';
++import{installScrollEvents}from'./scroll-events.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import{installElementScroll}from './element-scroll.js';
+ import {resolveFlowLength,nativeTextHeight} from './flow-metrics.js';
+@@ -36,7 +38,7 @@
+   const rawComputedStyle = options.getComputedStyle ?? window.getComputedStyle.bind(window);
+   let width = optionDimension(options.width ?? 1920, 'Viewport width');
+   let height = optionDimension(options.height ?? 1080, 'Viewport height');
+-  let scrollX = 0, scrollY = 0;
++  let scrollX = 0, scrollY = 0, scrollObserver, viewportObserver;
+   let cachedKey, cached, cachedFastKey;
+   const dimension=value=>resolveFlowLength(value,{width,height});
+   const identities = new WeakMap();
+@@ -106,7 +108,7 @@
+         value = {
+           advance: horizontal.advance(node),
+           width: horizontal.width(node),
+-          height: explicitHeight ?? (['html', 'body'].includes(node.localName) ? documentHeight : childHeight),
++          height: explicitHeight ?? (node===document.documentElement||node===document.body ? documentHeight : childHeight),
+         };
+       }
+       sizes.set(node, value); return value;
+@@ -142,7 +144,7 @@
+     for (const child of document.body?children(document.body):[]) {
+       if (!isHidden(child)) directHeight += dimension(child.style?.height) ?? 5;
+     }
+-    documentHeight = Math.max(documentHeight, directHeight);
++    documentHeight = Math.max(documentHeight, directHeight, dimension(document.body?.style.height)??0);
+     for (const node of nodes) {
+       const inlineHeight = dimension(node.style?.height);
+       if (inlineHeight !== undefined && !isHidden(node) && node.parentNode !== document.body && !['html', 'body'].includes(node.localName)) {
+@@ -197,15 +199,16 @@
+     return { boundingClientRect: bounds, intersectionRect, rootBounds: rectValue(0, 0, width, height), isIntersecting,
+       intersectionRatio: area > 0 ? intersectionRect.width * intersectionRect.height / area : 0 };
+   }
+-  function scrollTo(x = 0, y = 0) {
++  function scrollAxes(x, y) {
+     const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+     const extent = documentSize();
+-    const nextX = Math.min(Math.max(0, number(x)), Math.max(0, extent.width - width));
+-    const nextY = Math.min(Math.max(0, number(y)), Math.max(0, extent.height - height));
++    const nextX = x===undefined?scrollX:Math.min(Math.max(0, number(x)), Math.max(0, extent.width - width));
++    const nextY = y===undefined?scrollY:Math.min(Math.max(0, number(y)), Math.max(0, extent.height - height));
+     const changed = nextX !== scrollX || nextY !== scrollY;
+     scrollX = nextX; scrollY = nextY;
+-    if (changed) window.dispatchEvent(new window.Event('scroll'));
+-  }
++    if (changed) scrollObserver?.();
++  }
++  function scrollTo(x=0,y=0){scrollAxes(x,y)}
+   function scrollIntoView(node, region) {
+     const value = snapshot().record(node);
+     if (!value.rendered) return;
+@@ -221,7 +224,8 @@
+       height: Math.max(height, state.record(window.document.documentElement).rect.height) };
+   }
+   return {
+-    rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollIntoView,
++    rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollAxes, scrollIntoView,
++    setScrollObserver(value){scrollObserver=value},setViewportObserver(value){viewportObserver=value},
+     absoluteRect:node=>snapshot().record(node).rect,
+     dimension:(node,axis)=>snapshot().dimension(node,axis),
+     rendered:node=>snapshot().isRendered(node),
+@@ -234,7 +238,7 @@
+     setViewport(viewport) {
+       const nextWidth = optionDimension(viewport.width ?? width, 'Viewport width');
+       const nextHeight = optionDimension(viewport.height ?? height, 'Viewport height');
+-      width = nextWidth; height = nextHeight; scrollTo(scrollX, scrollY); refreshMediaQueries(window);
++      width = nextWidth; height = nextHeight; refreshMediaQueries(window); viewportObserver?.();
+     },
+     // Used by the window adapter without recursively reading its own overrides.
+     rawComputedStyle,
+@@ -248,7 +252,8 @@
+   LAYOUTS.set(implForWrapper(window.document),layout);
+   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
+   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
+-  installElementScroll(window,ownedLayout);
++  installElementScroll(window,implementation=>LAYOUTS.get(implementation._ownerDocument));
++  layout.setScrollObserver(installScrollEvents(page,window).windowScroll);
+   const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
+   const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
+   const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
+@@ -261,7 +266,7 @@
+     define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).viewport[dimension] : ownedLayout(this).dimension(this,dimension)); } });
+   }
+   for (const [name, dimension] of [['scrollWidth', 'width'], ['scrollHeight', 'height']]) {
+-    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):ownedLayout(this).scrollHeight(this)); } });
++    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):implForWrapper(this)===implForWrapper(this)._ownerDocument.body?ownedLayout(this).dimension(this,'height'):ownedLayout(this).scrollHeight(this)); } });
+   }
+   define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
+   define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
+@@ -300,6 +305,7 @@
+     computedViews.set(original,view); return view;
+   };
+   page.layout = layout;
++  installWindowViewport(page,window,layout);
+   return layout;
+ }
+ 
+--- a/src/media.js
++++ b/src/media.js
+@@ -1,3 +1,4 @@
++import{isViewportScreen}from'./window-viewport.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {createRequire} from 'node:module';
+ const require=createRequire(import.meta.url);
+@@ -76,8 +77,9 @@
+  const record={page,window,queries:new Set(),timers:new Set(),disposed:false,signal:page.documentAbort?.signal};
+  const interfaces=window.eval(`(${mediaInterfaces.toString()})`)(window,record,{},LISTS,EVENTS,evaluateMedia);
+  Object.assign(window,interfaces);
+- SCREENS.set(window.screen,record);
++ if(!isViewportScreen(window.screen)){SCREENS.set(window.screen,record);
+  for(const[key,dimension]of[['width','width'],['height','height']]){const original=Object.getOwnPropertyDescriptor(window.Screen.prototype,key);if(original?.get)Object.defineProperty(window.Screen.prototype,key,{...original,get(){const fallback=original.get.call(this),owner=SCREENS.get(this);return owner?owner.window[dimension==='width'?'innerWidth':'innerHeight']:fallback}})}
++ }
+  const previous=window.close;function dispose(){if(record.disposed)return;record.disposed=true;for(const timer of record.timers)window.clearTimeout(timer);record.timers.clear();record.queries.clear();record.signal?.removeEventListener('abort',dispose);if(window.close===close)window.close=previous}function close(...args){dispose();return previous.apply(this,args)}window.close=close;record.signal?.addEventListener('abort',dispose,{once:true});
+  record.controller={dispose,refresh:()=>refreshMediaQueries(window)};INSTALLED.set(window,record);return record.controller;
+ }
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import{setWindowDeviceMetrics}from'./window-viewport.js';
+ import {consoleProtocolType} from './console.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {ProtocolSerializer} from './protocol-serialization.js';
+@@ -283,11 +284,10 @@
+         return { layoutViewport, visualViewport, contentSize, cssLayoutViewport: layoutViewport, cssVisualViewport: visualViewport, cssContentSize: contentSize };
+       }
+       case 'Emulation.setDeviceMetricsOverride': {
+-        if (![params.width, params.height].every(value => Number.isInteger(value) && value >= 0)) throw new ProtocolError('Invalid viewport dimensions');
+-        page.viewport = { width: params.width || 1920, height: params.height || 1080 };
+-        page.layout.setViewport(page.viewport); return {};
+-      }
+-      case 'Emulation.clearDeviceMetricsOverride': page.viewport = undefined; page.layout.setViewport({ width: 1920, height: 1080 }); return {};
++        if (![params.width, params.height].every(value => Number.isInteger(value) && value >= 0 && value <= 4294967295) || ['screenWidth','screenHeight'].some(name=>params[name]!=null&&(!Number.isInteger(params[name])||params[name]<0||params[name]>4294967295)) || ['deviceScaleFactor','scale'].some(name=>params[name]!=null&&(typeof params[name]!=='number'||!Number.isFinite(params[name]))) || params.mobile!=null&&typeof params.mobile!=='boolean') throw new ProtocolError('Invalid viewport dimensions');
++        setWindowDeviceMetrics(page,params); return {};
++      }
++      case 'Emulation.clearDeviceMetricsOverride': page.viewport = undefined; setWindowDeviceMetrics(page,{ width: 1920, height: 1080,deviceScaleFactor:1 },{clear:true}); return {};
+       case 'Page.setLifecycleEventsEnabled': this.lifecycle = params.enabled; return {};
+       case 'Page.navigate': {
+         const target = params.frameId && params.frameId !== page.frameId ? page.frames?.findFrame(params.frameId) : page;
+--- /dev/null
++++ b/test/window-viewport-parity.test.js
+@@ -0,0 +1,11 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{createRequire}from'node:module';import{Browser}from'../src/browser.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{getHeapBinding}from'../src/native-heap.js';import{implementationForWrapper}from'../src/dom-event-state.js';import{eventTargetImplementation}from'../src/dom-event-target-state.js';import{serve}from'../src/cdp.js';import{connect}from'./cdp-client.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),Target=require('jsdom/lib/jsdom/living/generated/EventTarget.js'),binding=getHeapBinding(),plain=v=>JSON.parse(JSON.stringify(v));
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<!doctype html><body></body>');return{browser,page,w:page.dom.window}}
++for(const name of['viewport-first','viewport-details','viewport-extra','scroll-events-first','scroll-conversion','element-scroll-conversion','root-scroll-native','frame-viewport-state','document-extents'])test('actual viewport/scroll Native '+name+' controls match',async t=>{const{page}=await fixture(t),expression=await readFile(new URL('../docs/reference/window-viewport-parity/'+name+'-expression.js',import.meta.url),'utf8'),record=JSON.parse(await readFile(new URL('../docs/reference/window-viewport-parity/'+name+'-native.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(expression).digest('hex'),record.expressionSHA256);assert.deepEqual(plain(await page.evaluate(expression)),record.observations)});
++function realm(value,anchor){const prototype=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,{}),false);assert.equal(binding.creationGlobal(value),binding.creationGlobal(anchor));Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,prototype)}}
++test('actual metric constructors/accessors/fronts retain their real VM before/after null prototypes, including shared frame values',async t=>{const{page,w}=await fixture(t),frame=w.document.createElement('iframe');w.document.body.append(frame);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});for(const g of[w,frame.contentWindow,world.global])for(const name of['VisualViewport','Screen','ScreenOrientation']){const C=g[name];realm(C,g.Object.prototype);realm(C.prototype,g.Object.prototype);for(const key of Reflect.ownKeys(C.prototype)){const descriptor=Object.getOwnPropertyDescriptor(C.prototype,key);for(const field of['value','get','set'])if(typeof descriptor[field]==='function')realm(descriptor[field],g.Object.prototype)}const value=name==='VisualViewport'?g.visualViewport:name==='Screen'?g.screen:g.screen.orientation;realm(value,g===frame.contentWindow?w.Object.prototype:g.Object.prototype);assert.deepEqual(Reflect.ownKeys(value),[]);assert.ok(eventTargetImplementation(value))}const setup=Target.setup;let receiver;Target.setup=function(value,...args){receiver=value;return Reflect.apply(setup,this,[value,...args])};try{const{Browser}=await import('../src/browser.js'),second=new Browser();try{const p=second.createPage();const value=p.dom.window.visualViewport;assert.equal(receiver,value);realm(value,p.dom.window.Object.prototype)}finally{second.close()}}finally{Target.setup=setup}});
++test('private metric/Target slots reject inherited values, copied symbols and proxies before authored reads or conversion',async t=>{const{w}=await fixture(t);for(const [C,value,key]of[[w.VisualViewport,w.visualViewport,'width'],[w.Screen,w.screen,'width'],[w.ScreenOrientation,w.screen.orientation,'type']]){const getter=Object.getOwnPropertyDescriptor(C.prototype,key).get,fake=Object.create(C.prototype);Object.defineProperty(fake,utils.implSymbol,{value:eventTargetImplementation(value)});let traps=0;const proxy=new Proxy(value,{get(){traps++;throw 1},getOwnPropertyDescriptor(){traps++;throw 2}});for(const receiver of[fake,Object.create(value),proxy]){assert.throws(()=>getter.call(receiver),e=>e instanceof w.TypeError);assert.throws(()=>w.EventTarget.prototype.addEventListener.call(receiver,{toString(){throw Error('must reject before conversion')}},()=>{}),e=>e instanceof w.TypeError)}assert.equal(traps,0);assert.equal(utils.implForWrapper(fake),null);assert.equal(getter.call(value),value[key])}const target=new w.EventTarget();assert.deepEqual(Reflect.ownKeys(target),[]);const backend=eventTargetImplementation(target);Object.defineProperty(target,utils.implSymbol,{get(){throw Error('authored symbol')}});assert.equal(implementationForWrapper(target),backend);let seen=0;target.addEventListener('real',()=>seen++);target.dispatchEvent(new w.Event('real'));assert.equal(seen,1)});
++test('real Element scroll dispatch is coalesced, reentrant and canceled by actual document retirement',async t=>{const{page,w}=await fixture(t),node=w.document.createElement('div');let hits=0;node.addEventListener('scroll',e=>{hits++;assert.equal(e.target,node);assert.equal(e.isTrusted,true)});node.scrollTop=12;assert.equal(hits,0);page.documentAbort.abort();await new Promise(r=>setTimeout(r,35));assert.equal(hits,0)});
++test('metric/scroll public values use captured intrinsics and genuine private state after authored globals change',async t=>{const{page}=await fixture(t);assert.deepEqual(plain(await page.evaluate(`(()=>{const w=screen,v=visualViewport,lock=ScreenOrientation.prototype.lock,get=Object.getOwnPropertyDescriptor(Screen.prototype,'width').get,E=TypeError,P=Promise;const originals=[Object,String,Number,TypeError,Event,EventTarget];try{for(const key of ['Object','String','Number','TypeError','Event','EventTarget'])globalThis[key]=function(){throw Error('authored '+key)};let fake=false;try{get.call({})}catch(e){fake=e instanceof E}const pending=lock.call(screen.orientation,'invalid'),promise=pending instanceof P;pending.catch(()=>{});return[w.width,v.width,fake,promise]}finally{[globalThis.Object,globalThis.String,globalThis.Number,globalThis.TypeError,globalThis.Event,globalThis.EventTarget]=originals}})()`)),[1920,1920,true,true])});
++test('real CDP device overrides preserve Native zero/omitted fields, ignored orientation and navigation state',async t=>{const service=await serve({port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});await client.send('Page.navigate',{url:'data:text/html,<body>metrics'},sessionId);const read=async()=>{const result=await client.send('Runtime.evaluate',{expression:'[innerWidth,innerHeight,devicePixelRatio,screen.width,screen.height,screen.orientation.angle,screen.orientation.type]',returnByValue:true},sessionId);return result.result.value};const expected=JSON.parse(await readFile(new URL('../docs/reference/window-viewport-parity/device-metrics-native.json',import.meta.url),'utf8')).observations,rows=[];for(const row of expected){if(typeof row[0]==='object'){const response=await client.send('Emulation.setDeviceMetricsOverride',row[0],sessionId);rows.push([row[0],response,await read()])}else if(row[0]==='afterNavigation'){await client.send('Page.navigate',{url:'data:text/html,<body>next document'},sessionId);rows.push([row[0],await read()])}else{await client.send('Emulation.clearDeviceMetricsOverride',{},sessionId);rows.push(['clear',await read()])}}assert.deepEqual(rows,expected)});
++test('canonical Target and new typed receivers ignore authored backend Symbol.hasInstance hooks',async t=>{const{w}=await fixture(t),Impl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation,Element=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation,Document=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation,blob=new w.Blob();let calls=0;try{for(const C of[Impl,Element,Document])Object.defineProperty(C,Symbol.hasInstance,{value(){calls++;return true},configurable:true});const fake=Object.create(w.EventTarget.prototype);assert.equal(Target.is(fake),false);assert.throws(()=>w.EventTarget.prototype.addEventListener.call(fake,'x',()=>{}),e=>e instanceof w.TypeError);assert.throws(()=>Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').set.call(blob,{valueOf(){throw Error('must not convert')}}),e=>e instanceof w.TypeError);assert.throws(()=>Object.getOwnPropertyDescriptor(w.Document.prototype,'fullscreenElement').get.call(blob),e=>e instanceof w.TypeError);assert.equal(calls,0)}finally{for(const C of[Impl,Element,Document])delete C[Symbol.hasInstance]}});
+--- a/test/eventsource.test.js
++++ b/test/eventsource.test.js
+@@ -2,7 +2,7 @@
+ const plain=value=>JSON.parse(JSON.stringify(value));
+ async function fixture(t){const owned=await createOwnedSSEServer(),browser=new Browser({timeout:5000,loadResources:['iframe','worker']}),page=browser.createPage();t.after(async()=>{browser.close();await owned.close()});await page.navigate(owned.origin+'/doc');return{...owned,browser,page,w:page.dom.window}}
+ for(const[name,report]of[['parser','parser'],['status','status'],['reconnect','reconnect'],['cors','cors-v2'],['lifecycle','lifecycle'],['id','id'],['worker-parser','worker-parser'],['worker-surface','worker-surface'],['worker-reconnect','worker-reconnect'],['worker-cors','worker-cors'],['worker-park','worker-park'],['new-target','new-target'],['clone','clone']])test('EventSource actual Native streaming/realm/ownership control '+name,{timeout:15000},async t=>{const f=await fixture(t),source=await readFile(new URL('../proposals/eventsource/'+name+'.js',import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../proposals/eventsource/native-'+report+'.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(source).digest('hex'),native.sourceSHA256);const result=await f.page.evaluate(source.replaceAll('ORIGIN',JSON.stringify(f.origin)).replaceAll('CROSS',JSON.stringify(f.cross)));assert.deepEqual(JSON.parse(result),JSON.parse(native.result.result.value));if(name==='id'){const headers=f.requests.filter(r=>r.url.startsWith('/id?')&&r.count===2).map(r=>{const i=r.headers.findIndex(v=>v.toLowerCase()==='last-event-id');return i<0?null:r.headers[i+1]});assert.deepEqual(headers,['Ã©','ð\x9f\x92©',null,'leading'])}if(name==='worker-park'){const attempts=f.requests.filter(r=>r.url==='/retry-hold?key=worker-retry');assert.equal(attempts.length,2);assert.equal(attempts[1].closed,false);f.page.close();await new Promise(r=>setTimeout(r,30));assert.equal(attempts[1].closed,true)}});
+-test('EventSource constructor surface preserves measured Native descriptors/conversions and records inherited EventTarget symbol gap',async t=>{const f=await fixture(t),source=await readFile(new URL('../proposals/eventsource/surface.js',import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../proposals/eventsource/native-surface.json',import.meta.url),'utf8')),actual=JSON.parse(f.page.evaluate(source)),expected=JSON.parse(native.result.result.value);for(let i=0;i<expected.rows.length;i++)if(expected.rows[i].length===7){assert.deepEqual(expected.rows[i][6],[]);assert.deepEqual(actual.rows[i][6],['impl']);actual.rows[i][6]=[]}assert.deepEqual(actual,expected)});
++test('EventSource constructor surface preserves measured Native descriptors/conversions with private EventTarget backing',async t=>{const f=await fixture(t),source=await readFile(new URL('../proposals/eventsource/surface.js',import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../proposals/eventsource/native-surface.json',import.meta.url),'utf8')),actual=JSON.parse(f.page.evaluate(source)),expected=JSON.parse(native.result.result.value);assert.deepEqual(actual,expected)});
+ test('EventSource owns genuine VM allocation/strong brands and captured principals/intrinsics',{timeout:8000},async t=>{const{page,w,origin,requests}=await fixture(t),result=await page.evaluate(`new Promise(resolve=>{const C=EventSource,EventType=Event,MessageType=MessageEvent;Object.defineProperty(document,'baseURI',{value:'http://invalid.example/',configurable:true});Object.defineProperty(globalThis,'origin',{value:'http://invalid.example/',configurable:true});globalThis.Event=function(){throw 12};globalThis.MessageEvent=function(){throw 13};const es=new C('/hold?key=provenance');es.onmessage=event=>{es.close();resolve({es,event,eventType:event instanceof MessageType,target:event.target===es,trusted:event.isTrusted,anchor:[]})}})`);assert.equal(result.eventType,true);assert.equal(result.target,true);assert.equal(result.trusted,true);assert.ok(requests.some(r=>r.url==='/hold?key=provenance'));const{getHeapBinding}=await import('../src/native-heap.js'),binding=getHeapBinding();for(const value of[result.es,result.event]){assert.equal(binding.sameRealm(value,result.anchor),true);const prototype=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);assert.equal(binding.sameRealm(value,result.anchor),true);Object.setPrototypeOf(value,prototype)}const get=Object.getOwnPropertyDescriptor(w.EventSource.prototype,'readyState').get;let traps=0;for(const fake of[{},Object.create(result.es),new Proxy(result.es,{get(){traps++;throw 1}})])assert.throws(()=>get.call(fake),e=>e instanceof w.TypeError&&e.message==='Illegal invocation');assert.equal(traps,0);assert.equal(result.es.url,origin+'/hold?key=provenance')});
+ test('EventSource utility realm owns real wrappers/events while using the actual document principal',{timeout:5000},async t=>{const{page,w}=await fixture(t),{createIsolatedWorld}=await import('../src/isolated-world.js'),{installWindowEventSource}=await import('../src/eventsource.js'),world=createIsolatedWorld(w,{name:'sse-utility',timeout:2000,signal:page.documentAbort.signal});installWindowEventSource(page,world.global,{mainWindow:w,evaluate:source=>world.evaluate(source),initializeTarget:value=>world.setupEventTarget(value)});const result=await world.evaluate(`new Promise(resolve=>{const e=new EventSource('/hold?key=utility');e.onmessage=v=>{e.close();resolve({source:e instanceof EventSource,target:v.target===e,event:v instanceof MessageEvent,trusted:v.isTrusted,data:v.data})}})`);assert.deepEqual(plain(result),{source:true,target:true,event:true,trusted:true,data:'held'})});
+ test('authored Worker postMessage cannot enter the private SSE transport channel',{timeout:5000},async t=>{const{page,origin,requests}=await fixture(t),rows=await page.evaluate(`new Promise(resolve=>{const worker=new Worker('/worker.js'),rows=[];worker.onmessage=e=>{rows.push(e.data);if(rows.length===2){worker.terminate();resolve(rows)}};worker.postMessage(${JSON.stringify(`(()=>{postMessage({kind:'eventSourceOpen',id:'authored-id',url:origin+'/forged',credentials:true});return{done:true}})()`)}.replace('origin+',${JSON.stringify(JSON.stringify(origin)+'+')}))})`);assert.equal(rows[0].kind,'eventSourceOpen');assert.equal(rows[1].result.done,true);await new Promise(r=>setTimeout(r,30));assert.equal(requests.some(r=>r.url==='/forged'),false)});
+--- /dev/null
++++ b/docs/reference/window-viewport-parity-contract.md
+@@ -0,0 +1,47 @@
++# Window viewport and scroll profile
++
++VisualViewport, Screen and ScreenOrientation use actual selected-VM public
++constructors, prototypes, accessors and front objects over canonical EventTarget
++implementations. Their constructors are illegal, dynamic fields have exact
++private brands, and the measured constants retain their actual descriptor shape.
++The existing real EventTarget factory initializes the same actual front object.
++Backend and factory maps are Host-owned; reflected implementation symbols, fake
++prototypes, proxies and authored Symbol.hasInstance hooks cannot authenticate.
++
++Viewport and device metrics come from captured actual Document/layout records
++and a separate Host Browser device record. Frames expose the observed shared
++main-realm metric objects; isolated worlds have genuine own-VM fronts over the
++same backend. No retained metric getter resolves authority through a mutable
++public WindowProxy. Device width/height/DPR and optional screen sizes persist
++through navigation; zero/omitted dimensions retain the existing override.
++The native profile ignores screenOrientation and mobile/scale extras. No
++resize/change events are invented for device metric updates.
++
++Window scroll offsets and Element implementation fields are real state. Calls
++perform the measured int32 conversion, relative arithmetic and computed extent
++clamping. Window writes update VisualViewport page offsets synchronously.
++Queued delivery creates new genuine trusted Events and uses actual backend
++routing: Document scroll/scrollend bubbles, ordinary Element delivery does not.
++The measured two-phase element task changes state before callbacks, preserving
++reentrant writes. Tasks belong to the actual owner Document and are canceled
++when that document retires. Scroll commands create no synthetic user actions.
++
++The implementation independently uses the observed 10ms/20ms scheduling model;
++it does not replay captured event/coordinate vectors or cap event/node counts.
++Body explicit height and nested root-tag handling use real style/tree state.
++No pinch zoom or fullscreen is implemented: the measured constant viewport
++scale and unsupported fullscreen/orientation-lock Promise failures are exposed.
++
++Pinned Native SHA256:
++`9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f`.
++Raw expressions and Native records are in window-viewport-parity/. Production
++imports no Native engine source; reference-only source digests are archived.
++
++Bounds: the broader direct-Target migration must validate existing messaging
++and networking fronts before integration. Window/Node physical implementation
++symbol migration is separate. General faux-layout and text-rendering bounds
++remain: Page.getLayoutMetrics content size still uses the existing document
++extent, whereas Native uses its text renderer's content height. No equality for
++that preexisting renderer metric is claimed by these viewport-value controls.
++Cross-window borrowed scroll-event scheduling beyond the recorded owner-frame
++controls and additional unsupported APIs remain separate compatibility work.
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/device-events-native.json
+@@ -0,0 +1,77 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "f17b72e4979411c71f91c719705987fac429694eb2ec1659a7fd5224e5d643a0",
++  "observations": [
++    [
++      "sync",
++      [
++        800,
++        600,
++        800,
++        600,
++        2,
++        800,
++        600,
++        800,
++        1040,
++        "landscape-primary",
++        []
++      ]
++    ],
++    [
++      "async",
++      []
++    ],
++    [
++      "sync",
++      [
++        800,
++        600,
++        800,
++        600,
++        2,
++        800,
++        600,
++        800,
++        1040,
++        "landscape-primary",
++        []
++      ]
++    ],
++    [
++      "async",
++      []
++    ],
++    [
++      "sync",
++      [
++        700,
++        900,
++        700,
++        900,
++        1,
++        1000,
++        1200,
++        1000,
++        1040,
++        "portrait-primary",
++        []
++      ]
++    ],
++    [
++      "async",
++      []
++    ],
++    [
++      "clear",
++      [
++        1920,
++        1080,
++        1,
++        1920,
++        1080,
++        []
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/device-metrics-native.json
+@@ -0,0 +1,106 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "da708d0363885b665bd12082b9ba5cf375d5923591dbba9ade43d27fab3e962a",
++  "observations": [
++    [
++      {
++        "width": 800,
++        "height": 600,
++        "deviceScaleFactor": 2,
++        "screenWidth": 1200,
++        "screenHeight": 900,
++        "mobile": false
++      },
++      {},
++      [
++        800,
++        600,
++        2,
++        1200,
++        900,
++        0,
++        "landscape-primary"
++      ]
++    ],
++    [
++      {
++        "width": 0,
++        "height": 700,
++        "deviceScaleFactor": 0,
++        "screenWidth": 0,
++        "screenHeight": 0,
++        "screenOrientation": {
++          "type": "portraitSecondary",
++          "angle": 180
++        }
++      },
++      {},
++      [
++        800,
++        700,
++        2,
++        1200,
++        900,
++        0,
++        "landscape-primary"
++      ]
++    ],
++    [
++      {
++        "width": 600,
++        "height": 0
++      },
++      {},
++      [
++        600,
++        700,
++        2,
++        1200,
++        900,
++        0,
++        "landscape-primary"
++      ]
++    ],
++    [
++      {
++        "width": 0,
++        "height": 0,
++        "deviceScaleFactor": -1
++      },
++      {},
++      [
++        600,
++        700,
++        2,
++        1200,
++        900,
++        0,
++        "landscape-primary"
++      ]
++    ],
++    [
++      "afterNavigation",
++      [
++        600,
++        700,
++        2,
++        1200,
++        900,
++        0,
++        "landscape-primary"
++      ]
++    ],
++    [
++      "clear",
++      [
++        1920,
++        1080,
++        1,
++        1920,
++        1080,
++        0,
++        "landscape-primary"
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/document-extents-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[],read=()=>[document.documentElement.scrollWidth,document.documentElement.scrollHeight,document.body.clientHeight,document.body.scrollHeight];document.body.innerHTML='';document.body.style.cssText='width:4000px;height:4000px';rows.push(['explicitBody',read()]);const child=document.createElement('div');child.style.height='6000px';document.body.append(child);rows.push(['overflowBody',read()]);document.body.style.height='';rows.push(['autoBody',read()]);const outer=document.createElement('body'),inner=document.createElement('div');inner.style.height='300px';outer.append(inner);document.body.append(outer);rows.push(['nestedBody',[outer.clientHeight,outer.scrollHeight,...read()]]);child.remove();outer.remove();rows.push(['removed',read()]);return rows})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/document-extents-native.json
+@@ -0,0 +1,55 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "66530a2103350f6864bb408c2904972a54c4a969d8d5ee88bafcbcb5038fe6b2",
++  "observations": [
++    [
++      "explicitBody",
++      [
++        4000,
++        4000,
++        4000,
++        4000
++      ]
++    ],
++    [
++      "overflowBody",
++      [
++        4000,
++        6000,
++        4000,
++        4000
++      ]
++    ],
++    [
++      "autoBody",
++      [
++        4000,
++        6000,
++        6000,
++        6000
++      ]
++    ],
++    [
++      "nestedBody",
++      [
++        300,
++        300,
++        4000,
++        6005,
++        6005,
++        6005
++      ]
++    ],
++    [
++      "removed",
++      [
++        4000,
++        1080,
++        25,
++        25
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/element-scroll-conversion-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[],e=document.createElement('div');for(const value of [1.8,-1.8,NaN,Infinity,-Infinity,4294967297,1e20]){try{e.scrollTop=value;rows.push(['set:'+String(value),e.scrollTop])}catch(x){rows.push(['set:'+String(value),x.name])}}for(const[name,args]of[['scrollTo',[4294967297,3]],['scrollBy',[-1.8,2.8]],['scrollTo',[]],['scrollTo',[{top:3}]]]){try{e.scrollTo(10,20);e[name](...args);rows.push([name,args.length,e.scrollLeft,e.scrollTop])}catch(x){rows.push([name,args.length,x.name])}}return rows})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/element-scroll-conversion-native.json
+@@ -0,0 +1,60 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "edc728a58f71b9deecec64fd9b540b08306721fb92e73ef6916144f51b103a17",
++  "observations": [
++    [
++      "set:1.8",
++      1
++    ],
++    [
++      "set:-1.8",
++      0
++    ],
++    [
++      "set:NaN",
++      0
++    ],
++    [
++      "set:Infinity",
++      0
++    ],
++    [
++      "set:-Infinity",
++      0
++    ],
++    [
++      "set:4294967297",
++      1
++    ],
++    [
++      "set:100000000000000000000",
++      1661992960
++    ],
++    [
++      "scrollTo",
++      2,
++      1,
++      3
++    ],
++    [
++      "scrollBy",
++      2,
++      9,
++      22
++    ],
++    [
++      "scrollTo",
++      0,
++      10,
++      20
++    ],
++    [
++      "scrollTo",
++      1,
++      10,
++      3
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/frame-viewport-state-expression.js
+@@ -0,0 +1 @@
++(async()=>{document.body.style.cssText='width:5000px;height:5000px';const f=document.createElement('iframe');document.body.append(f);await new Promise(r=>setTimeout(r,10));const w=f.contentWindow;w.document.body.style.cssText='width:5000px;height:5000px';scrollTo(10,20);w.scrollTo(30,40);const rows=[];rows.push(['parentRead',[scrollX,scrollY,w.scrollX,w.scrollY,visualViewport.pageLeft,visualViewport.pageTop,w.visualViewport.pageLeft,w.visualViewport.pageTop]]);rows.push(['frameRead',w.eval('[scrollX,scrollY,top.scrollX,top.scrollY,visualViewport.pageLeft,visualViewport.pageTop,visualViewport===top.visualViewport]')]);f.remove();return rows})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/frame-viewport-state-native.json
+@@ -0,0 +1,33 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "c3a576c0ca81da99f0779c2c5e5c0d662c8f13abd1601005427d22a2b296370c",
++  "observations": [
++    [
++      "parentRead",
++      [
++        10,
++        20,
++        30,
++        40,
++        10,
++        20,
++        10,
++        20
++      ]
++    ],
++    [
++      "frameRead",
++      [
++        30,
++        40,
++        10,
++        20,
++        10,
++        20,
++        true
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/root-scroll-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{document.body.style.cssText='width:4000px;height:4000px';const rows=[];scrollTo(10,20);rows.push(['window',[scrollX,scrollY,document.documentElement.scrollTop,document.body.scrollTop]]);document.documentElement.scrollTop=50;rows.push(['html',[scrollX,scrollY,document.documentElement.scrollTop,document.body.scrollTop]]);document.body.scrollTop=70;rows.push(['body',[scrollX,scrollY,document.documentElement.scrollTop,document.body.scrollTop]]);for(const key of['scroll','scrollTo','scrollBy'])rows.push(['length:'+key,Element.prototype[key].length]);await new Promise(r=>setTimeout(r,40));return rows})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/root-scroll-native-native.json
+@@ -0,0 +1,47 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "845b5c020d5ad7a0ed22d1c200d8ff466a5cb5b05e8cbdcb04cc6d61d88b204f",
++  "observations": [
++    [
++      "window",
++      [
++        10,
++        20,
++        0,
++        0
++      ]
++    ],
++    [
++      "html",
++      [
++        10,
++        20,
++        50,
++        0
++      ]
++    ],
++    [
++      "body",
++      [
++        10,
++        20,
++        50,
++        70
++      ]
++    ],
++    [
++      "length:scroll",
++      0
++    ],
++    [
++      "length:scrollTo",
++      0
++    ],
++    [
++      "length:scrollBy",
++      0
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/scroll-conversion-expression.js
+@@ -0,0 +1,3 @@
++(async()=>{const out=[],row=(n,f)=>{try{out.push([n,f()])}catch(e){out.push([n,{error:e.name,message:e.message}])}};document.body.style.cssText='height:4000px;width:4000px';for(const method of ['scroll','scrollTo','scrollBy']){for(const args of [[],[3],[-1.8,2.8],[null],[undefined],[{top:21}],[{left:32}],[{behavior:'nope',left:1,top:2}],[{behavior:null}],[null,4],[NaN,Infinity],[4294967297,4294967297]])row(method+':'+JSON.stringify(args),()=>{scrollTo(10,20);globalThis[method](...args);return[scrollX,scrollY]});row(method+':order',()=>{const calls=[],options=new Proxy({left:3,top:4,behavior:'instant'},{has(t,k){calls.push('has:'+String(k));return Reflect.has(t,k)},get(t,k,r){calls.push('get:'+String(k));return Reflect.get(t,k,r)}});globalThis[method](options);return[calls,scrollX,scrollY]});row(method+':invalidReceiver',()=>{const calls=[];try{globalThis[method].call({},{get top(){calls.push('top');return1}});return[calls,'accepted']}catch(e){return[calls,e.name,e instanceof TypeError]}})}
++row('elementReentrancy',()=>null);const e=document.createElement('div'),events=[];e.addEventListener('scroll',()=>{events.push(['scroll',e.scrollTop]);if(events.length===1)e.scrollTop=101});e.addEventListener('scrollend',()=>{events.push(['end',e.scrollTop]);if(events.filter(x=>x[0]==='end').length===1)e.scrollTop=102});for(let i=1;i<=100;i++)e.scrollTop=i;await new Promise(r=>setTimeout(r,100));out.push(['elementReentrancyActual',events]);
++return out})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/scroll-conversion-native.json
+@@ -0,0 +1,358 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "104a98e67f402bdc79e8e2e13e56ad1ecae9b0c101469a76874718cf75dbae97",
++  "observations": [
++    [
++      "scroll:[]",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "scroll:[3]",
++      [
++        3,
++        0
++      ]
++    ],
++    [
++      "scroll:[-1.8,2.8]",
++      [
++        0,
++        2
++      ]
++    ],
++    [
++      "scroll:[null]",
++      [
++        0,
++        0
++      ]
++    ],
++    [
++      "scroll:[null]",
++      [
++        0,
++        0
++      ]
++    ],
++    [
++      "scroll:[{\"top\":21}]",
++      [
++        10,
++        21
++      ]
++    ],
++    [
++      "scroll:[{\"left\":32}]",
++      [
++        32,
++        20
++      ]
++    ],
++    [
++      "scroll:[{\"behavior\":\"nope\",\"left\":1,\"top\":2}]",
++      [
++        1,
++        2
++      ]
++    ],
++    [
++      "scroll:[{\"behavior\":null}]",
++      [
++        10,
++        20
++      ]
++    ],
++    [
++      "scroll:[null,4]",
++      [
++        0,
++        4
++      ]
++    ],
++    [
++      "scroll:[null,null]",
++      [
++        0,
++        0
++      ]
++    ],
++    [
++      "scroll:[4294967297,4294967297]",
++      [
++        1,
++        1
++      ]
++    ],
++    [
++      "scroll:order",
++      [
++        [
++          "has:behavior",
++          "get:behavior",
++          "has:left",
++          "get:left",
++          "has:top",
++          "get:top"
++        ],
++        3,
++        4
++      ]
++    ],
++    [
++      "scroll:invalidReceiver",
++      [
++        [],
++        "TypeError",
++        true
++      ]
++    ],
++    [
++      "scrollTo:[]",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "scrollTo:[3]",
++      [
++        3,
++        0
++      ]
++    ],
++    [
++      "scrollTo:[-1.8,2.8]",
++      [
++        0,
++        2
++      ]
++    ],
++    [
++      "scrollTo:[null]",
++      [
++        0,
++        0
++      ]
++    ],
++    [
++      "scrollTo:[null]",
++      [
++        0,
++        0
++      ]
++    ],
++    [
++      "scrollTo:[{\"top\":21}]",
++      [
++        10,
++        21
++      ]
++    ],
++    [
++      "scrollTo:[{\"left\":32}]",
++      [
++        32,
++        20
++      ]
++    ],
++    [
++      "scrollTo:[{\"behavior\":\"nope\",\"left\":1,\"top\":2}]",
++      [
++        1,
++        2
++      ]
++    ],
++    [
++      "scrollTo:[{\"behavior\":null}]",
++      [
++        10,
++        20
++      ]
++    ],
++    [
++      "scrollTo:[null,4]",
++      [
++        0,
++        4
++      ]
++    ],
++    [
++      "scrollTo:[null,null]",
++      [
++        0,
++        0
++      ]
++    ],
++    [
++      "scrollTo:[4294967297,4294967297]",
++      [
++        1,
++        1
++      ]
++    ],
++    [
++      "scrollTo:order",
++      [
++        [
++          "has:behavior",
++          "get:behavior",
++          "has:left",
++          "get:left",
++          "has:top",
++          "get:top"
++        ],
++        3,
++        4
++      ]
++    ],
++    [
++      "scrollTo:invalidReceiver",
++      [
++        [],
++        "TypeError",
++        true
++      ]
++    ],
++    [
++      "scrollBy:[]",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "scrollBy:[3]",
++      [
++        13,
++        20
++      ]
++    ],
++    [
++      "scrollBy:[-1.8,2.8]",
++      [
++        9,
++        22
++      ]
++    ],
++    [
++      "scrollBy:[null]",
++      [
++        10,
++        20
++      ]
++    ],
++    [
++      "scrollBy:[null]",
++      [
++        10,
++        20
++      ]
++    ],
++    [
++      "scrollBy:[{\"top\":21}]",
++      [
++        10,
++        41
++      ]
++    ],
++    [
++      "scrollBy:[{\"left\":32}]",
++      [
++        42,
++        20
++      ]
++    ],
++    [
++      "scrollBy:[{\"behavior\":\"nope\",\"left\":1,\"top\":2}]",
++      [
++        11,
++        22
++      ]
++    ],
++    [
++      "scrollBy:[{\"behavior\":null}]",
++      [
++        10,
++        20
++      ]
++    ],
++    [
++      "scrollBy:[null,4]",
++      [
++        10,
++        24
++      ]
++    ],
++    [
++      "scrollBy:[null,null]",
++      [
++        10,
++        20
++      ]
++    ],
++    [
++      "scrollBy:[4294967297,4294967297]",
++      [
++        11,
++        21
++      ]
++    ],
++    [
++      "scrollBy:order",
++      [
++        [
++          "has:behavior",
++          "get:behavior",
++          "has:left",
++          "get:left",
++          "has:top",
++          "get:top"
++        ],
++        14,
++        25
++      ]
++    ],
++    [
++      "scrollBy:invalidReceiver",
++      [
++        [],
++        "TypeError",
++        true
++      ]
++    ],
++    [
++      "elementReentrancy",
++      null
++    ],
++    [
++      "elementReentrancyActual",
++      [
++        [
++          "scroll",
++          100
++        ],
++        [
++          "scroll",
++          101
++        ],
++        [
++          "end",
++          101
++        ],
++        [
++          "scroll",
++          102
++        ],
++        [
++          "end",
++          102
++        ]
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/scroll-events-first-expression.js
+@@ -0,0 +1,2 @@
++(async()=>{const rows=[],pause=ms=>new Promise(r=>setTimeout(r,ms)),pos=()=>[scrollX,scrollY,visualViewport?.pageLeft,visualViewport?.pageTop];document.body.style.cssText='height:4000px;width:4000px';const record=(where)=>function(e){rows.push([where,e.type,e.target===document?'document':e.target===window?'window':e.target===visualViewport?'viewport':'element',e.currentTarget===this,e.isTrusted,e.bubbles,e.cancelable,e.composed,pos()])};for(const target of[window,document,visualViewport])for(const type of['scroll','scrollend','resize'])target.addEventListener(type,record(target===window?'window':target===document?'document':'viewport'));
++const before=pos();scrollTo(10.5,20.5);const sync=[pos(),rows.length];scrollTo(20.5,40.5);await pause(10);const first=rows.slice();scrollTo(30.5,40.5);await pause(90);const after=rows.slice();rows.length=0;scrollTo(30.5,40.5);await pause(40);const noop=rows.slice();const div=document.createElement('div');for(const type of['scroll','scrollend'])div.addEventListener(type,record('detached'));for(let i=0;i<100;i++)div.scrollTop=i;const detachedSync=[div.scrollTop,rows.length];await pause(60);return {before,sync,first,after,noop,detachedSync,detached:rows,extent:[document.documentElement.scrollWidth,document.documentElement.scrollHeight]}})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/scroll-events-first-native.json
+@@ -0,0 +1,198 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "2ded426e33dae72fa883954856adc9e6407ed72b48121bb8d6fdf3d8700f1742",
++  "observations": {
++    "before": [
++      0,
++      0,
++      0,
++      0
++    ],
++    "sync": [
++      [
++        10,
++        20,
++        10,
++        20
++      ],
++      0
++    ],
++    "first": [
++      [
++        "document",
++        "scroll",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          20,
++          40,
++          20,
++          40
++        ]
++      ],
++      [
++        "window",
++        "scroll",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          20,
++          40,
++          20,
++          40
++        ]
++      ]
++    ],
++    "after": [
++      [
++        "document",
++        "scroll",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          20,
++          40,
++          20,
++          40
++        ]
++      ],
++      [
++        "window",
++        "scroll",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          20,
++          40,
++          20,
++          40
++        ]
++      ],
++      [
++        "document",
++        "scroll",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          30,
++          40,
++          30,
++          40
++        ]
++      ],
++      [
++        "window",
++        "scroll",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          30,
++          40,
++          30,
++          40
++        ]
++      ],
++      [
++        "document",
++        "scrollend",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          30,
++          40,
++          30,
++          40
++        ]
++      ],
++      [
++        "window",
++        "scrollend",
++        "document",
++        true,
++        true,
++        true,
++        false,
++        false,
++        [
++          30,
++          40,
++          30,
++          40
++        ]
++      ]
++    ],
++    "noop": [],
++    "detachedSync": [
++      99,
++      0
++    ],
++    "detached": [
++      [
++        "detached",
++        "scroll",
++        "element",
++        true,
++        true,
++        false,
++        false,
++        false,
++        [
++          30,
++          40,
++          30,
++          40
++        ]
++      ],
++      [
++        "detached",
++        "scrollend",
++        "element",
++        true,
++        true,
++        false,
++        false,
++        false,
++        [
++          30,
++          40,
++          30,
++          40
++        ]
++      ]
++    ],
++    "extent": [
++      4000,
++      4000
++    ]
++  }
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/viewport-details-expression.js
+@@ -0,0 +1,5 @@
++(async()=>{const out=[],row=(name,fn)=>{try{out.push([name,fn()])}catch(e){out.push([name,{error:e.name,message:e.message}])}};for(const name of['VisualViewport','Screen','ScreenOrientation']){const C=globalThis[name],object=name==='VisualViewport'?visualViewport:name==='Screen'?screen:screen.orientation;row(name+':inheritance',()=>[Object.getPrototypeOf(C)===EventTarget,Object.getPrototypeOf(C.prototype)===EventTarget.prototype,C.name,Reflect.ownKeys(C).map(String)]);for(const key of Reflect.ownKeys(C.prototype)){const d=Object.getOwnPropertyDescriptor(C.prototype,key);row(name+':descriptor:'+String(key),()=>[d.enumerable,d.configurable,d.writable,typeof d.value,typeof d.get,typeof d.set,typeof d.value==='function'?d.value.length:null,d.get?.length,d.set?.length]);if(d.get)row(name+':brand:'+String(key),()=>[{},Object.create(C.prototype),new Proxy(object,{get(){throw 1}})].map(value=>{try{d.get.call(value);return'accepted'}catch(e){return[e.name,e instanceof TypeError]}}))}}
++row('screenSet',()=>{const s=screen,v=visualViewport;return ['width','height','availWidth','availHeight'].map(k=>[k,Reflect.set(s,k,42),s[k]])});
++row('viewportHandlers',()=>{let n=0;visualViewport.onscroll=()=>n++;visualViewport.dispatchEvent(new Event('scroll'));const d=Object.getOwnPropertyDescriptor(visualViewport,'onscroll');return[n,d?{enumerable:d.enumerable,configurable:d.configurable,writable:d.writable,value:typeof d.value}:null,visualViewport.onscroll===null]});
++for(const value of ['portrait','landscape','any','natural','portrait-primary','landscape-secondary','nope',null,undefined,Symbol('x')]){try{const p=screen.orientation.lock(value);out.push(['orientation.lock:'+String(value),{promise:p instanceof Promise,result:await p.then(()=> 'resolved',e=>[e.name,e instanceof DOMException,e instanceof TypeError])}])}catch(e){out.push(['orientation.lock:'+String(value),{thrown:[e.name,e instanceof TypeError]}])}}
++const frame=document.createElement('iframe');document.body.append(frame);await new Promise(r=>setTimeout(r,5));row('frame',()=>{const w=frame.contentWindow;return [w.visualViewport===visualViewport,w.screen===screen,w.screen.orientation===screen.orientation,w.visualViewport.width,w.visualViewport.height,w.innerWidth,w.innerHeight,w.screen.width,w.screen.height,w.visualViewport instanceof w.VisualViewport,w.visualViewport instanceof VisualViewport]});frame.remove();return out})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/viewport-details-native.json
+@@ -0,0 +1,748 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "473284b4d871e75b2ae3ccbad8dca2e55c89e653782699d02268c55e184cc431",
++  "observations": [
++    [
++      "VisualViewport:inheritance",
++      [
++        true,
++        true,
++        "VisualViewport",
++        [
++          "length",
++          "name",
++          "prototype"
++        ]
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:offsetLeft",
++      [
++        true,
++        false,
++        false,
++        "number",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:offsetTop",
++      [
++        true,
++        false,
++        false,
++        "number",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:pageLeft",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:brand:pageLeft",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:pageTop",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:brand:pageTop",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:width",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:brand:width",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:height",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:brand:height",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:scale",
++      [
++        true,
++        false,
++        false,
++        "number",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:constructor",
++      [
++        false,
++        true,
++        true,
++        "function",
++        "undefined",
++        "undefined",
++        0,
++        null,
++        null
++      ]
++    ],
++    [
++      "VisualViewport:descriptor:Symbol(Symbol.toStringTag)",
++      [
++        false,
++        true,
++        false,
++        "string",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "Screen:inheritance",
++      [
++        true,
++        true,
++        "Screen",
++        [
++          "length",
++          "name",
++          "prototype"
++        ]
++      ]
++    ],
++    [
++      "Screen:descriptor:width",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "Screen:brand:width",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "Screen:descriptor:height",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "Screen:brand:height",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "Screen:descriptor:availWidth",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "Screen:brand:availWidth",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "Screen:descriptor:availHeight",
++      [
++        true,
++        false,
++        false,
++        "number",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "Screen:descriptor:colorDepth",
++      [
++        true,
++        false,
++        false,
++        "number",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "Screen:descriptor:pixelDepth",
++      [
++        true,
++        false,
++        false,
++        "number",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "Screen:descriptor:orientation",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "Screen:brand:orientation",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "Screen:descriptor:constructor",
++      [
++        false,
++        true,
++        true,
++        "function",
++        "undefined",
++        "undefined",
++        0,
++        null,
++        null
++      ]
++    ],
++    [
++      "Screen:descriptor:Symbol(Symbol.toStringTag)",
++      [
++        false,
++        true,
++        false,
++        "string",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "ScreenOrientation:inheritance",
++      [
++        true,
++        true,
++        "ScreenOrientation",
++        [
++          "length",
++          "name",
++          "prototype"
++        ]
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:angle",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "ScreenOrientation:brand:angle",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:type",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "undefined",
++        null,
++        0,
++        null
++      ]
++    ],
++    [
++      "ScreenOrientation:brand:type",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:lock",
++      [
++        true,
++        true,
++        true,
++        "function",
++        "undefined",
++        "undefined",
++        1,
++        null,
++        null
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:unlock",
++      [
++        true,
++        true,
++        true,
++        "function",
++        "undefined",
++        "undefined",
++        0,
++        null,
++        null
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:onchange",
++      [
++        true,
++        true,
++        null,
++        "undefined",
++        "function",
++        "function",
++        null,
++        0,
++        1
++      ]
++    ],
++    [
++      "ScreenOrientation:brand:onchange",
++      [
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ],
++        [
++          "TypeError",
++          true
++        ]
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:constructor",
++      [
++        false,
++        true,
++        true,
++        "function",
++        "undefined",
++        "undefined",
++        0,
++        null,
++        null
++      ]
++    ],
++    [
++      "ScreenOrientation:descriptor:Symbol(Symbol.toStringTag)",
++      [
++        false,
++        true,
++        false,
++        "string",
++        "undefined",
++        "undefined",
++        null,
++        null,
++        null
++      ]
++    ],
++    [
++      "screenSet",
++      [
++        [
++          "width",
++          false,
++          1920
++        ],
++        [
++          "height",
++          false,
++          1080
++        ],
++        [
++          "availWidth",
++          false,
++          1920
++        ],
++        [
++          "availHeight",
++          false,
++          1040
++        ]
++      ]
++    ],
++    [
++      "viewportHandlers",
++      [
++        0,
++        {
++          "enumerable": true,
++          "configurable": true,
++          "writable": true,
++          "value": "function"
++        },
++        false
++      ]
++    ],
++    [
++      "orientation.lock:portrait",
++      {
++        "promise": true,
++        "result": [
++          "NotSupportedError",
++          true,
++          false
++        ]
++      }
++    ],
++    [
++      "orientation.lock:landscape",
++      {
++        "promise": true,
++        "result": [
++          "NotSupportedError",
++          true,
++          false
++        ]
++      }
++    ],
++    [
++      "orientation.lock:any",
++      {
++        "promise": true,
++        "result": [
++          "NotSupportedError",
++          true,
++          false
++        ]
++      }
++    ],
++    [
++      "orientation.lock:natural",
++      {
++        "promise": true,
++        "result": [
++          "NotSupportedError",
++          true,
++          false
++        ]
++      }
++    ],
++    [
++      "orientation.lock:portrait-primary",
++      {
++        "promise": true,
++        "result": [
++          "NotSupportedError",
++          true,
++          false
++        ]
++      }
++    ],
++    [
++      "orientation.lock:landscape-secondary",
++      {
++        "promise": true,
++        "result": [
++          "NotSupportedError",
++          true,
++          false
++        ]
++      }
++    ],
++    [
++      "orientation.lock:nope",
++      {
++        "promise": true,
++        "result": [
++          "TypeError",
++          false,
++          true
++        ]
++      }
++    ],
++    [
++      "orientation.lock:null",
++      {
++        "promise": true,
++        "result": [
++          "TypeError",
++          false,
++          true
++        ]
++      }
++    ],
++    [
++      "orientation.lock:undefined",
++      {
++        "promise": true,
++        "result": [
++          "TypeError",
++          false,
++          true
++        ]
++      }
++    ],
++    [
++      "orientation.lock:Symbol(x)",
++      {
++        "promise": true,
++        "result": [
++          "TypeError",
++          false,
++          true
++        ]
++      }
++    ],
++    [
++      "frame",
++      [
++        true,
++        true,
++        true,
++        1920,
++        1080,
++        1920,
++        1080,
++        1920,
++        1080,
++        false,
++        true
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/viewport-extra-expression.js
+@@ -0,0 +1 @@
++(async()=>{const out=[],row=(n,f)=>{try{out.push([n,f()])}catch(e){out.push([n,{error:e.name,message:e.message}])}};for(const [name,obj]of[['viewport',visualViewport],['screen',screen],['orientation',screen.orientation]])row(name+':unknown',()=>['onscroll','onresize','onchange','onunknown','unknown','width'].map(k=>[k,k in obj,obj[k],Object.hasOwn(obj,k)]));const frame=document.createElement('iframe');document.body.append(frame);await new Promise(r=>setTimeout(r,5));const retained=frame.contentWindow.visualViewport;frame.remove();row('removedFrame',()=>[retained===visualViewport,retained.width,retained.height,retained.pageLeft]);return out})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/viewport-extra-native.json
+@@ -0,0 +1,140 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "07648347592f19703423af14d300eebe9df479d301478762ca04b31813c2e371",
++  "observations": [
++    [
++      "viewport:unknown",
++      [
++        [
++          "onscroll",
++          false,
++          null,
++          false
++        ],
++        [
++          "onresize",
++          false,
++          null,
++          false
++        ],
++        [
++          "onchange",
++          false,
++          null,
++          false
++        ],
++        [
++          "onunknown",
++          false,
++          null,
++          false
++        ],
++        [
++          "unknown",
++          false,
++          null,
++          false
++        ],
++        [
++          "width",
++          true,
++          1920,
++          false
++        ]
++      ]
++    ],
++    [
++      "screen:unknown",
++      [
++        [
++          "onscroll",
++          false,
++          null,
++          false
++        ],
++        [
++          "onresize",
++          false,
++          null,
++          false
++        ],
++        [
++          "onchange",
++          false,
++          null,
++          false
++        ],
++        [
++          "onunknown",
++          false,
++          null,
++          false
++        ],
++        [
++          "unknown",
++          false,
++          null,
++          false
++        ],
++        [
++          "width",
++          true,
++          1920,
++          false
++        ]
++      ]
++    ],
++    [
++      "orientation:unknown",
++      [
++        [
++          "onscroll",
++          false,
++          null,
++          false
++        ],
++        [
++          "onresize",
++          false,
++          null,
++          false
++        ],
++        [
++          "onchange",
++          true,
++          null,
++          false
++        ],
++        [
++          "onunknown",
++          false,
++          null,
++          false
++        ],
++        [
++          "unknown",
++          false,
++          null,
++          false
++        ],
++        [
++          "width",
++          false,
++          null,
++          false
++        ]
++      ]
++    ],
++    [
++      "removedFrame",
++      [
++        true,
++        1920,
++        1080,
++        0
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/viewport-first-expression.js
+@@ -0,0 +1,10 @@
++(async()=>{const out=[],row=(name,fn)=>{try{out.push([name,fn()])}catch(e){out.push([name,{error:e.name,message:e.message}])}},shape=value=>({tag:Object.prototype.toString.call(value),keys:Reflect.ownKeys(value).map(String),constructor:value?.constructor?.name,target:value instanceof EventTarget});
++for(const n of ['VisualViewport','Screen','ScreenOrientation'])row('exposure:'+n,()=>[typeof globalThis[n],typeof globalThis[n]==='function'?globalThis[n].length:null]);
++row('viewport',()=>{const v=visualViewport;return {...shape(v),same:v===visualViewport,values:['offsetLeft','offsetTop','pageLeft','pageTop','width','height','scale'].map(k=>v[k]),proto:Reflect.ownKeys(Object.getPrototypeOf(v)).map(String),handlers:[v.onresize,v.onscroll,v.onscrollend]}});
++row('screen',()=>({...shape(screen),values:['width','height','availWidth','availHeight','colorDepth','pixelDepth','isExtended'].map(k=>[k,screen[k]]),proto:Reflect.ownKeys(Object.getPrototypeOf(screen)).map(String)}));
++row('orientation',()=>({...shape(screen.orientation),values:[screen.orientation.type,screen.orientation.angle,screen.orientation.onchange],proto:Reflect.ownKeys(Object.getPrototypeOf(screen.orientation)).map(String)}));
++row('window',()=>['innerWidth','innerHeight','outerWidth','outerHeight','screenX','screenY','screenLeft','screenTop','devicePixelRatio','scrollX','scrollY','pageXOffset','pageYOffset'].map(k=>[k,globalThis[k]]));
++for(const n of ['VisualViewport','Screen','ScreenOrientation'])row('construct:'+n,()=>new globalThis[n]());
++for(const n of ['scroll','scrollTo','scrollBy'])row('scrollShape:'+n,()=>({length:globalThis[n].length,name:globalThis[n].name,keys:Reflect.ownKeys(globalThis[n]).map(String)}));
++row('orientationUnlock',()=>screen.orientation.unlock());row('orientationLock',()=>typeof screen.orientation.lock);
++return out})()
+--- /dev/null
++++ b/docs/reference/window-viewport-parity/viewport-first-native.json
+@@ -0,0 +1,256 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "9e6810e225bf71840a51c50dcffc6080e2a7f0e6fdc2b62a52f4361d6967fcf6",
++  "observations": [
++    [
++      "exposure:VisualViewport",
++      [
++        "function",
++        0
++      ]
++    ],
++    [
++      "exposure:Screen",
++      [
++        "function",
++        0
++      ]
++    ],
++    [
++      "exposure:ScreenOrientation",
++      [
++        "function",
++        0
++      ]
++    ],
++    [
++      "viewport",
++      {
++        "tag": "[object VisualViewport]",
++        "keys": [],
++        "constructor": "VisualViewport",
++        "target": true,
++        "same": true,
++        "values": [
++          0,
++          0,
++          0,
++          0,
++          1920,
++          1080,
++          1
++        ],
++        "proto": [
++          "offsetLeft",
++          "offsetTop",
++          "pageLeft",
++          "pageTop",
++          "width",
++          "height",
++          "scale",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "handlers": [
++          null,
++          null,
++          null
++        ]
++      }
++    ],
++    [
++      "screen",
++      {
++        "tag": "[object Screen]",
++        "keys": [],
++        "constructor": "Screen",
++        "target": true,
++        "values": [
++          [
++            "width",
++            1920
++          ],
++          [
++            "height",
++            1080
++          ],
++          [
++            "availWidth",
++            1920
++          ],
++          [
++            "availHeight",
++            1040
++          ],
++          [
++            "colorDepth",
++            24
++          ],
++          [
++            "pixelDepth",
++            24
++          ],
++          [
++            "isExtended",
++            null
++          ]
++        ],
++        "proto": [
++          "width",
++          "height",
++          "availWidth",
++          "availHeight",
++          "colorDepth",
++          "pixelDepth",
++          "orientation",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "orientation",
++      {
++        "tag": "[object ScreenOrientation]",
++        "keys": [],
++        "constructor": "ScreenOrientation",
++        "target": true,
++        "values": [
++          "landscape-primary",
++          0,
++          null
++        ],
++        "proto": [
++          "angle",
++          "type",
++          "lock",
++          "unlock",
++          "onchange",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "window",
++      [
++        [
++          "innerWidth",
++          1920
++        ],
++        [
++          "innerHeight",
++          1080
++        ],
++        [
++          "outerWidth",
++          1920
++        ],
++        [
++          "outerHeight",
++          1080
++        ],
++        [
++          "screenX",
++          0
++        ],
++        [
++          "screenY",
++          0
++        ],
++        [
++          "screenLeft",
++          0
++        ],
++        [
++          "screenTop",
++          0
++        ],
++        [
++          "devicePixelRatio",
++          1
++        ],
++        [
++          "scrollX",
++          0
++        ],
++        [
++          "scrollY",
++          0
++        ],
++        [
++          "pageXOffset",
++          0
++        ],
++        [
++          "pageYOffset",
++          0
++        ]
++      ]
++    ],
++    [
++      "construct:VisualViewport",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "construct:Screen",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "construct:ScreenOrientation",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "scrollShape:scroll",
++      {
++        "length": 1,
++        "name": "scroll",
++        "keys": [
++          "length",
++          "name"
++        ]
++      }
++    ],
++    [
++      "scrollShape:scrollTo",
++      {
++        "length": 1,
++        "name": "scrollTo",
++        "keys": [
++          "length",
++          "name"
++        ]
++      }
++    ],
++    [
++      "scrollShape:scrollBy",
++      {
++        "length": 1,
++        "name": "scrollBy",
++        "keys": [
++          "length",
++          "name"
++        ]
++      }
++    ],
++    [
++      "orientationUnlock",
++      null
++    ],
++    [
++      "orientationLock",
++      "function"
++    ]
++  ]
++}

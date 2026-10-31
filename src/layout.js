@@ -1,3 +1,5 @@
+import{installWindowViewport}from'./window-viewport.js';
+import{installScrollEvents}from'./scroll-events.js';
 import {registerHeapWrapper} from './heap-registry.js';
 import{installElementScroll}from './element-scroll.js';
 import {resolveFlowLength,nativeTextHeight} from './flow-metrics.js';
@@ -36,7 +38,7 @@ export function createLayout(window, options = {}) {
   const rawComputedStyle = options.getComputedStyle ?? window.getComputedStyle.bind(window);
   let width = optionDimension(options.width ?? 1920, 'Viewport width');
   let height = optionDimension(options.height ?? 1080, 'Viewport height');
-  let scrollX = 0, scrollY = 0;
+  let scrollX = 0, scrollY = 0, scrollObserver, viewportObserver;
   let cachedKey, cached, cachedFastKey;
   const dimension=value=>resolveFlowLength(value,{width,height});
   const identities = new WeakMap();
@@ -106,7 +108,7 @@ export function createLayout(window, options = {}) {
         value = {
           advance: horizontal.advance(node),
           width: horizontal.width(node),
-          height: explicitHeight ?? (['html', 'body'].includes(node.localName) ? documentHeight : childHeight),
+          height: explicitHeight ?? (node===document.documentElement||node===document.body ? documentHeight : childHeight),
         };
       }
       sizes.set(node, value); return value;
@@ -142,7 +144,7 @@ export function createLayout(window, options = {}) {
     for (const child of document.body?children(document.body):[]) {
       if (!isHidden(child)) directHeight += dimension(child.style?.height) ?? 5;
     }
-    documentHeight = Math.max(documentHeight, directHeight);
+    documentHeight = Math.max(documentHeight, directHeight, dimension(document.body?.style.height)??0);
     for (const node of nodes) {
       const inlineHeight = dimension(node.style?.height);
       if (inlineHeight !== undefined && !isHidden(node) && node.parentNode !== document.body && !['html', 'body'].includes(node.localName)) {
@@ -197,15 +199,16 @@ export function createLayout(window, options = {}) {
     return { boundingClientRect: bounds, intersectionRect, rootBounds: rectValue(0, 0, width, height), isIntersecting,
       intersectionRatio: area > 0 ? intersectionRect.width * intersectionRect.height / area : 0 };
   }
-  function scrollTo(x = 0, y = 0) {
+  function scrollAxes(x, y) {
     const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
     const extent = documentSize();
-    const nextX = Math.min(Math.max(0, number(x)), Math.max(0, extent.width - width));
-    const nextY = Math.min(Math.max(0, number(y)), Math.max(0, extent.height - height));
+    const nextX = x===undefined?scrollX:Math.min(Math.max(0, number(x)), Math.max(0, extent.width - width));
+    const nextY = y===undefined?scrollY:Math.min(Math.max(0, number(y)), Math.max(0, extent.height - height));
     const changed = nextX !== scrollX || nextY !== scrollY;
     scrollX = nextX; scrollY = nextY;
-    if (changed) window.dispatchEvent(new window.Event('scroll'));
+    if (changed) scrollObserver?.();
   }
+  function scrollTo(x=0,y=0){scrollAxes(x,y)}
   function scrollIntoView(node, region) {
     const value = snapshot().record(node);
     if (!value.rendered) return;
@@ -221,7 +224,8 @@ export function createLayout(window, options = {}) {
       height: Math.max(height, state.record(window.document.documentElement).rect.height) };
   }
   return {
-    rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollIntoView,
+    rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollAxes, scrollIntoView,
+    setScrollObserver(value){scrollObserver=value},setViewportObserver(value){viewportObserver=value},
     absoluteRect:node=>snapshot().record(node).rect,
     dimension:(node,axis)=>snapshot().dimension(node,axis),
     rendered:node=>snapshot().isRendered(node),
@@ -234,7 +238,7 @@ export function createLayout(window, options = {}) {
     setViewport(viewport) {
       const nextWidth = optionDimension(viewport.width ?? width, 'Viewport width');
       const nextHeight = optionDimension(viewport.height ?? height, 'Viewport height');
-      width = nextWidth; height = nextHeight; scrollTo(scrollX, scrollY); refreshMediaQueries(window);
+      width = nextWidth; height = nextHeight; viewportObserver?.(); refreshMediaQueries(window);
     },
     // Used by the window adapter without recursively reading its own overrides.
     rawComputedStyle,
@@ -248,7 +252,8 @@ export function installLayout(page, window, options = {}) {
   LAYOUTS.set(implForWrapper(window.document),layout);
   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
-  installElementScroll(window,ownedLayout);
+  installElementScroll(window,implementation=>LAYOUTS.get(implementation._ownerDocument));
+  layout.setScrollObserver(installScrollEvents(page,window).windowScroll);
   const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
   const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
   const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
@@ -261,7 +266,7 @@ export function installLayout(page, window, options = {}) {
     define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).viewport[dimension] : ownedLayout(this).dimension(this,dimension)); } });
   }
   for (const [name, dimension] of [['scrollWidth', 'width'], ['scrollHeight', 'height']]) {
-    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):ownedLayout(this).scrollHeight(this)); } });
+    define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):implForWrapper(this)===implForWrapper(this)._ownerDocument.body?ownedLayout(this).dimension(this,'height'):ownedLayout(this).scrollHeight(this)); } });
   }
   define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
   define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
@@ -300,6 +305,7 @@ export function installLayout(page, window, options = {}) {
     computedViews.set(original,view); return view;
   };
   page.layout = layout;
+  installWindowViewport(page,window,layout);
   return layout;
 }
 

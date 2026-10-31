@@ -1,0 +1,73 @@
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -238,7 +238,7 @@
+     setViewport(viewport) {
+       const nextWidth = optionDimension(viewport.width ?? width, 'Viewport width');
+       const nextHeight = optionDimension(viewport.height ?? height, 'Viewport height');
+-      width = nextWidth; height = nextHeight; refreshMediaQueries(window); viewportObserver?.();
++      width = nextWidth; height = nextHeight; viewportObserver?.(); refreshMediaQueries(window);
+     },
+     // Used by the window adapter without recursively reading its own overrides.
+     rawComputedStyle,
+--- a/test/css-compat.test.js
++++ b/test/css-compat.test.js
+@@ -40,3 +40,14 @@
+ test('media lists are branded targets with genuine viewport changes, event order and cleanup',async t=>{
+  const{page,w}=fixture(t),m=w.matchMedia('(max-width:1000px)'),events=[];assert.equal(m instanceof w.EventTarget,true);assert.equal(Object.prototype.toString.call(m),'[object MediaQueryList]');assert.throws(()=>new w.MediaQueryList(),{name:'TypeError'});assert.equal(m.matches,false);m.addListener(e=>events.push([e.matches,e.media,e.isTrusted]));page.layout.setViewport({width:800,height:600});assert.equal(m.matches,true);assert.equal(w.screen.width,800);await new Promise(r=>w.setTimeout(r,10));assert.deepEqual(events,[[true,'(max-width:1000px)',true]]);assert.equal(w.matchMedia('not unknown').matches,false);assert.equal(w.matchMedia('not (unknown:x)').matches,true);assert.equal(w.matchMedia('(width:50em)').matches,true);page.layout.setViewport({width:900});assert.equal(events.length,1);page.documentAbort.abort();page.layout.setViewport({width:1200});await new Promise(r=>setTimeout(r,10));assert.equal(events.length,1);
+ });
++
++test('media change callbacks observe published layout and screen state in Native listener order',async t=>{
++ const{page,w}=fixture(t),query=w.matchMedia('(max-width:1000px)'),rows=[];
++ const capture=kind=>event=>rows.push([kind,event.matches,event.isTrusted,event.target===query,event.currentTarget===query,w.innerWidth,w.screen.width,w.visualViewport.width,page.layout.viewport.width,query.matches]);
++ query.addEventListener('change',capture('event-listener'));query.addListener(capture('legacy-listener'));query.onchange=capture('handler');
++ page.layout.setViewport({width:800,height:600});assert.equal(query.matches,true);await new Promise(resolve=>w.setTimeout(resolve,35));
++ assert.deepEqual(rows,['event-listener','legacy-listener','handler'].map(kind=>[kind,true,true,true,true,800,800,800,800,true]));
++ rows.length=0;page.layout.setViewport({width:900});await new Promise(resolve=>w.setTimeout(resolve,35));assert.deepEqual(rows,[]);
++ page.layout.setViewport({width:1200});assert.equal(query.matches,false);await new Promise(resolve=>w.setTimeout(resolve,35));
++ assert.deepEqual(rows,['event-listener','legacy-listener','handler'].map(kind=>[kind,false,true,true,true,1200,1200,1200,1200,false]));
++});
+--- a/test/resize-observer.test.js
++++ b/test/resize-observer.test.js
+@@ -11,10 +11,11 @@
+ function fixture(t,html='<div id="target" style="width:100px;height:60px"></div>'){
+   const dom=new JSDOM(html,{runScripts:'outside-only',pretendToBeVisual:true});
+   const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});
+-  installStyles(page,dom.window);const layout=installLayout(page,dom.window);
+-  const controller=installResizeObserver(page,dom.window,layout);
++  installStyles(page,dom.window);const styleAbort=new Set(getEventListeners(page.documentAbort.signal,'abort')),layout=installLayout(page,dom.window);
++  const layoutAbort=getEventListeners(page.documentAbort.signal,'abort').filter(listener=>!styleAbort.has(listener)),beforeResize=new Set(getEventListeners(page.documentAbort.signal,'abort'));
++  const controller=installResizeObserver(page,dom.window,layout),resizeAbort=getEventListeners(page.documentAbort.signal,'abort').filter(listener=>!beforeResize.has(listener));
+   t.after(()=>{page.documentAbort.abort();dom.window.close();});
+-  return{dom,page,window:dom.window,layout,controller,target:dom.window.document.getElementById('target')};
++  return{dom,page,window:dom.window,layout,controller,layoutAbort,resizeAbort,target:dom.window.document.getElementById('target')};
+ }
+ 
+ test('resize entries use actual layout, realm arrays/read-only interfaces and native content-box profile',async t=>{
+@@ -89,21 +90,21 @@
+ });
+ 
+ test('direct window.close stops pending resize callbacks and detaches before later Page teardown',async t=>{
+- const{window:w,page,target,controller}=fixture(t),document=w.document;let callbacks=0;
++ const{window:w,page,target,controller,layoutAbort,resizeAbort}=fixture(t),document=w.document;let callbacks=0,unrelatedCalls=0;const unrelated=()=>unrelatedCalls++;page.documentAbort.signal.addEventListener('abort',unrelated,{once:true});
+  const observer=new w.ResizeObserver(()=>callbacks++);observer.observe(target);
+  assert.doesNotThrow(()=>w.close());assert.equal(w.document,undefined);
+- assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.equal(page.listenerCount('close'),0);
++ assert.equal(resizeAbort.length,1);for(const listener of resizeAbort)assert.equal(getEventListeners(page.documentAbort.signal,'abort').includes(listener),false);assert.deepEqual(new Set(getEventListeners(page.documentAbort.signal,'abort')),new Set([...layoutAbort,unrelated]));assert.equal(page.listenerCount('close'),0);
+  target.style.width='40px';assert.doesNotThrow(()=>document.dispatchEvent(new w.Event('load')));
+- assert.doesNotThrow(()=>controller.dispose());assert.doesNotThrow(()=>page.documentAbort.abort());assert.doesNotThrow(()=>page.emit('close'));
++ assert.doesNotThrow(()=>controller.dispose());assert.doesNotThrow(()=>page.documentAbort.abort());assert.equal(unrelatedCalls,1);assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.doesNotThrow(()=>page.emit('close'));
+  await sleep(30);assert.equal(callbacks,0);
+ });
+ 
+ test('raw window close before queued resize delivery avoids reading the deleted window document',async t=>{
+  const dom=new JSDOM('<div style="width:100px;height:20px"></div>',{runScripts:'outside-only'}),w=dom.window,rawClose=w.close;
+  const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});
+- const layout=installLayout(page,w),controller=installResizeObserver(page,w,layout);t.after(()=>{controller.dispose();dom.window.close();});
++ const layout=installLayout(page,w),baseline=getEventListeners(page.documentAbort.signal,'abort'),beforeResize=new Set(baseline),controller=installResizeObserver(page,w,layout),resizeAbort=getEventListeners(page.documentAbort.signal,'abort').filter(listener=>!beforeResize.has(listener));t.after(()=>{controller.dispose();dom.window.close();});
+  let callbacks=0;const observer=new w.ResizeObserver(()=>callbacks++);observer.observe(w.document.querySelector('div'));
+  rawClose.call(w);await Promise.resolve();
+- assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.equal(page.listenerCount('close'),0);
+- assert.doesNotThrow(()=>page.documentAbort.abort());assert.doesNotThrow(()=>page.emit('close'));await sleep(20);assert.equal(callbacks,0);
++ assert.equal(resizeAbort.length,1);for(const listener of resizeAbort)assert.equal(getEventListeners(page.documentAbort.signal,'abort').includes(listener),false);assert.deepEqual(new Set(getEventListeners(page.documentAbort.signal,'abort')),new Set(baseline));assert.equal(page.listenerCount('close'),0);
++ assert.doesNotThrow(()=>page.documentAbort.abort());assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.doesNotThrow(()=>page.emit('close'));await sleep(20);assert.equal(callbacks,0);
+ });

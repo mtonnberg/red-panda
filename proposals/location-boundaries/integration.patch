@@ -1,0 +1,89 @@
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -23,6 +23,11 @@
+   if (parsed.protocol === 'about:' && parsed.pathname === 'blank' && !parsed.search) return;
+   throw new record.DOMException(`Unsupported navigation protocol: ${parsed.protocol}`, 'NotSupportedError');
+ }
++
++// Opaque external URI handoff has no headless document navigation. Web URI
++// schemes keep their existing dedicated handlers, including unsupported ones.
++const webOpaqueSchemes=new Set(['about','blob','data','javascript']);
++function externalOpaque(destination){return typeof destination.path==='string'&&!webOpaqueSchemes.has(destination.scheme)}
+ 
+ function fragmentNavigation(current, destination) {
+   if (destination.fragment === null) return false;
+@@ -127,14 +132,22 @@
+   patched = true;
+   const locationNavigate = LocationImpl.prototype._locationObjectNavigate;
+   const locationReload = LocationImpl.prototype.reload;
++  const locationHash = Object.getOwnPropertyDescriptor(LocationImpl.prototype,'hash');
+   const anchorFollow = AnchorImpl.prototype._followAHyperlink;
+   const anchorActivate = AnchorImpl.prototype._activationBehavior;
++
++  Object.defineProperty(LocationImpl.prototype,'hash',{...locationHash,set(value){
++    const record=DOCUMENTS.get(this._relevantDocument);
++    if(record&&active(record)&&this._url.fragment===null&&(value===''||value==='#'))return;
++    return locationHash.set.call(this,value);
++  }});
+ 
+   LocationImpl.prototype._locationObjectNavigate = function (destination, flags = {}) {
+     const record = DOCUMENTS.get(this._relevantDocument);
+     if (!record || !active(record)) return locationNavigate.call(this, destination, flags);
+     const url = whatwgURL.serializeURL(destination);
+     if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
++    if(externalOpaque(destination))return;
+     supported(record, url);
+     if (fragmentNavigation(this._url, destination)) {
+       if(url===record.window.location.href)return;
+@@ -164,6 +177,7 @@
+     if (!destination) return;
+     const url = whatwgURL.serializeURL(destination);
+     if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
++    if(externalOpaque(destination))return;
+     supported(record, url);
+     if (fragmentNavigation(this._ownerDocument._URL, destination)) {
+       const timer = record.setTimeout(() => {
+--- /dev/null
++++ b/test/location-boundaries.test.js
+@@ -0,0 +1,41 @@
++import {test,before,after} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {Browser} from '../src/browser.js';
++let server,origin,requests=[];
++before(async()=>{server=http.createServer((request,response)=>{requests.push(request.url);response.writeHead(200,{'content-type':'text/html'});response.end('<!doctype html><html><head><script>globalThis.actualEvents=[];globalThis.actualErrors=[];for(const type of["hashchange","popstate"])addEventListener(type,()=>actualEvents.push(type));for(const type of["navigate","currententrychange"])navigation.addEventListener(type,()=>actualEvents.push(type));addEventListener("error",event=>actualErrors.push(event.message));</script></head><body><section id=old>Actual old target</section></body></html>')});server.listen(0,'127.0.0.1');await once(server,'listening');origin='http://127.0.0.1:'+server.address().port});
++after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});
++const turn=page=>page.evaluate('new Promise(resolve=>setTimeout(resolve,0))');
++const value=(page,expression)=>JSON.parse(page.evaluate('JSON.stringify(('+expression+'))'));
++async function fixture(t,fragment=''){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate(origin+'/root'+fragment);page.evaluate('history.replaceState({owned:"seed"},"")');await turn(page);page.evaluate('actualEvents=[]');return page;}
++const entry=page=>page.history[page.historyIndex];
++
++test('raw empty and # hash setters preserve a genuinely fragmentless URL, state and current entry without events or requests',async t=>{
++ const page=await fixture(t),url=page.url,current=entry(page),count=requests.length,doc=page.dom.window.document;
++ for(const hash of['','#']){page.evaluate('location.hash='+JSON.stringify(hash));await turn(page);assert.equal(page.url,url);assert.equal(page.evaluate('document.URL'),url);assert.equal(page.dom.window.document,doc);assert.equal(entry(page),current);assert.deepEqual(value(page,'history.state'),{owned:'seed'});assert.deepEqual(value(page,'actualEvents'),[]);assert.deepEqual(value(page,'actualErrors'),[]);assert.equal(requests.length,count)}
++});
++
++test('full href and assign to # create a real empty fragment with actual history and transition events',async t=>{
++ for(const method of['href','assign']){const page=await fixture(t),old=page.url,length=page.history.length,count=requests.length,doc=page.dom.window.document;page.evaluate(method==='href'?'location.href="#"':'location.assign("#")');await turn(page);assert.equal(page.url,old+'#');assert.equal(page.evaluate('location.hash'),'');assert.equal(page.history.length,length+1);assert.equal(page.evaluate('history.state'),null);assert.equal(page.dom.window.document,doc);assert.deepEqual(value(page,'actualEvents'),['navigate','currententrychange','popstate','hashchange']);assert.equal(requests.length,count)}
++});
++
++test('clearing an existing hash retains the actual empty fragment, and repeated empty/current setters remain silent',async t=>{
++ const page=await fixture(t,'#old'),count=requests.length;assert.equal(page.evaluate('document.getElementById("old").matches(":target")'),true);page.evaluate('location.hash=""');await turn(page);assert.equal(page.url,origin+'/root#');assert.equal(page.evaluate('document.getElementById("old").matches(":target")'),false);const length=page.history.length;page.evaluate('actualEvents=[];location.hash="";location.hash="#"');await turn(page);assert.equal(page.history.length,length);assert.deepEqual(value(page,'actualEvents'),[]);assert.equal(requests.length,count);
++ page.evaluate('location.hash="same"');await turn(page);page.evaluate('actualEvents=[];location.hash="#same";location.hash="same"');await turn(page);assert.deepEqual(value(page,'actualEvents'),[]);assert.equal(page.url,origin+'/root#same');
++});
++
++test('opaque external URI Location and hyperlink actions retain real document, VM, URL, state and event queues',async t=>{
++ const page=await fixture(t),doc=page.dom.window.document,ObjectType=page.dom.window.Object,url=page.url,current=entry(page),count=requests.length;
++ for(const action of['location.href="mailto:actual@example.invalid"','location.assign("TEL:+15555550100")','location.replace("sms:+15555550100")','location.href="another-custom-opaque:actual-owned-value"','(()=>{const link=document.createElement("a");link.href="mailto:actual@example.invalid";document.body.appendChild(link);link.click()})()','(()=>{const link=document.createElement("a");link.href="tel:+15555550100";document.body.appendChild(link);link.click()})()']){
++  assert.doesNotThrow(()=>page.evaluate(action));await turn(page);assert.equal(page.url,url);assert.equal(page.dom.window.document,doc);assert.equal(page.dom.window.Object,ObjectType);assert.equal(entry(page),current);assert.deepEqual(value(page,'history.state'),{owned:'seed'});assert.deepEqual(value(page,'actualEvents'),[]);assert.deepEqual(value(page,'actualErrors'),[]);assert.equal(requests.length,count);
++ }
++});
++
++test('reserved web and hierarchical URI paths retain their existing explicit unsupported behavior',async t=>{
++ const page=await fixture(t),url=page.url,current=entry(page),count=requests.length;
++ for(const destination of['ftp://127.0.0.1/owned-unrequested','ws://127.0.0.1/owned-unrequested','file:///tmp/owned-unrequested','about:actual-unsupported','blob:null/actual-unregistered','hierarchical-custom://example.invalid/owned-unrequested']){
++  assert.throws(()=>page.evaluate('location.assign('+JSON.stringify(destination)+')'),error=>error.name==='NotSupportedError');assert.equal(page.url,url);assert.equal(entry(page),current);
++ }
++ await turn(page);assert.deepEqual(value(page,'actualEvents'),[]);assert.equal(requests.length,count);
++});

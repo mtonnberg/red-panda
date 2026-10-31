@@ -26,14 +26,20 @@ test('history API updates URL, clones state, replaces entries and retains the do
   } finally { browser.close(); }
 });
 
-test('invalid history state and cross-origin URLs fail without changing history', async () => {
+test('invalid History input leaves state intact and URL-only rewrites retain the actual document principal', async () => {
   const browser = new Browser();
   try {
     const page = browser.createPage(); await page.navigate(`${fixture.url}history`);
-    assert.throws(() => page.evaluate("history.pushState({},'', 'https://other.test/')"), /cannot update history/);
-    assert.throws(() => page.evaluate("history.pushState({fn:()=>1},'', '#bad')"), /could not be cloned/);
+    assert.throws(() => page.evaluate("history.pushState({},'', 'http://[')"), error=>error.name==='TypeError');
+    assert.throws(() => page.evaluate("history.pushState(1n,'', '#bad')"), error=>error.name==='DataCloneError');
     assert.equal(page.history.length, 1); assert.equal(page.historyIndex, 0);
     assert.equal(page.url, `${fixture.url}history`);
+    const document=page.dom.window.document,ObjectType=page.dom.window.Object,principal=page.securityOrigin,requests=[];
+    page.on('request',request=>requests.push(request));
+    page.evaluate("history.pushState({actual:1},'', 'https://other.test/')");
+    assert.equal(page.url,'https://other.test/');assert.equal(page.history.length,2);
+    assert.equal(page.dom.window.document,document);assert.equal(page.dom.window.Object,ObjectType);
+    assert.equal(page.dom.window.origin,principal);assert.equal(page.securityOrigin,principal);assert.equal(requests.length,0);
   } finally { browser.close(); }
 });
 

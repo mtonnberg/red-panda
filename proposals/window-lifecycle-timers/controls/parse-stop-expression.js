@@ -1,0 +1,1 @@
+new Promise(resolve=>{let n=0;function poll(){if(window.loaded)return resolve(window.loaded);if(++n>100)return resolve({timeout:true,ready:document.readyState,order:window.order});setTimeout(poll,10)}poll()})

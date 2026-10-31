@@ -1,0 +1,372 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -224,6 +224,7 @@
+     }
+     return new JSDOM(html, {
+       url: this.url,
++      referrer: this.referrerFor(this.url,this.documentReferrer??'') || undefined,
+       cookieJar: this.context.cookies,
+       runScripts: this.javascript ? 'dangerously' : 'outside-only',
+       resources: this.javascript ? new PageResources(this) : undefined,
+@@ -670,6 +671,7 @@
+       disposeBrowsingWindow(this.dom.window,{retain:isPopupPage(this)});
+       this.responseHeaders = response ? [...response.headers].map(([name, value]) => ({ name, value })) : [];
+       this.url = response?.finalUrl ?? target;
++      this.documentReferrer = response?.requestHeaders?.referer ?? '';
+       this.mimeType = mimeType;
+       this.status = response?.status ?? 200;
+       this.executionContextId = this.browser.nextExecutionContext++;
+diff --git a/src/forms.js b/src/forms.js
+--- a/src/forms.js
++++ b/src/forms.js
+@@ -2,7 +2,8 @@
+ import { submitDialogForm } from './dialogs.js';
+ import { createRequire } from 'node:module';
+ import { randomBytes } from 'node:crypto';
+-import { installNavigation, requestNavigation } from './navigation.js';
++import { installNavigation, requestTargetNavigation } from './navigation.js';
++import {resolveFormTarget,createFormPopup} from './popup-pages.js';
+ import { installFormControls } from './form-controls.js';
+ 
+ const require = createRequire(import.meta.url);
+@@ -37,18 +38,6 @@
+ function setting(form, submitter, name) {
+   const override = submitter?.getAttribute(`form${name}`);
+   return override === null || override === undefined ? form.getAttribute(name) : override;
+-}
+-
+-function ownTarget(record, target) {
+-  const normalized = target.toLowerCase();
+-  if (!normalized || normalized === '_self') return true;
+-  if (normalized === '_parent' || normalized === '_top') {
+-    try {
+-      const candidate = normalized === '_parent' ? record.window.parent : record.window.top;
+-      return candidate.document === record.document;
+-    } catch { return false; }
+-  }
+-  return false;
+ }
+ 
+ function installSubmitterProperties(window) {
+@@ -188,9 +177,11 @@
+ 
+ function submit(record, formImpl, submitterImpl, bypass) {
+   const { window } = record;
+-  if (!formImpl.isConnected || record.constructing.has(formImpl)) return;
++  if ((!bypass && !formImpl.isConnected) || record.constructing.has(formImpl)) return;
+   const form = wrapperForImpl(formImpl);
+   const submitter = submitterImpl ? wrapperForImpl(submitterImpl) : null;
++  const targetName = setting(form, submitter, 'target') ?? '';
++  let targetPage = resolveFormTarget(record.page, targetName);
+   if (!bypass) {
+     if (record.submitting.has(formImpl)) return;
+     record.submitting.add(formImpl);
+@@ -199,14 +190,14 @@
+       if (!dispatchTrusted(form, new window.SubmitEvent('submit', { bubbles: true, cancelable: true, submitter }))) return;
+     } finally { record.submitting.delete(formImpl); }
+   }
+-  if (!formImpl.isConnected || record.disposed || record.signal?.aborted) return;
++  if (record.disposed || record.signal?.aborted) return;
+   record.constructing.add(formImpl);
+   let data;
+   try {
+     data = entryList(record, formImpl, submitterImpl);
+     dispatchTrusted(form, new window.FormDataEvent('formdata', { bubbles: true, formData: data }));
+   } finally { record.constructing.delete(formImpl); }
+-  if (!formImpl.isConnected || record.disposed || record.signal?.aborted) return;
++  if (record.disposed || record.signal?.aborted) return;
+   const rawMethod = setting(form, submitter, 'method')?.toLowerCase();
+   if (submitDialogForm(form, submitter)) return;
+   const method = rawMethod === 'post' ? 'POST' : 'GET';
+@@ -215,8 +206,6 @@
+   if (!['http:', 'https:'].includes(destination.protocol)) {
+     throw new window.DOMException(`Form submission protocol ${destination.protocol} is not implemented`, 'NotSupportedError');
+   }
+-  const target = setting(form, submitter, 'target') ?? record.document.querySelector('base[target]')?.getAttribute('target') ?? '';
+-  if (!ownTarget(record, target)) throw new window.DOMException(`Form target ${target} is not implemented`, 'NotSupportedError');
+   const noReferrer = /(?:^|[\t\n\f\r ])noreferrer(?:$|[\t\n\f\r ])/i.test(form.getAttribute('rel') || '');
+   const options = { method, historyMode: 'push', referrer: noReferrer ? '' : window.location.href };
+   if (method === 'GET') {
+@@ -226,9 +215,13 @@
+     const encoding = encodings.has(requested) ? requested : 'application/x-www-form-urlencoded';
+     const { body, contentType } = encodeBody(data, encoding);
+     options.body = body;
+-    options.headers = { 'content-type': contentType, origin: window.location.origin };
+-  }
+-  requestNavigation(record.page, window, destination.href, options);
++    options.headers = { 'content-type': contentType, origin: formImpl._ownerDocument._origin ?? window.location.origin };
++  }
++  if (targetPage === null) {
++    targetPage = createFormPopup(record.page,window,{opener:/(?:^|[\t\n\f\r ])opener(?:$|[\t\n\f\r ])/i.test(form.getAttribute('rel') || '')});
++    if (!targetPage) throw new window.DOMException(`Form target ${targetName} is not implemented`, 'NotSupportedError');
++  }
++  requestTargetNavigation(record.page, window, targetPage, destination.href, options);
+ }
+ 
+ function patchHost() {
+diff --git a/src/frames.js b/src/frames.js
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -10,8 +10,8 @@
+ 
+ // These hooks target pinned jsdom26. They affect only frames whose owner
+ // document belongs to an installed registry, and retain jsdom's actual windows.
+-// Scope: GET navigation, src/srcdoc/about:blank and normal jsdom subresources.
+-// Frame history, POST navigation, named targets, sandbox/CSP/origin isolation and
++// Scope: actual GET/POST navigation, src/srcdoc/about:blank and jsdom subresources.
++// Frame history, sandbox/CSP/origin isolation and
+ // cross-frame coordinate transforms are not implemented. Child facade close()
+ // retires browsing authority while preserving the actual realm and Document;
+ // owning-page teardown finally aborts and closes the retained windows.
+@@ -77,6 +77,7 @@
+   };
+   WindowFactory.createWindow = function (options) {
+     const operation = operations.at(-1);
++    if(operation?.navigationRequest)options={...options,referrer:operation.owner.registry.page.referrerFor(options.url,operation.navigationRequest.referrer??'')??''};
+     const window = operation && !operation.created && !operation.owner.registry.disposed
+       ? createOwnedWindow(createWindow, options) : createWindow(options);
+     if (!operation || operation.created || operation.owner.registry.disposed) return window;
+@@ -93,7 +94,20 @@
+     let request;
+     const loaded = options.onLoad;
+     const abort = () => request?.abort?.();
+-    request = fetchResource.call(this, url, { ...options, onLoad(data) {
++    const navigation = page.record.navigationRequest;
++    // Keep jsdom's original request manager, resource queue, parser and load
++    // event path. Only this frame document's actual transport receives its
++    // submitted method/body/headers instead of the ordinary GET loader.
++    const originalLoader=this._resourceLoader;
++    if(navigation)this._resourceLoader=Object.assign(Object.create(originalLoader),{fetch(destination){
++      const controller=new AbortController(),headers=new Headers(navigation.headers);
++      const referrer=page.referrerFor(destination,navigation.referrer??'');if(referrer)headers.set('referer',referrer);
++      const request=page.fetch(destination,{method:navigation.method??'GET',body:navigation.body,headers,signal:controller.signal,skipDefaultReferrer:!headers.has('referer')},'Document').then(async response=>{
++        request.response={statusCode:response.status,headers:Object.fromEntries(response.headers)};delete request.response.headers['set-cookie'];request.href=response.finalUrl??response.url;request.documentReferrer=response.requestHeaders?.referer??'';
++        return Buffer.from(await response.arrayBuffer());
++      });request.abort=()=>controller.abort();request.getHeader=name=>headers.get(name)??page.extraHTTPHeaders.get(name);return request;
++    }});
++    try { request = fetchResource.call(this, url, { ...options, onLoad(data) {
+       if (page.closed) throw stale();
+       owner.registry.beforeFrameParse(frame, request);
+       page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
+@@ -102,7 +116,7 @@
+       page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
+       if (!page.closed && !page.retired) owner.registry.announce('frameNavigationError', { frameId: page.frameId, error });
+       return options.onError?.(error);
+-    } });
++    } }); } finally {this._resourceLoader=originalLoader;page.record.navigationRequest=undefined;}
+     page.documentAbort.signal.addEventListener('abort', abort, { once: true }); page.resourceRequests.add(request);
+     return request;
+   };
+@@ -298,6 +312,7 @@
+     childWindow._top = parentWindow.top; childWindow._frameElement = implementation;
+     childWindow._virtualConsole = parentWindow._virtualConsole;
+     record.window = childWindow; record.document = childWindow.document;
++    record.navigationRequest = operation.navigationRequest;
+     const framePage = record.page = new FramePage(registry, record, childWindow);
+     registry.frames.set(record.id, framePage);
+     const impl = implForWrapper(record.document);
+@@ -376,6 +391,7 @@
+     if (finalURL) {
+       const documentImpl = implForWrapper(record.document);
+       documentImpl._URL = parseURL(finalURL); documentImpl._origin = new URL(finalURL).origin;
++      if(request.documentReferrer!==undefined)documentImpl._referrer=request.documentReferrer;
+       documentImpl._clearBaseURLCache();
+       record.window._origin = documentImpl._origin; record.page.url = finalURL;
+       const mimeType = request?.response?.headers?.['content-type']?.split(';')[0].trim();
+@@ -397,24 +413,21 @@
+     };
+     return tree(root);
+   };
+-  registry.navigate = async (id, input, { waitUntil = 'load', onCommit, method, body, headers, historyMode } = {}) => {
++  registry.navigate = async (id, input, { waitUntil = 'load', onCommit, method, body, headers, historyMode, referrer } = {}) => {
+     const record = records.get(id);
+     if (!record || record.root || !record.page) throw stale();
+-    if ((method && method.toUpperCase() !== 'GET') || body !== undefined || (headers && [...new Headers(headers)].length)) {
+-      throw new TypeError('Frame POST navigation and custom navigation headers are not implemented');
+-    }
+     if (!['load', 'domcontentloaded'].includes(waitUntil)) throw new TypeError('Unsupported frame navigation wait condition');
+     const url = new URL(String(input), record.document.baseURI);
+     if (!['http:', 'https:', 'data:'].includes(url.protocol) && url.href !== 'about:blank') throw new TypeError(`Unsupported frame navigation URL: ${url.href}`);
+     const previousURL = new URL(record.page.url);
+-    if (historyMode !== 'reload' && url.href.includes('#') && url.href.split('#')[0] === previousURL.href.split('#')[0]) {
++    if ((!method || method.toUpperCase() === 'GET') && body === undefined && historyMode !== 'reload' && url.href.includes('#') && url.href.split('#')[0] === previousURL.href.split('#')[0]) {
+       record.window.location.hash = url.hash; record.page.reconcileURL(); onCommit?.();
+       return { url: record.page.url, frameId: id, loaderId: record.page.loaderId };
+     }
+     const implementation = record.element;
+     // Trigger native loadFrame without altering reflected iframe.src/srcdoc.
+     frameOperation(implementation, () => nativeAttrModified.call(implementation,
+-      'src', url.href, implementation.getAttributeNS(null, 'src')), { url: url.href, srcdoc: undefined, ignoreSrcdoc: true });
++      'src', url.href, implementation.getAttributeNS(null, 'src')), { url: url.href, srcdoc: undefined, ignoreSrcdoc: true, navigationRequest: {method,body,headers,referrer:referrer??record.page.url} });
+     const current = record.page; onCommit?.();
+     const loaded = new Promise(resolve => {
+       if (current.dom.window.document.readyState === 'complete') resolve();
+diff --git a/src/navigation.js b/src/navigation.js
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -1,4 +1,5 @@
+ import { createRequire } from 'node:module';
++import {onFrameRetirement} from './frame-activity.js';
+ 
+ // The pinned jsdom Location properties are deliberately nonconfigurable. Hook
+ // its host implementations rather than exposing a Page object to page scripts.
+@@ -201,11 +202,13 @@
+     DOCUMENTS.delete(documentImpl);
+     if (window.close === record.close) window.close = record.originalClose;
+     record.signal?.removeEventListener('abort', dispose);
++    record.retirementUnsubscribe?.();
+     page.off?.('close', dispose);
+   };
+   record.controller = { dispose };
+   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
+   DOCUMENTS.set(documentImpl, record);
++  record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');});
+   record.close = function () { dispose(); return record.originalClose.call(window); };
+   window.close = record.close;
+   record.signal?.addEventListener('abort', dispose, { once: true });
+@@ -224,3 +227,16 @@
+     historyMode: 'push', referrer: window.location.href, ...options,
+   });
+ }
++
++// Selection uses private browsing-context ownership. Once accepted, the target
++// document owns its queued navigation, so retiring the source frame cannot
++// cancel an active ancestor's submission. Closing the target cancels normally.
++export function requestTargetNavigation(page, window, targetPage, url, options = {}) {
++ const source=DOCUMENTS.get(implForWrapper(window?.document));
++ if(!source||source.page!==page||!active(source))throw new window.DOMException('The source document is not registered for navigation','InvalidStateError');
++ if(!targetPage||targetPage.closed||targetPage.retired)return;
++ if(targetPage!==page&&(targetPage.browser!==page.browser||targetPage.context!==page.context))throw new window.DOMException('The target browsing context is not owned by this context','SecurityError');
++ const targetWindow=targetPage.dom?.window??window,target=DOCUMENTS.get(implForWrapper(targetWindow.document));
++ if(!target||target.page!==targetPage||!active(target))return;
++ return schedule(target,new URL(url,window.location.href).href,{historyMode:'push',referrer:window.location.href,...options});
++}
+diff --git a/src/popup-pages.js b/src/popup-pages.js
+--- a/src/popup-pages.js
++++ b/src/popup-pages.js
+@@ -102,3 +102,29 @@
+   ownership.add(window,'load',()=>{if(!popup.closed&&popup.announced)announce(page,'frameLoad',{frameId:page.frameId,loaderId:page.loaderId})});
+  }
+ }
++
++// Form targets are resolved from genuine owned browsing contexts, never public
++// Window properties (which authored code can replace). Named lookup is the
++// observed descendant/ancestor-frame search; popups are independent roots.
++export function resolveFormTarget(page, name) {
++ const token=name.toLowerCase();
++ if(token==='_blank')return null;
++ const parent=value=>value.parentFrameId?(value.registry?.findFrame(value.parentFrameId)??value):value;
++ if(token==='_parent')return parent(page);
++ if(token==='_top'){let target=page;while(parent(target)!==target)target=parent(target);return target}
++ if(!token||token==='_self')return page;
++ const registry=page.frames??page.registry;
++ const children=value=>[...(registry?.frames.values()??[])].filter(child=>child.parentFrameId===value.frameId&&!child.closed&&!child.retired&&child.record?.element?.isConnected);
++ const find=value=>{for(const child of children(value)){if(child.record.element.getAttributeNS(null,'name')===name)return child;const nested=find(child);if(nested)return nested}};
++ const direct=find(page);if(direct)return direct;
++ let top=page;while(parent(top)!==top)top=parent(top);
++ return (top!==page?find(top):undefined)??page;
++}
++export function createFormPopup(page,window,{opener=false}={}) {
++ const source=WINDOWS.get(window);
++ if(!source||source.page!==page||source.disposed||page.closed||page.retired||source.document._defaultView===null||!page.browser?.createPopupPage)return undefined;
++ const root=rootFor(page),config=record({root,opener:opener?source.window:null,name:'',origin:source.document._origin,baseURL:source.document.baseURLSerialized(),referrer:source.document.URL});
++ const target=page.browser.createPopupPage(page.context.id,config);bindPopupPage(target);
++ root.attachedFrames.add(target.frameId);announce(target,'frameNavigationStarted',{frameId:target.frameId,loaderId:target.loaderId,url:'about:blank'});commit(target);
++ return target;
++}
+diff --git a/test/form-target-routing.test.js b/test/form-target-routing.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/form-target-routing.test.js
+@@ -0,0 +1,27 @@
++import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{Browser,until}from'../src/browser.js';
++let server,origin,posts=[];before(async()=>{server=http.createServer(async(q,s)=>{const chunks=[];for await(const b of q)chunks.push(b);if(q.url.startsWith('/submitted/')||q.url.startsWith('/redirect/'))posts.push({url:q.url,method:q.method,body:Buffer.concat(chunks).toString(),headers:q.headers});s.setHeader('Set-Cookie','routing-cookie=actual; Path=/');s.setHeader('content-type','text/html');if(q.url.startsWith('/redirect/')){s.writeHead(303,{location:'/submitted/redirected'});s.end();return}if(q.url==='/start')s.end('<!doctype html><title>Source</title><iframe name="outer" src="/outer"></iframe>');else if(q.url==='/outer')s.end('<!doctype html><title>Outer</title><iframe name="inner" src="/inner"></iframe>');else if(q.url==='/inner')s.end('<!doctype html><title>Inner</title><body>Inner');else s.end('<!doctype html><title>Actual response</title><body>actual HTTP '+q.url)});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`});after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r))});
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate(origin+'/start');const w=page.dom.window,outer=w.document.querySelector('iframe'),inner=outer.contentDocument.querySelector('iframe');return{browser,page,w,outer,inner,outerPage:page.frames.findElement(outer),innerPage:page.frames.findElement(inner)}}
++function form(w,target,path='/submitted/actual'){const f=w.document.createElement('form');f.method='post';f.action=origin+path;f.target=target;f.innerHTML='<input name="q" value="a & b"><button name="go" value="yes">send</button>';w.document.body.append(f);return f}
++const delay=ms=>new Promise(r=>setTimeout(r,ms));
++
++test('named frame POST navigates its actual document, retains frame identity and leaves source history alone',async t=>{const{page,w,outer,outerPage}=await fixture(t),oldDocument=outer.contentDocument,oldContext=outerPage.executionContextId,parentGeneration=page.documentGeneration,parentHistory=page.history.length,network=[];page.on('request',r=>network.push(r));const offset=posts.length,f=form(w,'outer');f.addEventListener('formdata',e=>e.formData.append('added','real'));f.requestSubmit(f.lastChild);const pending=outerPage.pendingNavigation;assert.ok(pending);assert.equal(page.pendingNavigation,undefined);await pending.promise;const next=page.frames.findElement(outer);assert.equal(next.frameId,outerPage.frameId);assert.notEqual(next.executionContextId,oldContext);assert.notEqual(next.dom.window.document,oldDocument);assert.equal(next.dom.window.document.title,'Actual response');assert.equal(next.dom.window.document.referrer,origin+'/start');assert.equal(outer.getAttribute('src'),'/outer');assert.equal(page.documentGeneration,parentGeneration);assert.equal(page.history.length,parentHistory);assert.equal(page.url,origin+'/start');const sent=posts[offset];assert.equal(sent.method,'POST');assert.equal(sent.body,'q=a+%26+b&go=yes&added=real');assert.equal(sent.headers['content-type'],'application/x-www-form-urlencoded');assert.equal(sent.headers.origin,origin);assert.equal(sent.headers.referer,origin+'/start');assert.equal(sent.headers.cookie,'routing-cookie=actual');const request=network.find(r=>r.url===origin+'/submitted/actual');assert.equal(request.frameId,next.frameId);assert.equal(request.loaderId,next.loaderId)});
++
++test('submitter target/action/method overrides route GET with the real mutable entry list into a nested frame',async t=>{const{page,w,inner,innerPage}=await fixture(t),f=form(w,'_self'),b=f.lastChild,offset=posts.length;b.formTarget='inner';b.formAction=origin+'/submitted/override?old=1';b.formMethod='get';b.formEnctype='text/plain';f.addEventListener('formdata',e=>e.formData.set('q','changed'));f.requestSubmit(b);await innerPage.pendingNavigation.promise;const sent=posts[offset];assert.equal(sent.url,'/submitted/override?go=yes&q=changed');assert.equal(sent.method,'GET');assert.equal(sent.body,'');assert.equal(sent.headers.origin,undefined);assert.equal(page.frames.findElement(inner).url,origin+sent.url);assert.equal(inner.contentDocument.referrer,origin+'/start');assert.equal(page.url,origin+'/start')});
++
++test('target selection is captured before submit and formdata handlers change names or target attributes',async t=>{const{page,w,outer,outerPage}=await fixture(t),f=form(w,'outer');const count=page.frames.executionPages().length;f.addEventListener('submit',()=>{f.target='_blank';outer.name='renamed'});f.addEventListener('formdata',()=>{f.target='_self'});f.requestSubmit();await outerPage.pendingNavigation.promise;assert.equal(page.frames.findElement(outer).url,origin+'/submitted/actual');assert.equal(page.frames.executionPages().length,count-1);assert.equal(page.url,origin+'/start')});
++
++test('removed selected frames cannot receive navigation and canceled/invalid blank submissions allocate no popup',async t=>{const{page,w,outer}=await fixture(t),offset=posts.length;const f=form(w,'outer');f.addEventListener('submit',()=>outer.remove());f.requestSubmit();await delay(40);assert.equal(posts.length,offset);for(const invalid of[false,true]){const g=form(w,'_blank');if(invalid){const input=w.document.createElement('input');input.required=true;g.append(input)}else g.addEventListener('submit',e=>e.preventDefault());const count=page.frames.executionPages().length;g.requestSubmit();await delay(30);assert.equal(page.frames.executionPages().length,count);assert.equal(posts.length,offset)}});
++
++test('blank submission creates a genuine independent popup Page/VM with private opener policy and real HTTP',async t=>{const{browser,page,w}=await fixture(t),f=form(w,'_blank'),before=new Set(page.frames.executionPages());f.requestSubmit();const popup=page.frames.executionPages().find(p=>!before.has(p));assert.ok(popup);assert.ok(popup instanceof page.constructor);assert.equal(popup.context,page.context);assert.equal(browser.pages.size,1);assert.notEqual(popup.dom.window.Object,w.Object);await popup.pendingNavigation.promise;assert.equal(popup.url,origin+'/submitted/actual');assert.equal(popup.dom.window.document.title,'Actual response');assert.equal(popup.dom.window.opener,null);assert.equal(popup.history.at(-1).request.method,'POST');assert.equal(page.frames.getTree().frame.url,origin+'/start');assert.equal(page.frames.getTree().childFrames.length,1);const open=form(w,'_blank','/submitted/opener');open.rel='opener';const previous=new Set(page.frames.executionPages());open.requestSubmit();const second=page.frames.executionPages().find(p=>!previous.has(p));await second.pendingNavigation.promise;assert.equal(second.dom.window.opener,w);assert.equal(page.url,origin+'/start');page.close();assert.equal(popup.closed,true);assert.equal(second.closed,true)});
++
++test('unknown names and named popup targets genuinely submit in the source; popup names are not frame names',async t=>{for(const name of['missing','popup-name']){const{page,w}=await fixture(t);const handle=w.open('about:blank','popup-name'),popup=page.frames.executionPages().find(p=>p.dom.window===handle),f=form(w,name);f.requestSubmit();await page.pendingNavigation.promise;assert.equal(page.url,origin+'/submitted/actual');assert.equal(page.dom.window.document.referrer,origin+'/start');assert.equal(popup.url,'about:blank');assert.equal(handle.document.URL,'about:blank')}});
++
++test('child parent/top targets use genuine ancestors; inherited blank popup submits with its actual tuple origin',async t=>{for(const target of['_parent','_top']){const{page,outer,inner,outerPage}=await fixture(t),f=form(inner.contentWindow,target),owner=target==='_parent'?outerPage:page;f.requestSubmit();await owner.pendingNavigation.promise;if(target==='_parent'){assert.equal(page.frames.findElement(outer).url,origin+'/submitted/actual');assert.equal(page.url,origin+'/start')}else assert.equal(page.url,origin+'/submitted/actual')}const{page,w}=await fixture(t),p=w.open('about:blank','source'),popup=page.frames.executionPages().find(x=>x.dom.window===p),offset=posts.length,f=form(p,'_parent');f.requestSubmit();await popup.pendingNavigation.promise;assert.equal(popup.url,origin+'/submitted/actual');assert.equal(posts[offset].headers.origin,origin);assert.equal(posts[offset].headers.referer,undefined);assert.equal(page.url,origin+'/start')});
++
++test('redirected frame POST uses real 303 GET transition, cookies, final URL and loader identity',async t=>{const{page,w,outer,outerPage}=await fixture(t),f=form(w,'outer','/redirect/actual'),offset=posts.length;f.requestSubmit();await outerPage.pendingNavigation.promise;assert.equal(posts[offset].method,'POST');assert.equal(posts[offset+1].method,'GET');assert.equal(posts[offset+1].body,'');assert.equal(page.frames.findElement(outer).url,origin+'/submitted/redirected');assert.equal(outer.contentDocument.URL,origin+'/submitted/redirected');assert.equal(outer.contentDocument.title,'Actual response')});
++
++test('closing the source before its queued cross-context submission cancels the owned operation',async t=>{const{page,w,outerPage}=await fixture(t),f=form(w,'outer'),offset=posts.length;f.requestSubmit();const pending=outerPage.pendingNavigation;page.close();await assert.rejects(pending.promise,e=>e.name==='AbortError');await delay(30);assert.equal(posts.length,offset)});
++
++test('an accepted ancestor submission survives source-frame removal, while removed targets cancel queued transport',async t=>{const{page,outer,inner,innerPage}=await fixture(t),offset=posts.length,f=form(inner.contentWindow,'_top','/submitted/retired-source');f.requestSubmit();const pending=page.pendingNavigation;outer.remove();assert.equal(innerPage.retired,true);await pending.promise;assert.equal(posts[offset].url,'/submitted/retired-source');assert.equal(page.url,origin+'/submitted/retired-source');const next=await fixture(t),target=form(next.w,'outer'),start=posts.length;target.requestSubmit();const canceled=next.outerPage.pendingNavigation;next.outer.remove();await assert.rejects(canceled.promise,e=>e.name==='AbortError');await delay(30);assert.equal(posts.length,start)});
++
++test('direct detached form submission routes real bytes while detached interactive requestSubmit stays inactive',async t=>{const{page,w,outerPage}=await fixture(t),offset=posts.length,f=form(w,'outer');f.remove();f.requestSubmit();await delay(20);assert.equal(posts.length,offset);f.submit();await outerPage.pendingNavigation.promise;assert.equal(posts[offset].body,'q=a+%26+b');assert.equal(page.url,origin+'/start')});
+diff --git a/test/forms.test.js b/test/forms.test.js
+--- a/test/forms.test.js
++++ b/test/forms.test.js
+@@ -274,10 +274,11 @@
+   try {
+     const form = f.document.querySelector('form');
+     form.querySelector('button').click(); assert.equal(f.page.pendingNavigation, undefined);
+-    form.remove(); form.submit(); form.requestSubmit(); assert.equal(f.page.pendingNavigation, undefined);
++    form.remove(); form.requestSubmit(); assert.equal(f.page.pendingNavigation, undefined);
++    form.submit(); await f.page.pendingNavigation.promise; assert.equal(f.calls.length,1);
+     f.document.body.append(form); form.noValidate = true;
+     form.requestSubmit(); await f.page.pendingNavigation.promise;
+-    assert.equal(f.calls.length, 1);
++    assert.equal(f.calls.length, 2);
+   } finally { f.close(); }
+ });
+ 
+diff --git a/test/frames-integration.test.js b/test/frames-integration.test.js
+--- a/test/frames-integration.test.js
++++ b/test/frames-integration.test.js
+@@ -6,7 +6,7 @@
+ async function fixture(t) {
+   const requests = [];
+   const server = http.createServer((req, res) => {
+-    requests.push({ url: req.url, referrer: req.headers.referer });
++    requests.push({ url: req.url, referrer: req.headers.referer, method:req.method });
+     const routes = {
+       '/parent': '<!doctype html><title>Parent</title><iframe id="child" src="/child"></iframe><iframe id="inline" srcdoc="<p>Inline</p><script>globalThis.inlineReady=true</script>"></iframe>',
+       '/child': '<!doctype html><title>Child</title><button>Child button</button><script>globalThis.childOnly=42;fetch("./data").then(r=>r.json()).then(d=>globalThis.fetched=d.value)</script><script type="module">import {answer} from "./dep.js";globalThis.moduleAnswer=answer;</script>',
+@@ -54,7 +54,7 @@
+ });
+ 
+ test('child navigation changes its real iframe document and invalidates old realms without replacing the parent', async t => {
+-  const { page, base } = await fixture(t);
++  const { page, base, requests } = await fixture(t);
+   await page.navigate(`${base}/parent`);
+   const element = page.dom.window.document.getElementById('child'), previous = page.frames.findElement(element);
+   const contextId = previous.executionContextId, parentGeneration = page.documentGeneration;
+@@ -65,6 +65,8 @@
+   assert.throws(() => previous.evaluate('1'), /detached|current/);
+   assert.equal(next.evaluate('document.title'), 'Next frame'); assert.equal(element.contentDocument, next.dom.window.document);
+   assert.equal(page.documentGeneration, parentGeneration); assert.equal(page.evaluate('document.title'), 'Parent');
+-  await assert.rejects(next.navigate(`${base}/next`, { method: 'POST', body: 'unsupported' }), /not implemented/);
++  await next.navigate(`${base}/next`, { method: 'POST', body: 'actual-post' });
++  assert.equal(requests.at(-1).method,'POST');
++  assert.equal(page.frames.findElement(element).evaluate('document.title'),'Next frame');
+   element.remove(); assert.equal(page.frames.findFrame(next.frameId), undefined);
+ });
+diff --git a/test/frames.test.js b/test/frames.test.js
+--- a/test/frames.test.js
++++ b/test/frames.test.js
+@@ -213,7 +213,10 @@
+   await child.navigate('#fragment');
+   assert.equal(f.frame(element), child); assert.equal(child.evaluate('location.hash'), '#fragment');
+   assert.equal(f.registry.findElement(element), child);
+-  await assert.rejects(child.navigate('/post', { method: 'POST', body: 'data' }), /not implemented/);
++  await child.navigate('/post', { method: 'POST', body: 'data' });
++  const submitted=f.requests.find(request=>request.url==='https://example.test/post');
++  assert.equal(submitted.init.method,'POST');assert.equal(submitted.init.body,'data');
++  assert.equal(f.frame(element).dom.window.document.contentType,'text/html');
+ });
+ 
+ test('nested document requests use their child frame identity and explicit referrer suppression is retained', async t => {

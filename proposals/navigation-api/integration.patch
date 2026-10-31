@@ -1,0 +1,676 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,5 @@
++import {documentNavigation} from './navigation-lifecycle.js';
++import {installNavigationAPI} from './navigation-api.js';
+ import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation} from './joint-history.js';
+ import {installSelectControls} from './select-controls.js';
+ import {installMediaElements} from './media-elements.js';
+@@ -284,6 +286,7 @@
+ 
+       installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
+       installJointHistory(this,window,historyState);
++      installNavigationAPI(this,window);
+       installNavigation(this, window);
+       installDialogs(this, window);
+       installForms(this, window);
+@@ -383,12 +386,12 @@
+   }
+ 
+   installHistory(window,state){return installJointHistory(this,window,state);}
+-  commitHistory(url,state=null,mode='push'){return commitJointHistory(this,url,state,mode);}
+-
+-  reconcileURL(window = this.dom.window, { historyMode = 'push' } = {}) {
++  commitHistory(url,state=null,mode='push',operation){return commitJointHistory(this,url,state,mode,undefined,operation);}
++
++  reconcileURL(window = this.dom.window, { historyMode = 'push',navigationOperation } = {}) {
+     if (this.closed || window !== this.dom.window || window.location.href === this.url) return;
+     this.url = window.location.href;
+-    this.commitHistory(this.url, null, historyMode);
++    this.commitHistory(this.url, null, historyMode,navigationOperation);
+     this.emit('withinDocument', { url: this.url, navigationType: 'fragment' });
+   }
+ 
+@@ -568,7 +571,7 @@
+   }
+ 
+   async navigate(url, { waitUntil = 'load', waitMs = 0, selector, script, historyMode = 'push', historyIndex, onCommit, referrer,
+-    method, body, headers } = {}) {
++    method, body, headers,navigationOperation } = {}) {
+     if (this.closed) throw new Error('Page is closed');
+     const generation = ++this.navigationGeneration;
+     const deadline = Date.now() + this.timeout;
+@@ -629,6 +632,7 @@
+       this.emit('contextsCleared');
+       this.documentId = randomUUID();
+       let state = null;
++      const previousHistoryEntry=this.history[this.historyIndex];
+       historyMode=normalizeHistoryNavigation(this,historyMode);
+       if (historyMode === 'traverse' || (historyMode === 'reload' && this.historyIndex >= 0)) {
+         const index = historyMode === 'reload' ? this.historyIndex : historyIndex;
+@@ -639,13 +643,15 @@
+         this.historyIndex = index;
+         entry.url = this.url;
+         state = structuredClone(entry.state);
+-      } else this.commitHistory(this.url, null, historyMode === 'replace' ? 'replace' : 'push');
++      } else this.commitHistory(this.url, null, historyMode === 'replace' ? 'replace' : 'push',navigationOperation);
++      if(navigationOperation?.source==='navigation')state=structuredClone(this.history[this.historyIndex].state);
+       if (this.history[this.historyIndex]) this.history[this.historyIndex].request = {
+         method: response?.requestMethod ?? requestMethod,
+         body: structuredClone(response ? response.requestBody : requestBody),
+         // Credentials/defaults are recomputed by the transport for each request.
+         headers: Object.fromEntries([...new Headers(response?.requestHeaders ?? requestHeaders)].filter(([name]) => !['cookie', 'authorization', 'user-agent', 'accept-language'].includes(name))),
+       };
++      documentNavigation(this,{previous:previousHistoryEntry,entry:this.history[this.historyIndex],kind:historyMode,operation:navigationOperation});
+       let resolveRedirect;
+       const requested = new Promise(resolve => { resolveRedirect = resolve; });
+       captureRedirect = pending => {
+--- a/src/joint-history.js
++++ b/src/joint-history.js
+@@ -1,3 +1,4 @@
++import {beforeNavigation,committedNavigation,documentNavigation} from './navigation-lifecycle.js';
+ import 'jsdom';
+ import {createRequire} from 'node:module';
+ import {getRuntimeBinding} from './native-runtime.js';
+@@ -27,13 +28,30 @@
+ subscribePlatformFactories((_wrapper,provenance)=>{if(provenance.kind!=='PopStateEvent')return;const implementation=provenance.implementation,text=PAYLOADS.get(implementation.state),realm=WINDOWS.get(provenance.globalRef?.deref());if(text!==undefined&&realm)implementation.state=value(realm,text)});
+ function stored(entry){return entry?.stateJSON??(stringify(entry?.state??null)??'undefined')}
+ export function historyState(page,window){const state=WINDOWS.get(window);if(!state)throw new Error('History realm is not installed');return value(state,stored(current(page)))}
+-export function commitJointHistory(page,url,state=null,mode='push',stateJSON){
+- const root=session(page),text=stateJSON??json(state,PAGES.get(page)?.window??page.dom?.window??root.dom?.window);
+- const entry=record({id:root.nextHistoryId++,url,state:text==='undefined'?undefined:parse(text),stateJSON:text,documentId:page.documentId,frameId:page.frameId});
++export function commitJointHistory(page,url,state=null,mode='push',stateJSON,operation){
++ const root=session(page),text=stateJSON??(operation?.source==='navigation'?operation.stateJSON:undefined)??json(state,PAGES.get(page)?.window??page.dom?.window??root.dom?.window);
++ const previous=root.history[root.historyIndex],disposed=mode==='replace'&&previous?[previous]:root.history.slice(root.historyIndex+1),id=root.nextHistoryId++;
++ const entry=record({id,navigationKey:mode==='replace'&&previous?(previous.navigationKey??String(previous.id-1)):String(id-1),url,state:text==='undefined'?undefined:parse(text),stateJSON:text,navigationStateJSON:operation?.source==='navigation'?operation.stateJSON:undefined,documentId:page.documentId,frameId:page.frameId});
+  if(mode==='replace'&&root.historyIndex>=0)root.history[root.historyIndex]=entry;
+  else{root.history.splice(root.historyIndex+1);root.history.push(entry);root.historyIndex=root.history.length-1}
+- return entry;
++ committedNavigation(page,{previous,entry,kind:mode,disposed,operation,classic:stateJSON!==undefined});return entry;
+ }
++export function planHistoryURL(page,window,url,kind='push'){
++ const state=WINDOWS.get(window),document=state.implementation._document,current=document._URL,destination=url===null||url===''?current:document.encodingParseAURL(url);
++ if(!destination)throw new state.TypeError('');
++ const authority=['scheme','username','password','host','port'].every(key=>key==='host'?JSON.stringify(destination.host)===JSON.stringify(current.host):destination[key]===current[key]);
++ if(!authority||(!['http','https'].includes(current.scheme)&&serializeURL(destination,true)!==serializeURL(current,true)))throw state.exception(`${kind}State() cannot update history to the URL ${serializeURL(destination)}.`,'SecurityError');
++ return serializeURL(destination);
++}
++export function commitNavigationState(page,window,url,text,mode,operation){
++ const state=WINDOWS.get(window),old=page.url,next=planHistoryURL(page,window,url);writeImplementation(state,mode==='replace'?'replaceState':'pushState',implementationValue(text),'',next);
++ page.url=next;if(new URL(old).hash!==new URL(next).hash)queueHistoryHash(page,old,next);const entry=commitJointHistory(page,next,text==='undefined'?undefined:parse(text),mode,text,operation);page.emit?.('withinDocument',{url:next,navigationType:'historyApi'});return entry;
++}
++export function updateNavigationState(page,text){
++ const root=session(page),entry=current(page);entry.stateJSON=text??'null';entry.state=text===undefined?null:text==='undefined'?undefined:parse(text);entry.navigationStateJSON=text;
++ committedNavigation(page,{previous:entry,entry,kind:null,disposed:[],update:true});return entry;
++}
++export function initialHistoryNavigation(page){return sessionState(page).initial}
+ function writeImplementation(state,name,data,title,url,exception=state.exception){
+  const implementation=state.implementation,document=implementation._document,current=document._URL;
+  if(typeof current.path!=='string'||!implementation._window)return apply(implementationMethods[name],implementation,[data,title,url]);
+@@ -69,13 +87,11 @@
+   const globals=state.globals,context=`Failed to execute '${name}' on 'History'`;
+   const title=conversions.DOMString(args[1],{globals,context:context+': parameter 2'}),rawURL=args.length>2?args[2]:undefined;
+   const url=rawURL===null||rawURL===undefined?null:conversions.USVString(rawURL,{globals,context:context+': parameter 3'});
+-  const text=json(args[0],window),copy=implementationValue(text);
+-  // Invoke the actual captured implementation after genuine IDL conversion.
+-  // Public implementation symbols cannot redirect this owned receiver.
+-  const result=writeImplementation(target,name,copy,title,url,state.exception);
+-  const next=target.window.location.href;
+-  commitJointHistory(target.page,next,copy,name==='pushState'?'push':'replace',text);
+-  target.page.url=next;target.page.emit?.('withinDocument',{url:next,navigationType:'historyApi'});return result;
++  const text=json(args[0],window),copy=implementationValue(text),kind=name==='pushState'?'push':'replace',next=planHistoryURL(target.page,target.window,url,kind);
++  const operation=beforeNavigation(target.page,{kind,url:next,sameDocument:true,classic:true,stateJSON:undefined});if(operation===false)return;
++  const result=writeImplementation(target,name,copy,title,next,state.exception);target.page.url=next;
++  commitJointHistory(target.page,next,copy,kind,text,operation);
++  target.page.emit?.('withinDocument',{url:next,navigationType:'historyApi'});return result;
+  });
+  const navigate=(target,source,args,distance)=>{
+   if(!source)throw new state.TypeError('History navigation requires a registered incumbent realm');
+@@ -87,34 +103,38 @@
+   if(index<0||index>=root.history.length)return;
+   const selected=root.history[index];
+   if(selected.documentId===source.page.documentId){void traverseJointHistory(source.page,index).catch(error=>source.page.emit?.('pageError',error));return}
+-  requestNavigation(source.page,source.window,selected.url,{historyMode:'traverse',historyIndex:index,method:'GET'});
++  requestNavigation(source.page,source.window,selected.url,{historyMode:'traverse',historyIndex:index,method:'GET',historyEntry:selected});
+  };
+  method('back',0,(target,source,args)=>navigate(target,source,args,-1));method('forward',0,(target,source,args)=>navigate(target,source,args,1));method('go',0,(target,source,args)=>navigate(target,source,args));
+  // All retained controller records and serialized payloads are Host allocations.
+  return state;
+ }
+-export async function traverseJointHistory(page,index,{forceReload=false}={}){
++export function queueHistoryHash(page,oldURL,newURL){const state=PAGES.get(page),target=state.windowImpl;let timer;timer=state.setTimeout(()=>{state.tasks.delete(timer);if(active(state))fireAnEvent('hashchange',target,HashChangeEvent,{oldURL,newURL})},0);state.tasks.add(timer);}
++export async function traverseJointHistory(page,index,{forceReload=false,navigationOperation}={}){
+  page.current?.();const root=session(page);if(!Number.isInteger(index)||index<0||index>=root.history.length)return false;
+  const selected=root.history[index],state=PAGES.get(page);
+  if(!forceReload&&selected.documentId===page.documentId){
+-  const old=page.url;restore(state,selected);root.historyIndex=index;page.url=selected.url;
++  const operation=navigationOperation??beforeNavigation(page,{kind:'traverse',url:selected.url,sameDocument:true,entry:selected,stateJSON:selected.navigationStateJSON});if(operation===false)return false;const previous=current(page),old=page.url;restore(state,selected);root.historyIndex=index;page.url=selected.url;
+   const changed=new URL(old).hash!==new URL(selected.url).hash;
+   const target=state.windowImpl;
+   // Own the queued hash task before entering any driver/authored callback.
+   // VM termination can bypass finally; retirement/abort still clears this task.
+-  if(changed){const next=page.url;let timer;timer=state.setTimeout(()=>{state.tasks.delete(timer);if(active(state))fireAnEvent('hashchange',target,HashChangeEvent,{oldURL:old,newURL:next})},0);state.tasks.add(timer);}
++  if(changed)queueHistoryHash(page,old,page.url);
++  committedNavigation(page,{previous,entry:selected,kind:'traverse',disposed:[],operation});
+   page.emit?.('withinDocument',{url:page.url,navigationType:changed?'fragment':'historyApi'});
+   fireAnEvent('popstate',target,PopStateEvent,{state:value(state,stored(selected))});
+- }else await page.navigate(selected.url,{historyMode:'traverse',historyIndex:index,method:'GET'});
++ }else await page.navigate(selected.url,{historyMode:'traverse',historyIndex:index,method:'GET',historyEntry:selected});
+  return true;
+ }
+-export function commitFrameHistory(page,{historyMode='push',historyIndex}={},request){
+- if(!PAGES.has(page))return;const root=session(page);if(['about:blank','about:srcdoc'].includes(page.url)||page.url.startsWith('blob:'))return;historyMode=normalizeHistoryNavigation(page,historyMode);
++export function commitFrameHistory(page,{historyMode='push',historyIndex,navigationOperation}={},request){
++ if(!PAGES.has(page))return;const root=session(page);if(['about:blank','about:srcdoc'].includes(page.url)||page.url.startsWith('blob:'))return;historyMode=normalizeHistoryNavigation(page,historyMode);const previousHistoryEntry=current(page);
+  if(historyMode==='traverse'||(historyMode==='reload'&&root.historyIndex>=0)){
+   const index=historyMode==='reload'?root.historyIndex:historyIndex,entry=root.history[index];if(!entry)throw new Error('History entry no longer exists');
+   const previous=entry.documentId;for(const item of root.history)if(item.documentId===previous){item.documentId=page.documentId;item.frameId=page.frameId;}
+   root.historyIndex=index;entry.url=page.url;entry.frameId=page.frameId;restore(PAGES.get(page),entry);
+- }else commitJointHistory(page,page.url,null,historyMode==='replace'?'replace':'push');
++ }else commitJointHistory(page,page.url,null,historyMode==='replace'?'replace':'push',undefined,navigationOperation);
++ if(navigationOperation?.source==='navigation')restore(PAGES.get(page),current(page));
+  if(request?.historyRequest)current(page).request=request.historyRequest;
++ documentNavigation(page,{previous:previousHistoryEntry,entry:current(page),kind:historyMode,operation:navigationOperation});
+ }
+ export function commitBlankPopupHistory(page){if(page.url==='about:blank'&&sessionState(page).initial){normalizeHistoryNavigation(page,'replace');commitJointHistory(page,'about:blank',null,'replace')}}
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -1,3 +1,5 @@
++import vm from 'node:vm';
++import {beforeNavigation,linkedNavigation,stopNavigation} from './navigation-lifecycle.js';
+ import { createRequire } from 'node:module';
+ import {onFrameRetirement} from './frame-activity.js';
+ 
+@@ -6,9 +8,10 @@
+ const require = createRequire(import.meta.url);
+ const LocationImpl = require('jsdom/lib/jsdom/living/window/Location-impl.js').implementation;
+ const AnchorImpl = require('jsdom/lib/jsdom/living/nodes/HTMLAnchorElement-impl.js').implementation;
+-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const { implForWrapper,wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/living/window/Location-impl.js'));
+ const whatwgURL = jsdomRequire('whatwg-url');
++const {percentDecodeString}=jsdomRequire('whatwg-url/lib/percent-encoding.js');
+ const DOCUMENTS = new WeakMap();
+ let patched = false;
+ 
+@@ -38,9 +41,16 @@
+   record.timers.delete(timer);
+ }
+ 
++function scheduleJavascript(record,url){
++ const source=Buffer.from(percentDecodeString(url.slice('javascript:'.length))).toString('utf8');
++ let timer;timer=record.setTimeout(()=>{record.timers.delete(timer);if(!active(record)||!ownsCurrentDocument(record))return;try{vm.runInContext(source,record.page.dom.getInternalVMContext(),{timeout:Math.min(record.page.timeout??10000,2000),displayErrors:false,filename:'javascript:'})}catch(error){record.page.emit?.('pageError',error)}},0);record.timers.add(timer);
++}
+ function schedule(record, url, options) {
++  if(new URL(url).protocol==='javascript:'){if(active(record))scheduleJavascript(record,url);return}
+   supported(record, url);
+   if (!active(record)) throw new record.DOMException('The document is no longer active', 'InvalidStateError');
++  const operation=options.navigationOperation??beforeNavigation(record.page,{kind:options.historyMode==='traverse'?'traverse':options.historyMode==='reload'?'reload':options.historyMode==='replace'?'replace':'push',url,sameDocument:false,entry:options.historyEntry,stateJSON:options.navigationStateJSON,sourceElement:options.sourceElement,formData:options.formData});if(operation===false)return;
++  if(operation!==undefined)options={...options,navigationOperation:operation};
+   let resolve, reject;
+   const promise = new Promise((accept, fail) => { resolve = accept; reject = fail; });
+   // A page's location setter returns void. Observe the owned promise even if no
+@@ -94,7 +104,7 @@
+     );
+   }, 0);
+   record.timers.add(pending.timer);
+-  record.page.emit?.('navigationRequested', pending);
++  linkedNavigation(operation,pending);record.page.emit?.('navigationRequested', pending);
+   return pending;
+ }
+ 
+@@ -122,13 +132,17 @@
+     const record = DOCUMENTS.get(this._relevantDocument);
+     if (!record || !active(record)) return locationNavigate.call(this, destination, flags);
+     const url = whatwgURL.serializeURL(destination);
++    if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
+     supported(record, url);
+     if (fragmentNavigation(this._url, destination)) {
++      if(url===record.window.location.href)return;
++      const historyMode=flags.replacement||record.document.readyState==='loading'?'replace':'push';
++      const operation=beforeNavigation(record.page,{kind:historyMode,url,sameDocument:true,hashChange:true});if(operation===false)return;
+       const result = locationNavigate.call(this, destination, flags);
+-      record.page.reconcileURL?.(record.window, { historyMode: flags.replacement ? 'replace' : 'push' });
++      record.page.reconcileURL?.(record.window, { historyMode,navigationOperation:operation });
+       return result;
+     }
+-    schedule(record, url, { historyMode: flags.replacement ? 'replace' : 'push', referrer: record.window.location.href });
++    schedule(record, url, { historyMode: flags.replacement||record.document.readyState==='loading' ? 'replace' : 'push', referrer: record.window.location.href });
+   };
+ 
+   LocationImpl.prototype.reload = function () {
+@@ -147,6 +161,7 @@
+     const destination = this._ownerDocument.encodingParseAURL(this.href);
+     if (!destination) return;
+     const url = whatwgURL.serializeURL(destination);
++    if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
+     supported(record, url);
+     if (fragmentNavigation(this._ownerDocument._URL, destination)) {
+       const timer = record.setTimeout(() => {
+@@ -159,7 +174,7 @@
+       record.timers.add(timer);
+       return;
+     }
+-    schedule(record, url, { historyMode: 'push', referrer: this.relList.contains('noreferrer') ? '' : record.window.location.href });
++    schedule(record, url, { historyMode:'push',sourceElement:wrapperForImpl(this), referrer: this.relList.contains('noreferrer') ? '' : record.window.location.href });
+   };
+ 
+   AnchorImpl.prototype._activationBehavior = function (event) {
+@@ -191,7 +206,7 @@
+     page, window, document, documentImpl, signal: page.documentAbort?.signal,
+     DOMException: window.DOMException, setTimeout: window.setTimeout.bind(window),
+     clearTimeout: window.clearTimeout.bind(window), timers: new Set(), pending: new Set(), disposed: false,
+-    originalClose: window.close,
++    originalClose: window.close,originalStop:window.stop,
+   };
+   const dispose = () => {
+     if (record.disposed) return;
+@@ -202,12 +217,13 @@
+     DOCUMENTS.delete(documentImpl);
+     if (window.close === record.close) window.close = record.originalClose;
+     record.signal?.removeEventListener('abort', dispose);
+-    record.retirementUnsubscribe?.();
++    record.retirementUnsubscribe?.();if(window.stop===record.stop)window.stop=record.originalStop;
+     page.off?.('close', dispose);
+   };
+   record.controller = { dispose };
+   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
+   DOCUMENTS.set(documentImpl, record);
++  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');record.page.navigationAbort?.abort();stopNavigation(record.page);return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
+   record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');});
+   record.close = function () { dispose(); return record.originalClose.call(window); };
+   window.close = record.close;
+--- a/src/forms.js
++++ b/src/forms.js
+@@ -208,7 +208,7 @@
+     throw new window.DOMException(`Form submission protocol ${destination.protocol} is not implemented`, 'NotSupportedError');
+   }
+   const noReferrer = /(?:^|[\t\n\f\r ])noreferrer(?:$|[\t\n\f\r ])/i.test(form.getAttribute('rel') || '');
+-  const options = { method, historyMode: 'push', referrer: noReferrer ? '' : window.location.href };
++  const options = { method, historyMode: 'push',sourceElement:submitter??form,formData:method==='POST'?data:null, referrer: noReferrer ? '' : window.location.href };
+   if (method === 'GET') {
+     destination.search = `?${new URLSearchParams(serializedPairs(data))}`;
+   } else {
+--- /dev/null
++++ b/src/navigation-api.js
+@@ -0,0 +1,176 @@
++import vm from'node:vm';
++import{createRequire}from'node:module';
++import{getRuntimeBinding}from'./native-runtime.js';
++import{platformFactoryRecord,registerPlatformFactory}from'./platform-factories.js';
++import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';
++import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
++import{setNavigationLifecycle}from'./navigation-lifecycle.js';
++import{initialHistoryNavigation,commitNavigationState,updateNavigationState,traverseJointHistory}from'./joint-history.js';
++import{requestNavigation}from'./navigation.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),conversions=require('webidl-conversions');
++const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const WINDOWS=new WeakMap(),VALUES=new WeakMap(),SESSIONS=new WeakMap();
++const documentImpl=window=>{const provenance=platformFactoryRecord(window.document);if(provenance?.kind!=='Document')throw Error('Actual Document factory provenance required');return provenance.implementation};
++const apply=Reflect.apply,construct=Reflect.construct,define=Object.defineProperty,record=value=>Object.assign(Object.create(null),value),stringify=JSON.stringify;
++const rootFor=page=>page.parentFrameId?page.registry.page:page;
++function bootstrap(g,b){
++ 'use strict';const TypeError=g.TypeError;
++ class Navigation extends g.EventTarget{constructor(){throw new TypeError('Illegal Constructor')}}
++ class NavigationHistoryEntry extends g.EventTarget{constructor(){throw new TypeError('Illegal Constructor')}}
++ class NavigationDestination{constructor(){throw new TypeError('Illegal Constructor')}}
++ class NavigationActivation{constructor(){throw new TypeError('Illegal Constructor')}}
++ class NavigateEvent extends g.Event{constructor(type,init){return b.construct('NavigateEvent',new.target,arguments.length,type,init)}}
++ class NavigationCurrentEntryChangeEvent extends g.Event{constructor(type,init){return b.construct('NavigationCurrentEntryChangeEvent',new.target,arguments.length,type,init)}}
++ b.export(Navigation,NavigationHistoryEntry,NavigationDestination,NavigationActivation,NavigateEvent,NavigationCurrentEntryChangeEvent);
++}
++function session(page){const root=rootFor(page);let state=SESSIONS.get(root);if(!state){state=record({root,view:null,entries:new WeakMap(),operations:new Map(),activation:null});SESSIONS.set(root,state);root.once?.('close',()=>{for(const operation of state.operations.values()){operation.phase='finished';operation.resolveCommitted=operation.rejectCommitted=operation.resolveFinished=operation.rejectFinished=undefined;operation.result=undefined}state.operations.clear()})}return state}
++function typed(value,kind,realm){const state=VALUES.get(value);if(!state||state.kind!==kind)throw new realm.TypeError('Illegal invocation');return state}
++function parse(realm,text){return text===undefined?undefined:apply(realm.parse,undefined,[text])}
++function array(realm,items){const value=construct(realm.Array,[]);for(let i=0;i<items.length;i++)define(value,String(i),{value:items[i],writable:true,enumerable:true,configurable:true});return value}
++function produce(realm,kind,details){
++ const value=kind==='Navigation'||kind==='NavigationHistoryEntry'?construct(realm.EventTarget,[],realm.api[kind]):apply(realm.create,undefined,[realm.api[kind].prototype]);
++ const provenance=platformFactoryRecord(value);if((kind==='Navigation'||kind==='NavigationHistoryEntry')&&provenance?.kind!=='EventTarget')throw Error('Actual EventTarget factory provenance is required');
++ const state=record({kind,realm,implementation:provenance?.implementation,...details});VALUES.set(value,state);state.value=value;registerPlatformFactory(value,{kind,implementation:state.implementation??state,globalObject:realm.window});return value;
++}
++function entryObject(owner,entry,realm){let value=owner.entries.get(entry);if(!value){value=produce(realm??owner.view.realm,'NavigationHistoryEntry',{owner,entry});owner.entries.set(entry,value)}return value}
++function navigationObject(realm,page){const owner=session(page);if(owner.view&&owner.view.documentId!==owner.root.documentId){owner.view=null;owner.entries=new WeakMap()}if(!owner.view){const value=produce(realm,'Navigation',{owner,documentId:owner.root.documentId});owner.view=VALUES.get(value)}return owner.view.value}
++function metadata(entry){return{key:entry.navigationKey??String(entry.id-1),id:String(entry.id-1)}}
++function current(owner){return owner.root.history[owner.root.historyIndex]}
++function actualPage(realm){const p=realm.page;if(p.parentFrameId)return p.registry.findFrame(p.frameId)??p;return p}
++function eventValue(realm,kind,type,init,{trusted=false,newTarget}={}){
++ const common=record({bubbles:Boolean(init.bubbles),cancelable:Boolean(init.cancelable),composed:Boolean(init.composed)}),value=construct(realm.Event,[type,common],newTarget??realm.api[kind]);
++ const provenance=platformFactoryRecord(value);if(provenance?.kind!=='Event')throw Error('Actual Event factory provenance is required');
++ const state=record({kind,realm,value,implementation:provenance.implementation,trusted,...init});VALUES.set(value,state);state.implementation.isTrusted=trusted;registerPlatformFactory(value,{kind,implementation:state.implementation,globalObject:realm.window});return value;
++}
++function dispatch(target,event){const value=VALUES.get(target),data=VALUES.get(event),backend=value?.implementation??platformFactoryRecord(target)?.implementation;if(!backend||!data?.implementation)throw Error('Actual event target and event required');return backend._dispatch(data.implementation)}
++function realmClasses(realm){
++ const binding=realm.page.browser?.runtimeBinding??getRuntimeBinding();realm.binding=binding;
++ const entry=(name,length,fn)=>{const value=binding.createEntry((incumbent,receiver,args)=>fn(receiver,args,WINDOWS.get(incumbent)),realm.Object);define(value,'name',{value:name,configurable:true});define(value,'length',{value:length,configurable:true});return value};
++ const method=(prototype,name,length,fn)=>define(prototype,name,{value:entry(name,length,fn),writable:true,enumerable:true,configurable:true});
++ const accessor=(prototype,name,get,set)=>define(prototype,name,{get:entry('get '+name,0,get),...(set?{set:entry('set '+name,1,set)}:{}),enumerable:true,configurable:true});
++ for(const C of Object.values(realm.api))delete C.prototype.constructor;
++ const N=realm.api.Navigation.prototype,E=realm.api.NavigationHistoryEntry.prototype,D=realm.api.NavigationDestination.prototype,A=realm.api.NavigationActivation.prototype;
++ accessor(N,'activation',receiver=>{const owner=typed(receiver,'Navigation',realm).owner;if(!owner.activation)owner.activation=record({entry:current(owner),from:null,type:'replace'});return produce(realm,'NavigationActivation',{owner,activation:owner.activation})});
++ accessor(N,'canGoBack',receiver=>typed(receiver,'Navigation',realm).owner.root.historyIndex>0);
++ accessor(N,'canGoForward',receiver=>{const root=typed(receiver,'Navigation',realm).owner.root;return root.historyIndex<root.history.length-1});
++ accessor(N,'currentEntry',receiver=>{const owner=typed(receiver,'Navigation',realm).owner;return entryObject(owner,current(owner),realm)});accessor(N,'transition',receiver=>{typed(receiver,'Navigation',realm);return null});
++ for(const name of['back','entries','forward','navigate','reload','traverseTo','updateCurrentEntry']){if(name==='entries'){method(N,name,0,receiver=>{const owner=typed(receiver,'Navigation',realm).owner;return array(realm,owner.root.history.map(entry=>entryObject(owner,entry,realm)))});continue}method(N,name,['navigate','traverseTo','updateCurrentEntry'].includes(name)?1:0,(receiver,args,source)=>performNavigation(typed(receiver,'Navigation',realm),name,args,source,realm))}
++ for(const key of['id','index','key','sameDocument','url'])accessor(E,key,receiver=>{const s=typed(receiver,'NavigationHistoryEntry',realm);if(key==='index')return s.owner.root.history.indexOf(s.entry);if(key==='sameDocument')return s.entry.documentId===actualPage(realm).documentId;if(key==='url')return s.entry.url;return metadata(s.entry)[key]});
++ method(E,'getState',0,receiver=>parse(realm,typed(receiver,'NavigationHistoryEntry',realm).entry.navigationStateJSON));
++ for(const key of['url','key','id','index','sameDocument'])accessor(D,key,receiver=>{const s=typed(receiver,'NavigationDestination',realm);if(key==='url')return s.url;if(key==='sameDocument')return s.sameDocument;if(key==='index')return s.entry?s.owner.root.history.indexOf(s.entry):-1;return s.entry?metadata(s.entry)[key]:''});
++ method(D,'getState',0,receiver=>parse(realm,typed(receiver,'NavigationDestination',realm).stateJSON));
++ for(const key of['entry','from','navigationType'])accessor(A,key,receiver=>{const s=typed(receiver,'NavigationActivation',realm),a=s.activation;if(key==='navigationType')return a.type;return a[key]?entryObject(s.owner,a[key],realm):null});
++ const V=realm.api.NavigateEvent.prototype,C=realm.api.NavigationCurrentEntryChangeEvent.prototype;
++ for(const key of['navigationType','destination','canIntercept','userInitiated','hashChange','signal','formData','downloadRequest','info','hasUAVisualTransition','sourceElement'])accessor(V,key,receiver=>typed(receiver,'NavigateEvent',realm)[key]);
++ for(const key of['from','navigationType'])accessor(C,key,receiver=>{const s=typed(receiver,'NavigationCurrentEntryChangeEvent',realm);return key==='from'&&s.fromEntry?entryObject(s.owner,s.fromEntry,realm):s[key]});
++ for(const name of['intercept','scroll'])method(V,name,0,receiver=>{const s=typed(receiver,'NavigateEvent',realm);if(!s.trusted)throw realm.exception(name+'() may only be called on a trusted event.','SecurityError');if(s.implementation._canceledFlag)throw realm.exception(name+'() may not be called if the event has been canceled.','InvalidStateError');if(s.operation?.phase!=='dispatch')throw realm.exception(name+'() may only be called while the navigate event is being dispatched.','InvalidStateError');if(name==='scroll')throw realm.exception('intercept() must be called before scroll()','InvalidStateError');if(!s.canIntercept){const page=actualPage(realm);throw realm.exception(`A navigation with URL '${VALUES.get(s.destination).url}' cannot be intercepted by in a window with origin '${documentImpl(page.dom.window)._origin}' and URL '${page.url}'.`,'SecurityError')}});
++ for(const [prototype,kind,types]of[[N,'Navigation',['navigate','currententrychange','navigatesuccess','navigateerror']],[E,'NavigationHistoryEntry',['dispose']]])for(const type of types){const key='on'+type;accessor(prototype,key,receiver=>typed(receiver,kind,realm).handlers?.get(type)?.listener??null,(receiver,args)=>{const s=typed(receiver,kind,realm);s.handlers??=new Map();const old=s.handlers.get(type);if(old)apply(realm.remove,s.value,[type,old.wrapper]);const listener=args[0];if(typeof listener!=='function'){s.handlers.delete(type);return}const wrapper=function(event){return apply(listener,receiver,[event])};s.handlers.set(type,record({listener,wrapper}));apply(realm.add,s.value,[type,wrapper])})}
++ for(const [kind,C]of Object.entries(realm.api)){define(C.prototype,'constructor',{value:C,writable:true,configurable:true});define(C.prototype,realm.Symbol.toStringTag,{value:kind,configurable:true});define(realm.window,kind,{value:C,writable:true,configurable:true});registerPlatformFactoryKind(kind)}
++ define(realm.window,'navigation',{get:entry('get navigation',0,receiver=>{const target=WINDOWS.get(receiver);if(!target)throw new realm.TypeError('Illegal invocation');return navigationObject(realm,target.page)}),enumerable:true,configurable:true});
++}
++function constructPublicEvent(realm,kind,newTarget,count,type,init){
++ if(count<2||init===null||typeof init!=='object')throw new realm.TypeError('invalid argument');
++ type=conversions.DOMString(type,{globals:realm.globals});
++ if(kind==='NavigateEvent'){
++  const destination=init.destination,signal=init.signal;if(VALUES.get(destination)?.kind!=='NavigationDestination'||platformFactoryRecord(signal)?.kind!=='AbortSignal')throw new realm.TypeError('invalid argument');
++  const rawType=init.navigationType,navigationType=rawType===undefined?'push':conversions.DOMString(rawType,{globals:realm.globals});if(!['push','replace','reload','traverse'].includes(navigationType))throw new realm.TypeError('invalid argument');
++  const formData=init.formData??null,sourceElement=init.sourceElement??null,rawDownload=init.downloadRequest;if(formData!==null&&platformFactoryRecord(formData)?.kind!=='FormData')throw new realm.TypeError('invalid argument');if(sourceElement!==null&&!(platformFactoryRecord(sourceElement)?.implementation instanceof ElementImpl))throw new realm.TypeError('invalid argument');
++  return eventValue(realm,kind,type,{bubbles:init.bubbles,cancelable:init.cancelable,composed:init.composed,navigationType,destination,signal,formData,sourceElement,canIntercept:Boolean(init.canIntercept),userInitiated:Boolean(init.userInitiated),hashChange:Boolean(init.hashChange),downloadRequest:rawDownload==null?null:conversions.DOMString(rawDownload,{globals:realm.globals}),info:init.info,hasUAVisualTransition:Boolean(init.hasUAVisualTransition)},{newTarget});
++ }
++ const from=init.from;if(VALUES.get(from)?.kind!=='NavigationHistoryEntry')throw new realm.TypeError('invalid argument');const rawType=init.navigationType,navigationType=rawType==null?null:conversions.DOMString(rawType,{globals:realm.globals});if(navigationType!==null&&!['push','replace','reload','traverse'].includes(navigationType))throw new realm.TypeError('invalid argument');return eventValue(realm,kind,type,{bubbles:init.bubbles,cancelable:init.cancelable,composed:init.composed,from,navigationType},{newTarget});
++}
++export function installNavigationAPI(page,window){
++ if(WINDOWS.has(window))return;
++ const api=record({}),realm=record({page,window,api,Object:window.Object,Array:window.Array,create:window.Object.create,parse:window.JSON.parse,TypeError:window.TypeError,Symbol:window.Symbol,Promise:window.Promise,Event:window.Event,EventTarget:window.EventTarget,ErrorEvent:window.ErrorEvent,signalGetter:Object.getOwnPropertyDescriptor(window.AbortController.prototype,'signal').get,AbortController:window.AbortController,abort:window.AbortController.prototype.abort,add:window.EventTarget.prototype.addEventListener,remove:window.EventTarget.prototype.removeEventListener,globals:record({String:window.String,TypeError:window.TypeError,Number:window.Number}),exception:captureDOMExceptionFactory(window)});
++ const bridge=record({construct:(...args)=>constructPublicEvent(realm,...args),export(...values){for(let i=0;i<values.length;i++)api[['Navigation','NavigationHistoryEntry','NavigationDestination','NavigationActivation','NavigateEvent','NavigationCurrentEntryChangeEvent'][i]]=values[i]}});
++ vm.compileFunction(`(${bootstrap.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:utils.implForWrapper(window)._globalObject})(bridge);
++ WINDOWS.set(window,realm);WINDOWS.set(utils.implForWrapper(window)._globalObject,realm);realmClasses(realm);
++}
++const enqueue=queueMicrotask;
++function realmFor(page){return WINDOWS.get(page.dom?.window)}
++function userJSON(realm,input){try{return stringify(input)??'undefined'}catch{throw realm.exception('The object can not be cloned','DataCloneError')}}
++function returnPromises(realm,operation){
++ const committed=construct(realm.Promise,[(resolve,reject)=>{operation.resolveCommitted=resolve;operation.rejectCommitted=reject}]),finished=construct(realm.Promise,[(resolve,reject)=>{operation.resolveFinished=resolve;operation.rejectFinished=reject}]);
++ realm.binding.markPromiseHandled?.(committed);realm.binding.markPromiseHandled?.(finished);
++ const value=apply(realm.create,undefined,[realm.Object.prototype]);for(const [key,promise]of[['committed',committed],['finished',finished]])define(value,key,{value:promise,writable:true,enumerable:true,configurable:true});return value;
++}
++function sendEvent(owner,event){if(owner.view)dispatch(owner.view.value,event)}
++function plainEvent(realm,type,init={}){const value=construct(type==='navigateerror'?realm.ErrorEvent:realm.Event,[type,init]);const provenance=platformFactoryRecord(value);if(!provenance?.implementation)throw Error('Actual event provenance required');provenance.implementation.isTrusted=true;return record({value,implementation:provenance.implementation})}
++function firePlain(owner,realm,type,init){if(!owner.view)return;const event=plainEvent(realm,type,init);owner.view.implementation._dispatch(event.implementation)}
++function errorEvent(operation){if(!operation.errorPending)return;operation.errorPending=false;firePlain(operation.owner,operation.realm,'navigateerror',{error:operation.reason,message:'AbortError: Navigation was aborted',filename:operation.page.url,lineno:0,colno:0})}
++function rejectOperation(operation){if(!operation.rejectionPending)return;operation.rejectionPending=false;if(!operation.committed)operation.rejectCommitted?.(operation.reason);operation.rejectFinished?.(operation.reason)}
++function resolveFinished(operation){if(!operation.finishPending)return;operation.finishPending=false;operation.resolveFinished?.(undefined)}
++function abortOperation(operation,reason,{cancelTransport=false}={}){
++ if(!operation||operation.phase==='aborted'||operation.phase==='finished')return;
++ if(operation.phase==='dispatch'&&operation.event)VALUES.get(operation.event).implementation._canceledFlag=true;
++ operation.phase='aborted';if(operation.owner.operations.get(operation.page.frameId)===operation)operation.owner.operations.delete(operation.page.frameId);
++ operation.reason=reason??operation.realm.exception('Navigation was aborted','AbortError');
++ operation.rejectionPending=true;
++ if(cancelTransport){operation.pending?.cancel?.('Navigation was aborted');if(operation.pending?.started)operation.page.navigationAbort?.abort()}
++ operation.errorPending=Boolean(operation.event);if(operation.errorPending)enqueue(()=>errorEvent(operation));enqueue(()=>rejectOperation(operation));
++ apply(operation.realm.abort,operation.controller,[operation.reason]);errorEvent(operation);rejectOperation(operation);
++}
++function finishOperation(operation){
++ if(!operation||operation.phase==='aborted'||operation.phase==='finished')return;
++ operation.phase='finished';if(operation.owner.operations.get(operation.page.frameId)===operation)operation.owner.operations.delete(operation.page.frameId);
++ if(!operation.sameDocument)return;
++ operation.committed=true;operation.resolveCommitted?.(undefined);
++ operation.finishPending=true;enqueue(()=>resolveFinished(operation));if(operation.event||operation.source==='navigation')firePlain(operation.owner,operation.realm,'navigatesuccess');resolveFinished(operation);
++}
++function begin(page,details){
++ const owner=session(page),realm=realmFor(page);if(!realm)return;
++ if(!page.parentFrameId)abortOperation(owner.operations.get(page.frameId));
++ const implementation=owner.view?.implementation,listeners=implementation?._eventListeners;
++ const observed=['navigate','navigateerror','navigatesuccess'].some(type=>listeners?.[type]?.length);
++ if(!details.api&&(!observed||page.parentFrameId||initialHistoryNavigation(page)))return;
++ const controller=construct(realm.AbortController,[]),operation=record({owner,page,realm,controller,signal:apply(realm.signalGetter,controller,[]),phase:'preparing',source:details.source??'history',stateJSON:details.stateJSON,sameDocument:Boolean(details.sameDocument),committed:false});
++ if(details.api)operation.result=returnPromises(details.methodRealm??realm,operation);
++ owner.operations.set(page.frameId,operation);
++ // Keep ownership before event handlers: VM termination can skip JS finally.
++ enqueue(()=>{if(operation.phase==='preparing'||operation.phase==='dispatch'||operation.phase==='waiting'&&operation.sameDocument&&!operation.committed)abortOperation(operation,undefined,{cancelTransport:true})});
++ if(!page.parentFrameId&&!initialHistoryNavigation(page)){
++  const destination=produce(realm,'NavigationDestination',{owner,url:details.url,sameDocument:Boolean(details.sameDocument),entry:details.entry??null,stateJSON:details.entry?details.entry.navigationStateJSON:details.stateJSON});
++  const event=eventValue(realm,'NavigateEvent','navigate',{navigationType:details.kind,destination,canIntercept:false,userInitiated:false,hashChange:Boolean(details.hashChange),signal:operation.signal,formData:details.formData??null,downloadRequest:null,info:details.info,hasUAVisualTransition:false,sourceElement:details.sourceElement??null,cancelable:details.kind!=='traverse'||Boolean(details.sameDocument),operation},{trusted:true});
++  operation.event=event;operation.phase='dispatch';sendEvent(owner,event);
++  if(VALUES.get(event).implementation._canceledFlag||operation.phase==='aborted'){abortOperation(operation);return details.api?operation:false}
++ }
++ operation.phase='waiting';if(!operation.sameDocument){operation.resolveCommitted=operation.rejectCommitted=operation.resolveFinished=operation.rejectFinished=undefined}return operation;
++}
++function disposeEntries(owner,realm,entries){const pending=record({index:0,entries});const flush=()=>{while(pending.index<pending.entries.length){const entry=pending.entries[pending.index++],value=owner.entries.get(entry);if(value){const event=plainEvent(realm,'dispose');VALUES.get(value).implementation._dispatch(event.implementation)}}};enqueue(flush);return flush}
++function changed(page,details){
++ const owner=session(page),realm=realmFor(page);if(!realm)return;
++ const operation=details.operation;if(operation){if(operation.phase==='aborted')return;operation.committed=true;operation.phase=operation.sameDocument?'committed-dispatch':'committed';operation.resolveCommitted?.(undefined);if(operation.sameDocument)enqueue(()=>{if(operation.phase==='committed-dispatch')finishOperation(operation)})}
++ const flush=disposeEntries(owner,realm,details.disposed??[]);
++ if(owner.view&&(details.classic||details.update||operation?.sameDocument)){
++  const event=eventValue(realm,'NavigationCurrentEntryChangeEvent','currententrychange',{owner,fromEntry:details.previous,navigationType:details.kind},{trusted:true});sendEvent(owner,event);
++ }
++ flush();
++ if(operation?.phase==='committed-dispatch'){operation.phase='committed';enqueue(()=>finishOperation(operation))}
++}
++function performNavigation(target,name,args,_source,methodRealm){
++ const owner=target.owner,page=actualPage(methodRealm),realm=realmFor(page)??methodRealm,root=owner.root;
++ if(page.context!==root.context)throw methodRealm.exception('Navigation contexts do not match','SecurityError');
++ if(name==='updateCurrentEntry'){
++  if(!args.length||args[0]===null||typeof args[0]!=='object'||!('state'in args[0]))throw new methodRealm.TypeError('invalid argument');const state=args[0].state,text=userJSON(methodRealm,state);updateNavigationState(page,text);return;
++ }
++ let url,kind='push',selected=null,stateJSON,info,options;
++ if(name==='navigate'){
++  if(!args.length)throw new methodRealm.TypeError('invalid argument');const text=conversions.USVString(args[0],{globals:methodRealm.globals});try{url=new URL(text,page.url).href}catch{throw new methodRealm.TypeError('')}
++  options=args.length>1?args[1]:undefined;kind=options?.history==='replace'?'replace':'push';const state=options?.state;if(state!==undefined)stateJSON=userJSON(methodRealm,state);info=options?.info;
++ }else{
++  options=args.length?args[0]:undefined;info=options?.info;
++  if(name==='reload'){kind='reload';selected=current(owner);url=page.url;const state=options?.state;stateJSON=state===undefined?selected.navigationStateJSON:userJSON(methodRealm,state)}
++  else{kind='traverse';let index=root.historyIndex+(name==='back'?-1:1);if(name==='traverseTo'){if(!args.length)throw new methodRealm.TypeError('invalid argument');const key=conversions.DOMString(args[0],{globals:methodRealm.globals});index=root.history.findIndex(entry=>metadata(entry).key===key);info=args.length>1?args[1]?.info:undefined}if(index<0||index>=root.history.length)throw methodRealm.exception('The object is in an invalid state','InvalidStateError');selected=root.history[index];url=selected.url;stateJSON=selected.navigationStateJSON}
++ }
++ const sameDocument=kind==='traverse'?selected.documentId===page.documentId:kind!=='reload'&&url.split('#')[0]===page.url.split('#')[0];
++ const operation=begin(page,{api:true,methodRealm,source:'navigation',kind,url,entry:selected,stateJSON,info,sameDocument,hashChange:sameDocument&&url!==page.url&&url.split('#')[0]===page.url.split('#')[0]});
++ const result=operation.result;if(operation.phase==='aborted')return result;
++ if(sameDocument){
++  if(kind==='traverse')void traverseJointHistory(page,root.history.indexOf(selected),{navigationOperation:operation}).catch(()=>abortOperation(operation));
++  else commitNavigationState(page,page.dom.window,url,stateJSON??'null',kind,operation)
++ }else{requestNavigation(page,page.dom.window,url,{historyMode:kind,historyIndex:selected?root.history.indexOf(selected):undefined,method:'GET',historyEntry:selected,navigationStateJSON:stateJSON,navigationOperation:operation})}
++ return result;
++}
++function linked(operation,pending){if(!operation||!pending)return;operation.pending=pending;pending.promise.then(()=>finishOperation(operation),()=>{if(operation.sameDocument)abortOperation(operation);else finishOperation(operation)})}
++setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:true})}}));
++
+--- /dev/null
++++ b/src/navigation-lifecycle.js
+@@ -0,0 +1,9 @@
++// Trusted Host-only lifecycle seam. Runtime state remains with actual journals,
++// queues, transports and public objects; callbacks never answer fixture data.
++let observer;
++export function setNavigationLifecycle(value){observer=value}
++export function beforeNavigation(page,details){return observer?.begin(page,details)}
++export function committedNavigation(page,details){return observer?.committed(page,details)}
++export function documentNavigation(page,details){return observer?.document(page,details)}
++export function linkedNavigation(operation,pending){observer?.linked(operation,pending)}
++export function stopNavigation(page){observer?.stop(page)}
+--- a/test/navigation.test.js
++++ b/test/navigation.test.js
+@@ -26,6 +26,7 @@
+ test('Location.assign and href setters queue full navigation without changing public descriptors', async () => {
+   const f = fixture();
+   try {
++    await tick();
+     const descriptor = Object.getOwnPropertyDescriptor(f.window.location, 'href');
+     assert.equal(descriptor.configurable, false);
+     assert.equal(f.window.location.assign('/next'), undefined);
+--- a/test/navigation-integration.test.js
++++ b/test/navigation-integration.test.js
+@@ -32,7 +32,7 @@
+   assert.equal(result.url, `${base}/final`);
+   assert.equal(page.evaluate('document.title'), 'Final');
+   assert.deepEqual(loads, [`${base}/final`]);
+-  assert.deepEqual(page.history.map(entry => entry.url), [`${base}/start`, `${base}/final`]);
++  assert.deepEqual(page.history.map(entry => entry.url), [`${base}/final`]);
+   assert.equal(requests.find(request => request.path === '/middle').referrer, `${base}/start`);
+   assert.equal(requests.find(request => request.path === '/final').referrer, `${base}/middle`);
+ });
+--- /dev/null
++++ b/test/navigation-api.test.js
+@@ -0,0 +1,149 @@
++import {test,before,after} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {Browser,until} from '../src/browser.js';
++
++let server,origin,wire=[],sequence=0;
++before(async()=>{
++ server=http.createServer(async(request,response)=>{
++  let body='';for await(const chunk of request)body+=chunk;
++  wire.push({url:request.url,method:request.method,body});
++  response.setHeader('content-type','text/html');
++  response.end('<!doctype html><script>globalThis.actualToken='+ ++sequence+'</script><body>'+(request.url==='/root'?'<iframe name="child" src="/child"></iframe>':''));
++ });
++ server.listen(0,'127.0.0.1');await once(server,'listening');origin='http://127.0.0.1:'+server.address().port;
++});
++after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});
++async function fixture(t,{frames=true}={}){
++ const browser=new Browser({loadResources:frames?['iframe']:[]}),page=browser.createPage();t.after(()=>browser.close());
++ await page.navigate(origin+(frames?'/root':'/single'));
++ return{browser,page,w:page.dom.window,child:frames?page.dom.window.document.querySelector('iframe'):null};
++}
++const value=(page,source)=>JSON.parse(page.evaluate('JSON.stringify(('+source+'))'));
++
++test('Navigation interfaces have real selected-realm brands and reject copied or authored lookalikes',async t=>{
++ const{page}=await fixture(t);
++ const actual=value(page,`(()=>{const nav=navigation,entry=nav.currentEntry,errors=[];for(const C of[Navigation,NavigationHistoryEntry,NavigationDestination,NavigationActivation]){try{new C()}catch(e){errors.push([e.name,e.message,e instanceof TypeError])}}const fake=Object.create(Navigation.prototype);for(const key of Reflect.ownKeys(nav))Object.defineProperty(fake,key,Object.getOwnPropertyDescriptor(nav,key));try{fake.entries()}catch(e){errors.push([e.name,e.message,e instanceof TypeError])}const lookalike={kind:'Navigation',owner:{},entries(){return'authored'}};return{errors,nav:nav instanceof EventTarget,entry:entry instanceof EventTarget,tag:Object.prototype.toString.call(nav),transition:nav.transition,unexposed:typeof NavigationTransition,ordinary:lookalike.entries(),keys:Object.keys(lookalike)}})()`);
++ assert.deepEqual(actual.errors.slice(0,4),Array(4).fill(['TypeError','Illegal Constructor',true]));
++ assert.deepEqual(actual.errors[4],['TypeError','Illegal invocation',true]);assert.equal(actual.nav,true);assert.equal(actual.entry,true);assert.equal(actual.tag,'[object Navigation]');assert.equal(actual.transition,null);assert.equal(actual.unexposed,'undefined');assert.equal(actual.ordinary,'authored');assert.deepEqual(actual.keys,['kind','owner','entries']);
++});
++
++test('the actual shared Navigation is created in its first accessing frame realm with stable entries and fresh arrays',async t=>{
++ const{page}=await fixture(t);
++ assert.deepEqual(value(page,`(()=>{const child=document.querySelector('iframe').contentWindow,nav=child.navigation,a=nav.entries(),b=navigation.entries();return{same:nav===navigation,prototype:Object.getPrototypeOf(nav)===child.Navigation.prototype,array:Object.getPrototypeOf(a)===child.Array.prototype,entry:Object.getPrototypeOf(a[0])===child.NavigationHistoryEntry.prototype,stable:a[0]===b[0],fresh:a!==b,current:nav.currentEntry===a.at(-1),documents:a.map(e=>e.sameDocument)}})()`),{same:true,prototype:true,array:true,entry:true,stable:true,fresh:true,current:true,documents:[false,true]});
++});
++
++test('borrowed Navigation methods use their genuine method realm for actions, promises and first entry allocation',async t=>{
++ const{page}=await fixture(t);
++ const row=JSON.parse(await page.evaluate(`(async()=>{const c=document.querySelector('iframe').contentWindow,n=navigation;const a=Object.getOwnPropertyDescriptor(c.Navigation.prototype,'activation').get.call(n),entry=a.entry;const script=c.document.createElement('script');script.textContent="globalThis.actualReturn=navigation.navigate('#method-realm');globalThis.childPromise=actualReturn.finished instanceof Promise";c.document.body.append(script);await c.actualReturn.finished;return JSON.stringify({activationChild:a instanceof c.NavigationActivation,entryChild:entry instanceof c.NavigationHistoryEntry,childPromise:c.childPromise,parentPromise:c.actualReturn.finished instanceof Promise,root:location.href,child:c.location.href})})()`));
++ assert.deepEqual(row,{activationChild:true,entryChild:true,childPromise:false,parentPromise:true,root:origin+'/root#method-realm',child:origin+'/child'});
++});
++
++test('an unread currententrychange event preserves genuine lazy entry allocation in a later borrowed getter realm',async t=>{
++ const{page}=await fixture(t);
++ assert.deepEqual(value(page,`(()=>{const c=document.querySelector('iframe').contentWindow,n=navigation;let event;n.addEventListener('currententrychange',e=>event=e,{once:true});history.pushState(null,'','/history-state');const activation=Object.getOwnPropertyDescriptor(c.Navigation.prototype,'activation').get.call(n),entry=activation.entry;return{child:entry instanceof c.NavigationHistoryEntry,main:entry instanceof NavigationHistoryEntry,fromSame:event.from===entry,activationURL:entry.url}})()`),{child:true,main:false,fromSame:true,activationURL:origin+'/child'});
++});
++
++test('child-owned shared Navigation emits real child-realm success for its own same-document API operation',async t=>{
++ const{page}=await fixture(t);
++ const row=JSON.parse(await page.evaluate(`(async()=>{const c=document.querySelector('iframe').contentWindow,n=c.navigation,events=[];for(const type of['navigate','currententrychange','navigatesuccess'])n.addEventListener(type,e=>events.push([e.type,e instanceof c.Event]));const result=n.navigate('#child-owned');await result.finished;return JSON.stringify({events,childPromise:result.finished instanceof c.Promise,root:location.href,child:c.location.href})})()`));
++ assert.deepEqual(row,{events:[['currententrychange',true],['navigatesuccess',true]],childPromise:true,root:origin+'/root',child:origin+'/child#child-owned'});
++});
++
++test('same-document API navigation commits real URL/state, VM promises, events and the owned hash task',async t=>{
++ const{page,w}=await fixture(t,{frames:false}),document=w.document,before=wire.length;
++ const actual=await page.evaluate(`(async()=>{const events=[];for(const type of['navigate','currententrychange','navigatesuccess'])navigation.addEventListener(type,e=>events.push([type,e.isTrusted,e.target===navigation]));addEventListener('hashchange',e=>events.push([e.type,e.isTrusted,e.target===window]));const state={nested:{actual:17}},info={actual:41};let signal,sameInfo;navigation.addEventListener('navigate',e=>{signal=e.signal;sameInfo=e.info===info;const a=e.destination.getState(),b=e.destination.getState();if(a===b||a.nested===b.nested)throw Error('state aliases')},{once:true});const result=navigation.navigate('#owned',{state,info});const immediate={url:location.href,keys:Object.keys(result),promises:result.committed instanceof Promise&&result.finished instanceof Promise,distinct:result.committed!==result.finished,events:events.slice()};state.nested.actual=99;const committed=await result.committed,finished=await result.finished;await new Promise(r=>setTimeout(r,10));return JSON.stringify({immediate,committed:typeof committed,finished:typeof finished,state:history.state,entry:navigation.currentEntry.getState(),sameInfo,aborted:signal.aborted,events})})()`);
++ const row=JSON.parse(actual);assert.equal(row.immediate.url,origin+'/single#owned');assert.deepEqual(row.immediate.keys,['committed','finished']);assert.equal(row.immediate.promises,true);assert.equal(row.immediate.distinct,true);assert.deepEqual(row.immediate.events,[['navigate',true,true],['currententrychange',true,true]]);assert.equal(row.committed,'undefined');assert.equal(row.finished,'undefined');assert.deepEqual(row.state,{nested:{actual:17}});assert.deepEqual(row.entry,row.state);assert.equal(row.sameInfo,true);assert.equal(row.aborted,false);assert.deepEqual(row.events.map(e=>e[0]),['navigate','currententrychange','navigatesuccess','hashchange']);assert.equal(page.dom.window.document,document);assert.equal(wire.length,before);
++});
++
++test('canceling the real navigate event rejects both API promises with the exact signal reason and makes no request',async t=>{
++ const{page}=await fixture(t,{frames:false}),before=wire.length;
++ const row=JSON.parse(await page.evaluate(`(async()=>{let event,error;navigation.addEventListener('navigate',e=>{event=e;e.preventDefault()},{once:true});navigation.addEventListener('navigateerror',e=>error=e,{once:true});const result=navigation.navigate('/never-requested',{state:{actual:1}});const settled=await Promise.allSettled([result.committed,result.finished]);return JSON.stringify({url:location.href,prevented:event.defaultPrevented,aborted:event.signal.aborted,same:settled.every(r=>r.reason===event.signal.reason)&&error.error===event.signal.reason,name:error.error.name,message:error.message,realm:error.error instanceof DOMException,trusted:error.isTrusted})})()`));
++ assert.deepEqual(row,{url:origin+'/single',prevented:true,aborted:true,same:true,name:'AbortError',message:'AbortError: Navigation was aborted',realm:true,trusted:true});assert.equal(wire.length,before);assert.equal(page.pendingNavigation==null,true);
++});
++
++test('supersession aborts only the unfinished promise after currententrychange has committed',async t=>{
++ const{page}=await fixture(t,{frames:false});
++ const row=JSON.parse(await page.evaluate(`(async()=>{navigation.addEventListener('currententrychange',()=>history.pushState(null,'','#inner'),{once:true});const result=navigation.navigate('#outer');return JSON.stringify(await Promise.all([result.committed.then(()=> 'resolved',e=>'rejected '+e.name),result.finished.then(()=> 'resolved',e=>'rejected '+e.name)]))})()`));
++ assert.deepEqual(row,['resolved','rejected AbortError']);assert.equal(page.url,origin+'/single#inner');
++});
++
++test('actual callback microtasks retain Native ordering around success and abort promise settlement',async t=>{
++ const{page}=await fixture(t,{frames:false});
++ const order=JSON.parse(await page.evaluate(`(async()=>{const order=[];navigation.addEventListener('currententrychange',()=>Promise.resolve().then(()=>order.push('current-micro')),{once:true});navigation.addEventListener('navigatesuccess',()=>{order.push('success');result.finished.then(()=>order.push('finished-in-success'));Promise.resolve().then(()=>order.push('success-micro'))},{once:true});const result=navigation.navigate('#micro');result.committed.then(()=>order.push('committed'));result.finished.then(()=>order.push('finished'));await result.finished;await Promise.resolve();return JSON.stringify(order)})()`));
++ assert.deepEqual(order,['current-micro','success','committed','success-micro','finished','finished-in-success']);
++ const aborted=JSON.parse(await page.evaluate(`(async()=>{const order=[];navigation.addEventListener('navigate',e=>e.signal.addEventListener('abort',()=>{result.finished.catch(()=>order.push('signal-promise'));Promise.resolve().then(()=>order.push('signal-micro'))}),{once:true});const result=navigation.navigate('#first');history.pushState(null,'','#second');result.finished.catch(()=>order.push('outside-promise'));await Promise.resolve();await Promise.resolve();return JSON.stringify(order)})()`));
++ assert.deepEqual(aborted,['signal-micro','signal-promise','outside-promise']);
++});
++
++test('replace/prune dispose real removed entries last; activation remains a fresh snapshot of actual document commits',async t=>{
++ const{page,child}=await fixture(t);
++ const initial=value(page,`(()=>{globalThis.originalActivation=navigation.activation;const a=originalActivation,b=navigation.activation,old=navigation.currentEntry;globalThis.disposal=[];old.addEventListener('dispose',e=>disposal.push([e.type,e.isTrusted,old.index]));navigation.addEventListener('currententrychange',()=>disposal.push(['currententrychange',old.index]),{once:true});history.replaceState({classic:1},'','/replacement');return{fresh:a!==b,activation:{entry:a.entry.url,from:a.from.url,type:a.navigationType},after:navigation.activation.entry.url,old:old.url,key:old.key,currentKey:navigation.currentEntry.key,currentState:navigation.currentEntry.getState(),order:disposal}})()`);
++ assert.equal(initial.fresh,true);assert.deepEqual(initial.activation,{entry:origin+'/child',from:origin+'/root',type:'push'});assert.equal(initial.after,origin+'/child');assert.equal(initial.old,origin+'/child');assert.equal(initial.key,initial.currentKey);assert.equal(initial.currentState,undefined);assert.deepEqual(initial.order,[['currententrychange',-1],['dispose',true,-1]]);
++ child.src='/child-next';await until(()=>child.contentDocument?.URL===origin+'/child-next'&&child.contentDocument.readyState==='complete');
++ assert.deepEqual(value(page,`({entry:navigation.activation.entry.url,from:navigation.activation.from.url,type:navigation.activation.navigationType,old:originalActivation.entry.url})`),{entry:origin+'/child-next',from:origin+'/replacement',type:'push',old:origin+'/child'});
++});
++
++test('state updates retain entry identity, JSON snapshot semantics and selected-realm getState values',async t=>{
++ const{page}=await fixture(t);
++ const row=value(page,`(()=>{const entry=navigation.currentEntry,events=[];navigation.addEventListener('currententrychange',e=>events.push([e.from===entry,e.navigationType]));const state={nested:{owned:1}};navigation.updateCurrentEntry({get state(){globalThis.reads=(globalThis.reads||0)+1;return state}});state.nested.owned=99;const a=entry.getState(),b=entry.getState();let missing,bigint;try{navigation.updateCurrentEntry({})}catch(e){missing=[e.name,e instanceof TypeError]}try{navigation.updateCurrentEntry({state:1n})}catch(e){bigint=[e.name,e.message,e instanceof DOMException]}return{same:entry===navigation.currentEntry,reads,state:history.state,a,fresh:a!==b&&a.nested!==b.nested,realm:Object.getPrototypeOf(a)===Object.prototype,events,missing,bigint}})()`);
++ assert.deepEqual(row,{same:true,reads:1,state:{nested:{owned:1}},a:{nested:{owned:1}},fresh:true,realm:true,events:[[true,null]],missing:['TypeError',true],bigint:['DataCloneError','The object can not be cloned',true]});
++});
++
++test('an explicit undefined state is stored; the genuine JSON read reports its selected-realm SyntaxError',async t=>{
++ const{page}=await fixture(t,{frames:false});
++ assert.deepEqual(value(page,`(()=>{let count=0;navigation.addEventListener('currententrychange',()=>count++);navigation.updateCurrentEntry({state:undefined});let error;try{navigation.currentEntry.getState()}catch(e){error=[e.name,e instanceof SyntaxError]}return{count,error}})()`),{count:1,error:['SyntaxError',true]});
++});
++
++test('traverseTo uses actual document ownership and live keys without an HTTP request',async t=>{
++ const{page,w}=await fixture(t,{frames:false}),doc=w.document,before=wire.length;
++ const row=JSON.parse(await page.evaluate(`(async()=>{history.pushState({one:1},'','/state-one');const entry=navigation.currentEntry;history.pushState({two:2},'','/state-two');const events=[];navigation.addEventListener('navigate',e=>events.push([e.navigationType,e.destination.key===entry.key,e.destination.index,e.destination.sameDocument]),{once:true});const result=navigation.traverseTo(entry.key);await result.finished;return JSON.stringify({url:location.href,state:history.state,current:navigation.currentEntry===entry,events})})()`));
++ assert.deepEqual(row,{url:origin+'/state-one',state:{one:1},current:true,events:[['traverse',true,1,true]]});assert.equal(wire.length,before);assert.equal(page.dom.window.document,doc);
++});
++
++test('an accepted cross-document API navigation performs real HTTP and keeps old-document promises unsettled',async t=>{
++ const{page,w}=await fixture(t,{frames:false}),before=wire.length;
++ page.evaluate(`globalThis.settled=[];const result=navigation.navigate('/network',{state:{actual:17}});result.committed.then(()=>settled.push('committed'));result.finished.then(()=>settled.push('finished'));true`);
++ const pending=page.pendingNavigation;assert.ok(pending);await pending.promise;
++ assert.equal(wire[before].url,'/network');assert.equal(wire[before].method,'GET');assert.equal(page.url,origin+'/network');assert.deepEqual(Array.from(w.settled),[]);assert.deepEqual(value(page,'({state:history.state,entry:navigation.currentEntry.getState()})'),{state:{actual:17},entry:{actual:17}});assert.notEqual(page.dom.window,w);
++});
++
++test('closing the real owning target cancels queued HTTP without acknowledging old-document API promises',async t=>{
++ const{page,w}=await fixture(t,{frames:false}),before=wire.length;
++ page.evaluate(`globalThis.settlements=[];const result=navigation.navigate('/closed-before-http');result.committed.then(()=>settlements.push('committed'),()=>settlements.push('rejected'));result.finished.then(()=>settlements.push('finished'),()=>settlements.push('rejected'));true`);
++ const pending=page.pendingNavigation;page.close();await assert.rejects(pending.promise,error=>error.name==='AbortError');await new Promise(resolve=>setImmediate(resolve));assert.equal(page.closed,true);assert.equal(page.activeRequests.size,0);assert.deepEqual(Array.from(w.settlements),[]);assert.equal(wire.length,before);
++});
++
++test('aborting a superseded event preserves the first accepted transport when the newer event is canceled',async t=>{
++ const{page}=await fixture(t,{frames:false}),before=wire.length;
++ const row=value(page,`(()=>{const events=[];navigation.addEventListener('navigate',e=>events.push(e));location.href='/accepted';navigation.addEventListener('navigate',e=>e.preventDefault(),{once:true});location.href='/canceled';return{aborted:events.map(e=>e.signal.aborted),prevented:events.map(e=>e.defaultPrevented)}})()`);
++ assert.deepEqual(row,{aborted:[true,true],prevented:[false,true]});const pending=page.pendingNavigation;assert.ok(pending);await pending.promise;assert.equal(wire[before].url,'/accepted');assert.equal(wire.slice(before).some(r=>r.url==='/canceled'),false);assert.equal(page.url,origin+'/accepted');
++});
++
++test('actual form and anchor producers provide their owned Element and FormData before cancellation',async t=>{
++ const{page}=await fixture(t,{frames:false}),before=wire.length;
++ assert.deepEqual(value(page,`(()=>{const events=[];navigation.addEventListener('navigate',e=>{events.push({source:e.sourceElement.tagName,data:e.formData&&Array.from(e.formData),trusted:e.isTrusted});e.preventDefault()});const f=document.createElement('form');f.method='post';f.action='/posted';f.innerHTML='<input name=actual value=value><button>go</button>';document.body.append(f);f.requestSubmit(f.lastChild);const a=document.createElement('a');a.href='/clicked';document.body.append(a);a.click();return events})()`),[{source:'BUTTON',data:[['actual','value']],trusted:true},{source:'A',data:null,trusted:true}]);assert.equal(wire.length,before);
++});
++
++test('javascript URLs execute real decoded code as owned tasks without navigation events or network',async t=>{
++ const{page}=await fixture(t,{frames:false}),before=wire.length;
++ assert.deepEqual(value(page,`(()=>{globalThis.navigationEvents=0;navigation.addEventListener('navigate',()=>navigationEvents++);location.href='javascript:globalThis.actualJavascript%3D17';return{value:globalThis.actualJavascript,url:location.href}})()`),{url:origin+'/single'});
++ await until(()=>page.evaluate('globalThis.actualJavascript')===17);assert.equal(page.evaluate('navigationEvents'),0);assert.equal(wire.length,before);assert.equal(page.url,origin+'/single');
++});
++
++test('VM interruption during navigate dispatch cancels actual ownership and a later navigation still works',async t=>{
++ const{page}=await fixture(t,{frames:false}),before=wire.length;page.timeout=60;
++ page.evaluate(`globalThis.actualSignal=null;navigation.addEventListener('navigate',e=>{actualSignal=e.signal;for(;;){}},{once:true})`);
++ assert.throws(()=>page.evaluate(`navigation.navigate('/interrupted')`),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});
++ await new Promise(resolve=>setImmediate(resolve));assert.equal(page.evaluate('actualSignal.aborted'),true);assert.equal(page.pendingNavigation==null,true);assert.equal(page.activeRequests.size,0);assert.equal(wire.length,before);
++ await page.evaluate(`navigation.navigate('#later').finished`);assert.equal(page.url,origin+'/single#later');
++});
++
++test('committed entry disposal remains owned when a real currententrychange callback is interrupted',async t=>{
++ const{page}=await fixture(t,{frames:false});page.timeout=60;
++ page.evaluate(`globalThis.oldEntry=navigation.currentEntry;globalThis.disposals=0;oldEntry.addEventListener('dispose',()=>disposals++);navigation.addEventListener('currententrychange',()=>{for(;;){}},{once:true});true`);
++ assert.throws(()=>page.evaluate(`history.replaceState({actual:1},'','/committed-before-interruption')`),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});
++ await new Promise(resolve=>setImmediate(resolve));assert.equal(page.evaluate('disposals'),1);assert.equal(page.evaluate('oldEntry.index'),-1);assert.equal(page.url,origin+'/committed-before-interruption');assert.equal(page.activeRequests.size,0);
++ await page.evaluate(`navigation.navigate('#later').finished`);assert.equal(page.url,origin+'/committed-before-interruption#later');
++});
+--- /dev/null
++++ b/test/navigation-api-privacy.test.js
+@@ -0,0 +1,16 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {Browser} from '../src/browser.js';
++import {queryHeapObjects} from '../src/heap-query.js';
++
++test('Navigation factories retain only Host-private records while genuine public and authored identities remain queryable',async t=>{
++ const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());
++ await page.navigate('data:text/html,actual-navigation-privacy');const w=page.dom.window;
++ page.evaluate(`globalThis.ordinaryNavigationObject={marker:17};globalThis.authoredNavigationInterfaces={Navigation,NavigationHistoryEntry,NavigationDestination,NavigationActivation,NavigateEvent,NavigationCurrentEntryChangeEvent};globalThis.authoredNavigationRecord={api:authoredNavigationInterfaces,window,construct(){return'authored'}};globalThis.actualDestination=null;navigation.addEventListener('navigate',e=>actualDestination=e.destination,{once:true});history.pushState(null,'','#owned');globalThis.actualActivation=navigation.activation;globalThis.actualEntry=navigation.currentEntry;true`);
++ const result=queryHeapObjects(w.Object.prototype,page.dom.getInternalVMContext()).objects;
++ for(const expected of[w.ordinaryNavigationObject,w.authoredNavigationInterfaces,w.authoredNavigationRecord,w.navigation,w.actualEntry,w.actualDestination,w.actualActivation])assert.equal(result.includes(expected),true);
++ const own=(object,key)=>Object.getOwnPropertyDescriptor(object,key)?.value;
++ const dictionaries=result.filter(object=>Object.getPrototypeOf(object)===w.Object.prototype&&['Navigation','NavigationHistoryEntry','NavigationDestination','NavigationActivation','NavigateEvent','NavigationCurrentEntryChangeEvent'].every(key=>own(object,key)===w[key]));
++ assert.equal(dictionaries.length,1);assert.equal(dictionaries[0],w.authoredNavigationInterfaces);
++ assert.equal(w.authoredNavigationRecord.construct(),'authored');assert.equal(w.actualDestination.url,'data:text/html,actual-navigation-privacy#owned');assert.equal(w.actualActivation instanceof w.NavigationActivation,true);
++});

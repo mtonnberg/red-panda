@@ -1,0 +1,9 @@
+Positive Window timer task checkpoint, isolated owned104 graph
+
+The unchanged broadcast_channel.html fixture uses a real BroadcastChannel to the real child Window and checks the received value after its original 100ms timer. Owned104 delivers the authentic message later than that overdue callback under inline-module load. Native delivers the message before that callback. The instrumented child is started and alive, with the same genuine Window/Document and no close/error; its late message proves actual transport/namespace ownership survives.
+
+Runtime proposal: retain once-converted normalized delays and the existing zero/clamped-zero path. A due positive timer schedules one captured Host Immediate before authored execution. Keep the genuine timer ID/private owner state until execution, cancel that pending job on clear/disposal/retirement, and coalesce pending interval jobs. No message payload, transport, Source budget, endpoint, Node API, native artifact, or fixture bytes change.
+
+Evidence epochs remain distinct: original Native/owned104 four-case diagnostic; blanket checkpoint trial; original104 heldout zero-order baseline; positive-only Native/candidate trial; later focused regression. The blanket trial is not the merge proposal. Both original104 and the positive proposal retain an existing zero-delay timer-first versus BroadcastChannel order mismatch. Native raw orders and original candidate contrary remain in evidence. Positive full/exact/trace/inline-busy cases pass Native and candidate with original100ms and full Source assertion budgets.
+
+The candidate graph is owned104 plus the single timer leaf, not currentRoot. Base timer bytes were independently verified equal to currentRoot before editing. Other Root fixes were not imported. Runtime integration must apply only the narrow timer patch, with the heldout regression test as a separate artifact.

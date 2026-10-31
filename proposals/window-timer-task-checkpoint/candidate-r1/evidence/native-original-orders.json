@@ -1,0 +1,98 @@
+{
+  "engine": "native",
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "origin": "http://127.0.0.1:33101",
+  "fixtureSHA256": "cfbabf0452b5c7b4d231ec64445cbd40e6cc8882533cd01a2d0dc48f9b68adbf",
+  "block": "\n{\n    const state = await testing.async();\n\n    const iframe = document.createElement(\"iframe\");\n    document.documentElement.appendChild(iframe);\n    const doc = iframe.contentDocument;\n    doc.write(\n        '<!DOCTYPE html><body><script>' +\n        'const c = new BroadcastChannel(\"x-p2i\");' +\n        'c.onmessage = (e) => { window.__got = e.data; };' +\n        '<\\/script></body>'\n    );\n    doc.close();\n\n    // The iframe's channel is registered synchronously by document.close(), so\n    // the listener is ready before we post.\n    const bc = new BroadcastChannel(\"x-p2i\");\n    bc.postMessage(\"hi-from-page\");\n\n    setTimeout(() => state.resolve(), 100);\n    await state.done(() => {\n        testing.expectEqual(\"hi-from-page\", iframe.contentWindow.__got);\n        bc.close();\n    });\n}\n",
+  "blockSHA256": "7073995cead605cea919114756d60ec566c9c70f304eab064f1aca2bdaa8d8d8",
+  "traced": "\n{\n    const state = await testing.async();\n\n    const trace=globalThis.__ownedBcTrace={events:[],errors:[]};\n    const iframe = document.createElement(\"iframe\");\n    iframe.addEventListener('load',()=>trace.events.push(['iframe-load',performance.now()]));\n    document.documentElement.appendChild(iframe);\n    const doc = iframe.contentDocument,w=iframe.contentWindow;\n    w.addEventListener('error',e=>trace.errors.push({message:e.message,name:e.error?.name}));\n    trace.snapshot=()=>({sameWindow:w===iframe.contentWindow,sameDocument:doc===iframe.contentDocument,closed:w.closed,ready:doc.readyState,url:doc.URL,origin:w.location.origin,started:w.__bcStarted,registered:w.__bcReady,messageAt:w.__bcMessageAt,got:w.__got,html:doc.documentElement?.outerHTML});\n    trace.afterAppend=trace.snapshot();\n    doc.write(\n        '<!DOCTYPE html><body><script>' +\n        'window.__bcStarted=performance.now();const c = new BroadcastChannel(\"x-p2i\");window.__bcReady=performance.now();' +\n        'c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };' +\n        '<\\/script></body>'\n    );\n    doc.close();trace.afterClose=trace.snapshot();\n\n    // The iframe's channel is registered synchronously by document.close(), so\n    // the listener is ready before we post.\n    const bc = new BroadcastChannel(\"x-p2i\");\n    trace.postAt=performance.now();bc.postMessage(\"hi-from-page\");\n\n    setTimeout(() => {trace.timerAt=performance.now();trace.at100=trace.snapshot();state.resolve()}, 100);\n    if(location.search.includes('busy')){const end=performance.now()+120;while(performance.now()<end){}}\n    await state.done(() => {\n        testing.expectEqual(\"hi-from-page\", iframe.contentWindow.__got);\n        bc.close();\n    });\n}\n",
+  "tracedSHA256": "1db587f5e36db226e39854eb06cf43c11a7aaf37ae4893cf48139c27eb6d9cfb",
+  "bodySHA256": {
+    "full": "cfbabf0452b5c7b4d231ec64445cbd40e6cc8882533cd01a2d0dc48f9b68adbf",
+    "exact": "b7ede5f3ccc949d989c3850e7a3a1e161c699f239e6cc2046974b7573199f417",
+    "trace": "84ff77eaab53c5a8fd5f47f7db918beaa09506e54bd7b91cbffda76089cba59e",
+    "busy": "699724ecc0a8dc06070471e229f61786d0406951649ed27ff5b98ae7da8b994c"
+  },
+  "pollSource": "(()=>{if(typeof testing==='undefined')return JSON.stringify({ready:false});try{return JSON.stringify({ready:true,native:testing.IS_TEST_RUNNER,passed:testing.assertOk()===true})}catch(error){return JSON.stringify({ready:true,native:testing.IS_TEST_RUNNER,failed:true,error:{name:error.name,message:error.message,stack:error.stack}})}})()",
+  "snapshot": "(()=>{const t=globalThis.__ownedBcTrace;return JSON.stringify({trace:t?{...t,snapshot:undefined,late:t.snapshot()}:null,document:{url:document.URL,ready:document.readyState},frames:[...document.querySelectorAll('iframe')].map(f=>{try{const w=f.contentWindow,d=f.contentDocument;return{url:d?.URL,ready:d?.readyState,closed:w?.closed,origin:w?.location.origin,got:w?.__got,html:d?.documentElement?.outerHTML}}catch(e){return{error:e.message}}})})})()",
+  "rows": [
+    {
+      "kind": "orders",
+      "navigation": {
+        "frameId": "FID-0000000001",
+        "loaderId": "LID-0000000001"
+      },
+      "polls": [],
+      "orders": {
+        "result": {
+          "type": "string",
+          "value": "{\"rows\":[{\"kind\":\"micro-zero\",\"log\":[\"sync\",\"micro\",\"timer1\",\"micro1\",\"timer2\"]},{\"kind\":\"message-first-zero\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"timer-first-zero\",\"log\":[\"timer\",[\"message\",\"actual message\"]]},{\"kind\":\"busy-overdue\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"busy-cancel\",\"log\":[[\"message\",\"actual message\"]]}],\"boundary\":\"Authored heldout task orders, actual callbacks/messages; busy120ms diagnostic only, original runtime delays unchanged\"}"
+        }
+      },
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders\",\"ready\":\"complete\"},\"frames\":[]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders\",\"ready\":\"complete\"},\"frames\":[]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "FID-0000000001",
+            "loaderId": "LID-0000000001",
+            "url": "http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders",
+            "domainAndRegistry": "",
+            "securityOrigin": "http://127.0.0.1:33101",
+            "mimeType": "text/html",
+            "adFrameStatus": {
+              "adFrameType": "none"
+            },
+            "secureContextType": "InsecureScheme",
+            "crossOriginIsolatedContextType": "NotIsolated",
+            "gatedAPIFeatures": []
+          }
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "type": "Navigation",
+            "frame": {
+              "id": "FID-0000000001",
+              "loaderId": "LID-0000000001",
+              "url": "http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders",
+              "domainAndRegistry": "",
+              "securityOrigin": "http://127.0.0.1:33101",
+              "mimeType": "text/html",
+              "adFrameStatus": {
+                "adFrameType": "none"
+              },
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            }
+          },
+          "sessionId": "SID-1"
+        }
+      ],
+      "ms": 471.101216
+    }
+  ],
+  "requests": [
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=orders",
+      "at": 337.356202
+    }
+  ],
+  "stderr": "$time=1793463720866 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:43527 max_connections=16120 max_browser_connections=16\n",
+  "ms": 1512.90155,
+  "boundary": "Whole source bytes unchanged for full. Exact-block/trace/busy are independent diagnostics, not whole-source acceptance. Original fixture100ms unchanged. Busy120ms is authored diagnostic only, no runtime budget change."
+}

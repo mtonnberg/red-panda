@@ -1,3 +1,5 @@
+import {withLocationFactory} from './location-factory.js';
+import {commitFrameHistory} from './joint-history.js';
 import {disposeBrowsingWindow} from './popup-pages.js';
 import {forwardRequestMetadata} from './request-metadata.js';
 import {retireFrameActivity} from './frame-activity.js';
@@ -11,8 +13,8 @@ import { createRequire } from 'node:module';
 
 // These hooks target pinned jsdom26. They affect only frames whose owner
 // document belongs to an installed registry, and retain jsdom's actual windows.
-// Scope: GET navigation, src/srcdoc/about:blank and normal jsdom subresources.
-// Frame history, POST navigation, named targets, sandbox/CSP/origin isolation and
+// Scope: actual GET/POST navigation, src/srcdoc/about:blank and jsdom subresources.
+// Frame history, sandbox/CSP/origin isolation and
 // cross-frame coordinate transforms are not implemented. Child facade close()
 // retires browsing authority while preserving the actual realm and Document;
 // owning-page teardown finally aborts and closes the retained windows.
@@ -78,8 +80,9 @@ function patch() {
   };
   WindowFactory.createWindow = function (options) {
     const operation = operations.at(-1);
+    if(operation?.navigationRequest)options={...options,referrer:operation.owner.registry.page.referrerFor(options.url,operation.navigationRequest.referrer??'')??''};
     const window = operation && !operation.created && !operation.owner.registry.disposed
-      ? createOwnedWindow(createWindow, options) : createWindow(options);
+      ? withLocationFactory(()=>createOwnedWindow(createWindow, options)) : createWindow(options);
     if (!operation || operation.created || operation.owner.registry.disposed) return window;
     operation.created = true; operation.restore();
     operation.owner.registry.register(operation, window);
@@ -94,7 +97,20 @@ function patch() {
     let request;
     const loaded = options.onLoad;
     const abort = () => request?.abort?.();
-    request = fetchResource.call(this, url, { ...options, onLoad(data) {
+    const navigation = page.record.navigationRequest;
+    // Keep jsdom's original request manager, resource queue, parser and load
+    // event path. Only this frame document's actual transport receives its
+    // submitted method/body/headers instead of the ordinary GET loader.
+    const originalLoader=this._resourceLoader;
+    if(navigation)this._resourceLoader=Object.assign(Object.create(originalLoader),{fetch(destination){
+      const controller=new AbortController(),headers=new Headers(navigation.headers);
+      const referrer=page.referrerFor(destination,navigation.referrer??'');if(referrer)headers.set('referer',referrer);
+      const request=page.fetch(destination,{method:navigation.method??'GET',body:navigation.body,headers,signal:controller.signal,skipDefaultReferrer:!headers.has('referer')},'Document').then(async response=>{
+        request.response={statusCode:response.status,headers:Object.fromEntries(response.headers)};delete request.response.headers['set-cookie'];request.href=response.finalUrl??response.url;request.documentReferrer=response.requestHeaders?.referer??'';request.historyRequest={method:response.requestMethod??navigation.method??'GET',body:structuredClone(response.requestBody),headers:Object.fromEntries([...new Headers(response.requestHeaders)].filter(([name])=>!['cookie','authorization','user-agent','accept-language'].includes(name)))};
+        return Buffer.from(await response.arrayBuffer());
+      });request.abort=()=>controller.abort();request.getHeader=name=>headers.get(name)??page.extraHTTPHeaders.get(name);return request;
+    }});
+    try { request = fetchResource.call(this, url, { ...options, onLoad(data) {
       if (page.closed) throw stale();
       owner.registry.beforeFrameParse(frame, request);
       page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
@@ -103,7 +119,7 @@ function patch() {
       page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
       if (!page.closed && !page.retired) owner.registry.announce('frameNavigationError', { frameId: page.frameId, error });
       return options.onError?.(error);
-    } });
+    } }); } finally {this._resourceLoader=originalLoader;page.record.navigationRequest=undefined;}
     page.documentAbort.signal.addEventListener('abort', abort, { once: true }); page.resourceRequests.add(request);
     return request;
   };
@@ -308,6 +324,8 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     childWindow._top = parentWindow.top; childWindow._frameElement = implementation;
     childWindow._virtualConsole = parentWindow._virtualConsole;
     record.window = childWindow; record.document = childWindow.document;
+    record.navigationRequest = operation.navigationRequest;
+    record.historyOperation = operation.navigationRequest;
     const framePage = record.page = new FramePage(registry, record, childWindow);
     registry.frames.set(record.id, framePage);
     const impl = implForWrapper(record.document);
@@ -386,12 +404,13 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     if (finalURL) {
       const documentImpl = implForWrapper(record.document);
       documentImpl._URL = parseURL(finalURL); documentImpl._origin = new URL(finalURL).origin;
+      if(request.documentReferrer!==undefined)documentImpl._referrer=request.documentReferrer;
       documentImpl._clearBaseURLCache();
       record.window._origin = documentImpl._origin; record.page.url = finalURL;
       const mimeType = request?.response?.headers?.['content-type']?.split(';')[0].trim();
       if (mimeType) documentImpl.contentType = mimeType;
     }
-    record.waitingResource = false; registry.committed(record);
+    record.waitingResource = false; commitFrameHistory(record.page,record.historyOperation,request);registry.committed(record);
   };
   registry.findFrame = id => !registry.disposed ? registry.frames.get(id) : undefined;
   registry.findContext = id => !registry.disposed ? contexts.get(id) : undefined;
@@ -407,24 +426,21 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     };
     return tree(root);
   };
-  registry.navigate = async (id, input, { waitUntil = 'load', onCommit, method, body, headers, historyMode } = {}) => {
+  registry.navigate = async (id, input, { waitUntil = 'load', onCommit, method, body, headers, historyMode, historyIndex, referrer } = {}) => {
     const record = records.get(id);
     if (!record || record.root || !record.page) throw stale();
-    if ((method && method.toUpperCase() !== 'GET') || body !== undefined || (headers && [...new Headers(headers)].length)) {
-      throw new TypeError('Frame POST navigation and custom navigation headers are not implemented');
-    }
     if (!['load', 'domcontentloaded'].includes(waitUntil)) throw new TypeError('Unsupported frame navigation wait condition');
     const url = new URL(String(input), record.document.baseURI);
     if (!['http:', 'https:', 'data:'].includes(url.protocol) && url.href !== 'about:blank') throw new TypeError(`Unsupported frame navigation URL: ${url.href}`);
     const previousURL = new URL(record.page.url);
-    if (historyMode !== 'reload' && url.href.includes('#') && url.href.split('#')[0] === previousURL.href.split('#')[0]) {
+    if ((!method || method.toUpperCase() === 'GET') && body === undefined && historyMode !== 'reload' && url.href.includes('#') && url.href.split('#')[0] === previousURL.href.split('#')[0]) {
       record.window.location.hash = url.hash; record.page.reconcileURL(); onCommit?.();
       return { url: record.page.url, frameId: id, loaderId: record.page.loaderId };
     }
     const implementation = record.element;
     // Trigger native loadFrame without altering reflected iframe.src/srcdoc.
     frameOperation(implementation, () => nativeAttrModified.call(implementation,
-      'src', url.href, implementation.getAttributeNS(null, 'src')), { url: url.href, srcdoc: undefined, ignoreSrcdoc: true });
+      'src', url.href, implementation.getAttributeNS(null, 'src')), { url: url.href, srcdoc: undefined, ignoreSrcdoc: true, navigationRequest: {method,body,headers,historyMode,historyIndex,referrer:referrer??record.page.url} });
     const current = record.page; onCommit?.();
     const loaded = new Promise(resolve => {
       if (current.dom.window.document.readyState === 'complete') resolve();
@@ -441,7 +457,7 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     let timer;
     try {
       await Promise.race([loaded, aborted, failure, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Frame navigation timed out')), current.timeout ?? 10000); })]);
-      await current.moduleReady; return { url: current.url, frameId: id, loaderId: current.loaderId };
+      return { url: current.url, frameId: id, loaderId: current.loaderId };
     } finally { clearTimeout(timer); current.documentAbort.signal.removeEventListener('abort', abort); registry.off('frameNavigationError', failed); }
   };
   const originalClose = window.close.bind(window);

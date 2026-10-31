@@ -182,3 +182,14 @@ export function createWorkerBlobURLs(page, window) {
     resolve(input){return resolveForOwner(owner,input);},
   };
 }
+
+// Trusted Host navigation checks actual registered document principals.
+// Native permits this operation on the same Document or a tuple-origin peer;
+// cross-document opaque targets stay denied even when Blob origins inherit.
+export function canNavigateJavaScript(firstWindow,secondWindow){
+ const first=documents.get(firstWindow.document),second=documents.get(secondWindow.document);
+ if(!first||!second||first.context!==second.context)return false;
+ if(first===second)return true;
+ const origin=refreshOrigin(first);
+ return origin.serialized!=='null'&&origin.identity===refreshOrigin(second).identity;
+}

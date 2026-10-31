@@ -1,3 +1,4 @@
+import {commitBlankPopupHistory} from './joint-history.js';
 // Real Page/VM/Document popup contexts owned by an existing CDP Page. Public
 // handles are the actual jsdom Window globals, never popup facades or Proxies.
 import vm from 'node:vm';
@@ -21,7 +22,7 @@ export function preparePopupDocument(page,window){
 }
 function frame(page){const w=page.dom.window;return{id:page.frameId,loaderId:page.loaderId,url:page.url,name:NAMES.get(page)??'',securityOrigin:implForWrapper(w.document)._origin,mimeType:page.mimeType}}
 function announce(page,name,payload){const state=PAGES.get(page);state.root.emitFrameEvent(name,payload)}
-function commit(page){const state=PAGES.get(page);if(page.closed)return;state.announced=true;state.lastContextId=page.executionContextId;state.root.attachedFrames.add(page.frameId);announce(page,'frameNavigated',{frame:frame(page),page});announce(page,'frameContextCreated',{frameId:page.frameId,page})}
+function commit(page){const state=PAGES.get(page);if(page.closed)return;commitBlankPopupHistory(page);state.announced=true;state.lastContextId=page.executionContextId;state.root.attachedFrames.add(page.frameId);announce(page,'frameNavigated',{frame:frame(page),page});announce(page,'frameContextCreated',{frameId:page.frameId,page})}
 export function bindPopupPage(page){
  const state=PAGES.get(page),root=state.root;
  page.on('navigationStarted',()=>{if(!state.closed){root.attachedFrames.add(page.frameId);announce(page,'frameNavigationStarted',{frameId:page.frameId,loaderId:page.loaderId,url:state.pendingURL??page.url})}});
@@ -101,4 +102,30 @@ export function installWindowOpen(page,window){
   const ownership=installListenerOwnership(window);ownership.add(window.document,'DOMContentLoaded',()=>{if(!popup.closed&&popup.announced)announce(page,'frameDOMContentLoaded',{frameId:page.frameId,loaderId:page.loaderId})});
   ownership.add(window,'load',()=>{if(!popup.closed&&popup.announced)announce(page,'frameLoad',{frameId:page.frameId,loaderId:page.loaderId})});
  }
+}
+
+// Form targets are resolved from genuine owned browsing contexts, never public
+// Window properties (which authored code can replace). Named lookup is the
+// observed descendant/ancestor-frame search; popups are independent roots.
+export function resolveFormTarget(page, name) {
+ const token=name.toLowerCase();
+ if(token==='_blank')return null;
+ const parent=value=>value.parentFrameId?(value.registry?.findFrame(value.parentFrameId)??value):value;
+ if(token==='_parent')return parent(page);
+ if(token==='_top'){let target=page;while(parent(target)!==target)target=parent(target);return target}
+ if(!token||token==='_self')return page;
+ const registry=page.frames??page.registry;
+ const children=value=>[...(registry?.frames.values()??[])].filter(child=>child.parentFrameId===value.frameId&&!child.closed&&!child.retired&&child.record?.element?.isConnected);
+ const find=value=>{for(const child of children(value)){if(child.record.element.getAttributeNS(null,'name')===name)return child;const nested=find(child);if(nested)return nested}};
+ const direct=find(page);if(direct)return direct;
+ let top=page;while(parent(top)!==top)top=parent(top);
+ return (top!==page?find(top):undefined)??page;
+}
+export function createFormPopup(page,window,{opener=false}={}) {
+ const source=WINDOWS.get(window);
+ if(!source||source.page!==page||source.disposed||page.closed||page.retired||source.document._defaultView===null||!page.browser?.createPopupPage)return undefined;
+ const root=rootFor(page),config=record({root,opener:opener?source.window:null,name:'',origin:source.document._origin,baseURL:source.document.baseURLSerialized(),referrer:source.document.URL});
+ const target=page.browser.createPopupPage(page.context.id,config);bindPopupPage(target);
+ root.attachedFrames.add(target.frameId);announce(target,'frameNavigationStarted',{frameId:target.frameId,loaderId:target.loaderId,url:'about:blank'});commit(target);
+ return target;
 }

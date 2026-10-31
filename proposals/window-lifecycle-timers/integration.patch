@@ -1,0 +1,178 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+ import {installHTMLElementState} from './html-element-state.js';
+ import{readStylesheetResource}from'./stylesheet-decoder.js';
+ import {installHTMLReflections} from './html-reflections.js';
+@@ -343,6 +344,7 @@
+     });
+     prepareUtilityPlatform(window);
+     installFrameActivity(this,window);
++    installWindowLifecycleTimers(this,window);
+     installScheduler(this,window);
+     installWindowOpen(this,window);
+     prepareHeapRealm(this,window);
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -27,7 +27,8 @@
+ const viewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get;
+ const viewLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
+ const viewOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get;
+-const INSTALLED = new WeakMap(), RETIRE_REQUESTS = new WeakMap();
++const INSTALLED = new WeakMap(), RETIRE_REQUESTS = new WeakMap(), STOP_REQUESTS = new WeakMap();
++export function fetchStopAuthority(window) { return STOP_REQUESTS.get(window); }
+ export function retireFetchRequests(window) { RETIRE_REQUESTS.get(window)?.(); }
+ const HEADER_STATE = new WeakMap(), REQUEST_STATE = new WeakMap(), RESPONSE_STATE = new WeakMap();
+ const FORBIDDEN = new Set(['accept-charset', 'accept-encoding', 'access-control-request-headers',
+@@ -72,7 +73,7 @@
+   const generation = page.documentGeneration;
+   const documentSignal = page.documentAbort?.signal;
+   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
+-  const pending = new Set();
++  const pending = new Set(), StopTypeError = window.TypeError;
+   const bodyCleanups = new Set();
+   let disposed = false, requestEpoch = 0;
+   const active = () => !disposed && !page.closed && !!window.document && page.documentGeneration === generation && !documentSignal?.aborted;
+@@ -730,6 +731,7 @@
+   const close = function (...args) { dispose(); return previousClose.apply(this, args); };
+   const cancelPending = () => { requestEpoch++; for (const controller of pending) controller.abort(); pending.clear(); };
+   RETIRE_REQUESTS.set(window, cancelPending);
++  STOP_REQUESTS.set(window, () => [...pending].map(controller => () => controller.abort(new StopTypeError('fetch error'))));
+   const dispose = () => {
+     if (disposed) return;
+     disposed = true;
+--- a/src/xhr.js
++++ b/src/xhr.js
+@@ -25,7 +25,9 @@
+   'expires', 'last-modified', 'pragma']);
+ const PROGRESS_EVENTS = ['loadstart', 'progress', 'abort', 'error', 'load', 'timeout', 'loadend'];
+ const RESPONSE_TYPES = new Set(['', 'text', 'json', 'document', 'arraybuffer', 'blob']);
+-const INSTALLED = new WeakMap();
++const INSTALLED = new WeakMap(), STOP_REQUESTS = new WeakMap(), RETIRE_REQUESTS = new WeakMap();
++export function xhrRetirementAuthority(window) { return RETIRE_REQUESTS.get(window); }
++export function xhrStopAuthority(window) { return STOP_REQUESTS.get(window); }
+ 
+ function mime(value, fallback = 'text/xml') {
+   try { return new MIMEType(value ?? fallback); } catch { return new MIMEType(fallback); }
+@@ -83,9 +85,10 @@
+     if (!op) return;
+     op.done = true; clearTimeout(op.timer); op.controller.abort(); live.delete(op);
+   }
+-  function terminal(xhr, s, op, kind) {
+-    if (!same(s, op) || op.done) return;
+-    cancelOperation(op); op.terminal = true; s.sending = false; clearResponse(s); s.readyState = 4;
++  function terminal(xhr, s, op, kind, readyState = 4) {
++    if (!same(s, op) || op.done && !(op.retiredStopped && kind === 'abort' && readyState === 0)) return;
++    op.retiredStopped = false;
++    cancelOperation(op); op.terminal = true; s.sending = false; clearResponse(s); s.readyState = readyState;
+     emit(xhr, 'readystatechange');
+     if (!same(s, op)) return;
+     if (op.uploadStarted && !op.uploadComplete) {
+@@ -436,8 +439,8 @@
+       // Calling abort again from the terminal readystatechange/abort handler
+       // must not suppress the outer abort and loadend events.
+       if (op?.terminal) return;
+-      if (s.sending && op && !op.done) {
+-        terminal(this, s, op, 'abort');
++      if (s.sending && op && (!op.done || op.retiredStopped)) {
++        terminal(this, s, op, 'abort', op.retiredStopped ? 0 : 4);
+         if (same(s, op)) s.readyState = 0;
+       } else {
+         cancelOperation(op); s.op = null; clearResponse(s); s.readyState = 0;
+@@ -544,6 +547,8 @@
+   };
+   window.close = close;
+   documentSignal?.addEventListener('abort', dispose, { once: true });
++  RETIRE_REQUESTS.set(window, () => { for (const op of [...live]) { cancelOperation(op); op.retiredStopped = true; } });
++  STOP_REQUESTS.set(window, () => [...live].map(op => () => terminal(op.xhr, op.state, op, 'abort', 0)));
+   INSTALLED.set(window, dispose);
+   return dispose;
+ }
+--- /dev/null
++++ b/src/window-lifecycle-timers.js
+@@ -0,0 +1,63 @@
++// Actual document task/cancellation owners. Public VM methods never expose the
++// Host records; a reflected global, symbol, prototype or Proxy cannot brand one.
++import vm from 'node:vm';
++import {implementationForWrapper} from './dom-event-state.js';
++import {createInvocationTrampoline} from './invocation.js';
++import {installErrors} from './errors.js';
++import {onFrameRetirement} from './frame-activity.js';
++import {fetchStopAuthority} from './fetch.js';
++import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
++const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
++function publicMethods(bridge){'use strict';return{
++ setTimeout(handler,delay=0,...args){return bridge.timer(this,false,arguments.length,handler,delay,args)},
++ setInterval(handler,delay=0,...args){return bridge.timer(this,true,arguments.length,handler,delay,args)},
++ clearTimeout(handle){return bridge.clear(this,arguments.length,handle)},
++ clearInterval(handle){return bridge.clear(this,arguments.length,handle)},
++ stop(){return bridge.stop(this)},
++}}
++function numericPrimitive(value,TypeError){
++ if(primitive(value))return value;
++ const exotic=value[Symbol.toPrimitive];
++ if(exotic!==undefined&&exotic!==null){if(typeof exotic!=='function')throw new TypeError('Cannot convert object to primitive value');const result=apply(exotic,value,['number']);if(primitive(result))return result;throw new TypeError('Cannot convert object to primitive value')}
++ for(const key of['valueOf','toString']){const method=value[key];if(typeof method==='function'){const result=apply(method,value,[]);if(primitive(result))return result}}
++ throw new TypeError('Cannot convert object to primitive value');
++}
++function number(value,caller){const input=numericPrimitive(value,caller.TypeError);if(typeof input==='bigint')throw new caller.TypeError('Cannot convert a BigInt value to a number');return apply(caller.Number,undefined,[input])}
++function delayNumber(value,caller){return number(value,caller)|0}
++function handleNumber(value,caller){if(typeof value==='bigint'){const integer=BigInt.asUintN(64,value);if(integer>4294967295n)throw new caller.TypeError('invalid argument');return Number(integer)}return number(value,caller)>>>0}
++export function installWindowLifecycleTimers(page,window){
++ const context=implementationForWrapper(window)._globalObject;
++ if(owners.has(context))return;
++ const document=implementationForWrapper(window.document),record=Object.assign(Object.create(null),{page,window,context,document,fetchStops:fetchStopAuthority(window),xhrStops:xhrStopAuthority(window),retireXHR:xhrRetirementAuthority(window),source:{timeout:window.setTimeout,interval:window.setInterval,clear:window.clearTimeout,stop:window.stop},TypeError:window.TypeError,Error:window.Error,Number:window.Number,String:window.String,timers:new Map(),intervals:0,children:new Set(),signal:page.documentAbort.signal,disposed:false,errors:installErrors(page,window),invocation:createInvocationTrampoline(context),options:{timeout:Math.min(page.timeout??2000,2000),displayErrors:false}});
++ owners.set(context,record);owners.set(window,record);owners.set(vm.runInContext('globalThis',context),record);pages.set(page,record);
++ const parent=page.registry?.findFrame(page.parentFrameId);record.parent=parent?pages.get(parent):undefined;record.parent?.children.add(record);
++ const owner=value=>{const result=value==null?record:owners.get(value);if(!result)throw new record.TypeError('Illegal invocation');return result};
++ function cancel(target,id){const timer=target.timers.get(id);if(timer){target.timers.delete(id);if(timer.repeat)target.intervals--}apply(target.source.clear,target.window,[id])}
++ const bridge=Object.assign(Object.create(null),{
++  timer(receiver,repeat,count,callback,delay,args){
++   const target=owner(receiver);if(!count)throw new record.TypeError('invalid argument');delay=delayNumber(delay,record);
++   let script;if(typeof callback!=='function'){if(typeof callback==='symbol')throw new record.TypeError('invalid argument');const text=apply(record.String,undefined,[callback]);try{script=new vm.Script(text,{filename:record.document.URL,displayErrors:false})}catch{throw new record.Error('CompilationError')}}
++   if(repeat&&target.intervals>=2048)throw new record.Error('TooManyTimeout');
++   const state=Object.assign(Object.create(null),{id:undefined,repeat});
++   const invoke=()=>{if(!repeat)target.timers.delete(state.id);if(target.disposed)return;try{if(script)return script.runInContext(record.context,target.options);return target.invocation.invoke(callback,record.window,args,target.options)}catch(error){record.errors.report(error)}};
++   state.id=apply(target.source[repeat?'interval':'timeout'],target.window,[invoke,delay]);
++   if(state.id){target.timers.set(state.id,state);if(repeat)target.intervals++}return state.id;
++  },
++  clear(receiver,count,value){const target=owner(receiver);if(!count)throw new record.TypeError('invalid argument');cancel(target,handleNumber(value,record))},
++  stop(receiver){
++   const target=owner(receiver),cohort=[],visit=current=>{if(current.disposed)return;cohort.push(current);for(const child of current.children)visit(child)};visit(target);
++   // Capture every custom load cohort before any abort handler can start a new
++   // request. The original per-document resource manager retains its real
++   // script/error/parser queue; stop does not dispose or cancel page timers.
++   const loads=cohort.map(current=>({current,fetches:current.fetchStops?.()??[],xhrs:current.xhrStops?.()??[]}));
++   for(const{current}of loads)apply(current.source.stop,current.window,[]);
++   for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
++  },
++ });
++ const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
++ for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});
++ const cancelTimers=()=>{for(const id of [...record.timers.keys()])cancel(record,id);record.timers.clear();record.intervals=0};
++ const retire=()=>{cancelTimers();record.retireXHR?.();record.parent?.children.delete(record);record.parent=undefined};onFrameRetirement(window,retire);
++ const dispose=()=>{if(record.disposed)return;retire();record.disposed=true;record.invocation.dispose();record.children.clear();if(pages.get(page)===record)pages.delete(page);record.signal.removeEventListener('abort',dispose)};
++ record.signal.addEventListener('abort',dispose,{once:true});
++}
+--- /dev/null
++++ b/test/window-lifecycle-timers.test.js
+@@ -0,0 +1,18 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {readFile,writeFile} from 'node:fs/promises';
++import {createHash} from 'node:crypto';
++import {createRequire} from 'node:module';
++import {Browser} from '../src/browser.js';
++import {getHeapBinding} from '../src/native-heap.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),read=name=>readFile(new URL('../proposals/window-lifecycle-timers/controls/'+name,import.meta.url),'utf8'),sha=value=>createHash('sha256').update(value).digest('hex'),plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t,kind){
++ const documentHTML=kind==='parse-stop'?await read('parse-stop-document.html'):'<!doctype html><body>lifecycle timers</body>',timers=new Set(),connections=new Set(),requests=[],server=http.createServer((req,res)=>{requests.push(req.url);if(req.url==='/defer.js'){res.setHeader('content-type','text/javascript');const timer=setTimeout(()=>{timers.delete(timer);res.end('window.deferRan=true')},300);timers.add(timer)}else if(req.url.startsWith('/slow')){const timer=setTimeout(()=>{timers.delete(timer);res.end('slow')},300);timers.add(timer)}else{res.setHeader('content-type','text/html');res.end(documentHTML)}});server.on('connection',s=>{connections.add(s);s.on('error',()=>{});s.on('close',()=>connections.delete(s))});server.listen(0,'127.0.0.1');await once(server,'listening');const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(async()=>{browser.close();for(const timer of timers)clearTimeout(timer);for(const socket of connections)socket.destroy();server.closeAllConnections();await new Promise(r=>server.close(r))});await page.navigate('http://127.0.0.1:'+server.address().port+'/');return{browser,page,w:page.dom.window,requests};
++}
++for(const kind of ['timer','stop','timer-ownership','stop-ownership','timer-callback','timer-range','timer-clear','retire-xhr','parse-stop'])test('Native Window timer/stop actual ownership control '+kind,{timeout:12000},async t=>{const{page}=await fixture(t,kind),source=await read(kind+'-expression.js'),native=JSON.parse(await read('native-'+kind+(['timer','stop'].includes(kind)?'-baseline':'')+'.json'));assert.equal(sha(source),native.sourceSHA256);assert.equal(native.binarySHA256,'9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f');assert.deepEqual(plain(await page.evaluate(source)),native.response.result.value)});
++test('timer/stop exact Window owner brands reject copied symbols and proxies before authored conversions',{timeout:8000},async t=>{const{w}=await fixture(t),fake=Object.create(w),symbol=utils.implSymbol;Object.defineProperty(fake,symbol,{value:utils.implForWrapper(w)});let traps=0,conversions=0;const proxy=new Proxy(w,{get(){traps++;throw 1},getOwnPropertyDescriptor(){traps++;throw 2}}),bad={valueOf(){conversions++;throw 3},toString(){conversions++;throw 4}};for(const name of ['setTimeout','setInterval','clearTimeout','clearInterval','stop'])for(const value of [{},fake,proxy])assert.throws(()=>Reflect.apply(w[name],value,[bad,bad]),e=>e instanceof w.TypeError&&e.message==='Illegal invocation');assert.equal(traps,0);assert.equal(conversions,0);const actual=await w.eval(`new Promise(resolve=>{const methods={setTimeout,setInterval,clearTimeout,clearInterval,stop},E=TypeError,originals=[Number,String,TypeError,Error];let correct;try{globalThis.Number=globalThis.String=globalThis.TypeError=globalThis.Error=function(){throw 99};try{methods.setTimeout.call(window,()=>{},Symbol())}catch(e){correct=e instanceof E}methods.setTimeout.call(window,()=>resolve(correct),0);methods.stop.call(window)}finally{[globalThis.Number,globalThis.String,globalThis.TypeError,globalThis.Error]=originals}})`);assert.equal(actual,true)});
++test('public timer/stop methods and thrown errors retain actual selected-VM contexts after null prototypes',{timeout:8000},async t=>{const{w}=await fixture(t),frame=w.document.createElement('iframe');w.document.body.append(frame);const binding=getHeapBinding(),rows=[];for(const[g,label]of[[w,'main'],[frame.contentWindow,'frame']])for(const name of ['setTimeout','setInterval','clearTimeout','clearInterval','stop']){let error;try{Reflect.apply(g[name],{},[])}catch(e){error=e}for(const[type,value]of[['method',g[name]],['error',error]]){const first=binding.sameRealm(value,g.Object.prototype),host=binding.sameRealm(value,{}),prototype=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);const after=binding.sameRealm(value,g.Object.prototype);Object.setPrototypeOf(value,prototype);rows.push({label:label+':'+name+':'+type,first,after,host});assert.equal(first,true);assert.equal(after,true);assert.equal(host,false)}}if(process.env.RED_PANDA_WINDOW_TASK_PROOF)await writeFile(process.env.RED_PANDA_WINDOW_TASK_PROOF,JSON.stringify({node:process.version,rows},null,2)+'\n',{flag:'wx'})});
++
++test('borrowed timers report actual error values to the Native callee Window; existing cross-Window drain order remains explicit',{timeout:8000},async t=>{const{page}=await fixture(t),source=await read('timer-error-expression.js'),native=JSON.parse(await read('native-timer-error.json'));assert.equal(sha(source),native.sourceSHA256);const actual=plain(await page.evaluate(source)),expected=native.response.result.value;assert.notDeepEqual(actual,expected);const order=rows=>rows.slice().sort((a,b)=>a[1].localeCompare(b[1]));assert.deepEqual(order(actual),order(expected))});

@@ -2,7 +2,6 @@ import {captureWorkerCreator} from './worker-apis.js';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url);
 const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
-const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
 
 function serviceRealm(bridge, role) {
   const secret={}, registrations=new Map(), workers=new Map(), registrationData=new WeakMap(),workerData=new WeakMap(),containers=new WeakSet();
@@ -100,6 +99,7 @@ export const SERVICE_WORKER_REALM_SOURCE=`(${serviceRealm.toString()})`;
 // Actual per-document registrations, matching the measured target's ownership.
 // There is no request interception/controller/client API or background lifetime.
 export function installServiceWorkers(page,window,{enabled=false,secure=false,spawn}={}) {
+ const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
   const creatorSnapshot=captureWorkerCreator(page,window);
   const signal=page.documentAbort?.signal,generation=page.documentGeneration,document=window.document;
   const registrations=new Map(),byId=new Map();let next=1,disposed=false,api;

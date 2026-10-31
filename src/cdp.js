@@ -1,3 +1,4 @@
+import{setWindowDeviceMetrics}from'./window-viewport.js';
 import {consoleProtocolType} from './console.js';
 import {installHeapUtilityFactories} from './heap-worlds.js';
 import {ProtocolSerializer} from './protocol-serialization.js';
@@ -111,10 +112,9 @@ class Session {
       const child = page.frames?.findFrame(params.frameId);
       if (child) this.lifecycleEvent('DOMContentLoaded', child);
     });
-    listen('frameLoad', async params => {
+    listen('frameLoad', params => {
       const child = page.frames?.findFrame(params.frameId);
       if (!child) return;
-      await child.moduleReady;
       if (child.closed) return;
       this.lifecycleEvent('load', child); this.event('Page.frameStoppedLoading', { frameId: params.frameId });
     });
@@ -283,11 +283,10 @@ class Session {
         return { layoutViewport, visualViewport, contentSize, cssLayoutViewport: layoutViewport, cssVisualViewport: visualViewport, cssContentSize: contentSize };
       }
       case 'Emulation.setDeviceMetricsOverride': {
-        if (![params.width, params.height].every(value => Number.isInteger(value) && value >= 0)) throw new ProtocolError('Invalid viewport dimensions');
-        page.viewport = { width: params.width || 1920, height: params.height || 1080 };
-        page.layout.setViewport(page.viewport); return {};
+        if (![params.width, params.height].every(value => Number.isInteger(value) && value >= 0 && value <= 4294967295) || ['screenWidth','screenHeight'].some(name=>params[name]!=null&&(!Number.isInteger(params[name])||params[name]<0||params[name]>4294967295)) || ['deviceScaleFactor','scale'].some(name=>params[name]!=null&&(typeof params[name]!=='number'||!Number.isFinite(params[name]))) || params.mobile!=null&&typeof params.mobile!=='boolean') throw new ProtocolError('Invalid viewport dimensions');
+        setWindowDeviceMetrics(page,params); return {};
       }
-      case 'Emulation.clearDeviceMetricsOverride': page.viewport = undefined; page.layout.setViewport({ width: 1920, height: 1080 }); return {};
+      case 'Emulation.clearDeviceMetricsOverride': page.viewport = undefined; setWindowDeviceMetrics(page,{ width: 1920, height: 1080,deviceScaleFactor:1 },{clear:true}); return {};
       case 'Page.setLifecycleEventsEnabled': this.lifecycle = params.enabled; return {};
       case 'Page.navigate': {
         const target = params.frameId && params.frameId !== page.frameId ? page.frames?.findFrame(params.frameId) : page;

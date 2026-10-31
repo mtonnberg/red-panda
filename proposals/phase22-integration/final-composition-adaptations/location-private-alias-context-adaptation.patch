@@ -1,0 +1,11 @@
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -52,7 +52,7 @@
+   const canonical=canonicalLocation(impl)??own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;for(const resolver of targetWrappers){const wrapper=resolver(canonical,impl);if(wrapper)return wrapper;}
+   const metric=viewportTargetInterface(impl);if(metric){const wrapper=wrapViewportTarget(context,impl);wrappers.set(impl,wrapper);register(wrapper,impl,metric);return wrapper;}
+   const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
+-  const name=interfaceFor(impl);if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
++  const name=canonicalLocation(impl)?'Location':interfaceFor(impl);if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+   if(webSocketImplementation(wrapper))bindWebSocketImplementation(wrapper,impl);else if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(directEventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});

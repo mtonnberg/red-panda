@@ -1,0 +1,1024 @@
+--- a/src/scroll-events.js
++++ b/src/scroll-events.js
+@@ -3,14 +3,14 @@
+ import {createRequire}from'node:module';
+ import {implementationForWrapper}from'./dom-event-state.js';
+ const require=createRequire(import.meta.url),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+-const documents=new WeakMap(),elements=new WeakMap(),schedule=setTimeout,cancel=clearTimeout;
++const documents=new WeakMap(),elements=new WeakMap(),schedule=setTimeout,cancel=clearTimeout,queueTask=setImmediate,cancelTask=clearImmediate;
+ function dispatch(record,target,type,bubbles){if(record.disposed||record.signal?.aborted)return;const event=EventIDL.create(record.globalObject,[type,{bubbles}],{isTrusted:true});implementationForWrapper(target)._dispatch(implementationForWrapper(event))}
+-function later(record,callback,delay){const token=schedule(()=>{record.timers.delete(token);if(!record.disposed&&!record.signal?.aborted)callback()},delay);record.timers.add(token);return token}
++function later(record,callback,delay){const token=schedule(()=>{record.timers.delete(token);if(record.disposed||record.signal?.aborted)return;const task=queueTask(()=>{record.tasks.delete(task);if(!record.disposed&&!record.signal?.aborted)callback()});record.tasks.add(task)},delay);record.timers.add(token);return token}
+ export function installScrollEvents(page,window){
+  const document=implementationForWrapper(window.document),prior=documents.get(document);if(prior)return prior;
+- const record=Object.assign(Object.create(null),{document,globalObject:implementationForWrapper(window)._globalObject,signal:page.documentAbort?.signal,disposed:false,timers:new Set(),windowState:'done'});
++ const record=Object.assign(Object.create(null),{document,globalObject:implementationForWrapper(window)._globalObject,signal:page.documentAbort?.signal,disposed:false,timers:new Set(),tasks:new Set(),windowState:'done'});
+  record.windowScroll=()=>{if(record.disposed)return;record.windowState='scroll';later(record,()=>{if(record.windowState!=='scroll')return;dispatch(record,utils.wrapperForImpl(document),'scroll',true);record.windowState='end'},10);const end=()=>{if(record.windowState==='scroll'){later(record,end,10);return}if(record.windowState==='end'){dispatch(record,utils.wrapperForImpl(document),'scrollend',true);record.windowState='done'}};later(record,end,20)};
+- record.dispose=()=>{if(record.disposed)return;record.disposed=true;for(const timer of record.timers)cancel(timer);record.timers.clear();record.windowState='done';record.signal?.removeEventListener('abort',record.dispose)};
++ record.dispose=()=>{if(record.disposed)return;record.disposed=true;for(const timer of record.timers)cancel(timer);record.timers.clear();for(const task of record.tasks)cancelTask(task);record.tasks.clear();record.windowState='done';record.signal?.removeEventListener('abort',record.dispose)};
+  documents.set(document,record);record.signal?.addEventListener('abort',record.dispose,{once:true});return record;
+ }
+ export function queueElementScroll(implementation){
+--- /dev/null
++++ b/test/scroll-task-checkpoint.test.js
+@@ -0,0 +1,12 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{Browser}from'../src/browser.js';
++const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms)),busy=ms=>{const end=performance.now()+ms;while(performance.now()<end){}};
++async function fixture(t){const browser=new Browser({loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<!doctype html><body></body>');return{browser,page,w:page.dom.window}}
++for(const name of['registration-overdue','scroll-dispatch-overdue'])test('actual Native scroll task order retains its cohort with '+name,async t=>{const{page}=await fixture(t),profiles=JSON.parse(await readFile(new URL('../docs/reference/scroll-task-checkpoint/profiles.json',import.meta.url),'utf8')),native=JSON.parse(await readFile(new URL('../docs/reference/scroll-task-checkpoint/native-profiles.json',import.meta.url),'utf8')),record=native.profiles.find(value=>value.name===name),source=profiles[name];assert.equal(native.binarySHA256,'9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f');assert.equal(createHash('sha256').update(source).digest('hex'),record.expressionSHA256);assert.equal(record.result.exceptionDetails,undefined);assert.deepEqual(JSON.parse(JSON.stringify(await page.evaluate(source))),record.result.result.value)});
++function queueBoth(w){w.document.body.style.cssText='height:4000px;width:4000px';const rows=[],div=w.document.createElement('div');w.document.body.append(div);for(const type of['scroll','scrollend']){w.document.addEventListener(type,()=>rows.push('document:'+type));div.addEventListener(type,()=>rows.push('element:'+type))}w.scrollTo(7,11);div.scrollTop=19;assert.deepEqual([w.scrollX,w.scrollY,div.scrollTop],[7,11,19]);assert.deepEqual(rows,[]);return rows}
++// Both real native deadlines are overdue before polling resumes. The later15ms
++// owner action therefore runs after due10ms callbacks have queued their tasks,
++// while their real Immediate callbacks still await the check phase.
++async function retireOverdue(action){const retired=new Promise((resolve,reject)=>setTimeout(()=>{try{Promise.resolve(action()).then(resolve,reject)}catch(error){reject(error)}},15));busy(35);await retired;await pause(45)}
++test('actual document abort cancels queued Window and Element scroll tasks',async t=>{const{page,w}=await fixture(t),rows=queueBoth(w);await retireOverdue(()=>page.documentAbort.abort());assert.equal(page.documentAbort.signal.aborted,true);assert.deepEqual(rows,[])});
++test('actual Page close cancels queued Window and Element scroll tasks',async t=>{const{page,w}=await fixture(t),rows=queueBoth(w);await retireOverdue(()=>page.close());assert.equal(page.closed,true);assert.deepEqual(rows,[])});
++test('real navigation cancels old scroll tasks and leaves the new document cohort active',async t=>{const{page,w}=await fixture(t),rows=queueBoth(w),signal=page.documentAbort.signal;await retireOverdue(()=>page.navigate('data:text/html,<!doctype html><body>new document</body>'));assert.equal(signal.aborted,true);assert.deepEqual(rows,[]);const next=page.dom.window,events=[];next.document.body.style.cssText='height:4000px;width:4000px';assert.notEqual(next.document,w.document);next.document.addEventListener('scroll',event=>events.push([event.target===next.document,event.isTrusted,next.scrollX,next.scrollY]));next.scrollTo(13,17);assert.deepEqual([next.scrollX,next.scrollY],[13,17]);await pause(45);assert.deepEqual(events,[[true,true,13,17]]);assert.deepEqual(rows,[])});
+--- /dev/null
++++ b/docs/reference/scroll-task-checkpoint/profiles.json
+@@ -0,0 +1,5 @@
++{
++  "unchanged": "(async()=>{const rows=[],pause=ms=>new Promise(r=>setTimeout(r,ms)),pos=()=>[scrollX,scrollY,visualViewport?.pageLeft,visualViewport?.pageTop];document.body.style.cssText='height:4000px;width:4000px';const record=(where)=>function(e){rows.push([where,e.type,e.target===document?'document':e.target===window?'window':e.target===visualViewport?'viewport':'element',e.currentTarget===this,e.isTrusted,e.bubbles,e.cancelable,e.composed,pos()])};for(const target of[window,document,visualViewport])for(const type of['scroll','scrollend','resize'])target.addEventListener(type,record(target===window?'window':target===document?'document':'viewport'));\nconst before=pos();scrollTo(10.5,20.5);const sync=[pos(),rows.length];scrollTo(20.5,40.5);await pause(10);const first=rows.slice();scrollTo(30.5,40.5);await pause(90);const after=rows.slice();rows.length=0;scrollTo(30.5,40.5);await pause(40);const noop=rows.slice();const div=document.createElement('div');for(const type of['scroll','scrollend'])div.addEventListener(type,record('detached'));for(let i=0;i<100;i++)div.scrollTop=i;const detachedSync=[div.scrollTop,rows.length];await pause(60);return {before,sync,first,after,noop,detachedSync,detached:rows,extent:[document.documentElement.scrollWidth,document.documentElement.scrollHeight]}})()\n",
++  "registration-overdue": "(async()=>{const rows=[],pause=ms=>new Promise(r=>setTimeout(r,ms)),pos=()=>[scrollX,scrollY,visualViewport?.pageLeft,visualViewport?.pageTop];document.body.style.cssText='height:4000px;width:4000px';const record=(where)=>function(e){rows.push([where,e.type,e.target===document?'document':e.target===window?'window':e.target===visualViewport?'viewport':'element',e.currentTarget===this,e.isTrusted,e.bubbles,e.cancelable,e.composed,pos()])};for(const target of[window,document,visualViewport])for(const type of['scroll','scrollend','resize'])target.addEventListener(type,record(target===window?'window':target===document?'document':'viewport'));\nconst before=pos();scrollTo(10.5,20.5);const sync=[pos(),rows.length];scrollTo(20.5,40.5);const pendingPause=pause(10);const until=performance.now()+35;while(performance.now()<until){}await pendingPause;const first=rows.slice();scrollTo(30.5,40.5);await pause(90);const after=rows.slice();rows.length=0;scrollTo(30.5,40.5);await pause(40);const noop=rows.slice();const div=document.createElement('div');for(const type of['scroll','scrollend'])div.addEventListener(type,record('detached'));for(let i=0;i<100;i++)div.scrollTop=i;const detachedSync=[div.scrollTop,rows.length];await pause(60);return {before,sync,first,after,noop,detachedSync,detached:rows,extent:[document.documentElement.scrollWidth,document.documentElement.scrollHeight]}})()\n",
++  "scroll-dispatch-overdue": "(async()=>{const rows=[],pause=ms=>new Promise(r=>setTimeout(r,ms)),pos=()=>[scrollX,scrollY,visualViewport?.pageLeft,visualViewport?.pageTop];document.body.style.cssText='height:4000px;width:4000px';const record=(where)=>function(e){rows.push([where,e.type,e.target===document?'document':e.target===window?'window':e.target===visualViewport?'viewport':'element',e.currentTarget===this,e.isTrusted,e.bubbles,e.cancelable,e.composed,pos()])};for(const target of[window,document,visualViewport])for(const type of['scroll','scrollend','resize'])target.addEventListener(type,record(target===window?'window':target===document?'document':'viewport'));\ndocument.addEventListener('scroll',()=>{const until=performance.now()+35;while(performance.now()<until){}},{once:true});const before=pos();scrollTo(10.5,20.5);const sync=[pos(),rows.length];scrollTo(20.5,40.5);await pause(10);const first=rows.slice();scrollTo(30.5,40.5);await pause(90);const after=rows.slice();rows.length=0;scrollTo(30.5,40.5);await pause(40);const noop=rows.slice();const div=document.createElement('div');for(const type of['scroll','scrollend'])div.addEventListener(type,record('detached'));for(let i=0;i<100;i++)div.scrollTop=i;const detachedSync=[div.scrollTop,rows.length];await pause(60);return {before,sync,first,after,noop,detachedSync,detached:rows,extent:[document.documentElement.scrollWidth,document.documentElement.scrollHeight]}})()\n"
++}
+--- /dev/null
++++ b/docs/reference/scroll-task-checkpoint/native-profiles.json
+@@ -0,0 +1,977 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "7e6732fc23c220a9b979563cf377876e360f4753d0977f8b83a42a4ad25049e9",
++  "profiles": [
++    {
++      "name": "unchanged",
++      "expressionSHA256": "2ded426e33dae72fa883954856adc9e6407ed72b48121bb8d6fdf3d8700f1742",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "before": [
++              0,
++              0,
++              0,
++              0
++            ],
++            "sync": [
++              [
++                10,
++                20,
++                10,
++                20
++              ],
++              0
++            ],
++            "first": [
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ]
++            ],
++            "after": [
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "document",
++                "scrollend",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scrollend",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ]
++            ],
++            "noop": [],
++            "detachedSync": [
++              99,
++              0
++            ],
++            "detached": [
++              [
++                "detached",
++                "scroll",
++                "element",
++                true,
++                true,
++                false,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "detached",
++                "scrollend",
++                "element",
++                true,
++                true,
++                false,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ]
++            ],
++            "extent": [
++              4000,
++              4000
++            ]
++          }
++        }
++      },
++      "durationMs": 204.83343599999995
++    },
++    {
++      "name": "registration-overdue",
++      "expressionSHA256": "5eeff2a77b48abdc323aaa084ad0523d542dac4819e024ffdf8df33da8172abf",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "before": [
++              0,
++              0,
++              0,
++              0
++            ],
++            "sync": [
++              [
++                10,
++                20,
++                10,
++                20
++              ],
++              0
++            ],
++            "first": [
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ]
++            ],
++            "after": [
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "document",
++                "scrollend",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scrollend",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ]
++            ],
++            "noop": [],
++            "detachedSync": [
++              99,
++              0
++            ],
++            "detached": [
++              [
++                "detached",
++                "scroll",
++                "element",
++                true,
++                true,
++                false,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "detached",
++                "scrollend",
++                "element",
++                true,
++                true,
++                false,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ]
++            ],
++            "extent": [
++              4000,
++              4000
++            ]
++          }
++        }
++      },
++      "durationMs": 227.7832420000001
++    },
++    {
++      "name": "scroll-dispatch-overdue",
++      "expressionSHA256": "c0e845dfff64024bad30a5b61386bd119bec852ac8063224cdd12b3e754e4044",
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "before": [
++              0,
++              0,
++              0,
++              0
++            ],
++            "sync": [
++              [
++                10,
++                20,
++                10,
++                20
++              ],
++              0
++            ],
++            "first": [
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ]
++            ],
++            "after": [
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  20,
++                  40,
++                  20,
++                  40
++                ]
++              ],
++              [
++                "document",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scroll",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "document",
++                "scrollend",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "window",
++                "scrollend",
++                "document",
++                true,
++                true,
++                true,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ]
++            ],
++            "noop": [],
++            "detachedSync": [
++              99,
++              0
++            ],
++            "detached": [
++              [
++                "detached",
++                "scroll",
++                "element",
++                true,
++                true,
++                false,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ],
++              [
++                "detached",
++                "scrollend",
++                "element",
++                true,
++                true,
++                false,
++                false,
++                false,
++                [
++                  30,
++                  40,
++                  30,
++                  40
++                ]
++              ]
++            ],
++            "extent": [
++              4000,
++              4000
++            ]
++          }
++        }
++      },
++      "durationMs": 237.23183100000006
++    }
++  ],
++  "pid": 546141,
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "data:text/html,<!doctype html><body></body>",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "data:text/html,<!doctype html><body></body>",
++          "domainAndRegistry": "",
++          "securityOrigin": "://",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 62662
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 62662
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Inspector.detached",
++      "params": {
++        "reason": "Render process gone."
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Target.detachedFromTarget",
++      "params": {
++        "targetId": "FID-0000000001",
++        "sessionId": "SID-1",
++        "reason": "Render process gone."
++      }
++    },
++    {
++      "method": "Target.targetDestroyed",
++      "params": {
++        "targetId": "FID-0000000001"
++      }
++    },
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000002",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-2",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000002",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000002",
++        "url": "data:text/html,<!doctype html><body></body>",
++        "loaderId": "LID-0000000002",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000002",
++          "loaderId": "LID-0000000002",
++          "url": "data:text/html,<!doctype html><body></body>",
++          "domainAndRegistry": "",
++          "securityOrigin": "://",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 62662
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 62662
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Inspector.detached",
++      "params": {
++        "reason": "Render process gone."
++      },
++      "sessionId": "SID-2"
++    },
++    {
++      "method": "Target.detachedFromTarget",
++      "params": {
++        "targetId": "FID-0000000002",
++        "sessionId": "SID-2",
++        "reason": "Render process gone."
++      }
++    },
++    {
++      "method": "Target.targetDestroyed",
++      "params": {
++        "targetId": "FID-0000000002"
++      }
++    },
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000003",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-3",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000003",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000003",
++        "url": "data:text/html,<!doctype html><body></body>",
++        "loaderId": "LID-0000000003",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000003"
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000003",
++          "loaderId": "LID-0000000003",
++          "url": "data:text/html,<!doctype html><body></body>",
++          "domainAndRegistry": "",
++          "securityOrigin": "://",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 62662
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 62662
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000003"
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Inspector.detached",
++      "params": {
++        "reason": "Render process gone."
++      },
++      "sessionId": "SID-3"
++    },
++    {
++      "method": "Target.detachedFromTarget",
++      "params": {
++        "targetId": "FID-0000000003",
++        "sessionId": "SID-3",
++        "reason": "Render process gone."
++      }
++    },
++    {
++      "method": "Target.targetDestroyed",
++      "params": {
++        "targetId": "FID-0000000003"
++      }
++    }
++  ],
++  "stderr": "$time=1793466177833 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:33439 max_connections=16120 max_browser_connections=16\n"
++}

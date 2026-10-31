@@ -2,7 +2,7 @@
 // Native worker parks its still-open transports until the owning Page ends.
 import {randomUUID} from 'node:crypto';
 import {EventEmitter} from 'node:events';
-import {workerWebSocketOwner} from './window-websocket.js';
+import {workerWebSocketOwner} from './worker-websocket-owners.js';
 import {normalizeWebSocketURL,validWebSocketProtocols,socketHeaders,openWebSocketTransport} from './websocket-transports.js';
 export function createParentWorkerSockets(page,{origin,send,active}){
  const owner=workerWebSocketOwner(page),transports=new Map(),acknowledgements=new Map();let detached=false;

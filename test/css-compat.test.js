@@ -40,3 +40,14 @@ test('flat tree geometry follows actual private slot assignment and fallback sta
 test('media lists are branded targets with genuine viewport changes, event order and cleanup',async t=>{
  const{page,w}=fixture(t),m=w.matchMedia('(max-width:1000px)'),events=[];assert.equal(m instanceof w.EventTarget,true);assert.equal(Object.prototype.toString.call(m),'[object MediaQueryList]');assert.throws(()=>new w.MediaQueryList(),{name:'TypeError'});assert.equal(m.matches,false);m.addListener(e=>events.push([e.matches,e.media,e.isTrusted]));page.layout.setViewport({width:800,height:600});assert.equal(m.matches,true);assert.equal(w.screen.width,800);await new Promise(r=>w.setTimeout(r,10));assert.deepEqual(events,[[true,'(max-width:1000px)',true]]);assert.equal(w.matchMedia('not unknown').matches,false);assert.equal(w.matchMedia('not (unknown:x)').matches,true);assert.equal(w.matchMedia('(width:50em)').matches,true);page.layout.setViewport({width:900});assert.equal(events.length,1);page.documentAbort.abort();page.layout.setViewport({width:1200});await new Promise(r=>setTimeout(r,10));assert.equal(events.length,1);
 });
+
+test('media change callbacks observe published layout and screen state in Native listener order',async t=>{
+ const{page,w}=fixture(t),query=w.matchMedia('(max-width:1000px)'),rows=[];
+ const capture=kind=>event=>rows.push([kind,event.matches,event.isTrusted,event.target===query,event.currentTarget===query,w.innerWidth,w.screen.width,w.visualViewport.width,page.layout.viewport.width,query.matches]);
+ query.addEventListener('change',capture('event-listener'));query.addListener(capture('legacy-listener'));query.onchange=capture('handler');
+ page.layout.setViewport({width:800,height:600});assert.equal(query.matches,true);await new Promise(resolve=>w.setTimeout(resolve,35));
+ assert.deepEqual(rows,['event-listener','legacy-listener','handler'].map(kind=>[kind,true,true,true,true,800,800,800,800,true]));
+ rows.length=0;page.layout.setViewport({width:900});await new Promise(resolve=>w.setTimeout(resolve,35));assert.deepEqual(rows,[]);
+ page.layout.setViewport({width:1200});assert.equal(query.matches,false);await new Promise(resolve=>w.setTimeout(resolve,35));
+ assert.deepEqual(rows,['event-listener','legacy-listener','handler'].map(kind=>[kind,false,true,true,true,1200,1200,1200,1200,false]));
+});

@@ -128,7 +128,7 @@ class DriverSession {
     if (entry) for (const [name, callback] of entry.listeners) page.off(name, callback);
     this.pageListeners.delete(page.id);
   }
-  realmInfo(page) { return { realm: this.realm(page), origin: new URL(page.url).origin, type: 'window', context: page.id }; }
+  realmInfo(page) { return { realm: this.realm(page), origin: page.securityOrigin??new URL(page.url).origin, type: 'window', context: page.id }; }
   handle(value, page, kind = 'handle') {
     if (kind !== 'handle') for (const [id, entry] of this.handles) {
       if (entry.value === value && entry.pageId === page.id && entry.generation === page.executionContextId && entry.kind === kind) return id;

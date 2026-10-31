@@ -1,0 +1,754 @@
+{
+  "engine": "candidate",
+  "binary": "/workspace/shared/broadcast-task-order-fix/bin/red-panda.js",
+  "binarySHA256": "812cd987921a9b184bb4961faebdc60206c22a96974e02836f4ba40f4c83d98e",
+  "origin": "http://127.0.0.1:41727",
+  "fixtureSHA256": "cfbabf0452b5c7b4d231ec64445cbd40e6cc8882533cd01a2d0dc48f9b68adbf",
+  "block": "\n{\n    const state = await testing.async();\n\n    const iframe = document.createElement(\"iframe\");\n    document.documentElement.appendChild(iframe);\n    const doc = iframe.contentDocument;\n    doc.write(\n        '<!DOCTYPE html><body><script>' +\n        'const c = new BroadcastChannel(\"x-p2i\");' +\n        'c.onmessage = (e) => { window.__got = e.data; };' +\n        '<\\/script></body>'\n    );\n    doc.close();\n\n    // The iframe's channel is registered synchronously by document.close(), so\n    // the listener is ready before we post.\n    const bc = new BroadcastChannel(\"x-p2i\");\n    bc.postMessage(\"hi-from-page\");\n\n    setTimeout(() => state.resolve(), 100);\n    await state.done(() => {\n        testing.expectEqual(\"hi-from-page\", iframe.contentWindow.__got);\n        bc.close();\n    });\n}\n",
+  "blockSHA256": "7073995cead605cea919114756d60ec566c9c70f304eab064f1aca2bdaa8d8d8",
+  "traced": "\n{\n    const state = await testing.async();\n\n    const trace=globalThis.__ownedBcTrace={events:[],errors:[]};\n    const iframe = document.createElement(\"iframe\");\n    iframe.addEventListener('load',()=>trace.events.push(['iframe-load',performance.now()]));\n    document.documentElement.appendChild(iframe);\n    const doc = iframe.contentDocument,w=iframe.contentWindow;\n    w.addEventListener('error',e=>trace.errors.push({message:e.message,name:e.error?.name}));\n    trace.snapshot=()=>({sameWindow:w===iframe.contentWindow,sameDocument:doc===iframe.contentDocument,closed:w.closed,ready:doc.readyState,url:doc.URL,origin:w.location.origin,started:w.__bcStarted,registered:w.__bcReady,messageAt:w.__bcMessageAt,got:w.__got,html:doc.documentElement?.outerHTML});\n    trace.afterAppend=trace.snapshot();\n    doc.write(\n        '<!DOCTYPE html><body><script>' +\n        'window.__bcStarted=performance.now();const c = new BroadcastChannel(\"x-p2i\");window.__bcReady=performance.now();' +\n        'c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };' +\n        '<\\/script></body>'\n    );\n    doc.close();trace.afterClose=trace.snapshot();\n\n    // The iframe's channel is registered synchronously by document.close(), so\n    // the listener is ready before we post.\n    const bc = new BroadcastChannel(\"x-p2i\");\n    trace.postAt=performance.now();bc.postMessage(\"hi-from-page\");\n\n    setTimeout(() => {trace.timerAt=performance.now();trace.at100=trace.snapshot();state.resolve()}, 100);\n    if(location.search.includes('busy')){const end=performance.now()+120;while(performance.now()<end){}}\n    await state.done(() => {\n        testing.expectEqual(\"hi-from-page\", iframe.contentWindow.__got);\n        bc.close();\n    });\n}\n",
+  "tracedSHA256": "1db587f5e36db226e39854eb06cf43c11a7aaf37ae4893cf48139c27eb6d9cfb",
+  "bodySHA256": {
+    "full": "cfbabf0452b5c7b4d231ec64445cbd40e6cc8882533cd01a2d0dc48f9b68adbf",
+    "exact": "b7ede5f3ccc949d989c3850e7a3a1e161c699f239e6cc2046974b7573199f417",
+    "trace": "84ff77eaab53c5a8fd5f47f7db918beaa09506e54bd7b91cbffda76089cba59e",
+    "busy": "699724ecc0a8dc06070471e229f61786d0406951649ed27ff5b98ae7da8b994c"
+  },
+  "pollSource": "(()=>{if(typeof testing==='undefined')return JSON.stringify({ready:false});try{return JSON.stringify({ready:true,native:testing.IS_TEST_RUNNER,passed:testing.assertOk()===true})}catch(error){return JSON.stringify({ready:true,native:testing.IS_TEST_RUNNER,failed:true,error:{name:error.name,message:error.message,stack:error.stack}})}})()",
+  "snapshot": "(()=>{const t=globalThis.__ownedBcTrace;return JSON.stringify({trace:t?{...t,snapshot:undefined,late:t.snapshot()}:null,document:{url:document.URL,ready:document.readyState},frames:[...document.querySelectorAll('iframe')].map(f=>{try{const w=f.contentWindow,d=f.contentDocument;return{url:d?.URL,ready:d?.readyState,closed:w?.closed,origin:w?.location.origin,got:w?.__got,html:d?.documentElement?.outerHTML}}catch(e){return{error:e.message}}})})})()",
+  "rows": [
+    {
+      "kind": "orders",
+      "navigation": {
+        "frameId": "a5c19292-5c30-4af2-be3b-d6f1b230483d",
+        "loaderId": "b72ed428-b486-4587-8304-a63b0bcd6a27",
+        "isDownload": false
+      },
+      "polls": [],
+      "orders": {
+        "result": {
+          "type": "string",
+          "value": "{\"rows\":[{\"kind\":\"micro-zero\",\"log\":[\"sync\",\"micro\",\"timer1\",\"micro1\",\"timer2\"]},{\"kind\":\"message-first-zero\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"timer-first-zero\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"busy-overdue\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"busy-cancel\",\"log\":[[\"message\",\"actual message\"]]}],\"boundary\":\"Authored heldout task orders, actual callbacks/messages; busy120ms diagnostic only, original runtime delays unchanged\"}"
+        }
+      },
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=orders\",\"ready\":\"complete\"},\"frames\":[]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=orders\",\"ready\":\"complete\"},\"frames\":[]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "a5c19292-5c30-4af2-be3b-d6f1b230483d",
+            "loaderId": "b72ed428-b486-4587-8304-a63b0bcd6a27",
+            "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=orders",
+            "securityOrigin": "http://127.0.0.1:41727",
+            "mimeType": "text/html"
+          }
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "a5c19292-5c30-4af2-be3b-d6f1b230483d",
+              "loaderId": "b72ed428-b486-4587-8304-a63b0bcd6a27",
+              "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=orders",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html",
+              "domainAndRegistry": "",
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "43ab0d1c-f23e-4846-9bda-a79b9f27ab08"
+        }
+      ],
+      "ms": 808.4666159999997
+    },
+    {
+      "kind": "full",
+      "navigation": {
+        "frameId": "f9e045d2-3953-495c-915f-822042f09e99",
+        "loaderId": "d81212d0-1f0e-4861-854b-4e6ccc900c5c",
+        "isDownload": false
+      },
+      "polls": [
+        {
+          "ready": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": true
+        }
+      ],
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=full\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-i2p\\\");setTimeout(() => c.postMessage(\\\"hi-from-iframe\\\"), 10);</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-p2i\\\");c.onmessage = (e) => { window.__got = e.data; };</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const other = new BroadcastChannel(\\\"x-iso-other\\\");other.onmessage = () => { window.__leaked = true; };</script></body></html>\"}]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=full\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-i2p\\\");setTimeout(() => c.postMessage(\\\"hi-from-iframe\\\"), 10);</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-p2i\\\");c.onmessage = (e) => { window.__got = e.data; };</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const other = new BroadcastChannel(\\\"x-iso-other\\\");other.onmessage = () => { window.__leaked = true; };</script></body></html>\"}]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "f9e045d2-3953-495c-915f-822042f09e99",
+            "loaderId": "d81212d0-1f0e-4861-854b-4e6ccc900c5c",
+            "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=full",
+            "securityOrigin": "http://127.0.0.1:41727",
+            "mimeType": "text/html"
+          },
+          "childFrames": [
+            {
+              "frame": {
+                "id": "98ec66d0-1d46-49e4-922b-3848408870c6",
+                "parentId": "f9e045d2-3953-495c-915f-822042f09e99",
+                "loaderId": "3544e8b9-11db-4ceb-9f79-3d7733bbd737",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            },
+            {
+              "frame": {
+                "id": "5f89dffe-075e-4b14-bc7c-424998778bb3",
+                "parentId": "f9e045d2-3953-495c-915f-822042f09e99",
+                "loaderId": "4cd63d2c-d80e-4f67-be56-be4a675cf10a",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            },
+            {
+              "frame": {
+                "id": "22a0fc7e-e3b6-442e-8633-5f36093165c2",
+                "parentId": "f9e045d2-3953-495c-915f-822042f09e99",
+                "loaderId": "cbe205ce-6be6-403d-8bc9-7550b624faea",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            }
+          ]
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "f9e045d2-3953-495c-915f-822042f09e99",
+              "loaderId": "d81212d0-1f0e-4861-854b-4e6ccc900c5c",
+              "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=full",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html",
+              "domainAndRegistry": "",
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "20046315-9280-4948-95be-693edd91dc18"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "98ec66d0-1d46-49e4-922b-3848408870c6",
+              "parentId": "f9e045d2-3953-495c-915f-822042f09e99",
+              "loaderId": "3544e8b9-11db-4ceb-9f79-3d7733bbd737",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "20046315-9280-4948-95be-693edd91dc18"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "5f89dffe-075e-4b14-bc7c-424998778bb3",
+              "parentId": "f9e045d2-3953-495c-915f-822042f09e99",
+              "loaderId": "4cd63d2c-d80e-4f67-be56-be4a675cf10a",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "20046315-9280-4948-95be-693edd91dc18"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "22a0fc7e-e3b6-442e-8633-5f36093165c2",
+              "parentId": "f9e045d2-3953-495c-915f-822042f09e99",
+              "loaderId": "cbe205ce-6be6-403d-8bc9-7550b624faea",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "20046315-9280-4948-95be-693edd91dc18"
+        }
+      ],
+      "ms": 848.5133489999998
+    },
+    {
+      "kind": "exact",
+      "navigation": {
+        "frameId": "18f28590-484a-473b-9a07-fd3bb4150e7c",
+        "loaderId": "e1dc7cfd-5181-4bb9-a99d-0635b9e940df",
+        "isDownload": false
+      },
+      "polls": [
+        {
+          "ready": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": true
+        }
+      ],
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=exact\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-p2i\\\");c.onmessage = (e) => { window.__got = e.data; };</script></body></html>\"}]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=exact\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-p2i\\\");c.onmessage = (e) => { window.__got = e.data; };</script></body></html>\"}]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "18f28590-484a-473b-9a07-fd3bb4150e7c",
+            "loaderId": "e1dc7cfd-5181-4bb9-a99d-0635b9e940df",
+            "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=exact",
+            "securityOrigin": "http://127.0.0.1:41727",
+            "mimeType": "text/html"
+          },
+          "childFrames": [
+            {
+              "frame": {
+                "id": "7146dc4e-d82c-4799-8bb3-a537e5846940",
+                "parentId": "18f28590-484a-473b-9a07-fd3bb4150e7c",
+                "loaderId": "116750b5-7368-45d6-a6e5-b32fa960bc41",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            }
+          ]
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "18f28590-484a-473b-9a07-fd3bb4150e7c",
+              "loaderId": "e1dc7cfd-5181-4bb9-a99d-0635b9e940df",
+              "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=exact",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html",
+              "domainAndRegistry": "",
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "78fa460b-7543-48aa-8607-71b0aa965f17"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "7146dc4e-d82c-4799-8bb3-a537e5846940",
+              "parentId": "18f28590-484a-473b-9a07-fd3bb4150e7c",
+              "loaderId": "116750b5-7368-45d6-a6e5-b32fa960bc41",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "78fa460b-7543-48aa-8607-71b0aa965f17"
+        }
+      ],
+      "ms": 400.62419299999965
+    },
+    {
+      "kind": "trace",
+      "navigation": {
+        "frameId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+        "loaderId": "84d83bf9-b8b5-46bf-b09b-bd446bc06ce8",
+        "isDownload": false
+      },
+      "polls": [
+        {
+          "ready": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": true
+        }
+      ],
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":{\"events\":[[\"iframe-load\",334.18913900000007],[\"iframe-load\",334.49539400000003]],\"errors\":[],\"afterAppend\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"html\":\"<html><head></head><body></body></html>\"},\"afterClose\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"loading\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":33.58508900000015,\"registered\":33.93222300000025,\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"postAt\":262.13971300000003,\"timerAt\":363.3459039999998,\"at100\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":33.58508900000015,\"registered\":33.93222300000025,\"messageAt\":110.92019800000025,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"late\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":33.58508900000015,\"registered\":33.93222300000025,\"messageAt\":110.92019800000025,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"}},\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=trace\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-i2p\\\");setTimeout(() => c.postMessage(\\\"hi-from-iframe\\\"), 10);</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const other = new BroadcastChannel(\\\"x-iso-other\\\");other.onmessage = () => { window.__leaked = true; };</script></body></html>\"}]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":{\"events\":[[\"iframe-load\",334.18913900000007],[\"iframe-load\",334.49539400000003]],\"errors\":[],\"afterAppend\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"html\":\"<html><head></head><body></body></html>\"},\"afterClose\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"loading\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":33.58508900000015,\"registered\":33.93222300000025,\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"postAt\":262.13971300000003,\"timerAt\":363.3459039999998,\"at100\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":33.58508900000015,\"registered\":33.93222300000025,\"messageAt\":110.92019800000025,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"late\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":33.58508900000015,\"registered\":33.93222300000025,\"messageAt\":110.92019800000025,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"}},\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=trace\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const c = new BroadcastChannel(\\\"x-i2p\\\");setTimeout(() => c.postMessage(\\\"hi-from-iframe\\\"), 10);</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"html\":\"<html><head></head><body><script>const other = new BroadcastChannel(\\\"x-iso-other\\\");other.onmessage = () => { window.__leaked = true; };</script></body></html>\"}]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+            "loaderId": "84d83bf9-b8b5-46bf-b09b-bd446bc06ce8",
+            "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=trace",
+            "securityOrigin": "http://127.0.0.1:41727",
+            "mimeType": "text/html"
+          },
+          "childFrames": [
+            {
+              "frame": {
+                "id": "44689933-9578-40ce-b581-80a0e266781c",
+                "parentId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+                "loaderId": "59e6846c-bfd3-4799-a744-f27ef341afcd",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            },
+            {
+              "frame": {
+                "id": "38d274ce-d196-491a-bd41-bc4b3ad704d4",
+                "parentId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+                "loaderId": "3d9bb598-147a-477e-931d-756b9b7ad96b",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            },
+            {
+              "frame": {
+                "id": "ec0a6ff8-f0a3-4c87-a1d4-54281040b9d8",
+                "parentId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+                "loaderId": "590b38bb-64f9-4257-a687-72719a5872d0",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            }
+          ]
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+              "loaderId": "84d83bf9-b8b5-46bf-b09b-bd446bc06ce8",
+              "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=trace",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html",
+              "domainAndRegistry": "",
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "d8e5cbb0-7653-488b-bc86-3fe21b5d4101"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "44689933-9578-40ce-b581-80a0e266781c",
+              "parentId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+              "loaderId": "59e6846c-bfd3-4799-a744-f27ef341afcd",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "d8e5cbb0-7653-488b-bc86-3fe21b5d4101"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "38d274ce-d196-491a-bd41-bc4b3ad704d4",
+              "parentId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+              "loaderId": "3d9bb598-147a-477e-931d-756b9b7ad96b",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "d8e5cbb0-7653-488b-bc86-3fe21b5d4101"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "ec0a6ff8-f0a3-4c87-a1d4-54281040b9d8",
+              "parentId": "3ea37a6d-e427-4b85-ab02-aba789390e4e",
+              "loaderId": "590b38bb-64f9-4257-a687-72719a5872d0",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "d8e5cbb0-7653-488b-bc86-3fe21b5d4101"
+        }
+      ],
+      "ms": 711.9568200000003
+    },
+    {
+      "kind": "busy",
+      "navigation": {
+        "frameId": "5fc7b6e0-ef45-4a8f-81a5-b89f08aff7e7",
+        "loaderId": "a6e3a5ac-026e-4214-a0dd-b5c31bcbe62e",
+        "isDownload": false
+      },
+      "polls": [
+        {
+          "ready": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": false
+        },
+        {
+          "ready": true,
+          "native": true,
+          "passed": true
+        }
+      ],
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":{\"events\":[[\"iframe-load\",342.56342300000006],[\"iframe-load\",346.5404389999999]],\"errors\":[],\"afterAppend\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"html\":\"<html><head></head><body></body></html>\"},\"afterClose\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"loading\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":59.32027999999991,\"registered\":59.64790499999981,\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"postAt\":201.45981600000005,\"timerAt\":417.6642770000003,\"at100\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":59.32027999999991,\"registered\":59.64790499999981,\"messageAt\":275.3997830000003,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"late\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":59.32027999999991,\"registered\":59.64790499999981,\"messageAt\":275.3997830000003,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"}},\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=busy&busy=1\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"}]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":{\"events\":[[\"iframe-load\",342.56342300000006],[\"iframe-load\",346.5404389999999]],\"errors\":[],\"afterAppend\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"html\":\"<html><head></head><body></body></html>\"},\"afterClose\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"loading\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":59.32027999999991,\"registered\":59.64790499999981,\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"postAt\":201.45981600000005,\"timerAt\":417.6642770000003,\"at100\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":59.32027999999991,\"registered\":59.64790499999981,\"messageAt\":275.3997830000003,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"},\"late\":{\"sameWindow\":true,\"sameDocument\":true,\"closed\":false,\"ready\":\"complete\",\"url\":\"about:blank\",\"origin\":\"null\",\"started\":59.32027999999991,\"registered\":59.64790499999981,\"messageAt\":275.3997830000003,\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"}},\"document\":{\"url\":\"http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=busy&busy=1\",\"ready\":\"complete\"},\"frames\":[{\"url\":\"about:blank\",\"ready\":\"complete\",\"closed\":false,\"origin\":\"null\",\"got\":\"hi-from-page\",\"html\":\"<html><head></head><body><script>window.__bcStarted=performance.now();const c = new BroadcastChannel(\\\"x-p2i\\\");window.__bcReady=performance.now();c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };</script></body></html>\"}]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "5fc7b6e0-ef45-4a8f-81a5-b89f08aff7e7",
+            "loaderId": "a6e3a5ac-026e-4214-a0dd-b5c31bcbe62e",
+            "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=busy&busy=1",
+            "securityOrigin": "http://127.0.0.1:41727",
+            "mimeType": "text/html"
+          },
+          "childFrames": [
+            {
+              "frame": {
+                "id": "c3bc046c-8cb6-45b4-9895-0088f5f84976",
+                "parentId": "5fc7b6e0-ef45-4a8f-81a5-b89f08aff7e7",
+                "loaderId": "3b0e876c-017a-4f9f-9864-b6e0f4759687",
+                "url": "about:blank",
+                "name": "",
+                "securityOrigin": "http://127.0.0.1:41727",
+                "mimeType": "text/html"
+              }
+            }
+          ]
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "5fc7b6e0-ef45-4a8f-81a5-b89f08aff7e7",
+              "loaderId": "a6e3a5ac-026e-4214-a0dd-b5c31bcbe62e",
+              "url": "http://127.0.0.1:41727/src/browser/tests/broadcast_channel.html?case=busy&busy=1",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html",
+              "domainAndRegistry": "",
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "12876a65-9219-4b6d-9f9d-be1b0d81ea1a"
+        },
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "c3bc046c-8cb6-45b4-9895-0088f5f84976",
+              "parentId": "5fc7b6e0-ef45-4a8f-81a5-b89f08aff7e7",
+              "loaderId": "3b0e876c-017a-4f9f-9864-b6e0f4759687",
+              "url": "about:blank",
+              "name": "",
+              "securityOrigin": "http://127.0.0.1:41727",
+              "mimeType": "text/html"
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "12876a65-9219-4b6d-9f9d-be1b0d81ea1a"
+        }
+      ],
+      "ms": 529.6103549999998
+    }
+  ],
+  "requests": [
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=orders",
+      "at": 197.095578
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=full",
+      "at": 644.357782
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 645.664626
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=exact",
+      "at": 829.071682
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 830.085253
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=trace",
+      "at": 997.437018
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 998.417359
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=busy&busy=1",
+      "at": 1174.891082
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 1176.078655
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=orders",
+      "at": 4207.285748
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=full",
+      "at": 4852.257342
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 4914.829617
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=exact",
+      "at": 5698.99444
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 5783.907337
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=trace",
+      "at": 6103.879607
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 6193.798984
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=busy&busy=1",
+      "at": 6802.007701
+    },
+    {
+      "url": "/src/browser/tests/testing.js",
+      "at": 6906.16922
+    }
+  ],
+  "stderr": "RedPanda/0.1.0 automation server listening on 127.0.0.1:38487\n(node:517395) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(Use `node --trace-warnings ...` to show where the warning was created)\n(node:517395) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(node:517395) ExperimentalWarning: VM Modules is an experimental feature and might change at any time\n(node:517395) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(node:517395) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(node:517395) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n",
+  "ms": 5433.370618999999,
+  "boundary": "Whole source bytes unchanged for full. Exact-block/trace/busy are independent diagnostics, not whole-source acceptance. Original fixture100ms unchanged. Busy120ms is authored diagnostic only, no runtime budget change."
+}

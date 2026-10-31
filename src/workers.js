@@ -1,4 +1,6 @@
 import {withRequestMetadata} from './request-metadata.js';
+import {fetchWorkerHTTP} from './worker-fetch-policy.js';
+import {installWorkerFetchRealm} from './worker-fetch-realm.js';
 import {getHeapBinding} from './native-heap.js';
 import {createSharedWorkerContext,installSharedWorkerGlobal} from './shared-worker-global.js';
 import {installSharedWorkers} from './shared-workers.js';
@@ -122,6 +124,16 @@ export function installWorkers(page, window, { enabled = true } = {}) {
           const requestAbort = new AbortController();
           this.#requests.set(message.id, requestAbort);
           try {
+            if(!service&&!message.script&&!message.sync&&message.resourceType!=='XHR'){
+              const combined=AbortSignal.any([...(signal?[signal]:[]),this.#abort.signal,requestAbort.signal]);
+              const result=await fetchWorkerHTTP({origin:creator.origin,referrerFor:(target,source)=>page.referrerFor?.(target,source),request:(target,init,history)=>{
+                const blobSnapshot=new URL(target).protocol==='blob:'?blobURLs?.resolve(target):undefined;
+                const transportInit=withRequestMetadata({...init,signal:combined,credentialsOrigin:creator.origin,...(blobSnapshot?{blobSnapshot}:{})},{origin:creator.origin,mode:init.mode,redirects:history});
+                return page.fetch(target,transportInit,'Fetch');
+              }},message.url,message.init,message.sourceURL??url.href);
+              if(!this.#terminated&&active())this.#thread.postMessage({kind:'response',id:message.id,result},[result.bytes.buffer]);
+              return;
+            }
             const headers = new Headers(message.init?.headers);
             if (!headers.has('referer')) {
               const referrer = page.referrerFor?.(message.url, url.href);
@@ -206,7 +218,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
 async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData) {
   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
   let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient,connectShared;
-  let fetchTypeError;
+  let fetchTypeError,fetchRealm;
   let dispatchError = value => report(value);
   const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
@@ -217,7 +229,7 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
     const abort = () => { pending.delete(id); parentPort.postMessage({ kind: 'cancel', id }); reject(signal.reason); };
     signal?.addEventListener('abort', abort, { once: true });
     pending.set(id, { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
-    parentPort.postMessage({ kind: 'request', id, url, init, script, resourceType });
+    parentPort.postMessage({ kind: 'request', id, url, init, script, resourceType,sourceURL:workerData.url });
   });
   const syncSource = url => {
     const sync = new SharedArrayBuffer(SYNC_BYTES + 8), state = new Int32Array(sync, 0, 2);
@@ -262,6 +274,12 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
       }
     },
     async fetch(input, init = {}, resourceType) {
+      if(fetchRealm&&resourceType!=='XHR'){
+        const prepared=fetchRealm.prepare(input,init),original=prepared.raw,nativeSignal=original.signal;
+        const method=original.method,headers=[...original.headers],body=['GET','HEAD'].includes(method)?undefined:new Uint8Array(await original.clone().arrayBuffer());
+        let result;try{result=await request(original.url,{method,headers,body,mode:original.mode,credentials:original.credentials,redirect:original.redirect},false,nativeSignal,resourceType)}catch(error){if(nativeSignal.aborted)throw nativeSignal.reason;throw new fetchTypeError('fetch error')}
+        return fetchRealm.response(result);
+      }
       const supplied = init.signal;
       const nativeSignal = supplied == null ? supplied : abortPlatform.hasSignal(supplied) ? abortPlatform.nativeSignal(supplied) : supplied;
       const nativeInit = supplied == null ? init : {...init,signal:nativeSignal};
@@ -351,6 +369,7 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
   Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+  if(!workerData.shared&&!workerData.service)fetchRealm=installWorkerFetchRealm(realm,{evaluate,streams,abort:abortPlatform,baseURL:()=>workerData.url,lifetime:lifetime.signal,fetch:(input,init)=>bridge.fetch(input,init)});
   installImageData(vm.runInContext('globalThis', context));
   installWebCrypto(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context)});
   installURLPattern(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context)});

@@ -1,0 +1,226 @@
+--- /dev/null
++++ b/src/dom-websocket-state.js
+@@ -0,0 +1,29 @@
++// Genuine canonical WebSocket wrappers keep their implementation in Host
++// private state. Only successful setup/new callsites can install this brand.
++import {createRequire} from 'node:module';
++import {createHash} from 'node:crypto';
++import {bindEventTargetImplementation} from './dom-event-target-state.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const values=new WeakMap(),installed=new WeakSet();
++export function webSocketImplementation(value){return values.get(value)}
++export function hasWebSocketImplementation(value){return values.has(value)}
++export function bindWebSocketImplementation(value,implementation){bindEventTargetImplementation(value,implementation);values.set(value,implementation);return implementation}
++export function installPrivateWebSocketUtils(target=utils){if(installed.has(target))return;installed.add(target);target.webSocketImplementation=webSocketImplementation;target.hasWebSocketImplementation=hasWebSocketImplementation;target.bindWebSocketImplementation=bindWebSocketImplementation;target.configureWebSocketPrototype=configureWebSocketPrototype}
++// Native exposes extensions as a constant and preserves this IDL member order.
++// Rebuild the actual generated prototype's own descriptors before publication.
++function configureWebSocketPrototype(prototype){
++ const descriptors=Object.getOwnPropertyDescriptors(prototype),keys=['CONNECTING','OPEN','CLOSING','CLOSED','url','readyState','bufferedAmount','binaryType','protocol','extensions','onopen','onmessage','onerror','onclose','send','close','constructor',Symbol.toStringTag];
++ for(const key of Reflect.ownKeys(prototype))if(descriptors[key].configurable)delete prototype[key];
++ descriptors.extensions={value:'',writable:false,enumerable:true,configurable:false};
++ // Constants already exist nonconfigurably on the original generated prototype.
++ // Their physical order precedes all configurable members after removal.
++ for(const key of keys)if(descriptors[key].configurable||key==='extensions')Object.defineProperty(prototype,key,descriptors[key]);
++}
++installPrivateWebSocketUtils();
++export function transformPrivateWebSocketSource(source){
++ if(createHash('sha256').update(source).digest('hex')!=='8ee5efbe6419e82e8f3983c022acd66f7651c25d11045fdf579023b4434b3053')throw new Error('Pinned generated WebSocket source changed');
++ const setup='Object.defineProperty(wrapper, implSymbol, {\n    value: new Impl.implementation(globalObject, constructorArgs, privateData),\n    configurable: true\n  });',allocate='Object.defineProperty(wrapper, implSymbol, {\n    value: Object.create(Impl.implementation.prototype),\n    configurable: true\n  });',brand='utils.isObject(value) && utils.hasOwn(value, implSymbol) && value[implSymbol] instanceof Impl.implementation';
++ for(const expression of[setup,allocate,brand])if(source.split(expression).length!==2)throw new Error('Pinned generated WebSocket backing changed');
++ source=source.replace(setup,'utils.bindWebSocketImplementation(wrapper, new Impl.implementation(globalObject, constructorArgs, privateData));').replace(allocate,'utils.bindWebSocketImplementation(wrapper, Object.create(Impl.implementation.prototype));').replace(brand,'utils.isObject(value) && utils.hasWebSocketImplementation(value)');
++ for(const name of['wrapper','esValue','value'])source=source.replaceAll(name+'[implSymbol]','utils.webSocketImplementation('+name+')');return source.replace('  ctorRegistry[interfaceName] = WebSocket;','  utils.configureWebSocketPrototype(WebSocket.prototype);\n  ctorRegistry[interfaceName] = WebSocket;');
++}
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {transformPrivateWebSocketSource} from './dom-websocket-state.js';
+ import {transformPrivateEventTargetSource} from './dom-event-target-state.js';
+ import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+ import {transformPrivateEventSource} from './dom-event-state.js';
+@@ -65,17 +66,17 @@
+   const full=join(directory,filename),factory=require(full),kind=basename(filename,'.js');
+   if(typeof factory.setup!=='function'||interfaces.getInterfaceWrapper(kind)!==factory)continue;
+   let Implementation;
+-  for(const folder of (kind==='Attr'||kind==='NamedNodeMap')?['attributes']:['nodes','events']){
++  for(const folder of kind==='WebSocket'?['websockets']:(kind==='Attr'||kind==='NamedNodeMap')?['attributes']:['nodes','events']){
+    try{Implementation=require('jsdom/lib/jsdom/living/'+folder+'/'+kind+'-impl.js').implementation;break;}catch(error){if(error.code!=='MODULE_NOT_FOUND')throw error;}
+   }
+   if(!Implementation)continue;
+   const node=Implementation===NodeImpl||Implementation.prototype instanceof NodeImpl,event=Implementation===EventImpl||Implementation.prototype instanceof EventImpl;
+-  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&kind!=='NamedNodeMap'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
++  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&kind!=='NamedNodeMap'&&!node&&!event&&Implementation!==EventTargetImpl&&kind!=='WebSocket')continue;
+   if(node||kind==='HTMLFormControlsCollection'||kind==='NamedNodeMap')registerDOMAllocationKind(kind);
+   // Recompile the pinned independent generated source before any Window is
+   // installed. The same CommonJS exports object and Host implementations stay
+   // canonical. Only the three initial wrapper allocation expressions change.
+-  const originalSource=readFileSync(full,'utf8');let source=originalSource;
++  const originalSource=readFileSync(full,'utf8');let source=kind==='WebSocket'?transformPrivateWebSocketSource(originalSource):originalSource;
+   const shell='return Object.create(proto);',proxy='return new Proxy(wrapper, proxyHandler);',constructor='exports.setup(Object.create(new.target.prototype),';
+   if(source.split(shell).length!==2)throw new Error('Unexpected generated Node allocation source: '+kind);
+   source=source.replace(shell,`return createShell(globalObject, proto, ${JSON.stringify(kind)});`);
+@@ -98,10 +99,10 @@
+   }
+   if(event)source=transformPrivateEventSource(source,kind);
+   if(Implementation===EventTargetImpl)source=transformPrivateEventTargetSource(source);
+-  if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
++  if(event||Implementation===EventTargetImpl||kind==='WebSocket')source=transformEventIDLInstall(source,kind);
+   candidates.push({factory,kind,full,originalSource,source});
+  }
+- const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
++ const fingerprint=createHash('sha256').update(candidates.filter(({kind})=>kind!=='WebSocket').map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
+  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
+  for(const {factory,kind,full,source} of candidates){
+   const module={exports:factory};
+--- a/src/event-idl-realms.js
++++ b/src/event-idl-realms.js
+@@ -7,8 +7,9 @@
+ const records=new WeakMap(),HostObject=Object.prototype,HostFunction=Function.prototype;
+ const isArray=Array.isArray,isFrozen=Object.isFrozen;
+ const own=Reflect.ownKeys,descriptor=Object.getOwnPropertyDescriptor,define=Object.defineProperty,prototype=Object.getPrototypeOf,setPrototype=Object.setPrototypeOf,apply=Reflect.apply;
+-function recordFor(globalObject){
+- const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
++function recordFor(globalObject,selectedContext){
++ if(selectedContext!==undefined&&(!vm.isContext(selectedContext)||vm.runInContext('globalThis',selectedContext)!==globalObject))throw new TypeError('An actual public interface Context/global pair is required');
++ const context=selectedContext??(vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject);
+  // A genuine JSDOM created without runScripts belongs to the Host realm.
+  // Keep its original generated interface instead of inventing a VM context.
+  if(!context||!vm.isContext(context))return null;
+@@ -30,8 +31,8 @@
+  const value=vm.compileFunction("'use strict';"+source,['key','invoke'],{parsingContext:record.context})(key,invoke);
+  for(const name of['name','length'])define(value,name,descriptor(original,name));return value;
+ }
+-export function installEventIDLRealm(globalObject,kind,original,constructOperation,brand){
+- const record=recordFor(globalObject);if(!record)return original;
++export function installEventIDLRealm(globalObject,kind,original,constructOperation,brand,selectedContext){
++ const record=recordFor(globalObject,selectedContext);if(!record)return original;
+  // Strict ordinary construction supplies the genuine selected-VM receiver
+  // and performs V8's prototype resolution exactly once before conversion.
+  // Setup initializes that SAME receiver; a call without new never creates a
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,5 @@
++import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
++import {installPrivateWebSocketUtils,transformPrivateWebSocketSource,webSocketImplementation,bindWebSocketImplementation} from './dom-websocket-state.js';
+ import{viewportTargetInterface,wrapViewportTarget,installUtilityViewport}from'./window-viewport.js';
+ import {installPrivateEventTargetUtils,transformPrivateEventTargetSource,eventTargetImplementation,directEventTargetImplementation,bindEventTargetImplementation} from './dom-event-target-state.js';
+ import {installEventAPIParity,configureEventDictionary,customEventInterface,wrapCustomEvent} from './event-api-parity.js';
+@@ -32,7 +34,7 @@
+  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
+  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+- const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);installPrivateEventTargetUtils(localUtils);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
++ const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);installPrivateEventTargetUtils(localUtils);installPrivateWebSocketUtils(localUtils);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
+  const metadata={context,global,mainWindow,signal,disposed:false};const pendingFactories=[];let factoryReady=false;
+  const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);registerPlatformFactory(wrapper,{kind:interfaceName,implementation:impl,globalObject:global});if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
+  const utilityPrototypes=new Map();
+@@ -52,7 +54,7 @@
+   const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+-  if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(eventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
++  if(webSocketImplementation(wrapper))bindWebSocketImplementation(wrapper,impl);else if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(eventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+   wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);
+   return wrapper;
+  }
+@@ -75,13 +77,20 @@
+   // wrapper. Never replace an existing implementation's main wrapper to enter a world.
+   const hostGenerated=require(join(generatedRoot,name+'.js'));
+   if(typeof hostGenerated.new==='function'&&mainWindow[name]){
+-   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else if(eventTargetImplementation(canonical))bindEventTargetImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
++   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(webSocketImplementation(canonical))bindWebSocketImplementation(canonical,impl);else if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else if(eventTargetImplementation(canonical))bindEventTargetImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
+   }
+   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
+  }
+  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
+   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
+-  let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);if(interfaceName==='EventTarget')source=transformPrivateEventTargetSource(source);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
++  let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);if(interfaceName==='EventTarget')source=transformPrivateEventTargetSource(source);if(interfaceName==='WebSocket'){
++   source=transformPrivateWebSocketSource(source).replace('return Object.create(proto);','return createShell(globalObject, proto);').replaceAll('exports.setup(Object.create(new.target.prototype),','exports.setup(createShell(globalObject, new.target.prototype),');
++   source=transformEventIDLInstall(source,'WebSocket');
++   // Keep private conversion/controller closures in Host while publishing real
++   // utility-VM definitions and the same canonical generated setup receiver.
++   const ObjectType=global.Object,createShell=(_global,prototype)=>Object.setPrototypeOf(Reflect.construct(ObjectType,[]),prototype);
++   vm.compileFunction(source,['require','module','exports','__filename','__dirname','createShell','installEventIDLRealm'],{filename})(localRequire,module,module.exports,filename,dirname(filename),createShell,(g,...args)=>installEventIDLRealm(g,...args,context));
++  }else{const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));}
+   configureEventDictionary(interfaceName,module.exports);
+   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
+    // Measured native producer quirk: MO arguments are real main-world values,
+--- a/src/window-websocket.js
++++ b/src/window-websocket.js
+@@ -1,3 +1,4 @@
++import {hasWebSocketImplementation} from './dom-websocket-state.js';
+ import {createRequire} from 'node:module';
+ import {browserWebSocketQuota,normalizeWebSocketURL,validWebSocketProtocols,socketHeaders,openWebSocketTransport} from './websocket-transports.js';
+ import {captureDOMExceptionFactory} from './worker-dom-exception.js';
+@@ -50,7 +51,8 @@
+  module.implementation=WebSocketImpl;
+  // Keep genuine unowned jsdom instances compatible with the pinned factory;
+  // owned sockets use the successful private backend record, never a tag.
+- generated.isImpl=value=>STATES.has(value)||value instanceof Original;
+- generated.is=value=>utils.isObject(value)&&utils.hasOwn(value,utils.implSymbol)&&generated.isImpl(utils.implForWrapper(value));
++ const ordinaryHasInstance=Function.prototype[Symbol.hasInstance];
++ generated.isImpl=value=>STATES.has(value)||Reflect.apply(ordinaryHasInstance,Original,[value]);
++ generated.is=hasWebSocketImplementation;
+  const cleanup=Original.cleanUpWindow;Original.cleanUpWindow=window=>{const owner=OWNERS.get(window._globalProxy??window);if(owner)kill(owner);return cleanup.call(Original,window)};
+ }
+--- a/test/shared-workers.test.js
++++ b/test/shared-workers.test.js
+@@ -4,7 +4,7 @@
+ async function fixture(t,version='worker.js',enabled=true){const worker=await read(version),owned=await createOwnedSharedServer(worker),browser=new Browser({loadResources:enabled?['iframe','worker']:['iframe']}),page=browser.createPage();t.after(async()=>{browser.close();await owned.close()});await page.navigate(owned.origin);return{...owned,browser,page,w:page.dom.window,worker}}
+ for(const [name,report]of[['sharing','sharing'],['options','options'],['errors','errors'],['lifecycle-v2','lifecycle-v2'],['transfer-v3','transfer-v3'],['intrinsics','intrinsics'],['creator-blob-http','creator-blob-http']])test('SharedWorker real Native scripts/ports/lifetime '+name,{timeout:18000},async t=>{const f=await fixture(t),source=await read(name+'.js'),native=JSON.parse(await read('native-'+report+'.json'));assert.equal(createHash('sha256').update(source).digest('hex'),native.sourceSHA256);assert.equal(createHash('sha256').update(f.worker).digest('hex'),native.workerSHA256);const result=JSON.parse(await f.page.evaluate(source.replaceAll('ORIGIN',JSON.stringify(f.origin)).replaceAll('CROSS',JSON.stringify(f.cross))));assert.deepEqual(normalize(result,f.origin,f.cross),normalize(JSON.parse(native.result.result.value),native.origin,native.cross));if(name==='errors')assert.equal(f.requests.some(r=>r.headers.includes(f.cross)),false)});
+ test('SharedWorker real shared counters/connect fields and explicit existing global profile gap',{timeout:8000},async t=>{const f=await fixture(t),native=JSON.parse(await read('native-basic.json')),actual=JSON.parse(await f.page.evaluate(await read('basic.js'))),expected=JSON.parse(native.result.result.value);const actualChain=actual.scope.chain,expectedChain=expected.scope.chain;delete actual.scope.chain;delete expected.scope.chain;assert.deepEqual(normalize(actual,f.origin,f.cross),normalize(expected,native.origin,native.cross));assert.deepEqual(actualChain.slice(1).map(p=>p.tag),expectedChain.slice(1).map(p=>p.tag));assert.equal(actualChain[0].keys.some(k=>k.startsWith('__')),false);assert.notDeepEqual(actualChain[3].keys,expectedChain[3].keys);assert.equal(f.requests.filter(r=>r.url==='/worker.js').length,2)});
+-test('SharedWorker constructor descriptors/conversions/strong getters record inherited Target symbol gap',async t=>{const f=await fixture(t),native=JSON.parse(await read('native-surface.json')),expected=JSON.parse(native.result.result.value),actual=JSON.parse(f.page.evaluate((await read('surface.js')).replaceAll('CROSS',JSON.stringify(f.cross))));for(let i=0;i<expected.rows.length;i++)if(expected.rows[i].length===4){assert.deepEqual(expected.rows[i][3],[]);assert.deepEqual(actual.rows[i][3],['impl']);actual.rows[i][3]=[]}assert.deepEqual(actual,expected);let traps=0;const proxy=new Proxy(new f.w.SharedWorker('/worker.js'),{get(){traps++;throw 1}});assert.throws(()=>Object.getOwnPropertyDescriptor(f.w.SharedWorker.prototype,'port').get.call(proxy),e=>e instanceof f.w.TypeError);assert.equal(traps,0)});
++test('SharedWorker constructor descriptors/conversions/strong getters match Native private Target shape',async t=>{const f=await fixture(t),native=JSON.parse(await read('native-surface.json')),expected=JSON.parse(native.result.result.value),actual=JSON.parse(f.page.evaluate((await read('surface.js')).replaceAll('CROSS',JSON.stringify(f.cross))));assert.deepEqual(actual,expected);let traps=0;const proxy=new Proxy(new f.w.SharedWorker('/worker.js'),{get(){traps++;throw 1}});assert.throws(()=>Object.getOwnPropertyDescriptor(f.w.SharedWorker.prototype,'port').get.call(proxy),e=>e instanceof f.w.TypeError);assert.equal(traps,0)});
+ test('Shared global real scope attributes match Native; engine intrinsic constructor gap is retained',{timeout:8000},async t=>{const f=await fixture(t,'worker-v3.js'),native=JSON.parse(await read('native-scope-properties-v2.json')),expected=JSON.parse(native.result.result.value),actual=JSON.parse(await f.page.evaluate(await read('scope-properties.js')));assert.equal(actual.constructorIdentity.objectName,'Object');assert.equal(expected.constructorIdentity.same,false);assert.equal(expected.constructorIdentity.prototype,true);delete expected.constructorIdentity;delete actual.constructorIdentity;assert.deepEqual(actual,expected)});
+ test('VM messaging public interfaces match Native descriptors/brands; existing clone wording gap is explicit',async t=>{const f=await fixture(t),native=JSON.parse(await read('native-ports.json')),expected=JSON.parse(native.result.result.value),actual=JSON.parse(f.page.evaluate(await read('ports.js')));assert.equal(expected.rows[0][1],'The object can not be cloned');assert.equal(expected.rows[2][1],'The object can not be cloned');assert.equal(actual.rows[0][1],'Unsupported structured clone type');assert.equal(actual.rows[2][1],'MessagePort must be transferred and cannot be detached');expected.rows[0][1]=actual.rows[0][1];expected.rows[2][1]=actual.rows[2][1];assert.deepEqual(actual,expected)});
+ test('Shared worker pool survives creator-frame removal and creates genuine separate actors for independent Pages',{timeout:8000},async t=>{const f=await fixture(t),source=`(async()=>{globalThis.frame=document.createElement('iframe');frame.src='/frame';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;return await frame.contentWindow.eval("new Promise(r=>{const w=new SharedWorker('/worker.js','creator');w.port.onmessage=e=>r(e.data.count);w.port.postMessage('first')})")})()`;assert.equal(await f.page.evaluate(source),1);f.page.evaluate('frame.remove()');assert.equal(await f.page.evaluate(`new Promise(r=>{const w=new SharedWorker('/worker.js','creator');w.port.onmessage=e=>r(e.data.count);w.port.postMessage('again')})`),2);const other=f.browser.createPage();await other.navigate(f.origin);assert.equal(await other.evaluate(`new Promise(r=>{const w=new SharedWorker('/worker.js','creator');w.port.onmessage=e=>r(e.data.count);w.port.postMessage('separate')})`),1);f.page.close();const fresh=f.browser.createPage();await fresh.navigate(f.origin);assert.equal(await fresh.evaluate(`new Promise(r=>{const w=new SharedWorker('/worker.js','creator');w.port.onmessage=e=>r(e.data.count);w.port.postMessage('fresh')})`),1)});
+--- a/test/websocket-quota.test.js
++++ b/test/websocket-quota.test.js
+@@ -1,3 +1,4 @@
++import {webSocketImplementation} from '../src/dom-websocket-state.js';
+ import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{WebSocketServer}from'ws';import{Browser}from'../src/browser.js';import{browserWebSocketQuota}from'../src/websocket-transports.js';import{parseWebSocketLimit,prepareCLIArguments}from'../src/cli-options.js';
+ let server,wss,origin,endpoint,worker;const sockets=new Set(),upgrades=[];
+ let setup;
+@@ -8,5 +9,5 @@
+ for(const[name,report]of[['ownership.js','native-ownership1.json'],['failure-order.js','native-failure-order1.json'],['termination.js','native-termination1.json'],['frame-release.js','native-frame-release1.json'],['worker-frame-release.js','native-worker-frame-release1.json'],['handshake-failure.js','native-handshake-failure1.json'],['pending.js','native-pending1.json'],['remote-close.js','native-remote-close1.json'],['worker-cancel.js','native-worker-cancel1.json']])test('WebSocket genuine quota/transport Native control '+name,{timeout:12000},async t=>{const{page}=await fixture(t),source=await readFile(new URL('../proposals/websocket-quota/'+name,import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../proposals/websocket-quota/'+report,import.meta.url),'utf8'));assert.equal(createHash('sha256').update(source).digest('hex'),native.sourceSHA256);const actual=JSON.parse(await page.evaluate(source.replaceAll('ENDPOINT',JSON.stringify(endpoint))));assert.deepEqual(actual,JSON.parse(native.result.result.value));if(name==='worker-cancel.js')assert.equal(upgrades.includes('/hang?worker-cancel'),false)});
+ test('WebSocket default8 and explicit50 admit only actual shared Node transport starts',{timeout:10000},async t=>{for(const[limit,count]of[[null,8],[50,16]]){const{browser,page}=await fixture(t,limit),start=upgrades.length,rows=await page.evaluate(`(async()=>{const held=[];const rows=await Promise.all(Array.from({length:16},(_,i)=>new Promise(resolve=>{const w=new WebSocket(${JSON.stringify(endpoint)}+'/?sixteen='+i);held.push(w);w.onopen=()=>resolve('open');w.onerror=()=>{};w.onclose=()=>resolve('closed')})));await Promise.all(held.map(w=>w.readyState===3?undefined:new Promise(resolve=>{w.onclose=resolve;w.close()})));return rows})()`);assert.equal(rows.filter(x=>x==='open').length,count);assert.equal(upgrades.length-start,count);await new Promise(r=>setImmediate(r));assert.equal(browserWebSocketQuota(browser).usage(),0)}});
+ test('WebSocket closed/terminated worker transports remain real until owning Page teardown; Browser controllers are independent',{timeout:10000},async t=>{const{browser,page}=await fixture(t),held=await page.evaluate(`new Promise(resolve=>{globalThis.worker=new Worker('/worker.js');worker.onmessage=()=>{worker.terminate();resolve(true)};worker.postMessage({command:'hold',id:'owner',count:1})})`);assert.equal(held,true);assert.equal(browserWebSocketQuota(browser).usage(),1);const other=browser.createPage();await other.navigate(origin);assert.equal(await other.evaluate(`new Promise(resolve=>{const s=new WebSocket(${JSON.stringify(endpoint)});s.onerror=()=>{};s.onclose=()=>resolve('denied');s.onopen=()=>resolve('open')})`),'denied');page.close();assert.equal(browserWebSocketQuota(browser).usage(),0);assert.equal(await other.evaluate(`new Promise(resolve=>{globalThis.socket=new WebSocket(${JSON.stringify(endpoint)});socket.onopen=()=>resolve('open')})`),'open');const independent=new Browser({wsMaxConcurrent:1});t.after(()=>independent.close());const p=independent.createPage();await p.navigate(origin);assert.equal(await p.evaluate(`new Promise(resolve=>{globalThis.socket=new WebSocket(${JSON.stringify(endpoint)});socket.onopen=()=>resolve('open')})`),'open')});
+-test('WebSocket main transport data uses the real receiving VM and private backend records',{timeout:6000},async t=>{const{page,w}=await fixture(t),result=await page.evaluate(`new Promise(resolve=>{const s=new WebSocket(${JSON.stringify(endpoint)});s.binaryType='arraybuffer';s.onopen=()=>s.send(new Uint8Array([3,1,4]));s.onmessage=e=>{s.close();resolve({s,bytes:e.data})}})`),{getHeapBinding}=await import('../src/native-heap.js'),binding=getHeapBinding(),anchor=w.eval('[]');assert.equal(binding.sameRealm(result.bytes,anchor),true);const proto=Object.getPrototypeOf(result.bytes);Object.setPrototypeOf(result.bytes,null);assert.equal(binding.sameRealm(result.bytes,anchor),true);Object.setPrototypeOf(result.bytes,proto);assert.deepEqual(Array.from(new w.Uint8Array(result.bytes)),[3,1,4]);const symbols=Object.getOwnPropertySymbols(result.s),impl=result.s[symbols.find(s=>s.description==='impl')];assert.ok(impl);assert.equal(Object.keys(impl).some(key=>/socket|transport|lease|quota|headers/i.test(key)),false);assert.throws(()=>Object.getOwnPropertyDescriptor(w.WebSocket.prototype,'readyState').get.call(Object.create(w.WebSocket.prototype)),e=>e instanceof w.TypeError)});
++test('WebSocket main transport data uses the real receiving VM and private backend records',{timeout:6000},async t=>{const{page,w}=await fixture(t),result=await page.evaluate(`new Promise(resolve=>{const s=new WebSocket(${JSON.stringify(endpoint)});s.binaryType='arraybuffer';s.onopen=()=>s.send(new Uint8Array([3,1,4]));s.onmessage=e=>{s.close();resolve({s,bytes:e.data})}})`),{getHeapBinding}=await import('../src/native-heap.js'),binding=getHeapBinding(),anchor=w.eval('[]');assert.equal(binding.sameRealm(result.bytes,anchor),true);const proto=Object.getPrototypeOf(result.bytes);Object.setPrototypeOf(result.bytes,null);assert.equal(binding.sameRealm(result.bytes,anchor),true);Object.setPrototypeOf(result.bytes,proto);assert.deepEqual(Array.from(new w.Uint8Array(result.bytes)),[3,1,4]);assert.deepEqual(Reflect.ownKeys(result.s),[]);const impl=webSocketImplementation(result.s);assert.ok(impl);assert.equal(Object.keys(impl).some(key=>/socket|transport|lease|quota|headers/i.test(key)),false);assert.throws(()=>Object.getOwnPropertyDescriptor(w.WebSocket.prototype,'readyState').get.call(Object.create(w.WebSocket.prototype)),e=>e instanceof w.TypeError)});
+ test('WebSocket quota decimal CLI grammar matches actual Native accepted and rejected flags',async()=>{const native=JSON.parse(await readFile(new URL('../proposals/websocket-quota/native-cli-validation-v3.json',import.meta.url),'utf8'));for(const row of native.rows){if(row.exitCode===0)assert.ok(parseWebSocketLimit(row.value)>=0,row.value);else assert.throws(()=>parseWebSocketLimit(row.value),Error,row.value)}assert.deepEqual(prepareCLIArguments(['serve','--ws-max-concurrent','-0'],[]),['serve','--ws-max-concurrent=-0']);for(const value of[-1,256,1.2,NaN,'8'])assert.throws(()=>new Browser({wsMaxConcurrent:value}),RangeError)});
+--- /dev/null
++++ b/test/direct-target-migration.test.js
+@@ -0,0 +1,33 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {readFile,writeFile} from 'node:fs/promises';
++import {createHash} from 'node:crypto';
++import {createRequire} from 'node:module';
++import {WebSocketServer} from 'ws';
++import {Browser} from '../src/browser.js';
++import {createIsolatedWorld} from '../src/isolated-world.js';
++import {installWindowWebSocket} from '../src/window-websocket.js';
++import {webSocketImplementation} from '../src/dom-websocket-state.js';
++import {eventTargetImplementation} from '../src/dom-event-target-state.js';
++import {implementationForWrapper} from '../src/dom-event-state.js';
++import {getHeapBinding} from '../src/native-heap.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),plain=value=>JSON.parse(JSON.stringify(value)),sha=value=>createHash('sha256').update(value).digest('hex');
++const worker=`onconnect=e=>{const port=e.ports[0];port.onmessage=e=>port.postMessage({input:e.data,shared:true})};`;
++async function fixture(t){
++ const connections=new Set(),server=http.createServer((req,res)=>{if(req.url==='/shared.js'){res.writeHead(200,{'content-type':'text/javascript'});res.end(worker)}else if(req.url==='/sse'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});res.write('data: sse\n\n')}else{res.writeHead(200,{'content-type':'text/html'});res.end('<!doctype html><body>fronts</body>')}}),sockets=new WebSocketServer({server,path:'/socket'});
++ server.on('connection',s=>{connections.add(s);s.on('close',()=>connections.delete(s));s.on('error',()=>{})});sockets.on('connection',s=>{s.on('error',()=>{});s.on('message',(bytes,binary)=>s.send(bytes,{binary}))});server.listen(0,'127.0.0.1');await once(server,'listening');const origin='http://127.0.0.1:'+server.address().port,browser=new Browser({loadResources:['worker','iframe']}),page=browser.createPage();
++ t.after(async()=>{browser.close();for(const socket of sockets.clients)socket.terminate();for(const socket of connections)socket.destroy();await new Promise(r=>sockets.close(r));server.closeAllConnections();await new Promise(r=>server.close(r))});await page.navigate(origin);return{browser,page,w:page.dom.window,origin,endpoint:origin.replace('http','ws')+'/socket'};
++}
++async function reference(name){const source=await readFile(new URL('../proposals/direct-target-migration/evidence/'+name+'-expression.js',import.meta.url),'utf8'),record=JSON.parse(await readFile(new URL('../proposals/direct-target-migration/evidence/native-'+(name==='fronts'?'fronts-baseline':'websocket-entry-v2')+'.json',import.meta.url),'utf8'));assert.equal(sha(source),record.sourceSHA256);assert.equal(sha(worker),record.workerSHA256);assert.equal(record.binarySHA256,'9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f');return{source,expected:record.response.result.value}}
++test('Native direct fronts have private shapes and deliver real Channel/Shared/SSE/WebSocket data and trusted targets',{timeout:7000},async t=>{const{page}=await fixture(t),{source,expected}=await reference('fronts');assert.deepEqual(plain(await page.evaluate(source)),expected)});
++test('Native WebSocket descriptors and genuine constructor conversion/newTarget order match in main and utility VMs',{timeout:7000},async t=>{const{page,w,endpoint}=await fixture(t),{source:template,expected}=await reference('websocket-entry'),source=template.replaceAll('WEBSOCKET_ENDPOINT',JSON.stringify(endpoint));assert.deepEqual(plain(page.evaluate(source)),expected);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});installWindowWebSocket(page,world.global,{mainWindow:w});assert.deepEqual(plain(world.evaluate(source)),expected)});
++test('canonical WebSocket private implementation survives real utility wrapping with unchanged backend identity',{timeout:7000},async t=>{const{page,w,endpoint}=await fixture(t),socket=w.eval(`new WebSocket(${JSON.stringify(endpoint)})`),implementation=webSocketImplementation(socket),world=createIsolatedWorld(w,{signal:page.documentAbort.signal});installWindowWebSocket(page,world.global,{mainWindow:w});const wrapped=world.wrap(socket);assert.equal(webSocketImplementation(wrapped),implementation);assert.equal(eventTargetImplementation(wrapped),implementation);assert.equal(implementationForWrapper(wrapped),implementation);assert.equal(utils.wrapperForImpl(implementation),socket);assert.equal(world.wrap(socket),wrapped);assert.deepEqual(Reflect.ownKeys(wrapped),[]);assert.equal(wrapped instanceof world.global.WebSocket,true);assert.equal(Object.getOwnPropertyDescriptor(world.global.WebSocket.prototype,'url').get.call(wrapped),endpoint);const received=new Promise((resolve,reject)=>{wrapped.onmessage=resolve;socket.onerror=reject;socket.onopen=()=>wrapped.send('real utility')});const event=await received;assert.equal(event.data,'real utility');assert.equal(event.target,wrapped);assert.equal(event.currentTarget,null);assert.equal(event.isTrusted,true);assert.equal(event instanceof world.global.MessageEvent,true);wrapped.close();assert.equal(utils.wrapperForImpl(implementation),socket)});
++test('WebSocket brand authority never comes from inherited/copyable symbols, proxies or authored hasInstance',{timeout:7000},async t=>{const{w,endpoint}=await fixture(t),socket=new w.WebSocket(endpoint),implementation=webSocketImplementation(socket),getter=Object.getOwnPropertyDescriptor(w.WebSocket.prototype,'readyState').get,fake=Object.create(w.WebSocket.prototype);Object.defineProperty(fake,utils.implSymbol,{value:implementation});let traps=0;const proxy=new Proxy(socket,{get(){traps++;throw 1},getOwnPropertyDescriptor(){traps++;throw 2}});for(const value of[{},fake,Object.create(socket),proxy]){assert.throws(()=>getter.call(value),e=>e instanceof w.TypeError);assert.throws(()=>w.EventTarget.prototype.addEventListener.call(value,{toString(){throw 3}},()=>{}),e=>e instanceof w.TypeError)}assert.equal(traps,0);assert.equal(implementationForWrapper(fake),null);assert.deepEqual(Reflect.ownKeys(socket),[]);Object.defineProperty(socket,utils.implSymbol,{get(){throw 4}});Object.defineProperty(w.WebSocket,Symbol.hasInstance,{value(){throw 5},configurable:true});assert.equal(getter.call(socket),0);assert.equal(implementationForWrapper(socket),implementation);w.WebSocket.prototype.close.call(socket)});
++test('direct target fronts and WebSocket public definitions own actual selected VM creation contexts',{timeout:7000},async t=>{const{page,w,endpoint}=await fixture(t),frame=w.document.createElement('iframe');w.document.body.append(frame);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});installWindowWebSocket(page,world.global,{mainWindow:w});const binding=getHeapBinding(),rows=[];
++ function check(value,anchor,label){const first=binding.sameRealm(value,anchor),host=binding.sameRealm(value,{}),prototype=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);const after=binding.sameRealm(value,anchor);Object.setPrototypeOf(value,prototype);rows.push({label,first,after,host});assert.equal(first,true,label);assert.equal(after,true,label);assert.equal(host,false,label)}
++ for(const[g,label]of[[w,'main'],[frame.contentWindow,'frame'],[world.global,'utility']]){for(const value of[g.WebSocket,g.WebSocket.prototype])check(value,g.Object.prototype,label+':'+(typeof value==='function'?'constructor':'prototype'));for(const key of Reflect.ownKeys(g.WebSocket.prototype)){const d=Object.getOwnPropertyDescriptor(g.WebSocket.prototype,key);for(const field of['value','get','set'])if(typeof d[field]==='function')check(d[field],g.Object.prototype,label+':'+String(key)+':'+field)}const socket=new g.WebSocket(endpoint);check(socket,g.Object.prototype,label+':value');assert.deepEqual(Reflect.ownKeys(socket),[]);socket.close()}
++ for(const[g,label]of[[w,'main'],[frame.contentWindow,'frame']]){const channel=new g.MessageChannel(),shared=new g.SharedWorker('/shared.js'),sse=new g.EventSource('/sse');for(const[name,value]of[['channel',channel],['port',channel.port1],['shared',shared],['shared.port',shared.port],['sse',sse]]){check(value,g.Object.prototype,label+':'+name);assert.deepEqual(Reflect.ownKeys(value),[])}channel.port1.close();channel.port2.close();shared.port.close();sse.close()}
++ if(process.env.RED_PANDA_DIRECT_TARGET_PROOF)await writeFile(process.env.RED_PANDA_DIRECT_TARGET_PROOF,JSON.stringify({node:process.version,rows},null,2)+'\n',{flag:'wx'});
++});

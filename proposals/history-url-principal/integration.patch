@@ -1,0 +1,335 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
+ import {installNavigationAPI} from './navigation-api.js';
+ import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
+@@ -92,6 +93,7 @@
+ installHeapFactories();
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const PRINCIPAL_DOCUMENTS=new WeakMap();
+ let defaultCollectionsBinding;
+ 
+ export const VERSION = '0.1.0';
+@@ -245,6 +247,8 @@
+ 
+   prepareWindow(window, historyState = null, { main = true } = {}) {
+     preparePopupDocument(this,window);
++    captureCookieDocument(this,implForWrapper(window.document));
++    if(main)PRINCIPAL_DOCUMENTS.set(this,implForWrapper(window.document));
+     captureProtocolRealm(window);
+     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
+     this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
+@@ -440,6 +444,8 @@
+     if (metadata !== undefined) this.userAgentMetadata = metadata;
+   }
+ 
++  get securityOrigin(){return PRINCIPAL_DOCUMENTS.get(this)?._origin??'null'}
++
+   referrerFor(target, source = this.url) {
+     let origin, destination;
+     try { origin = new URL(source); destination = new URL(target); } catch { return null; }
+@@ -490,14 +496,14 @@
+     let method = init.method ?? (input instanceof Request ? input.method : 'GET');
+     let body = init.body ?? (input instanceof Request && !['GET', 'HEAD'].includes(method) ? await input.arrayBuffer() : undefined);
+     const credentials = init.credentials ?? (input instanceof Request ? input.credentials : 'include');
+-    const credentialsOrigin = init.credentialsOrigin ?? new URL(this.url).origin;
++    const credentialsOrigin = init.credentialsOrigin ?? this.securityOrigin;
+     const deadline = AbortSignal.timeout(this.timeout);
+     const signal = init.signal ? AbortSignal.any([deadline, init.signal]) : deadline;
+     let redirectResponse;
+     for (let redirects = 0; redirects <= 20; redirects++) {
+       const useCookies = credentials !== 'omit' && (credentials !== 'same-origin' || new URL(url).origin === credentialsOrigin);
+       if (useCookies) {
+-        const cookies = await this.context.cookies.getCookieString(url);
++        const cookies = type==='Document'?await this.context.cookies.getCookieString(url):await cookieHeaderFor(this.context.cookies,this,url,init.frameId);
+         if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
+       } else headers.delete('cookie');
+       // Privileged CDP headers override request/default/jar values, including
+--- a/src/joint-history.js
++++ b/src/joint-history.js
+@@ -8,7 +8,7 @@
+ import {onFrameRetirement} from './frame-activity.js';
+ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const HistoryImpl=require('jsdom/lib/jsdom/living/window/History-impl.js').implementation;
+-const implementationMethods=Object.freeze(Object.assign(Object.create(null),{pushState:HistoryImpl.prototype.pushState,replaceState:HistoryImpl.prototype.replaceState}));
++const implementationMethods=Object.freeze(Object.assign(Object.create(null),{pushState:HistoryImpl.prototype.pushState,replaceState:HistoryImpl.prototype.replaceState,guard:HistoryImpl.prototype._guardAgainstInactiveDocuments}));
+ const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
+ const PopStateEvent=require('jsdom/lib/jsdom/living/generated/PopStateEvent.js'),HashChangeEvent=require('jsdom/lib/jsdom/living/generated/HashChangeEvent.js');
+ const conversions=require('webidl-conversions'),{serializeURL}=createRequire(require.resolve('jsdom/lib/jsdom/living/window/History-impl.js'))('whatwg-url');
+@@ -39,8 +39,6 @@
+ export function planHistoryURL(page,window,url,kind='push'){
+  const state=WINDOWS.get(window),document=state.implementation._document,current=document._URL,destination=url===null||url===''?current:document.encodingParseAURL(url);
+  if(!destination)throw new state.TypeError('');
+- const authority=['scheme','username','password','host','port'].every(key=>key==='host'?JSON.stringify(destination.host)===JSON.stringify(current.host):destination[key]===current[key]);
+- if(!authority||(!['http','https'].includes(current.scheme)&&serializeURL(destination,true)!==serializeURL(current,true)))throw state.exception(`${kind}State() cannot update history to the URL ${serializeURL(destination)}.`,'SecurityError');
+  return serializeURL(destination);
+ }
+ export function commitNavigationState(page,window,url,text,mode,operation){
+@@ -54,12 +52,11 @@
+ export function initialHistoryNavigation(page){return sessionState(page).initial}
+ function writeImplementation(state,name,data,title,url,exception=state.exception){
+  const implementation=state.implementation,document=implementation._document,current=document._URL;
+- if(typeof current.path!=='string'||!implementation._window)return apply(implementationMethods[name],implementation,[data,title,url]);
+- // Pinned jsdom assumes every URL path is an Array. Real opaque URL records
+- // have a String path; use their genuine session history for the permitted
+- // fragment-only rewrite, preserving the actual opaque record throughout.
++ apply(implementationMethods.guard,implementation,[]);
+  const destination=url===null||url===''?current:document.encodingParseAURL(url);
+- if(!destination||serializeURL(destination,true)!==serializeURL(current,true))throw exception('The history URL cannot update this document','SecurityError');
++ if(!destination)throw new state.TypeError('');
++ // URL-only History updates retain the real Document, realm and _origin.
++ // Use the actual session-history slots rather than changing the principal.
+  const history=implementation._window._sessionHistory;
+  if(name==='pushState'){history.removeAllEntriesAfterCurrentEntry();history.clearHistoryTraversalTasks();const entry={document,stateObject:data,url:destination};history.addEntryAfterCurrentEntry(entry);history.updateCurrentEntry(entry)}
+  else{history.currentEntry.stateObject=data;history.currentEntry.url=destination}
+--- a/src/cookie-store.js
++++ b/src/cookie-store.js
+@@ -56,7 +56,7 @@
+ }
+ const trim=value=>value.replace(/^[ \t]+|[ \t]+$/g,'');
+ function site(host){try{return toughCookie.getPublicSuffix(host,{allowSpecialUseDomain:true})??host;}catch{return host;}}
+-function sameSite(owner,url){let page=owner.page;const expected=site(url.hostname),scheme=url.protocol;const seen=new Set();while(page&&!seen.has(page)){seen.add(page);let actual;try{const document=page===owner.page?owner.document:implForWrapper(page.dom.window.document);actual=new URL(document._origin);}catch{return false;}if(site(actual.hostname)!==expected||actual.protocol!==scheme)return false;page=page.parentFrameId?page.registry?.findFrame(page.parentFrameId):null;}return true;}
++function sameSite(owner,url){let page=owner.page;const expected=site(url.hostname),scheme=url.protocol;const seen=new Set();while(page&&!seen.has(page)){seen.add(page);let actual;try{const document=page===owner.page?owner.document:implForWrapper(page.dom.window.document);actual=new URL(document.URL);}catch{return false;}if(site(actual.hostname)!==expected||actual.protocol!==scheme)return false;page=page.parentFrameId?page.registry?.findFrame(page.parentFrameId):null;}return true;}
+ function visible(owner,cookie){let url;try{url=new URL(owner.document.URL);}catch{return false;}if(cookie.httpOnly||!url.hostname)return false;const host=url.hostname.replace(/^\[|\]$/g,'');return(cookie.hostOnly?host===cookie.domain:toughCookie.domainMatch(host,cookie.domain))&&toughCookie.pathMatch(url.pathname,cookie.path)&&(!cookie.secure||trustworthyCookieURL(url.href))&&(cookie.sameSite==='none'||sameSite(owner,url));}
+ export function installCookieStore(page,window){
+  if(installed.has(window))return installed.get(window);
+@@ -71,8 +71,8 @@
+  const copyItem=value=>record({domain:value.domain,hostOnly:value.domain===null,expires:value.expires,name:value.name,partitioned:value.partitioned,path:value.path,sameSite:value.sameSite,secure:value.secure,value:value.value});
+  const hasListeners=()=>owner.store!==null&&!!implForWrapper(owner.store)._eventListeners.change?.length;
+  const bridge=record({hasStore:value=>stores.has(value),hasEvent:value=>events.has(value),
+-  read(name,override,first){let url;try{url=new URL(override??document.URL,document.baseURLSerialized());}catch{fail('InvalidUrl');}if(url.origin!==document._origin)fail('SecurityError');const current=new URL(document.URL);current.hash='';const compared=new URL(url.href);compared.hash='';if(override!==null&&current.href!==compared.href)fail('InvalidUrl');if(!url.hostname)fail('SecurityError');
+-   const values=jar.getCookiesSync(url.href,{http:false,sameSiteContext:sameSite(owner,url)?'strict':'none',sort:true}).filter(value=>name===null||value.key===trim(name)).map(value=>record({name:value.key,value:value.value,domain:value.domain,hostOnly:value.hostOnly,path:value.path,expires:value.expiryTime(),secure:!!value.secure,sameSite:value.sameSite??'lax'}));return first?(values.length?item(values[0]):null):list(values);
++  read(name,override,first){let url;try{url=new URL(override??document.URL,document.baseURLSerialized());}catch{fail('InvalidUrl');}if(override!==null&&url.origin!==document._origin)fail('SecurityError');const current=new URL(document.URL);current.hash='';const compared=new URL(url.href);compared.hash='';if(override!==null&&current.href!==compared.href)fail('InvalidUrl');if(!url.hostname)fail('SecurityError');
++   const same=sameSite(owner,url);const values=jar.getCookiesSync(url.href,{http:false,sameSiteContext:same?'strict':'none',sort:true}).filter(value=>(same||(value.sameSite??'lax')==='none')&&(name===null||value.key===trim(name))).map(value=>record({name:value.key,value:value.value,domain:value.domain,hostOnly:value.hostOnly,path:value.path,expires:value.expiryTime(),secure:!!value.secure,sameSite:value.sameSite??'lax'}));return first?(values.length?item(values[0]):null):list(values);
+   },
+   write(input,deleting){
+    const name=trim(input.name),value=trim(input.value),path=input.path,domain=input.domain;let expires=input.expires,url;
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,3 +1,4 @@
++import {cookieHeaderForSync} from './cookie-site.js';
+ import { Worker } from 'node:worker_threads';
+ import { randomUUID } from 'node:crypto';
+ const enqueue=queueMicrotask;
+@@ -30,7 +31,7 @@
+    for(let redirects=0;redirects<=20;redirects++){
+     checkpoint();
+     const useCookies=init.credentials!=='omit'&&(init.credentials!=='same-origin'||new URL(url).origin===init.credentialsOrigin);
+-    const cookie=useCookies?page.context.cookies.getCookieStringSync(url):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
++    const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
+     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
+     const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+     page.emit('request',{id,url,type:'XHR',method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+--- a/src/performance.js
++++ b/src/performance.js
+@@ -231,7 +231,7 @@
+ export function installPerformance(page,window,{navigationType=page.performanceNavigationType??'navigate'}={}){
+   if(installed.has(window))return installed.get(window);
+   if(!window?.performance||typeof window.eval!=='function')throw new TypeError('Performance installation requires a document realm');
+-  const document=window.document,signal=page.documentAbort?.signal,previousClose=window.close;
++  const document=window.document,principal=implForWrapper(document),signal=page.documentAbort?.signal,previousClose=window.close;
+   let disposed=false;
+   const live=()=>!disposed&&window.document===document;
+   const owner=page.registry?.page??page,tracker=trackerFor(owner);
+@@ -266,9 +266,9 @@
+       responseStatus:response.status??0,contentType:(headers.get('content-type')??'').split(';')[0].trim().toLowerCase(),contentEncoding:encoding,
+       nextHopProtocol:response.protocol??'',finalResponseHeadersStart:0};
+     let sameOrigin=false;
+-    try{sameOrigin=new URL(record.currentURL).origin===window.location.origin;}catch{}
++    try{sameOrigin=new URL(record.currentURL).origin===principal._origin;}catch{}
+     const allowed=(headers.get('timing-allow-origin')??'').split(',').map(value=>value.trim());
+-    if(!sameOrigin&&!allowed.includes('*')&&!allowed.includes(window.location.origin)){
++    if(!sameOrigin&&!allowed.includes('*')&&!allowed.includes(principal._origin)){
+       for(const name of ['requestStart','responseStart','redirectStart','redirectEnd','decodedBodySize','encodedBodySize','transferSize','responseStatus','finalResponseHeadersStart'])value[name]=0;
+       for(const name of ['contentType','contentEncoding','nextHopProtocol'])value[name]='';
+       value.fetchStart=start;
+--- a/src/webdriver.js
++++ b/src/webdriver.js
+@@ -128,7 +128,7 @@
+     if (entry) for (const [name, callback] of entry.listeners) page.off(name, callback);
+     this.pageListeners.delete(page.id);
+   }
+-  realmInfo(page) { return { realm: this.realm(page), origin: new URL(page.url).origin, type: 'window', context: page.id }; }
++  realmInfo(page) { return { realm: this.realm(page), origin: page.securityOrigin??new URL(page.url).origin, type: 'window', context: page.id }; }
+   handle(value, page, kind = 'handle') {
+     if (kind !== 'handle') for (const [id, entry] of this.handles) {
+       if (entry.value === value && entry.pageId === page.id && entry.generation === page.executionContextId && entry.kind === kind) return id;
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -1,3 +1,4 @@
++import {networkDocumentURL} from './cookie-site.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import { randomBytes } from 'node:crypto';
+ import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable, onReadableSettled, noteReadableOperation } from './request-stream-state.js';
+@@ -585,12 +586,12 @@
+       (!cross || SIMPLE_RESPONSE.has(name) || exposed.has(name) || (exposed.has('*') && !credentials))));
+   }
+   function referrerFor(request, destination) {
+-    const source = request.referrer === 'about:client' ? window.location.href : request.referrer;
++    const source = request.referrer === 'about:client' ? networkDocumentURL(page) : request.referrer;
+     if (!source) return null;
+     let from, to;
+     try { from = new URL(source); to = new URL(destination); } catch { return null; }
+     if (!['http:', 'https:'].includes(from.protocol) || !['http:', 'https:'].includes(to.protocol)) return null;
+-    if (from.origin !== documentOrigin()) return null;
++    if (request.referrer!=='about:client' && from.origin !== documentOrigin()) return null;
+     from.username = ''; from.password = ''; from.hash = '';
+     const same = from.origin === to.origin, downgrade = from.protocol === 'https:' && to.protocol === 'http:';
+     switch (request.referrerPolicy || 'strict-origin-when-cross-origin') {
+--- /dev/null
++++ b/src/cookie-site.js
+@@ -0,0 +1,46 @@
++import {createRequire} from 'node:module';
++
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const {getPublicSuffix}=require('tough-cookie');
++const DOCUMENTS=new WeakMap();
++export function captureCookieDocument(page,document){DOCUMENTS.set(page,document)}
++const parent=page=>page.parentFrameId?page.registry?.findFrame(page.parentFrameId):null;
++function documentURL(page){try{return(DOCUMENTS.get(page)??implForWrapper(page.dom.window.document)).URL}catch{return null}}
++// Actual blank/srcdoc child contexts use their owned parent Document URL for
++// network site/referrer selection, even after a URL-only History update.
++export function networkDocumentURL(page){
++ const seen=new Set();let owner=page;
++ while(owner&&!seen.has(owner)){
++  seen.add(owner);const url=documentURL(owner);
++  if(url!=='about:blank'&&url!=='about:srcdoc')return url;
++  const ancestor=parent(owner);if(!ancestor)return url;owner=ancestor;
++ }
++ return null;
++}
++
++function site(input){
++ let url;try{url=new URL(input)}catch{return null}
++ if(!url.hostname)return null;
++ const host=url.hostname.toLowerCase().replace(/^\[|\]$/g,'');
++ try{return getPublicSuffix(host,{allowSpecialUseDomain:true})??host}catch{return host}
++}
++
++// The pinned transport's cookie site follows the live document URL, including
++// a URL-only History rewrite. Origin/CORS/credentials authority stays separate.
++// Its measured HTTP/HTTPS cookie-site comparison is host/site based.
++export function cookieSameSiteContext(page,target,frameId){
++ let owner=page;
++ if(frameId&&frameId!==page.frameId)owner=page.frames?.findFrame(frameId)??page.frames?.executionPages().find(value=>value.frameId===frameId)??page;
++ const expected=site(target),seen=new Set();if(expected===null)return'none';
++ while(owner&&!seen.has(owner)){
++  seen.add(owner);const current=site(networkDocumentURL(owner));
++  if(current!==expected)return'none';
++  owner=parent(owner);
++ }
++ return'strict';
++}
++
++function header(cookies,context){return cookies.filter(cookie=>context!=='none'||(cookie.sameSite??'lax')==='none').map(cookie=>cookie.cookieString()).join('; ')}
++export async function cookieHeaderFor(jar,page,url,frameId){const context=cookieSameSiteContext(page,url,frameId);return header(await jar.getCookies(url,{sameSiteContext:context}),context)}
++export function cookieHeaderForSync(jar,page,url,frameId){const context=cookieSameSiteContext(page,url,frameId);return header(jar.getCookiesSync(url,{sameSiteContext:context}),context)}
+--- a/test/history.test.js
++++ b/test/history.test.js
+@@ -26,14 +26,20 @@
+   } finally { browser.close(); }
+ });
+ 
+-test('invalid history state and cross-origin URLs fail without changing history', async () => {
++test('invalid History input leaves state intact and URL-only rewrites retain the actual document principal', async () => {
+   const browser = new Browser();
+   try {
+     const page = browser.createPage(); await page.navigate(`${fixture.url}history`);
+-    assert.throws(() => page.evaluate("history.pushState({},'', 'https://other.test/')"), /cannot update history/);
++    assert.throws(() => page.evaluate("history.pushState({},'', 'http://[')"), error=>error.name==='TypeError');
+     assert.throws(() => page.evaluate("history.pushState(1n,'', '#bad')"), error=>error.name==='DataCloneError');
+     assert.equal(page.history.length, 1); assert.equal(page.historyIndex, 0);
+     assert.equal(page.url, `${fixture.url}history`);
++    const document=page.dom.window.document,ObjectType=page.dom.window.Object,principal=page.securityOrigin,requests=[];
++    page.on('request',request=>requests.push(request));
++    page.evaluate("history.pushState({actual:1},'', 'https://other.test/')");
++    assert.equal(page.url,'https://other.test/');assert.equal(page.history.length,2);
++    assert.equal(page.dom.window.document,document);assert.equal(page.dom.window.Object,ObjectType);
++    assert.equal(page.dom.window.origin,principal);assert.equal(page.securityOrigin,principal);assert.equal(requests.length,0);
+   } finally { browser.close(); }
+ });
+ 
+--- /dev/null
++++ b/test/history-principal.test.js
+@@ -0,0 +1,77 @@
++import {test,before,after} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {Browser} from '../src/browser.js';
++
++let a,b,servers,requests=[],sequence=0;
++before(async()=>{
++ servers=['A','B'].map(label=>http.createServer(async(request,response)=>{
++  let body='';for await(const chunk of request)body+=chunk;
++  requests.push({label,url:request.url,method:request.method,body,headers:request.headers});
++  const allowed=[a,b,'null'].includes(request.headers.origin)?request.headers.origin:null;
++  const cors=allowed?{'access-control-allow-origin':allowed,'access-control-allow-credentials':'true'}:{};
++  if(request.url.startsWith('/probe')){response.writeHead(200,{'content-type':'application/json',...cors});response.end(JSON.stringify({label,origin:request.headers.origin??null,referer:request.headers.referer??null,cookie:request.headers.cookie??null,body}));return}
++  if(request.url.startsWith('/worker.js')){response.writeHead(200,{'content-type':'application/javascript'});response.end(`onmessage=async e=>{const rows=[];for(const [label,url]of e.data.urls){try{rows.push({label,result:await(await fetch(url,{method:'POST',headers:{'content-type':'text/plain'},credentials:'include',body:e.data.phase+'-'+label})).json()})}catch(error){rows.push({label,error:error.name})}}postMessage({id:e.data.id,rows,location:location.href})};postMessage({ready:true})`);return}
++  response.writeHead(200,{'content-type':'text/html','cache-control':'no-store','set-cookie':[label.toLowerCase()+'_public=owned-'+label+'; Path=/',label.toLowerCase()+'_hidden=hidden-'+label+'; Path=/; HttpOnly']});
++  const children=request.url.startsWith('/root')?'<iframe src="'+b+'/other"></iframe>':'';
++  response.end('<!doctype html><script>globalThis.actualToken='+ ++sequence+';localStorage.setItem("principal-marker",'+JSON.stringify(label)+')</script><body><p>actual '+label+'</p>'+children);
++ }));
++ for(let i=0;i<servers.length;i++)servers[i].listen(0,i?'127.0.0.2':'127.0.0.1');await Promise.all(servers.map(server=>once(server,'listening')));
++ a='http://127.0.0.1:'+servers[0].address().port;b='http://127.0.0.2:'+servers[1].address().port;
++});
++after(async()=>{for(const server of servers){server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}});
++async function fixture(t,frames=true){const browser=new Browser({loadResources:['iframe','worker']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate(a+(frames?'/root':'/plain'));return{browser,page,w:page.dom.window}}
++const value=(page,expression)=>JSON.parse(page.evaluate('JSON.stringify(('+expression+'))'));
++
++test('push and replace update real URL/history while retaining Document, VM, storage and principal',async t=>{
++ const{page,w}=await fixture(t),doc=w.document,ObjectType=w.Object,loader=page.loaderId,context=page.executionContextId,token=w.actualToken,before=requests.length;
++ const row=value(page,`(()=>{const held=localStorage,entry=navigation.currentEntry;sessionStorage.setItem('actual-session','A');history.pushState({actual:1},'',${JSON.stringify(b+'/presented')});const afterPush={url:location.href,locationOrigin:location.origin,windowOrigin:origin,base:document.baseURI,state:history.state,current:navigation.currentEntry.url,storage:localStorage.getItem('principal-marker'),session:sessionStorage.getItem('actual-session'),sameStorage:held===localStorage};history.replaceState({actual:2},'',${JSON.stringify(b+'/replaced')});return{afterPush,afterReplace:{url:location.href,state:history.state,current:navigation.currentEntry.url}}})()`);
++ assert.deepEqual(row,{afterPush:{url:b+'/presented',locationOrigin:b,windowOrigin:a,base:b+'/presented',state:{actual:1},current:b+'/presented',storage:'A',session:'A',sameStorage:true},afterReplace:{url:b+'/replaced',state:{actual:2},current:b+'/replaced'}});
++ assert.equal(page.securityOrigin,a);assert.equal(page.frames.getTree().frame.securityOrigin,a);assert.equal(page.dom.window.document,doc);assert.equal(page.dom.window.Object,ObjectType);assert.equal(page.executionContextId,context);assert.equal(page.loaderId,loader);assert.equal(w.actualToken,token);assert.equal(requests.length,before);
++});
++
++test('data, JavaScript, about, file and credential URL records remain URL-only and malformed input does not mutate state',async t=>{
++ const{page,w}=await fixture(t),doc=w.document,token=w.actualToken,before=requests.length;
++ for(const url of['data:text/html,<script>globalThis.unwanted=1</script>','javascript:globalThis.unwanted=1','about:blank','file:///tmp/principal-control-never-read',b.replace('http://','http://u:p@')+'/credential']){
++  page.evaluate('history.pushState({actual:1},"",'+JSON.stringify(url)+')');assert.equal(page.url,url);assert.equal(page.securityOrigin,a);assert.equal(page.dom.window.origin,a);assert.equal(page.dom.window.document,doc);assert.equal(page.dom.window.actualToken,token);assert.equal(page.evaluate('globalThis.unwanted'),undefined);
++ }
++ const length=page.history.length,old=page.url;assert.throws(()=>page.evaluate('history.pushState({},"","http://[")'),error=>error.name==='TypeError');assert.equal(page.history.length,length);assert.equal(page.url,old);assert.equal(requests.length,before);
++});
++
++test('default Fetch referrer uses live URL while credentials authority stays original and Lax cookie delivery uses live site',async t=>{
++ const{page}=await fixture(t);const row=JSON.parse(await page.evaluate(`(async()=>{history.pushState(null,'',${JSON.stringify(b+'/new-source')});const rows=[];for(const credentials of['same-origin','include'])for(const[label,url]of[['A',${JSON.stringify(a+'/probe')}],['B',${JSON.stringify(b+'/probe')}]])rows.push({credentials,label,value:await(await fetch(url,{method:'POST',headers:{'content-type':'text/plain'},credentials,body:'actual-'+label})).json()});return JSON.stringify(rows)})()`));
++ for(const record of row){assert.equal(record.value.origin,a);assert.equal(record.value.referer,record.label==='A'?b+'/':b+'/new-source');if(record.credentials==='include'&&record.label==='B')assert.equal(record.value.cookie,'b_public=owned-B; b_hidden=hidden-B');else assert.equal(record.value.cookie,null)}
++});
++
++test('HTTPS display URL suppresses downgraded Referer but preserves Native host-based cookie site and original Origin',async t=>{
++ const{page}=await fixture(t),shown=b.replace('http://','https://')+'/display-only';const row=JSON.parse(await page.evaluate(`(async()=>{history.replaceState(null,'',${JSON.stringify(shown)});return JSON.stringify(await(await fetch(${JSON.stringify(b+'/probe')},{method:'POST',headers:{'content-type':'text/plain'},credentials:'include',body:'scheme-control'})).json())})()`));
++ assert.equal(page.url,shown);assert.equal(page.securityOrigin,a);assert.equal(row.origin,a);assert.equal(row.referer,null);assert.equal(row.cookie,'b_public=owned-B; b_hidden=hidden-B');
++});
++
++test('default CookieStore follows actual URL, explicit URL still authenticates principal, and real writes/events stay backed by the jar',async t=>{
++ const{page}=await fixture(t);const row=JSON.parse(await page.evaluate(`(async()=>{const held=cookieStore,events=[];held.addEventListener('change',e=>events.push({changed:e.changed.map(c=>[c.name,c.value,c.secure]),trusted:e.isTrusted}));history.pushState(null,'',${JSON.stringify(b+'/cookies')});let currentError,originalError;try{await held.getAll({url:location.href})}catch(e){currentError=[e.name,e.message]}try{await held.getAll({url:${JSON.stringify(a+'/root')}})}catch(e){originalError=[e.name,e.message]}const before=(await held.getAll()).map(c=>c.name);await held.set({name:'actual-rewrite',value:'actual-value',sameSite:'lax',path:'/'});await new Promise(r=>setTimeout(r,10));return JSON.stringify({same:held===cookieStore,before,currentError,originalError,events,cookie:document.cookie,values:(await held.getAll()).map(c=>[c.name,c.value,c.secure])})})()`));
++ assert.equal(row.same,true);assert.deepEqual(row.before,['b_public']);assert.deepEqual(row.currentError,['TypeError','SecurityError']);assert.deepEqual(row.originalError,['TypeError','InvalidUrl']);assert.deepEqual(row.events,[{changed:[['actual-rewrite','actual-value',true]],trusted:true}]);assert.equal(row.cookie.includes('b_public=owned-B'),true);assert.equal(row.cookie.includes('b_hidden'),false);assert.deepEqual(row.values,[['b_public','owned-B',false],['actual-rewrite','actual-value',true]]);
++ const actual=await page.context.cookies.getCookies(b+'/cookies');assert.equal(actual.some(cookie=>cookie.key==='actual-rewrite'&&cookie.value==='actual-value'&&cookie.secure),true);
++});
++
++test('object URL origin and resource-timing detail follow original principal while message-origin metadata follows current URL',async t=>{
++ const{page}=await fixture(t);const row=JSON.parse(await page.evaluate(`(async()=>{history.pushState(null,'',${JSON.stringify(b+'/metadata')});const uri=URL.createObjectURL(new Blob(['actual-blob-bytes']));const blob={origin:new URL(uri).origin,text:await(await fetch(uri)).text()};URL.revokeObjectURL(uri);const message=await new Promise(resolve=>{addEventListener('message',e=>resolve({origin:e.origin,source:e.source===window}),{once:true});postMessage('actual-message','*')});const urls=[${JSON.stringify(a+'/probe?timing=A')},${JSON.stringify(b+'/probe?timing=B')}];for(const url of urls)await(await fetch(url,{method:'POST',headers:{'content-type':'text/plain'},body:'actual-resource-body'})).text();return JSON.stringify({blob,message,entries:urls.map(url=>{const e=performance.getEntriesByName(url)[0];return{size:e.decodedBodySize,status:e.responseStatus}})})})()`));
++ assert.deepEqual(row.blob,{origin:a,text:'actual-blob-bytes'});assert.deepEqual(row.message,{origin:b,source:true});assert.equal(row.entries[0].size>0,true);assert.equal(row.entries[0].status,200);assert.deepEqual(row.entries[1],{size:0,status:0});
++});
++
++test('existing dedicated worker retains original Origin/referrer while live creator URL changes cookie delivery site',async t=>{
++ const{page}=await fixture(t);const row=JSON.parse(await page.evaluate(`(async()=>{const worker=new Worker(${JSON.stringify(a+'/worker.js')}),ready=new Promise(resolve=>worker.onmessage=e=>e.data.ready&&resolve());await ready;const ask=phase=>new Promise(resolve=>{worker.onmessage=e=>e.data.id===phase&&resolve(e.data);worker.postMessage({id:phase,phase,urls:[['A',${JSON.stringify(a+'/probe')}],['B',${JSON.stringify(b+'/probe')}]]})});try{const before=await ask('before');history.pushState(null,'',${JSON.stringify(b+'/live-owner')});return JSON.stringify({before,after:await ask('after')})}finally{worker.terminate()}})()`));
++ assert.equal(row.before.rows[0].result.cookie,'a_public=owned-A; a_hidden=hidden-A');assert.equal(row.before.rows[1].result.cookie,null);assert.equal(row.after.rows[0].result.cookie,null);assert.equal(row.after.rows[1].result.cookie,'b_public=owned-B; b_hidden=hidden-B');for(const record of row.after.rows)assert.equal(record.result.origin,a);assert.equal(row.after.location,a+'/worker.js');assert.equal(row.after.rows[0].result.referer,a+'/worker.js');assert.equal(row.after.rows[1].result.referer,a+'/');
++});
++
++test('same-document traversal restores URL/state across origins without replacing the VM or principal',async t=>{
++ const{page,w}=await fixture(t,false),doc=w.document,before=requests.length;page.evaluate(`history.pushState({one:1},'',${JSON.stringify(b+'/one')});history.pushState({two:2},'','data:text/html,actual-two');history.back();true`);
++ assert.equal(page.url,b+'/one');assert.deepEqual(value(page,'history.state'),{one:1});assert.equal(page.securityOrigin,a);assert.equal(page.dom.window.document,doc);assert.equal(requests.length,before);page.evaluate('history.back();true');assert.equal(page.url,a+'/plain');assert.equal(page.securityOrigin,a);
++});
++
++test('owned blank/srcdoc and History-about:blank child Fetch uses real parent URL for cookie site and default referrer',async t=>{
++ const{page}=await fixture(t,false);const rows=JSON.parse(await page.evaluate(`(async()=>{const rows=[];for(const kind of['blank','srcdoc','http','history-blank']){const frame=document.createElement('iframe');if(kind==='srcdoc')frame.srcdoc='<p>actual child</p>';if(kind==='http'||kind==='history-blank')frame.src=${JSON.stringify(a+'/frame-a')};const loaded=new Promise(resolve=>frame.onload=resolve);document.body.appendChild(frame);await loaded;const child=frame.contentWindow;if(kind==='history-blank')child.history.pushState(null,'','about:blank');try{rows.push({kind,url:child.location.href,origin:child.origin,response:await(await child.fetch(${JSON.stringify(a+'/probe')},{method:'POST',headers:{'content-type':'text/plain'},credentials:'include',body:'actual-'+kind})).json()})}finally{frame.remove()}}return JSON.stringify(rows)})()`));
++ assert.equal(rows.length,4);for(const row of rows){assert.equal(row.origin,a);assert.equal(row.response.origin,a);assert.equal(row.response.cookie,'a_public=owned-A; a_hidden=hidden-A');assert.equal(row.response.referer,a+(row.kind==='http'?'/frame-a':'/plain'))}
++ assert.deepEqual(rows.map(row=>row.url),['about:blank','about:srcdoc',a+'/frame-a','about:blank']);
++});

@@ -231,7 +231,7 @@ function trackerFor(owner){
 export function installPerformance(page,window,{navigationType=page.performanceNavigationType??'navigate'}={}){
   if(installed.has(window))return installed.get(window);
   if(!window?.performance||typeof window.eval!=='function')throw new TypeError('Performance installation requires a document realm');
-  const document=window.document,signal=page.documentAbort?.signal,previousClose=window.close;
+  const document=window.document,principal=implForWrapper(document),signal=page.documentAbort?.signal,previousClose=window.close;
   let disposed=false;
   const live=()=>!disposed&&window.document===document;
   const owner=page.registry?.page??page,tracker=trackerFor(owner);
@@ -266,9 +266,9 @@ export function installPerformance(page,window,{navigationType=page.performanceN
       responseStatus:response.status??0,contentType:(headers.get('content-type')??'').split(';')[0].trim().toLowerCase(),contentEncoding:encoding,
       nextHopProtocol:response.protocol??'',finalResponseHeadersStart:0};
     let sameOrigin=false;
-    try{sameOrigin=new URL(record.currentURL).origin===window.location.origin;}catch{}
+    try{sameOrigin=new URL(record.currentURL).origin===principal._origin;}catch{}
     const allowed=(headers.get('timing-allow-origin')??'').split(',').map(value=>value.trim());
-    if(!sameOrigin&&!allowed.includes('*')&&!allowed.includes(window.location.origin)){
+    if(!sameOrigin&&!allowed.includes('*')&&!allowed.includes(principal._origin)){
       for(const name of ['requestStart','responseStart','redirectStart','redirectEnd','decodedBodySize','encodedBodySize','transferSize','responseStatus','finalResponseHeadersStart'])value[name]=0;
       for(const name of ['contentType','contentEncoding','nextHopProtocol'])value[name]='';
       value.fetchStart=start;

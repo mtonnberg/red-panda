@@ -7,8 +7,9 @@ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/livi
 const records=new WeakMap(),HostObject=Object.prototype,HostFunction=Function.prototype;
 const isArray=Array.isArray,isFrozen=Object.isFrozen;
 const own=Reflect.ownKeys,descriptor=Object.getOwnPropertyDescriptor,define=Object.defineProperty,prototype=Object.getPrototypeOf,setPrototype=Object.setPrototypeOf,apply=Reflect.apply;
-function recordFor(globalObject){
- const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
+function recordFor(globalObject,selectedContext){
+ if(selectedContext!==undefined&&(!vm.isContext(selectedContext)||vm.runInContext('globalThis',selectedContext)!==globalObject))throw new TypeError('An actual public interface Context/global pair is required');
+ const context=selectedContext??(vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject);
  // A genuine JSDOM created without runScripts belongs to the Host realm.
  // Keep its original generated interface instead of inventing a VM context.
  if(!context||!vm.isContext(context))return null;
@@ -30,8 +31,8 @@ function member(record,interfaceName,key,kind,original,brand,globalObject){
  const value=vm.compileFunction("'use strict';"+source,['key','invoke'],{parsingContext:record.context})(key,invoke);
  for(const name of['name','length'])define(value,name,descriptor(original,name));return value;
 }
-export function installEventIDLRealm(globalObject,kind,original,constructOperation,brand){
- const record=recordFor(globalObject);if(!record)return original;
+export function installEventIDLRealm(globalObject,kind,original,constructOperation,brand,selectedContext){
+ const record=recordFor(globalObject,selectedContext);if(!record)return original;
  // Strict ordinary construction supplies the genuine selected-VM receiver
  // and performs V8's prototype resolution exactly once before conversion.
  // Setup initializes that SAME receiver; a call without new never creates a

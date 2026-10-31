@@ -1,0 +1,5 @@
+import hashlib,json,os,subprocess,time
+from pathlib import Path
+root=Path(__file__).resolve().parent.parent;e=root/'evidence'
+def guard():return{str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()for top in ['src','test','bin','scripts','native']for p in sorted((root/top).rglob('*'))if p.is_file()}
+start=time.monotonic();before=guard();(e/'positive-before.json').write_text(json.dumps(before,indent=2)+'\n');node='/workspace/shared/rea-tools/node_modules/node/bin/node';cmd=[node,'--experimental-vm-modules','evidence/probe-positive.mjs'];r=subprocess.run(cmd,cwd=root,env={**os.environ,'PATH':str(Path(node).parent)+':'+os.environ['PATH']},capture_output=True);(e/'positive.stdout').write_bytes(r.stdout);(e/'positive.stderr').write_bytes(r.stderr);after=guard();(e/'positive-after.json').write_text(json.dumps(after,indent=2)+'\n');status={'command':cmd,'exit':r.returncode,'seconds':time.monotonic()-start,'graphStable':before==after,'inputs':len(before),'base':'own104, timer leaf baseline identical to currentRoot, other currentRoot fixes not present'};(e/'positive-status.json').write_text(json.dumps(status,indent=2)+'\n');print(json.dumps(status))

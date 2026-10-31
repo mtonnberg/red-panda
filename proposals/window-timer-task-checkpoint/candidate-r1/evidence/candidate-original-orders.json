@@ -1,0 +1,93 @@
+{
+  "engine": "candidate",
+  "binary": "/workspace/shared/worker-clone-snapshot104/bin/red-panda.js",
+  "binarySHA256": "812cd987921a9b184bb4961faebdc60206c22a96974e02836f4ba40f4c83d98e",
+  "origin": "http://127.0.0.1:33101",
+  "fixtureSHA256": "cfbabf0452b5c7b4d231ec64445cbd40e6cc8882533cd01a2d0dc48f9b68adbf",
+  "block": "\n{\n    const state = await testing.async();\n\n    const iframe = document.createElement(\"iframe\");\n    document.documentElement.appendChild(iframe);\n    const doc = iframe.contentDocument;\n    doc.write(\n        '<!DOCTYPE html><body><script>' +\n        'const c = new BroadcastChannel(\"x-p2i\");' +\n        'c.onmessage = (e) => { window.__got = e.data; };' +\n        '<\\/script></body>'\n    );\n    doc.close();\n\n    // The iframe's channel is registered synchronously by document.close(), so\n    // the listener is ready before we post.\n    const bc = new BroadcastChannel(\"x-p2i\");\n    bc.postMessage(\"hi-from-page\");\n\n    setTimeout(() => state.resolve(), 100);\n    await state.done(() => {\n        testing.expectEqual(\"hi-from-page\", iframe.contentWindow.__got);\n        bc.close();\n    });\n}\n",
+  "blockSHA256": "7073995cead605cea919114756d60ec566c9c70f304eab064f1aca2bdaa8d8d8",
+  "traced": "\n{\n    const state = await testing.async();\n\n    const trace=globalThis.__ownedBcTrace={events:[],errors:[]};\n    const iframe = document.createElement(\"iframe\");\n    iframe.addEventListener('load',()=>trace.events.push(['iframe-load',performance.now()]));\n    document.documentElement.appendChild(iframe);\n    const doc = iframe.contentDocument,w=iframe.contentWindow;\n    w.addEventListener('error',e=>trace.errors.push({message:e.message,name:e.error?.name}));\n    trace.snapshot=()=>({sameWindow:w===iframe.contentWindow,sameDocument:doc===iframe.contentDocument,closed:w.closed,ready:doc.readyState,url:doc.URL,origin:w.location.origin,started:w.__bcStarted,registered:w.__bcReady,messageAt:w.__bcMessageAt,got:w.__got,html:doc.documentElement?.outerHTML});\n    trace.afterAppend=trace.snapshot();\n    doc.write(\n        '<!DOCTYPE html><body><script>' +\n        'window.__bcStarted=performance.now();const c = new BroadcastChannel(\"x-p2i\");window.__bcReady=performance.now();' +\n        'c.onmessage = (e) => { window.__bcMessageAt=performance.now();window.__got = e.data; };' +\n        '<\\/script></body>'\n    );\n    doc.close();trace.afterClose=trace.snapshot();\n\n    // The iframe's channel is registered synchronously by document.close(), so\n    // the listener is ready before we post.\n    const bc = new BroadcastChannel(\"x-p2i\");\n    trace.postAt=performance.now();bc.postMessage(\"hi-from-page\");\n\n    setTimeout(() => {trace.timerAt=performance.now();trace.at100=trace.snapshot();state.resolve()}, 100);\n    if(location.search.includes('busy')){const end=performance.now()+120;while(performance.now()<end){}}\n    await state.done(() => {\n        testing.expectEqual(\"hi-from-page\", iframe.contentWindow.__got);\n        bc.close();\n    });\n}\n",
+  "tracedSHA256": "1db587f5e36db226e39854eb06cf43c11a7aaf37ae4893cf48139c27eb6d9cfb",
+  "bodySHA256": {
+    "full": "cfbabf0452b5c7b4d231ec64445cbd40e6cc8882533cd01a2d0dc48f9b68adbf",
+    "exact": "b7ede5f3ccc949d989c3850e7a3a1e161c699f239e6cc2046974b7573199f417",
+    "trace": "84ff77eaab53c5a8fd5f47f7db918beaa09506e54bd7b91cbffda76089cba59e",
+    "busy": "699724ecc0a8dc06070471e229f61786d0406951649ed27ff5b98ae7da8b994c"
+  },
+  "pollSource": "(()=>{if(typeof testing==='undefined')return JSON.stringify({ready:false});try{return JSON.stringify({ready:true,native:testing.IS_TEST_RUNNER,passed:testing.assertOk()===true})}catch(error){return JSON.stringify({ready:true,native:testing.IS_TEST_RUNNER,failed:true,error:{name:error.name,message:error.message,stack:error.stack}})}})()",
+  "snapshot": "(()=>{const t=globalThis.__ownedBcTrace;return JSON.stringify({trace:t?{...t,snapshot:undefined,late:t.snapshot()}:null,document:{url:document.URL,ready:document.readyState},frames:[...document.querySelectorAll('iframe')].map(f=>{try{const w=f.contentWindow,d=f.contentDocument;return{url:d?.URL,ready:d?.readyState,closed:w?.closed,origin:w?.location.origin,got:w?.__got,html:d?.documentElement?.outerHTML}}catch(e){return{error:e.message}}})})})()",
+  "rows": [
+    {
+      "kind": "orders",
+      "navigation": {
+        "frameId": "6d9219c6-6e15-4b8b-9b66-41eca5815f34",
+        "loaderId": "9fb2f233-9937-432e-b6b3-d38cf3bd06ff",
+        "isDownload": false
+      },
+      "polls": [],
+      "orders": {
+        "result": {
+          "type": "string",
+          "value": "{\"rows\":[{\"kind\":\"micro-zero\",\"log\":[\"sync\",\"micro\",\"timer1\",\"micro1\",\"timer2\"]},{\"kind\":\"message-first-zero\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"timer-first-zero\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"busy-overdue\",\"log\":[[\"message\",\"actual message\"],\"timer\"]},{\"kind\":\"busy-cancel\",\"log\":[[\"message\",\"actual message\"]]}],\"boundary\":\"Authored heldout task orders, actual callbacks/messages; busy120ms diagnostic only, original runtime delays unchanged\"}"
+        }
+      },
+      "atResult": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders\",\"ready\":\"complete\"},\"frames\":[]}"
+        }
+      },
+      "late": {
+        "result": {
+          "type": "string",
+          "value": "{\"trace\":null,\"document\":{\"url\":\"http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders\",\"ready\":\"complete\"},\"frames\":[]}"
+        }
+      },
+      "frameTree": {
+        "frameTree": {
+          "frame": {
+            "id": "6d9219c6-6e15-4b8b-9b66-41eca5815f34",
+            "loaderId": "9fb2f233-9937-432e-b6b3-d38cf3bd06ff",
+            "url": "http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders",
+            "securityOrigin": "http://127.0.0.1:33101",
+            "mimeType": "text/html"
+          }
+        }
+      },
+      "events": [
+        {
+          "method": "Page.frameNavigated",
+          "params": {
+            "frame": {
+              "id": "6d9219c6-6e15-4b8b-9b66-41eca5815f34",
+              "loaderId": "9fb2f233-9937-432e-b6b3-d38cf3bd06ff",
+              "url": "http://127.0.0.1:33101/src/browser/tests/broadcast_channel.html?case=orders",
+              "securityOrigin": "http://127.0.0.1:33101",
+              "mimeType": "text/html",
+              "domainAndRegistry": "",
+              "secureContextType": "InsecureScheme",
+              "crossOriginIsolatedContextType": "NotIsolated",
+              "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+          },
+          "sessionId": "276aded7-e48f-4a9e-a94b-98c449a065c2"
+        }
+      ],
+      "ms": 954.2926779999998
+    }
+  ],
+  "requests": [
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=orders",
+      "at": 337.356202
+    },
+    {
+      "url": "/src/browser/tests/broadcast_channel.html?case=orders",
+      "at": 3975.177865
+    }
+  ],
+  "stderr": "RedPanda/0.1.0 automation server listening on 127.0.0.1:34583\n(node:517754) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(Use `node --trace-warnings ...` to show where the warning was created)\n",
+  "ms": 3023.075952,
+  "boundary": "Whole source bytes unchanged for full. Exact-block/trace/busy are independent diagnostics, not whole-source acceptance. Original fixture100ms unchanged. Busy120ms is authored diagnostic only, no runtime budget change."
+}

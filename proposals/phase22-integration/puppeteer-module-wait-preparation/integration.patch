@@ -1,0 +1,55 @@
+--- a/automation/src/RedPanda/Puppeteer.js
++++ b/automation/src/RedPanda/Puppeteer.js
+@@ -83,6 +83,10 @@
+ });
+ export const disposeHandleImpl = handle => async(async () => { await handle.dispose(); });
+ export const contentImpl = page => async(() => page.content());
++export const waitForFunctionImpl = page => expression => async(async () => {
++  const handle = await page.waitForFunction(expression, { timeout: 5000, polling: 'mutation' });
++  await handle.dispose();
++});
+ export const waitForSelectorImpl = page => selector => async(async () => {
+   const handle = await page.waitForSelector(selector, { timeout: 5000 });
+   await handle?.dispose();
+--- a/automation/src/RedPanda/Puppeteer.purs
++++ b/automation/src/RedPanda/Puppeteer.purs
+@@ -9,7 +9,7 @@
+   , setExtraHTTPHeaders, setUserAgent
+   , click, focus, typeText, pressKey, insertText
+   , UtilityWorld, withUtilityWorld, evaluateUtilityString
+-  , evaluateString, textContent, waitForSelector, dispatchClick, content, cookieNames, setCookie
++  , evaluateString, textContent, waitForSelector, waitForFunction, dispatchClick, content, cookieNames, setCookie
+   , evaluateHandle, queryObjects, evaluateHandleString, disposeHandle, withHandle
+   , Async, fromAsync, quote
+   ) where
+@@ -92,6 +92,7 @@
+ foreign import evaluateHandleStringImpl :: JSHandle -> String -> Async String
+ foreign import disposeHandleImpl :: JSHandle -> Async Unit
+ foreign import waitForSelectorImpl :: Page -> String -> Async Unit
++foreign import waitForFunctionImpl :: Page -> String -> Async Unit
+ foreign import contentImpl :: Page -> Async String
+ foreign import setCookieImpl :: BrowserContext -> String -> String -> String -> Async Unit
+ foreign import cookieNamesImpl :: BrowserContext -> Async (Array String)
+@@ -225,6 +226,9 @@
+ textContent page selector = evaluateString page $
+   "document.querySelector(" <> quote selector <> ").textContent"
+ 
++waitForFunction :: Page -> String -> Aff Unit
++waitForFunction page expression = fromAsync $ waitForFunctionImpl page expression
++
+ waitForSelector :: Page -> String -> Aff Unit
+ waitForSelector page selector = fromAsync $ waitForSelectorImpl page selector
+ 
+--- a/automation/test/Test/Main.purs
++++ b/automation/test/Test/Main.purs
+@@ -163,8 +163,9 @@
+           Left _ -> true
+           Right _ -> false
+         void $ Browser.goto page $ url <> "modules"
++        Browser.waitForFunction page "document.querySelector('h1').textContent === '42'"
+         moduleResult <- Browser.textContent page "h1"
+-        assert "Puppeteer load waits for module imports and top-level await" $ moduleResult == "42"
++        assert "PureScript waits for the real module result separately from document load" $ moduleResult == "42"
+         void $ Browser.goto page $ url <> "navigation-source"
+         scriptDestination <- Browser.pageUrl page
+         assert "Puppeteer goto follows scripted document replacement" $ scriptDestination == url <> "next"

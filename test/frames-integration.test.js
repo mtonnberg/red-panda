@@ -6,7 +6,7 @@ import { Browser, until } from '../src/browser.js';
 async function fixture(t) {
   const requests = [];
   const server = http.createServer((req, res) => {
-    requests.push({ url: req.url, referrer: req.headers.referer });
+    requests.push({ url: req.url, referrer: req.headers.referer, method:req.method });
     const routes = {
       '/parent': '<!doctype html><title>Parent</title><iframe id="child" src="/child"></iframe><iframe id="inline" srcdoc="<p>Inline</p><script>globalThis.inlineReady=true</script>"></iframe>',
       '/child': '<!doctype html><title>Child</title><button>Child button</button><script>globalThis.childOnly=42;fetch("./data").then(r=>r.json()).then(d=>globalThis.fetched=d.value)</script><script type="module">import {answer} from "./dep.js";globalThis.moduleAnswer=answer;</script>',
@@ -54,7 +54,7 @@ test('actual child-frame invocation ignores authored apply and exposes no tempor
 });
 
 test('child navigation changes its real iframe document and invalidates old realms without replacing the parent', async t => {
-  const { page, base } = await fixture(t);
+  const { page, base, requests } = await fixture(t);
   await page.navigate(`${base}/parent`);
   const element = page.dom.window.document.getElementById('child'), previous = page.frames.findElement(element);
   const contextId = previous.executionContextId, parentGeneration = page.documentGeneration;
@@ -65,6 +65,8 @@ test('child navigation changes its real iframe document and invalidates old real
   assert.throws(() => previous.evaluate('1'), /detached|current/);
   assert.equal(next.evaluate('document.title'), 'Next frame'); assert.equal(element.contentDocument, next.dom.window.document);
   assert.equal(page.documentGeneration, parentGeneration); assert.equal(page.evaluate('document.title'), 'Parent');
-  await assert.rejects(next.navigate(`${base}/next`, { method: 'POST', body: 'unsupported' }), /not implemented/);
+  await next.navigate(`${base}/next`, { method: 'POST', body: 'actual-post' });
+  assert.equal(requests.at(-1).method,'POST');
+  assert.equal(page.frames.findElement(element).evaluate('document.title'),'Next frame');
   element.remove(); assert.equal(page.frames.findFrame(next.frameId), undefined);
 });

@@ -1,0 +1,20 @@
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -54,7 +54,7 @@
+   const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+-  if(webSocketImplementation(wrapper))bindWebSocketImplementation(wrapper,impl);else if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(eventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
++  if(webSocketImplementation(wrapper))bindWebSocketImplementation(wrapper,impl);else if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(directEventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+   wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);
+   return wrapper;
+  }
+@@ -77,7 +77,7 @@
+   // wrapper. Never replace an existing implementation's main wrapper to enter a world.
+   const hostGenerated=require(join(generatedRoot,name+'.js'));
+   if(typeof hostGenerated.new==='function'&&mainWindow[name]){
+-   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(webSocketImplementation(canonical))bindWebSocketImplementation(canonical,impl);else if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else if(eventTargetImplementation(canonical))bindEventTargetImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
++   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(webSocketImplementation(canonical))bindWebSocketImplementation(canonical,impl);else if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else if(directEventTargetImplementation(canonical))bindEventTargetImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
+   }
+   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
+  }

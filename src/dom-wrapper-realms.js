@@ -1,3 +1,6 @@
+import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
+import {transformPrivateWebSocketSource} from './dom-websocket-state.js';
+import {transformPrivateEventTargetSource} from './dom-event-target-state.js';
 import {assertControlInterfaceSource,installControlInterface,transformControlInterfaceInstall,installValidityStateInterfaceRealm} from './control-interface-realms.js';
 import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
 import {transformPrivateEventSource} from './dom-event-state.js';
@@ -65,17 +68,17 @@ export function installDOMWrapperRealms(){
   const full=join(directory,filename),factory=require(full),kind=basename(filename,'.js');
   if(typeof factory.setup!=='function'||interfaces.getInterfaceWrapper(kind)!==factory)continue;
   let Implementation;
-  for(const folder of (kind==='Attr'||kind==='NamedNodeMap')?['attributes']:['nodes','events']){
+  for(const folder of kind==='WebSocket'?['websockets']:(kind==='Attr'||kind==='NamedNodeMap')?['attributes']:['nodes','events']){
    try{Implementation=require('jsdom/lib/jsdom/living/'+folder+'/'+kind+'-impl.js').implementation;break;}catch(error){if(error.code!=='MODULE_NOT_FOUND')throw error;}
   }
   if(!Implementation)continue;
   const node=Implementation===NodeImpl||Implementation.prototype instanceof NodeImpl,event=Implementation===EventImpl||Implementation.prototype instanceof EventImpl;
-  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&kind!=='NamedNodeMap'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
+  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&kind!=='NamedNodeMap'&&!node&&!event&&Implementation!==EventTargetImpl&&kind!=='WebSocket')continue;
   if(node||kind==='HTMLFormControlsCollection'||kind==='NamedNodeMap')registerDOMAllocationKind(kind);
   // Recompile the pinned independent generated source before any Window is
   // installed. The same CommonJS exports object and Host implementations stay
   // canonical. Only the three initial wrapper allocation expressions change.
-  const originalSource=readFileSync(full,'utf8');let source=originalSource;
+  const originalSource=readFileSync(full,'utf8');let source=kind==='WebSocket'?transformPrivateWebSocketSource(originalSource):originalSource;
   const shell='return Object.create(proto);',proxy='return new Proxy(wrapper, proxyHandler);',constructor='exports.setup(Object.create(new.target.prototype),';
   if(source.split(shell).length!==2)throw new Error('Unexpected generated Node allocation source: '+kind);
   source=source.replace(shell,`return createShell(globalObject, proto, ${JSON.stringify(kind)});`);
@@ -97,11 +100,13 @@ export function installDOMWrapperRealms(){
    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
   }
   if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
+  if(isAdditionalControlInterface(kind))source=transformAdditionalControlInterface(source,kind,originalSource);
   if(event)source=transformPrivateEventSource(source,kind);
-  if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
+  if(Implementation===EventTargetImpl)source=transformPrivateEventTargetSource(source);
+  if(event||Implementation===EventTargetImpl||kind==='WebSocket')source=transformEventIDLInstall(source,kind);
   candidates.push({factory,kind,full,originalSource,source});
  }
- const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
+ const fingerprint=createHash('sha256').update(candidates.filter(({kind})=>kind!=='WebSocket').map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
  for(const {factory,kind,full,source} of candidates){
   const module={exports:factory};

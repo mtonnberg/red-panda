@@ -1,6 +1,6 @@
 // Owned transport thread: synchronous Window XHR must not depend on the blocked
 // parent event loop. Cookies, redirects, CORS and tracing stay with its Page.
-import { parentPort,workerData } from 'node:worker_threads';
+import { parentPort } from 'node:worker_threads';
 const requests=new Map();
 parentPort.on('message',async message=>{
  if(message.cancel){requests.get(message.cancel)?.abort();return}
@@ -16,4 +16,3 @@ parentPort.on('message',async message=>{
  }catch(error){const text=Buffer.from(JSON.stringify({error:String(error.message)}));output.set(text.subarray(0,output.length));Atomics.store(state,1,Math.min(text.length,output.length));Atomics.store(state,0,2)}
  finally{requests.delete(id);Atomics.notify(state,0)}
 });
-const ready=new Int32Array(workerData.ready);Atomics.store(ready,0,1);Atomics.notify(ready,0);

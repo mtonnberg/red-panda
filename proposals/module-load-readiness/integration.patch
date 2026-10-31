@@ -1,0 +1,110 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -699,7 +699,6 @@
+         finally { this.creatingDOM = false; }
+       }));
+       navigationWindow = this.dom.window;
+-      const moduleReady = this.moduleReady;
+       this.flushFrameEvents();
+       onCommit?.();
+       const documentReady = new Promise(resolve => {
+@@ -712,8 +711,10 @@
+       });
+       const canceledRedirect=()=>redirect?.settled&&!redirect.started&&redirect.error?.name==='AbortError'&&this.dom.window===navigationWindow;
+       documentReady.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('domContentLoaded'); });
+-      loaded.then(async () => { await moduleReady; if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('load'); });
+-      const ready = waitUntil === 'none' ? Promise.resolve() : waitUntil === 'domcontentloaded' ? documentReady : Promise.all([loaded, moduleReady]);
++      // Module evaluation can await load or continue application work after it.
++      // Keep moduleReady as the explicit evaluation drain, not a load barrier.
++      loaded.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('load'); });
++      const ready = waitUntil === 'none' ? Promise.resolve() : waitUntil === 'domcontentloaded' ? documentReady : loaded;
+       await withTimeout(Promise.race([ready, requested]), remaining(), 'Page load timed out');
+       if (redirect) {
+         try { await withTimeout(redirect.promise, remaining(), 'Page navigation chain timed out'); }
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -112,10 +112,9 @@
+       const child = page.frames?.findFrame(params.frameId);
+       if (child) this.lifecycleEvent('DOMContentLoaded', child);
+     });
+-    listen('frameLoad', async params => {
++    listen('frameLoad', params => {
+       const child = page.frames?.findFrame(params.frameId);
+       if (!child) return;
+-      await child.moduleReady;
+       if (child.closed) return;
+       this.lifecycleEvent('load', child); this.event('Page.frameStoppedLoading', { frameId: params.frameId });
+     });
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -456,7 +456,7 @@
+     let timer;
+     try {
+       await Promise.race([loaded, aborted, failure, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Frame navigation timed out')), current.timeout ?? 10000); })]);
+-      await current.moduleReady; return { url: current.url, frameId: id, loaderId: current.loaderId };
++      return { url: current.url, frameId: id, loaderId: current.loaderId };
+     } finally { clearTimeout(timer); current.documentAbort.signal.removeEventListener('abort', abort); registry.off('frameNavigationError', failed); }
+   };
+   const originalClose = window.close.bind(window);
+--- a/test/navigation-integration.test.js
++++ b/test/navigation-integration.test.js
+@@ -56,6 +56,7 @@
+ test('Page module readiness includes imports and top-level await, and module navigation follows its child', async t => {
+   const { page, base } = await fixture(t);
+   await page.navigate(`${base}/module`);
++  await page.moduleReady;
+   assert.equal(page.evaluate('document.title'), '42');
+   await page.navigate(`${base}/module-navigation`);
+   assert.equal(page.url, `${base}/final`);
+--- a/test/navigation-load-cancel.test.js
++++ b/test/navigation-load-cancel.test.js
+@@ -9,6 +9,6 @@
+  const server=http.createServer((request,response)=>{requests.push(request.url);response.setHeader('content-type','text/html');response.end(`<!doctype html><script>globalThis.loaded=new Promise(r=>addEventListener('load',()=>setTimeout(r)))</script><script type=module>await loaded;location.href='/must-not-fetch';stop();globalThis.moduleCompleted=true;</script><p>actual original</p>`)});
+  server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve))});
+  const origin='http://127.0.0.1:'+server.address().port,browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());const events=[];page.on('load',()=>events.push('load'));page.on('navigationError',error=>events.push(error.name));
+- await page.navigate(origin+'/original');await new Promise(resolve=>setImmediate(resolve));
++ await page.navigate(origin+'/original');await page.moduleReady;await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(requests,['/original']);assert.equal(page.url,origin+'/original');assert.equal(page.evaluate('document.readyState'),'complete');assert.equal(page.evaluate('moduleCompleted'),true);assert.equal(page.evaluate('document.querySelector("p").textContent'),'actual original');assert.deepEqual(events,['load']);assert.equal(page.activeRequests.size,0);assert.equal(page.pendingNavigation,null);
+ });
+--- /dev/null
++++ b/test/module-load-readiness.test.js
+@@ -0,0 +1,39 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {Browser,until} from '../src/browser.js';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++
++const pending='<!doctype html><script type="module">globalThis.started=true;await new Promise(resolve=>globalThis.release=resolve);globalThis.finished=true;</script>';
++async function fixture(t){
++ const requests=[],server=http.createServer((request,response)=>{requests.push(request.url);response.writeHead(200,{'Content-Type':'text/html'});response.end(request.url==='/parent'?'<!doctype html><iframe src="/pending"></iframe>':pending)});
++ server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve))});
++ return {origin:'http://127.0.0.1:'+server.address().port,requests};
++}
++
++test('real document load and Browser navigation complete while moduleReady retains suspended evaluation',async t=>{
++ const {origin}=await fixture(t),browser=new Browser({timeout:1500}),page=browser.createPage();t.after(()=>browser.close());const loads=[];page.on('load',()=>loads.push(page.url));
++ await page.navigate(origin+'/pending');
++ assert.equal(page.evaluate('document.readyState'),'complete');assert.equal(page.evaluate('started'),true);assert.equal(page.evaluate('globalThis.finished'),undefined);assert.deepEqual(loads,[origin+'/pending']);
++ let drained=false;page.moduleReady.then(()=>{drained=true});await new Promise(resolve=>setImmediate(resolve));assert.equal(drained,false);
++ page.evaluate('release()');await page.moduleReady;assert.equal(page.evaluate('finished'),true);assert.equal(drained,true);assert.equal(loads.length,1);
++});
++
++test('a child frame navigation observes document load without draining its suspended module',async t=>{
++ const {origin}=await fixture(t),browser=new Browser({loadResources:['iframe'],timeout:1500}),page=browser.createPage();t.after(()=>browser.close());await page.navigate(origin+'/parent');
++ const frame=page.frames.findElement(page.dom.window.document.querySelector('iframe'));
++ assert.equal(frame.evaluate('document.readyState'),'complete');assert.equal(frame.evaluate('started'),true);assert.equal(frame.evaluate('globalThis.finished'),undefined);
++ await frame.navigate(origin+'/next');const current=page.frames.findElement(page.dom.window.document.querySelector('iframe'));
++ assert.equal(current.evaluate('document.readyState'),'complete');assert.equal(current.evaluate('globalThis.finished'),undefined);current.evaluate('release()');await current.moduleReady;assert.equal(current.evaluate('finished'),true);
++});
++
++test('CDP emits root and child load lifecycle events before their real module evaluation settles',async t=>{
++ const {origin}=await fixture(t),service=await serve({port:0,loadResources:['iframe']});t.after(()=>service.close());const client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(()=>client.close());const {targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true}),send=(method,params={})=>client.send(method,params,sessionId);
++ await send('Page.enable');await send('Runtime.enable');await send('Page.setLifecycleEventsEnabled',{enabled:true});const offset=client.events.length;
++ await send('Page.navigate',{url:origin+'/parent'});
++ await until(()=>client.events.slice(offset).filter(e=>e.method==='Page.lifecycleEvent'&&e.params.name==='load').length===2,{timeout:1500});
++ const state=await send('Runtime.evaluate',{expression:'JSON.stringify({root:document.readyState,child:document.querySelector("iframe").contentDocument.readyState,started:frames[0].started,finished:frames[0].finished===true})',returnByValue:true});assert.deepEqual(JSON.parse(state.result.value),{root:'complete',child:'complete',started:true,finished:false});
++ const evaluate=await send('Runtime.evaluate',{expression:'frames[0].release();true',returnByValue:true});assert.equal(evaluate.result.value,true);
++});

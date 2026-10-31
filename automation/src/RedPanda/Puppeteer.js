@@ -83,6 +83,10 @@ export const evaluateHandleStringImpl = handle => expression => async(async () =
 });
 export const disposeHandleImpl = handle => async(async () => { await handle.dispose(); });
 export const contentImpl = page => async(() => page.content());
+export const waitForFunctionImpl = page => expression => async(async () => {
+  const handle = await page.waitForFunction(expression, { timeout: 5000, polling: 20 });
+  await handle.dispose();
+});
 export const waitForSelectorImpl = page => selector => async(async () => {
   const handle = await page.waitForSelector(selector, { timeout: 5000 });
   await handle?.dispose();
@@ -92,3 +96,14 @@ export const setCookieImpl = context => url => name => value => async(async () =
 });
 export const cookieNamesImpl = context => async(async () => (await context.cookies()).map(cookie => cookie.name));
 export const quote = JSON.stringify;
+
+export const createProtocolSessionImpl = page => async(() => page.createCDPSession(), session => session.detach());
+export const detachProtocolSessionImpl = session => async(() => session.detach());
+export const getFrameTreeImpl = session => async(() => session.send('Page.getFrameTree'));
+export const createUtilityWorldImpl = session => params => async(() => session.send('Page.createIsolatedWorld', params));
+export const evaluateUtilityStringImpl = session => contextId => expression => async(async () => {
+  const response = await session.send('Runtime.evaluate', { contextId, expression, awaitPromise: true, returnByValue: true });
+  if (response.exceptionDetails) throw new Error(response.exceptionDetails.exception?.description ?? response.exceptionDetails.text);
+  if (typeof response.result.value !== 'string') throw new TypeError('Utility evaluation did not return a string');
+  return response.result.value;
+});

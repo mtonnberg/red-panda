@@ -1,0 +1,1 @@
+(()=>{const rows=[];for(const value of[-1,NaN,Infinity,1.7,2**32,undefined,null,'1',true,1n,Object(1n)]){try{rows.push([String(value),typeof clearTimeout(value)])}catch(e){rows.push([String(value),e.name,e.message,e instanceof TypeError])}}return rows})()

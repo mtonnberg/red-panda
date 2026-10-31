@@ -1,8 +1,10 @@
 import {registerHeapWrapper} from './heap-registry.js';
+import {registerPlatformFactory} from './platform-factories.js';
 import { createReadableState, bindReadable, bindTransformPair, bindReadableController, failReadable, noteReadableOperation } from './request-stream-state.js';
 import * as web from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
 import { codecPair } from './stream-codecs.js';
+import { captureDOMExceptionFactory } from './worker-dom-exception.js';
 
 const NATIVES = { ...web, TextEncoder, TextDecoder };
 const SURFACE = {
@@ -62,11 +64,17 @@ function encoderString(input, TypeErrorClass) {
  */
 export function installStreams(page, realm, { signal = page?.documentAbort?.signal } = {}) {
   if (INSTALLED.has(realm)) return INSTALLED.get(realm);
+  // Internal retirement uses captured real producers, not the authored global
+  // constructor or a generated public constructor's VM argument-array pushes.
+  const retirementException = typeof realm.DOMException === 'function' ? captureDOMExceptionFactory(realm) : undefined;
+  const RetirementError = realm.Error;
   const constructors = {}, owned = new WeakMap(), references = new Set(), pending = new Set(), functions = new WeakMap(), special = new WeakMap(), codecDisposers = new WeakMap();
   // Ownership must not keep consumed Fetch bodies, readers or controllers alive
   // for the lifetime of a long-lived document. Finalizer holdings and unregister
   // tokens contain only WeakRefs, never the stream or a closure capturing it.
   const finalization = new FinalizationRegistry(reference => references.delete(reference));
+  const genuineReadables=new WeakSet();
+  function readableProducer(value){if(value){genuineReadables.add(value);registerPlatformFactory(value,{kind:'ReadableStream',globalObject:realm})}return value}
   function tag(value, name) {
     owned.set(value, name);
     registerHeapWrapper(value,realm);
@@ -167,7 +175,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
       if (!['gzip', 'deflate', 'deflate-raw', 'brotli'].includes(format)) throw new realm.TypeError('invalid argument');
       const result = Object.create(constructors[name].prototype);
       const pair = codecPair({ realm, format, decompress: name === 'DecompressionStream' });
-      special.set(result, pair); tag(result, name); adopt(pair.readable); adopt(pair.writable);
+      special.set(result, pair); tag(result, name); readableProducer(pair.readable);adopt(pair.readable); adopt(pair.writable);
       codecDisposers.set(pair.readable, pair.dispose); codecDisposers.set(pair.writable, pair.dispose);
       return result;
     }
@@ -182,7 +190,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
       const result = Object.create(constructors[name].prototype);
       special.set(result, { encoding: 'utf-8', readable: transform.readable, writable: transform.writable });
       tag(result, name);
-      adopt(transform.readable); adopt(transform.writable);
+      readableProducer(transform.readable);adopt(transform.readable); adopt(transform.writable);
       return result;
     }
     if (name === 'TextDecoderStream') {
@@ -203,11 +211,11 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
       const result = Object.create(constructors[name].prototype);
       special.set(result, { encoding: decoder.encoding, fatal: decoder.fatal, ignoreBOM: decoder.ignoreBOM,
         readable: transform.readable, writable: transform.writable });
-      tag(result, name); adopt(transform.readable); adopt(transform.writable); return result;
+      tag(result, name);readableProducer(transform.readable);adopt(transform.readable); adopt(transform.writable); return result;
     }
     try { const result = Reflect.construct(NATIVES[name], args); if (name === 'TextEncoder') TEXT_ENCODERS.add(result);
-      if (name === 'ReadableStream') bindReadable(result, readableState);
-      if (name === 'TransformStream') bindTransformPair(result.readable, result.writable, readableState); return adopt(result); }
+      if (name === 'ReadableStream'){readableProducer(result);bindReadable(result, readableState);}
+      if (name === 'TransformStream'){readableProducer(result.readable);bindTransformPair(result.readable, result.writable, readableState);} return adopt(result); }
     catch (error) { throw errorInRealm(error); }
   }
   for (const name of STREAM_CONSTRUCTORS) {
@@ -300,7 +308,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
   }
   function dispose(reason) {
     if (disposed) return;
-    disposalReason = reason ?? (realm.DOMException ? new realm.DOMException('The stream realm is disposed', 'AbortError') : new realm.Error('The stream realm is disposed'));
+    disposalReason = reason ?? (retirementException ? retirementException('The stream realm is disposed', 'AbortError') : new RetirementError('The stream realm is disposed'));
     disposed = true;
     const ignore = task => { try { Promise.resolve(task()).catch(() => {}); } catch {} };
     // Hold only a synchronous disposal snapshot strongly. Ordinary operation
@@ -328,7 +336,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
     pending.clear(); signal?.removeEventListener('abort', onAbort);
   }
   const onAbort = () => dispose();
-  const controller = { constructors: Object.freeze(constructors), adopt, dispose, get disposed() { return disposed; } };
+  const controller = { constructors: Object.freeze(constructors), adopt, adoptProduced(value){readableProducer(value);return adopt(value)},dispose,has(value,name){return name==='ReadableStream'&&genuineReadables.has(value)},get disposed() { return disposed; } };
   INSTALLED.set(realm, controller);
   if (signal?.aborted) dispose(); else signal?.addEventListener('abort', onAbort, { once: true });
   return controller;

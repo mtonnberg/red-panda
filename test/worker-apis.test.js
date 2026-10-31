@@ -164,9 +164,11 @@ test('explicit API controller disposal silently cancels real requests and preven
 });
 
 test('sync/async cross-origin XHR uses actual credentials and cookie-free preflight requests',async t=>{
-  const f=await fixture(t),cross=f.origin.replace('127.0.0.1','0.0.0.0');
-  // Cookie host must match the destination; ports do not participate in cookie scope.
-  await f.page.context.cookies.setCookie('destination=actual; HttpOnly; Path=/',cross);
+  const f=await fixture(t),cross=f.origin.replace('127.0.0.1','127.0.0.2');
+  // Native omits default SameSite cookies across these actual distinct sites.
+  // A real Secure SameSite=None cookie remains eligible on trustworthy loopback.
+  await f.page.context.cookies.setCookie('default_destination=blocked; HttpOnly; Path=/',cross);
+  await f.page.context.cookies.setCookie('destination=actual; HttpOnly; Path=/; SameSite=None; Secure',cross);
   const actual=await f.run(`const results=[];for(const sync of[false,true])for(const credentials of[false,true]){const x=new XMLHttpRequest();x.open('PUT',${JSON.stringify(cross)}+'/cors?report=1',!sync);x.withCredentials=credentials;x.responseType='json';x.setRequestHeader('x-real','actual');const done=sync?null:new Promise(resolve=>x.onloadend=resolve);x.send(new Uint8Array([0,128,255]));if(done)await done;results.push({sync,credentials,status:x.status,response:x.response})}return results`);
   for(const result of actual){assert.equal(result.status,200);assert.equal(result.response.cookie,result.credentials?'destination=actual':'');assert.equal(result.response.origin,f.origin);assert.equal(result.response.method,'PUT');assert.deepEqual([...result.response.bytes],[0,128,255])}
   const preflights=f.requests.filter(request=>request.method==='OPTIONS');assert.equal(preflights.length,4);assert.ok(preflights.every(request=>!request.headers.cookie));

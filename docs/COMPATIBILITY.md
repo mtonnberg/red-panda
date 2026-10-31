@@ -4,29 +4,39 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The latest integrated checkpoint passes **1,669 JavaScript tests, 93 PureScript
+The latest integrated checkpoint passes **1,854 JavaScript tests, 100 PureScript
 Puppeteer checks and 13 native differential groups**, syntax and strict/pedantic
-PureScript builds. [Validation](reference/phase21-integration/validation.json)
-records 10,355 unchanged guarded inputs. The earlier failed full run and two
-focused epochs remain separate records; final input/beacon/XHR checks pass on
-Node 24.19.0,24.22.1 and 26.13.0 with 8,325 inputs unchanged.
+PureScript builds. [Validation](reference/phase22-integration/validation.json)
+records 12,423 unchanged monitored inputs. All rejected Root epochs remain
+separate: missing reference transfers, media/retirement corrections, an
+unreproduced audio assertion, CLI deadline and reproduced scroll ordering.
 
-It adds parser/XML namespace and Attr behavior, independent serialization,
-Native-calibrated Event extensions, form state/reflections, original VM
-Input/ValidityState public definitions, real document editing, and guarded inert
-focus/selection. Stylesheets retain real declarations beyond the former eager
-limit while enforcing the decompressed source-byte bound. Trusted CDP pointer
-motion retains fractions; XHR Document bodies follow the observed Native string
-conversion independently of public XMLSerializer. All three native bindings were
-rebuilt for each prepared Node SDK after the optional native entry-name change.
+The independent implementation now includes actual viewport/scroll state and
+queued trusted events, Worker and utility Fetch/messaging, private EventTarget
+backing, joint history/Navigation/form targets, reload/cancellation, genuine
+Location creation and navigation, additional VM form definitions and Option
+aliases. Load readiness remains independent of top-level await; PureScript
+explicitly waits for its result. Positive Window timers and internal scroll
+delivery share a cancellable task checkpoint. Synchronous HTTP allocates its real
+transport on first dispatch. CLI enables VM modules before loading the browser
+graph, avoiding a measured duplicate bootstrap.
 
-The paired 48/48 reference result belongs to the earlier isolated 73-leaf graph,
-with 8,901 unchanged inputs and original 2s load then fresh 2/8s assertion budgets.
-It is not relabeled as a run on the final 77-leaf Root graph. Its first Sanitizer
-assertion and XHR load timeout remain preserved. The complete 455-case candidate
-matrix is still historical; curated positives do not establish full replication.
-Utility messaging/Fetch, history/Navigation, viewport, Option aliases, timer
-behavior and further realm work remain separate unaccepted proposals.
+Focused recovery checks pass on all three prepared Node versions: 39 for
+viewport/stream retirement, 54 for Window task/messaging behavior and 60 for the
+scroll checkpoint and consumers. The original private 104-leaf composition passes
+264 focused checks on each SDK and 63/63 paired unchanged source fixtures, with
+9,993 and 9,129 inputs respectively unchanged. Source fixtures retain the original
+2s load and fresh 2/8s assertion budgets. These source results are not relabeled
+as execution on the final 112-leaf graph. The complete 455-case candidate matrix
+remains historical; curated positives do not establish full replication.
+
+Native MQL timing/private viewport state, zero-delay task ordering, literal
+client-hint branding, genuine Window/Document/module boundaries and broader
+network/layout/media behavior still differ. The exact earlier audio/CLI failure
+causes remain unproved despite the final full pass. Later CSS, cookie and genuine
+interface-definition compositions are still isolated and unrun. Their presence in
+proposals does not establish production support. The current native C++ runtime
+is unchanged at cb235f73; future owned-context/module work is not integrated.
 
 The sections below retain earlier checkpoint evidence and its original limits.
 

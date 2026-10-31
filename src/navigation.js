@@ -1,13 +1,20 @@
+import {canNavigateJavaScript} from './blob-urls.js';
+import {reportWindowException} from './errors.js';
+import vm from 'node:vm';
+import {beforeNavigation,linkedNavigation,stopNavigation} from './navigation-lifecycle.js';
 import { createRequire } from 'node:module';
+import {onFrameRetirement} from './frame-activity.js';
 
 // The pinned jsdom Location properties are deliberately nonconfigurable. Hook
 // its host implementations rather than exposing a Page object to page scripts.
 const require = createRequire(import.meta.url);
 const LocationImpl = require('jsdom/lib/jsdom/living/window/Location-impl.js').implementation;
 const AnchorImpl = require('jsdom/lib/jsdom/living/nodes/HTMLAnchorElement-impl.js').implementation;
-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const locationUtils = require('jsdom/lib/jsdom/living/generated/utils.js');
+const implForWrapper=value=>locationUtils.implForWrapper(value),wrapperForImpl=locationUtils.wrapperForImpl;
 const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/living/window/Location-impl.js'));
 const whatwgURL = jsdomRequire('whatwg-url');
+const {percentDecodeString}=jsdomRequire('whatwg-url/lib/percent-encoding.js');
 const DOCUMENTS = new WeakMap();
 let patched = false;
 
@@ -17,6 +24,11 @@ function supported(record, url) {
   if (parsed.protocol === 'about:' && parsed.pathname === 'blank' && !parsed.search) return;
   throw new record.DOMException(`Unsupported navigation protocol: ${parsed.protocol}`, 'NotSupportedError');
 }
+
+// Opaque external URI handoff has no headless document navigation. Web URI
+// schemes keep their existing dedicated handlers, including unsupported ones.
+const webOpaqueSchemes=new Set(['about','blob','data','javascript']);
+function externalOpaque(destination){return typeof destination.path==='string'&&!webOpaqueSchemes.has(destination.scheme)}
 
 function fragmentNavigation(current, destination) {
   if (destination.fragment === null) return false;
@@ -37,9 +49,16 @@ function clearTimer(record, timer) {
   record.timers.delete(timer);
 }
 
+function scheduleJavascript(record,url){
+ const source=Buffer.from(percentDecodeString(url.slice('javascript:'.length))).toString('utf8');
+ let timer;timer=record.setTimeout(()=>{record.timers.delete(timer);record.javascriptTasks.delete(timer);if(!active(record)||!ownsCurrentDocument(record))return;try{vm.runInContext(source,record.page.dom.getInternalVMContext(),{timeout:Math.min(record.page.timeout??10000,2000),displayErrors:false,filename:'javascript:'})}catch(error){if(!reportWindowException(record.window,error))record.page.emit?.('pageError',error)}},0);record.timers.add(timer);record.javascriptTasks.add(timer);
+}
 function schedule(record, url, options) {
+  if(new URL(url).protocol==='javascript:'){if(active(record))scheduleJavascript(record,url);return}
   supported(record, url);
   if (!active(record)) throw new record.DOMException('The document is no longer active', 'InvalidStateError');
+  const operation=options.navigationOperation??beforeNavigation(record.page,{kind:options.historyMode==='traverse'?'traverse':options.historyMode==='reload'?'reload':options.historyMode==='replace'?'replace':'push',url,sameDocument:false,entry:options.historyEntry,stateJSON:options.navigationStateJSON,sourceElement:options.sourceElement,formData:options.formData});if(operation===false)return;
+  if(operation!==undefined)options={...options,navigationOperation:operation};
   let resolve, reject;
   const promise = new Promise((accept, fail) => { resolve = accept; reject = fail; });
   // A page's location setter returns void. Observe the owned promise even if no
@@ -93,7 +112,7 @@ function schedule(record, url, options) {
     );
   }, 0);
   record.timers.add(pending.timer);
-  record.page.emit?.('navigationRequested', pending);
+  linkedNavigation(operation,pending);record.page.emit?.('navigationRequested', pending);
   return pending;
 }
 
@@ -114,38 +133,52 @@ function patchHostImplementations() {
   patched = true;
   const locationNavigate = LocationImpl.prototype._locationObjectNavigate;
   const locationReload = LocationImpl.prototype.reload;
+  const locationHash = Object.getOwnPropertyDescriptor(LocationImpl.prototype,'hash');
   const anchorFollow = AnchorImpl.prototype._followAHyperlink;
   const anchorActivate = AnchorImpl.prototype._activationBehavior;
+
+  Object.defineProperty(LocationImpl.prototype,'hash',{...locationHash,set(value){
+    const record=DOCUMENTS.get(this._relevantDocument);
+    if(record&&active(record)&&this._url.fragment===null&&(value===''||value==='#'))return;
+    return locationHash.set.call(this,value);
+  }});
 
   LocationImpl.prototype._locationObjectNavigate = function (destination, flags = {}) {
     const record = DOCUMENTS.get(this._relevantDocument);
     if (!record || !active(record)) return locationNavigate.call(this, destination, flags);
     const url = whatwgURL.serializeURL(destination);
+    if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
+    if(externalOpaque(destination))return;
     supported(record, url);
     if (fragmentNavigation(this._url, destination)) {
+      if(url===record.window.location.href)return;
+      const historyMode=flags.replacement||record.document.readyState==='loading'?'replace':'push';
+      const operation=beforeNavigation(record.page,{kind:historyMode,url,sameDocument:true,hashChange:true});if(operation===false)return;
       const result = locationNavigate.call(this, destination, flags);
-      record.page.reconcileURL?.(record.window, { historyMode: flags.replacement ? 'replace' : 'push' });
+      record.page.reconcileURL?.(record.window, { historyMode,navigationOperation:operation });
       return result;
     }
-    schedule(record, url, { historyMode: flags.replacement ? 'replace' : 'push', referrer: record.window.location.href });
+    schedule(record, url, { historyMode: flags.replacement||record.document.readyState==='loading' ? 'replace' : 'push', referrer: record.window.location.href });
   };
 
   LocationImpl.prototype.reload = function () {
     const record = DOCUMENTS.get(this._relevantDocument);
     if (!record || !active(record)) return locationReload.call(this);
-    schedule(record, whatwgURL.serializeURL(this._url), { historyMode: 'reload', referrer: record.window.location.href });
+    schedule(record, whatwgURL.serializeURL(this._url), { historyMode: 'reload', method:'GET', referrer: record.window.location.href });
   };
 
   AnchorImpl.prototype._followAHyperlink = function () {
     const record = DOCUMENTS.get(this._ownerDocument);
     if (!record || !active(record)) return anchorFollow.call(this);
     if (this._cannotNavigate() || !this.hasAttributeNS(null, 'href')) return;
-    if (this.hasAttributeNS(null, 'download')) throw new record.DOMException('Anchor downloads are not implemented', 'NotSupportedError');
+    const destination = this._ownerDocument.encodingParseAURL(this.href);
+    if (this.hasAttributeNS(null, 'download') && destination?.scheme!=='javascript') throw new record.DOMException('Anchor downloads are not implemented', 'NotSupportedError');
     const target = this._getAnElementsTarget();
     if (!targetIsSelf(record, target)) throw new record.DOMException(`Navigation target ${target} is not implemented`, 'NotSupportedError');
-    const destination = this._ownerDocument.encodingParseAURL(this.href);
     if (!destination) return;
     const url = whatwgURL.serializeURL(destination);
+    if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
+    if(externalOpaque(destination))return;
     supported(record, url);
     if (fragmentNavigation(this._ownerDocument._URL, destination)) {
       const timer = record.setTimeout(() => {
@@ -158,7 +191,7 @@ function patchHostImplementations() {
       record.timers.add(timer);
       return;
     }
-    schedule(record, url, { historyMode: 'push', referrer: this.relList.contains('noreferrer') ? '' : record.window.location.href });
+    schedule(record, url, { historyMode:'push',sourceElement:wrapperForImpl(this), referrer: this.relList.contains('noreferrer') ? '' : record.window.location.href });
   };
 
   AnchorImpl.prototype._activationBehavior = function (event) {
@@ -189,23 +222,26 @@ export function installNavigation(page, window) {
   const record = {
     page, window, document, documentImpl, signal: page.documentAbort?.signal,
     DOMException: window.DOMException, setTimeout: window.setTimeout.bind(window),
-    clearTimeout: window.clearTimeout.bind(window), timers: new Set(), pending: new Set(), disposed: false,
-    originalClose: window.close,
+    clearTimeout: window.clearTimeout.bind(window), timers: new Set(), javascriptTasks: new Set(), pending: new Set(), disposed: false,
+    originalClose: window.close,originalStop:window.stop,
   };
   const dispose = () => {
     if (record.disposed) return;
     record.disposed = true;
     for (const pending of record.pending) if (!pending.started) pending.cancel('Source document was disposed');
     for (const timer of record.timers) record.clearTimeout(timer);
-    record.timers.clear();
+    record.timers.clear();record.javascriptTasks.clear();
     DOCUMENTS.delete(documentImpl);
     if (window.close === record.close) window.close = record.originalClose;
     record.signal?.removeEventListener('abort', dispose);
+    record.retirementUnsubscribe?.();if(window.stop===record.stop)window.stop=record.originalStop;
     page.off?.('close', dispose);
   };
   record.controller = { dispose };
   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
   DOCUMENTS.set(documentImpl, record);
+  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');record.page.navigationAbort?.abort();stopNavigation(record.page);return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
+  record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');for(const timer of record.javascriptTasks)clearTimer(record,timer);record.javascriptTasks.clear();});
   record.close = function () { dispose(); return record.originalClose.call(window); };
   window.close = record.close;
   record.signal?.addEventListener('abort', dispose, { once: true });
@@ -223,4 +259,19 @@ export function requestNavigation(page, window, url, options = {}) {
   return schedule(record, new URL(url, window.location.href).href, {
     historyMode: 'push', referrer: window.location.href, ...options,
   });
+}
+
+// Selection uses private browsing-context ownership. Once accepted, the target
+// document owns its queued navigation, so retiring the source frame cannot
+// cancel an active ancestor's submission. Closing the target cancels normally.
+export function requestTargetNavigation(page, window, targetPage, url, options = {}) {
+ const source=DOCUMENTS.get(implForWrapper(window?.document));
+ if(!source||source.page!==page||!active(source))throw new window.DOMException('The source document is not registered for navigation','InvalidStateError');
+ if(!targetPage||targetPage.closed||targetPage.retired)return;
+ if(targetPage!==page&&(targetPage.browser!==page.browser||targetPage.context!==page.context))throw new window.DOMException('The target browsing context is not owned by this context','SecurityError');
+ const targetWindow=targetPage.dom?.window??window,target=DOCUMENTS.get(implForWrapper(targetWindow.document));
+ if(!target||target.page!==targetPage||!active(target))return;
+ const destination=new URL(url,window.location.href);
+ if(destination.protocol==='javascript:'&&target!==source&&!canNavigateJavaScript(source.window,target.window))return;
+ return schedule(target,destination.href,{historyMode:'push',referrer:window.location.href,...options});
 }

@@ -10,7 +10,7 @@ function cli(args, input = '') {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['bin/red-panda.js', ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`CLI deadline: ${args[0]}`)); }, 15000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`CLI deadline: ${JSON.stringify(args)}\nstdout:\n${stdout}\nstderr:\n${stderr}`)); }, 15000);
     child.stdout.on('data', data => { stdout += data; });
     child.stderr.on('data', data => { stderr += data; });
     child.once('error', error => { clearTimeout(timer); reject(error); });

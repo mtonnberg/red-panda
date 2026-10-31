@@ -5,12 +5,10 @@ import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';
 import{registerProtocolPrototype}from'./protocol-classes.js';
 import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
 import{captureWorkerCreator}from'./worker-apis.js';
-import{onFrameRetirement}from'./frame-activity.js';
+import{onFrameRetirement}from'./frame-retirement-hooks.js';
 import{openEventSourceTransport}from'./eventsource-transport.js';
 import{eventSourcePolicy}from'./eventsource-policy.js';
 const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
-const TargetIDL=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
-const TargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const installed=new WeakMap(),states=new WeakMap(),apply=Reflect.apply,record=value=>Object.assign(Object.create(null),value);
 function factory(g,b){
  'use strict';const TypeError=g.TypeError,String=g.String,EventTarget=g.EventTarget,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,setPrototype=g.Object.setPrototypeOf,construct=g.Reflect.construct,apply=g.Reflect.apply,description=descriptor(g.Symbol.prototype,'description').get,wellFormed=g.String.prototype.toWellFormed;
@@ -33,6 +31,7 @@ export function installEventSource(realm,{evaluate,baseURL,createTransport,signa
  const dispose=()=>{for(const state of live)state.transport.close();live.clear()};const api=record({dispose});installed.set(realm,api);evaluate(`(${factory.toString()})`)(realm,bridge);signal?.addEventListener('abort',dispose,{once:true});return api;
 }
 export function installWindowEventSource(page,realm,{mainWindow=realm,evaluate,initializeTarget}={}){
+ const TargetIDL=require('jsdom/lib/jsdom/living/generated/EventTarget.js'),TargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
  const dispatchGenerated=TargetImpl.prototype._dispatch,creator=captureWorkerCreator(page,mainWindow),document=implForWrapper(mainWindow.document),base=document.baseURLSerialized,context=implForWrapper(mainWindow)?._globalObject,owned=new Set(),policy=eventSourcePolicy(page,{origin:creator().origin,referrer:page.url});
  const api=installEventSource(realm,{evaluate:evaluate??(source=>vm.runInContext(source,context)),baseURL:()=>Reflect.apply(base,document,[]),signal:page.documentAbort.signal,createTransport:(url,withCredentials,emit)=>openEventSourceTransport({url,withCredentials,emit,policy,owner:owned}),initializeTarget:initializeTarget??(value=>TargetIDL.setup(value,realm,[])),dispatchTrusted:(target,event)=>apply(dispatchGenerated,implForWrapper(target),[implForWrapper(event)]),trustEvent:event=>{const implementation=implForWrapper(event);if(!implementation)throw new TypeError('Real Event implementation required');implementation.isTrusted=true;return event}});
  onFrameRetirement(mainWindow,()=>setTimeout(()=>api.dispose(),0));return api;

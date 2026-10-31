@@ -1,0 +1,50 @@
+# Bounded public Navigation API and stopped-navigation load completion
+
+This handoff contains two separate immutable patch chains. Apply the frozen form-routing patch `634a309cbcdbb9939713d17fc7e737aaf4a4b45d41bc827402cd6bd92d417b20`, then joint history `18db4f42b5bec35c10bf437486a8a0bc8d35a2091d5332464499e600bfa235fa`, then `integration.patch`, then `load-cancellation.patch`. The two manifests pin every exact base and resulting leaf. Root production was not edited. `candidate/` is the API-only result; the executed archive is the actual composition including the separate load correction.
+
+## Actual behavior
+
+The API uses the real shared joint journal, actual browsing-context navigation queues and HTTP backend. Navigation/entry objects use genuine selected-VM EventTarget allocation; destinations and activation snapshots use genuine selected-VM objects. Public class and method prototypes belong to their real VM. Private state, interface exports, controllers and factories are Host null-prototype allocations or private WeakMaps. No VM factory table or helper returns an implementation record. Actual authored objects/lookalikes remain queryable and usable. A targeted real heap-query test verifies those identities alongside the genuine public objects.
+
+Entries have real stable wrapper identity, dynamic indices, document ownership and replacement/pruning disposal. Entry wrapper conversion is lazy, including currententrychange.from, and the first successful conversion selects its actual realm. entries() produces a fresh actual method-realm Array. Native's shared Navigation object is allocated in its first accessing frame realm. Navigation methods use their actual method realm for actions and returned promises; History's independently measured incumbent rules remain intact.
+
+State is a real JSON snapshot using the pinned target's measured semantics. History-produced entries expose no Navigation state; updateCurrentEntry mutates the actual current entry without replacing its identity, emits a real currententrychange, and returns fresh selected-VM parses on reads. Explicit undefined is stored and its subsequent genuine JSON read throws the selected-VM SyntaxError. No fabricated sensor/network/result values are used.
+
+navigate/currententrychange/dispose/success/error events come from actual mutations and accepted/canceled operations. Genuine AbortController/Signal state and the same realm DOMException identity reach signal.reason, navigateerror.error and canceled promises. Callback microtasks have measured Native ordering. Same-document operations preserve the actual Document and VM, commit before currententrychange callbacks, and own their hash tasks before callbacks can interrupt execution. Queued fallback cleanup preserves operation settlement and remaining disposal if a real V8 deadline skips normal Host continuations. Superseding an event does not itself cancel an already accepted load; stop() cancels the real queued transport. Accepted cross-document API promises stay unsettled as the old document goes away, matching the executable oracle rather than inventing an acknowledgement. Real document commits update activation; later history-state changes do not. Form and anchor events carry the actual source Element and POST FormData from their genuine producers.
+
+Location javascript: URLs execute actual percent-decoded code in the target's real VM as owned tasks, without HTTP or navigate events, as calibrated. The pinned Native runs the script and ignores its return value. Existing unsupported-protocol/backend limits remain.
+
+## Separate Browser load correction
+
+`load-cancellation.patch` changes only Browser's original-document completion branch and adds one real HTTP/module test. An accepted redirect canceled before transport is recognized by its actual pending request identity, cancellation error and unchanged current Window. The real original ready/module promises finish; no forced readyState, fake load event, module barrier, HTTP acknowledgement or larger timeout is added. Previously Browser suppressed its completed original load and reported the canceled queued redirect as the initial load failure. The API patch alone does not include this correction.
+
+The CSS source-liveness proposal was read before making this change. Its Browser hunks concern stylesheet decoding/resource bytes, while this correction is in Page.navigate's actual redirect/readiness branch; its independent module initiation/TLA work is preserved. Existing Page readiness policy still awaits moduleReady; this patch does not claim broad CDP/TLA lifecycle parity.
+
+## Executed evidence
+
+* Final exact composition: **83/83** focused tests on prepared Node 24.22.1, system Node 24.19.0 and Node 26.13.0, run serially. See evidence/final-focused-status.json and final-focus-*.log. This includes 22 new API/lifecycle/privacy controls and existing journal, History, Location, form and integration regressions. One targeted privacy case per SDK was run; no broad heap, full repository or PureScript suite was run here.
+* Native and candidate both pass the unchanged pinned **navigation/navigate_event.html** and **history_traverse.html** fixtures with the original conformance runner, upstream profile, registered source options, native harness branch, real 2000 ms load plus 2000 ms assertion budgets, nonzero observations and no diagnostics/runtime exceptions. See native-source2-v1.json and candidate-source2-final.json. Ephemeral fixture/browser ports were owned and released; no canonical ports were used.
+* **31** executable Native/candidate rows were retained. **27/31** match the selected complete projection of JSON result, post-navigation state when queried, actual server wire records and actual root frame URL. Only the owned HTTP origin is normalized. All four differing rows remain in evidence/final-paired-comparison.json; two exercise the same existing error-document VM boundary. No reflected key, asserted value or fixture name is hidden by the runtime or comparison.
+* All **418** frozen runtime/test/tool/package/native inputs remained byte-for-byte unchanged across final serial tests, paired replay, source replay and syntax checks. evidence/final-source-hashes.json, final-source-stability.json and final-freeze.json pin the graph. Another 587 final external input hashes identify SDKs, actual Native binary, oracle source/harness, registration map and installed dependency source. Root's external driver/client bytes equal the copied graph's bytes.
+* Exact base-copy apply/check of both patches succeeded and all 11 resulting leaves equal the executed composition. No extra Git repository was initialized for that check. The scratch Git root is an owned empty patch-construction convenience with unborn HEAD, no remotes and no tracked files; evidence/scratch-provenance.json records its positive classification.
+* Preserve the earlier contrary graph results: Source load timeouts and detailed debug errors, 76/79 old-domain stage, 81/81 prior frozen graph on all three SDKs, and the old child-success/lazy-allocation observations. They are not final successes. The real Native redirect-chain control proves parser-loading assign/replace leaves one final entry before changing the old integration expectation; the standalone descriptor test now waits for actual document completion before checking the loaded-document push path.
+
+## Explicit remaining bounds
+
+1. Actual EventTarget allocation still publishes its pre-existing jsdom implementation Symbol; Native publishes none. This causes the exposure row mismatch. It is not hidden with ownKeys/name/property filters, fake wrappers or copied-symbol authentication.
+2. Native's cross-origin History control accepts a new Location URL. Red Panda retains its existing genuine document rewrite/origin authority boundary. The Native URL result alone does not establish principal/token, storage, fetch Origin or referrer changes; those need separate consistent executable boundary calibration. The candidate's real selected-VM SecurityError and unchanged URL remain explicit in the raw control.
+3. On the deliberately refused-port navigation, Native replaces the document/VM with its error document. Existing candidate navigation backend reports failure while retaining the original document. Both affected raw rows remain different; this slice does not invent an error document or successful HTTP. Accepted old-document API promises are never falsely fulfilled/rejected with Host errors.
+4. Advanced reload option timing/destination metadata is not fully calibrated by these controls. Current reload construction passes the selected entry as destination data, whereas the pinned source describes traversal-only entry metadata; executable follow-up is pending. Bare initial-target activation, retained old-root/global/WindowProxy identity/security, isolated worlds and broader browser/navigation features are outside this bounded slice. Native's unexposed NavigationTransition and unsupported interception are not advertised as implemented capabilities.
+
+The actual Native binary is SHA256 `9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f`, reference source commit `948d773786380bae36f046639fc61e2ddddd212a`. Native source/binary are read-only oracles; no engine implementation was imported, forked or vendored. No dependencies were added.
+
+## Reproduce
+
+In the executed scratch or exact exported graph with the recorded dependencies/SDK addons available:
+
+```sh
+python3 helpers/run-focused.py
+/workspace/shared/rea-tools/node_modules/node/bin/node --experimental-vm-modules helpers/navigation-probe.mjs /workspace/shared/navigation-public /new/report.json
+```
+
+Each probe takes `native` or a candidate repository path followed by a new report path and refuses to overwrite prior evidence. Source replay and all SDK/probe commands are recorded in evidence/final-*-status.json. Existing immutable logs must be copied or a fresh export used before replaying the focused driver because it likewise refuses overwriting evidence logs. Root owns final composed full-suite verification, integration, commit and push.

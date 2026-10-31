@@ -1,12 +1,14 @@
 // Host-only ownership for actual fresh DOM factory allocation. No Document
 // globals, backend ownership or existing canonical wrappers are changed.
 import 'jsdom';
+import {domWrapperGlobal,recordDOMWrapperGlobal} from './dom-wrapper-globals.js';
+export {domWrapperGlobal,recordDOMWrapperGlobal} from './dom-wrapper-globals.js';
 import vm from 'node:vm';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
 const {lookupCEDefinition}=require('jsdom/lib/jsdom/living/helpers/custom-elements.js');
 const {HTML_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
-const scopes=[],kinds=new Set(),globals=new WeakMap(),primaryScopes=new WeakMap(),realmGlobals=new WeakMap();
+const scopes=[],kinds=new Set(),primaryScopes=new WeakMap(),realmGlobals=new WeakMap();
 const nil=()=>Object.create(null);
 function context(value){return vm.isContext(value)?value:utils.implForWrapper(value)?._globalObject;}
 // Plain vm.Context sandboxes and their genuine JS globals can be distinct
@@ -17,8 +19,6 @@ export function registerDOMAllocationRealm(context,globalObject){
  realmGlobals.set(context,globalObject);
 }
 export function registerDOMAllocationKind(kind){kinds.add(kind);}
-export function domWrapperGlobal(value,fallback){return globals.get(value)??fallback;}
-export function recordDOMWrapperGlobal(value,globalObject){globals.set(value,globalObject);return value;}
 export function selectDOMWrapperAllocation(globalObject,prototype,kind){
  const scope=scopes.at(-1);
  if(!scope?.active||!kinds.has(kind)||context(globalObject)!==scope.source)return Object.assign(nil(),{globalObject,prototype});
@@ -27,7 +27,7 @@ export function selectDOMWrapperAllocation(globalObject,prototype,kind){
  return Object.assign(nil(),{globalObject:selected,prototype:Constructor.prototype,scope});
 }
 export function noteDOMWrapperShell(value,selection){
- globals.set(value,selection.globalObject);
+ recordDOMWrapperGlobal(value,selection.globalObject);
  if(selection.scope&&!selection.scope.primary){selection.scope.primary=value;primaryScopes.set(value,selection.scope);}
  return value;
 }

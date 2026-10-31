@@ -1,4 +1,5 @@
 import {createMessagingInterfaces} from './messaging-interfaces.js';
+import {implementationForWrapper} from './dom-event-state.js';
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import { isCanvasCloneRejected } from './canvas.js';
 import { cloneObjectKind } from './clone-object-kind.js';
@@ -10,8 +11,6 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
-const { fireAnEvent } = require('jsdom/lib/jsdom/living/helpers/events.js');
-const MessageEvent = require('jsdom/lib/jsdom/living/generated/MessageEvent.js');
 const nativeClone = globalThis.structuredClone;
 const PORTS = new WeakMap(), INSTALLED = new WeakMap();
 const ERROR_NAMES = ['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError'];
@@ -29,13 +28,14 @@ const VIEW_NAMES = ['DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 
  * Blob/File preserve their immutable bytes and private metadata through graph
  * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
  */
-export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false, portCopiesArrayBuffers = false, mutableMessagePorts = false, initializeTarget } = {}) {
+export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false, portCopiesArrayBuffers = false, mutableMessagePorts = false, initializeTarget, callbackTarget } = {}) {
   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
   const codec = createPlatformCodec(realm);
   const deliveryQueues = new WeakMap(), pendingDeliveries = new Set();
   const EventTarget = realm.EventTarget,addPortListener=EventTarget.prototype.addEventListener,removePortListener=EventTarget.prototype.removeEventListener;
   const owned = new Set(), wrapped = new WeakMap(), channels = new WeakMap(), secret = {};
+  const aliases = new WeakMap(), handlerOwner = {}, handlerStates = new Set();
   let disposed = false;
   const live = () => !disposed && active();
   const Exception=realm.DOMException;
@@ -87,7 +87,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     if (types.isProxy(value) && !platformFactoryRecord(value)) throw cloneError('Proxy objects cannot be structured cloned');
     const port = PORTS.get(value);
     if (port) {
-      if (port.detached || !allowed.has(value)) throw cloneError('MessagePort must be transferred and cannot be detached');
+      if (port.detached || !allowed.has(value) && !allowed.has(port)) throw cloneError('MessagePort must be transferred and cannot be detached');
       return port.native;
     }
     if (value instanceof NativePort) throw cloneError('Native MessagePort must be wrapped before sending');
@@ -137,7 +137,9 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       const state = PORTS.get(value);
       if (state) {
         if (state.detached) throw cloneError('MessagePort is already detached');
-        if (value === sourcePort) throw cloneError('A MessagePort cannot transfer itself');
+        if (transfer.includes(state.native)) throw cloneError('Transfer list contains duplicates');
+        allowed.add(state);
+        if (value === sourcePort || state === PORTS.get(sourcePort)) throw cloneError('A MessagePort cannot transfer itself');
         transfer.push(state.native); ports.push(state.native); moved.push(state);
       } else if (types.isArrayBuffer(value)) transfer.push(value);
       else throw cloneError(isCanvasCloneRejected(value)?'The object can not be cloned':'Transfer list contains a non-transferable value');
@@ -270,7 +272,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     configurable: true, enumerable: true,
     get() { return record(this).handlers.get(type)?.callback ?? null; },
     set(value) {
-      const state=record(this),previous=state.handlers.get(type);value=typeof value==='function'?value:null;if(previous){if(value){previous.callback=value;return}Reflect.apply(removePortListener,this,[type,previous.relay]);state.handlers.delete(type);return}if(!value)return;const entry={callback:value,relay:null};entry.relay=event=>Reflect.apply(entry.callback,this,[event]);state.handlers.set(type,entry);Reflect.apply(addPortListener,this,[type,entry.relay]);if(type==='message')Reflect.apply(PortBackendMethods.prototype.start,this,[]);
+      const state=record(this),previous=state.handlers.get(type);value=typeof value==='function'?value:null;if(previous){if(value){previous.callback=value;previous.owner=handlerOwner;if(state.owner!==owned)handlerStates.add(state);return}Reflect.apply(removePortListener,this,[type,previous.relay]);state.handlers.delete(type);return}if(!value)return;const entry={callback:value,relay:null,owner:handlerOwner};if(state.owner!==owned)handlerStates.add(state);entry.relay=event=>Reflect.apply(entry.callback,callbackTarget?callbackTarget(event,this):this,[event]);state.handlers.set(type,entry);Reflect.apply(addPortListener,this,[type,entry.relay]);if(type==='message')Reflect.apply(PortBackendMethods.prototype.start,this,[]);
     },
   });
   for(const kind of ['MessagePort','MessageChannel'])registerPlatformFactoryKind(kind);
@@ -285,17 +287,27 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
   function dispose() {
     if (disposed) return;
     disposed = true;
+    for (const state of handlerStates) if (state.owner !== owned) for (const [type, entry] of state.handlers) if (entry.owner === handlerOwner) { Reflect.apply(removePortListener, state.port, [type, entry.relay]); state.handlers.delete(type); }
+    handlerStates.clear();
     for (const work of pendingDeliveries) dropMessage(work.message); pendingDeliveries.clear();
     for (const state of [...owned]) { state.closed = true; release(state); state.native.close(); }
   }
   registerPlatformCloneRealm(realm);
   return { MessageChannel, MessagePort, prepare, receive, deliver, prepareBroadcast, broadcastBody: codec.broadcastBody, dispatchMessage, clone, discard, wrap,
     unwrap(port) { const state = record(port); if (state.detached) throw cloneError('MessagePort is detached'); return state.native; },
-    isPort: value => PORTS.has(value), dispose, get size() { return owned.size; } };
+    aliasPort(value, bind) {
+      const state = PORTS.get(value); if (!state) return;
+      let alias = aliases.get(state); if (alias) return alias;
+      alias = new MessagePort(secret); bind(alias, implementationForWrapper(value), 'MessagePort');
+      PORTS.set(alias, state); aliases.set(state, alias);
+      registerPlatformFactory(alias, {kind: 'MessagePort', globalObject: realm});
+      return alias;
+    }, isPort: value => PORTS.has(value), dispose, get size() { return owned.size; } };
 }
 
 /** Install document-owned channels plus realm-correct structuredClone. */
 export function installMessaging(page, window) {
+  const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js'),MessageEvent=require('jsdom/lib/jsdom/living/generated/MessageEvent.js');
   if (INSTALLED.has(window)) return INSTALLED.get(window);
   const generation = page.documentGeneration, signal = page.documentAbort?.signal;
   const bridge = createMessagingRealm(window, {
@@ -313,4 +325,36 @@ export function installMessaging(page, window) {
   window.close = close;
   signal?.addEventListener('abort', () => { bridge.dispose(); if (window.close === close) window.close = previousClose; }, { once: true });
   INSTALLED.set(window, bridge); return bridge;
+}
+
+/** Real document-owned endpoints with public values allocated in an isolated VM. */
+export function installUtilityMessaging(page, controller) {
+  const realm = controller.global;
+  if (INSTALLED.has(realm)) return INSTALLED.get(realm);
+  const signal = page.documentAbort?.signal, generation = page.documentGeneration;
+  const dispatch = require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype._dispatch, Event = realm.MessageEvent;
+  const bridge = createMessagingRealm(realm, {
+    cloneUnknownTransfers: !page.parentFrameId,
+    portCopiesArrayBuffers: true, mutableMessagePorts: true,
+    initializeTarget: value => controller.setupEventTarget(value),
+    callbackTarget: (event, receiver) => { const impl = implementationForWrapper(event); return impl?.currentTarget ? controller.wrap(impl.currentTarget) : receiver; },
+    active: () => !controller.disposed && !page.closed && generation === page.documentGeneration && !signal?.aborted,
+    dispatch(target, type, data, ports) {
+      const event = new Event(type, {data, ports, origin: '', source: null, lastEventId: ''});
+      const implementation = implementationForWrapper(event);
+      // Transport-decoded ports already are public receiving-realm wrappers.
+      // Keep the actual backend field in that realm, as the main transport does.
+      implementation.ports = ports;
+      implementation.isTrusted = true;
+      Reflect.apply(dispatch, implementationForWrapper(target), [implementationForWrapper(event)]);
+    },
+    reportError: error => page.emit?.('pageError', error),
+  });
+  for (const [name, value] of Object.entries({MessageChannel: bridge.MessageChannel, MessagePort: bridge.MessagePort})) {
+    Object.defineProperty(realm, name, {value, configurable: true, writable: true});
+  }
+  controller.registerTargetWrapper(value => bridge.aliasPort(value, controller.bindTargetWrapper));
+  controller.onDispose(() => bridge.dispose());
+  INSTALLED.set(realm, bridge);
+  return bridge;
 }

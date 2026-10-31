@@ -1,0 +1,71 @@
+--- /dev/null
++++ b/src/option-alias.js
+@@ -0,0 +1,32 @@
++// Construct the actual selected-VM receiver and initialize that SAME object
++// with the canonical generated Option backend. No replacement receiver or
++// prototype correction is used; V8 owns real newTarget/prototype resolution.
++import vm from 'node:vm';
++import{createRequire}from'node:module';
++const require=createRequire(import.meta.url),Option=require('jsdom/lib/jsdom/living/generated/HTMLOptionElement.js'),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const installed=new WeakMap(),apply=Reflect.apply,define=Object.defineProperty;
++const symbolDescription=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get;
++const HTML='http://www.w3.org/1999/xhtml';
++export function installOptionAlias(window){
++ const previous=installed.get(window);if(previous)return previous;
++ const document=utils.implForWrapper(window.document),globalObject=document._globalObject,context=vm.isContext(globalObject)?globalObject:undefined;
++ const StringConstructor=context?vm.runInContext('String',context):window.String,TypeErrorConstructor=window.TypeError;
++ const text=value=>typeof value==='symbol'?apply(StringConstructor,undefined,[apply(symbolDescription,value,[])]):apply(StringConstructor,undefined,[value]);
++ const initialize=(receiver,args)=>{
++  const content=args[0]===undefined?'':text(args[0]),value=args[1]===undefined?undefined:text(args[1]);
++  const defaultSelected=Boolean(args[2]),selected=Boolean(args[3]);
++  const actual=Option.setup(receiver,globalObject,[],{ownerDocument:document,localName:'option',namespace:HTML,prefix:null,ceState:'uncustomized',ceDefinition:null,isValue:null});
++  if(actual!==receiver)throw new Error('Canonical Option setup changed receiver identity');
++  const implementation=utils.implForWrapper(receiver);
++  if(content!=='')implementation.text=content;
++  if(value!==undefined)implementation.setAttributeNS(null,'value',value);
++  if(defaultSelected)implementation.setAttributeNS(null,'selected','');
++  implementation._selectedness=selected;
++ };
++ // The factory entry is temporary; its only surviving public value is the
++ // actual constructible alias. Host owns initialization/conversion state.
++ const Constructor=vm.compileFunction('"use strict";return function Option(){if(!new.target)throw new TypeErrorConstructor("invalid argument");initialize(this,arguments)}',['initialize','TypeErrorConstructor'],{...(context?{parsingContext:context}:{}),filename:'red-panda:Option'})(initialize,TypeErrorConstructor);
++ define(Constructor,'prototype',{value:window.HTMLOptionElement.prototype,writable:false});
++ define(window,'Option',{value:Constructor,writable:true,enumerable:false,configurable:true});
++ installed.set(window,Constructor);return Constructor;
++}
+--- a/src/input-controls.js
++++ b/src/input-controls.js
+@@ -1,3 +1,4 @@
++import {installOptionAlias} from './option-alias.js';
+ // Independent input state adaptation over pinned jsdom DOM/IDL primitives.
+ import { createRequire } from 'node:module';
+ 
+@@ -177,14 +178,7 @@
+   const record = { page, window, document: window.document, signal: page.documentAbort?.signal, disposed: false,
+     arrayFrom: window.Array.from.bind(window.Array) };
+   documents.set(document, record);
+-  const NativeOption = window.Option;
+-  function Option() {
+-    if (!new.target) throw new window.TypeError('invalid argument');
+-    return Reflect.apply(NativeOption, undefined, arguments);
+-  }
+-  Object.setPrototypeOf(Option, window.Function.prototype);
+-  Object.defineProperty(Option, 'prototype', { value: window.HTMLOptionElement.prototype, writable: false });
+-  Object.defineProperty(window, 'Option', { value: Option, configurable: true, writable: true });
++  installOptionAlias(window);
+   const previousClose = window.close;
+   const dispose = () => {
+     if (record.disposed) return;
+--- /dev/null
++++ b/test/option-alias.test.js
+@@ -0,0 +1,10 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{createRequire}from'node:module';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{platformFactoryRecord}from'../src/platform-factories.js';import{installOptionAlias}from'../src/option-alias.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),factory=require('jsdom/lib/jsdom/living/generated/HTMLOptionElement.js'),binding=getHeapBinding();
++function realm(value,w){const old=Object.getPrototypeOf(value),a=w.eval('[]');try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,a),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('Option alias and its canonical same-object setup receiver are genuinely in their original VM',async t=>{const{w}=await fixture(t),original=factory.setup;let supplied,returned;factory.setup=function(receiver,...args){supplied=receiver;returned=Reflect.apply(original,this,[receiver,...args]);return returned};let e;try{e=new w.Option('actual','owned',true,true)}finally{factory.setup=original}assert.equal(e,supplied);assert.equal(e,returned);assert.equal(utils.wrapperForImpl(utils.implForWrapper(e)),e);assert.equal(platformFactoryRecord(e).implementation,utils.implForWrapper(e));realm(w.Option,w);realm(e,w);assert.equal(e.ownerDocument,w.document);assert.equal(e.value,'owned');assert.equal(e.selected,true);assert.equal(e.defaultSelected,true);assert.equal(e.namespaceURI,'http://www.w3.org/1999/xhtml');});
++test('real constructible alias metadata matches measured members without counterfeit native source',async t=>{const{w}=await fixture(t),C=w.Option,d=Object.getOwnPropertyDescriptor(C,'prototype');assert.equal(C.name,'Option');assert.equal(C.length,0);assert.deepEqual(Reflect.ownKeys(C),['length','name','prototype']);assert.equal(d.value,w.HTMLOptionElement.prototype);assert.deepEqual([d.writable,d.enumerable,d.configurable],[false,false,false]);assert.equal(C.prototype.constructor,w.HTMLOptionElement);assert.equal(Object.getPrototypeOf(C),w.Function.prototype);assert.equal(Object.hasOwn(C,'toString'),false);assert.equal(Function.prototype.toString.call(C).includes('[native code]'),false);assert.throws(()=>C('x'),e=>e instanceof w.TypeError&&e.message==='invalid argument');});
++test('actual Native Symbol/null conversions, selection flags and authored thrown identities are preserved',async t=>{const{w}=await fixture(t);const e=new w.Option(w.Symbol('text'),w.Symbol('value'));assert.equal(e.text,'text');assert.equal(e.value,'value');assert.equal(new w.Option(w.Symbol()).value,'undefined');const n=new w.Option(null,null);assert.equal(n.textContent,'null');assert.equal(n.getAttribute('value'),'null');assert.throws(()=>new w.Option(Object(w.Symbol('x'))),e=>e instanceof w.TypeError&&e.message==='Cannot convert a Symbol value to a string');const token=w.eval('({authored:true})');assert.throws(()=>new w.Option({toString(){throw token}}),e=>e===token);const order=[];new w.Option({toString(){order.push('text');return'T'}},{toString(){order.push('value');return'V'}},{valueOf(){order.push('default');return 1}},{valueOf(){order.push('selected');return 1}});assert.deepEqual(order,['text','value']);const a=new w.Option('a  b','V',true,false);assert.equal(a.text,'a b');assert.equal(a.textContent,'a  b');assert.equal(a.defaultSelected,true);assert.equal(a.selected,false);});
++test('V8 resolves actual newTarget once before conversion and canonical backend survives custom prototypes',async t=>{const{w}=await fixture(t);const result=JSON.parse(w.eval(`JSON.stringify((()=>{const out=[],owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get,value=Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype,'value').get;for(const[label,proto]of[['object',{owned:true}],['null',null],['primitive',3]]){let reads=0;const order=[],P=new Proxy(function Target(){},{get(t,p,r){if(p==='prototype'){reads++;order.push('prototype');return proto}return Reflect.get(t,p,r)}});const e=Reflect.construct(Option,[{toString(){order.push('text');return'T'}},{toString(){order.push('value');return'V'}}],P);out.push({label,reads,order,custom:Object.getPrototypeOf(e)===proto,object:Object.getPrototypeOf(e)===Object.prototype,option:Object.getPrototypeOf(e)===HTMLOptionElement.prototype,actualOwner:owner.call(e)===document,actualValue:value.call(e)})}return out})())`));assert.deepEqual(result,['object','null','primitive'].map(label=>({label,reads:1,order:['prototype','text','value'],custom:label==='object',object:label!=='object',option:false,actualOwner:true,actualValue:'V'})));const sub=w.eval('new(class Actual extends Option{constructor(){super("owned","value");this.authored=1}})()');assert.equal(sub.authored,1);assert.equal(sub.constructor.name,'Actual');assert.equal(sub instanceof w.Option,true);assert.equal(sub.value,'value');realm(sub,w);});
++test('frame newTarget changes the genuine prototype while owner and real state stay with constructor document',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;realm(c.Option,c);const e=Reflect.construct(w.Option,['owned','V'],c.HTMLOptionElement);assert.equal(Object.getPrototypeOf(e),c.HTMLOptionElement.prototype);assert.equal(e.ownerDocument,w.document);assert.equal(e.value,'V');realm(e,w);const create=w.document.createElement;let calls=0;w.document.createElement=()=>{calls++;throw Error('authored')};try{const a=new w.Option('after','A');assert.equal(a.value,'A');assert.equal(calls,0)}finally{w.document.createElement=create}const s=w.document.body.appendChild(w.document.createElement('select'));s.add(e);assert.equal(s.options[0],e);assert.equal(s.value,'V');});
++test('Host fallback is genuine and unregistered windows plus frozen interface helpers remain unchanged',()=>{const a=new JSDOM(''),b=new JSDOM('');try{installOptionAlias(a.window);assert.equal(binding.sameRealm(a.window.Option,[]),true);assert.equal(binding.sameRealm(new a.window.Option('host','H'),[]),true);assert.equal(a.window.Option.length,0);assert.equal(b.window.Option.length,4);assert.equal(b.window.Option('original').text,'original');for(const[name,expected]of[['control-interface-realms.js','9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f'],['additional-control-interface-realms.js','62b1eb9a098e15c7613bcf3a75a0fb60e3fffa2d90a925ea986e844a9385d0bf']])assert.equal(createHash('sha256').update(readFileSync(new URL('../src/'+name,import.meta.url))).digest('hex'),expected)}finally{a.window.close();b.window.close()}});

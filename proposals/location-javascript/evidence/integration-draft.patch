@@ -1,0 +1,228 @@
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -1,3 +1,5 @@
++import {canNavigateJavaScript} from './blob-urls.js';
++import {reportWindowException} from './errors.js';
+ import vm from 'node:vm';
+ import {beforeNavigation,linkedNavigation,stopNavigation} from './navigation-lifecycle.js';
+ import { createRequire } from 'node:module';
+@@ -43,7 +45,7 @@
+ 
+ function scheduleJavascript(record,url){
+  const source=Buffer.from(percentDecodeString(url.slice('javascript:'.length))).toString('utf8');
+- let timer;timer=record.setTimeout(()=>{record.timers.delete(timer);if(!active(record)||!ownsCurrentDocument(record))return;try{vm.runInContext(source,record.page.dom.getInternalVMContext(),{timeout:Math.min(record.page.timeout??10000,2000),displayErrors:false,filename:'javascript:'})}catch(error){record.page.emit?.('pageError',error)}},0);record.timers.add(timer);
++ let timer;timer=record.setTimeout(()=>{record.timers.delete(timer);record.javascriptTasks.delete(timer);if(!active(record)||!ownsCurrentDocument(record))return;try{vm.runInContext(source,record.page.dom.getInternalVMContext(),{timeout:Math.min(record.page.timeout??10000,2000),displayErrors:false,filename:'javascript:'})}catch(error){if(!reportWindowException(record.window,error))record.page.emit?.('pageError',error)}},0);record.timers.add(timer);record.javascriptTasks.add(timer);
+ }
+ function schedule(record, url, options) {
+   if(new URL(url).protocol==='javascript:'){if(active(record))scheduleJavascript(record,url);return}
+@@ -155,10 +157,10 @@
+     const record = DOCUMENTS.get(this._ownerDocument);
+     if (!record || !active(record)) return anchorFollow.call(this);
+     if (this._cannotNavigate() || !this.hasAttributeNS(null, 'href')) return;
+-    if (this.hasAttributeNS(null, 'download')) throw new record.DOMException('Anchor downloads are not implemented', 'NotSupportedError');
++    const destination = this._ownerDocument.encodingParseAURL(this.href);
++    if (this.hasAttributeNS(null, 'download') && destination?.scheme!=='javascript') throw new record.DOMException('Anchor downloads are not implemented', 'NotSupportedError');
+     const target = this._getAnElementsTarget();
+     if (!targetIsSelf(record, target)) throw new record.DOMException(`Navigation target ${target} is not implemented`, 'NotSupportedError');
+-    const destination = this._ownerDocument.encodingParseAURL(this.href);
+     if (!destination) return;
+     const url = whatwgURL.serializeURL(destination);
+     if(destination.scheme==='javascript'){scheduleJavascript(record,url);return}
+@@ -205,7 +207,7 @@
+   const record = {
+     page, window, document, documentImpl, signal: page.documentAbort?.signal,
+     DOMException: window.DOMException, setTimeout: window.setTimeout.bind(window),
+-    clearTimeout: window.clearTimeout.bind(window), timers: new Set(), pending: new Set(), disposed: false,
++    clearTimeout: window.clearTimeout.bind(window), timers: new Set(), javascriptTasks: new Set(), pending: new Set(), disposed: false,
+     originalClose: window.close,originalStop:window.stop,
+   };
+   const dispose = () => {
+@@ -213,7 +215,7 @@
+     record.disposed = true;
+     for (const pending of record.pending) if (!pending.started) pending.cancel('Source document was disposed');
+     for (const timer of record.timers) record.clearTimeout(timer);
+-    record.timers.clear();
++    record.timers.clear();record.javascriptTasks.clear();
+     DOCUMENTS.delete(documentImpl);
+     if (window.close === record.close) window.close = record.originalClose;
+     record.signal?.removeEventListener('abort', dispose);
+@@ -224,7 +226,7 @@
+   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
+   DOCUMENTS.set(documentImpl, record);
+   const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');record.page.navigationAbort?.abort();stopNavigation(record.page);return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
+-  record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');});
++  record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');for(const timer of record.javascriptTasks)clearTimer(record,timer);record.javascriptTasks.clear();});
+   record.close = function () { dispose(); return record.originalClose.call(window); };
+   window.close = record.close;
+   record.signal?.addEventListener('abort', dispose, { once: true });
+@@ -254,5 +256,7 @@
+  if(targetPage!==page&&(targetPage.browser!==page.browser||targetPage.context!==page.context))throw new window.DOMException('The target browsing context is not owned by this context','SecurityError');
+  const targetWindow=targetPage.dom?.window??window,target=DOCUMENTS.get(implForWrapper(targetWindow.document));
+  if(!target||target.page!==targetPage||!active(target))return;
+- return schedule(target,new URL(url,window.location.href).href,{historyMode:'push',referrer:window.location.href,...options});
+-}
++ const destination=new URL(url,window.location.href);
++ if(destination.protocol==='javascript:'&&target!==source&&!canNavigateJavaScript(source.window,target.window))return;
++ return schedule(target,destination.href,{historyMode:'push',referrer:window.location.href,...options});
++}
+--- a/src/forms.js
++++ b/src/forms.js
+@@ -204,14 +204,15 @@
+   const method = rawMethod === 'post' ? 'POST' : 'GET';
+   const action = setting(form, submitter, 'action');
+   const destination = new URL(action || window.location.href, record.document.baseURI);
+-  if (!['http:', 'https:'].includes(destination.protocol)) {
++  const javascript=destination.protocol==='javascript:';
++  if (!javascript&&!['http:', 'https:'].includes(destination.protocol)) {
+     throw new window.DOMException(`Form submission protocol ${destination.protocol} is not implemented`, 'NotSupportedError');
+   }
+   const noReferrer = /(?:^|[\t\n\f\r ])noreferrer(?:$|[\t\n\f\r ])/i.test(form.getAttribute('rel') || '');
+   const options = { method, historyMode: 'push',sourceElement:submitter??form,formData:method==='POST'?data:null, referrer: noReferrer ? '' : window.location.href };
+-  if (method === 'GET') {
++  if (method === 'GET'&&!javascript) {
+     destination.search = `?${new URLSearchParams(serializedPairs(data))}`;
+-  } else {
++  } else if(!javascript) {
+     const requested = setting(form, submitter, 'enctype')?.toLowerCase();
+     const encoding = encodings.has(requested) ? requested : 'application/x-www-form-urlencoded';
+     const { body, contentType } = encodeBody(data, encoding);
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,3 +1,4 @@
++import {types} from 'node:util';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ import { createHook } from 'node:async_hooks';
+@@ -193,3 +194,19 @@
+   record.signal?.addEventListener('abort', record.controller.dispose, { once: true });
+   return record.controller;
+ }
++
++// Trusted Host callers reuse the actual registered realm's ErrorEvent path.
++// Host VM-control errors keep their existing protocol diagnostic path.
++// Return only reporting status; private records and Host errors stay outside the VM.
++const hostErrorPrototype=Error.prototype;
++function hostError(value){
++ if(!types.isNativeError(value))return false;
++ let prototype=getPrototypeOf(value);
++ for(let depth=0;prototype&&depth<32;depth++){
++  if(types.isProxy(prototype))return false;
++  if(prototype===hostErrorPrototype)return true;
++  prototype=getPrototypeOf(prototype);
++ }
++ return false;
++}
++export function reportWindowException(window,value){const record=records.get(window);if(!record||hostError(value))return false;report(record,value);return true;}
+--- a/src/blob-urls.js
++++ b/src/blob-urls.js
+@@ -148,3 +148,14 @@
+   }
+   return { bytes: Uint8Array.from(record.bytes), mimeType: record.mimeType, url: requestedURL };
+ }
++
++// Trusted Host navigation checks actual registered document principals.
++// Native permits this operation on the same Document or a tuple-origin peer;
++// cross-document opaque targets stay denied even when Blob origins inherit.
++export function canNavigateJavaScript(firstWindow,secondWindow){
++ const first=documents.get(firstWindow.document),second=documents.get(secondWindow.document);
++ if(!first||!second||first.context!==second.context)return false;
++ if(first===second)return true;
++ const origin=refreshOrigin(first);
++ return origin.serialized!=='null'&&origin.identity===refreshOrigin(second).identity;
++}
+--- /dev/null
++++ b/test/location-javascript.test.js
+@@ -0,0 +1,93 @@
++import {test,before,after} from 'node:test';
++import http from 'node:http';
++import {once} from 'node:events';
++import assert from 'node:assert/strict';
++import {Browser} from '../src/browser.js';
++
++async function fixture(t){
++ const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());
++ await page.navigate('data:text/html,'+encodeURIComponent('<!doctype html><html><head><title>Actual old document</title><script>globalThis.actualMarker="kept";globalThis.actualRuns=[];</script></head><body><p>Actual old body</p></body></html>'));
++ const document=page.dom.window.document,ObjectType=page.dom.window.Object,context=page.executionContextId,loader=page.loaderId,url=page.url,requests=[];page.on('request',request=>requests.push(request));
++ return{page,requests,checkIdentity(){assert.equal(page.dom.window.document,document);assert.equal(page.dom.window.Object,ObjectType);assert.equal(page.executionContextId,context);assert.equal(page.loaderId,loader);assert.equal(page.url,url);assert.equal(page.evaluate('actualMarker'),'kept');assert.equal(requests.length,0)}};
++}
++const value=(page,expression)=>JSON.parse(page.evaluate('JSON.stringify(('+expression+'))'));
++const turn=page=>page.evaluate('new Promise(resolve=>setTimeout(resolve,0))');
++
++test('Location JavaScript URLs execute actual decoded code after sync/microtasks without replacing the document or fetching',async t=>{
++ const{page,checkIdentity}=await fixture(t);
++ const immediate=page.evaluate(`location.href='javascript:actualRuns.push("actual%20decoded")';actualRuns.push('sync');queueMicrotask(()=>actualRuns.push('microtask'));setTimeout(()=>actualRuns.push('timer'),0);JSON.stringify(actualRuns)`);
++ assert.deepEqual(JSON.parse(immediate),['sync']);await turn(page);assert.deepEqual(value(page,'actualRuns'),['sync','microtask','actual decoded','timer']);checkIdentity();
++ page.evaluate(`location.assign('  JaVaScRiPt:void actualRuns.push("assign")');location.replace('javascript:void actualRuns.push("replace")')`);await turn(page);assert.deepEqual(value(page,'actualRuns.slice(-2)'),['assign','replace']);checkIdentity();
++});
++
++test('GET and POST JavaScript form actions execute their actual source without adding form data to the code URL',async t=>{
++ const{page,checkIdentity}=await fixture(t);const initialLength=page.evaluate('history.length');
++ for(const method of['get','post']){
++  page.evaluate(`(()=>{const form=document.createElement('form');form.method=${JSON.stringify(method)};form.action='javascript:void actualRuns.push('+JSON.stringify(${JSON.stringify(method)})+')';form.innerHTML='<input name=actual value=payload>';document.body.appendChild(form);form.requestSubmit()})()`);
++  await turn(page);assert.equal(page.evaluate('actualRuns.at(-1)'),method);checkIdentity();
++ }
++ assert.equal(page.evaluate('history.length'),initialLength);
++});
++
++test('a JavaScript hyperlink download attribute still queues genuine script execution',async t=>{
++ const{page,checkIdentity}=await fixture(t);page.evaluate(`(()=>{const link=document.createElement('a');link.download='actual.txt';link.href='javascript:void actualRuns.push("download-script")';document.body.appendChild(link);link.click();actualRuns.push('sync')})()`);
++ assert.deepEqual(value(page,'actualRuns'),['sync']);await turn(page);assert.deepEqual(value(page,'actualRuns'),['sync','download-script']);checkIdentity();
++});
++
++test('actual click and submit cancellation prevent JavaScript URL default actions',async t=>{
++ const{page,checkIdentity}=await fixture(t);page.evaluate(`(()=>{const link=document.createElement('a');link.href='javascript:void actualRuns.push("unwanted-link")';link.onclick=event=>{actualRuns.push('click');event.preventDefault()};document.body.appendChild(link);link.click();const form=document.createElement('form');form.action='javascript:void actualRuns.push("unwanted-form")';form.onsubmit=event=>{actualRuns.push('submit');event.preventDefault()};document.body.appendChild(form);form.requestSubmit()})()`);
++ await turn(page);assert.deepEqual(value(page,'actualRuns'),['click','submit']);checkIdentity();
++});
++
++test('stop preserves queued JavaScript tasks, assignments retain order, and returned HTML is not a document replacement',async t=>{
++ const{page,checkIdentity}=await fixture(t);page.evaluate(`location.assign('javascript:void actualRuns.push("first")');stop();location.assign('javascript:void actualRuns.push("second")');location.replace('javascript:"<p>Returned bytes</p>"');actualRuns.push('sync')`);await turn(page);
++ assert.deepEqual(value(page,'actualRuns'),['sync','first','second']);assert.equal(page.evaluate('document.body.textContent'),'Actual old body');checkIdentity();
++});
++
++test('a thrown JavaScript URL error dispatches a genuine trusted same-realm ErrorEvent',async t=>{
++ const{page,checkIdentity}=await fixture(t),errors=[];page.on('pageError',error=>errors.push(error));
++ page.evaluate(`globalThis.actualErrors=[];addEventListener('error',event=>{actualErrors.push({message:event.message,name:event.error.name,realm:event.error instanceof TypeError,trusted:event.isTrusted});event.preventDefault()});location.assign('javascript:throw new TypeError("actual-JSURL-error")')`);await turn(page);
++ assert.deepEqual(value(page,'actualErrors'),[{message:'TypeError: actual-JSURL-error',name:'TypeError',realm:true,trusted:true}]);assert.equal(errors.length,0);checkIdentity();
++});
++
++let originA,originB,servers,wire=[];
++before(async()=>{
++ servers=['A','B'].map(label=>http.createServer((request,response)=>{
++  wire.push({label,url:request.url,method:request.method});response.writeHead(200,{'content-type':'text/html'});
++  response.end('<!doctype html><html><head><script>globalThis.actualMarker='+JSON.stringify(label)+';globalThis.actualRuns=[];globalThis.actualParent=parent;</script></head><body>'+(request.url==='/root'?'<iframe name=same src="'+originA+'/child"></iframe><iframe name=foreign src="'+originB+'/child"></iframe>':'Actual '+label)+'</body></html>');
++ }));
++ for(let i=0;i<servers.length;i++)servers[i].listen(0,i?'127.0.0.2':'127.0.0.1');await Promise.all(servers.map(server=>once(server,'listening')));originA='http://127.0.0.1:'+servers[0].address().port;originB='http://127.0.0.2:'+servers[1].address().port;
++});
++after(async()=>{for(const server of servers){server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}});
++async function frameFixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate(originA+'/root');return page;}
++
++test('JavaScript form targets use actual original document identity across URL-only History changes',async t=>{
++ const page=await frameFixture(t),requests=wire.length;const rows=page.frames.executionPages(),same=rows.find(row=>row.url===originA+'/child'),foreign=rows.find(row=>row.url===originB+'/child');assert.ok(same);assert.ok(foreign);
++ const submit=(target,code)=>page.evaluate(`(()=>{const form=document.createElement('form');form.target=${JSON.stringify(target)};form.action='javascript:'+${JSON.stringify(code)};document.body.appendChild(form);form.requestSubmit()})()`);
++ submit('same','void actualRuns.push("original-A")');submit('foreign','void actualRuns.push("unwanted-B")');await turn(page);assert.deepEqual(value(same,'actualRuns'),['original-A']);assert.deepEqual(value(foreign,'actualRuns'),[]);
++ page.evaluate('history.pushState(null,"",'+JSON.stringify(originB+'/displayed-only')+')');submit('same','void actualRuns.push("still-principal-A")');submit('foreign','void actualRuns.push("unwanted-new-display-origin")');await turn(page);
++ assert.equal(page.securityOrigin,originA);assert.equal(page.url,originB+'/displayed-only');assert.deepEqual(value(same,'actualRuns'),['original-A','still-principal-A']);assert.deepEqual(value(foreign,'actualRuns'),[]);assert.equal(wire.length,requests);
++});
++
++test('frame removal cancels only existing JavaScript navigation tasks; a fresh retained-window assignment still executes',async t=>{
++ const page=await frameFixture(t),requests=wire.length;page.evaluate(`globalThis.actualChild=frames[0];actualChild.location.assign('javascript:void actualParent.actualRuns.push("unwanted-queued")');document.querySelector('iframe[name=same]').remove()`);await turn(page);assert.deepEqual(value(page,'actualRuns'),[]);
++ page.evaluate(`actualChild.location.assign('javascript:void actualParent.actualRuns.push("fresh-retained")')`);await turn(page);assert.deepEqual(value(page,'actualRuns'),['fresh-retained']);assert.equal(wire.length,requests);
++});
++
++test('JavaScript form navigation permits its own opaque document and denies every different opaque document, including inherited srcdoc',async t=>{
++ const{page,requests}=await fixture(t);const data='data:text/html,'+encodeURIComponent('<!doctype html><html><head><script>globalThis.actualRuns=[];globalThis.actualMarker="D";</script></head><body>D</body></html>');
++ await page.evaluate(`(async()=>{for(const kind of['inherited','independent']){const frame=document.createElement('iframe');frame.name=kind;if(kind==='inherited')frame.srcdoc='<script>globalThis.actualRuns=[];globalThis.actualMarker="I";<\\/script>';else frame.src=${JSON.stringify(data)};const loaded=new Promise(resolve=>frame.onload=resolve);document.body.appendChild(frame);await loaded}})()`);
++ const rows=page.frames.executionPages(),inherited=rows.find(row=>row.url==='about:srcdoc'),independent=rows.find(row=>row.url===data);assert.ok(inherited);assert.ok(independent);assert.equal(inherited.securityOrigin,'null');assert.equal(independent.securityOrigin,'null');const count=requests.length;
++ page.evaluate(`(()=>{for(const target of['inherited','independent','_self']){const form=document.createElement('form');form.target=target;form.action='javascript:void actualRuns.push('+JSON.stringify(target)+')';document.body.appendChild(form);form.requestSubmit()}})()`);await turn(page);
++ assert.deepEqual(value(inherited,'actualRuns'),[]);assert.deepEqual(value(independent,'actualRuns'),[]);assert.deepEqual(value(page,'actualRuns'),['_self']);assert.equal(requests.length,count);
++});
++
++test('VM-control errors stay outside Web callbacks while genuine authored Error objects with the same code remain observable',async t=>{
++ const{page}=await fixture(t),diagnostics=[];page.on('pageError',error=>diagnostics.push(error));
++ page.evaluate(`globalThis.actualWebErrors=[];addEventListener('error',event=>{actualWebErrors.push({name:event.error?.name,code:event.error?.code,realm:event.error instanceof Error,same:event.error===globalThis.actualAuthoredError});event.preventDefault()})`);
++ const originalTimeout=page.timeout;page.timeout=20;
++ try{page.evaluate(`location.assign('javascript:while(true){}')`);await turn(page);}finally{page.timeout=originalTimeout}
++ assert.deepEqual(value(page,'actualWebErrors'),[]);assert.equal(diagnostics.length,1);assert.equal(diagnostics[0].code,'ERR_SCRIPT_EXECUTION_TIMEOUT');
++ page.evaluate(`location.assign('javascript:globalThis.actualAuthoredError=new Error("authored VM value");actualAuthoredError.code="ERR_SCRIPT_EXECUTION_TIMEOUT";throw actualAuthoredError')`);await turn(page);
++ assert.deepEqual(value(page,'actualWebErrors'),[{name:'Error',code:'ERR_SCRIPT_EXECUTION_TIMEOUT',realm:true,same:true}]);assert.equal(diagnostics.length,1);
++});

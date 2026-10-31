@@ -1,0 +1,17 @@
+# Location hash and opaque external URI boundaries
+
+Canonical artifacts are integration.patch and manifest.json. This separate follow-up depends on the frozen JavaScript URL patch d36e1e125928cf7e21aaab4fdea0353af27ceeea57c6a0bb223ad8889046a77d. It changes only navigation.js and adds five focused tests.
+
+The actual Location implementation hash setter now treats raw empty string and raw # as no-ops when the backing URL has no fragment. It preserves the real document URL, current history entry/state and event queues. Assigning a full href or using assign("#") still creates an empty fragment, pushes real history and emits transitions. Clearing an existing fragment retains the trailing #, and repeated empty/current hash assignments remain silent. The original generated Web IDL conversion and public descriptors stay authoritative.
+
+Location and self-hyperlink actions for opaque external URIs leave the actual document, VM, URL, history and queues intact, matching the headless Native observations. Classification uses the real parsed URL record's opaque path. The dedicated web schemes about/blob/data/javascript are excluded. Hierarchical/reserved paths keep existing handlers, and forms, Navigation API and generic navigation owners are unchanged. No fixture prefix, external-application success, synthetic network response or acknowledgement is invented.
+
+The unchanged pinned Native binary 9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f (source 948d773786380bae36f046639fc61e2ddddd212a) supplied 14 genuine fresh-document controls: eight hash/full-URL variants and six mailto/tel/sms/custom opaque URI actions. Actual before/immediate/after snapshots include seed state, entry length, document/VM identity, error events, navigation/currententrychange/hashchange/popstate queues, a genuine queued checkpoint and real owned HTTP request logs.
+
+All 14 final snapshots match Native after replacing only the owned ephemeral origin. Ten entire before/immediate/after traces match. Four positive fragment navigations retain a preexisting timing difference: Native popstate occurs synchronously, while the candidate queues it. The unchanged baseline has the same difference; final event sequence and state match. No immediate fields were dropped to claim parity.
+
+Focused tests passed 5/5 on Node 24.22.1, 24.19.0 and 26.13.0, and all 222 listed source/test/helper/complete-native/external-support inputs remained unchanged. The patch applies to the exact recorded base and reproduces both result hashes. The full matching native source/binaries/JSON manifests and actual Root diagnostic support bytes are included in the executed archive; no addon or dependency was built or changed. The original Native baseline and candidate failures, unchanged pinned fixtures and primary Source63 report rows/hashes are preserved.
+
+The canonical source fixtures passed Native under the original two-second load and assertion budgets. This child did not rerun canonical fixtures, broad/full suites, heaps or PureScript; Parent owns composed Source3 validation. Unsupported FTP/ws/file/custom-hierarchical behavior is explicitly preserved and is not claimed calibrated Native parity. Full CDP tree/stack metadata and the separate raw WindowProxy/global access-control foundation remain outside this patch.
+
+No Root production files were edited, no Git repository was initialized, and no canonical ports or external services were used.

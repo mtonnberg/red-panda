@@ -48,7 +48,7 @@ function patch(){
  if(patched)return;patched=true;
  const createElement=Element.createImpl;Element.createImpl=function(globalObject,args,privateData){
   const document=privateData?.ownerDocument,namespace=privateData?.namespace;
-  if(ownsNamespaceNode(document)&&(depth.get(document)?.count??0)>0&&namespace!==HTML_NS&&namespace!==SVG_NS)return UnknownElement.createImpl(globalObject,args,privateData);
+  if(ownsNamespaceNode(document)&&namespace!==HTML_NS&&namespace!==SVG_NS)return UnknownElement.createImpl(globalObject,args,privateData);
   return apply(createElement,this,arguments);
  };
  const createDocument=DOMParserImpl.prototype.createScriptingDisabledDocument;DOMParserImpl.prototype.createScriptingDisabledDocument=function(parsingMode,contentType,string){

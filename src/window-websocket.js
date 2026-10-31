@@ -1,17 +1,17 @@
+import {hasWebSocketImplementation} from './dom-websocket-state.js';
 import {createRequire} from 'node:module';
 import {browserWebSocketQuota,normalizeWebSocketURL,validWebSocketProtocols,socketHeaders,openWebSocketTransport} from './websocket-transports.js';
 import {captureDOMExceptionFactory} from './worker-dom-exception.js';
-import {onFrameRetirement} from './frame-activity.js';
+import {onFrameRetirement} from './frame-retirement-hooks.js';
 const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
 const generated=require('jsdom/lib/jsdom/living/generated/WebSocket.js'),module=require('jsdom/lib/jsdom/living/websockets/WebSocket-impl.js');
 const EventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js'),{setupForSimpleEventAccessors}=require('jsdom/lib/jsdom/living/helpers/create-event-accessor.js');
 const CloseEvent=require('jsdom/lib/jsdom/living/generated/CloseEvent.js'),MessageEvent=require('jsdom/lib/jsdom/living/generated/MessageEvent.js'),Blob=require('jsdom/lib/jsdom/living/generated/Blob.js');
-const OWNERS=new WeakMap(),STATES=new WeakMap(),ROOT_WORKER_OWNERS=new WeakMap();let patched=false;
+const OWNERS=new WeakMap(),STATES=new WeakMap();let patched=false;
 const record=value=>Object.assign(Object.create(null),value);
-const rootFor=page=>{const seen=new Set();while(page.registry?.page&&page.registry.page!==page&&!seen.has(page)){seen.add(page);page=page.registry.page}return page};
 function kill(owner){for(const transport of [...owner.transports])transport.kill()}
-export function workerWebSocketOwner(page){const root=rootFor(page);let owner=ROOT_WORKER_OWNERS.get(root);if(!owner){owner=record({quota:browserWebSocketQuota(page.browser??root),transports:new Set()});ROOT_WORKER_OWNERS.set(root,owner);root.once('close',()=>kill(owner));if(!page.browser)root.documentAbort?.signal.addEventListener('abort',()=>kill(owner),{once:true})}return owner}
+export {workerWebSocketOwner} from './worker-websocket-owners.js';
 export function installWindowWebSocket(page,realm,{mainWindow=realm}={}){
  patch();if(OWNERS.has(realm))return OWNERS.get(realm);
  const document=utils.implForWrapper(mainWindow.document),exception=captureDOMExceptionFactory(realm),owner=record({page,realm,document,exception,ArrayType:realm.Uint8Array,arraySet:realm.Uint8Array.prototype.set,quota:browserWebSocketQuota(page.browser),transports:new Set(),disposed:false});
@@ -50,7 +50,8 @@ function patch(){
  module.implementation=WebSocketImpl;
  // Keep genuine unowned jsdom instances compatible with the pinned factory;
  // owned sockets use the successful private backend record, never a tag.
- generated.isImpl=value=>STATES.has(value)||value instanceof Original;
- generated.is=value=>utils.isObject(value)&&utils.hasOwn(value,utils.implSymbol)&&generated.isImpl(utils.implForWrapper(value));
+ const ordinaryHasInstance=Function.prototype[Symbol.hasInstance];
+ generated.isImpl=value=>STATES.has(value)||Reflect.apply(ordinaryHasInstance,Original,[value]);
+ generated.is=hasWebSocketImplementation;
  const cleanup=Original.cleanUpWindow;Original.cleanUpWindow=window=>{const owner=OWNERS.get(window._globalProxy??window);if(owner)kill(owner);return cleanup.call(Original,window)};
 }

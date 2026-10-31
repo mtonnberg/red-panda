@@ -1,3 +1,9 @@
+import {withLocationFactory} from './location-factory.js';
+import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+import {documentNavigation} from './navigation-lifecycle.js';
+import {installNavigationAPI} from './navigation-api.js';
+import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
 import {installHTMLElementState} from './html-element-state.js';
 import{readStylesheetResource}from'./stylesheet-decoder.js';
 import {installHTMLReflections} from './html-reflections.js';
@@ -98,6 +104,7 @@ installVMContextNames();
 installHeapFactories();
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const PRINCIPAL_DOCUMENTS=new WeakMap();
 let defaultCollectionsBinding;
 
 export const VERSION = '0.1.0';
@@ -239,19 +246,22 @@ export class Page extends EventEmitter {
     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
       virtualConsole.on(type, (...args) => this.emit('console', { type, args }));
     }
-    return new JSDOM(html, {
+    return withLocationFactory(()=>new JSDOM(html, {
       url: this.url,
+      referrer: this.referrerFor(this.url,this.documentReferrer??'') || undefined,
       cookieJar: this.context.cookies,
       runScripts: this.javascript ? 'dangerously' : 'outside-only',
       resources: this.javascript ? new PageResources(this) : undefined,
       virtualConsole,
       pretendToBeVisual: true,
       beforeParse: window => this.prepareWindow(window, historyState),
-    });
+    }));
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
     preparePopupDocument(this,window);
+    captureCookieDocument(this,implForWrapper(window.document));
+    if(main)PRINCIPAL_DOCUMENTS.set(this,implForWrapper(window.document));
     captureProtocolRealm(window);
     installWindowWebSocket(this,window);
     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
@@ -295,7 +305,8 @@ export class Page extends EventEmitter {
       installCache(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,baseURL:()=>creatorSnapshot().baseURL});
 
       installBeacon(this, window, { enabled: this.browser.options.loadResources?.includes('beacon') ?? false });
-      if (main) this.installHistory(window, historyState);
+      installJointHistory(this,window,historyState);
+      installNavigationAPI(this,window);
       installNavigation(this, window);
       installDialogs(this, window);
       installForms(this, window);
@@ -343,6 +354,7 @@ export class Page extends EventEmitter {
     });
     prepareUtilityPlatform(window);
     installFrameActivity(this,window);
+    installWindowLifecycleTimers(this,window);
     installScheduler(this,window);
     installWindowOpen(this,window);
     prepareHeapRealm(this,window);
@@ -397,53 +409,13 @@ export class Page extends EventEmitter {
     return id;
   }
 
-  installHistory(window, state) {
-    const nativePush = window.history.pushState.bind(window.history);
-    const nativeReplace = window.history.replaceState.bind(window.history);
-    const nativeState = Object.getOwnPropertyDescriptor(window.History.prototype, 'state').get.bind(window.history);
-    if (state !== null) nativeReplace(structuredClone(state), '', window.location.href);
-    this.nativeHistoryReplace = nativeReplace;
-    Object.defineProperty(window.history, 'length', { get: () => Math.max(1, this.history.length) });
-    Object.defineProperty(window.history, 'state', { get: () => nativeState() ?? null });
-    for (const [name, native] of [['pushState', nativePush], ['replaceState', nativeReplace]]) {
-      window.history[name] = (...args) => {
-        const input = [...args];
-        if (input.length) input[0] = structuredClone(input[0]);
-        const result = native(...input);
-        this.commitHistory(window.location.href, window.history.state, name === 'pushState' ? 'push' : 'replace');
-        this.url = window.location.href;
-        this.emit('withinDocument', { url: this.url, navigationType: 'historyApi' });
-        return result;
-      };
-    }
-    window.addEventListener('hashchange', () => this.reconcileURL(window));
-    for (const [name, fixedDelta] of [['back', -1], ['forward', 1], ['go', undefined]]) {
-      window.history[name] = (delta = 0) => {
-        const distance = fixedDelta ?? Math.trunc(Number(delta) || 0);
-        if (!Number.isFinite(distance)) return;
-        window.setTimeout(() => {
-          if (this.closed || this.dom.window !== window) return;
-          const action = distance === 0 ? this.navigate(this.url, { historyMode: 'reload' }) : this.traverseHistory(this.historyIndex + distance);
-          action.catch(error => this.emit('pageError', error));
-        }, 0);
-      };
-    }
-  }
+  installHistory(window,state){return installJointHistory(this,window,state);}
+  commitHistory(url,state=null,mode='push',operation){return commitJointHistory(this,url,state,mode,undefined,operation);}
 
-  commitHistory(url, state = null, mode = 'push') {
-    const entry = { id: this.nextHistoryId++, url, state: structuredClone(state), documentId: this.documentId };
-    if (mode === 'replace' && this.historyIndex >= 0) this.history[this.historyIndex] = entry;
-    else {
-      this.history.splice(this.historyIndex + 1);
-      this.history.push(entry);
-      this.historyIndex = this.history.length - 1;
-    }
-  }
-
-  reconcileURL(window = this.dom.window, { historyMode = 'push' } = {}) {
+  reconcileURL(window = this.dom.window, { historyMode = 'push',navigationOperation } = {}) {
     if (this.closed || window !== this.dom.window || window.location.href === this.url) return;
     this.url = window.location.href;
-    this.commitHistory(this.url, window.history.state, historyMode);
+    this.commitHistory(this.url, null, historyMode,navigationOperation);
     this.emit('withinDocument', { url: this.url, navigationType: 'fragment' });
   }
 
@@ -451,24 +423,7 @@ export class Page extends EventEmitter {
     return { currentIndex: this.historyIndex, entries: this.history.map(({ id, url }) => ({ id, url, userTypedURL: url, title: '', transitionType: 'other' })) };
   }
 
-  async traverseHistory(index, { forceReload = false } = {}) {
-    if (!Number.isInteger(index) || index < 0 || index >= this.history.length) return false;
-    const entry = this.history[index];
-    if (!forceReload && entry.documentId === this.documentId) {
-      const previousURL = this.url;
-      this.nativeHistoryReplace(structuredClone(entry.state), '', entry.url);
-      this.historyIndex = index;
-      this.url = entry.url;
-      const hashChanged = new URL(previousURL).hash !== new URL(this.url).hash;
-      this.emit('withinDocument', { url: this.url, navigationType: hashChanged ? 'fragment' : 'historyApi' });
-      const window = this.dom.window;
-      window.dispatchEvent(new window.PopStateEvent('popstate', { state: structuredClone(entry.state) }));
-      if (hashChanged) {
-        window.dispatchEvent(new window.HashChangeEvent('hashchange', { oldURL: previousURL, newURL: this.url }));
-      }
-    } else await this.navigate(entry.url, { historyMode: 'traverse', historyIndex: index });
-    return true;
-  }
+  async traverseHistory(index,options={}){return traverseJointHistory(this,index,options);}
   requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId) {
     this.activeRequests.delete(id);
     this.lastActivity = Date.now();
@@ -508,6 +463,8 @@ export class Page extends EventEmitter {
     if (platform !== undefined) this.platform = platform;
     if (metadata !== undefined) this.userAgentMetadata = metadata;
   }
+
+  get securityOrigin(){return PRINCIPAL_DOCUMENTS.get(this)?._origin??'null'}
 
   referrerFor(target, source = this.url) {
     let origin, destination;
@@ -560,14 +517,14 @@ export class Page extends EventEmitter {
     let method = init.method ?? (input instanceof Request ? input.method : 'GET');
     let body = init.body ?? (input instanceof Request && !['GET', 'HEAD'].includes(method) ? await input.arrayBuffer() : undefined);
     const credentials = init.credentials ?? (input instanceof Request ? input.credentials : 'include');
-    const credentialsOrigin = init.credentialsOrigin ?? new URL(this.url).origin;
+    const credentialsOrigin = init.credentialsOrigin ?? this.securityOrigin;
     const deadline = AbortSignal.timeout(this.timeout);
     const signal = init.signal ? AbortSignal.any([deadline, init.signal]) : deadline;
     let redirectResponse;
     for (let redirects = 0; redirects <= 20; redirects++) {
       const useCookies = credentials !== 'omit' && (credentials !== 'same-origin' || new URL(url).origin === credentialsOrigin);
       if (useCookies) {
-        const cookies = await this.context.cookies.getCookieString(url);
+        const cookies = type==='Document'?await this.context.cookies.getCookieString(url):await cookieHeaderFor(this.context.cookies,this,url,init.frameId);
         if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
       } else headers.delete('cookie');
       // Privileged CDP headers override request/default/jar values, including
@@ -642,7 +599,7 @@ export class Page extends EventEmitter {
   }
 
   async navigate(url, { waitUntil = 'load', waitMs = 0, selector, script, historyMode = 'push', historyIndex, onCommit, referrer,
-    method, body, headers } = {}) {
+    method, body, headers,navigationOperation } = {}) {
     if (this.closed) throw new Error('Page is closed');
     const generation = ++this.navigationGeneration;
     const deadline = Date.now() + this.timeout;
@@ -652,8 +609,8 @@ export class Page extends EventEmitter {
     const target = new URL(url, this.url).href;
     const rememberedRequest = (historyMode === 'reload' ? this.history[this.historyIndex] : historyMode === 'traverse' ? this.history[historyIndex] : null)?.request;
     const requestMethod = method ?? rememberedRequest?.method ?? 'GET';
-    const requestBody = body ?? rememberedRequest?.body;
-    const requestHeaders = new Headers(headers ?? rememberedRequest?.headers);
+    const requestBody = body ?? (method===undefined?rememberedRequest?.body:undefined);
+    const requestHeaders = new Headers(headers ?? (method===undefined?rememberedRequest?.headers:undefined));
     let navigationWindow, redirect, captureRedirect;
     this.performanceNavigationType = historyMode === 'reload' ? 'reload' : historyMode === 'traverse' ? 'back_forward' : 'navigate';
     this.loaderId = randomUUID();
@@ -696,28 +653,33 @@ export class Page extends EventEmitter {
       disposeBrowsingWindow(this.dom.window,{retain:isPopupPage(this)});
       this.responseHeaders = response ? [...response.headers].map(([name, value]) => ({ name, value })) : [];
       this.url = response?.finalUrl ?? target;
+      this.documentReferrer = response?.requestHeaders?.referer ?? '';
       this.mimeType = mimeType;
       this.status = response?.status ?? 200;
       this.executionContextId = this.browser.nextExecutionContext++;
       this.emit('contextsCleared');
       this.documentId = randomUUID();
       let state = null;
+      const previousHistoryEntry=this.history[this.historyIndex],initial=initialHistoryNavigation(this);
+      historyMode=normalizeHistoryNavigation(this,historyMode);
       if (historyMode === 'traverse' || (historyMode === 'reload' && this.historyIndex >= 0)) {
         const index = historyMode === 'reload' ? this.historyIndex : historyIndex;
         const entry = this.history[index];
         if (!entry) throw new Error('History entry no longer exists');
         const oldDocumentId = entry.documentId;
-        for (const candidate of this.history) if (candidate.documentId === oldDocumentId) candidate.documentId = this.documentId;
+        for (const candidate of this.history) if (candidate.documentId === oldDocumentId) {candidate.documentId = this.documentId;candidate.frameId=this.frameId;}
         this.historyIndex = index;
-        entry.url = this.url;
+        if(historyMode!=='reload')entry.url = this.url;
         state = structuredClone(entry.state);
-      } else this.commitHistory(this.url, null, historyMode === 'replace' ? 'replace' : 'push');
+      } else this.commitHistory(this.url, null, historyMode === 'replace' ? 'replace' : 'push',navigationOperation);
+      if(navigationOperation?.source==='navigation')state=structuredClone(this.history[this.historyIndex].state);
       if (this.history[this.historyIndex]) this.history[this.historyIndex].request = {
         method: response?.requestMethod ?? requestMethod,
         body: structuredClone(response ? response.requestBody : requestBody),
         // Credentials/defaults are recomputed by the transport for each request.
         headers: Object.fromEntries([...new Headers(response?.requestHeaders ?? requestHeaders)].filter(([name]) => !['cookie', 'authorization', 'user-agent', 'accept-language'].includes(name))),
       };
+      documentNavigation(this,{previous:previousHistoryEntry,entry:this.history[this.historyIndex],kind:historyMode,operation:navigationOperation,initial});
       let resolveRedirect;
       const requested = new Promise(resolve => { resolveRedirect = resolve; });
       captureRedirect = pending => {
@@ -738,7 +700,6 @@ export class Page extends EventEmitter {
         finally { this.creatingDOM = false; }
       }));
       navigationWindow = this.dom.window;
-      const moduleReady = this.moduleReady;
       this.flushFrameEvents();
       onCommit?.();
       const documentReady = new Promise(resolve => {
@@ -749,11 +710,21 @@ export class Page extends EventEmitter {
         if (this.dom.window.document.readyState === 'complete') resolve();
         else installListenerOwnership(this.dom.window).add(this.dom.window, 'load', resolve, { once: true });
       });
-      documentReady.then(() => { if (generation === this.navigationGeneration && !redirect) this.emit('domContentLoaded'); });
-      loaded.then(async () => { await moduleReady; if (generation === this.navigationGeneration && !redirect) this.emit('load'); });
-      const ready = waitUntil === 'none' ? Promise.resolve() : waitUntil === 'domcontentloaded' ? documentReady : Promise.all([loaded, moduleReady]);
+      const canceledRedirect=()=>redirect?.settled&&!redirect.started&&redirect.error?.name==='AbortError'&&this.dom.window===navigationWindow;
+      documentReady.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('domContentLoaded'); });
+      // Module evaluation can await load or continue application work after it.
+      // Keep moduleReady as the explicit evaluation drain, not a load barrier.
+      loaded.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('load'); });
+      const ready = waitUntil === 'none' ? Promise.resolve() : waitUntil === 'domcontentloaded' ? documentReady : loaded;
       await withTimeout(Promise.race([ready, requested]), remaining(), 'Page load timed out');
-      if (redirect) await withTimeout(redirect.promise, remaining(), 'Page navigation chain timed out');
+      if (redirect) {
+        try { await withTimeout(redirect.promise, remaining(), 'Page navigation chain timed out'); }
+        catch(error) {
+          if(!canceledRedirect()||error!==redirect.error)throw error;
+          redirect=undefined;
+          await withTimeout(ready,remaining(),'Page load timed out');
+        }
+      }
       if (waitUntil === 'networkidle0' || waitUntil === 'networkidle2') {
         const allowed = waitUntil === 'networkidle2' ? 2 : 0;
         await until(() => this.activeRequests.size <= allowed && Date.now() - this.lastActivity >= 500, { timeout: remaining() });

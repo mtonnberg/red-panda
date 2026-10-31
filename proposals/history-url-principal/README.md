@@ -1,0 +1,33 @@
+# URL-only History and principal follow-up
+
+Canonical review artifacts are `integration.patch` and `manifest.json`. This is a separate follow-up to the frozen form-routing, joint-history, Navigation API/load-cancellation and reload chain. The older packets remain unchanged. `evidence/integration-draft.patch` and earlier status files describe preparatory epochs only.
+
+The pinned Native engine accepts valid cross-origin and cross-scheme History URL records while retaining the actual Document, VM, original principal and storage. Red Panda previously rejected these writes. The patch updates the actual document URL, actual jsdom session-history slots and existing shared journal. It retains private `Document._origin`, Window origin, script context and document identities. Malformed URLs still fail without a History mutation. A History URL change does not fetch or execute the displayed URL.
+
+Real request policy has distinct inputs. Fetch Origin/CORS and same-origin credentials use the original principal. The default referrer uses the displayed URL, with ordinary credential stripping, policy and downgrade rules. Native's measured network cookie site follows the live document URL and compares the host/site across HTTP and HTTPS. An existing dedicated worker follows its live creator's cookie site while retaining its worker-script location/referrer and original Origin. Actual blank/srcdoc child contexts, including an HTTP child rewritten to `about:blank`, resolve the parent Document URL for network site and default Window Fetch referrer. Main-window hostless History URLs have no cookie site.
+
+The new site module retains only Host WeakMaps and uses genuine document implementations and the owned frame registry. Jar reads, cookie strings and writes remain actual CookieJar operations. Unspecified HTTP Set-Cookie SameSite is treated as Lax for cross-site subresource delivery. The Document request path keeps its existing navigation policy. CookieStore default reads follow the live URL; explicit URL options retain Native's separate original-principal and exact-current-URL checks. HttpOnly, path/domain, expiry and Secure storage remain owned by the real jar. Existing synchronous HTTP cancellation/operation ownership stays intact.
+
+The Page/CDP/BiDi security origin and resource-timing authority now read the actual document principal. Blob, Web Storage, IndexedDB, worker creation and default-denied device permissions already used appropriate private identity and were audited without changes. Native `MessageEvent.origin` intentionally follows the displayed URL and is preserved.
+
+## Evidence and validation
+
+The unchanged pinned Native binary is SHA256 `9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f`, from source `948d773786380bae36f046639fc61e2ddddd212a`. It was used only as an oracle. The packet preserves 25 genuine causal cases: ten URL/principal/scheme/opaque cases, two CookieStore/worker-authority cases, one retained-worker cookie-lifetime case, six cookie-site scheme cases, one real cookie-write case, one timing-authority case and four actual child-context cases. All requests used owned ephemeral loopback servers and actual HTTP headers/bodies, with no external services or engine imports.
+
+The old restricted candidate baseline, failed first wire stage, failed inherited-frame stage and all Native rows are retained. `observed-paired-summary.json` records exact normalized HTTP and real-cookie-write results. Timing matches every observed field except the existing unavailable transport-overhead `transferSize` (Native 445, candidate 0). `inherited-paired-summary.json` records four exact matches after replacing only ephemeral owned origins.
+
+Final serial scoped runs passed **16/16 on Node 24.22.1, 24.19.0 and 26.13.0**: eight new scoped tests plus eight existing History regressions. These include real URL/state/VM/storage identity, no-request History writes, malformed input, actual Origin/Referer/cookie delivery, CookieStore writes/events/jar storage, Blob bytes, messaging metadata, timing, traversal, and four child loads/fetches/removals. The 378 listed local JS/helper/addon/lock inputs stayed unchanged across the final paired replay and all three SDK runs. External Root CDP-client/reference-runner support files were not part of that before/after inventory. Matching prebuilt native addons are included in the executed graph; no addon was compiled.
+
+**The full retained-worker Origin/referrer assertion remains verbatim in the delivered test.** An earlier full eight-test run passed seven and failed this assertion: existing Worker Fetch sent no POST Origin, while Native sent original A. Its four before/after real-cookie assertions passed before that failure; later referrer assertions were not reached. The final scoped runs explicitly excluded this test using `--test-skip-pattern='existing dedicated worker'`. The separately owned Worker Fetch follow-up must be composed before the complete test is accepted. No standalone full-suite green result is claimed. The original failed log, the mistakenly inclusive negative-name-filter run and the externally stopped third-SDK epoch are retained; later Node 26 focused runs completed successfully.
+
+The patch applies to the exact recorded base and reproduces all ten result-file hashes in a plain temporary verification directory without initializing another Git repository. The malformed-input regression changes the previously contradicted cross-origin rejection assertion only after preserving the old baseline and actual Native controls.
+
+## Remaining bounds
+
+- The reusable raw WindowProxy and V8 security-token foundation is separate. Existing direct foreign-global access differences remain; this patch preserves the actual principal and does not implement that missing access-control foundation.
+- Opaque CDP origin serialization remains Native `://` versus candidate `null`.
+- SharedWorker HTTP, EventSource and WebSocket use separate transport owners; their cookie-site lifetimes were not generalized from dedicated-worker observations.
+- Inherited child referrer controls cover Window Fetch. XHR and other resource referrer paths were not calibrated here.
+- No quiet two-second canonical source-fixture replay, broad/full suite, heap suite, native build, PureScript suite, dependency change or canonical-port use was performed for this follow-up. Parent will compose proposals and own those checks.
+
+`executed-graph.tar.gz` contains the listed executed local graph and matching addons. Dependencies remain the existing pinned install. The patch has eight production leaves and two test leaves; no Root production files were edited.

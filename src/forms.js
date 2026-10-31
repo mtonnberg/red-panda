@@ -3,7 +3,8 @@ import {appendFormAssociatedValue} from './element-internals.js';
 import { submitDialogForm } from './dialogs.js';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
-import { installNavigation, requestNavigation } from './navigation.js';
+import { installNavigation, requestTargetNavigation } from './navigation.js';
+import {resolveFormTarget,createFormPopup} from './popup-pages.js';
 import { installFormControls } from './form-controls.js';
 
 const require = createRequire(import.meta.url);
@@ -38,18 +39,6 @@ function documentRecord(document) {
 function setting(form, submitter, name) {
   const override = submitter?.getAttribute(`form${name}`);
   return override === null || override === undefined ? form.getAttribute(name) : override;
-}
-
-function ownTarget(record, target) {
-  const normalized = target.toLowerCase();
-  if (!normalized || normalized === '_self') return true;
-  if (normalized === '_parent' || normalized === '_top') {
-    try {
-      const candidate = normalized === '_parent' ? record.window.parent : record.window.top;
-      return candidate.document === record.document;
-    } catch { return false; }
-  }
-  return false;
 }
 
 function installSubmitterProperties(window) {
@@ -189,9 +178,11 @@ function encodeBody(data, encoding) {
 
 function submit(record, formImpl, submitterImpl, bypass) {
   const { window } = record;
-  if (!formImpl.isConnected || record.constructing.has(formImpl)) return;
+  if ((!bypass && !formImpl.isConnected) || record.constructing.has(formImpl)) return;
   const form = wrapperForImpl(formImpl);
   const submitter = submitterImpl ? wrapperForImpl(submitterImpl) : null;
+  const targetName = setting(form, submitter, 'target') ?? '';
+  let targetPage = resolveFormTarget(record.page, targetName);
   if (!bypass) {
     if (record.submitting.has(formImpl)) return;
     record.submitting.add(formImpl);
@@ -200,36 +191,39 @@ function submit(record, formImpl, submitterImpl, bypass) {
       if (!dispatchTrusted(form, new window.SubmitEvent('submit', { bubbles: true, cancelable: true, submitter }))) return;
     } finally { record.submitting.delete(formImpl); }
   }
-  if (!formImpl.isConnected || record.disposed || record.signal?.aborted) return;
+  if (record.disposed || record.signal?.aborted) return;
   record.constructing.add(formImpl);
   let data;
   try {
     data = entryList(record, formImpl, submitterImpl);
     dispatchTrusted(form, new window.FormDataEvent('formdata', { bubbles: true, formData: data }));
   } finally { record.constructing.delete(formImpl); }
-  if (!formImpl.isConnected || record.disposed || record.signal?.aborted) return;
+  if (record.disposed || record.signal?.aborted) return;
   const rawMethod = setting(form, submitter, 'method')?.toLowerCase();
   if (submitDialogForm(form, submitter)) return;
   const method = rawMethod === 'post' ? 'POST' : 'GET';
   const action = setting(form, submitter, 'action');
   const destination = new URL(action || window.location.href, record.document.baseURI);
-  if (!['http:', 'https:'].includes(destination.protocol)) {
+  const javascript=destination.protocol==='javascript:';
+  if (!javascript&&!['http:', 'https:'].includes(destination.protocol)) {
     throw new window.DOMException(`Form submission protocol ${destination.protocol} is not implemented`, 'NotSupportedError');
   }
-  const target = setting(form, submitter, 'target') ?? record.document.querySelector('base[target]')?.getAttribute('target') ?? '';
-  if (!ownTarget(record, target)) throw new window.DOMException(`Form target ${target} is not implemented`, 'NotSupportedError');
   const noReferrer = /(?:^|[\t\n\f\r ])noreferrer(?:$|[\t\n\f\r ])/i.test(form.getAttribute('rel') || '');
-  const options = { method, historyMode: 'push', referrer: noReferrer ? '' : window.location.href };
-  if (method === 'GET') {
+  const options = { method, historyMode: 'push',sourceElement:submitter??form,formData:method==='POST'?data:null, referrer: noReferrer ? '' : window.location.href };
+  if (method === 'GET'&&!javascript) {
     destination.search = `?${new URLSearchParams(serializedPairs(data))}`;
-  } else {
+  } else if(!javascript) {
     const requested = setting(form, submitter, 'enctype')?.toLowerCase();
     const encoding = encodings.has(requested) ? requested : 'application/x-www-form-urlencoded';
     const { body, contentType } = encodeBody(data, encoding);
     options.body = body;
-    options.headers = { 'content-type': contentType, origin: window.location.origin };
+    options.headers = { 'content-type': contentType, origin: formImpl._ownerDocument._origin ?? window.location.origin };
   }
-  requestNavigation(record.page, window, destination.href, options);
+  if (targetPage === null) {
+    targetPage = createFormPopup(record.page,window,{opener:/(?:^|[\t\n\f\r ])opener(?:$|[\t\n\f\r ])/i.test(form.getAttribute('rel') || '')});
+    if (!targetPage) throw new window.DOMException(`Form target ${targetName} is not implemented`, 'NotSupportedError');
+  }
+  requestTargetNavigation(record.page, window, targetPage, destination.href, options);
 }
 
 function patchHost() {

@@ -7,7 +7,7 @@ import {createRequire} from 'node:module';
 import {createInvocationTrampoline} from './invocation.js';
 import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
-import {onFrameRetirement} from './frame-activity.js';
+import {onFrameRetirement} from './frame-retirement-hooks.js';
 const require=createRequire(import.meta.url);
 const installed=new WeakMap(),controllers=new WeakMap(),signals=new WeakMap(),events=new WeakMap(),schedulers=new WeakMap();
 const apply=Reflect.apply,microtask=queueMicrotask;

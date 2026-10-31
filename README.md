@@ -276,26 +276,33 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 93 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 100 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 1,669 JavaScript tests, 93 PureScript Puppeteer
+The current checkpoint passes 1,854 JavaScript tests, 100 PureScript Puppeteer
 checks and 13 native differential groups, plus syntax and strict/pedantic
-PureScript checks. [Validation](docs/reference/phase21-integration/validation.json)
-records all 10,355 unchanged guarded inputs and the three earlier full-run
-failures. The corrected input, beacon and XHR checks also pass on all three
-prepared Node versions. An earlier isolated composition passes 48/48 paired
-native/candidate fixtures with the original load and assertion budgets; that
-report identifies its exact graph separately from the final corrections.
+PureScript checks. [Validation](docs/reference/phase22-integration/validation.json)
+records all 12,423 unchanged monitored inputs and retains the rejected runs.
+Focused viewport, retirement and task-order checks also pass on all three
+prepared Node versions.
 
-This checkpoint adds namespace/attribute and Event behavior, form state and
-reflections, original VM Input/ValidityState definitions, actual document editing,
-guarded inert focus/selection and real stylesheet source parsing. The separate
-full-fetch fixture still fails its literal client-hint branding check. Historical
-failures remain recorded, and full browser equivalence remains incomplete.
+It adds real viewport/scroll state, private EventTarget backing, Worker and
+utility Fetch/messaging, joint history and Navigation, form targets, cancellation,
+Location construction and navigation, genuine form interfaces and Option aliases.
+Document load completes independently of suspended module evaluation; PureScript
+waits explicitly for the module result. Internal scroll tasks share the cancellable
+Window timer checkpoint. Synchronous HTTP starts its transport on first use,
+and CLI activates VM modules before importing the browser graph.
+
+An earlier original 104-leaf composition passes 63/63 paired unchanged source
+fixtures with the original load/assertion budgets. That report remains separate
+from the final 112-leaf graph. The historical full candidate matrix, literal
+client-hint branding check, scheduling and realm boundaries, and broader browser
+coverage remain incomplete. Earlier intermittent audio and CLI failures remain
+recorded; this successful full run does not establish their exact causes.
 
 ## REA investigation and comparison
 

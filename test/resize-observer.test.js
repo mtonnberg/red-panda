@@ -11,10 +11,11 @@ async function until(check){const end=Date.now()+1500;while(!check()){if(Date.no
 function fixture(t,html='<div id="target" style="width:100px;height:60px"></div>'){
   const dom=new JSDOM(html,{runScripts:'outside-only',pretendToBeVisual:true});
   const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});
-  installStyles(page,dom.window);const layout=installLayout(page,dom.window);
-  const controller=installResizeObserver(page,dom.window,layout);
+  installStyles(page,dom.window);const styleAbort=new Set(getEventListeners(page.documentAbort.signal,'abort')),layout=installLayout(page,dom.window);
+  const layoutAbort=getEventListeners(page.documentAbort.signal,'abort').filter(listener=>!styleAbort.has(listener)),beforeResize=new Set(getEventListeners(page.documentAbort.signal,'abort'));
+  const controller=installResizeObserver(page,dom.window,layout),resizeAbort=getEventListeners(page.documentAbort.signal,'abort').filter(listener=>!beforeResize.has(listener));
   t.after(()=>{page.documentAbort.abort();dom.window.close();});
-  return{dom,page,window:dom.window,layout,controller,target:dom.window.document.getElementById('target')};
+  return{dom,page,window:dom.window,layout,controller,layoutAbort,resizeAbort,target:dom.window.document.getElementById('target')};
 }
 
 test('resize entries use actual layout, realm arrays/read-only interfaces and native content-box profile',async t=>{
@@ -89,21 +90,21 @@ test('abort cancels queued deliveries and methods/constructors enforce their rea
 });
 
 test('direct window.close stops pending resize callbacks and detaches before later Page teardown',async t=>{
- const{window:w,page,target,controller}=fixture(t),document=w.document;let callbacks=0;
+ const{window:w,page,target,controller,layoutAbort,resizeAbort}=fixture(t),document=w.document;let callbacks=0,unrelatedCalls=0;const unrelated=()=>unrelatedCalls++;page.documentAbort.signal.addEventListener('abort',unrelated,{once:true});
  const observer=new w.ResizeObserver(()=>callbacks++);observer.observe(target);
  assert.doesNotThrow(()=>w.close());assert.equal(w.document,undefined);
- assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.equal(page.listenerCount('close'),0);
+ assert.equal(resizeAbort.length,1);for(const listener of resizeAbort)assert.equal(getEventListeners(page.documentAbort.signal,'abort').includes(listener),false);assert.deepEqual(new Set(getEventListeners(page.documentAbort.signal,'abort')),new Set([...layoutAbort,unrelated]));assert.equal(page.listenerCount('close'),0);
  target.style.width='40px';assert.doesNotThrow(()=>document.dispatchEvent(new w.Event('load')));
- assert.doesNotThrow(()=>controller.dispose());assert.doesNotThrow(()=>page.documentAbort.abort());assert.doesNotThrow(()=>page.emit('close'));
+ assert.doesNotThrow(()=>controller.dispose());assert.doesNotThrow(()=>page.documentAbort.abort());assert.equal(unrelatedCalls,1);assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.doesNotThrow(()=>page.emit('close'));
  await sleep(30);assert.equal(callbacks,0);
 });
 
 test('raw window close before queued resize delivery avoids reading the deleted window document',async t=>{
  const dom=new JSDOM('<div style="width:100px;height:20px"></div>',{runScripts:'outside-only'}),w=dom.window,rawClose=w.close;
  const page=Object.assign(new EventEmitter(),{documentAbort:new AbortController()});
- const layout=installLayout(page,w),controller=installResizeObserver(page,w,layout);t.after(()=>{controller.dispose();dom.window.close();});
+ const layout=installLayout(page,w),baseline=getEventListeners(page.documentAbort.signal,'abort'),beforeResize=new Set(baseline),controller=installResizeObserver(page,w,layout),resizeAbort=getEventListeners(page.documentAbort.signal,'abort').filter(listener=>!beforeResize.has(listener));t.after(()=>{controller.dispose();dom.window.close();});
  let callbacks=0;const observer=new w.ResizeObserver(()=>callbacks++);observer.observe(w.document.querySelector('div'));
  rawClose.call(w);await Promise.resolve();
- assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.equal(page.listenerCount('close'),0);
- assert.doesNotThrow(()=>page.documentAbort.abort());assert.doesNotThrow(()=>page.emit('close'));await sleep(20);assert.equal(callbacks,0);
+ assert.equal(resizeAbort.length,1);for(const listener of resizeAbort)assert.equal(getEventListeners(page.documentAbort.signal,'abort').includes(listener),false);assert.deepEqual(new Set(getEventListeners(page.documentAbort.signal,'abort')),new Set(baseline));assert.equal(page.listenerCount('close'),0);
+ assert.doesNotThrow(()=>page.documentAbort.abort());assert.equal(getEventListeners(page.documentAbort.signal,'abort').length,0);assert.doesNotThrow(()=>page.emit('close'));await sleep(20);assert.equal(callbacks,0);
 });

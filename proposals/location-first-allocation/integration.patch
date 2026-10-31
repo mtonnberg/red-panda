@@ -1,0 +1,331 @@
+--- /dev/null
++++ b/src/location-factory.js
+@@ -0,0 +1,103 @@
++// Sole first-allocation Location fronts over the existing real backend. Private
++// brands/caches are Host-owned; no implementation or factory record enters a VM.
++import './dom-event-state.js';
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {createHash} from 'node:crypto';
++import {readFileSync} from 'node:fs';
++import {getRuntimeBinding} from './native-runtime.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const generated=require('jsdom/lib/jsdom/living/generated/Location.js'),LocationModule=require('jsdom/lib/jsdom/living/window/Location-impl.js'),LocationImpl=LocationModule.implementation;
++const conversions=require('webidl-conversions'),url=require('whatwg-url');
++const legacy=Object.assign(Object.create(null),generated),ownedGlobals=new WeakSet();let creationDepth=0;
++const fronts=new WeakMap(),canonical=new WeakMap(),backends=new WeakSet(),realms=new WeakMap(),contexts=new WeakMap(),documents=new WeakMap(),utilsInstalled=new WeakSet();
++const apply=Reflect.apply,define=Object.defineProperty,create=Object.create,prototypeOf=Object.getPrototypeOf;
++const nil=value=>Object.assign(create(null),value);
++let installed=false;
++export function withLocationFactory(callback){creationDepth++;try{return callback()}finally{creationDepth--;}}
++export function locationImplementation(value){return fronts.get(value)}
++export function canonicalLocation(value){return canonical.get(value)}
++export function installPrivateLocationUtils(target=utils){
++ if(utilsInstalled.has(target))return;utilsInstalled.add(target);const legacy=target.implForWrapper,legacyWrapper=target.wrapperForImpl;
++ target.implForWrapper=value=>{const owned=fronts.get(value);if(owned)return owned;const candidate=legacy(value);return backends.has(candidate)?null:candidate;};
++ target.tryImplForWrapper=value=>target.implForWrapper(value)??value;
++ target.wrapperForImpl=value=>canonical.get(value)??legacyWrapper(value);
++ target.tryWrapperForImpl=value=>target.wrapperForImpl(value)??value;
++}
++export function prepareLocationContext(globalObject,context,document){ownedGlobals.add(globalObject);contexts.set(globalObject,context);if(document){documents.set(globalObject,document);const state=realms.get(globalObject);if(state)state.document=document;}return globalObject;}
++function contextFor(globalObject){const found=contexts.get(globalObject)??(vm.isContext(globalObject)?globalObject:globalObject?._globalObject);return vm.isContext(found)?found:null;}
++function stateFor(globalObject){
++ let state=realms.get(globalObject);if(state)return state;
++ const context=contextFor(globalObject);
++ const ObjectConstructor=context?vm.runInContext('Object',context):globalObject.Object,TypeErrorConstructor=context?vm.runInContext('TypeError',context):globalObject.TypeError,StringConstructor=context?vm.runInContext('String',context):globalObject.String;
++ if(typeof ObjectConstructor!=='function'||typeof TypeErrorConstructor!=='function')throw new TypeError('An actual Location originating realm is required');
++ state=nil({global:globalObject,context,Object:ObjectConstructor,create:context?vm.runInContext('Object.create',context):globalObject.Object.create,TypeError:TypeErrorConstructor,aliases:new WeakMap(),document:documents.get(globalObject)??null,symbolDescription:context?vm.runInContext('Object.getOwnPropertyDescriptor(Symbol.prototype,"description").get',context):Object.getOwnPropertyDescriptor(globalObject.Symbol.prototype,'description').get,globals:nil({TypeError:TypeErrorConstructor,String:StringConstructor})});
++ realms.set(globalObject,state);if(context){realms.set(vm.runInContext('globalThis',context),state);realms.set(context,state);}
++ const Constructor=vm.compileFunction('return function Location(){throw new E("Illegal constructor")}', ['E'],context?{parsingContext:context}:{})(TypeErrorConstructor);
++ const prototype=Constructor.prototype;delete prototype.constructor;state.Constructor=Constructor;state.prototype=prototype;
++ const entry=(name,length,operation,key)=>{
++  const fn=getRuntimeBinding().createEntry((incumbent,receiver,args)=>{
++   const implementation=fronts.get(receiver);if(!implementation)throw new TypeErrorConstructor('Illegal invocation');
++   if(operation==='get')return implementation[key];
++   if(operation==='reload')return implementation.reload();
++   if(operation==='string')return implementation.href;
++   if(operation==='method'&&!args.length)throw new TypeErrorConstructor('invalid argument');
++   const value=args.length?args[0]:undefined;
++   const text=conversions.USVString(typeof value==='symbol'?apply(state.symbolDescription,value,[]):value,{globals:state.globals});
++   if(key==='href'||operation==='method'){
++    const source=realms.get(incumbent)?.document??state.document??implementation._relevantDocument;
++    const parsed=url.parseURL(text,{baseURL:source.baseURL()});if(!parsed)throw new TypeErrorConstructor('');
++    if(key==='href')return implementation._locationObjectSetterNavigate(parsed);
++    return implementation._locationObjectNavigate(parsed,{replacement:key==='replace'});
++   }
++   implementation[key]=text;return undefined;
++  },ObjectConstructor,name);
++  define(fn,'name',{value:name,configurable:true});define(fn,'length',{value:length,configurable:true});return fn;
++ };
++ define(prototype,'toString',{value:entry('toString',0,'string'),writable:true,enumerable:true,configurable:true});
++ for(const key of ['href','search','hash','pathname','hostname','host','port','origin','protocol']){
++  const descriptor={get:entry('get '+key,0,'get',key),enumerable:true,configurable:true};
++  if(['href','search','hash','pathname'].includes(key))descriptor.set=entry('set '+key,1,'set',key);
++  define(prototype,key,descriptor);
++ }
++ for(const key of ['assign','replace','reload'])define(prototype,key,{value:entry(key,key==='reload'?0:1,key==='reload'?'reload':'method',key),writable:true,enumerable:true,configurable:true});
++ define(prototype,'constructor',{value:Constructor,writable:true,configurable:true});
++ define(prototype,globalObject.Symbol.toStringTag,{value:'Location',configurable:true});
++ return state;
++}
++function allocate(globalObject){const state=stateFor(globalObject);return apply(state.create,state.Object,[state.prototype]);}
++function globalCanonical(implementation,front){canonical.set(implementation,front)}
++function bind(front,implementation,globalObject,{canonical=true}={}){
++ if(!(implementation instanceof LocationImpl))throw new TypeError('A real Location implementation is required');
++ fronts.set(front,implementation);backends.add(implementation);const state=stateFor(globalObject);state.aliases.set(implementation,front);state.document??=implementation._relevantDocument;
++ if(canonical){implementation[utils.wrapperSymbol]=front;globalCanonical(implementation,front);}return front;
++}
++export function createLocationAlias(globalObject,implementation){const state=stateFor(globalObject),previous=state.aliases.get(implementation);return previous??bind(allocate(globalObject),implementation,globalObject,{canonical:false});}
++export function installLocationFactory(){
++ if(installed)return;installed=true;
++ const filename=require.resolve('jsdom/lib/jsdom/living/generated/Location.js'),digest=createHash('sha256').update(readFileSync(filename)).digest('hex');
++ if(require('jsdom/package.json').version!=='26.1.0'||digest!=='80e42335f99dce6bcd1cefb4ad7180927960580aa12ab62184852a5c810e94f6')throw new Error('Pinned Location allocation source changed');
++ installPrivateLocationUtils();
++ generated.is=value=>{if(fronts.has(value))return true;if(!utils.isObject(value))return false;const descriptor=Object.getOwnPropertyDescriptor(value,utils.implSymbol);return !!descriptor&&'value'in descriptor&&!backends.has(descriptor.value)&&legacy.is(value);};
++ generated.isImpl=value=>value instanceof LocationImpl;
++ generated.convert=(globalObject,value,{context='The provided value'}={})=>{const implementation=fronts.get(value);if(implementation)return implementation;if(generated.is(value))return legacy.convert(globalObject,value,{context});throw new (stateFor(globalObject).TypeError)(context+" is not of type 'Location'.");};
++ generated._internalSetup=(wrapper,globalObject)=>{if(!ownedGlobals.has(globalObject))return legacy._internalSetup(wrapper,globalObject);};
++ generated.setup=(wrapper,globalObject,constructorArgs=[],privateData={})=>{if(!ownedGlobals.has(globalObject))return legacy.setup(wrapper,globalObject,constructorArgs,privateData);privateData.wrapper=wrapper;const implementation=new LocationImpl(globalObject,constructorArgs,privateData);bind(wrapper,implementation,globalObject);if(LocationModule.init)LocationModule.init(implementation);return wrapper;};
++ generated.create=(globalObject,constructorArgs,privateData)=>!ownedGlobals.has(globalObject)?legacy.create(globalObject,constructorArgs,privateData):generated.setup(allocate(globalObject),globalObject,constructorArgs,privateData);
++ generated.createImpl=(globalObject,constructorArgs,privateData)=>ownedGlobals.has(globalObject)?fronts.get(generated.create(globalObject,constructorArgs,privateData)):legacy.createImpl(globalObject,constructorArgs,privateData);
++ generated.new=(globalObject,newTarget)=>{if(!ownedGlobals.has(globalObject))return legacy.new(globalObject,newTarget);const wrapper=allocate(globalObject),implementation=create(LocationImpl.prototype);bind(wrapper,implementation,globalObject);if(LocationModule.init)LocationModule.init(implementation);return implementation;};
++ generated.install=(globalObject,globalNames)=>{if(!globalNames.includes('Window'))return;if(creationDepth>0)ownedGlobals.add(globalObject);if(!ownedGlobals.has(globalObject))return legacy.install(globalObject,globalNames);const state=stateFor(globalObject),registry=utils.initCtorRegistry(globalObject);registry.Location=state.Constructor;define(globalObject,'Location',{value:state.Constructor,writable:true,configurable:true});};
++}
++
++export function installLocationInterface(globalObject){generated.install(globalObject,['Window']);}
++export function transformUtilityLocationInterfaces(source){
++ if(createHash('sha256').update(source).digest('hex')!=='e3de115f04fc02a4c870a67bc7766247880fd56ab92013fab71bbcf80ea52765')throw new Error('Pinned utility interface source changed');
++ const line='  Location: require("./generated/Location"),';if(source.split(line).length!==2)throw new Error('Canonical Location interface entry changed');
++ return source.replace(line,'');
++}
++export function installLocationWindowAlias(globalObject,resolve){
++ const state=stateFor(globalObject),entry=(name,length,callback)=>{const fn=getRuntimeBinding().createEntry(callback,state.Object,name);define(fn,'name',{value:name,configurable:true});define(fn,'length',{value:length,configurable:true});return fn;};
++ const getter=entry('get location',0,()=>resolve());
++ const setter=entry('set location',1,(_incumbent,_receiver,args)=>{const front=resolve();front.href=args.length?args[0]:undefined;});
++ define(globalObject,'location',{get:getter,set:setter,enumerable:true,configurable:false});
++}
+--- a/src/platform-factory-hooks.js
++++ b/src/platform-factory-hooks.js
+@@ -1,3 +1,4 @@
++import {installLocationFactory} from './location-factory.js';
+ import {domWrapperGlobal} from './dom-factory-scope.js';
+ import {installDOMWrapperRealms} from './dom-wrapper-realms.js';
+ import 'jsdom';
+@@ -18,6 +19,7 @@
+ // Candidate classification never discovers brands from implementation symbols.
+ export function installPlatformFactoryHooks() {
+   if (installed) return;
++  installLocationFactory();
+   installDOMWrapperRealms();
+   installed = true;
+   const directory = path.dirname(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'));
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -10,7 +10,8 @@
+ const require = createRequire(import.meta.url);
+ const LocationImpl = require('jsdom/lib/jsdom/living/window/Location-impl.js').implementation;
+ const AnchorImpl = require('jsdom/lib/jsdom/living/nodes/HTMLAnchorElement-impl.js').implementation;
+-const { implForWrapper,wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const locationUtils = require('jsdom/lib/jsdom/living/generated/utils.js');
++const implForWrapper=value=>locationUtils.implForWrapper(value),wrapperForImpl=locationUtils.wrapperForImpl;
+ const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/living/window/Location-impl.js'));
+ const whatwgURL = jsdomRequire('whatwg-url');
+ const {percentDecodeString}=jsdomRequire('whatwg-url/lib/percent-encoding.js');
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,4 @@
++import {canonicalLocation,locationImplementation,installPrivateLocationUtils,prepareLocationContext,installLocationInterface,transformUtilityLocationInterfaces,createLocationAlias,installLocationWindowAlias} from './location-factory.js';
+ import {installPrivateEventUtils,transformPrivateEventSource,isPrivateEventKind,eventImplementation,bindEventImplementation} from './dom-event-state.js';
+ import {restoreWindowGlobalInheritance} from './window-global.js';
+ import {installConsole,consoleProtocolType} from './console.js';
+@@ -28,7 +29,7 @@
+  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
+  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+- const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
++ const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);installPrivateLocationUtils(localUtils);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
+  const metadata={context,global,mainWindow,signal,disposed:false};const pendingFactories=[];let factoryReady=false;
+  const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);registerPlatformFactory(wrapper,{kind:interfaceName,implementation:impl,globalObject:global});if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
+  const utilityPrototypes=new Map();
+@@ -38,12 +39,12 @@
+  const utilityApply=global.Reflect.apply;
+  const realmFunction=bridge=>vm.compileFunction('return function(...args){return apply(bridge,this,args)}',['bridge','apply'],{parsingContext:context})(bridge,utilityApply);
+  for(const[name,constructor]of Object.entries(mainWindow[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)mainPrototypes.set(constructor.prototype,name);
+- function interfaceFor(impl){const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(!canonical)throw new Error('DOM implementation has no canonical wrapper');let proto=Object.getPrototypeOf(canonical);for(let i=0;proto&&i<64;i++,proto=Object.getPrototypeOf(proto)){const name=mainPrototypes.get(proto)??utilityPrototypes.get(proto);if(name&&!name.startsWith('%'))return name;}throw new Error('No pinned IDL interface for implementation');}
++ function interfaceFor(impl){const canonical=canonicalLocation(impl)??own(impl,hostUtils.wrapperSymbol)?.value;if(!canonical)throw new Error('DOM implementation has no canonical wrapper');let proto=Object.getPrototypeOf(canonical);for(let i=0;proto&&i<64;i++,proto=Object.getPrototypeOf(proto)){const name=mainPrototypes.get(proto)??utilityPrototypes.get(proto);if(name&&!name.startsWith('%'))return name;}throw new Error('No pinned IDL interface for implementation');}
+  function wrapImpl(impl){
+   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
+   const cached=wrappers.get(impl);if(cached)return cached;
+-  const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
+-  const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
++  const canonical=canonicalLocation(impl)??own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
++  const name=interfaceFor(impl);if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+   if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+@@ -54,11 +55,12 @@
+   if(!objectLike(value))return value;if(value===mainWindow||value===mainWindow._globalProxy)return global;if(value===global||wrapperImpls.has(value))return value;const otherWindow=resolveWindow?.(value);if(otherWindow)return otherWindow;
+   const known=mainWrappers.get(value);if(known)return wrapImpl(known);
+   if(types.isProxy(value))return value;
++  const privateLocation=locationImplementation(value);if(privateLocation)return wrapImpl(privateLocation);if(canonicalLocation(value))return wrapImpl(value);
+   const privateEvent=eventImplementation(value);if(privateEvent)return wrapImpl(privateEvent);
+   const candidate=own(value,hostUtils.implSymbol)?.value;
+   if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
+   const canonical=own(value,hostUtils.wrapperSymbol)?.value;
+-  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical);if(event?event===value:own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
++  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical);if(event?event===value:locationImplementation(canonical)===value||own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
+   if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
+   return value;
+  }
+@@ -75,7 +77,7 @@
+  }
+  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
+   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
+-  let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
++  let source=readFileSync(filename,'utf8');if(filename===interfacesPath)source=transformUtilityLocationInterfaces(source);const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
+   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
+    // Measured native producer quirk: MO arguments are real main-world values,
+    // while the authored callback itself continues in its genuine utility realm.
+@@ -84,11 +86,13 @@
+   return module.exports;
+  }
+  Object.defineProperties(global,{window:{value:global,writable:false},self:{value:global,writable:false},top:{get:realmFunction(()=>resolveWindow?.(mainWindow.top)??global)},parent:{get:realmFunction(()=>resolveWindow?.(mainWindow.parent)??global)},closed:{get:realmFunction(()=>Boolean(isWindowClosed?.()??signal?.aborted))},frames:{value:global}});
++ prepareLocationContext(global,context,mainDocument);installLocationInterface(global);
+  load(interfacesPath).installInterfaces(global,['Window']);
+  for(const[name,constructor]of Object.entries(global[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)utilityPrototypes.set(constructor.prototype,name);
+  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
+  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
+  Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
++ installLocationWindowAlias(global,()=>wrapImpl(mainDocument._location));
+  const windowImpl=hostUtils.implForWrapper(mainWindow);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
+  global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);restoreWindowGlobalInheritance(global,context,originalGlobalPrototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
+  const add=global.EventTarget.prototype.addEventListener,remove=global.EventTarget.prototype.removeEventListener;
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {withLocationFactory} from './location-factory.js';
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
+ import {installNavigationAPI} from './navigation-api.js';
+@@ -233,7 +234,7 @@
+     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
+       virtualConsole.on(type, (...args) => this.emit('console', { type, args }));
+     }
+-    return new JSDOM(html, {
++    return withLocationFactory(()=>new JSDOM(html, {
+       url: this.url,
+       referrer: this.referrerFor(this.url,this.documentReferrer??'') || undefined,
+       cookieJar: this.context.cookies,
+@@ -242,7 +243,7 @@
+       virtualConsole,
+       pretendToBeVisual: true,
+       beforeParse: window => this.prepareWindow(window, historyState),
+-    });
++    }));
+   }
+ 
+   prepareWindow(window, historyState = null, { main = true } = {}) {
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -1,3 +1,4 @@
++import {withLocationFactory} from './location-factory.js';
+ import {commitFrameHistory} from './joint-history.js';
+ import {disposeBrowsingWindow} from './popup-pages.js';
+ import {retireFrameActivity} from './frame-activity.js';
+@@ -80,7 +81,7 @@
+     const operation = operations.at(-1);
+     if(operation?.navigationRequest)options={...options,referrer:operation.owner.registry.page.referrerFor(options.url,operation.navigationRequest.referrer??'')??''};
+     const window = operation && !operation.created && !operation.owner.registry.disposed
+-      ? createOwnedWindow(createWindow, options) : createWindow(options);
++      ? withLocationFactory(()=>createOwnedWindow(createWindow, options)) : createWindow(options);
+     if (!operation || operation.created || operation.owner.registry.disposed) return window;
+     operation.created = true; operation.restore();
+     operation.owner.registry.register(operation, window);
+--- /dev/null
++++ b/test/location-factory.test.js
+@@ -0,0 +1,85 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createRequire} from 'node:module';
++import {Browser} from '../src/browser.js';
++import {JSDOM} from 'jsdom';
++import {getHeapBinding} from '../src/native-heap.js';
++import {createIsolatedWorld} from '../src/isolated-world.js';
++import {serializeURL} from 'whatwg-url';
++import {createServer} from 'node:http';
++import {once} from 'node:events';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++function actualRealm(value,anchor){const previous=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);try{assert.equal(getHeapBinding().sameRealm(value,anchor),true)}finally{Object.setPrototypeOf(value,previous)}}
++async function fixture(t){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,'+encodeURIComponent('<!doctype html><html><head><script>globalThis.actualMarker="kept"</script></head><body>Actual Location front</body></html>'));return page;}
++test('the first actual Location front has native placement, selected VM functions and the same real backend identity',async t=>{
++ const page=await fixture(t),w=page.dom.window,front=w.location,implementation=utils.implForWrapper(front);
++ const anchor=page.evaluate('({actualRealmAnchor:true})');actualRealm(w.Location,anchor);actualRealm(w.Location.prototype,anchor);actualRealm(front,anchor);
++ assert.equal(front,w.document.location);assert.equal(Object.getPrototypeOf(front),w.Location.prototype);assert.deepEqual(Object.getOwnPropertyNames(front),[]);assert.deepEqual(Object.getOwnPropertySymbols(front),[]);
++ assert.equal(implementation,utils.implForWrapper(w.document)._location);assert.equal(utils.wrapperForImpl(implementation),front);
++ for(const key of ['href','search','hash','pathname','hostname','host','port','origin','protocol']){
++  const d=Object.getOwnPropertyDescriptor(w.Location.prototype,key);assert.equal(d.enumerable,true);assert.equal(d.configurable,true);assert.equal(Object.getPrototypeOf(d.get),w.Function.prototype);actualRealm(d.get,anchor);assert.equal(d.get.name,'get '+key);assert.equal(d.get.length,0);
++  if(['href','search','hash','pathname'].includes(key)){assert.equal(Object.getPrototypeOf(d.set),w.Function.prototype);actualRealm(d.set,anchor);assert.equal(d.set.name,'set '+key);assert.equal(d.set.length,1)}else assert.equal(d.set,undefined);
++  assert.equal(d.get.call(front),implementation[key]);
++ }
++ for(const key of ['assign','replace','reload','toString']){const d=Object.getOwnPropertyDescriptor(w.Location.prototype,key);assert.equal(d.writable,true);assert.equal(d.enumerable,true);assert.equal(d.configurable,true);assert.equal(Object.getPrototypeOf(d.value),w.Function.prototype);actualRealm(d.value,anchor);}
++ assert.equal(front.toString(),page.url);assert.throws(()=>new w.Location(),error=>Object.getPrototypeOf(error)===w.TypeError.prototype);
++});
++test('ordinary lookalikes and copied implementation symbols never gain Location authority',async t=>{
++ const page=await fixture(t),w=page.dom.window,front=w.location,implementation=utils.implForWrapper(front),fake=page.evaluate('({actualAuthored:true})'),get=Object.getOwnPropertyDescriptor(w.Location.prototype,'href').get;
++ let reads=0;Object.defineProperty(fake,utils.implSymbol,{get(){reads++;return implementation},configurable:true});assert.throws(()=>get.call(fake),error=>Object.getPrototypeOf(error)===w.TypeError.prototype&&error.message==='Illegal invocation');assert.equal(reads,0);assert.equal(fake.actualAuthored,true);
++ Object.defineProperty(fake,utils.implSymbol,{value:implementation,configurable:true});assert.equal(utils.implForWrapper(fake),null);assert.throws(()=>w.Location.prototype.assign.call(fake,'javascript:void 0'),error=>Object.getPrototypeOf(error)===w.TypeError.prototype);
++ const previous=implementation[utils.wrapperSymbol];implementation[utils.wrapperSymbol]=fake;try{assert.equal(utils.wrapperForImpl(implementation),front);assert.equal(w.document.location,front);assert.equal(w.location,front)}finally{implementation[utils.wrapperSymbol]=previous}
++});
++test('readonly prototype URL components preserve actual state and do not create own shadows through assignment',async t=>{
++ const page=await fixture(t),w=page.dom.window,url=page.url;
++ for(const key of ['protocol','host','hostname','port','origin']){assert.equal(Reflect.set(w.location,key,'actual-unwanted-value'),false);assert.equal(Object.hasOwn(w.location,key),false);assert.equal(page.url,url);}
++ assert.equal(w.document.URL,url);assert.equal(page.evaluate('actualMarker'),'kept');
++});
++test('utility Location aliases have genuine utility VM definitions over the same backend while the main canonical front stays stable',async t=>{
++ const page=await fixture(t),w=page.dom.window,main=w.location,implementation=utils.implForWrapper(main),world=createIsolatedWorld(w,{name:'actual-location-utility'});t.after(()=>world.dispose());
++ const anchor=world.evaluate('({actualUtilityAnchor:true})'),alias=world.global.location;actualRealm(world.global.Location,anchor);actualRealm(world.global.Location.prototype,anchor);actualRealm(alias,anchor);assert.notEqual(alias,main);assert.equal(alias,world.global.document.location);assert.equal(alias,world.global.location);assert.equal(utils.implForWrapper(alias),implementation);assert.equal(utils.wrapperForImpl(implementation),main);assert.equal(w.location,main);
++ assert.equal(Object.getPrototypeOf(alias),world.global.Location.prototype);assert.deepEqual(Object.getOwnPropertyNames(alias),[]);assert.deepEqual(Object.getOwnPropertySymbols(alias),[]);
++ const utility=Object.getOwnPropertyDescriptor(world.global.Location.prototype,'href');assert.equal(Object.getPrototypeOf(utility.get),world.global.Function.prototype);actualRealm(utility.get,anchor);actualRealm(utility.set,anchor);actualRealm(world.global.Location.prototype.assign,anchor);assert.equal(utility.get.call(main),page.url);assert.equal(Object.getOwnPropertyDescriptor(w.Location.prototype,'href').get.call(alias),page.url);
++ assert.throws(()=>utility.get.call({}),error=>Object.getPrototypeOf(error)===world.global.TypeError.prototype&&error.message==='Illegal invocation');
++});
++
++test('unowned jsdom embedders retain their genuine original Location factory and identity',()=>{
++ for(const runScripts of [undefined,'outside-only']){
++  const dom=new JSDOM('<!doctype html>',{url:'https://unowned.example/',...(runScripts?{runScripts}:{})});
++  try{assert.equal(Object.hasOwn(dom.window.location,'href'),true);assert.equal(Object.getOwnPropertyDescriptor(dom.window.location,'href').configurable,false);assert.equal(dom.window.location,dom.window.document.location);assert.equal(utils.wrapperForImpl(utils.implForWrapper(dom.window.location)),dom.window.location);}finally{dom.window.close()}
++ }
++});
++test('dynamically created owned frames allocate the sole canonical Location in their actual VM before parsing',async t=>{
++ const page=await fixture(t);
++ await page.evaluate('(async()=>{const frame=document.createElement("iframe");frame.srcdoc="<!doctype html><html><body>Actual owned child</body></html>";const loaded=new Promise(resolve=>frame.onload=resolve);document.body.appendChild(frame);await loaded})()');
++ const w=page.dom.window.document.querySelector('iframe').contentWindow,front=w.location;assert.equal(w.document.body.textContent,'Actual owned child');assert.equal(front,w.document.location);assert.equal(Object.getPrototypeOf(front),w.Location.prototype);assert.deepEqual(Object.getOwnPropertyNames(front),[]);assert.deepEqual(Object.getOwnPropertySymbols(front),[]);assert.equal(Object.getPrototypeOf(Object.getOwnPropertyDescriptor(w.Location.prototype,'pathname').set),w.Function.prototype);assert.equal(utils.implForWrapper(front),utils.implForWrapper(w.document)._location);
++});
++test('actual Location setters and methods use captured realm conversion intrinsics and deliver real parsed URLs to the same backend',async t=>{
++ const server=createServer((_request,response)=>response.end('<!doctype html><body>Actual conversion document</body>'));server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>new Promise(resolve=>server.close(resolve)));
++ const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('http://127.0.0.1:'+server.address().port+'/actual/base?original=1');
++ const w=page.dom.window,front=w.location,implementation=utils.implForWrapper(front),document=utils.implForWrapper(w.document),requests=[];
++ const originalSetter=implementation._locationObjectSetterNavigate,originalNavigate=implementation._locationObjectNavigate;
++ implementation._locationObjectSetterNavigate=function(value){assert.equal(this,implementation);requests.push({kind:'setter',url:serializeURL(value)});};
++ implementation._locationObjectNavigate=function(value,options){assert.equal(this,implementation);requests.push({kind:'method',url:serializeURL(value),replacement:options?.replacement===true});};
++ const StringIntrinsic=w.String,TypeErrorIntrinsic=w.TypeError,symbolDescription=Object.getOwnPropertyDescriptor(w.Symbol.prototype,'description');
++ try{
++  w.String=function(){throw Error('Authored String must not be invoked')};w.TypeError=function(){throw Error('Authored TypeError must not be invoked')};
++  let conversions=0;const value=text=>({toString(){conversions++;return text}});
++  front.href=value('https://actual.example/new?source=href#fragment');
++  front.pathname=value('/actual-path');front.search=value('source=search');front.hash=value('actual-hash');
++  front.assign(value('https://actual.example/assign'));front.replace(value('https://actual.example/replace'));
++  assert.equal(conversions,6);assert.equal(requests.length,6);
++  assert.equal(requests[0].url,'https://actual.example/new?source=href#fragment');
++  const pathnameURL=new URL(page.url);pathnameURL.pathname='/actual-path';assert.equal(requests[1].url,pathnameURL.href);
++  assert.equal(requests[2].url,new URL('?source=search',page.url).href);assert.equal(requests[3].url,new URL('#actual-hash',page.url).href);
++  assert.deepEqual(requests.slice(4),[{kind:'method',url:'https://actual.example/assign',replacement:false},{kind:'method',url:'https://actual.example/replace',replacement:true}]);
++  Object.defineProperty(w.Symbol.prototype,'description',{configurable:true,get(){throw Error('Authored description getter must not be invoked')}});
++  for(const [symbol,description]of [[w.Symbol('actual'),'actual'],[w.Symbol(), 'undefined'],[w.Symbol.iterator,'Symbol.iterator']]){front.hash=symbol;assert.equal(requests.at(-1).url,new URL('#'+description,page.url).href)}
++  const beforeEmpty=requests.length;front.hash=w.Symbol('');assert.equal(requests.length,beforeEmpty);
++  front.href=w.Symbol('#symbol-href');front.assign(w.Symbol('#symbol-assign'));front.replace(w.Symbol('#symbol-replace'));
++  assert.deepEqual(requests.slice(-3),[{kind:'setter',url:new URL('#symbol-href',page.url).href},{kind:'method',url:new URL('#symbol-assign',page.url).href,replacement:false},{kind:'method',url:new URL('#symbol-replace',page.url).href,replacement:true}]);
++  for(const operation of [()=>{front.hash=w.Object(w.Symbol('boxed'))},()=>{front.href=w.Object(w.Symbol('#boxed-href'))},()=>front.assign(w.Object(w.Symbol('#boxed-assign'))),()=>front.replace(w.Object(w.Symbol('#boxed-replace')))])assert.throws(operation,error=>Object.getPrototypeOf(error)===TypeErrorIntrinsic.prototype&&error.message==='Cannot convert a Symbol value to a string');
++  for(const operation of [()=>front.assign(),()=>front.replace()])assert.throws(operation,error=>Object.getPrototypeOf(error)===TypeErrorIntrinsic.prototype&&error.message==='invalid argument');
++  assert.equal(utils.implForWrapper(front),document._location);assert.equal(w.document.location,front);assert.equal(utils.wrapperForImpl(implementation),front);
++ }finally{w.String=StringIntrinsic;w.TypeError=TypeErrorIntrinsic;Object.defineProperty(w.Symbol.prototype,'description',symbolDescription);implementation._locationObjectSetterNavigate=originalSetter;implementation._locationObjectNavigate=originalNavigate;}
++});

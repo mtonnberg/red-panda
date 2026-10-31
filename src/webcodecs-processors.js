@@ -5,8 +5,6 @@ import { encodedChunkData } from './webcodecs-values.js';
 import { registerPlatformFactory, platformFactoryRecord } from './platform-factories.js';
 
 const require=createRequire(import.meta.url);
-const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
-const JsdomEventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const installed=new WeakMap(),states=new WeakMap(),eventTargets=new WeakMap();
 const typed=Object.getPrototypeOf(Uint8Array.prototype),get=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
 const tb=get(typed,'buffer'),tl=get(typed,'byteLength'),to=get(typed,'byteOffset'),db=get(DataView.prototype,'buffer'),dl=get(DataView.prototype,'byteLength'),dof=get(DataView.prototype,'byteOffset');
@@ -140,12 +138,14 @@ function copyConfiguration(value){
  const copy=Object.create(null);for(const key of Reflect.ownKeys(value)){const descriptor=Object.getOwnPropertyDescriptor(value,key);if(descriptor&&'value'in descriptor)Object.defineProperty(copy,key,{value:copyConfiguration(descriptor.value),enumerable:true,writable:true,configurable:true})}return copy;
 }
 export function installWebCodecsProcessors(realm,{trustEvent}={}){
+ // The supplied private Worker event producer already owns real Node targets.
+ const domEvents=trustEvent?null:{fireAnEvent:require('jsdom/lib/jsdom/living/helpers/events.js').fireAnEvent,Target:require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation};
  if(installed.has(realm))return installed.get(realm);
  for(const kind of['AudioDecoder','VideoDecoder','AudioEncoder','VideoEncoder'])registerPlatformFactoryKind(kind);
  const Event=realm.Event,Exception=realm.DOMException,dispatch=realm.EventTarget.prototype.dispatchEvent,add=realm.EventTarget.prototype.addEventListener,remove=realm.EventTarget.prototype.removeEventListener;
  const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
  const timer=callback=>Reflect.apply(setTimer,realm,[callback,0]),cancel=id=>{if(id!==null)Reflect.apply(clearTimer,realm,[id])};
- const emit=value=>{const implementation=eventTargets.get(value);if(implementation)fireAnEvent('dequeue',implementation);else{const event=new Event('dequeue');Reflect.apply(dispatch,value,[trustEvent?trustEvent(event):event])}};
+ const emit=value=>{const implementation=eventTargets.get(value);if(implementation)domEvents.fireAnEvent('dequeue',implementation);else{const event=new Event('dequeue');Reflect.apply(dispatch,value,[trustEvent?trustEvent(event):event])}};
  const runtime=hidden({timer,cancel,emit,Exception,add,remove});
  const dequeue=state=>{if(state.dequeueTask!==null)return;state.dequeueTask=state.runtime.timer(()=>{state.dequeueTask=null;state.runtime.emit(state.value)})};
  const discard=(state,next,error)=>{
@@ -161,7 +161,7 @@ export function installWebCodecsProcessors(realm,{trustEvent}={}){
   bytes:snapshotBytes,chunk:encodedChunkData,
   media(value,kind){const provenance=platformFactoryRecord(value);if(provenance?.kind!==kind||typeof provenance.read!=='function')return null;const record=provenance.read();return record},
   create(value,kind,error,output){
-   const implementation=platformFactoryRecord(value)?.implementation;if(implementation instanceof JsdomEventTargetImpl)eventTargets.set(value,implementation);
+   const implementation=platformFactoryRecord(value)?.implementation;if(domEvents&&implementation instanceof domEvents.Target)eventTargets.set(value,implementation);
    const state=hidden({value,runtime,interface:kind,state:'unconfigured',queueSize:0,keyRequired:true,error,output,handler:null,listener:null,configurationTask:null,dequeueTask:null,flushes:[],work:[]});
    states.set(value,state);registerPlatformFactory(value,{kind,globalObject:realm,implementation:state});
   },

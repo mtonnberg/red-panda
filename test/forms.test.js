@@ -274,10 +274,11 @@ test('disabled and disconnected activation does not submit and novalidate bypass
   try {
     const form = f.document.querySelector('form');
     form.querySelector('button').click(); assert.equal(f.page.pendingNavigation, undefined);
-    form.remove(); form.submit(); form.requestSubmit(); assert.equal(f.page.pendingNavigation, undefined);
+    form.remove(); form.requestSubmit(); assert.equal(f.page.pendingNavigation, undefined);
+    form.submit(); await f.page.pendingNavigation.promise; assert.equal(f.calls.length,1);
     f.document.body.append(form); form.noValidate = true;
     form.requestSubmit(); await f.page.pendingNavigation.promise;
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 2);
   } finally { f.close(); }
 });
 

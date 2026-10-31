@@ -213,7 +213,10 @@ test('same-document fragment navigation retains the child VM context', async t =
   await child.navigate('#fragment');
   assert.equal(f.frame(element), child); assert.equal(child.evaluate('location.hash'), '#fragment');
   assert.equal(f.registry.findElement(element), child);
-  await assert.rejects(child.navigate('/post', { method: 'POST', body: 'data' }), /not implemented/);
+  await child.navigate('/post', { method: 'POST', body: 'data' });
+  const submitted=f.requests.find(request=>request.url==='https://example.test/post');
+  assert.equal(submitted.init.method,'POST');assert.equal(submitted.init.body,'data');
+  assert.equal(f.frame(element).dom.window.document.contentType,'text/html');
 });
 
 test('nested document requests use their child frame identity and explicit referrer suppression is retained', async t => {

@@ -1,3 +1,4 @@
+import {installOptionAlias} from './option-alias.js';
 // Independent input state adaptation over pinned jsdom DOM/IDL primitives.
 import { createRequire } from 'node:module';
 
@@ -177,14 +178,7 @@ export function installInputControls(page, window) {
   const record = { page, window, document: window.document, signal: page.documentAbort?.signal, disposed: false,
     arrayFrom: window.Array.from.bind(window.Array) };
   documents.set(document, record);
-  const NativeOption = window.Option;
-  function Option() {
-    if (!new.target) throw new window.TypeError('invalid argument');
-    return Reflect.apply(NativeOption, undefined, arguments);
-  }
-  Object.setPrototypeOf(Option, window.Function.prototype);
-  Object.defineProperty(Option, 'prototype', { value: window.HTMLOptionElement.prototype, writable: false });
-  Object.defineProperty(window, 'Option', { value: Option, configurable: true, writable: true });
+  installOptionAlias(window);
   const previousClose = window.close;
   const dispose = () => {
     if (record.disposed) return;

@@ -25,7 +25,9 @@ const SIMPLE_RESPONSE = new Set(['cache-control', 'content-language', 'content-l
   'expires', 'last-modified', 'pragma']);
 const PROGRESS_EVENTS = ['loadstart', 'progress', 'abort', 'error', 'load', 'timeout', 'loadend'];
 const RESPONSE_TYPES = new Set(['', 'text', 'json', 'document', 'arraybuffer', 'blob']);
-const INSTALLED = new WeakMap();
+const INSTALLED = new WeakMap(), STOP_REQUESTS = new WeakMap(), RETIRE_REQUESTS = new WeakMap();
+export function xhrRetirementAuthority(window) { return RETIRE_REQUESTS.get(window); }
+export function xhrStopAuthority(window) { return STOP_REQUESTS.get(window); }
 
 function mime(value, fallback = 'text/xml') {
   try { return new MIMEType(value ?? fallback); } catch { return new MIMEType(fallback); }
@@ -83,9 +85,10 @@ export function installXHR(page, window) {
     if (!op) return;
     op.done = true; clearTimeout(op.timer); op.controller.abort(); live.delete(op);
   }
-  function terminal(xhr, s, op, kind) {
-    if (!same(s, op) || op.done) return;
-    cancelOperation(op); op.terminal = true; s.sending = false; clearResponse(s); s.readyState = 4;
+  function terminal(xhr, s, op, kind, readyState = 4) {
+    if (!same(s, op) || op.done && !(op.retiredStopped && kind === 'abort' && readyState === 0)) return;
+    op.retiredStopped = false;
+    cancelOperation(op); op.terminal = true; s.sending = false; clearResponse(s); s.readyState = readyState;
     emit(xhr, 'readystatechange');
     if (!same(s, op)) return;
     if (op.uploadStarted && !op.uploadComplete) {
@@ -432,8 +435,8 @@ export function installXHR(page, window) {
       // Calling abort again from the terminal readystatechange/abort handler
       // must not suppress the outer abort and loadend events.
       if (op?.terminal) return;
-      if (s.sending && op && !op.done) {
-        terminal(this, s, op, 'abort');
+      if (s.sending && op && (!op.done || op.retiredStopped)) {
+        terminal(this, s, op, 'abort', op.retiredStopped ? 0 : 4);
         if (same(s, op)) s.readyState = 0;
       } else {
         cancelOperation(op); s.op = null; clearResponse(s); s.readyState = 0;
@@ -540,6 +543,8 @@ export function installXHR(page, window) {
   };
   window.close = close;
   documentSignal?.addEventListener('abort', dispose, { once: true });
+  RETIRE_REQUESTS.set(window, () => { for (const op of [...live]) { cancelOperation(op); op.retiredStopped = true; } });
+  STOP_REQUESTS.set(window, () => [...live].map(op => () => terminal(op.xhr, op.state, op, 'abort', 0)));
   INSTALLED.set(window, dispose);
   return dispose;
 }

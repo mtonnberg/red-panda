@@ -1,3 +1,4 @@
+import{isViewportScreen}from'./window-viewport.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url);
@@ -76,8 +77,9 @@ export function installMedia(page,window){
  const record={page,window,queries:new Set(),timers:new Set(),disposed:false,signal:page.documentAbort?.signal};
  const interfaces=window.eval(`(${mediaInterfaces.toString()})`)(window,record,{},LISTS,EVENTS,evaluateMedia);
  Object.assign(window,interfaces);
- SCREENS.set(window.screen,record);
+ if(!isViewportScreen(window.screen)){SCREENS.set(window.screen,record);
  for(const[key,dimension]of[['width','width'],['height','height']]){const original=Object.getOwnPropertyDescriptor(window.Screen.prototype,key);if(original?.get)Object.defineProperty(window.Screen.prototype,key,{...original,get(){const fallback=original.get.call(this),owner=SCREENS.get(this);return owner?owner.window[dimension==='width'?'innerWidth':'innerHeight']:fallback}})}
+ }
  const previous=window.close;function dispose(){if(record.disposed)return;record.disposed=true;for(const timer of record.timers)window.clearTimeout(timer);record.timers.clear();record.queries.clear();record.signal?.removeEventListener('abort',dispose);if(window.close===close)window.close=previous}function close(...args){dispose();return previous.apply(this,args)}window.close=close;record.signal?.addEventListener('abort',dispose,{once:true});
  record.controller={dispose,refresh:()=>refreshMediaQueries(window)};INSTALLED.set(window,record);return record.controller;
 }

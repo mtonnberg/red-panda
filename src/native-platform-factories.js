@@ -6,6 +6,7 @@ const apply=Reflect.apply,construct=Reflect.construct,define=Object.defineProper
 const size=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'size').get,type=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
 const name=Object.getOwnPropertyDescriptor(NativeFile.prototype,'name').get,modified=Object.getOwnPropertyDescriptor(NativeFile.prototype,'lastModified').get;
 const slice=NativeBlob.prototype.slice,then=Promise.prototype.then;
+const nativeStream=NativeBlob.prototype.stream;
 const privateBlobPrototype=Object.create(getPrototype(NativeBlob.prototype),Object.getOwnPropertyDescriptors(NativeBlob.prototype));
 const nativeForm=globalThis.FormData,formEntries=nativeForm?.prototype.entries;
 const iteratorPrototype=formEntries?getPrototype(apply(formEntries,new nativeForm(),[])):null,iteratorNext=iteratorPrototype?.next;
@@ -13,6 +14,16 @@ const formAppend=nativeForm?.prototype.append,formSet=nativeForm?.prototype.set;
 const readers=[globalThis.Request,globalThis.Response].filter(Boolean).map(C=>({prototype:C.prototype,blob:C.prototype.blob,formData:C.prototype.formData}));
 const installed=new WeakMap();
 let methodsInstalled=false;
+let streamsInstalled=false;
+export function installNativeBlobStreamFactory(realm){
+ if(streamsInstalled)return;streamsInstalled=true;const ErrorCtor=realm.TypeError;
+ define(NativeBlob.prototype,'stream',{configurable:true,writable:true,value:function stream(){
+  const producer=platformFactoryRecord(this);
+  if(!producer||!['Blob','File'].includes(producer.kind)||!producer.read)throw new ErrorCtor('Illegal invocation');
+  const value=apply(nativeStream,producer.read().blob,[]);
+  registerPlatformFactory(value,{kind:'ReadableStream',globalObject:producer.globalRef?.deref()??realm});return value;
+ }});
+}
 
 /** Call only at a trusted successful native factory/producer return. */
 export function registerNativeBlobFactory(value,{kind='Blob',globalObject=globalThis}={}){

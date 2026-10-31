@@ -1,0 +1,33 @@
+--- a/bin/red-panda.js
++++ b/bin/red-panda.js
+@@ -3,20 +3,22 @@
+ import { parseArgs } from 'node:util';
+ import vm from 'node:vm';
+ import { readFile } from 'node:fs/promises';
+-import { Browser, VERSION } from '../src/browser.js';
+-import { serve } from '../src/cdp.js';
+-import { runMCPStdio } from '../src/mcp.js';
+-import { serveMCPHTTP } from '../src/mcp-http.js';
+-import { runScript } from '../src/script.js';
+-import { DUMP_FORMATS, STRIP_MODES } from '../src/dump.js';
+-import { alternateMarkdown } from '../src/markdown-alternate.js';
+-import { readCookieFile, writeCookieFile, setCookie, exportCookies } from '../src/cookies.js';
+ 
+ // Re-exec in place so module scripts share the page VM and server ownership
+ // remains attached to the same PID (including bounded conformance cleanup).
+ if (typeof vm.SourceTextModule !== 'function' && typeof process.execve === 'function') {
+   process.execve(process.execPath, [process.execPath, '--experimental-vm-modules', ...process.execArgv, ...process.argv.slice(1)], process.env);
+ }
++
++// Load the browser graph only after the VM-module re-exec above.
++const { Browser, VERSION } = await import('../src/browser.js');
++const { serve } = await import('../src/cdp.js');
++const { runMCPStdio } = await import('../src/mcp.js');
++const { serveMCPHTTP } = await import('../src/mcp-http.js');
++const { runScript } = await import('../src/script.js');
++const { DUMP_FORMATS, STRIP_MODES } = await import('../src/dump.js');
++const { alternateMarkdown } = await import('../src/markdown-alternate.js');
++const { readCookieFile, writeCookieFile, setCookie, exportCookies } = await import('../src/cookies.js');
+ 
+ const help = `Red Panda ${VERSION} — experimental headless browser
+ 

@@ -32,7 +32,7 @@ test('Page navigation follows script redirects and replacement history through t
   assert.equal(result.url, `${base}/final`);
   assert.equal(page.evaluate('document.title'), 'Final');
   assert.deepEqual(loads, [`${base}/final`]);
-  assert.deepEqual(page.history.map(entry => entry.url), [`${base}/start`, `${base}/final`]);
+  assert.deepEqual(page.history.map(entry => entry.url), [`${base}/final`]);
   assert.equal(requests.find(request => request.path === '/middle').referrer, `${base}/start`);
   assert.equal(requests.find(request => request.path === '/final').referrer, `${base}/middle`);
 });
@@ -56,6 +56,7 @@ test('anchor navigation obeys cancellation and noreferrer, and fragment replacem
 test('Page module readiness includes imports and top-level await, and module navigation follows its child', async t => {
   const { page, base } = await fixture(t);
   await page.navigate(`${base}/module`);
+  await page.moduleReady;
   assert.equal(page.evaluate('document.title'), '42');
   await page.navigate(`${base}/module-navigation`);
   assert.equal(page.url, `${base}/final`);

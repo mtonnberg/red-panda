@@ -8,7 +8,8 @@ module RedPanda.Puppeteer
   , evaluateOnNewDocument, removePreload
   , setExtraHTTPHeaders, setUserAgent
   , click, focus, typeText, pressKey, insertText
-  , evaluateString, textContent, waitForSelector, dispatchClick, content, cookieNames, setCookie
+  , UtilityWorld, withUtilityWorld, evaluateUtilityString
+  , evaluateString, textContent, waitForSelector, waitForFunction, dispatchClick, content, cookieNames, setCookie
   , evaluateHandle, queryObjects, evaluateHandleString, disposeHandle, withHandle
   , Async, fromAsync, quote
   ) where
@@ -29,6 +30,15 @@ foreign import data Response :: Type
 foreign import data JSHandle :: Type
 foreign import data PendingNavigation :: Type
 foreign import data ByteArray :: Type
+foreign import data ProtocolSession :: Type
+
+newtype UtilityWorld = UtilityWorld { session :: ProtocolSession, contextId :: Int }
+
+foreign import createProtocolSessionImpl :: Page -> Async ProtocolSession
+foreign import detachProtocolSessionImpl :: ProtocolSession -> Async Unit
+foreign import getFrameTreeImpl :: ProtocolSession -> Async { frameTree :: { frame :: { id :: String } } }
+foreign import createUtilityWorldImpl :: ProtocolSession -> { frameId :: String, worldName :: String } -> Async { executionContextId :: Int }
+foreign import evaluateUtilityStringImpl :: ProtocolSession -> Int -> String -> Async String
 
 newtype PreloadScript = PreloadScript String
 
@@ -82,6 +92,7 @@ foreign import queryObjectsImpl :: Page -> JSHandle -> Async JSHandle
 foreign import evaluateHandleStringImpl :: JSHandle -> String -> Async String
 foreign import disposeHandleImpl :: JSHandle -> Async Unit
 foreign import waitForSelectorImpl :: Page -> String -> Async Unit
+foreign import waitForFunctionImpl :: Page -> String -> Async Unit
 foreign import contentImpl :: Page -> Async String
 foreign import setCookieImpl :: BrowserContext -> String -> String -> String -> Async Unit
 foreign import cookieNamesImpl :: BrowserContext -> Async (Array String)
@@ -103,6 +114,19 @@ newPage context = fromAsync $ newPageImpl context
 
 closePage :: Page -> Aff Unit
 closePage page = fromAsync $ closePageImpl page
+
+-- PureScript owns protocol-session lifetime and world setup; FFI adapts each call.
+withUtilityWorld :: forall a. Page -> (UtilityWorld -> Aff a) -> Aff a
+withUtilityWorld page action = bracket
+  (fromAsync $ createProtocolSessionImpl page)
+  (fromAsync <<< detachProtocolSessionImpl)
+  \session -> do
+    tree <- fromAsync $ getFrameTreeImpl session
+    created <- fromAsync $ createUtilityWorldImpl session { frameId: tree.frameTree.frame.id, worldName: "purescript-utility" }
+    action $ UtilityWorld { session, contextId: created.executionContextId }
+
+evaluateUtilityString :: UtilityWorld -> String -> Aff String
+evaluateUtilityString (UtilityWorld world) expression = fromAsync $ evaluateUtilityStringImpl world.session world.contextId expression
 
 goto :: Page -> String -> Aff Int
 goto page url = fromAsync $ gotoImpl page url
@@ -201,6 +225,9 @@ withHandle acquire = bracket acquire disposeHandle
 textContent :: Page -> String -> Aff String
 textContent page selector = evaluateString page $
   "document.querySelector(" <> quote selector <> ").textContent"
+
+waitForFunction :: Page -> String -> Aff Unit
+waitForFunction page expression = fromAsync $ waitForFunctionImpl page expression
 
 waitForSelector :: Page -> String -> Aff Unit
 waitForSelector page selector = fromAsync $ waitForSelectorImpl page selector

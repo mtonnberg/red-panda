@@ -1,0 +1,32 @@
+--- a/src/window-lifecycle-timers.js
++++ b/src/window-lifecycle-timers.js
+@@ -8,6 +8,7 @@
+ import {fetchStopAuthority} from './fetch.js';
+ import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
+ const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
++const queueTask=setImmediate,cancelTask=clearImmediate;
+ function publicMethods(bridge){'use strict';return{
+  setTimeout(handler,delay=0,...args){return bridge.timer(this,false,arguments.length,handler,delay,args)},
+  setInterval(handler,delay=0,...args){return bridge.timer(this,true,arguments.length,handler,delay,args)},
+@@ -32,14 +33,18 @@
+  owners.set(context,record);owners.set(window,record);owners.set(vm.runInContext('globalThis',context),record);pages.set(page,record);
+  const parent=page.registry?.findFrame(page.parentFrameId);record.parent=parent?pages.get(parent):undefined;record.parent?.children.add(record);
+  const owner=value=>{const result=value==null?record:owners.get(value);if(!result)throw new record.TypeError('Illegal invocation');return result};
+- function cancel(target,id){const timer=target.timers.get(id);if(timer){target.timers.delete(id);if(timer.repeat)target.intervals--}apply(target.source.clear,target.window,[id])}
++ function cancel(target,id){const timer=target.timers.get(id);if(timer){target.timers.delete(id);if(timer.pending)cancelTask(timer.pending);timer.pending=null;if(timer.repeat)target.intervals--}apply(target.source.clear,target.window,[id])}
+  const bridge=Object.assign(Object.create(null),{
+   timer(receiver,repeat,count,callback,delay,args){
+    const target=owner(receiver);if(!count)throw new record.TypeError('invalid argument');delay=delayNumber(delay,record);
+    let script;if(typeof callback!=='function'){if(typeof callback==='symbol')throw new record.TypeError('invalid argument');const text=apply(record.String,undefined,[callback]);try{script=new vm.Script(text,{filename:record.document.URL,displayErrors:false})}catch{throw new record.Error('CompilationError')}}
+    if(repeat&&target.intervals>=2048)throw new record.Error('TooManyTimeout');
+-   const state=Object.assign(Object.create(null),{id:undefined,repeat});
+-   const invoke=()=>{if(!repeat)target.timers.delete(state.id);if(target.disposed)return;try{if(script)return script.runInContext(record.context,target.options);return target.invocation.invoke(callback,record.window,args,target.options)}catch(error){record.errors.report(error)}};
++   const state=Object.assign(Object.create(null),{id:undefined,repeat,pending:null});
++   const execute=()=>{if(!repeat)target.timers.delete(state.id);if(target.disposed)return;try{if(script)return script.runInContext(record.context,target.options);return target.invocation.invoke(callback,record.window,args,target.options)}catch(error){record.errors.report(error)}};
++   // Positive native deadlines enter the browser task queue after an actual
++   // posted-message/poll checkpoint. Keep the existing zero/clamped-zero path,
++   // and keep pending positive tasks cancellable/coalesced until execution.
++   const invoke=()=>{if(delay<=0)return execute();if(target.disposed||target.timers.get(state.id)!==state||state.pending)return;state.pending=queueTask(()=>{state.pending=null;if(target.disposed||target.timers.get(state.id)!==state)return;return execute()})};
+    state.id=apply(target.source[repeat?'interval':'timeout'],target.window,[invoke,delay]);
+    if(state.id){target.timers.set(state.id,state);if(repeat)target.intervals++}return state.id;
+   },

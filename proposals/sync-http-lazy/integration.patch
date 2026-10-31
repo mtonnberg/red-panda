@@ -1,0 +1,104 @@
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -6,19 +6,27 @@
+ const clock=()=>performance.now()/1000;
+ /** One browser-owned real transport; the worker never owns document policy. */
+ export class SyncHTTP {
+- constructor(){
+-  const ready=new SharedArrayBuffer(4);this.worker=new Worker(new URL('./sync-http-thread.js',import.meta.url),{workerData:{ready},execArgv:[]});
+-  this.worker.on('error',error=>{this.error=error});this.worker.unref();this.operations=new Set();this.closed=false;
+-  if(Atomics.wait(new Int32Array(ready),0,0,2000)==='timed-out'){this.close();throw Error('Synchronous HTTP worker readiness timed out')}
++ constructor(){this.operations=new Set();this.closed=false;}
++ // Start the real independent transport only when a synchronous request exists.
++ // Node queues its first message until the actual worker listener is installed.
++ #ensureWorker(){
++  if(this.closed||this.error)throw this.error??Error('Synchronous transport is closed');
++  if(!this.worker){
++   this.worker=new Worker(new URL('./sync-http-thread.js',import.meta.url),{execArgv:[]});
++   this.worker.on('error',error=>{this.error=error});
++   this.worker.once('exit',code=>{if(!this.closed&&!this.error)this.error=Error('Synchronous HTTP transport exited with code '+code)});
++   this.worker.unref();
++  }
++  return this.worker;
+  }
+- close(){if(this.closed)return;this.closed=true;for(const op of this.operations)op.cancel();void this.worker.terminate()}
++ close(){if(this.closed)return;this.closed=true;for(const op of this.operations)op.cancel();void this.worker?.terminate()}
+  fetch(page,input,init={}){
+   const metadata=requestMetadataPolicy(init);
+   if(this.closed||this.error)throw this.error??Error('Synchronous transport is closed');
+   const resourceType=init.resourceType??'XHR',maxBodyBytes=init.maxBodyBytes??16*1024*1024;if(typeof resourceType!=='string'||!Number.isSafeInteger(maxBodyBytes)||maxBodyBytes<1||maxBodyBytes>16*1024*1024)throw TypeError('Invalid synchronous resource options');
+   const owned=new Set(),op={complete:false,canceled:false,cancel:()=>{
+    op.canceled=true;init.signal?.removeEventListener('abort',onAbort);
+-   for(const id of owned){page.activeRequests.delete(id);this.worker.postMessage({cancel:id})}
++   for(const id of owned){page.activeRequests.delete(id);this.worker?.postMessage({cancel:id})}
+    owned.clear();this.operations.delete(op);
+   }};
+   const onAbort=()=>op.cancel();
+@@ -41,7 +49,7 @@
+     page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+     checkpoint();
+     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
+-    this.worker.postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
++    this.#ensureWorker().postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
+     const remaining=deadline-Date.now();
+     if(remaining<=0||Atomics.wait(state,0,0,remaining)==='timed-out')throw Error('Synchronous HTTP request timed out');
+     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
+--- a/src/sync-http-thread.js
++++ b/src/sync-http-thread.js
+@@ -1,6 +1,6 @@
+ // Owned transport thread: synchronous Window XHR must not depend on the blocked
+ // parent event loop. Cookies, redirects, CORS and tracing stay with its Page.
+-import { parentPort,workerData } from 'node:worker_threads';
++import { parentPort } from 'node:worker_threads';
+ const requests=new Map();
+ parentPort.on('message',async message=>{
+  if(message.cancel){requests.get(message.cancel)?.abort();return}
+@@ -16,4 +16,3 @@
+  }catch(error){const text=Buffer.from(JSON.stringify({error:String(error.message)}));output.set(text.subarray(0,output.length));Atomics.store(state,1,Math.min(text.length,output.length));Atomics.store(state,0,2)}
+  finally{requests.delete(id);Atomics.notify(state,0)}
+ });
+-const ready=new Int32Array(workerData.ready);Atomics.store(ready,0,1);Atomics.notify(ready,0);
+--- a/test/window-viewport-parity.test.js
++++ b/test/window-viewport-parity.test.js
+@@ -1,6 +1,6 @@
+ import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{createRequire}from'node:module';import{Browser}from'../src/browser.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{getHeapBinding}from'../src/native-heap.js';import{implementationForWrapper}from'../src/dom-event-state.js';import{eventTargetImplementation}from'../src/dom-event-target-state.js';import{serve}from'../src/cdp.js';import{connect}from'./cdp-client.js';
+ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),Target=require('jsdom/lib/jsdom/living/generated/EventTarget.js'),binding=getHeapBinding(),plain=v=>JSON.parse(JSON.stringify(v));
+-async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<!doctype html><body></body>');return{browser,page,w:page.dom.window}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<!doctype html><body></body>');return{browser,page,w:page.dom.window}}
+ for(const name of['viewport-first','viewport-details','viewport-extra','scroll-events-first','scroll-conversion','element-scroll-conversion','root-scroll-native','frame-viewport-state','document-extents'])test('actual viewport/scroll Native '+name+' controls match',async t=>{const{page}=await fixture(t),expression=await readFile(new URL('../docs/reference/window-viewport-parity/'+name+'-expression.js',import.meta.url),'utf8'),record=JSON.parse(await readFile(new URL('../docs/reference/window-viewport-parity/'+name+'-native.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(expression).digest('hex'),record.expressionSHA256);assert.deepEqual(plain(await page.evaluate(expression)),record.observations)});
+ function realm(value,anchor){const prototype=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,{}),false);assert.equal(binding.creationGlobal(value),binding.creationGlobal(anchor));Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,prototype)}}
+ test('actual metric constructors/accessors/fronts retain their real VM before/after null prototypes, including shared frame values',async t=>{const{page,w}=await fixture(t),frame=w.document.createElement('iframe');w.document.body.append(frame);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});for(const g of[w,frame.contentWindow,world.global])for(const name of['VisualViewport','Screen','ScreenOrientation']){const C=g[name];realm(C,g.Object.prototype);realm(C.prototype,g.Object.prototype);for(const key of Reflect.ownKeys(C.prototype)){const descriptor=Object.getOwnPropertyDescriptor(C.prototype,key);for(const field of['value','get','set'])if(typeof descriptor[field]==='function')realm(descriptor[field],g.Object.prototype)}const value=name==='VisualViewport'?g.visualViewport:name==='Screen'?g.screen:g.screen.orientation;realm(value,g===frame.contentWindow?w.Object.prototype:g.Object.prototype);assert.deepEqual(Reflect.ownKeys(value),[]);assert.ok(eventTargetImplementation(value))}const setup=Target.setup;let receiver;Target.setup=function(value,...args){receiver=value;return Reflect.apply(setup,this,[value,...args])};try{const{Browser}=await import('../src/browser.js'),second=new Browser();try{const p=second.createPage();const value=p.dom.window.visualViewport;assert.equal(receiver,value);realm(value,p.dom.window.Object.prototype)}finally{second.close()}}finally{Target.setup=setup}});
+--- /dev/null
++++ b/test/sync-http-lazy.test.js
+@@ -0,0 +1,31 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createHook} from 'node:async_hooks';
++import {Worker} from 'node:worker_threads';
++import {once} from 'node:events';
++import {setImmediate as turn} from 'node:timers/promises';
++import {Browser,until} from '../src/browser.js';
++
++const source=`const {parentPort}=require('node:worker_threads'),http=require('node:http'),log=[];const server=http.createServer(async(q,s)=>{const path=new URL(q.url,'http://fixture').pathname;if(path==='/log'){s.setHeader('content-type','application/json');s.end(JSON.stringify(log));return}const record={path,method:q.method,closed:false};log.push(record);s.on('close',()=>record.closed=true);if(path==='/hang')return;const chunks=[];for await(const chunk of q)chunks.push(chunk);if(path==='/'){s.end('<!doctype html><title>actual async navigation</title>');return}s.setHeader('content-type','application/json');s.end(JSON.stringify({method:q.method,body:Buffer.concat(chunks).toString()}))});server.listen(0,'127.0.0.1',()=>parentPort.postMessage({port:server.address().port}));parentPort.on('message',m=>{if(m==='close'){server.closeAllConnections();server.close(()=>parentPort.close())}});`;
++async function fixture(t){const server=new Worker(source,{eval:true});t.after(()=>server.terminate());const[ready]=await once(server,'message');const browser=new Browser({timeout:1000});t.after(()=>browser.close());const page=browser.createPage(),base='http://127.0.0.1:'+ready.port;await page.navigate(base);return{server,browser,page,w:page.dom.window,base}}
++function workersDuring(){const rows=[],hook=createHook({init(id,type){if(type==='WORKER')rows.push(id)}});hook.enable();return{rows,close:()=>hook.disable()}}
++
++test('async Browser/Page navigation and close-before-use allocate no synchronous transport thread',async t=>{
++ const observed=workersDuring();t.after(()=>observed.close());const browser=new Browser({timeout:1000});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<!doctype html><title>async only</title>');assert.equal(page.dom.window.document.title,'async only');assert.equal(page.dom.window.document.readyState,'complete');assert.equal(browser.syncHTTP.worker,undefined);assert.deepEqual(observed.rows,[]);browser.close();assert.throws(()=>browser.syncHTTP.fetch(page,'http://127.0.0.1/'),/closed/);assert.deepEqual(observed.rows,[]);
++});
++
++test('first real synchronous XHR owns one actual thread and subsequent requests reuse its HTTP transport',async t=>{
++ const{browser,w,base}=await fixture(t),observed=workersDuring();t.after(()=>observed.close());assert.equal(browser.syncHTTP.worker,undefined);const first=new w.XMLHttpRequest();first.open('POST',base+'/echo',false);first.send('first actual bytes');assert.equal(first.status,200);assert.deepEqual(JSON.parse(first.responseText),{method:'POST',body:'first actual bytes'});const worker=browser.syncHTTP.worker;assert.ok(worker instanceof Worker);assert.ok(worker.threadId>0);assert.equal(observed.rows.length,1);const second=new w.XMLHttpRequest();second.open('GET',base+'/echo',false);second.send();assert.equal(second.status,200);assert.strictEqual(browser.syncHTTP.worker,worker);assert.equal(observed.rows.length,1);assert.equal(browser.syncHTTP.operations.size,0);
++});
++
++test('request-callback abort before first dispatch leaves no transport thread or owned request',async t=>{
++ const{browser,page,base}=await fixture(t),observed=workersDuring();t.after(()=>observed.close());const controller=new AbortController();page.activeRequests.add('unrelated');page.once('request',()=>controller.abort());assert.throws(()=>browser.syncHTTP.fetch(page,base+'/must-not-send',{signal:controller.signal}),/canceled/);await turn();assert.equal(browser.syncHTTP.worker,undefined);assert.deepEqual(observed.rows,[]);assert.deepEqual([...page.activeRequests],['unrelated']);assert.equal(browser.syncHTTP.operations.size,0);assert.equal((await(await fetch(base+'/log')).json()).some(v=>v.path==='/must-not-send'),false);
++});
++
++test('first-request startup counts toward the original1000ms request timeout and cancels actual hanging HTTP',async t=>{
++ const{browser,page,w,base}=await fixture(t);assert.equal(page.timeout,1000);const xhr=new w.XMLHttpRequest();xhr.open('GET',base+'/hang',false);assert.throws(()=>xhr.send(),e=>e instanceof w.DOMException&&e.name==='NetworkError');await turn();assert.equal(page.timeout,1000);assert.equal(page.activeRequests.size,0);assert.equal(browser.syncHTTP.operations.size,0);await until(async()=>{const log=await(await fetch(base+'/log')).json();return log.some(v=>v.path==='/hang'&&v.closed)},{timeout:1000});
++});
++
++test('an actual unexpected transport exit propagates to later requests without inventing a response',async t=>{
++ const{browser,page,w,base}=await fixture(t);const xhr=new w.XMLHttpRequest();xhr.open('GET',base+'/echo',false);xhr.send();assert.equal(xhr.status,200);await browser.syncHTTP.worker.terminate();await turn();assert.match(browser.syncHTTP.error.message,/transport exited/);const failed=new w.XMLHttpRequest();failed.open('GET',base+'/echo',false);assert.throws(()=>failed.send(),e=>e instanceof w.DOMException&&e.name==='NetworkError');assert.equal(failed.status,0);assert.equal(page.activeRequests.size,0);assert.equal(browser.syncHTTP.operations.size,0);
++});
