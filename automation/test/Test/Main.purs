@@ -9,6 +9,7 @@ import Effect.Aff (Aff, bracket, launchAff_, throwError, attempt)
 import Effect.Class.Console (log)
 import Effect.Exception (error)
 import RedPanda.Puppeteer as Browser
+import Test.Upload (uploadChecks)
 
 foreign import data Fixture :: Type
 foreign import startImpl :: Browser.Async Fixture
@@ -372,3 +373,4 @@ main = launchAff_ $
         capabilityChecks fixture browser
         Browser.closePage page
         log "PureScript Puppeteer integration: 117 checks passed"
+        uploadChecks browser $ fixtureCapabilityOrigin fixture

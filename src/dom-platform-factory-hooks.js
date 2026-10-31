@@ -1,4 +1,5 @@
 import {installLocationFactory} from './location-factory.js';
+import {captureCanonicalDispatchWrapper} from './dom-dispatch-recovery.js';
 import {domWrapperGlobal} from './dom-factory-scope.js';
 import {installDOMWrapperRealms} from './dom-wrapper-realms.js';
 import 'jsdom';
@@ -25,12 +26,14 @@ export function installPlatformFactoryHooks() {
     if (typeof setup === 'function') factory.setup = function (wrapper, globalObject, ...args) {
       const value = setup.call(this, wrapper, globalObject, ...args);
       const descriptor = Object.getOwnPropertyDescriptor(wrapper, utils.implSymbol);
+      captureCanonicalDispatchWrapper(value,utils.implForWrapper(value)??descriptor?.value);
       registerPlatformFactory(value, { kind, implementation:utils.implForWrapper(value)??descriptor?.value, globalObject:domWrapperGlobal(value,globalObject) });
       return value;
     };
     if (typeof allocate === 'function') factory.new = function (globalObject, ...args) {
       const implementation = allocate.call(this, globalObject, ...args);
       const descriptor = Object.getOwnPropertyDescriptor(implementation, utils.wrapperSymbol);
+      if(descriptor?.value)captureCanonicalDispatchWrapper(descriptor.value,implementation);
       if (descriptor?.value) registerPlatformFactory(descriptor.value, { kind, implementation, globalObject:domWrapperGlobal(descriptor.value,globalObject) });
       return implementation;
     };

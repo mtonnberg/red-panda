@@ -1,3 +1,4 @@
+import {fileWrapperImplementation} from './file-wrapper-realms.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -8,18 +9,18 @@ const setBytes = Uint8Array.prototype.set;
 
 // Immutable Blob/File data is independent of a live document or FileReader.
 // Every read produces a real copy in the owning realm.
-export function installBlobReads(window) {
+export function installBlobReads(window, { prototype = window.Blob.prototype } = {}) {
   if (installed.has(window)) return;
   installed.add(window);
   const Promise = window.Promise, Bytes = window.Uint8Array, TypeError = window.TypeError;
   const Readable = window.ReadableStream ?? globalThis.ReadableStream;
   const snapshot = value => {
     if (!BlobIDL.is(value)) throw new TypeError('Illegal invocation');
-    return Buffer.from(implForWrapper(value)._buffer);
+    return Buffer.from((fileWrapperImplementation(value)??implForWrapper(value))._buffer);
   };
   const copy = data => { const bytes = new Bytes(data.length); setBytes.call(bytes, data); return bytes; };
   for (const kind of ['text', 'arrayBuffer', 'bytes']) {
-    Object.defineProperty(window.Blob.prototype, kind, { configurable: true, writable: true,
+    Object.defineProperty(prototype, kind, { configurable: true, writable: true,
       value: function () {
         return new Promise(resolve => {
           const data = snapshot(this);
@@ -28,7 +29,7 @@ export function installBlobReads(window) {
       },
     });
   }
-  Object.defineProperty(window.Blob.prototype, 'stream', { configurable: true, writable: true,
+  Object.defineProperty(prototype, 'stream', { configurable: true, writable: true,
     value: function () {
       const data = snapshot(this); let offset = 0;
       return new Readable({ pull(controller) {

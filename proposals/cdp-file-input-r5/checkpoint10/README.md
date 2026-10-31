@@ -1,0 +1,5 @@
+# R5 acceptance first partial epoch
+
+Source and assertions are unchanged. The controller stops after17.53s on a test-selection/count mismatch: Node24.19 recovery8/8 passes; the next command exits0 with all18 capability cases passing, including17 ordinary tests and the duplicate Host-CDP watchdog. Its negative-lookahead name selector did not exclude that duplicate. The expected17 counter assertion therefore fails. This is a retained harness-selection failure, not a runtime assertion failure.
+
+The actual17 ordinary physical/functional assertions and duplicate watchdog are green; this does not promote the overall five-command gate to success. Node26 recovery/ordinary and seven-file consumer71 are unrun. Both recorded commands exited, source548/551 graph labels remain explicit and the actual551 candidate plus external Root guards match. Existing MaxListeners warnings remain. No retry or Root source edit occurred. Any next controller must be a separately named derivative and preserve this epoch.

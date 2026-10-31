@@ -1,0 +1,689 @@
+{
+  "profile": "candidate",
+  "binary": "/workspace/shared/domimplementation-readiness-recovery/red-panda-launcher",
+  "binarySHA256": "cdde68dc7b581f5b276e95979141a51c40ddb803abcad8dd7986dc1438777c24",
+  "source": "(async()=>{\n const rows=[],own=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);\n const phase=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};\n const method=document.getElementById,find=id=>method.call(document,id);\n const shape=(d,k,expected)=>{const v=d[k],desc=Object.getOwnPropertyDescriptor(d,k);return{type:typeof v,in:k in d,own:own(d,k),isExpected:v===expected,tag:Object.prototype.toString.call(v),descriptor:desc?{keys:Reflect.ownKeys(desc),hasValue:own(desc,'value'),hasWritable:own(desc,'writable'),writable:desc.writable??null,enumerable:desc.enumerable,configurable:desc.configurable,valueIsExpected:own(desc,'value')?desc.value===expected:null}:null}};\n const summary=d=>({state:d.readyState,url:d.URL,contentType:d.contentType,defaultViewNull:d.defaultView===null,doctype:d.doctype?.name??null,tag:Object.prototype.toString.call(d),isDocument:d instanceof Document,isHTMLDocument:d instanceof HTMLDocument,isXMLDocument:d instanceof XMLDocument,title:d.title,childNames:[...d.childNodes].map(n=>n.nodeName)});\n await phase('factory-readiness',()=>{const entries=[['no-title',()=>document.implementation.createHTMLDocument()],['undefined-title',()=>document.implementation.createHTMLDocument(undefined)],['null-title',()=>document.implementation.createHTMLDocument(null)],['text-title',()=>document.implementation.createHTMLDocument('actual title')],['new-document',()=>new Document()],['xml-factory',()=>document.implementation.createDocument(null,'root',null)],['html-parser',()=>new DOMParser().parseFromString('<p>actual</p>','text/html')]];return entries.map(([name,create])=>{try{return{name,value:summary(create())}}catch(e){return{name,error:{name:e.name,message:e.message}}}})});\n await phase('factory-lifecycle',async()=>{const d=document.implementation.createHTMLDocument(),events=[];for(const type of ['readystatechange','DOMContentLoaded','load'])d.addEventListener(type,()=>events.push({type,state:d.readyState}));const immediate=summary(d);await Promise.resolve();const microtask=summary(d);await new Promise(resolve=>setTimeout(resolve,0));return{immediate,microtask,later:summary(d),events}});\n await phase('initial-named-properties',()=>{document.body.insertAdjacentHTML('beforeend','<form name=\"actualForm\" id=\"f\"><input name=\"entry\" value=\"real\"></form><img name=\"actualPicture\" id=\"pictureId\"><img id=\"idOnly\"><object id=\"actualObject\"></object><div name=\"ignoredName\"></div><form name=\"getElementById\" id=\"builtinForm\"></form><form name=\"actualDup\" id=\"dup1\"></form><embed name=\"actualDup\" id=\"dup2\">');return{keys:Object.keys(document),form:shape(document,'actualForm',find('f')),pictureName:shape(document,'actualPicture',find('pictureId')),pictureId:shape(document,'pictureId',find('pictureId')),idOnly:shape(document,'idOnly',undefined),object:shape(document,'actualObject',find('actualObject')),ignored:shape(document,'ignoredName',undefined),builtinType:typeof document.getElementById,field:document.actualForm?.entry?.value??null}});\n await phase('live-duplicates',()=>{const held=document.actualDup,extra=document.createElement('form');extra.name='actualDup';extra.id='dup3';const snapshot=()=>({tag:Object.prototype.toString.call(held),isCollection:held instanceof HTMLCollection,length:held?.length??null,ids:held?[...held].map(n=>n.id):[]});const before=snapshot();document.body.append(extra);const appended=snapshot();extra.remove();return{before,appended,removed:snapshot(),sameLookupObject:document.actualDup===held}});\n await phase('dynamic-filter-and-keys',()=>{const f=document.createElement('form');f.name='dynamicActual';document.body.append(f);const added=shape(document,'dynamicActual',f);f.name='changedActual';const renamed={old:shape(document,'dynamicActual',undefined),new:shape(document,'changedActual',f),keys:Object.keys(document)};f.remove();const removed=shape(document,'changedActual',undefined);const image=find('pictureId');image.removeAttribute('name');return{added,renamed,removed,imageWithoutName:shape(document,'pictureId',undefined)}});\n await phase('own-shadow-and-delete',()=>{const target=find('f');let write;try{document.actualForm='authored';write='returned'}catch(e){write=e.name}const written=shape(document,'actualForm',target);const deleted=Reflect.deleteProperty(document,'actualForm');const afterDelete=shape(document,'actualForm',target);let define;try{Object.defineProperty(document,'actualForm',{value:'own-value',writable:true,enumerable:true,configurable:true});define='returned'}catch(e){define=e.name}return{write,written,deleted,afterDelete,define,afterDefine:shape(document,'actualForm',target)}});\n await phase('iframe-named-value',()=>{const f=document.querySelector('iframe');f.name='actualFrame';const before=shape(document,'actualFrame',f.contentWindow);f.name='actualFrameMoved';const renamed={old:shape(document,'actualFrame',undefined),new:shape(document,'actualFrameMoved',f.contentWindow)};return{before,renamed}});\n await phase('windowless-named-documents',()=>{const html=document.implementation.createHTMLDocument(),form=html.createElement('form');form.name='inertActual';html.body.append(form);const xml=document.implementation.createDocument(null,'root',null),node=xml.createElement('form');node.setAttribute('name','xmlActual');xml.documentElement.append(node);return{html:shape(html,'inertActual',form),htmlKeys:Object.keys(html),xml:shape(xml,'xmlActual',undefined),xmlKeys:Object.keys(xml)}});\n return {rows,boundary:'Independent authored real DOM/Document factory observations; no fixture/assertion edits or expected-output lookup.'};\n})()\n",
+  "sourceSHA256": "c8c7cadfb610af3bcbf2f8047a744cb3eaa2bdd84e90b02f9ecd107d5e986684",
+  "args": [
+    "--ws-max-concurrent",
+    "50",
+    "--load-resources",
+    "iframe",
+    "--load-resources",
+    "worker"
+  ],
+  "rpcBudgetMs": 3000,
+  "loadBudgetMs": 2000,
+  "requests": [
+    {
+      "url": "/main",
+      "headers": {
+        "host": "127.0.0.1:34411",
+        "connection": "keep-alive",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "sec-ch-ua": "\"RedPanda\";v=\"0\"",
+        "sec-ch-ua-full-version-list": "\"RedPanda\";v=\"0.1.0\"",
+        "accept": "*/*",
+        "sec-fetch-mode": "cors",
+        "accept-encoding": "gzip, deflate"
+      }
+    },
+    {
+      "url": "/child?id=first",
+      "headers": {
+        "host": "127.0.0.1:34411",
+        "connection": "keep-alive",
+        "referer": "http://127.0.0.1:34411/main",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "sec-ch-ua": "\"RedPanda\";v=\"0\"",
+        "sec-ch-ua-full-version-list": "\"RedPanda\";v=\"0.1.0\"",
+        "accept": "*/*",
+        "sec-fetch-mode": "cors",
+        "accept-encoding": "gzip, deflate"
+      }
+    }
+  ],
+  "stages": [
+    {
+      "name": "load",
+      "status": "observed"
+    }
+  ],
+  "status": "observed",
+  "origin": "http://127.0.0.1:34411",
+  "pid": 712412,
+  "navigation": {
+    "frameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7",
+    "loaderId": "58aae98d-0086-48e9-aa72-05de3ce8a789",
+    "isDownload": false
+  },
+  "evaluation": {
+    "result": {
+      "type": "object",
+      "value": {
+        "rows": [
+          {
+            "name": "factory-readiness",
+            "value": [
+              {
+                "name": "no-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "undefined-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "null-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "null",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "text-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "actual title",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "new-document",
+                "value": {
+                  "state": "loading",
+                  "url": "about:blank",
+                  "contentType": "application/xml",
+                  "defaultViewNull": true,
+                  "doctype": null,
+                  "tag": "[object Document]",
+                  "isDocument": true,
+                  "isHTMLDocument": false,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": []
+                }
+              },
+              {
+                "name": "xml-factory",
+                "value": {
+                  "state": "loading",
+                  "url": "about:blank",
+                  "contentType": "application/xml",
+                  "defaultViewNull": true,
+                  "doctype": null,
+                  "tag": "[object XMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": false,
+                  "isXMLDocument": true,
+                  "title": "",
+                  "childNames": [
+                    "root"
+                  ]
+                }
+              },
+              {
+                "name": "html-parser",
+                "value": {
+                  "state": "complete",
+                  "url": "http://127.0.0.1:34411/main",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": null,
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": [
+                    "HTML"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "name": "factory-lifecycle",
+            "value": {
+              "immediate": {
+                "state": "complete",
+                "url": "about:blank",
+                "contentType": "text/html",
+                "defaultViewNull": true,
+                "doctype": "html",
+                "tag": "[object HTMLDocument]",
+                "isDocument": true,
+                "isHTMLDocument": true,
+                "isXMLDocument": false,
+                "title": "",
+                "childNames": [
+                  "html",
+                  "HTML"
+                ]
+              },
+              "microtask": {
+                "state": "complete",
+                "url": "about:blank",
+                "contentType": "text/html",
+                "defaultViewNull": true,
+                "doctype": "html",
+                "tag": "[object HTMLDocument]",
+                "isDocument": true,
+                "isHTMLDocument": true,
+                "isXMLDocument": false,
+                "title": "",
+                "childNames": [
+                  "html",
+                  "HTML"
+                ]
+              },
+              "later": {
+                "state": "complete",
+                "url": "about:blank",
+                "contentType": "text/html",
+                "defaultViewNull": true,
+                "doctype": "html",
+                "tag": "[object HTMLDocument]",
+                "isDocument": true,
+                "isHTMLDocument": true,
+                "isXMLDocument": false,
+                "title": "",
+                "childNames": [
+                  "html",
+                  "HTML"
+                ]
+              },
+              "events": []
+            }
+          },
+          {
+            "name": "initial-named-properties",
+            "value": {
+              "keys": [
+                "location"
+              ],
+              "form": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "pictureName": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "pictureId": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "idOnly": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "object": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "ignored": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "builtinType": "function",
+              "field": null
+            }
+          },
+          {
+            "name": "live-duplicates",
+            "value": {
+              "before": {
+                "tag": "[object Undefined]",
+                "isCollection": false,
+                "length": null,
+                "ids": []
+              },
+              "appended": {
+                "tag": "[object Undefined]",
+                "isCollection": false,
+                "length": null,
+                "ids": []
+              },
+              "removed": {
+                "tag": "[object Undefined]",
+                "isCollection": false,
+                "length": null,
+                "ids": []
+              },
+              "sameLookupObject": true
+            }
+          },
+          {
+            "name": "dynamic-filter-and-keys",
+            "value": {
+              "added": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "renamed": {
+                "old": {
+                  "type": "undefined",
+                  "in": false,
+                  "own": false,
+                  "isExpected": true,
+                  "tag": "[object Undefined]",
+                  "descriptor": null
+                },
+                "new": {
+                  "type": "undefined",
+                  "in": false,
+                  "own": false,
+                  "isExpected": false,
+                  "tag": "[object Undefined]",
+                  "descriptor": null
+                },
+                "keys": [
+                  "location"
+                ]
+              },
+              "removed": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "imageWithoutName": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              }
+            }
+          },
+          {
+            "name": "own-shadow-and-delete",
+            "value": {
+              "write": "returned",
+              "written": {
+                "type": "string",
+                "in": true,
+                "own": true,
+                "isExpected": false,
+                "tag": "[object String]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": false
+                }
+              },
+              "deleted": true,
+              "afterDelete": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "define": "returned",
+              "afterDefine": {
+                "type": "string",
+                "in": true,
+                "own": true,
+                "isExpected": false,
+                "tag": "[object String]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": false
+                }
+              }
+            }
+          },
+          {
+            "name": "iframe-named-value",
+            "value": {
+              "before": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "renamed": {
+                "old": {
+                  "type": "undefined",
+                  "in": false,
+                  "own": false,
+                  "isExpected": true,
+                  "tag": "[object Undefined]",
+                  "descriptor": null
+                },
+                "new": {
+                  "type": "undefined",
+                  "in": false,
+                  "own": false,
+                  "isExpected": false,
+                  "tag": "[object Undefined]",
+                  "descriptor": null
+                }
+              }
+            }
+          },
+          {
+            "name": "windowless-named-documents",
+            "value": {
+              "html": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": false,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "htmlKeys": [
+                "location"
+              ],
+              "xml": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "xmlKeys": [
+                "location"
+              ]
+            }
+          }
+        ],
+        "boundary": "Independent authored real DOM/Document factory observations; no fixture/assertion edits or expected-output lookup."
+      }
+    }
+  },
+  "events": [
+    {
+      "method": "Target.attachedToTarget",
+      "params": {
+        "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966",
+        "targetInfo": {
+          "targetId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7",
+          "type": "page",
+          "title": "",
+          "url": "about:blank",
+          "attached": true,
+          "canAccessOpener": false,
+          "browserContextId": "default"
+        },
+        "waitingForDebugger": false
+      }
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 1,
+          "origin": "null",
+          "name": "",
+          "uniqueId": "8b284bb6-0141-495f-b145-3f7a74c1cf5e",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7"
+          }
+        }
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7",
+        "url": "about:blank",
+        "loaderId": "58aae98d-0086-48e9-aa72-05de3ce8a789",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Runtime.executionContextsCleared",
+      "params": {},
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "frame": {
+          "id": "4170c730-106c-4d86-bdd2-cbbe04b62ff7",
+          "loaderId": "58aae98d-0086-48e9-aa72-05de3ce8a789",
+          "url": "http://127.0.0.1:34411/main",
+          "securityOrigin": "http://127.0.0.1:34411",
+          "mimeType": "text/html",
+          "domainAndRegistry": "",
+          "secureContextType": "InsecureScheme",
+          "crossOriginIsolatedContextType": "NotIsolated",
+          "gatedAPIFeatures": []
+        },
+        "type": "Navigation"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 2,
+          "origin": "http://127.0.0.1:34411",
+          "name": "",
+          "uniqueId": "2e850931-84aa-4cb8-8bdc-6212cb4decc6",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7"
+          }
+        }
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameAttached",
+      "params": {
+        "frameId": "2f1e3f3f-e5c2-4cf1-996d-a10f5018fc7f",
+        "parentFrameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "2f1e3f3f-e5c2-4cf1-996d-a10f5018fc7f",
+        "loaderId": "45f3424e-dd17-43ff-8378-13fd5a89477c",
+        "url": "http://127.0.0.1:34411/child?id=first",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "2f1e3f3f-e5c2-4cf1-996d-a10f5018fc7f"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "frame": {
+          "id": "2f1e3f3f-e5c2-4cf1-996d-a10f5018fc7f",
+          "parentId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7",
+          "loaderId": "45f3424e-dd17-43ff-8378-13fd5a89477c",
+          "url": "http://127.0.0.1:34411/child?id=first",
+          "name": "",
+          "securityOrigin": "http://127.0.0.1:34411",
+          "mimeType": "text/html"
+        },
+        "type": "Navigation"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 3,
+          "origin": "http://127.0.0.1:34411",
+          "name": "",
+          "uniqueId": "d5d9b5f2-d775-4fb1-9e0d-292ff0fe1038",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "2f1e3f3f-e5c2-4cf1-996d-a10f5018fc7f"
+          }
+        }
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "2f1e3f3f-e5c2-4cf1-996d-a10f5018fc7f"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.domContentEventFired",
+      "params": {
+        "timestamp": 1.2356723939999998
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.loadEventFired",
+      "params": {
+        "timestamp": 1.2360849
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "4170c730-106c-4d86-bdd2-cbbe04b62ff7"
+      },
+      "sessionId": "b3d6cb2d-682e-46d2-8926-3cb5846e1966"
+    }
+  ],
+  "stderr": "RedPanda/0.1.0 automation server listening on 127.0.0.1:44747\n(node:712412) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(Use `node --trace-warnings ...` to show where the warning was created)\n",
+  "exitCode": 0,
+  "signal": null,
+  "cleanup": "owned browser/client/server closed"
+}

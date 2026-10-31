@@ -1,0 +1,510 @@
+--- /dev/null
++++ b/src/data-transfer.js
+@@ -0,0 +1,126 @@
++// Shared real DataTransfer state. Only public definitions/results are allocated
++// in the selected VM; private stores, item records and Proxy traps stay Host.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {types} from 'node:util';
++import {implementationForWrapper} from './dom-event-state.js';
++import {platformFactoryRecord} from './platform-factories.js';
++import {createUtilityFileListProducer,fileWrapperImplementation,originalFileAPIPrototype} from './file-wrapper-realms.js';
++import {captureWindowTaskOwner} from './window-lifecycle-timers.js';
++import {getRuntimeBinding} from './native-runtime.js';
++import {installBlobReads} from './blob.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const conversions=require('webidl-conversions');
++const File=require('jsdom/lib/jsdom/living/generated/File.js'),FileList=require('jsdom/lib/jsdom/living/generated/FileList.js');
++const Element=require('jsdom/lib/jsdom/living/generated/Element.js'),ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const records=new WeakMap(),transfers=new WeakMap(),items=new WeakMap(),itemLists=new WeakMap();
++const apply=Reflect.apply,own=Object.getOwnPropertyDescriptor,define=Object.defineProperty,setPrototype=Object.setPrototypeOf,hasInstance=Function.prototype[Symbol.hasInstance];
++export const isDataTransfer=value=>transfers.has(value);
++function definitions(bridge){
++ const iteratorSymbol=bridge.iteratorSymbol;
++ class DataTransferItem{
++  constructor(){bridge.illegal()}
++  get kind(){return bridge.item(this,'kind')}
++  get type(){return bridge.item(this,'type')}
++  getAsFile(){return bridge.itemFile(this)}
++  getAsString(callback){return bridge.itemString(this,callback)}
++ }
++ class DataTransferItemList{
++  constructor(){bridge.illegal()}
++  get length(){return bridge.length(this)}
++  add(data,type){return bridge.add(this,arguments.length,data,type)}
++  remove(at){return bridge.remove(this,arguments.length,at)}
++  clear(){return bridge.clearItems(this)}
++  [iteratorSymbol](){const state=bridge.iterator(this);return{next(){return bridge.next(state)},[iteratorSymbol](){return this}}}
++ }
++ class DataTransfer{
++  constructor(){bridge.create(this)}
++  get items(){return bridge.transfer(this,'list')}
++  get files(){return bridge.transfer(this,'files')}
++  get types(){return bridge.types(this)}
++  get dropEffect(){return bridge.transfer(this,'dropEffect')}
++  set dropEffect(value){bridge.effect(this,'dropEffect',value)}
++  get effectAllowed(){return bridge.transfer(this,'effectAllowed')}
++  set effectAllowed(value){bridge.effect(this,'effectAllowed',value)}
++  getData(format){return bridge.getData(this,arguments.length,format)}
++  setData(format,data){return bridge.setData(this,arguments.length,format,data)}
++  clearData(format){return bridge.clearData(this,arguments.length,format)}
++  setDragImage(element,x,y){return bridge.dragImage(this,arguments.length,element,x,y)}
++ }
++ bridge.publish(DataTransfer,DataTransferItem,DataTransferItemList);
++}
++function plain(record,prototype=record.objectPrototype){return setPrototype(Reflect.construct(record.Object,[]),prototype)}
++function result(record,done,value){const object=plain(record);define(object,'done',{value:done,writable:true,enumerable:true,configurable:true});if(!done)define(object,'value',{value,writable:true,enumerable:true,configurable:true});return object}
++function indexed(record,state){
++ const target=plain(record,record.ItemList.prototype),index=key=>typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<4294967295;
++ const handler={
++  get(target,key,receiver){return index(key)?state.values[Number(key)]:Reflect.get(target,key,receiver)},
++  has(target,key){return index(key)?Number(key)<state.values.length:Reflect.has(target,key)},
++  ownKeys(target){return [...state.values.map((_,i)=>String(i)),...Reflect.ownKeys(target)]},
++  getOwnPropertyDescriptor(target,key){if(index(key)&&Number(key)<state.values.length)return{value:state.values[Number(key)],writable:false,enumerable:true,configurable:true};return Reflect.getOwnPropertyDescriptor(target,key)},
++  set(target,key,value,receiver){return index(key)||key==='length'?false:Reflect.set(target,key,value,receiver)},
++  defineProperty(target,key,descriptor){return index(key)?false:Reflect.defineProperty(target,key,descriptor)},
++  deleteProperty(target,key){return index(key)&&Number(key)<state.values.length?false:Reflect.deleteProperty(target,key)},
++  preventExtensions(){return false},
++ };
++ const value=Reflect.construct(record.Proxy,[target,handler]);itemLists.set(value,state);return value;
++}
++function install(page,globalObject,context,{utility=false}={}){
++ if(records.has(globalObject))return records.get(globalObject);
++ const selected=vm.isContext(context),intrinsic=name=>selected?vm.runInContext(name,context):globalThis[name];
++ const record=Object.assign(Object.create(null),{page,global:globalObject,context,utility,Object:intrinsic('Object'),Proxy:intrinsic('Proxy'),Array:intrinsic('Array'),TypeError:intrinsic('TypeError'),String:intrinsic('String'),Number:intrinsic('Number'),sourceTimer:globalObject.setTimeout,taskOwner:null});
++ record.conversionGlobals=Object.freeze({TypeError:record.TypeError,String:record.String,Number:record.Number});
++ record.objectPrototype=own(record.Object,'prototype').value;record.ArrayFrom=selected?vm.runInContext('Array.from',context):Array.from;
++ const createList=selected?createUtilityFileListProducer(context,globalObject,{allowLegacy:!page?.browser}):()=>FileList.create(globalObject,[],{});
++ const error=()=>new record.TypeError('invalid argument'),brand=(map,value)=>{const state=map.get(value);if(!state)throw new record.TypeError('Illegal invocation');return state};
++ const text=value=>{if(typeof value==='symbol')throw error();return String(value)},normalize=value=>{const raw=text(value).replace(/[A-Z]/g,x=>x.toLowerCase());return raw==='text'?'text/plain':raw==='url'?'text/uri-list':raw};
++ const makeItem=state=>{const value=plain(record,record.Item.prototype);items.set(value,state);return value};
++ const update=state=>{const list=fileWrapperImplementation(state.files)??utils.implForWrapper(state.files);list.length=0;for(const item of state.values){const value=items.get(item);if(value.kind==='file')list.push(fileWrapperImplementation(value.file)??utils.implForWrapper(value.file))}};
++ const isElement=value=>{if(!page?.browser)return Element.is(value);const implementation=platformFactoryRecord(value)?.implementation;return !types.isProxy(implementation)&&apply(hasInstance,ElementImpl,[implementation])};
++ const enqueue=(callback,value)=>{
++  if(!utility&&page?.browser){try{record.taskOwner??=captureWindowTaskOwner(page,globalObject);return record.taskOwner.schedule(()=>callback(value),0)}catch(error){if(record.taskOwner)throw error}}
++  return apply(record.sourceTimer,globalObject,[()=>callback(value),0]);
++ };
++ const bridge={
++  iteratorSymbol:Symbol.iterator,
++  illegal(){throw new record.TypeError('Illegal Constructor')},
++  publish(Transfer,Item,ItemList){
++   record.Transfer=Transfer;record.Item=Item;record.ItemList=ItemList;
++   for(const[name,Constructor]of[['DataTransferItem',Item],['DataTransferItemList',ItemList],['DataTransfer',Transfer]]){
++    define(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});
++    for(const key of Object.getOwnPropertyNames(Constructor.prototype)){if(key==='constructor')continue;const descriptor=own(Constructor.prototype,key);define(Constructor.prototype,key,{...descriptor,enumerable:true})}
++    define(globalObject,name,{value:Constructor,writable:true,configurable:true,enumerable:false});
++   }
++  },
++  create(receiver){const state=Object.assign(Object.create(null),{values:[],files:createList(),dropEffect:'none',effectAllowed:'none'});state.list=indexed(record,state);transfers.set(receiver,state)},
++  transfer(receiver,key){return brand(transfers,receiver)[key]},
++  item(receiver,key){return brand(items,receiver)[key]},
++  itemFile(receiver){const state=brand(items,receiver);return state.kind==='file'?state.file:null},
++  itemString(receiver,callback){const state=brand(items,receiver);if(callback==null)return;if(typeof callback!=='function')throw error();if(state.kind==='string')enqueue(callback,state.data)},
++  length(receiver){return brand(itemLists,receiver).values.length},
++  add(receiver,count,data,type){const state=brand(itemLists,receiver);let item;if(File.is(data))item=makeItem(Object.assign(Object.create(null),{kind:'file',type:fileWrapperImplementation(data)?.type??utils.implForWrapper(data).type,file:data}));else{if(count<2)throw error();item=makeItem(Object.assign(Object.create(null),{kind:'string',type:normalize(type),data:text(data)}))}state.values.push(item);update(state);return item},
++  remove(receiver,count,at){if(!count)throw error();const state=brand(itemLists,receiver);state.values.splice(conversions['unsigned long'](at,{globals:record.conversionGlobals}),1);update(state)},
++  clearItems(receiver){const state=brand(itemLists,receiver);state.values.length=0;update(state)},
++  iterator(receiver){return Object.assign(Object.create(null),{state:brand(itemLists,receiver),index:0})},
++  next(iterator){const done=iterator.index>=iterator.state.values.length;return result(record,done,done?undefined:iterator.state.values[iterator.index++])},
++  types(receiver){const state=brand(transfers,receiver),values=state.values.filter(item=>items.get(item).kind==='string').map(item=>items.get(item).type);if(state.values.some(item=>items.get(item).kind==='file'))values.push('Files');return apply(record.ArrayFrom,record.Array,[values])},
++  effect(receiver,key,value){const state=brand(transfers,receiver);value=text(value);if((key==='dropEffect'?['none','copy','link','move']:['none','copy','copyLink','copyMove','link','linkMove','move','all','uninitialized']).includes(value))state[key]=value},
++  getData(receiver,count,format){if(!count)throw error();const state=brand(transfers,receiver),raw=text(format),type=normalize(raw),item=state.values.find(item=>{const entry=items.get(item);return entry.kind==='string'&&entry.type===type});let value=item?items.get(item).data:'';if(raw.toLowerCase()==='url')value=value.split(/\r\n|\r|\n/).find(line=>line&&!line.startsWith('#'))??'';return value},
++  setData(receiver,count,format,data){if(count<2)throw error();const state=brand(transfers,receiver),type=normalize(format),value=text(data),item=state.values.find(item=>{const entry=items.get(item);return entry.kind==='string'&&entry.type===type});if(item)items.get(item).data=value;else state.values.push(makeItem(Object.assign(Object.create(null),{kind:'string',type,data:value})))},
++  clearData(receiver,count,format){const state=brand(transfers,receiver),type=count?normalize(format):null;state.values=state.values.filter(item=>{const entry=items.get(item);return entry.kind!=='string'||type!==null&&entry.type!==type});update(state)},
++  dragImage(receiver,count,element,x,y){const state=brand(transfers,receiver);if(count<3||!isElement(element))throw error();state.dragImage=Object.assign(Object.create(null),{element,x:conversions.long(x,{globals:record.conversionGlobals}),y:conversions.long(y,{globals:record.conversionGlobals})})},
++ };
++ if(selected)vm.compileFunction('('+definitions.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);else definitions(bridge);
++ records.set(globalObject,record);return record;
++}
++export function installDataTransfer(page,window){const record=install(page,window,implementationForWrapper(window)?._globalObject);return record.Transfer}
++export function installUtilityDataTransfer(page,world){
++ if(records.has(world.global))return records.get(world.global).Transfer;
++ // The canonical utility File/Blob definitions and private brands are already
++ // installed before any public transfer or FileList value is constructed.
++ const Prototype=originalFileAPIPrototype(world.context,world.global,'Blob');
++ installBlobReads(world.global,{prototype:Prototype});
++ const binding=getRuntimeBinding(),anchor=vm.runInContext('Object.prototype',world.context);
++ for(const name of['text','arrayBuffer','bytes','stream']){const descriptor=own(Prototype,name),operation=descriptor.value,value=binding.createEntry((_caller,receiver,args)=>apply(operation,receiver,args),anchor,name);define(value,'length',{value:operation.length,configurable:true});define(Prototype,name,{...descriptor,value})}
++ return install(page,world.global,world.context,{utility:true}).Transfer;
++}
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,4 @@
++import {utilityFileModule,wrapFileAPIView,fileWrapperImplementation,isFileAPIImplementation,fileAPIKind} from './file-wrapper-realms.js';
+ import {installDocumentXPathEntries} from './document-member-realms.js';
+ import {canonicalLocation,locationImplementation,installPrivateLocationUtils,prepareLocationContext,installLocationInterface,transformUtilityLocationInterfaces,createLocationAlias,installLocationWindowAlias} from './location-factory.js';
+ import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+@@ -51,9 +52,10 @@
+   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
+   const cached=wrappers.get(impl);if(cached)return cached;
+   const canonical=canonicalLocation(impl)??own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;for(const resolver of targetWrappers){const wrapper=resolver(canonical,impl);if(wrapper)return wrapper;}
++  if(isFileAPIImplementation(impl)){const value=wrapFileAPIView(context,global,impl);wrappers.set(impl,value);if(fileAPIKind(impl)!=='File'){register(value,impl,fileAPIKind(impl));if(objectLike(canonical))mainWrappers.set(canonical,impl)}return value;}
+   const metric=viewportTargetInterface(impl);if(metric){const wrapper=wrapViewportTarget(context,impl);wrappers.set(impl,wrapper);register(wrapper,impl,metric);return wrapper;}
+   const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
+-  const name=canonicalLocation(impl)?'Location':interfaceFor(impl);if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
++  const name=canonicalLocation(impl)?'Location':interfaceFor(impl);if(['Blob','File','FileList'].includes(name))return canonical;if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+   if(webSocketImplementation(wrapper))bindWebSocketImplementation(wrapper,impl);else if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(directEventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+@@ -63,13 +65,14 @@
+  function wrap(value){
+   if(!objectLike(value))return value;if(value===mainWindow||value===mainWindow._globalProxy)return global;if(value===global||wrapperImpls.has(value))return value;const otherWindow=resolveWindow?.(value);if(otherWindow)return otherWindow;
+   const known=mainWrappers.get(value);if(known)return wrapImpl(known);
++  const privateFile=fileWrapperImplementation(value);if(privateFile)return wrapImpl(privateFile);
+   if(types.isProxy(value))return value;
+   const privateLocation=locationImplementation(value);if(privateLocation)return wrapImpl(privateLocation);if(canonicalLocation(value))return wrapImpl(value);
+   const privateEvent=eventImplementation(value);if(privateEvent)return wrapImpl(privateEvent);const privateTarget=directEventTargetImplementation(value);if(privateTarget)return wrapImpl(privateTarget);
+   const candidate=own(value,hostUtils.implSymbol)?.value;
+-  if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
++  if(candidate&&!isFileAPIImplementation(candidate)&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
+   const canonical=own(value,hostUtils.wrapperSymbol)?.value;
+-  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical),target=directEventTargetImplementation(canonical);if(event?event===value:target?target===value:locationImplementation(canonical)===value||own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
++  if(canonical&&objectLike(canonical)&&!isFileAPIImplementation(value)){const event=eventImplementation(canonical),target=directEventTargetImplementation(canonical);if(event?event===value:target?target===value:locationImplementation(canonical)===value||own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
+   if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
+   return value;
+  }
+@@ -85,6 +88,7 @@
+   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
+  }
+  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
++  if(filename.startsWith(generatedRoot+'/')){const kind=filename.slice(generatedRoot.length+1,-3),fileModule=utilityFileModule(kind,context,global);if(fileModule){modules.set(filename,{exports:fileModule});return fileModule;}}
+   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
+   let source=readFileSync(filename,'utf8');if(filename===interfacesPath)source=transformUtilityLocationInterfaces(source);const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);if(interfaceName==='EventTarget')source=transformPrivateEventTargetSource(source);if(interfaceName==='WebSocket'){
+    source=transformPrivateWebSocketSource(source).replace('return Object.create(proto);','return createShell(globalObject, proto);').replaceAll('exports.setup(Object.create(new.target.prototype),','exports.setup(createShell(globalObject, new.target.prototype),');
+@@ -93,7 +97,8 @@
+    // utility-VM definitions and the same canonical generated setup receiver.
+    const ObjectType=global.Object,createShell=(_global,prototype)=>Object.setPrototypeOf(Reflect.construct(ObjectType,[]),prototype);
+    vm.compileFunction(source,['require','module','exports','__filename','__dirname','createShell','installEventIDLRealm'],{filename})(localRequire,module,module.exports,filename,dirname(filename),createShell,(g,...args)=>installEventIDLRealm(g,...args,context));
+-  }else{const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));}
++  }else if(filename===interfacesPath){vm.compileFunction(source,['require','module','exports','__filename','__dirname'],{filename})(localRequire,module,module.exports,filename,dirname(filename));}
++  else{const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));}
+   configureEventDictionary(interfaceName,module.exports);
+   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
+    // Measured native producer quirk: MO arguments are real main-world values,
+--- a/src/blob.js
++++ b/src/blob.js
+@@ -9,7 +9,7 @@
+ 
+ // Immutable Blob/File data is independent of a live document or FileReader.
+ // Every read produces a real copy in the owning realm.
+-export function installBlobReads(window) {
++export function installBlobReads(window, { prototype = window.Blob.prototype } = {}) {
+   if (installed.has(window)) return;
+   installed.add(window);
+   const Promise = window.Promise, Bytes = window.Uint8Array, TypeError = window.TypeError;
+@@ -20,7 +20,7 @@
+   };
+   const copy = data => { const bytes = new Bytes(data.length); setBytes.call(bytes, data); return bytes; };
+   for (const kind of ['text', 'arrayBuffer', 'bytes']) {
+-    Object.defineProperty(window.Blob.prototype, kind, { configurable: true, writable: true,
++    Object.defineProperty(prototype, kind, { configurable: true, writable: true,
+       value: function () {
+         return new Promise(resolve => {
+           const data = snapshot(this);
+@@ -29,7 +29,7 @@
+       },
+     });
+   }
+-  Object.defineProperty(window.Blob.prototype, 'stream', { configurable: true, writable: true,
++  Object.defineProperty(prototype, 'stream', { configurable: true, writable: true,
+     value: function () {
+       const data = snapshot(this); let offset = 0;
+       return new Readable({ pull(controller) {
+--- a/src/file-wrapper-realms.js
++++ b/src/file-wrapper-realms.js
+@@ -11,7 +11,7 @@
+ import {registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-kinds.js';
+ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+-const identities=new WeakMap(),hasInstance=Function.prototype[Symbol.hasInstance];
++const identities=new WeakMap(),implementationKinds=new WeakMap(),hasInstance=Function.prototype[Symbol.hasInstance];
+ const realms=new WeakMap(),pageRealms=new WeakMap(),incumbents=[],listAllocations=[],pendingBackends=new WeakMap(),lazyFiles=new WeakSet(),adaptedHandlers=new WeakSet();
+ const iterators=new WeakMap(),fileFronts=new WeakMap();
+ const FileImplementation=require('jsdom/lib/jsdom/living/file-api/File-impl.js').implementation;
+@@ -20,16 +20,17 @@
+ // the implementation, class/function creation and state are independent.
+ const ITERATOR_PUBLIC_NAME='browser.webapi.collections.iterator.Entry(browser.webapi.FileList.Iterator__struct_26,null).JsApi';
+ const pins=Object.freeze({Blob:'d086a0782c57b196cd2759aec9358578bbe07137abdc72e2da44391536b0b648',File:'daf94ff0921904e6ff8ac976e834a94f0ed7dd2c9d2dc6d2bf76493945fc1db9',FileList:'5bbe3385bfc31337a3ad4e25da7c0fd5c1a6b17f4d09aa6ada790370a8fe7ddd'});
+-let installed=false;
++let installed=false,fileShell;
++const utilityModules=new WeakMap(),viewData=new WeakSet(),canonicalFronts=new WeakMap();
+ export function fileWrapperImplementation(value){return identities.get(value)}
+ const brand=(value,Implementation)=>Reflect.apply(hasInstance,Implementation,[identities.get(value)]);
+-function remember(wrapper){const implementation=utils.implForWrapper(wrapper);if(!implementation)throw new TypeError('A successful canonical file factory is required');identities.set(wrapper,implementation);if(Reflect.apply(hasInstance,FileImplementation,[implementation])){const previous=fileFronts.get(implementation);if(previous&&previous!==wrapper)throw new TypeError('A canonical File frontend cannot be replaced');fileFronts.set(implementation,wrapper)}return wrapper}
++function remember(wrapper){const implementation=utils.implForWrapper(wrapper);if(!implementation)throw new TypeError('A successful canonical file factory is required');identities.set(wrapper,implementation);if(!implementationKinds.has(implementation))implementationKinds.set(implementation,Reflect.apply(hasInstance,FileImplementation,[implementation])?'File':Reflect.apply(hasInstance,ListImplementation,[implementation])?'FileList':'Blob');if(implementationKinds.get(implementation)==='File'){const previous=fileFronts.get(implementation);if(previous&&previous!==wrapper)throw new TypeError('A canonical File frontend cannot be replaced');fileFronts.set(implementation,wrapper)}return wrapper}
+ function realm(globalObject){
+  let record=realms.get(globalObject);if(record)return record;
+  const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
+  if(!context||!vm.isContext(context))return null;
+  const global=vm.runInContext('globalThis',context),Object=vm.runInContext('Object',context);
+- record=realms.get(context);if(!record){record=globalThis.Object.assign(globalThis.Object.create(null),{context,global,Object,TypeError:vm.runInContext('TypeError',context),root:null,iterator:null,prototypes:globalThis.Object.create(null)});realms.set(context,record);realms.set(global,record)}
++ record=realms.get(context);if(!record){record=globalThis.Object.assign(globalThis.Object.create(null),{context,global,Object,TypeError:vm.runInContext('TypeError',context),String:vm.runInContext('String',context),Number:vm.runInContext('Number',context),root:null,iterator:null,prototypes:globalThis.Object.create(null)});realms.set(context,record);realms.set(global,record)}
+  realms.set(globalObject,record);return record;
+ }
+ function scope(record,operation){incumbents.push(record);try{return operation()}finally{if(incumbents.pop()!==record)throw Error('File incumbent scope mismatch')}}
+@@ -56,7 +57,7 @@
+ export function createDiskFileImplementation(globalObject,args){
+  // Genuine independent jsdom File backend, with actual disk data. It has no
+  // public wrapper until an actual page indexed/item/iterator access asks.
+- const implementation=Reflect.construct(FileImplementation,[globalObject,args,globalThis.Object.create(null)]);lazyFiles.add(implementation);return implementation;
++ const implementation=Reflect.construct(FileImplementation,[globalObject,args,globalThis.Object.create(null)]);lazyFiles.add(implementation);implementationKinds.set(implementation,'File');return implementation;
+ }
+ function implementation(globalObject,args,privateData,Implementation){
+  const existing=pendingBackends.get(privateData);if(existing){pendingBackends.delete(privateData);return existing}
+@@ -98,7 +99,7 @@
+  },'',false,true),writable:true,configurable:true});
+ }
+ export function installFileWrapperRealms(createShell,createProxy){
+- if(installed)return;installed=true;
++ if(installed)return;installed=true;fileShell=createShell;
+  if(require('jsdom/package.json').version!=='26.1.0')throw Error('Pinned file-api jsdom version changed');
+  for(const kind of ['Blob','File','FileList']){
+   const filename=require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),factory=require(filename),original=readFileSync(filename,'utf8');
+@@ -108,7 +109,7 @@
+   replace('return Object.create(proto);',`return createShell(globalObject, proto, ${JSON.stringify(kind)});`);
+   replace('proto = globalObject[ctorRegistrySymbol]["'+kind+'"].prototype;','proto = originalPrototype(globalObject, '+JSON.stringify(kind)+');');
+   replace('utils.isObject(value) && utils.hasOwn(value, implSymbol) && value[implSymbol] instanceof Impl.implementation','privateBrand(value, Impl.implementation)');
+-  if(kind==='File')replace('value: new Impl.implementation(globalObject, constructorArgs, privateData),','value: selectedImplementation(globalObject, constructorArgs, privateData, Impl.implementation),');
++  replace('value: new Impl.implementation(globalObject, constructorArgs, privateData),','value: selectedImplementation(globalObject, constructorArgs, privateData, Impl.implementation),');
+   // Bind immediately after the genuine backend exists, before the original
+   // Proxy/init/backend links read it. Authored symbol getters never supply
+   // authority or backing for these generated public operations.
+@@ -116,6 +117,9 @@
+   replace(setupEnd,setupEnd+'\n  remember(wrapper);',2);
+   for(const name of ['wrapper','esValue','value','target'])source=source.replaceAll(name+'[implSymbol]','privateImplementation('+name+')');
+   source=source.replaceAll('utils.implForWrapper(', 'privateImplementation(');
++  const publication='privateImplementation(wrapper)[utils.wrapperSymbol] = wrapper;';
++  if(source.split(publication).length!==3)throw Error('Pinned file canonical publication changed: '+kind);
++  source=source.replace(publication,'publishWrapper(privateImplementation(wrapper), wrapper, privateData);');
+   if(kind==='FileList'){
+    replace('return new Proxy(wrapper, proxyHandler);','return createProxy(wrapper, proxyHandler, globalObject, "FileList");');
+    replace('utils.tryWrapperForImpl(indexedValue)','wrapFile(indexedValue, this._globalObject)',2);
+@@ -135,10 +139,71 @@
+    }
+    const value=createProxy(target,handler,globalObject,name);identities.set(value,identities.get(target));return value;
+   };
+-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','privateBrand','privateImplementation','remember','selectedImplementation','wrapFile','installListIterator','originalPrototype','capturePrototype'],{filename})(factory,createRequire(filename),module,filename,filename.slice(0,filename.lastIndexOf('/')),shell,proxy,brand,fileWrapperImplementation,remember,implementation,wrapFile,installListIterator,originalPrototype,capturePrototype);
++  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','privateBrand','privateImplementation','remember','selectedImplementation','wrapFile','installListIterator','originalPrototype','capturePrototype','publishWrapper'],{filename})(factory,createRequire(filename),module,filename,filename.slice(0,filename.lastIndexOf('/')),shell,proxy,brand,fileWrapperImplementation,remember,implementation,wrapFile,installListIterator,originalPrototype,capturePrototype,publishWrapper);
+   if(module.exports!==factory)throw Error('Canonical generated file-api exports changed: '+kind);
+   const setup=factory.setup,allocate=factory.new;
+   factory.setup=function(...args){return remember(Reflect.apply(setup,this,args))};
+-  factory.new=function(...args){const implementation=Reflect.apply(allocate,this,args);remember(utils.wrapperForImpl(implementation));return implementation};
++  factory.new=function(...args){const implementation=Reflect.apply(allocate,this,args),wrapper=utils.wrapperForImpl(implementation);remember(wrapper);if(!canonicalFronts.has(implementation))canonicalFronts.set(implementation,wrapper);return implementation};
+  }
+ }
++
++// A view binds its real existing backend before its sole Proxy is created. The
++// original canonical frontend is retained, never redirected through a dummy.
++function publishWrapper(implementation,wrapper,privateData){
++ const previous=canonicalFronts.get(implementation);
++ if(!previous){canonicalFronts.set(implementation,wrapper);implementation[utils.wrapperSymbol]=wrapper}
++ else if(!viewData.has(privateData)&&previous!==wrapper)throw new TypeError('A canonical file frontend cannot be replaced');
++}
++export function isFileAPIImplementation(value){return implementationKinds.has(value)}
++export function fileAPIKind(value){return implementationKinds.get(value)}
++function trustedUtility(context,globalObject){
++ if(!vm.isContext(context)||vm.runInContext('this',context)!==globalObject)throw new TypeError('An actual utility File Context/global pair is required');
++ const record=realm(context);if(record.global!==globalObject)throw new TypeError('File realm cannot be retargeted');return record;
++}
++export function createUtilityFileListProducer(context,globalObject,{allowLegacy=false}={}){
++ if(!installed&&allowLegacy){const create=require('jsdom/lib/jsdom/living/generated/FileList.js').create;return()=>Reflect.apply(create,undefined,[globalObject,[],Object.create(null)])}
++ const record=trustedUtility(context,globalObject);
++ if(!record.prototypes.FileList)throw new TypeError('The original utility FileList definition must be installed first');
++ const create=require('jsdom/lib/jsdom/living/generated/FileList.js').create;
++ return()=>Reflect.apply(create,undefined,[globalObject,[],Object.create(null)]);
++}
++export function wrapFileAPIView(context,globalObject,value){
++ if(!isFileAPIImplementation(value))return undefined;
++ trustedUtility(context,globalObject);
++ // A File always retains its original actual first frontend, including lazy
++ // disk files. FileList and Blob views need distinct genuine realm frontends.
++ if(implementationKinds.get(value)==='File')return fileFronts.get(value)??wrapFile(value,globalObject,true);
++ const kind=implementationKinds.get(value),factory=require('jsdom/lib/jsdom/living/generated/'+kind+'.js'),data=Object.create(null);
++ pendingBackends.set(data,value);viewData.add(data);
++ try{return factory.create(globalObject,[],data)}finally{pendingBackends.delete(data);viewData.delete(data)}
++}
++// Only original public generated interface bodies execute in the utility VM.
++// All module/setup/conversion/identity state stays in the same canonical Host
++// factory graph. No local symbol-based is/convert or dummy canonical frontend.
++export function utilityFileModule(kind,context,globalObject){
++ if(!['Blob','File','FileList'].includes(kind))return undefined;
++ if(!installed||!fileShell)return undefined;
++ const record=trustedUtility(context,globalObject);let modules=utilityModules.get(context);if(!modules){modules=new Map();utilityModules.set(context,modules)}if(modules.has(kind))return modules.get(kind);
++ const filename=require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),factory=require(filename),source=readFileSync(filename,'utf8');
++ if(createHash('sha256').update(source).digest('hex')!==pins[kind])throw Error('Pinned utility file source changed: '+kind);
++ const signature='exports.install = (globalObject, globalNames) => {\n',start=source.indexOf(signature),end=source.indexOf('\n};\n',start),header=source.slice(0,source.indexOf('exports.is = ')),exposed=source.match(/^const exposed = .*;$/m)?.[0],footer=source.slice(source.lastIndexOf('const Impl = require('));
++ if(start<0||end<start||!exposed||source.split(signature).length!==2)throw Error('Pinned utility file installer shape changed: '+kind);
++ const names=[...header.matchAll(/^const ([A-Za-z0-9_]+) =/gm)].map(match=>match[1]);
++ const values=vm.compileFunction(header+'\n'+exposed+'\n'+footer+'\nreturn ['+[...names,'exposed','Impl'].join(',')+'];',['require'],{filename})(createRequire(filename));
++ let body=source.slice(start+signature.length,end);
++ const change=(from,to,count)=>{if(body.split(from).length-1!==count)throw Error('Pinned utility file signature changed: '+kind+':'+from);body=body.replaceAll(from,to)};
++ change('const args = [];','const args = newPrivateArguments();',kind==='Blob'?2:1);
++ if(kind!=='FileList'){change('const V = [];','const V = newPrivateArguments();',1);change('exports.setup(Object.create(new.target.prototype),','exports.setup(createShell(globalObject, new.target.prototype, '+JSON.stringify(kind)+'),',1)}
++ body=body.replaceAll('globalObject.TypeError','originalTypeError').replaceAll('globals: globalObject','globals: conversionGlobals').replaceAll('ArrayBuffer.isView(','originalIsView(').replaceAll('PropertyBag.convert(globalObject,','PropertyBag.convert(conversionGlobals,');
++ body=body.replaceAll('utils.implForWrapper(', 'privateImplementation(').replaceAll('esValue[implSymbol]','privateImplementation(esValue)');
++ if(kind==='FileList')change('utils.tryWrapperForImpl(privateImplementation(esValue).item(...args))','wrapFile(privateImplementation(esValue).item(...args), globalObject, true)',1);
++ const assignment='  ctorRegistry[interfaceName] = '+kind+';',publication='  capturePrototype(globalObject, '+JSON.stringify(kind)+', '+kind+'.prototype);\n'+(kind==='FileList'?'  installListIterator(globalObject, FileList.prototype, FileList.prototype.item);\n':'');change(assignment,publication+assignment,1);
++ const conversionGlobals=Object.freeze({TypeError:record.TypeError,String:record.String,Number:record.Number}),extraNames=['exports','createShell','privateImplementation','newPrivateArguments','wrapFile','capturePrototype','installListIterator','originalTypeError','conversionGlobals','originalIsView'],extraValues=[factory,fileShell,fileWrapperImplementation,()=>[],wrapFile,capturePrototype,installListIterator,record.TypeError,conversionGlobals,vm.runInContext('ArrayBuffer.isView',context)];
++ const install=vm.compileFunction('"use strict";\n'+body,['globalObject','globalNames',...names,'exposed','Impl',...extraNames],{parsingContext:context,filename});
++ const facade=Object.assign(Object.create(null),factory),convert=factory.convert;
++ facade.convert=(_global,value,options)=>Reflect.apply(convert,factory,[conversionGlobals,value,options]);
++ facade.install=(selected,globalNames)=>{if(selected!==globalObject)throw new TypeError('Utility file installation cannot change realm');return install(globalObject,globalNames,...values,...extraValues)};
++ modules.set(kind,facade);return facade;
++}
++
++export function originalFileAPIPrototype(context,globalObject,kind){const record=trustedUtility(context,globalObject),prototype=record.prototypes[kind];if(!prototype)throw new TypeError('An original installed File interface is required');return prototype;}
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installUtilityDataTransfer} from './data-transfer.js';
+ import {installFetch} from './fetch.js';
+ import {installJavaScriptDialogs} from './javascript-dialogs.js';
+ import {installUtilityMessaging} from './messaging.js';
+@@ -52,7 +53,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLElementState(page,record.global,{context:record.context,mainWindow:window});installHTMLReflections(record.global,{context:record.context});installFetch(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source)});const utilityMessaging=installUtilityMessaging(page,record.controller);installSharedWorkers(page,record.global,{enabled:page.browser.options.loadResources===undefined||page.browser.options.loadResources.includes('worker'),mainWindow:window,messaging:utilityMessaging,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installJavaScriptDialogs(page,record.global,{context:record.context,mainWindow:window});installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLElementState(page,record.global,{context:record.context,mainWindow:window});installHTMLReflections(record.global,{context:record.context});installFetch(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source)});installUtilityDataTransfer(page,record.controller);const utilityMessaging=installUtilityMessaging(page,record.controller);installSharedWorkers(page,record.global,{enabled:page.browser.options.loadResources===undefined||page.browser.options.loadResources.includes('worker'),mainWindow:window,messaging:utilityMessaging,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installJavaScriptDialogs(page,record.global,{context:record.context,mainWindow:window});installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/dom-events.js
++++ b/src/dom-events.js
+@@ -1,3 +1,4 @@
++import {installDataTransfer,isDataTransfer} from './data-transfer.js';
+ import {installEventAPIParity,eventFactoryType,createDocumentEvent} from './event-api-parity.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import 'jsdom';
+@@ -6,14 +7,12 @@
+ 
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
+-const File=require('jsdom/lib/jsdom/living/generated/File.js');
+-const FileList=require('jsdom/lib/jsdom/living/generated/FileList.js');
+ const installed=new WeakMap();
+ // Interface brands are shared across actual realms without replacing
+ // instanceof or turning arbitrary lookalike objects into DOM interface values.
+-const shared={transfers:new WeakMap(),items:new WeakMap(),itemLists:new WeakMap(),touches:new WeakMap(),touchLists:new WeakMap(),events:new WeakMap()};
+-function factory(g,bridge){
+- const{transfers,items,itemLists,touches,touchLists,events}=bridge.shared;
++const shared={touches:new WeakMap(),touchLists:new WeakMap(),events:new WeakMap()};
++function factory(g,bridge,DataTransfer){
++ const{touches,touchLists,events}=bridge.shared;
+  const error=()=>new g.TypeError('invalid argument'),illegal=()=>{throw new g.TypeError('Illegal Constructor');};
+  const brand=(map,value)=>{const state=map.get(value);if(!state)throw new g.TypeError('Illegal invocation');return state;};
+  const dictionary=value=>{if(value==null)return{};if(!['object','function'].includes(typeof value))throw error();return value;};
+@@ -22,24 +21,10 @@
+  const restricted=(value,single=false)=>{let result=number(value);if(single)result=Math.fround(result);if(!Number.isFinite(result))throw new g.TypeError('TouchInit member is not a finite number');return result;};
+  const index=value=>number(value)>>>0;
+  const tag=(Constructor,name)=>Object.defineProperty(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});
+- const normalize=value=>{const raw=string(value).replace(/[A-Z]/g,x=>x.toLowerCase());return raw==='text'?'text/plain':raw==='url'?'text/uri-list':raw;};
+  function indexed(Constructor,map,state,values,iterable=false){const object=Object.create(Constructor.prototype),isIndex=key=>typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<4294967295;
+   const proxy=new g.Proxy(object,{get(target,key,receiver){return isIndex(key)?values()[Number(key)]:Reflect.get(target,key,receiver);},has(target,key){return isIndex(key)?Number(key)<values().length:Reflect.has(target,key);},ownKeys(target){return [...values().map((_,i)=>String(i)),...Reflect.ownKeys(target)];},getOwnPropertyDescriptor(target,key){if(isIndex(key)&&Number(key)<values().length)return{value:values()[Number(key)],writable:false,enumerable:true,configurable:true};return Reflect.getOwnPropertyDescriptor(target,key);},set(target,key,value,receiver){return isIndex(key)||key==='length'?false:Reflect.set(target,key,value,receiver);},defineProperty(target,key,descriptor){return isIndex(key)?false:Reflect.defineProperty(target,key,descriptor);},deleteProperty(target,key){return isIndex(key)&&Number(key)<values().length?false:Reflect.deleteProperty(target,key);},preventExtensions(){return false;}});map.set(proxy,state);return proxy;
+  }
+- const updateFiles=state=>bridge.files(state.files,state.values.filter(item=>items.get(item).kind==='file').map(item=>items.get(item).file));
+- class DataTransferItem{constructor(){illegal();}get kind(){return brand(items,this).kind;}get type(){return brand(items,this).type;}getAsFile(){const s=brand(items,this);return s.kind==='file'?s.file:null;}getAsString(callback){const s=brand(items,this);if(callback==null)return;if(typeof callback!=='function')throw error();if(s.kind==='string'){const value=s.data;g.setTimeout(()=>callback(value),0);}}}
+- tag(DataTransferItem,'DataTransferItem');
+- function makeItem(state){const object=Object.create(DataTransferItem.prototype);items.set(object,state);return object;}
+- class DataTransferItemList{constructor(){illegal();}get length(){return brand(itemLists,this).values.length;}add(data,type){const s=brand(itemLists,this);let item;if(bridge.isFile(data))item=makeItem({kind:'file',type:bridge.fileType(data),file:data});else{if(arguments.length<2)throw error();item=makeItem({kind:'string',type:normalize(type),data:string(data)});}s.values.push(item);updateFiles(s);return item;}remove(at){if(!arguments.length)throw error();const s=brand(itemLists,this);s.values.splice(index(at),1);updateFiles(s);}clear(){const s=brand(itemLists,this);s.values.length=0;updateFiles(s);}[Symbol.iterator](){const state=brand(itemLists,this);let cursor=0;return{next(){return cursor<state.values.length?{done:false,value:state.values[cursor++]}:{done:true,value:undefined};},[Symbol.iterator](){return this;}};}}
+- tag(DataTransferItemList,'DataTransferItemList');
+- class DataTransfer{constructor(){const state={values:[],files:bridge.fileList(),dropEffect:'none',effectAllowed:'none'};state.list=indexed(DataTransferItemList,itemLists,state,()=>state.values,true);transfers.set(this,state);}get items(){return brand(transfers,this).list;}get files(){return brand(transfers,this).files;}get types(){const s=brand(transfers,this),result=s.values.filter(item=>items.get(item).kind==='string').map(item=>items.get(item).type);if(s.values.some(item=>items.get(item).kind==='file'))result.push('Files');return g.Array.from(result);}get dropEffect(){return brand(transfers,this).dropEffect;}set dropEffect(value){const s=brand(transfers,this);value=string(value);if(['none','copy','link','move'].includes(value))s.dropEffect=value;}get effectAllowed(){return brand(transfers,this).effectAllowed;}set effectAllowed(value){const s=brand(transfers,this);value=string(value);if(['none','copy','copyLink','copyMove','link','linkMove','move','all','uninitialized'].includes(value))s.effectAllowed=value;}
+-  getData(format){if(!arguments.length)throw error();const s=brand(transfers,this),raw=string(format),type=normalize(raw),item=s.values.find(item=>{const x=items.get(item);return x.kind==='string'&&x.type===type;});let value=item?items.get(item).data:'';if(raw.toLowerCase()==='url')value=value.split(/\r\n|\r|\n/).find(line=>line&&!line.startsWith('#'))??'';return value;}
+-  setData(format,data){if(arguments.length<2)throw error();const s=brand(transfers,this),type=normalize(format),value=string(data),item=s.values.find(item=>{const x=items.get(item);return x.kind==='string'&&x.type===type;});if(item)items.get(item).data=value;else s.values.push(makeItem({kind:'string',type,data:value}));}
+-  clearData(format){const s=brand(transfers,this),type=arguments.length?normalize(format):null;s.values=s.values.filter(item=>{const x=items.get(item);return x.kind!=='string'||(type!==null&&x.type!==type);});updateFiles(s);}
+-  setDragImage(element,x,y){const s=brand(transfers,this);if(arguments.length<3||!bridge.isElement(element))throw error();s.dragImage={element,x:number(x)|0,y:number(y)|0};}
+- }
+- tag(DataTransfer,'DataTransfer');
+- class DragEvent extends g.MouseEvent{constructor(type,init={}){if(!arguments.length)throw error();init=dictionary(init);const coordinates=new Map(),coordinateNames=new Set(['clientX','clientY','screenX','screenY']),proxy=new g.Proxy(init,{get(target,key){if(coordinateNames.has(key)){if(!coordinates.has(key)){const value=Reflect.get(target,key,target);coordinates.set(key,value===undefined?0:Math.floor(number(value)));}const value=coordinates.get(key);return Number.isFinite(value)?value:0;}return Reflect.get(target,key,target);}});super(type,proxy);for(const[key,value]of coordinates)bridge.coordinate(this,key,value);const value=init.dataTransfer??null;if(value!==null&&!transfers.has(value))throw error();events.set(this,{kind:'drag',dataTransfer:value});}get dataTransfer(){const s=brand(events,this);if(s.kind!=='drag')throw error();return s.dataTransfer;}}
++ class DragEvent extends g.MouseEvent{constructor(type,init={}){if(!arguments.length)throw error();init=dictionary(init);const coordinates=new Map(),coordinateNames=new Set(['clientX','clientY','screenX','screenY']),proxy=new g.Proxy(init,{get(target,key){if(coordinateNames.has(key)){if(!coordinates.has(key)){const value=Reflect.get(target,key,target);coordinates.set(key,value===undefined?0:Math.floor(number(value)));}const value=coordinates.get(key);return Number.isFinite(value)?value:0;}return Reflect.get(target,key,target);}});super(type,proxy);for(const[key,value]of coordinates)bridge.coordinate(this,key,value);const value=init.dataTransfer??null;if(value!==null&&!bridge.isDataTransfer(value))throw error();events.set(this,{kind:'drag',dataTransfer:value});}get dataTransfer(){const s=brand(events,this);if(s.kind!=='drag')throw error();return s.dataTransfer;}}
+  tag(DragEvent,'DragEvent');
+  class TextEvent extends g.UIEvent{constructor(){illegal();}get data(){const s=brand(events,this);if(s.kind!=='text')throw error();return s.data;}initTextEvent(type,bubbles=false,cancelable=false,view=null,data='undefined'){const s=brand(events,this);if(s.kind!=='text')throw error();if(!arguments.length)throw error();if(bridge.dispatching(this))return;g.UIEvent.prototype.initUIEvent.call(this,type,bubbles,cancelable,view,0);s.data=data==null?'undefined':string(data);}}
+  tag(TextEvent,'TextEvent');
+@@ -52,7 +37,7 @@
+  function touchList(value){const array=[];if(value!==undefined){if(value===null||!['object','function'].includes(typeof value)||typeof value[Symbol.iterator]!=='function')throw error();for(const item of value){if(!touches.has(item))throw error();array.push(item);}}return indexed(TouchList,touchLists,array,()=>array);}
+  class TouchEvent extends g.UIEvent{constructor(type,init={}){if(!arguments.length)throw error();init=dictionary(init);super(type,init);const state={kind:'touch'};for(const key of['altKey','ctrlKey','metaKey','shiftKey'])state[key]=!!init[key];for(const key of['changedTouches','targetTouches','touches'])state[key]=touchList(init[key]);events.set(this,state);}}
+  tag(TouchEvent,'TouchEvent');for(const key of['touches','targetTouches','changedTouches','altKey','metaKey','ctrlKey','shiftKey'])Object.defineProperty(TouchEvent.prototype,key,{configurable:true,enumerable:true,get(){const s=brand(events,this);if(s.kind!=='touch')throw error();return s[key];}});
+- for(const Constructor of[DataTransferItem,DataTransferItemList,DataTransfer,DragEvent,TextEvent,TouchList])for(const key of Object.getOwnPropertyNames(Constructor.prototype)){if(key==='constructor')continue;const descriptor=Object.getOwnPropertyDescriptor(Constructor.prototype,key);Object.defineProperty(Constructor.prototype,key,{...descriptor,enumerable:true});}
+- for(const[name,value]of Object.entries({DataTransferItem,DataTransferItemList,DataTransfer,DragEvent,TextEvent,Touch,TouchList,TouchEvent}))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:false});return{DataTransfer,DragEvent,TextEvent,Touch,TouchEvent};
++ for(const Constructor of[DragEvent,TextEvent,TouchList])for(const key of Object.getOwnPropertyNames(Constructor.prototype)){if(key==='constructor')continue;const descriptor=Object.getOwnPropertyDescriptor(Constructor.prototype,key);Object.defineProperty(Constructor.prototype,key,{...descriptor,enumerable:true});}
++ for(const[name,value]of Object.entries({DragEvent,TextEvent,Touch,TouchList,TouchEvent}))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:false});return{DataTransfer,DragEvent,TextEvent,Touch,TouchEvent};
+ }
+-export function installDOMEvents(page,window){installEventAPIParity(window);if(installed.has(window))return installed.get(window);const controller=window.eval(`(${factory.toString()})`)(window,{shared,eventType:(receiver,args)=>eventFactoryType(window,receiver,args),createEvent:(receiver,type)=>createDocumentEvent(window,receiver,type),isFile:File.is,isElement:Element.is,isEventTarget:EventTarget.is,fileType:file=>implForWrapper(file).type,fileList:()=>FileList.create(window,[],{}),files(list,values){const impl=implForWrapper(list);impl.length=0;for(const value of values)impl.push(implForWrapper(value));},coordinate(event,key,value){implForWrapper(event)[key]=value;},dispatching:event=>implForWrapper(event)._dispatchFlag});installed.set(window,controller);return controller;}
++export function installDOMEvents(page,window){installEventAPIParity(window);if(installed.has(window))return installed.get(window);const DataTransfer=installDataTransfer(page,window),controller=window.eval(`(${factory.toString()})`)(window,{shared,isDataTransfer,eventType:(receiver,args)=>eventFactoryType(window,receiver,args),createEvent:(receiver,type)=>createDocumentEvent(window,receiver,type),isElement:Element.is,isEventTarget:EventTarget.is,coordinate(event,key,value){implForWrapper(event)[key]=value;},dispatching:event=>implForWrapper(event)._dispatchFlag},DataTransfer);installed.set(window,controller);return controller;}
+--- /dev/null
++++ b/test/utility-data-transfer.test.js
+@@ -0,0 +1,74 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {createRequire} from 'node:module';
++import {writeFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++import {createIsolatedWorld} from '../src/isolated-world.js';
++import {installUtilityDataTransfer} from '../src/data-transfer.js';
++import {installFetch} from '../src/fetch.js';
++import {getHeapBinding} from '../src/native-heap.js';
++import {observeDOMWrapperProxy} from '../src/dom-wrapper-realms.js';
++import {fileWrapperImplementation} from '../src/file-wrapper-realms.js';
++import {platformFactoryRecord} from '../src/platform-factories.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),File=require('jsdom/lib/jsdom/living/generated/File.js'),List=require('jsdom/lib/jsdom/living/generated/FileList.js');
++const binding=getHeapBinding(),plain=value=>JSON.parse(JSON.stringify(value)),proofs=[];
++function actual(value,anchor,label){const prototype=Object.getPrototypeOf(value),before={selected:binding.sameRealm(value,anchor),Host:binding.sameRealm(value,{}),global:binding.creationGlobal(value)===binding.creationGlobal(anchor)};Object.setPrototypeOf(value,null);const after={selected:binding.sameRealm(value,anchor),Host:binding.sameRealm(value,{}),global:binding.creationGlobal(value)===binding.creationGlobal(anchor)};Object.setPrototypeOf(value,prototype);proofs.push({label,before,after});assert.deepEqual(before,{selected:true,Host:false,global:true});assert.deepEqual(after,before)}
++async function fixture(t){const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<input id=files type=file multiple>');const main=page.dom.window,world=createIsolatedWorld(main,{signal:page.documentAbort.signal});installFetch(page,world.global,{mainWindow:main,evaluate:source=>world.evaluate(source)});installUtilityDataTransfer(page,world);t.after(()=>{world.dispose();browser.close()});return{browser,page,main,world,g:world.global}}
++
++test('main and utility DataTransfer definitions and first public values use their actual VMs and original single list Proxy',async t=>{
++ const{main,world,g}=await fixture(t),observed=[];const stop=observeDOMWrapperProxy('FileList',(target,handler)=>observed.push({target,handler}));t.after(stop);
++ for(const[global,label]of[[main,'main'],[g,'utility']]){
++  const store=new global.DataTransfer(),files=store.files,item=store.items.add('actual','text/plain'),iterator=store.items[Symbol.iterator]();
++  for(const[name,value]of Object.entries({Constructor:global.DataTransfer,prototype:global.DataTransfer.prototype,getFiles:Object.getOwnPropertyDescriptor(global.DataTransfer.prototype,'files').get,Item:global.DataTransferItem,ItemList:global.DataTransferItemList,store,files,item,list:store.items,iterator,next:iterator.next,result:iterator.next(),types:store.types}))actual(value,global.Object.prototype,label+':'+name);
++  assert.equal(store.files,files);assert.equal(List.is(files),true);assert.equal(platformFactoryRecord(files).implementation,fileWrapperImplementation(files));assert.equal(utils.wrapperForImpl(fileWrapperImplementation(files)),files);
++  const targets=binding.proxyTargets(files);assert.equal(targets.length,1);assert.ok(observed.some(row=>row.target===targets[0]));actual(targets[0],global.Object.prototype,label+':original-FileList-target');
++ }
++ assert.equal(observed.length,2);
++ for(const{handler}of observed)for(const key of['get','getOwnPropertyDescriptor']){const value=handler[key],prototype=Object.getPrototypeOf(value);assert.equal(binding.sameRealm(value,{}),true);Object.setPrototypeOf(value,null);assert.equal(binding.sameRealm(value,{}),true);assert.equal(binding.sameRealm(value,g.Object.prototype),false);Object.setPrototypeOf(value,prototype)}
++ assert.equal(world.evaluate('typeof DataTransfer'), 'function');
++});
++
++test('utility DataTransfer copies real membership into the shared stable input list and exact authored empty branch retains trust',async t=>{
++ const{main,world}=await fixture(t),input=main.document.getElementById('files'),original=input.files,events=[];for(const type of['input','change'])input.addEventListener(type,e=>events.push([e.type,e.isTrusted,e.target===input,input.files.length]));
++ const value=await world.evaluate(`(async()=>{const input=document.getElementById('files'),transfer=new DataTransfer(),list=input.files,file=new File(['utility data'],'utility.txt',{type:'text/plain',lastModified:123});transfer.items.add(file);input.files=transfer.files;transfer.items.clear();return{sameList:input.files===list,length:input.files.length,sourceLength:transfer.files.length,name:input.files[0].name,text:await input.files[0].text(),sameFile:input.files[0]===file,listInstance:input.files instanceof FileList,fileInstance:file instanceof File}})()`);
++ assert.deepEqual(plain(value),{sameList:true,length:1,sourceLength:0,name:'utility.txt',text:'utility data',sameFile:true,listInstance:true,fileInstance:true});assert.equal(input.files,original);assert.equal(input.files[0].name,'utility.txt');assert.deepEqual(events,[]);
++ for(let n=0;n<2;n++)world.evaluate(`(()=>{const element=document.getElementById('files');element.files=new DataTransfer().files;element.dispatchEvent(new Event('input',{bubbles:true,composed:true}));element.dispatchEvent(new Event('change',{bubbles:true}));})()`);
++ assert.equal(input.files,original);assert.equal(input.files.length,0);assert.equal(input.value,'');assert.deepEqual(events,[['input',false,true,0],['change',false,true,0],['input',false,true,0],['change',false,true,0]]);
++});
++
++test('utility File and Blob canonical factories retain genuine first frontends, original backends and real read/clone bytes',async t=>{
++ const{main,world,g}=await fixture(t),values=world.evaluate(`(()=>{const blob=new Blob([new Uint8Array([3,0,255])],{type:'application/octet-stream'}),file=new File([blob],'actual.bin',{type:'application/octet-stream',lastModified:123}),slice=blob.slice(1);return{blob,file,slice}})()`);
++ for(const[name,value]of Object.entries(values)){actual(value,g.Object.prototype,'utility:'+name);assert.equal(platformFactoryRecord(value).implementation,fileWrapperImplementation(value));assert.equal(utils.wrapperForImpl(fileWrapperImplementation(value)),value)}
++ for(const[name,value]of Object.entries({File:g.File,Blob:g.Blob,FileList:g.FileList,filePrototype:g.File.prototype,blobText:g.Blob.prototype.text,blobArrayBuffer:g.Blob.prototype.arrayBuffer,fileName:Object.getOwnPropertyDescriptor(g.File.prototype,'name').get}))actual(value,g.Object.prototype,'utility-definition:'+name);
++ assert.equal(File.is(values.file),true);assert.equal(await values.file.text(),'\u0003\u0000\ufffd');assert.deepEqual(Array.from(new Uint8Array(await values.file.arrayBuffer())),[3,0,255]);assert.deepEqual(Array.from(new Uint8Array(await values.slice.arrayBuffer())),[0,255]);
++ const clone=main.structuredClone(values.file);assert.notEqual(clone,values.file);assert.equal(clone.name,'actual.bin');assert.equal(clone.type,'application/octet-stream');assert.equal(clone.lastModified,123);assert.deepEqual(Array.from(new Uint8Array(await clone.arrayBuffer())),[3,0,255]);assert.equal(utils.wrapperForImpl(fileWrapperImplementation(values.file)),values.file);
++ const list=main.document.getElementById('files').files;const alias=world.evaluate('document.getElementById("files").files');assert.notEqual(alias,list);assert.equal(fileWrapperImplementation(alias),fileWrapperImplementation(list));assert.equal(utils.wrapperForImpl(fileWrapperImplementation(list)),list);assert.equal(List.is(alias),true);
++});
++
++test('copied symbols, Proxy fronts and public symbol redirection cannot authorize utility file/transfer brands or input assignment',async t=>{
++ const{main,world,g}=await fixture(t),file=new g.File(['real'],'real.txt'),transfer=new g.DataTransfer(),list=transfer.files,input=world.evaluate('document.getElementById("files")');let reads=0;
++ const setter=Object.getOwnPropertyDescriptor(g.HTMLInputElement.prototype,'files').set,getter=Object.getOwnPropertyDescriptor(g.DataTransfer.prototype,'files').get;
++ for(const[value,convert]of[[file,File],[list,List]]){
++  const copy=Object.create(Object.getPrototypeOf(value));Object.defineProperties(copy,Object.getOwnPropertyDescriptors(value));for(const key of Reflect.ownKeys(copy))if(typeof key==='symbol')Object.defineProperty(copy,key,{get(){reads++;throw Error('authored symbol')},configurable:true});
++  const proxy=new Proxy(value,{get(){reads++;throw Error('authored Proxy')},getOwnPropertyDescriptor(){reads++;throw Error('authored descriptor')}});
++  for(const fake of[copy,proxy]){assert.equal(convert.is(fake),false);if(value===list)assert.throws(()=>setter.call(input,fake),error=>{actual(error,g.Object.prototype,'setter-strong-brand-error');return error instanceof g.TypeError});else await assert.rejects(g.Blob.prototype.arrayBuffer.call(fake),error=>error instanceof g.TypeError)}
++ }
++ for(const fake of[{},Object.create(g.DataTransfer.prototype),new Proxy(transfer,{get(){reads++;throw Error('authored transfer')}})])assert.throws(()=>getter.call(fake),error=>{actual(error,g.Object.prototype,'transfer-strong-brand-error');return error instanceof g.TypeError&&error.message==='Illegal invocation'});
++ const fakeBackend=Object.create(Object.getPrototypeOf(fileWrapperImplementation(file))),fakeFront=Object.create(g.File.prototype);
++ Object.defineProperty(fakeFront,utils.implSymbol,{value:fakeBackend,configurable:true});Object.defineProperty(fakeBackend,utils.wrapperSymbol,{value:fakeFront,configurable:true});
++ assert.equal(world.wrap(fakeFront),fakeFront);assert.equal(File.is(fakeFront),false);assert.equal(platformFactoryRecord(fakeFront),undefined);
++ const symbol=utils.implSymbol,descriptor=Object.getOwnPropertyDescriptor(file,symbol),implementation=fileWrapperImplementation(file);
++ Object.defineProperty(file,symbol,{get(){reads++;throw Error('authored real-file symbol')},configurable:true});
++ try{assert.equal(File.is(file),true);assert.equal(fileWrapperImplementation(file),implementation);assert.equal(file.name,'real.txt');assert.equal(await file.text(),'real');const clone=main.structuredClone(file);assert.equal(await clone.text(),'real')}finally{if(descriptor)Object.defineProperty(file,symbol,descriptor);else delete file[symbol]}
++ assert.equal(reads,0);assert.equal(input.files.length,0);
++});
++
++test('captured utility producer and private conversion arrays ignore replacement globals, registry constructors and numeric Array setters',async t=>{
++ const{world}=await fixture(t);const result=world.evaluate(`(()=>{const Transfer=DataTransfer,FileType=File,BlobType=Blob,OriginalError=Error,OriginalArray=Array,OriginalObject=Object,OriginalSymbol=Symbol,saved=[],priorIndex=Object.getOwnPropertyDescriptor(Array.prototype,'0');let reads=0;const poison=()=>{reads++;throw new OriginalError('authored global')};for(const key of['Object','Proxy','Array','TypeError','String','Number','FileList','Blob','Symbol']){saved.push([key,OriginalObject.getOwnPropertyDescriptor(globalThis,key)]);OriginalObject.defineProperty(globalThis,key,{get:poison,configurable:true})}OriginalObject.defineProperty(OriginalArray.prototype,'0',{set:poison,configurable:true});try{const transfer=new Transfer(),blob=new BlobType(['a']),file=new FileType(['b'],'b.txt',{lastModified:123}),entry=transfer.items.add(file);const iterator=transfer.items[OriginalSymbol.iterator]();return {values:[transfer.files.length,transfer.files[0]===file,entry.getAsFile()===file,blob.size,transfer.types[0],iterator.next().value===entry],reads}}finally{if(priorIndex)OriginalObject.defineProperty(OriginalArray.prototype,'0',priorIndex);else delete OriginalArray.prototype[0];for(const [key,descriptor]of saved)OriginalObject.defineProperty(globalThis,key,descriptor)}})()`);assert.deepEqual(plain(result),{values:[1,true,true,1,'Files',true],reads:0});
++});
++
++test('utility installation is idempotent and DataTransfer string callbacks remain real asynchronous owner tasks',async t=>{
++ const{page,world,g}=await fixture(t),Constructor=g.DataTransfer,read=g.Blob.prototype.text;installUtilityDataTransfer(page,world);assert.equal(g.DataTransfer,Constructor);assert.equal(g.Blob.prototype.text,read);
++ const trace=await world.evaluate(`new Promise(resolve=>{const transfer=new DataTransfer(),item=transfer.items.add('actual','text/plain'),trace=[];item.getAsString(value=>{trace.push(value);resolve(trace)});trace.push('sync');transfer.items.clear()})`);assert.deepEqual(Array.from(trace),['sync','actual']);
++});
++test.after(async()=>{if(process.env.DATA_TRANSFER_REALM_PROOF)await writeFile(process.env.DATA_TRANSFER_REALM_PROOF,JSON.stringify({proofs},null,2)+'\n',{flag:'wx'})});

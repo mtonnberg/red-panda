@@ -1,0 +1,14 @@
+# Combined R5 + utility File/DataTransfer + PureScript upload handoff
+
+This patch targets exact current Root commit `d41fd69740fd5d13d41ab99143b20b89cc032d9b`. It was composed only in `/workspace/shared/utility-data-transfer-final-d41-20261031` by applying, in order: accepted R5 current-d41 context patch `4772de8113…`, utility R3 patch `d149f13c…`, and the original frozen PureScript five-leaf patch `76c931d8…`. Every application checked cleanly; there were no context adaptations, wholesale replacements or conflict resolutions.
+
+The resulting combined delta has 26 leaves. `Root-before.json` and `candidate-after.json` contain all exact before/after hashes; `changes.json` includes actual modes and Git modes. All 1,903 unaffected baseline inputs remain identical, including all 18 native artifacts. `protected-source.json` and `native18.json` are explicit inventories. Private reverse/check/apply reproduces the exact baseline and final graph. Root source before/after remains identical. All 572 source inputs of the actually tested R3+PS copy are byte-identical in this final copy; four R5 test/fixture leaves and unchanged existing reference assets are additionally present.
+
+Accepted isolated evidence remains separate and immutable:
+
+- R3: 39/39 Node24 tests (6 new +33 existing), six complete Native semantic objects equal and the seventh ordinary cross-world CDP rejection also equal; 43 actual creation-context rows before/after prototype nulling, including original sole FileList proxy target and Host-owned traps.
+- Remaining SDKs: the same six new tests passed each Node24.19 and26.13, with all 43 physical rows each. Existing33 and Native were not repeated.
+- Real PureScript: cached offline/pure strict/pedantic build had zero compiler warnings/errors; existing117 plus12 new real Puppeteer assertions passed. Exact disk NUL/nonUTF8 bytes, metadata, stable FileList and File identity, trusted nonempty events, missing-path atomicity, actual utility empty/repeated-empty authored events and bracketed handle release are covered. FFI adapts individual operations and owns only basic disk fixtures; PureScript sequences the upload workflow. Observed children exited and owned upload directories were removed.
+- Accepted R5 causal/SDK/consumer evidence is linked by its original final manifest; this combined packet does not relabel its rejected R4/R3 epochs.
+
+The final whole Root integration/full suite is UNRUN. Parent owns Root application and final workflow. Existing runtime MaxListeners/VM Modules warnings are retained. R1 (2/6) and R2 (4/6) failed epochs, the Native R1 rejected cross-world call, and nominal-versus-physical proof boundaries remain visible. No larger file/remote filesystem/complete File or DOM parity claims are made. Public/private ownership and Red Panda branding remain unchanged. No native source/build, dependency, fixture-oracle, timeout, assertion or branch workaround was added.

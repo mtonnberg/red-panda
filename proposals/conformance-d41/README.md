@@ -1,0 +1,7 @@
+# Full registered-fixture census at d41fd69
+
+The frozen independent production graph ran all455 original registered fixtures under eight exact profiles:402 verified adapted-harness passes,50 assertion failures,3 source-load timeouts. All8,542 graph/control and165 source-contract identities remained unchanged. All455 owned processes exited and both fixture ports were released. Runtime761.863seconds.
+
+Only external testing.js runner eligibility recognizes RedPanda as well as Lightpanda. Actual UA/client hints and every original fixture assertion remain unchanged. Navigator/fetch/XHR literal branding failures are counted; later unexecuted assertions remain unverified. Original2second load and fresh2/8second assertions are intact. This is adapted conformance, not strict unchanged-harness success, WPT, performance equivalence or full replication.
+
+receipt/ preserves the original immutable receipt, all455 reports/raw logs,53 nonpass diagnostics, exact profiles/controllers/adapter/preflight and before/after guards. Relative workspace paths in those original artifacts describe their original location /workspace/shared/registration455-adapted-plan-20261031; the large frozen app/dependency export is not copied into this proposal. Production source identity is the pushed commit d41fd69740fd5d13d41ab99143b20b89cc032d9b, with declared artifacts separately hashed. No old338-score subtraction is a causal improvement claim.

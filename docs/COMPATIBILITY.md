@@ -4,11 +4,51 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current combined checkpoint passes **1,992 JavaScript tests, 117 PureScript
+The current combined checkpoint passes **2,043 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds with zero warnings or errors. The
-[frozen validation](../proposals/phase26-full-accepted/README.md) records 10,016
-unchanged inputs and the exact 27 runtime/test/reference leaves over 48380c5.
+[frozen validation](../proposals/phase26-full-file-element-url/README.md) records
+10,035 unchanged inputs and the exact 38 runtime/test/automation leaves over
+d41fd69. The earlier 1,992/117/13 Markdown and animation checkpoint remains
+[separate evidence](../proposals/phase26-full-accepted/README.md).
+
+Disk file selection now reads actual bytes/MIME/stat timestamps, validates the
+whole vector before mutation, preserves canonical FileList identity and dispatches
+trusted input/change events inside the real owner VM budget. Interruption recovery
+restores abandoned private dispatch/reporting state while preserving live outer
+dispatches. [R5 evidence](../proposals/cdp-file-input-r5/README.md) retains every
+negative epoch and the untested size-boundary/default-action limits. Legacy main
+File/Blob definitions remain Host-created even though fresh wrappers are genuine
+VM objects. Utility File/Blob/FileList definitions and DataTransfer state use the
+same real backends. Six Native semantic objects match; selected checks pass on
+all three SDKs. The real PureScript/Puppeteer flow verifies nonempty disk upload,
+atomic missing-path failure, actual empty/repeated-empty upload, byte identity
+and handle cleanup. [Composition](../proposals/utility-data-transfer/final-d41-r1/README.md).
+
+Measured [element corrections](../proposals/element-api-parity/README.md) cover
+exact-empty closest errors, typed param/hidden-input display and authored revert,
+and genuine composed shadow/slot geometry with scoped hit retargeting. Their
+three original fixtures pass separately. Canonical URL.parse now binds its real
+parser backend before first public return, with actual VM URL/searchParams
+shells; its original fixture and selected SDK/consumer checks pass. Public legacy
+URL definitions and broader utility/brand/iterator behavior remain outside that
+[slice](../proposals/url-parse-canonical-factory/README.md).
+The original [createHTMLDocument fixture](../proposals/domimplementation-readiness/README.md)
+also passes after initializing the actual successful backend to complete;
+named-document properties and DOMParser readiness remain separate gaps.
+
+The fresh [registered-fixture census](../proposals/conformance-d41/README.md)
+at pushed d41fd69 completed all 455 fixtures under eight registration profiles:
+**402 verified passes, 50 assertion failures and three source-load timeouts**.
+All 8,542 graph/control inputs and 165 source contracts stayed unchanged.
+Original load/assertion budgets and WS50 were preserved. Only the external
+harness eligibility predicate recognizes Red Panda; public UA/client hints and
+fixture assertions are unchanged. Navigator/fetch/XHR branding literals remain
+counted failures, with later unexecuted assertions unverified. This adapted
+conformance run establishes neither strict unchanged-harness success nor full
+replication, WPT or performance equivalence. Its 53 nonpasses remain actionable
+evidence, including Window/document properties, script/module behavior,
+styles/layout, frame lifecycle and timing surfaces.
 
 Canonical Markdown now reads actual author-style producers and backend nodes,
 with source-document style ownership, main render-context URLs, measured slot
@@ -114,7 +154,7 @@ Inspector debugging, or TLS policy. [Configuration evidence](../proposals/cdp-co
 The new protocol/transport controls have bounded Native comparisons, with their
 remaining owner, parser and transport exclusions retained in each proposal.
 Functional work still includes broader Markdown/CSSOM, cache and actual
-Fetch interception/downloads, trusted file input/semantic tools, broader media,
+Fetch interception/downloads, wider file-input/semantic tool coverage, broader media,
 and genuine reusable Window/module boundaries. Promise interruption with external
 or legacy Host init hooks remains a foundational gap. The earlier animation
 experiment that corrupted Node's async-hook stack remains rejected; the new

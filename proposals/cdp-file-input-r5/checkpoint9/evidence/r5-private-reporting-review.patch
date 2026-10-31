@@ -1,0 +1,67 @@
+--- a/src/dom-dispatch-recovery.js
++++ b/src/dom-dispatch-recovery.js
+@@ -7,7 +7,7 @@
+ import {setImmediate as checkpoint} from 'node:timers';
+ const require=createRequire(import.meta.url),own=Object.getOwnPropertyDescriptor,define=Object.defineProperty,apply=Reflect.apply;
+ const windows=new WeakMap(),canonical=new WeakMap(),cohorts=[],pending=new Set();
+-let currentListener=null,installed=false,EventImplementation;
++let currentListener=null,currentParticipant=null,installed=false,EventImplementation;
+ const nil=()=>Object.create(null),weak=value=>value!==null&&(typeof value==='object'||typeof value==='function')?{ref:new WeakRef(value)}:{value};
+ const value=box=>box?.ref?box.ref.deref():box?.value;
+ const hasInstance=Function.prototype[Symbol.hasInstance];
+@@ -47,17 +47,31 @@
+  if(frame.activation)diagnostics.push('interrupted activation/default action is outside this recovery tranche');
+  frame.active=false;
+ }
+-function recover(tokens,diagnostics){for(let i=tokens.length-1;i>=0;i--){const token=tokens[i];if(token.kind==='listener')unwindListener(token,diagnostics);else unwindDispatch(token,diagnostics)}}
++function unwindParticipant(token,diagnostics){
++ if(!token.active)return;
++ try{token.restore()}catch(error){diagnostics.push('private dispatch participant recovery failed: '+error.message)}
++ token.active=false;if(currentParticipant?.deref()===token)currentParticipant=token.previous;
++}
++// A participating implementation owns its actual private state and captures the
++// prior value before incrementing. Only tokens abandoned by a terminated VM
++// invoke restore; ordinary finally paths mark their own tokens completed.
++export function beginDispatchRecoveryParticipant(restore){
++ const token=Object.assign(nil(),{kind:'participant',restore,active:true,previous:currentParticipant});
++ currentParticipant=new WeakRef(token);const cohort=activeCohort();if(cohort)cohort.tokens.push(token);return token;
++}
++export function completeDispatchRecoveryParticipant(token){token.active=false;if(currentParticipant?.deref()===token)currentParticipant=token.previous}
++function participantAncestors(){const result=[],seen=new Set();let cursor=currentParticipant?.deref();while(cursor&&cursor.active&&!seen.has(cursor)){seen.add(cursor);result.push(cursor);cursor=cursor.previous?.deref()}return result}
++function recover(tokens,diagnostics){for(let i=tokens.length-1;i>=0;i--){const token=tokens[i];if(token.kind==='listener')unwindListener(token,diagnostics);else if(token.kind==='participant')unwindParticipant(token,diagnostics);else unwindDispatch(token,diagnostics)}}
+ function ancestors(){const result=[],seen=new Set();let cursor=currentListener?.deref();while(cursor&&cursor.active&&!seen.has(cursor)){seen.add(cursor);result.push(cursor);const frame=value(cursor.frame);if(frame?.active)result.push(frame);cursor=cursor.previous?.deref()}return result}
+ function complete(cohort){
+  recover(cohort.tokens,cohort.diagnostics);const index=cohorts.lastIndexOf(cohort);if(index!==-1)cohorts.splice(index,1);cohort.completed=true;
+ }
+ export function withOwnedDispatchRecovery(operation){
+- const cohort=Object.assign(nil(),{tokens:[],ancestors:ancestors(),diagnostics:[],completed:false});cohorts.push(cohort);pending.add(cohort);
++ const cohort=Object.assign(nil(),{tokens:[],ancestors:ancestors(),participantAncestors:participantAncestors(),diagnostics:[],completed:false});cohorts.push(cohort);pending.add(cohort);
+  // Only an actual owned cohort posts this Host checkpoint. Live synchronous
+  // ancestor dispatches are preserved now; after the stack ends, any still
+  // active frames were abandoned by a wider V8 termination.
+- const task=checkpoint(()=>{complete(cohort);recover(cohort.ancestors.slice().reverse(),cohort.diagnostics);pending.delete(cohort)});task.unref?.();
++ const task=checkpoint(()=>{complete(cohort);recover(cohort.ancestors.slice().reverse(),cohort.diagnostics);recover(cohort.participantAncestors.slice().reverse(),cohort.diagnostics);pending.delete(cohort)});task.unref?.();
+  try{return operation()}finally{complete(cohort)}
+ }
+ const lifecycle={
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,4 +1,5 @@
+ import {types} from 'node:util';
++import {beginDispatchRecoveryParticipant,completeDispatchRecoveryParticipant} from './dom-dispatch-recovery.js';
+ import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-parity.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+@@ -144,9 +145,11 @@
+     if (!reporting) return dispatch.call(this, event, ...args);
+     // Also covers classic script errors reported by jsdom itself.
+     event.message = message(event.error);
++    const previousDepth = record.depth;
++    const recovery = beginDispatchRecoveryParticipant(() => { record.depth = previousDepth; });
+     record.depth++;
+     try { return dispatch.call(this, event, ...args); }
+-    finally { record.depth--; }
++    finally { record.depth--; completeDispatchRecoveryParticipant(recovery); }
+   };
+   function onUnhandled(reason, promise) {
+     let owned = promises.get(promise);

@@ -1,3 +1,4 @@
+import {supportsFileInput,rememberFileInputContext,forgetFileInputContext,runFileInput} from './cdp-file-input.js';
 import {dumpMarkdownNode} from './markdown-node.js';
 import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
 import{setWindowDeviceMetrics}from'./window-viewport.js';
@@ -603,7 +604,7 @@ class Connection {
       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
       const sessionCommand=session&&!method.startsWith('Browser.')&&!method.startsWith('Target.')&&!CONFIGURATION_ACK_METHODS.has(method);
       dispatchedSession=sessionCommand?session:undefined;
-      const result = supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+      const result = supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
         ? await session.run(method, params) : await this.run(method, params, session);
       // Closed sessions have no receiver for their pending command replies.
       // Page.close itself completes only after its successful response below.
@@ -645,10 +646,11 @@ class Connection {
         return {};
       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
-      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
-      case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId); return {};
+      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));rememberFileInputContext(this,browser.contexts.get(id));return {browserContextId:id};}
+      case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId);forgetFileInputContext(this,params.browserContextId); return {};
       case 'Target.createTarget': {
         const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});
+        rememberFileInputContext(this,page.context);
         if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
         return { targetId: page.id };
       }

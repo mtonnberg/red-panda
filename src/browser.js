@@ -1,3 +1,4 @@
+import {installFileInputs} from './file-inputs.js';
 import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse,disposeNetworkCapture}from'./network-capture.js';
 import {withLocationFactory} from './location-factory.js';
 import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
@@ -355,6 +356,7 @@ export class Page extends EventEmitter {
       installSVG(this, window);
       installDOMIDL(this, window);
       installDOMEvents(this, window);
+      installFileInputs(this,window);
       installDOMLifecycle(this, window);
       installSanitizer(this,window);
       installSelection(this, window);

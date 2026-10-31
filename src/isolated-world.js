@@ -1,3 +1,4 @@
+import {utilityFileModule,wrapFileAPIView,fileWrapperImplementation,isFileAPIImplementation,fileAPIKind} from './file-wrapper-realms.js';
 import {installDocumentXPathEntries} from './document-member-realms.js';
 import {canonicalLocation,locationImplementation,installPrivateLocationUtils,prepareLocationContext,installLocationInterface,transformUtilityLocationInterfaces,createLocationAlias,installLocationWindowAlias} from './location-factory.js';
 import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
@@ -51,9 +52,10 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
   const cached=wrappers.get(impl);if(cached)return cached;
   const canonical=canonicalLocation(impl)??own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;for(const resolver of targetWrappers){const wrapper=resolver(canonical,impl);if(wrapper)return wrapper;}
+  if(isFileAPIImplementation(impl)){const value=wrapFileAPIView(context,global,impl);wrappers.set(impl,value);if(fileAPIKind(impl)!=='File'){register(value,impl,fileAPIKind(impl));if(objectLike(canonical))mainWrappers.set(canonical,impl)}return value;}
   const metric=viewportTargetInterface(impl);if(metric){const wrapper=wrapViewportTarget(context,impl);wrappers.set(impl,wrapper);register(wrapper,impl,metric);return wrapper;}
   const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
-  const name=canonicalLocation(impl)?'Location':interfaceFor(impl);if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+  const name=canonicalLocation(impl)?'Location':interfaceFor(impl);if(['Blob','File','FileList'].includes(name))return canonical;if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
   if(webSocketImplementation(wrapper))bindWebSocketImplementation(wrapper,impl);else if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else if(directEventTargetImplementation(wrapper))bindEventTargetImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
@@ -63,13 +65,15 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  function wrap(value){
   if(!objectLike(value))return value;if(value===mainWindow||value===mainWindow._globalProxy)return global;if(value===global||wrapperImpls.has(value))return value;const otherWindow=resolveWindow?.(value);if(otherWindow)return otherWindow;
   const known=mainWrappers.get(value);if(known)return wrapImpl(known);
+  const privateFile=fileWrapperImplementation(value);if(privateFile)return wrapImpl(privateFile);
+  if(isFileAPIImplementation(value))return wrapImpl(value);
   if(types.isProxy(value))return value;
   const privateLocation=locationImplementation(value);if(privateLocation)return wrapImpl(privateLocation);if(canonicalLocation(value))return wrapImpl(value);
   const privateEvent=eventImplementation(value);if(privateEvent)return wrapImpl(privateEvent);const privateTarget=directEventTargetImplementation(value);if(privateTarget)return wrapImpl(privateTarget);
   const candidate=own(value,hostUtils.implSymbol)?.value;
-  if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
+  if(candidate&&!isFileAPIImplementation(candidate)&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
   const canonical=own(value,hostUtils.wrapperSymbol)?.value;
-  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical),target=directEventTargetImplementation(canonical);if(event?event===value:target?target===value:locationImplementation(canonical)===value||own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
+  if(canonical&&objectLike(canonical)&&!isFileAPIImplementation(value)){const event=eventImplementation(canonical),target=directEventTargetImplementation(canonical);if(event?event===value:target?target===value:locationImplementation(canonical)===value||own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
   if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
   return value;
  }
@@ -85,6 +89,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
  }
  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
+  if(filename.startsWith(generatedRoot+'/')){const kind=filename.slice(generatedRoot.length+1,-3),fileModule=utilityFileModule(kind,context,global);if(fileModule){modules.set(filename,{exports:fileModule});return fileModule;}}
   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
   let source=readFileSync(filename,'utf8');if(filename===interfacesPath)source=transformUtilityLocationInterfaces(source);const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);if(interfaceName==='EventTarget')source=transformPrivateEventTargetSource(source);if(interfaceName==='WebSocket'){
    source=transformPrivateWebSocketSource(source).replace('return Object.create(proto);','return createShell(globalObject, proto);').replaceAll('exports.setup(Object.create(new.target.prototype),','exports.setup(createShell(globalObject, new.target.prototype),');
@@ -93,7 +98,8 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
    // utility-VM definitions and the same canonical generated setup receiver.
    const ObjectType=global.Object,createShell=(_global,prototype)=>Object.setPrototypeOf(Reflect.construct(ObjectType,[]),prototype);
    vm.compileFunction(source,['require','module','exports','__filename','__dirname','createShell','installEventIDLRealm'],{filename})(localRequire,module,module.exports,filename,dirname(filename),createShell,(g,...args)=>installEventIDLRealm(g,...args,context));
-  }else{const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));}
+  }else if(filename===interfacesPath){vm.compileFunction(source,['require','module','exports','__filename','__dirname'],{filename})(localRequire,module,module.exports,filename,dirname(filename));}
+  else{const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));}
   configureEventDictionary(interfaceName,module.exports);
   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
    // Measured native producer quirk: MO arguments are real main-world values,

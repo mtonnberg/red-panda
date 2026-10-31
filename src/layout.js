@@ -1,3 +1,6 @@
+import{composedLayoutChildren,retargetLayoutHit}from'./composed-layout-tree.js';
+import{platformFactoryRecord}from'./platform-factories.js';
+import{installPlatformFactoryHooks}from'./platform-factory-hooks.js';
 import {captureDocumentMemberFactory} from './document-member-realms.js';
 import {captureIDLMemberFactory} from './public-idl-member.js';
 import{installWindowViewport}from'./window-viewport.js';
@@ -17,6 +20,8 @@ const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
 const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const LAYOUTS=new WeakMap(),COMPUTED_VIEWS=new WeakMap();
+// Standalone genuine JSDOM embeddings also observe their real future factories.
+installPlatformFactoryHooks();
 const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
 const hiddenTags = new Set(['head', 'style', 'script', 'template', 'meta', 'link', 'title', 'base']);
 const blockTags = new Set(['html', 'body', 'div', 'p', 'main', 'section', 'article', 'aside', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'blockquote']);
@@ -50,25 +55,22 @@ export function createLayout(window, options = {}) {
     const document = window.document;
     const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,implForWrapper(document)._version,width,height]);
     if(fastKey!==null&&cachedFastKey===fastKey)return cached;
-    const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
+    const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map(),parents=new Map();
     const childNodeLists=new Map(),childElementLists=new Map();
-    const children=node=>{let list=childNodeLists.get(node);if(!list){list=Array.from(domSymbolTree.childrenIterator(implForWrapper(node)),wrapperForImpl);childNodeLists.set(node,list);}return list;};
+    const children=node=>{let list=childNodeLists.get(node);if(!list){list=composedLayoutChildren(implForWrapper(node)).map(wrapperForImpl);childNodeLists.set(node,list);}return list;};
     const elements=node=>{let list=childElementLists.get(node);if(!list){list=children(node).filter(child=>child.nodeType===1);childElementLists.set(node,list);}return list;};
-    const documentImpl=implForWrapper(document),shadowRoots=[],tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
-    const appendTree=root=>{
-      for(const implementation of domSymbolTree.treeIterator(root)){
-        if(implementation.nodeType===11)continue;
-        const node=wrapperForImpl(implementation);
-        order.set(node,nodes.length);nodes.push(node);
-        if(tokens){
-          if(!identities.has(node))identities.set(node,nextIdentity++);
-          tokens.push(identities.get(node),node.nodeType,node.nodeValue);
-          if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
-        }
-        if(implementation._shadowRoot)shadowRoots.push(implementation._shadowRoot);
+    const documentImpl=implForWrapper(document),tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
+    const pending=[{implementation:documentImpl,parent:null}];
+    while(pending.length){
+      const {implementation,parent}=pending.pop(),node=wrapperForImpl(implementation);
+      parents.set(node,parent);order.set(node,nodes.length);nodes.push(node);
+      if(tokens){
+        if(!identities.has(node))identities.set(node,nextIdentity++);
+        tokens.push(identities.get(node),node.nodeType,node.nodeValue);
+        if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
       }
-    };
-    appendTree(documentImpl);for(let index=0;index<shadowRoots.length;index++)appendTree(shadowRoots[index]);
+      const next=children(node);for(let index=next.length-1;index>=0;index--)pending.push({implementation:implForWrapper(next[index]),parent:node});
+    }
     if(tokens)for(const sheet of document.styleSheets){try{tokens.push([...sheet.cssRules].map(rule=>rule.cssText));}catch{tokens.push(null);}}
     const key=fastKey??JSON.stringify(tokens);
     if(key===cachedKey)return cached;
@@ -118,10 +120,10 @@ export function createLayout(window, options = {}) {
     const siblingAdvances=new Map();
     function siblingAdvance(node){
       if(siblingAdvances.has(node))return siblingAdvances.get(node);
-      const parent=domSymbolTree.parent(implForWrapper(node));if(!parent)return 0;
+      const parent=parents.get(node);if(!parent)return 0;
       let sum=0;
-      for(const implementation of domSymbolTree.childrenIterator(parent)){
-        const sibling=wrapperForImpl(implementation);siblingAdvances.set(sibling,sum);
+      for(const sibling of children(parent)){
+        siblingAdvances.set(sibling,sum);
         if(isHidden(sibling))continue;
         if(sibling.nodeType===1)sum+=horizontal.advance(sibling);
       }
@@ -130,7 +132,7 @@ export function createLayout(window, options = {}) {
     function position(node) {
       if (positions.has(node)) return positions.get(node);
       if (isHidden(node)) { positions.set(node, ZERO); return ZERO; }
-      const parent = node.parentNode ?? node.host;
+      const parent = parents.get(node);
       const parentX = parent ? position(parent).x : 0;
       let x = parentX;
       x+=siblingAdvance(node);
@@ -159,7 +161,7 @@ export function createLayout(window, options = {}) {
       return { rect: position(node), rendered: true };
     }
     cachedKey = key;cachedFastKey=fastKey;
-    cached = { nodes, style, record, horizontal, isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
+    cached = { nodes, style, record, horizontal,parent:node=>parents.get(node), isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
     return cached;
   }
 
@@ -174,23 +176,32 @@ export function createLayout(window, options = {}) {
     const value = rect(node), quad = [value.left, value.top, value.right, value.top, value.right, value.bottom, value.left, value.bottom];
     return { content: [...quad], padding: [...quad], border: [...quad], margin: [...quad], width: Math.trunc(value.width), height: Math.trunc(value.height) };
   }
-  function elementsFromPoint(x, y) {
+  function elementsFromPoint(x, y,scope=implForWrapper(window.document)) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
     x = Math.round(x); y = Math.round(y);
     if (x < 0 || y < 0 || x >= width || y >= height) return [];
-    const state = snapshot();
-    return state.nodes.filter(node => {
-      if (node.nodeType !== 1) return false;
-      // Document hit testing retargets shadow content to its host. Shadow
-      // rectangles remain available to privileged geometry/observer consumers.
-      if (node.getRootNode() !== window.document) return false;
-      const record = state.record(node), { rendered } = record, box = viewportRect(record.rect);
-      const declaration = state.style(node);
-      return rendered && declaration.visibility !== 'hidden' && declaration.visibility !== 'collapse' && declaration.pointerEvents !== 'none' &&
-        box.width > 0 && box.height > 0 && x >= box.left && x < box.right && y >= box.top && y < box.bottom;
-    }).reverse();
+    const state=snapshot(),eligible=node=>{
+      if(node.nodeType!==1||!state.record(node).rendered)return false;
+      const declaration=state.style(node);
+      return declaration.display!=='contents'&&declaration.visibility!=='hidden'&&declaration.visibility!=='collapse'&&declaration.pointerEvents!=='none';
+    };
+    let hit;
+    for(let index=state.nodes.length-1;index>=0;index--){
+      const node=state.nodes[index];if(!eligible(node))continue;
+      const box=viewportRect(state.record(node).rect);
+      if(box.width>0&&box.height>0&&x>=box.left&&x<box.right&&y>=box.top&&y<box.bottom){hit=node;break}
+    }
+    const result=[],seen=new Set();
+    // Native returns the eligible composed ancestry of the actual top hit,
+    // even when a child's real box overflows its ancestor's real box.
+    for(let node=hit;node;node=state.parent(node)){
+      if(!eligible(node))continue;
+      const actual=wrapperForImpl(retargetLayoutHit(implForWrapper(node),scope));
+      if(!seen.has(actual)){seen.add(actual);result.push(actual)}
+    }
+    return result;
   }
-  function hitTest(x, y) { return elementsFromPoint(x, y)[0] ?? null; }
+  function hitTest(x,y,scope){return elementsFromPoint(x,y,scope)[0]??null;}
   function intersection(node) {
     const bounds = rect(node);
     const left = Math.max(0, bounds.left), top = Math.max(0, bounds.top);
@@ -263,7 +274,7 @@ export function installLayout(page, window, options = {}) {
   const define = (target, name, descriptor) => {
     if(target===window.Document.prototype){
       descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=documentMember(name,slot,descriptor[slot]);
-    }else if(target===window.Element.prototype||target===window.HTMLElement.prototype){
+    }else if(target===window.Element.prototype||target===window.HTMLElement.prototype||target===window.ShadowRoot.prototype){
       descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(name,slot,descriptor[slot]);
     }
     return Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
@@ -282,8 +293,23 @@ export function installLayout(page, window, options = {}) {
   define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
   define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
   define(window.HTMLElement.prototype,'offsetLeft',{get(){return ownedLayout(this).absoluteRect(this).x;}});
-  define(window.Document.prototype, 'elementFromPoint', { writable: true, value(x, y) { return layout.hitTest(Number(x), Number(y)); } });
-  define(window.Document.prototype, 'elementsFromPoint', { writable: true, value(x, y) { return layout.elementsFromPoint(Number(x), Number(y)); } });
+  const numeric=window.Number,TypeErrorConstructor=window.TypeError,number=value=>{if(typeof value==='symbol')throw new TypeErrorConstructor('Cannot convert a Symbol value to a number');if(typeof value==='bigint')throw new TypeErrorConstructor('Cannot convert a BigInt value to a number');return numeric(value);};
+  for(const[kind,prototype]of[['Document',window.Document.prototype],['ShadowRoot',window.ShadowRoot.prototype]]){
+    const receiver=value=>{const record=platformFactoryRecord(value),implementation=record?.implementation;
+      if(!implementation||(kind==='Document'?!['Document','HTMLDocument','XMLDocument'].includes(record.kind):record.kind!=='ShadowRoot'))throw new TypeErrorConstructor('Illegal invocation');
+      return implementation;
+    };
+    for(const name of['elementFromPoint','elementsFromPoint']){
+      const operation=({[name](x,y){
+        const scope=receiver(this);if(arguments.length<2)throw new TypeErrorConstructor('invalid argument');
+        x=number(x);y=number(y);const document=scope.nodeType===9?scope:scope._ownerDocument,model=document._defaultView&&LAYOUTS.get(document);
+        if(name==='elementFromPoint')return model?.hitTest(x,y,scope)??null;
+        const values=model?.elementsFromPoint(x,y,scope)??[];
+        return clientRectList(ArrayConstructor,set,ErrorConstructor,values);
+      }})[name];
+      define(prototype,name,{writable:true,value:operation});
+    }
+  }
   define(window, 'innerWidth', { get: () => layout.viewport.width });
   define(window, 'innerHeight', { get: () => layout.viewport.height });
   for (const [name, axis] of [['scrollX', 'x'], ['pageXOffset', 'x'], ['scrollY', 'y'], ['pageYOffset', 'y']]) define(window, name, { get: () => layout.scroll[axis] });

@@ -117,7 +117,7 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | --- | --- |
 | Fetch | Streaming EventSource with reconnect, IDs, cookies and CORS; HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Actual WebAssembly streaming compilation from genuine Response bytes; incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket/EventSource and FileReaderSync, shared Worker actors and real ports; Browser-wide WebSocket admission (default 8, `--ws-max-concurrent 0..255`) |
+| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, disk file selection with stable FileList state, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket/EventSource and FileReaderSync, shared Worker actors and real ports; Browser-wide WebSocket admission (default 8, `--ws-max-concurrent 0..255`) |
 | Web APIs | Real HTMLDDA collections, CSS.escape/supports namespaces, Selection and Range geometry, actual Web Crypto keys/bytes, Cookie Store, Web Locks, Scheduler, form-associated custom elements, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Canvas | Genuine context/Path2D state, measured transparent pixel reads and independently encoded PNG output; the target profile has no Canvas rasterizer |
 | Storage | UTF-8 value-byte quota, context/origin backing state and genuine shared frame wrappers; key order and legacy reflection remain incomplete |
@@ -130,13 +130,13 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
 | CDP page/runtime | Document/fragment/history navigation, reload, frame tree, actual isolated VM worlds over shared DOM implementations, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; thrown objects retain actual handles even when returnByValue is requested; Page close/stop with real request cancellation and buffered-prefix completion |
-| CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, nested frame/shadow keyboard focus, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
+| CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, DOM.setFileInputFiles with actual disk bytes and trusted input/change events, nested frame/shadow keyboard focus, Enter form activation, Tab traversal, composed shadow/slot hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, bounded byte-accurate response and POST retention, cookie deletion/clearing and attached writes, UTF-8 cookie transport, per-page extra HTTP headers, user agent, language/platform overrides |
 | Rendering | Text-only CLI dumps, CDP screenshots/PDF streams and MCP screenshots, with real font rasterization and selectable PDF text |
 | Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64; `LP.version`, canonical-node `LP.getMarkdown`, and measured one-shot JavaScript dialog handling |
 | WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
 | MCP / saved scripts | Stdio and HTTP MCP sessions, extraction/actions/waits/cookies/downloads; saved scripts with top-level await/return and synchronous browser actions |
-| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, response text/bytes, preloads, headers, waits, keyboard/text input, coordinate clicks, cookies/deletion, typed permission/geolocation overrides, screenshots, PDFs and `content` |
+| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, response text/bytes, preloads, headers, waits, keyboard/text input, coordinate clicks, bracketed ElementHandle file uploads, cookies/deletion, typed permission/geolocation overrides, screenshots, PDFs and `content` |
 
 Unsupported commands return a CDP error with code `-32601`. HTTP discovery
 provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
@@ -284,17 +284,24 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 117 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 129 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 1,992 JavaScript tests, 117 PureScript Puppeteer
+The current checkpoint passes 2,043 JavaScript tests, 129 PureScript Puppeteer
 checks and 13 native differential groups, plus syntax and strict/pedantic
-PureScript checks. [Validation](proposals/phase26-full-accepted/README.md)
-records all 10,016 unchanged monitored inputs. Earlier failed runs remain
+PureScript checks. [Validation](proposals/phase26-full-file-element-url/README.md)
+records all 10,035 unchanged monitored inputs. Earlier failed runs remain
 separate evidence.
+
+File uploads use real disk bytes and timestamps, atomic path validation and stable
+canonical FileList objects. PureScript owns the actual Puppeteer nonempty and
+empty upload branches and ElementHandle cleanup. The public and utility worlds
+share genuine file backends. Typed display defaults and composed shadow/slot
+geometry now match their measured controls; URL.parse returns a canonical public
+URL, and createHTMLDocument starts complete without synthetic lifecycle events.
 
 Canonical Markdown reads actual author styles and source-document ownership,
 including inactive documents, adoption, slots and render-context links. Automatic

@@ -1,0 +1,793 @@
+--- a/src/blob.js
++++ b/src/blob.js
+@@ -1,3 +1,4 @@
++import {fileWrapperImplementation} from './file-wrapper-realms.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -15,7 +16,7 @@
+   const Readable = window.ReadableStream ?? globalThis.ReadableStream;
+   const snapshot = value => {
+     if (!BlobIDL.is(value)) throw new TypeError('Illegal invocation');
+-    return Buffer.from(implForWrapper(value)._buffer);
++    return Buffer.from((fileWrapperImplementation(value)??implForWrapper(value))._buffer);
+   };
+   const copy = data => { const bytes = new Bytes(data.length); setBytes.call(bytes, data); return bytes; };
+   for (const kind of ['text', 'arrayBuffer', 'bytes']) {
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installFileInputs} from './file-inputs.js';
+ import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse,disposeNetworkCapture}from'./network-capture.js';
+ import {withLocationFactory} from './location-factory.js';
+ import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+@@ -355,6 +356,7 @@
+       installSVG(this, window);
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
++      installFileInputs(this,window);
+       installDOMLifecycle(this, window);
+       installSanitizer(this,window);
+       installSelection(this, window);
+--- /dev/null
++++ b/src/cdp-file-input.js
+@@ -0,0 +1,85 @@
++// Independent CDP disk-input adapter, calibrated against actual owned files.
++// Read/stat the whole input vector before mutating any real control state.
++import 'jsdom';
++import {openSync,readSync,closeSync,statSync} from 'node:fs';
++import {basename,extname} from 'node:path';
++import {createRequire} from 'node:module';
++import {canonicalUtilityValue} from './isolated-world.js';
++import {platformFactoryRecord} from './platform-factories.js';
++import {fileInputOwner,commitFileInputSelection} from './file-inputs.js';
++import {createDiskFileImplementation} from './file-wrapper-realms.js';
++const require=createRequire(import.meta.url);
++const Node=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation,Input=require('jsdom/lib/jsdom/living/nodes/HTMLInputElement-impl.js').implementation;
++const owners=new WeakMap(),MAX_BYTES=100*1024*1024;
++const MIME=Object.freeze({'.txt':'text/plain','.html':'text/html','.htm':'text/html','.css':'text/css','.js':'text/javascript','.json':'application/json','.xml':'application/xml','.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.webp':'image/webp','.svg':'image/svg+xml','.csv':'text/csv','.zip':'application/zip'});
++export const supportsFileInput=method=>method==='DOM.setFileInputFiles';
++export function rememberFileInputContext(connection,context){owners.set(connection,context)}
++export function forgetFileInputContext(connection,id){if(owners.get(connection)?.id===id)owners.delete(connection)}
++function fail(Error,message){throw new Error(message,-31998)}
++function uint(value,Error){
++ if(typeof value!=='number'&&typeof value!=='string')fail(Error,'UnexpectedToken');
++ if(typeof value==='string'){
++  if(!/^[+-]?[0-9]+$/.test(value))fail(Error,'InvalidCharacter');
++  const n=BigInt(value);if(n<0n||n>4294967295n)fail(Error,'Overflow');return Number(n);
++ }
++ if(value<0||value>4294967295)fail(Error,'Overflow');
++ if(!Number.isInteger(value))fail(Error,'InvalidNumber');return value;
++}
++function parameters(params,Error){
++ if(!Object.hasOwn(params,'files'))fail(Error,'MissingField');
++ if(!Array.isArray(params.files)||params.files.some(value=>typeof value!=='string'))fail(Error,'UnexpectedToken');
++ const selectors=Object.create(null);
++ // Optional fields are all decoded, including ignored lower-priority fields.
++ for(const name of ['nodeId','backendNodeId'])if(params[name]!=null)selectors[name]=uint(params[name],Error);
++ if(params.objectId!=null){if(typeof params.objectId!=='string')fail(Error,'UnexpectedToken');selectors.objectId=params.objectId}
++ return {paths:params.files,selectors};
++}
++function read(path,Error){
++ let fd;
++ try{
++  fd=openSync(path,'r');const parts=[];let size=0;
++  for(;;){const buffer=Buffer.allocUnsafe(Math.min(65536,MAX_BYTES+1-size)),count=readSync(fd,buffer,0,buffer.length,null);if(count===0)break;size+=count;if(size>MAX_BYTES)fail(Error,'StreamTooLong');parts.push(buffer.subarray(0,count))}
++  // Native source stats the path after the actual byte read. Preserve that
++  // distinction rather than substituting a pre-read size or fake metadata.
++  const st=statSync(path,{bigint:true});return {bytes:Buffer.concat(parts,size),name:basename(path),lastModified:Number(st.mtimeNs/1000000n),type:MIME[extname(path).toLowerCase()]??'application/octet-stream'};
++ }catch(error){
++  const name={ENOENT:'FileNotFound',EISDIR:'IsDir',ENOTDIR:'NotDir',EACCES:'AccessDenied',EPERM:'AccessDenied',ENAMETOOLONG:'NameTooLong',ELOOP:'SymLinkLoop'}[error.code];
++  if(name)fail(Error,name);throw error;
++ }finally{if(fd!==undefined)closeSync(fd)}
++}
++function selectedPage(connection,session,Error){
++ if(session)return session.page;
++ const context=owners.get(connection);
++ if(!context||connection.browser.contexts.get(context.id)!==context)fail(Error,'BrowserContextNotLoaded');
++ const page=[...connection.browser.pages.values()].find(page=>page.context===context&&!page.closed);
++ if(!page)fail(Error,'FrameNotLoaded');return page;
++}
++function selectedNode(connection,session,page,selectors,Error){
++ const id=selectors.nodeId??selectors.backendNodeId;
++ if(id!==undefined){
++  const nodes=new Set();for(const s of session?[session]:connection.sessions.values())if(s.page===page){const node=s.nodes?.get(id);if(node)nodes.add(node)}
++  if(nodes.size!==1)fail(Error,'NodeNotFound');return [...nodes][0];
++ }
++ if(selectors.objectId!==undefined){
++  const chosen=session??[...connection.sessions.values()].find(s=>s.page===page);let value;
++  try{value=chosen?.object(selectors.objectId)}catch{fail(Error,'UnwrapFailed')}
++  if(value===undefined)fail(Error,'UnwrapFailed');
++  const node=canonicalUtilityValue(value),implementation=platformFactoryRecord(node)?.implementation;
++  if(!(implementation instanceof Node))fail(Error,'ObjectIdIsNotANode');return node;
++ }
++ fail(Error,'MissingParams');
++}
++export function runFileInput(connection,session,params,Error){
++ const {paths,selectors}=parameters(params,Error),page=selectedPage(connection,session,Error);
++ if(page.closed||!page.dom)fail(Error,'FrameNotLoaded');
++ const wrapper=selectedNode(connection,session,page,selectors,Error),implementation=platformFactoryRecord(wrapper)?.implementation;
++ if(!(implementation instanceof Node))fail(Error,'NodeNotFound');
++ if(implementation.nodeType!==1)fail(Error,'NodeIsNotAnElement');
++ if(!(implementation instanceof Input))fail(Error,'NotAnInputElement');
++ if(implementation.type!=='file')fail(Error,'NotAFileInput');
++ const owner=fileInputOwner(implementation);if(!owner||owner.page.closed||owner.page.retired||owner.signal?.aborted)fail(Error,'InvalidNodeId');
++ const records=paths.map(path=>read(path,Error));
++ const values=records.map(record=>createDiskFileImplementation(owner.document._globalObject,[[record.bytes],record.name,{type:record.type,lastModified:record.lastModified,endings:'transparent'}]));
++ if(!commitFileInputSelection(implementation,values))fail(Error,'InvalidNodeId');
++ return {};
++}
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import {supportsFileInput,rememberFileInputContext,forgetFileInputContext,runFileInput} from './cdp-file-input.js';
+ import {dumpMarkdownNode} from './markdown-node.js';
+ import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
+ import{setWindowDeviceMetrics}from'./window-viewport.js';
+@@ -603,7 +604,7 @@
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
+       const sessionCommand=session&&!method.startsWith('Browser.')&&!method.startsWith('Target.')&&!CONFIGURATION_ACK_METHODS.has(method);
+       dispatchedSession=sessionCommand?session:undefined;
+-      const result = supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
++      const result = supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+       // Closed sessions have no receiver for their pending command replies.
+       // Page.close itself completes only after its successful response below.
+@@ -645,10 +646,11 @@
+         return {};
+       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
+       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
+-      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
+-      case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId); return {};
++      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));rememberFileInputContext(this,browser.contexts.get(id));return {browserContextId:id};}
++      case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId);forgetFileInputContext(this,params.browserContextId); return {};
+       case 'Target.createTarget': {
+         const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});
++        rememberFileInputContext(this,page.context);
+         if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
+         return { targetId: page.id };
+       }
+--- /dev/null
++++ b/src/dom-dispatch-recovery.js
+@@ -0,0 +1,133 @@
++// Host-private interruption recovery for explicitly owned synchronous dispatch
++// cohorts. Original jsdom algorithms/lexical helpers remain pinned and intact.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {readFileSync} from 'node:fs';
++import {createHash} from 'node:crypto';
++import {setImmediate as checkpoint} from 'node:timers';
++const require=createRequire(import.meta.url),own=Object.getOwnPropertyDescriptor,define=Object.defineProperty,apply=Reflect.apply;
++const windows=new WeakMap(),canonical=new WeakMap(),cohorts=[],pending=new Set();
++let currentListener=null,currentParticipant=null,installed=false,EventImplementation;
++const nil=()=>Object.create(null),weak=value=>value!==null&&(typeof value==='object'||typeof value==='function')?{ref:new WeakRef(value)}:{value};
++const value=box=>box?.ref?box.ref.deref():box?.value;
++const hasInstance=Function.prototype[Symbol.hasInstance];
++function unsupported(message){return Object.assign(new Error('Owned dispatch recovery boundary: '+message),{dispatchRecoveryBoundary:true})}
++function activeCohort(){return cohorts.at(-1)}
++export function captureCanonicalDispatchWrapper(wrapper,implementation){if(implementation&&typeof implementation==='object')canonical.set(implementation,new WeakRef(wrapper))}
++export function captureDispatchWindow(window,context){
++ if(!vm.isContext(context)||vm.runInContext('globalThis',context)!==window)throw new TypeError('An actual Window/context pair is required');
++ const previous=windows.get(window);if(previous&&previous.context!==context)throw new TypeError('Dispatch Window authority cannot be retargeted');
++ const record=previous??Object.assign(nil(),{context});windows.set(window,record);windows.set(context,record);windows.set(vm.runInContext('globalThis',context),record);
++}
++function slot(record){const d=own(record.context,'_currentEvent');if(!d||!Object.hasOwn(d,'value')||!d.writable)throw unsupported('current-event slot must remain its genuine writable data slot');if(d.value!==undefined&&(!apply(hasInstance,EventImplementation,[d.value])||!canonical.has(d.value)))throw unsupported('current-event data lacks successful canonical Event authority');return d}
++function restoreWindow(token){
++ if(!token.touched)return;
++ const record=value(token.window);if(!record)return;
++ // Intrinsic raw-context data definition never invokes an authored Window
++ // getter/setter. Unsupported descriptor tampering is retained as a bound.
++ const d=slot(record);define(record.context,'_currentEvent',{...d,value:value(token.previousEvent)});
++}
++function unwindListener(token,diagnostics){
++ if(!token.active)return;const event=value(token.event);if(event)setBackendData(event,'_inPassiveListenerFlag',false,diagnostics);
++ try{restoreWindow(token)}catch(error){diagnostics.push(error.message)}
++ token.active=false;if(currentListener?.deref()===token)currentListener=token.previous;
++}
++function setBackendData(event,key,next,diagnostics){
++ const d=own(event,key);
++ if(d&&(!Object.hasOwn(d,'value')||!d.writable)){if(Object.hasOwn(d,'value')&&Object.is(d.value,next))return;diagnostics.push('private Event data slot changed: '+key);return}
++ // Definition on the actual ordinary backend never calls a published Event
++ // setter or an authored accessor installed on a legacy private surface.
++ define(event,key,{value:next,writable:d?.writable??true,enumerable:d?.enumerable??true,configurable:d?.configurable??true});
++}
++function unwindDispatch(frame,diagnostics){
++ if(!frame.active)return;const event=value(frame.event);if(!event){frame.active=false;return}
++ for(const[key,next]of [['eventPhase',0],['currentTarget',null],['_path',[]],['_dispatchFlag',false],['_stopPropagationFlag',false],['_stopImmediatePropagationFlag',false],['_inPassiveListenerFlag',false]])setBackendData(event,key,next,diagnostics);
++ if(frame.ready){if(frame.clearTargets){setBackendData(event,'target',null,diagnostics);setBackendData(event,'relatedTarget',null,diagnostics)}else{setBackendData(event,'target',value(frame.finalTarget)??null,diagnostics);if(frame.relatedKnown)setBackendData(event,'relatedTarget',value(frame.finalRelated)??null,diagnostics);else diagnostics.push('unknown related-target factory authority; related-target restoration is not claimed')}}
++ else diagnostics.push('dispatch interrupted before original pre-tree decision; target restoration is not claimed');
++ if(frame.activation)diagnostics.push('interrupted activation/default action is outside this recovery tranche');
++ frame.active=false;
++}
++function unwindParticipant(token,diagnostics){
++ if(!token.active)return;
++ try{token.restore()}catch(error){diagnostics.push('private dispatch participant recovery failed: '+error.message)}
++ token.active=false;if(currentParticipant?.deref()===token)currentParticipant=token.previous;
++}
++// A participating implementation owns its actual private state and captures the
++// prior value before incrementing. Only tokens abandoned by a terminated VM
++// invoke restore; ordinary finally paths mark their own tokens completed.
++export function beginDispatchRecoveryParticipant(restore){
++ const token=Object.assign(nil(),{kind:'participant',restore,active:true,previous:currentParticipant});
++ currentParticipant=new WeakRef(token);const cohort=activeCohort();if(cohort)cohort.tokens.push(token);return token;
++}
++export function completeDispatchRecoveryParticipant(token){token.active=false;if(currentParticipant?.deref()===token)currentParticipant=token.previous}
++function participantAncestors(){const result=[],seen=new Set();let cursor=currentParticipant?.deref();while(cursor&&cursor.active&&!seen.has(cursor)){seen.add(cursor);result.push(cursor);cursor=cursor.previous?.deref()}return result}
++function recover(tokens,diagnostics){for(let i=tokens.length-1;i>=0;i--){const token=tokens[i];if(token.kind==='listener')unwindListener(token,diagnostics);else if(token.kind==='participant')unwindParticipant(token,diagnostics);else unwindDispatch(token,diagnostics)}}
++function ancestors(){const result=[],seen=new Set();let cursor=currentListener?.deref();while(cursor&&cursor.active&&!seen.has(cursor)){seen.add(cursor);result.push(cursor);const frame=value(cursor.frame);if(frame?.active)result.push(frame);cursor=cursor.previous?.deref()}return result}
++function complete(cohort){
++ recover(cohort.tokens,cohort.diagnostics);const index=cohorts.lastIndexOf(cohort);if(index!==-1)cohorts.splice(index,1);cohort.completed=true;
++}
++export function withOwnedDispatchRecovery(operation){
++ const cohort=Object.assign(nil(),{tokens:[],ancestors:ancestors(),participantAncestors:participantAncestors(),diagnostics:[],completed:false});cohorts.push(cohort);pending.add(cohort);
++ // Only an actual owned cohort posts this Host checkpoint. Live synchronous
++ // ancestor dispatches are preserved now; after the stack ends, any still
++ // active frames were abandoned by a wider V8 termination.
++ const task=checkpoint(()=>{complete(cohort);recover(cohort.ancestors.slice().reverse(),cohort.diagnostics);recover(cohort.participantAncestors.slice().reverse(),cohort.diagnostics);pending.delete(cohort)});task.unref?.();
++ try{return operation()}finally{complete(cohort)}
++}
++const lifecycle={
++ start(event){
++  const frame=Object.assign(nil(),{kind:'dispatch',event:weak(event),active:true,ready:false,clearTargets:false,finalTarget:weak(null),finalRelated:weak(null),relatedKnown:true,activation:false});
++  // Outside a cohort this is only a local weak ancestor context, not a log.
++  const cohort=activeCohort();if(cohort)cohort.tokens.push(frame);return frame;
++ },
++ ready(frame,event,clearTargets){
++  const path=event._path;let index=path.length-1;while(index>=0&&!event.bubbles&&path[index].target===null)index--;
++  let target=null;for(let i=index;i>=0;i--)if(path[i].target){target=path[i].target;break}
++  const related=index>=0?path[index].relatedTarget:null;let wrapper=null;
++  if(related){wrapper=canonical.get(related)?.deref();if(!wrapper&&activeCohort())throw unsupported('related target lacks successful canonical factory authority')}
++  frame.clearTargets=clearTargets;frame.finalTarget=weak(target);frame.finalRelated=weak(wrapper);frame.relatedKnown=!related||!!wrapper;frame.ready=true;
++ },
++ activation(frame,target){frame.activation=target!==null},
++ end(frame){frame.active=false},
++ listener(frame,event,window,inShadow){
++  const record=window?windows.get(window):null,cohort=activeCohort();
++  if(cohort&&window&&!record)throw unsupported('listener Window is not a registered genuine owner context');
++  let descriptor;if(record){try{descriptor=slot(record)}catch(error){if(cohort)throw error}}
++  const token=Object.assign(nil(),{kind:'listener',event:weak(event),frame:weak(frame),window:weak(record),previous:currentListener,previousEvent:weak(descriptor?.value),touched:false,active:true,inShadow});
++  currentListener=new WeakRef(token);if(cohort)cohort.tokens.push(token);return token;
++ },
++ read(window,token){
++  if(!activeCohort())return window._currentEvent;
++  const record=value(token.window);if(!record)throw unsupported('missing listener Window context');return slot(record).value;
++ },
++ write(window,next,token){
++  if(!activeCohort()){window._currentEvent=next;return}
++  const record=value(token.window);if(!record)throw unsupported('missing listener Window context');const d=slot(record);token.touched=true;define(record.context,'_currentEvent',{...d,value:next});
++ },
++ leave(token){token.active=false;if(currentListener?.deref()===token)currentListener=token.previous},
++};
++export function installDispatchRecovery(){
++ if(installed)return;installed=true;
++ const filename=require.resolve('jsdom/lib/jsdom/living/events/EventTarget-impl.js'),source=readFileSync(filename,'utf8');
++ if(require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(source).digest('hex')!=='75c12340a6925ceba5e675df7caae5199f5115dc868bd210a45ccc3e8607ce0b')throw new Error('Pinned EventTarget dispatch source changed');
++ const Implementation=require(filename).implementation;EventImplementation=require('jsdom/lib/jsdom/living/events/Event-impl.js').implementation;
++ const start=source.indexOf('  _dispatch('),end=source.indexOf('\n}\n\nmodule.exports'),method=source.slice(start+2,end);
++ if(apply(Function.prototype.toString,Implementation.prototype._dispatch,[])!==method)throw new Error('Dispatch recovery must install before existing lifecycle wrappers');
++ const header=source.slice(0,source.indexOf('class EventTargetImpl {')),helpers=source.slice(source.indexOf('// https://dom.spec.whatwg.org/#concept-event-listener-invoke'));
++ let body=method.slice(method.indexOf('{')+1,method.lastIndexOf('}')),suffix=helpers;
++ const replace=(text,from,to,count=1)=>{if(text.split(from).length-1!==count)throw new Error('Pinned dispatch lifecycle seam changed');return text.replaceAll(from,to)};
++ body='\n    const recoveryDispatch = lifecycle.start(eventImpl);'+body;
++ body=replace(body,'      if (activationTarget !== null && activationTarget._legacyPreActivationBehavior) {','      lifecycle.ready(recoveryDispatch, eventImpl, clearTargets);\n      lifecycle.activation(recoveryDispatch, activationTarget);\n      if (activationTarget !== null && activationTarget._legacyPreActivationBehavior) {');
++ for(const phase of ['capturing','bubbling'])body=replace(body,'invokeEventListeners(struct, eventImpl, "'+phase+'");','invokeEventListeners(struct, eventImpl, "'+phase+'", recoveryDispatch);');
++ body=replace(body,'    return !eventImpl._canceledFlag;','    lifecycle.end(recoveryDispatch);\n    return !eventImpl._canceledFlag;');
++ suffix=replace(suffix,'function invokeEventListeners(struct, eventImpl, phase) {','function invokeEventListeners(struct, eventImpl, phase, recoveryDispatch) {');
++ suffix=replace(suffix,'innerInvokeEventListeners(eventImpl, listeners, phase, struct.itemInShadowTree);','innerInvokeEventListeners(eventImpl, listeners, phase, struct.itemInShadowTree, recoveryDispatch);');
++ suffix=replace(suffix,'function innerInvokeEventListeners(eventImpl, listeners, phase, itemInShadowTree) {','function innerInvokeEventListeners(eventImpl, listeners, phase, itemInShadowTree, recoveryDispatch) {');
++ suffix=replace(suffix,'    let currentEvent;','    const recoveryListener = lifecycle.listener(recoveryDispatch, eventImpl, window, itemInShadowTree);\n    let currentEvent;');
++ suffix=replace(suffix,'currentEvent = window._currentEvent;','currentEvent = lifecycle.read(window, recoveryListener);');
++ suffix=replace(suffix,'window._currentEvent = eventImpl;','lifecycle.write(window, eventImpl, recoveryListener);');
++ suffix=replace(suffix,'window._currentEvent = currentEvent;','lifecycle.write(window, currentEvent, recoveryListener);');
++ suffix=replace(suffix,'    if (eventImpl._stopImmediatePropagationFlag) {','    lifecycle.leave(recoveryListener);\n    if (eventImpl._stopImmediatePropagationFlag) {');
++ const dispatch=vm.compileFunction(header+'\nreturn function _dispatch(eventImpl, legacyTargetOverrideFlag){'+body+'\n};\n'+suffix,['require','lifecycle'],{filename})(createRequire(filename),lifecycle);
++ Object.defineProperty(Implementation.prototype,'_dispatch',{...own(Implementation.prototype,'_dispatch'),value:dispatch});
++}
+--- a/src/dom-event-state.js
++++ b/src/dom-event-state.js
+@@ -1,6 +1,7 @@
+ // Host-private backing for the original generated Event wrappers. No symbols,
+ // extra fronts, reflected-key filters or authored object tags confer authority.
+ import vm from 'node:vm';
++import {installDispatchRecovery} from './dom-dispatch-recovery.js';
+ import {ownsWorkerRuntime} from './owned-worker-context.js';
+ import {createRequire} from 'node:module';
+ import {readFileSync} from 'node:fs';
+@@ -10,7 +11,7 @@
+ const require=createRequire(import.meta.url);
+ // Preserve the former DOM-factory dependency's genuine CJS bootstrap order
+ // for all Host embeddings, including direct EventTarget/WebSocket imports.
+-if(!ownsWorkerRuntime)require('jsdom');
++if(!ownsWorkerRuntime){require('jsdom');installDispatchRecovery();}
+ const utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+ if(require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(readFileSync(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'))).digest('hex')!=='3dce521ab525a11eb5d817a78bf3308a8ab2e16b73c5c288f81c8d6ad496fa2e')throw new Error('Pinned jsdom Event utilities source changed');
+ const EventImpl=require('jsdom/lib/jsdom/living/events/Event-impl.js').implementation;
+--- a/src/dom-platform-factory-hooks.js
++++ b/src/dom-platform-factory-hooks.js
+@@ -1,4 +1,5 @@
+ import {installLocationFactory} from './location-factory.js';
++import {captureCanonicalDispatchWrapper} from './dom-dispatch-recovery.js';
+ import {domWrapperGlobal} from './dom-factory-scope.js';
+ import {installDOMWrapperRealms} from './dom-wrapper-realms.js';
+ import 'jsdom';
+@@ -25,12 +26,14 @@
+     if (typeof setup === 'function') factory.setup = function (wrapper, globalObject, ...args) {
+       const value = setup.call(this, wrapper, globalObject, ...args);
+       const descriptor = Object.getOwnPropertyDescriptor(wrapper, utils.implSymbol);
++      captureCanonicalDispatchWrapper(value,utils.implForWrapper(value)??descriptor?.value);
+       registerPlatformFactory(value, { kind, implementation:utils.implForWrapper(value)??descriptor?.value, globalObject:domWrapperGlobal(value,globalObject) });
+       return value;
+     };
+     if (typeof allocate === 'function') factory.new = function (globalObject, ...args) {
+       const implementation = allocate.call(this, globalObject, ...args);
+       const descriptor = Object.getOwnPropertyDescriptor(implementation, utils.wrapperSymbol);
++      if(descriptor?.value)captureCanonicalDispatchWrapper(descriptor.value,implementation);
+       if (descriptor?.value) registerPlatformFactory(descriptor.value, { kind, implementation, globalObject:domWrapperGlobal(descriptor.value,globalObject) });
+       return implementation;
+     };
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {installFileWrapperRealms} from './file-wrapper-realms.js';
+ import {isDocumentInterface,transformDocumentInterface} from './document-interface-realms.js';
+ import {isFoundationalInterface,transformFoundationalInterface} from './foundational-interface-realms.js';
+ import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
+@@ -63,6 +64,7 @@
+ }
+ export function installDOMWrapperRealms(){
+  if(installed)return;installed=true;
++ installFileWrapperRealms(createDOMWrapperShell,createDOMWrapperProxy);
+  const directory=dirname(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'));
+  const candidates=[];
+  for(const filename of readdirSync(directory).sort()){
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,4 +1,5 @@
+ import {types} from 'node:util';
++import {beginDispatchRecoveryParticipant,completeDispatchRecoveryParticipant} from './dom-dispatch-recovery.js';
+ import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-parity.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+@@ -144,9 +145,11 @@
+     if (!reporting) return dispatch.call(this, event, ...args);
+     // Also covers classic script errors reported by jsdom itself.
+     event.message = message(event.error);
++    const previousDepth = record.depth;
++    const recovery = beginDispatchRecoveryParticipant(() => { record.depth = previousDepth; });
+     record.depth++;
+     try { return dispatch.call(this, event, ...args); }
+-    finally { record.depth--; }
++    finally { record.depth--; completeDispatchRecoveryParticipant(recovery); }
+   };
+   function onUnhandled(reason, promise) {
+     let owned = promises.get(promise);
+--- /dev/null
++++ b/src/file-inputs.js
+@@ -0,0 +1,54 @@
++// Actual file-control state over canonical jsdom backends. No public value is
++// a protocol description: File/FileList consumers see the original real data.
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {platformFactoryRecord} from './platform-factories.js';
++import {captureFileAPIRealm,withInputFileListAllocation} from './file-wrapper-realms.js';
++import {createInvocationTrampoline} from './invocation.js';
++import {captureDispatchWindow,withOwnedDispatchRecovery} from './dom-dispatch-recovery.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const Input=require('jsdom/lib/jsdom/living/nodes/HTMLInputElement-impl.js').implementation;
++const FileList=require('jsdom/lib/jsdom/living/file-api/FileList-impl.js').implementation;
++const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
++const documents=new WeakMap(),installed=new WeakSet(),own=Object.getOwnPropertyDescriptor;
++let patched=false;
++function owner(control){return documents.get(control._ownerDocument)}
++function replace(list,values){list.length=0;for(let i=0;i<values.length;i++)list.push(values[i])}
++function patch(){
++ if(patched)return;patched=true;
++ const files=own(Input.prototype,'files'),value=own(Input.prototype,'value'),reset=Input.prototype._formReset;
++ Object.defineProperty(Input.prototype,'files',{...files,set(source){
++  if(!owner(this))return files.set.call(this,source);
++  if(this.type!=='file'||source===null)return;
++  if(!(source instanceof FileList))throw new TypeError('A canonical FileList implementation is required');
++  const target=withInputFileListAllocation(owner(this).realm,()=>files.get.call(this));if(target===source)return;
++  // Snapshot the actual members before mutation, including self/alias cases.
++  replace(target,Array.from(source));
++ },get(){const record=owner(this);return record?withInputFileListAllocation(record.realm,()=>files.get.call(this)):files.get.call(this)}});
++ Object.defineProperty(Input.prototype,'value',{...value,set(text){if(owner(this)&&this.type==='file'&&text==='')return;return value.set.call(this,text)}});
++ Input.prototype._formReset=function(...args){const result=Reflect.apply(reset,this,args);if(owner(this)&&this.type==='file')replace(this.files,[]);return result};
++}
++export function installFileInputs(page,window){
++ if(installed.has(window))return;installed.add(window);patch();
++ const document=platformFactoryRecord(window.document)?.implementation;
++ if(!document)throw new TypeError('A canonical Document implementation is required');
++ const realm=captureFileAPIRealm(page,window);
++ if(!realm)throw new TypeError('An actual file-input owner VM is required');
++ captureDispatchWindow(window,realm.context);
++ const record=Object.assign(Object.create(null),{page,window,document,signal:page.documentAbort?.signal,realm,context:realm.context,invocation:createInvocationTrampoline(realm.context),options:{timeout:Math.min(page.timeout??2000,2000),displayErrors:false}});
++ documents.set(document,record);
++}
++export function fileInputOwner(implementation){return implementation instanceof Input?owner(implementation):undefined}
++export function commitFileInputSelection(implementation,values){
++ const record=owner(implementation);if(!record||record.page.closed||record.page.retired||record.signal?.aborted||!record.document._defaultView)return false;
++ // CDP is a Host entry with no outer Runtime.evaluate watchdog. Enter the
++ // captured genuine owner VM before the actual commit/event cohort, just as
++ // owned Page.stopLoading does for authored abort handlers. The original
++ // synchronous state mutation/dispatch order remains inside this one budget.
++ return withOwnedDispatchRecovery(()=>record.invocation.invoke(commitAndDispatch,undefined,[implementation,values,record],record.options));
++}
++function commitAndDispatch(implementation,values,record){
++ const list=implementation.files;replace(list,values);
++ for(const type of ['input','change'])implementation._dispatch(Event.createImpl(record.document._globalObject,[type,{bubbles:true,cancelable:false,composed:false}],{isTrusted:true}));
++ return true;
++}
+--- /dev/null
++++ b/src/file-wrapper-realms.js
+@@ -0,0 +1,144 @@
++// Genuine first allocation for the original pinned file-api factories.
++// The original public installer bodies, implementations, sole FileList Proxy,
++// exports object, caches, and canonical wrapper/implementation links remain.
++import 'jsdom';
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {readFileSync} from 'node:fs';
++import {createHash} from 'node:crypto';
++import {domWrapperGlobal} from './dom-wrapper-globals.js';
++import {getRuntimeBinding} from './native-runtime.js';
++import {registerPlatformFactory} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-kinds.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const identities=new WeakMap(),hasInstance=Function.prototype[Symbol.hasInstance];
++const realms=new WeakMap(),pageRealms=new WeakMap(),incumbents=[],listAllocations=[],pendingBackends=new WeakMap(),lazyFiles=new WeakSet(),adaptedHandlers=new WeakSet();
++const iterators=new WeakMap(),fileFronts=new WeakMap();
++const FileImplementation=require('jsdom/lib/jsdom/living/file-api/File-impl.js').implementation;
++const ListImplementation=require('jsdom/lib/jsdom/living/file-api/FileList-impl.js').implementation;
++// This is an observed public constructor name in the pinned Native binary;
++// the implementation, class/function creation and state are independent.
++const ITERATOR_PUBLIC_NAME='browser.webapi.collections.iterator.Entry(browser.webapi.FileList.Iterator__struct_26,null).JsApi';
++const pins=Object.freeze({Blob:'d086a0782c57b196cd2759aec9358578bbe07137abdc72e2da44391536b0b648',File:'daf94ff0921904e6ff8ac976e834a94f0ed7dd2c9d2dc6d2bf76493945fc1db9',FileList:'5bbe3385bfc31337a3ad4e25da7c0fd5c1a6b17f4d09aa6ada790370a8fe7ddd'});
++let installed=false;
++export function fileWrapperImplementation(value){return identities.get(value)}
++const brand=(value,Implementation)=>Reflect.apply(hasInstance,Implementation,[identities.get(value)]);
++function remember(wrapper){const implementation=utils.implForWrapper(wrapper);if(!implementation)throw new TypeError('A successful canonical file factory is required');identities.set(wrapper,implementation);if(Reflect.apply(hasInstance,FileImplementation,[implementation])){const previous=fileFronts.get(implementation);if(previous&&previous!==wrapper)throw new TypeError('A canonical File frontend cannot be replaced');fileFronts.set(implementation,wrapper)}return wrapper}
++function realm(globalObject){
++ let record=realms.get(globalObject);if(record)return record;
++ const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
++ if(!context||!vm.isContext(context))return null;
++ const global=vm.runInContext('globalThis',context),Object=vm.runInContext('Object',context);
++ record=realms.get(context);if(!record){record=globalThis.Object.assign(globalThis.Object.create(null),{context,global,Object,TypeError:vm.runInContext('TypeError',context),root:null,iterator:null,prototypes:globalThis.Object.create(null)});realms.set(context,record);realms.set(global,record)}
++ realms.set(globalObject,record);return record;
++}
++function scope(record,operation){incumbents.push(record);try{return operation()}finally{if(incumbents.pop()!==record)throw Error('File incumbent scope mismatch')}}
++function entry(globalObject,operation,name,privateTrap=false,callee=false){
++ const fallback=realm(globalObject);if(!fallback)return operation;
++ // Private trap entries themselves stay genuinely Host-created. Native V8
++ // captures the actual incumbent BEFORE entering their Host JS operation;
++ // public item alone is a genuine VM function at its first publication.
++ const result=getRuntimeBinding().createEntry((actualIncumbent,receiver,args)=>{
++  const selected=callee?fallback:realms.get(actualIncumbent)??incumbents.at(-1)??fallback;
++  return scope(selected,()=>Reflect.apply(operation,receiver,args));
++ },privateTrap?globalThis.Object.prototype:fallback.Object.prototype,name);
++ Object.defineProperty(result,'length',{value:operation.length,configurable:true});return result;
++}
++export function captureFileAPIRealm(page,window){
++ const record=realm(window);if(!record)return null;
++ const root=page.registry&&page.record?pageRealms.get(page.registry.page):null;
++ if(record.root&&record.root!==(root??record))throw new TypeError('File allocation realm cannot be retargeted');
++ record.root=root??record;pageRealms.set(page,record);return record;
++}
++export function withInputFileListAllocation(record,operation){
++ const selected=record?.root??record;listAllocations.push(selected);try{return operation()}finally{if(listAllocations.pop()!==selected)throw Error('FileList allocation scope mismatch')}
++}
++export function createDiskFileImplementation(globalObject,args){
++ // Genuine independent jsdom File backend, with actual disk data. It has no
++ // public wrapper until an actual page indexed/item/iterator access asks.
++ const implementation=Reflect.construct(FileImplementation,[globalObject,args,globalThis.Object.create(null)]);lazyFiles.add(implementation);return implementation;
++}
++function implementation(globalObject,args,privateData,Implementation){
++ const existing=pendingBackends.get(privateData);if(existing){pendingBackends.delete(privateData);return existing}
++ return Reflect.construct(Implementation,[globalObject,args,privateData]);
++}
++function capturePrototype(globalObject,kind,prototype){const record=realm(globalObject);if(record){const old=record.prototypes[kind];if(old&&old!==prototype)throw new TypeError('An original File prototype cannot be retargeted');record.prototypes[kind]=prototype}}
++function originalPrototype(globalObject,kind){return realm(globalObject)?.prototypes[kind]??globalObject[utils.ctorRegistrySymbol][kind].prototype}
++function wrapFile(value,globalObject,callee=false){
++ const existing=fileFronts.get(value);if(existing)return existing;
++ if(!lazyFiles.has(value))return utils.tryWrapperForImpl(value);
++ const selected=callee?realm(globalObject):incumbents.at(-1)??realm(globalObject);if(!selected)throw new TypeError('An actual File first-access realm is required');
++ const privateData=globalThis.Object.create(null);pendingBackends.set(privateData,value);
++ try{return require('jsdom/lib/jsdom/living/generated/File.js').create(selected.context,[],privateData)}finally{pendingBackends.delete(privateData)}
++}
++function plain(record,prototype=record.Object.prototype){const value=Reflect.construct(record.Object,[]);Object.setPrototypeOf(value,prototype);return value}
++function iteratorInterface(record){
++ if(record.iterator)return record.iterator;
++ // This public class/prototype is genuinely compiled in the actual selected
++ // VM. It carries no VM-private map/controller, and creates no published Host
++ // shell. UA iterator instances use the actual VM Object below.
++ const Constructor=vm.compileFunction("'use strict';return function FileListIterator(){throw new TypeError('Illegal Constructor')}",['TypeError'],{parsingContext:record.context})(record.TypeError),prototype=Constructor.prototype;
++ Object.defineProperty(Constructor,'name',{value:ITERATOR_PUBLIC_NAME,configurable:true});Object.defineProperty(Constructor,'prototype',{writable:false});delete prototype.constructor;
++ const next=entry(record.context,function(){
++  const state=iterators.get(this);if(!state)throw new record.TypeError('Illegal invocation');
++  const implementation=state.list.item(state.index),done=implementation===null;
++  let value;if(!done){state.index++;value=wrapFile(implementation,record.context,true)}
++  const result=plain(record);Object.defineProperties(result,{done:{value:done,writable:true,enumerable:true,configurable:true},value:{value,writable:true,enumerable:true,configurable:true}});return result;
++ },'next',false,true);
++ const same=entry(record.context,function(){if(!iterators.has(this))throw new record.TypeError('Illegal invocation');return this},'',false,true);
++ Object.defineProperties(prototype,{next:{value:next,writable:true,enumerable:true,configurable:true},constructor:{value:Constructor,writable:true,configurable:true},[Symbol.iterator]:{value:same,writable:true,configurable:true}});
++ record.iterator=Object.assign(Object.create(null),{Constructor,prototype});return record.iterator;
++}
++function installListIterator(globalObject,Prototype,originalItem){
++ const record=realm(globalObject);if(!record)return;
++ Object.defineProperty(Prototype,'item',{value:entry(globalObject,function(index){if(!brand(this,ListImplementation))throw new record.TypeError('Illegal invocation');return Reflect.apply(originalItem,this,arguments)},'item',false,true),writable:true,configurable:true});
++ Object.defineProperty(Prototype,Symbol.iterator,{value:entry(globalObject,function(){
++  const list=identities.get(this);if(!Reflect.apply(hasInstance,ListImplementation,[list]))throw new record.TypeError('invalid argument');
++  const value=plain(record,iteratorInterface(record).prototype),state=Object.assign(Object.create(null),{list,index:0});iterators.set(value,state);registerPlatformFactoryKind('FileListIterator');registerPlatformFactory(value,{kind:'FileListIterator',implementation:state,globalObject:record.context});return value;
++ },'',false,true),writable:true,configurable:true});
++}
++export function installFileWrapperRealms(createShell,createProxy){
++ if(installed)return;installed=true;
++ if(require('jsdom/package.json').version!=='26.1.0')throw Error('Pinned file-api jsdom version changed');
++ for(const kind of ['Blob','File','FileList']){
++  const filename=require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),factory=require(filename),original=readFileSync(filename,'utf8');
++  if(createHash('sha256').update(original).digest('hex')!==pins[kind])throw Error('Pinned generated file-api source changed: '+kind);
++  let source=original;
++  const replace=(from,to,count=1)=>{if(source.split(from).length-1!==count)throw Error('Generated file-api allocation signature changed: '+kind);source=source.replaceAll(from,to)};
++  replace('return Object.create(proto);',`return createShell(globalObject, proto, ${JSON.stringify(kind)});`);
++  replace('proto = globalObject[ctorRegistrySymbol]["'+kind+'"].prototype;','proto = originalPrototype(globalObject, '+JSON.stringify(kind)+');');
++  replace('utils.isObject(value) && utils.hasOwn(value, implSymbol) && value[implSymbol] instanceof Impl.implementation','privateBrand(value, Impl.implementation)');
++  if(kind==='File')replace('value: new Impl.implementation(globalObject, constructorArgs, privateData),','value: selectedImplementation(globalObject, constructorArgs, privateData, Impl.implementation),');
++  // Bind immediately after the genuine backend exists, before the original
++  // Proxy/init/backend links read it. Authored symbol getters never supply
++  // authority or backing for these generated public operations.
++  const setupEnd='    configurable: true\n  });';
++  replace(setupEnd,setupEnd+'\n  remember(wrapper);',2);
++  for(const name of ['wrapper','esValue','value','target'])source=source.replaceAll(name+'[implSymbol]','privateImplementation('+name+')');
++  source=source.replaceAll('utils.implForWrapper(', 'privateImplementation(');
++  if(kind==='FileList'){
++   replace('return new Proxy(wrapper, proxyHandler);','return createProxy(wrapper, proxyHandler, globalObject, "FileList");');
++   replace('utils.tryWrapperForImpl(indexedValue)','wrapFile(indexedValue, this._globalObject)',2);
++   replace('utils.tryWrapperForImpl(privateImplementation(esValue).item(...args))','wrapFile(privateImplementation(esValue).item(...args), globalObject, true)');
++   // First publication installs the genuine selected-VM item/iterator entries;
++   // the original generated item body still owns conversions/backend access.
++   replace('  ctorRegistry[interfaceName] = FileList;','  installListIterator(globalObject, FileList.prototype, FileList.prototype.item);\n  ctorRegistry[interfaceName] = FileList;');
++  }
++  else replace('exports.setup(Object.create(new.target.prototype),','exports.setup(createShell(globalObject, new.target.prototype, '+JSON.stringify(kind)+'),');
++  replace('  ctorRegistry[interfaceName] = '+kind+';','  capturePrototype(globalObject, '+JSON.stringify(kind)+', '+kind+'.prototype);\n  ctorRegistry[interfaceName] = '+kind+';');
++  const module={exports:factory};
++  const shell=(globalObject,prototype,name)=>{const selected=name==='FileList'?listAllocations.at(-1):null;if(selected){globalObject=selected.context;prototype=originalPrototype(selected.context,'FileList')}return createShell(globalObject,prototype,name)};
++  const proxy=(target,handler,globalObject,name)=>{
++   if(!adaptedHandlers.has(handler)){
++    adaptedHandlers.add(handler);const selected=domWrapperGlobal(target,globalObject);
++    for(const key of ['get','has','ownKeys','getOwnPropertyDescriptor','set','defineProperty','deleteProperty','preventExtensions'])if(typeof handler[key]==='function')Object.defineProperty(handler,key,{value:entry(selected,handler[key],key,true),writable:true,configurable:true});
++   }
++   const value=createProxy(target,handler,globalObject,name);identities.set(value,identities.get(target));return value;
++  };
++  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','privateBrand','privateImplementation','remember','selectedImplementation','wrapFile','installListIterator','originalPrototype','capturePrototype'],{filename})(factory,createRequire(filename),module,filename,filename.slice(0,filename.lastIndexOf('/')),shell,proxy,brand,fileWrapperImplementation,remember,implementation,wrapFile,installListIterator,originalPrototype,capturePrototype);
++  if(module.exports!==factory)throw Error('Canonical generated file-api exports changed: '+kind);
++  const setup=factory.setup,allocate=factory.new;
++  factory.setup=function(...args){return remember(Reflect.apply(setup,this,args))};
++  factory.new=function(...args){const implementation=Reflect.apply(allocate,this,args);remember(utils.wrapperForImpl(implementation));return implementation};
++ }
++}
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -35,7 +35,7 @@
+   const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+-  if(['Animation','AnimationPlaybackEvent','Storage','StorageEvent','PaymentRequest','PaymentResponse','PaymentRequestUpdateEvent','PaymentMethodChangeEvent','VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
++  if(['FileListIterator','Animation','AnimationPlaybackEvent','Storage','StorageEvent','PaymentRequest','PaymentResponse','PaymentRequestUpdateEvent','PaymentMethodChangeEvent','VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+   const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
+   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+--- /dev/null
++++ b/test/file-input-capability.test.js
+@@ -0,0 +1,116 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {createRequire} from 'node:module';
++import {mkdtemp,writeFile,rm,utimes} from 'node:fs/promises';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {Browser} from '../src/browser.js';
++import {getHeapBinding} from '../src/native-heap.js';
++import {runFileInput} from '../src/cdp-file-input.js';
++import {platformFactoryRecord} from '../src/platform-factories.js';
++import {fileWrapperImplementation} from '../src/file-wrapper-realms.js';
++import {observeDOMWrapperProxy} from '../src/dom-wrapper-realms.js';
++import {spawn} from 'node:child_process';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),File=require('jsdom/lib/jsdom/living/generated/File.js'),List=require('jsdom/lib/jsdom/living/generated/FileList.js'),Blob=require('jsdom/lib/jsdom/living/generated/Blob.js');
++class WireError extends Error {constructor(message,code){super(message);this.code=code}}
++async function fixture(t){
++ const dir=await mkdtemp(join(tmpdir(),'red-panda-file-input-')),browser=new Browser({timeout:1000}),page=browser.createPage();
++ t.after(async()=>{browser.close();await rm(dir,{recursive:true,force:true})});
++ await page.navigate('data:text/html,<form id=form><input id=a type=file required><input id=b type=file></form><iframe id=child>');
++ const w=page.dom.window,a=w.document.getElementById('a'),b=w.document.getElementById('b');
++ const session={page,nodes:new Map([[1,a],[2,b]]),object(id){if(id==='a')return a;throw Error('actual missing handle')}},connection={browser,sessions:new Map([['actual-test-session',session]])};
++ const set=(files,selector={nodeId:1})=>runFileInput(connection,session,{files,...selector},WireError);
++ const path=join(dir,'owned.txt'),binary=join(dir,'bytes.unknown');await writeFile(path,Buffer.from([65,0,255]));await writeFile(binary,Buffer.from([3,1,4]));await utimes(path,1700000000.125,1700000000.125);
++ return {dir,browser,page,w,a,b,path,binary,set,connection,session};
++}
++function actualRealm(value,w){const binding=getHeapBinding(),anchor=w.eval('[]'),host=[],p=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,host),false);assert.equal(binding.creationGlobal(value),binding.creationGlobal(anchor));Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,p)}}
++test('file-api factories allocate genuine VM wrappers before binding the same canonical backend and sole list Proxy',async t=>{
++ const observed=[];const stop=observeDOMWrapperProxy('FileList',(target,handler)=>observed.push({target,handler}));t.after(stop);
++ const {w,a}=await fixture(t),blob=new w.Blob(['real']),file=new w.File(['bytes'],'authored.txt',{lastModified:123});
++ for(const value of [blob,file,a.files])actualRealm(value,w);
++ for(const[value,factory]of [[blob,Blob],[file,File],[a.files,List]]){const implementation=fileWrapperImplementation(value);assert.equal(platformFactoryRecord(value).implementation,implementation);assert.equal(utils.wrapperForImpl(implementation),value);assert.equal(utils.implForWrapper(value),implementation);assert.equal(factory.is(value),true)}
++ // Legacy generated public definitions are explicitly outside this migration.
++ assert.equal(getHeapBinding().sameRealm(w.File,[]),true);
++ assert.ok(observed.length);const binding=getHeapBinding();for(const {target,handler}of observed){actualRealm(target,w);for(const key of ['get','getOwnPropertyDescriptor']){const f=handler[key],p=Object.getPrototypeOf(f);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(f,[]),true);assert.equal(binding.sameRealm(f,w.eval('[]')),false);Object.setPrototypeOf(f,null)}}finally{Object.setPrototypeOf(f,p)}}}
++});
++test('copied and Proxy lookalikes cannot supply file brands or trigger authored symbol getters',async t=>{
++ const {w,a}=await fixture(t);for(const[value,factory,Prototype,key]of [[new w.File(['actual'],'name'),File,w.File.prototype,'name'],[a.files,List,w.FileList.prototype,'length']]){
++  let reads=0;const fake=Object.create(Object.getPrototypeOf(value));Object.defineProperties(fake,Object.getOwnPropertyDescriptors(value));
++  const symbol=Reflect.ownKeys(value).find(k=>typeof k==='symbol'&&k.description==='impl');if(symbol)Object.defineProperty(fake,symbol,{get(){reads++;throw Error('authored slot read')},configurable:true});
++  assert.equal(factory.is(fake),false);assert.equal(factory.is(new Proxy(value,{get(){reads++;throw Error('authored Proxy read')}})),false);
++  assert.throws(()=>Object.getOwnPropertyDescriptor(Prototype,key).get.call(fake),e=>e instanceof w.TypeError);assert.equal(reads,0);
++ }
++});
++test('real disk assignment yields exact bytes, stat mtime, stable list and trusted plain input then change Events',async t=>{
++ const {w,a,path,binary,set}=await fixture(t),list=a.files,events=[];
++ for(const type of ['input','change'])a.addEventListener(type,e=>events.push([e.type,e.isTrusted,e.bubbles,e.cancelable,e.composed,e instanceof w.Event,e instanceof w.InputEvent,Array.from(a.files,f=>f.name)]));
++ assert.deepEqual(set([path,binary]),{});assert.equal(a.files,list);assert.equal(list.length,2);assert.equal(a.multiple,false);assert.equal(a.validity.valueMissing,false);actualRealm(list,w);actualRealm(list[0],w);
++ assert.deepEqual(Array.from(new w.Uint8Array(await list[0].arrayBuffer())),[65,0,255]);assert.equal(list[0].name,'owned.txt');assert.equal(list[0].type,'text/plain');assert.equal(list[0].lastModified,1700000000125);assert.equal(list[1].type,'application/octet-stream');
++ assert.deepEqual(events,[['input',true,true,false,false,true,false,['owned.txt','bytes.unknown']],['change',true,true,false,false,true,false,['owned.txt','bytes.unknown']]]);
++});
++test('a later disk failure preserves actual old File identity, bytes, list and event count atomically',async t=>{
++ const {w,a,path,binary,dir,set}=await fixture(t);set([path]);const list=a.files,file=list[0];let events=0;a.addEventListener('input',()=>events++);a.addEventListener('change',()=>events++);
++ assert.throws(()=>set([binary,join(dir,'missing-owned-path')]),e=>e.code===-31998&&e.message==='FileNotFound');assert.equal(a.files,list);assert.equal(list.length,1);assert.equal(list[0],file);assert.equal(events,0);assert.deepEqual(Array.from(new w.Uint8Array(await file.arrayBuffer())),[65,0,255]);
++});
++test('files assignment copies membership, empty value keeps it, reset clears and every explicit empty selection fires real events',async t=>{
++ const {a,b,path,binary,set}=await fixture(t),target=b.files;set([path,binary]);b.files=a.files;assert.equal(b.files,target);assert.notEqual(b.files,a.files);assert.equal(b.files[0],a.files[0]);set([binary]);assert.equal(b.files.length,2);
++ a.value='';assert.equal(a.files.length,1);a.form.reset();assert.equal(a.files.length,0);assert.equal(b.files.length,0);
++ const events=[];a.addEventListener('input',e=>events.push([e.type,e.isTrusted]));a.addEventListener('change',e=>events.push([e.type,e.isTrusted]));set([]);set([]);assert.deepEqual(events,[['input',true],['change',true],['input',true],['change',true]]);
++});
++test('selector precedence and strong private real-Node authority reject copied lookalikes without reading authored slots',async t=>{
++ const {w,a,path,set,connection,session}=await fixture(t);set([path],{nodeId:1,backendNodeId:2,objectId:'missing'});assert.equal(a.files.length,1);
++ assert.throws(()=>set([path],{nodeId:4000000000,backendNodeId:1}),e=>e.code===-31998&&e.message==='NodeNotFound');
++ let reads=0;const fake=Object.create(w.HTMLInputElement.prototype);Object.defineProperties(fake,Object.getOwnPropertyDescriptors(a));session.object=()=>fake;
++ const sym=Reflect.ownKeys(a).find(k=>typeof k==='symbol'&&k.description==='impl');if(sym)Object.defineProperty(fake,sym,{get(){reads++;throw Error('authored input slot')},configurable:true});
++ assert.throws(()=>runFileInput(connection,session,{files:[path],objectId:'fake'},WireError),e=>e.message==='ObjectIdIsNotANode');assert.equal(reads,0);
++});
++test('immutable Blob reads retain actual file backing after authored implementation-symbol replacement',async t=>{
++ const {w,a,path,set}=await fixture(t);set([path]);const file=a.files[0],sym=Reflect.ownKeys(file).find(k=>typeof k==='symbol'&&k.description==='impl');let reads=0;
++ if(sym)Object.defineProperty(file,sym,{get(){reads++;throw Error('authored file slot')},configurable:true});
++ assert.equal(file.name,'owned.txt');assert.equal(file.size,3);assert.deepEqual(Array.from(new w.Uint8Array(await file.arrayBuffer())),[65,0,255]);assert.equal(reads,0);
++});
++test('genuine standalone Host documents retain Host allocation and canonical File and FileList behavior',()=>{
++ const {JSDOM}=require('jsdom'),dom=new JSDOM('<input type=file>');try{const w=dom.window,file=new w.File(['host'],'host.txt'),list=w.document.querySelector('input').files;assert.equal(getHeapBinding().sameRealm(file,[]),true);assert.equal(getHeapBinding().sameRealm(list,[]),true);assert.equal(file.name,'host.txt');assert.equal(list.length,0);assert.equal(File.is(file),true);assert.equal(List.is(list),true)}finally{dom.window.close()}
++});
++for(const access of ['index','item','iterator'])test('child first '+access+' access uses actual indexed-reader or method-callee VM and retains one canonical File',async t=>{
++ const {w,path,page,connection}=await fixture(t),iframe=w.document.querySelector('iframe');const child=iframe.contentWindow,input=child.document.createElement('input');input.type='file';input.id='childUpload';child.document.body.append(input);
++ const session={page,nodes:new Map([[1,input]])};connection.sessions.set('child-control',session);runFileInput(connection,session,{files:[path],nodeId:1},WireError);
++ const list=input.files;assert.equal(Object.getPrototypeOf(list),w.FileList.prototype);actualRealm(list,w);
++ const expression=access==='index'?'list[0]':access==='item'?'list.item(0)':'list[Symbol.iterator]().next().value';
++ const first=child.eval(`(()=>{const list=document.getElementById('childUpload').files;return ${expression}})()`);const selected=access==='index'?child:w;actualRealm(first,selected);assert.equal(Object.getPrototypeOf(first),selected.File.prototype);assert.equal(list[0],first);assert.equal(list.item(0),first);assert.equal(list[Symbol.iterator]().next().value,first);assert.equal(platformFactoryRecord(first).implementation,fileWrapperImplementation(first));
++});
++test('main first File access stays in its original genuine VM after child access without retargeting',async t=>{
++ const {w,path,page,connection}=await fixture(t),iframe=w.document.querySelector('iframe');const child=iframe.contentWindow,input=child.document.createElement('input');input.type='file';input.id='childUpload';child.document.body.append(input);const session={page,nodes:new Map([[1,input]])};connection.sessions.set('child-main-control',session);runFileInput(connection,session,{files:[path],nodeId:1},WireError);
++ const file=w.eval(`document.querySelector('iframe').contentDocument.getElementById('childUpload').files[0]`);actualRealm(file,w);assert.equal(Object.getPrototypeOf(file),w.File.prototype);const childRead=child.eval(`document.getElementById('childUpload').files.item(0)`);assert.equal(childRead,file);actualRealm(childRead,w);assert.equal(childRead instanceof child.File,false);
++});
++test('borrowed item uses its authentic method VM independently of caller and preserves the first real File',async t=>{
++ const {w,path,page,connection}=await fixture(t),child=w.document.querySelector('iframe').contentWindow,input=child.document.createElement('input');input.id='childUpload';input.type='file';child.document.body.append(input);const session={page,nodes:new Map([[1,input]])};connection.sessions.set('borrowed-item',session);
++ runFileInput(connection,session,{files:[path],nodeId:1},WireError);const first=child.FileList.prototype.item.call(input.files,0);actualRealm(first,child);assert.equal(Object.getPrototypeOf(first),child.File.prototype);assert.equal(w.FileList.prototype.item.call(input.files,0),first);
++ runFileInput(connection,session,{files:[path],nodeId:1},WireError);const second=w.FileList.prototype.item.call(input.files,0);actualRealm(second,w);assert.equal(Object.getPrototypeOf(second),w.File.prototype);assert.equal(child.FileList.prototype.item.call(input.files,0),second);
++});
++test('genuine VM iterator prototypes and results follow actual borrowed next callee with exact public data shape',async t=>{
++ const {w,path,page,connection}=await fixture(t),child=w.document.querySelector('iframe').contentWindow,input=child.document.createElement('input');input.id='childUpload';input.type='file';child.document.body.append(input);const session={page,nodes:new Map([[1,input]])};connection.sessions.set('borrowed-next',session);const assign=()=>runFileInput(connection,session,{files:[path],nodeId:1},WireError);
++ assign();const list=input.files,main=list[Symbol.iterator](),other=child.FileList.prototype[Symbol.iterator].call(list),mp=Object.getPrototypeOf(main),cp=Object.getPrototypeOf(other);actualRealm(main,w);actualRealm(mp,w);actualRealm(other,child);actualRealm(cp,child);assert.notEqual(mp,cp);assert.deepEqual(Reflect.ownKeys(main),[]);assert.equal(Object.hasOwn(main,'next'),false);assert.equal(Object.prototype.toString.call(main),'[object Object]');assert.deepEqual(Reflect.ownKeys(mp),['next','constructor',Symbol.iterator]);assert.equal(main[Symbol.iterator](),main);assert.equal(typeof main.return,'undefined');assert.equal(typeof main.throw,'undefined');
++ for(const [prototype,selected]of [[mp,w],[cp,child]]){actualRealm(prototype.next,selected);actualRealm(prototype.constructor,selected);actualRealm(prototype[Symbol.iterator],selected);assert.equal(prototype.next.name,'next');assert.equal(prototype.next.length,0);assert.equal(Object.getOwnPropertyDescriptor(prototype,'next').enumerable,true);assert.equal(Object.getOwnPropertyDescriptor(prototype,'constructor').enumerable,false);assert.equal(Object.getOwnPropertyDescriptor(prototype,Symbol.iterator).enumerable,false)}
++ const result=cp.next.call(main);actualRealm(result,child);actualRealm(result.value,child);assert.deepEqual(Object.keys(result),['done','value']);assert.equal(result.done,false);for(const key of ['done','value']){const d=Object.getOwnPropertyDescriptor(result,key);assert.equal(d.enumerable,true);assert.equal(d.configurable,true);assert.equal(d.writable,true)}
++ assign();const fresh=child.FileList.prototype[Symbol.iterator].call(list),opposite=mp.next.call(fresh);actualRealm(opposite,w);actualRealm(opposite.value,w);const done=mp.next.call(fresh);assert.equal(done.done,true);assert.equal(done.value,undefined);assert.equal(Object.hasOwn(done,'value'),true);
++});
++test('real iterator reads live replacement and resumes at unchanged index after done',async t=>{
++ const {w,a,path,binary,set}=await fixture(t);set([path,binary]);const it=a.files[Symbol.iterator]();assert.equal(it.next().value.name,'owned.txt');set([binary]);assert.equal(it.next().done,true);set([path,binary]);assert.equal(it.next().value.name,'bytes.unknown');assert.equal(it.next().done,true);
++ const before=a.files[Symbol.iterator]();set([binary,path]);assert.equal(before.next().value.name,'bytes.unknown');set([]);assert.equal(before.next().done,true);set([binary,path]);const resumed=before.next();actualRealm(resumed,w);assert.equal(resumed.done,false);assert.equal(resumed.value.name,'owned.txt');
++});
++test('private iterator brands reject copied/Proxy receivers without traps and use real callee VM errors',async t=>{
++ const {w,a}=await fixture(t),child=w.document.querySelector('iframe').contentWindow,it=a.files[Symbol.iterator](),other=child.FileList.prototype[Symbol.iterator].call(a.files);let traps=0;const fake=Object.create(Object.getPrototypeOf(it)),proxy=new Proxy(it,{get(){traps++;throw Error('authored iterator trap')}});
++ for(const receiver of [fake,proxy])assert.throws(()=>it.next.call(receiver),e=>{actualRealm(e,w);return e instanceof w.TypeError&&e.message==='Illegal invocation'});
++ assert.throws(()=>Object.getPrototypeOf(other).next.call(fake),e=>{actualRealm(e,child);return e instanceof child.TypeError&&e.message==='Illegal invocation'});assert.equal(traps,0);
++ assert.throws(()=>w.FileList.prototype[Symbol.iterator].call(Object.create(w.FileList.prototype)),e=>e instanceof w.TypeError&&e.message==='invalid argument');
++});
++test('real stateful iterators reject cloning while real disk File still clones actual bytes',async t=>{
++ const {w,a,path,set}=await fixture(t);set([path]);const it=a.files[Symbol.iterator]();assert.throws(()=>w.structuredClone(it),e=>e.name==='DataCloneError');const original=a.files[0],copy=w.structuredClone(original);assert.notEqual(copy,original);actualRealm(copy,w);assert.equal(copy.name,original.name);assert.equal(copy.type,original.type);assert.equal(copy.lastModified,original.lastModified);assert.deepEqual(Array.from(new w.Uint8Array(await copy.arrayBuffer())),[65,0,255]);
++});
++test('Host CDP file commit and authored handlers obey the genuine owner VM policy and recover',{timeout:8000},async()=>{
++ const child=spawn(process.execPath,['--experimental-vm-modules',new URL('./fixtures/file-input-watchdog.mjs',import.meta.url).pathname],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
++ let expired=false;const deadline=setTimeout(()=>{expired=true;child.kill('SIGKILL')},7000);const{code,signal}=await new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(deadline);
++ if(process.env.FILE_INPUT_WATCHDOG_EVIDENCE)await writeFile(process.env.FILE_INPUT_WATCHDOG_EVIDENCE,JSON.stringify({node:process.version,pid:child.pid,expired,code,signal,stdout,stderr},null,2)+'\n',{flag:'wx'});
++ assert.equal(expired,false,stdout+stderr);assert.equal(signal,null,stdout+stderr);assert.equal(code,0,stdout+stderr);const report=JSON.parse(stdout.trim().split('\n').at(-1));assert.equal(report.effectiveTimeout,200);assert.equal(report.afterTimeout.entered,true);assert.equal(report.afterTimeout.sameDocument,true);assert.equal(report.disposed,true);
++});
+--- /dev/null
++++ b/test/file-input-dispatch-recovery.test.js
+@@ -0,0 +1,8 @@
++import test from 'node:test';import assert from 'node:assert/strict';
++import {spawn} from 'node:child_process';import {writeFile} from 'node:fs/promises';
++for(const mode of ['basic','nested','shadow-open','shadow-closed','prior-outer','tampered-slot','error-report','prior-reporting'])test('Owned file dispatch recovery: '+mode,{timeout:8000},async()=>{
++ const child=spawn(process.execPath,['--experimental-vm-modules',new URL('./fixtures/file-input-watchdog.mjs',import.meta.url).pathname,mode],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
++ let expired=false;const timer=setTimeout(()=>{expired=true;child.kill('SIGKILL')},7000),result=await new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(timer);
++ if(process.env.FILE_DISPATCH_RECOVERY_EVIDENCE)await writeFile(process.env.FILE_DISPATCH_RECOVERY_EVIDENCE,JSON.stringify({mode,node:process.version,pid:child.pid,expired,...result,stdout,stderr},null,2)+'\n',{flag:'wx'});
++ assert.equal(expired,false,stdout+stderr);assert.equal(result.signal,null,stdout+stderr);assert.equal(result.code,0,stdout+stderr);const report=JSON.parse(stdout.trim().split('\n').at(-1));assert.equal(report.failure,undefined,stdout+stderr);assert.equal(report.effectiveTimeout,200);if(mode==='tampered-slot'){assert.equal(report.boundary.reads,0);assert.equal(report.boundary.entered,false);assert.equal(report.disposed,true);return}assert.equal(report.afterTimeout.eventState.phase,0);assert.equal(report.afterTimeout.eventState.currentTarget,null);assert.equal(report.afterTimeout.eventState.pathLength,0);assert.equal(report.afterTimeout.eventState.eventUndefined,true);assert.equal(report.redispatch.phase,0);assert.equal(report.disposed,true);
++});
+--- /dev/null
++++ b/test/fixtures/file-input-watchdog.mjs
+@@ -0,0 +1,73 @@
++// Owned-process regression. Parent retains the existing 7s child ownership
++// watchdog; actual authored callback execution uses configured 200ms policy.
++import assert from 'node:assert/strict';
++import {mkdtemp,writeFile,rm} from 'node:fs/promises';
++import {tmpdir} from 'node:os';import {join} from 'node:path';
++import {serve} from '../../src/cdp.js';import {runFileInput} from '../../src/cdp-file-input.js';import {installListenerOwnership} from '../../src/listener-ownership.js';import {connect} from '../cdp-client.js';import {installErrors} from '../../src/errors.js';
++const depthObserver=process.env.FILE_DISPATCH_DEPTH_OBSERVER?await import(process.env.FILE_DISPATCH_DEPTH_OBSERVER):null;
++let service,client,dir;const mode=process.argv[2]??'basic',report={effectiveTimeout:200,mode};
++try{
++ dir=await mkdtemp(join(tmpdir(),'red-panda-file-watchdog-'));const first=join(dir,'first.txt'),second=join(dir,'second.txt');await writeFile(first,Buffer.from([65,0,255]));await writeFile(second,Buffer.from([3,1,4]));
++ service=await serve({port:0,timeout:200,loadResources:['iframe']});client=await connect('ws://127.0.0.1:'+service.port+'/',{timeout:2000});
++ const {targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
++ const send=(method,params={})=>client.send(method,params,sessionId);
++ await send('Runtime.enable');await send('Page.enable');await send('Page.navigate',{url:'data:text/html,<body id=stable>real guarded file page<iframe id=child></iframe></body>'});
++ const end=Date.now()+2000;for(;;){const r=await send('Runtime.evaluate',{expression:'document.readyState==="complete"&&document.getElementById("child").contentDocument.readyState==="complete"',returnByValue:true});if(r.result?.value===true)break;if(Date.now()>end)throw Error('Original2s actual complete deadline');await new Promise(r=>setTimeout(r,5))}
++ const tree=await send('Page.getFrameTree'),frameId=tree.frameTree.childFrames[0].frame.id,context=client.events.filter(e=>e.method==='Runtime.executionContextCreated'&&e.sessionId===sessionId).map(e=>e.params.context).findLast(c=>c.auxData?.isDefault&&c.auxData.frameId===frameId);assert.ok(context);
++ const actualOwnerWindow=service.browser.pages.get(targetId).frames.findFrame(frameId).dom.window;
++ if(depthObserver)report.initialDepth=depthObserver.readErrorDepth(actualOwnerWindow);
++ const evaluate=async expression=>{const result=await send('Runtime.evaluate',{expression,contextId:context.id,returnByValue:true});assert.equal(result.exceptionDetails,undefined);return result.result.value};
++ await evaluate(`(()=>{globalThis.events=[];globalThis.entered=false;globalThis.originalDocument=document;const i=document.createElement('input');i.type='file';i.id='upload';document.body.append(i);globalThis.input=i;window.addEventListener('error',e=>{events.push(['error',e.message]);e.preventDefault()});i.addEventListener('input',e=>events.push(['input-next',e.isTrusted,Array.from(i.files,f=>f.name)]));i.addEventListener('change',e=>events.push(['change',e.isTrusted,Array.from(i.files,f=>f.name)]));window.eval=()=>{throw Error('authored eval must not run')};Reflect.apply=()=>{throw Error('authored Reflect.apply must not run')};return true})()`);
++ const actorMode=JSON.stringify(mode);
++ await evaluate(`(()=>{
++  const mode=${actorMode};
++  if(mode==='shadow-open'||mode==='shadow-closed'){const host=document.createElement('div');host.id='shadowHost';document.body.append(host);globalThis.shadowHost=host;globalThis.ownedShadow=host.attachShadow({mode:mode==='shadow-open'?'open':'closed'});ownedShadow.append(input)}
++  if(mode==='nested'||mode==='shadow-open'||mode==='shadow-closed'){
++   const n=document.createElement('div');n.id='nested';globalThis.nestedTarget=n;(globalThis.ownedShadow??document.body).append(n);
++   n.addEventListener('nested',e=>{globalThis.nestedSaved=e;events.push(['nested',e.defaultPrevented]);e.preventDefault();e.stopImmediatePropagation();entered=true;if(globalThis.ownedShadow)document.body.append(n);while(true){}},{once:true,passive:true});
++   input.addEventListener('input',e=>{globalThis.saved=e;events.push(['input-nesting',e.isTrusted]);n.dispatchEvent(new Event('nested',{bubbles:true,cancelable:true,composed:true}))},{once:true});
++  }else if(mode==='error-report'||mode==='prior-reporting'){
++   window.addEventListener('error',e=>{globalThis.errorSaved=e;events.push(['error-infinite',e.message]);entered=true;e.preventDefault();while(true){}},{once:true});
++   input.addEventListener('input',e=>{globalThis.saved=e;events.push(['input-throw',e.isTrusted]);throw new Error('file input owned error')},{once:true});
++  }else input.addEventListener('input',e=>{globalThis.saved=e;events.push(['input-infinite',e.isTrusted,Array.from(input.files,f=>f.name)]);entered=true;while(true){}},{once:true});
++  return true;
++ })()`);
++ const handle=await send('Runtime.evaluate',{expression:'input',contextId:context.id,returnByValue:false});assert.ok(handle.result.objectId);const objectId=handle.result.objectId;
++ if(mode==='tampered-slot'){
++  await evaluate(`(()=>{globalThis.privateSlotReads=0;Object.defineProperty(window,'_currentEvent',{get(){privateSlotReads++;throw Error('authored private slot getter')},set(){privateSlotReads++;throw Error('authored private slot setter')},configurable:true});return true})()`);
++  try{report.first=await send('DOM.setFileInputFiles',{files:[first],objectId})}catch(e){report.firstError={message:e.message,code:e.code}}
++  report.boundary=JSON.parse(await evaluate(`JSON.stringify({reads:privateSlotReads,entered,names:Array.from(input.files,f=>f.name),events:events.slice()})`));assert.ok(report.firstError);assert.match(report.firstError.message,/current-event slot/);assert.equal(report.boundary.reads,0);assert.equal(report.boundary.entered,false);
++  await evaluate(`(()=>{Object.defineProperty(window,'_currentEvent',{value:undefined,writable:true,enumerable:true,configurable:true});return true})()`);await send('Page.close');report.disposed=service.browser.pages.size===0;
++ }else{
++ process.stdout.write(JSON.stringify({marker:'armed',effectiveTimeout:200,frameId,contextId:context.id})+'\n');
++ const started=Date.now();
++ if(mode==='prior-reporting'){
++  const actual=service.browser.pages.get(targetId),parentWindow=actual.dom.window;
++  const session={page:actual,nodes:new Map([[1,actualOwnerWindow.document.getElementById('upload')]])},connection={browser:service.browser,sessions:new Map([['fixture',session]])};class WireError extends Error{constructor(message,code){super(message);this.code=code}}
++  installListenerOwnership(parentWindow).add(parentWindow,'error',event=>{event.preventDefault();report.priorReporting={trusted:event.isTrusted,phase:event.eventPhase,windowSame:parentWindow.event===event};if(depthObserver)report.priorReporting.depthBefore=depthObserver.readErrorDepth(parentWindow);try{report.first=runFileInput(connection,session,{files:[first],nodeId:1},WireError)}catch(e){report.firstError={message:e.message,code:e.code}}report.priorReporting.windowSameAfter=parentWindow.event===event;if(depthObserver){report.priorReporting.depthAfter=depthObserver.readErrorDepth(parentWindow);report.priorReporting.childAfter=depthObserver.readErrorDepth(actualOwnerWindow)}});
++  installErrors(actual,parentWindow).report(new Error('owned outer reporting'));report.outerReportingAfter={eventUndefined:parentWindow.event===undefined};if(depthObserver)report.outerReportingAfter.depth=depthObserver.readErrorDepth(parentWindow);assert.equal(report.priorReporting.trusted,true);assert.equal(report.priorReporting.phase,2);assert.equal(report.priorReporting.windowSame,true);assert.equal(report.priorReporting.windowSameAfter,true);assert.equal(report.outerReportingAfter.eventUndefined,true);if(depthObserver){assert.equal(report.priorReporting.depthBefore,1);assert.equal(report.priorReporting.depthAfter,1);assert.equal(report.priorReporting.childAfter,0);assert.equal(report.outerReportingAfter.depth,0)}
++ }else if(mode==='prior-outer'){
++  const actual=service.browser.pages.get(targetId),frame=actual.frames.findFrame(frameId),w=frame.dom.window,outer=w.document.createElement('section');outer.id='outer';w.document.body.append(outer);const outerEvent=new w.Event('outer',{bubbles:true});
++  const session={page:actual,nodes:new Map([[1,w.document.getElementById('upload')]])},connection={browser:service.browser,sessions:new Map([['fixture',session]])};class WireError extends Error{constructor(message,code){super(message);this.code=code}}
++  installListenerOwnership(w).add(outer,'outer',()=>{report.priorBefore=w.event===outerEvent;try{report.first=runFileInput(connection,session,{files:[first],nodeId:1},WireError)}catch(e){report.firstError={message:e.message,code:e.code}}report.priorAfter=w.event===outerEvent;report.outerDuring={phase:outerEvent.eventPhase,current:outerEvent.currentTarget?.id??null};});
++  outer.dispatchEvent(outerEvent);report.outerAfter={phase:outerEvent.eventPhase,current:outerEvent.currentTarget?.id??null,path:outerEvent.composedPath().length,eventUndefined:w.event===undefined};assert.equal(report.priorBefore,true);assert.equal(report.priorAfter,true);assert.equal(report.outerDuring.phase,2);assert.equal(report.outerAfter.phase,0);assert.equal(report.outerAfter.eventUndefined,true);
++ }else try{report.first=await send('DOM.setFileInputFiles',{files:[first],objectId})}catch(e){report.firstError={message:e.message,code:e.code}}
++ report.elapsedMilliseconds=Date.now()-started;
++ if(depthObserver){report.depthAfterTimeout=depthObserver.readErrorDepth(actualOwnerWindow);report.depthObservations=depthObserver.errorDepthObservations()}
++ report.afterTimeout=JSON.parse(await evaluate(`JSON.stringify({entered,sameDocument:document===originalDocument,ready:document.readyState,names:Array.from(input.files,f=>f.name),sizes:Array.from(input.files,f=>f.size),events:events.slice(),eventState:saved?{phase:saved.eventPhase,currentTarget:saved.currentTarget?.id??null,target:saved.target?.id??null,pathLength:saved.composedPath().length,windowEventSame:window.event===saved,eventUndefined:window.event===undefined}:null})`));
++ report.otherStates=JSON.parse(await evaluate(`JSON.stringify({nested:globalThis.nestedSaved?{phase:nestedSaved.eventPhase,current:nestedSaved.currentTarget?.id??null,path:nestedSaved.composedPath().length,target:nestedSaved.target?.id??null,defaultPrevented:nestedSaved.defaultPrevented}:null,error:globalThis.errorSaved?{phase:errorSaved.eventPhase,current:errorSaved.currentTarget?.id??null,path:errorSaved.composedPath().length}:null})`));
++ assert.equal(report.afterTimeout.eventState.phase,0);assert.equal(report.afterTimeout.eventState.currentTarget,null);assert.equal(report.afterTimeout.eventState.pathLength,0);assert.equal(report.afterTimeout.eventState.eventUndefined,true);
++ if(mode==='shadow-open'||mode==='shadow-closed'){assert.equal(report.afterTimeout.eventState.target,null);assert.equal(report.otherStates.nested.target,'shadowHost')}
++ if(report.otherStates.nested){assert.equal(report.otherStates.nested.phase,0);assert.equal(report.otherStates.nested.current,null);assert.equal(report.otherStates.nested.path,0);assert.equal(report.otherStates.nested.defaultPrevented,false);report.nestedRedispatch=JSON.parse(await evaluate(`JSON.stringify((()=>{let calls=0;nestedTarget.addEventListener('nested',e=>{calls++;e.preventDefault()});nestedTarget.addEventListener('nested',()=>calls++);const result=nestedTarget.dispatchEvent(nestedSaved);return{result,calls,phase:nestedSaved.eventPhase,current:nestedSaved.currentTarget?.id??null,path:nestedSaved.composedPath().length,defaultPrevented:nestedSaved.defaultPrevented,target:nestedSaved.target?.id??null}})())`));assert.equal(report.nestedRedispatch.result,false);assert.equal(report.nestedRedispatch.calls,2);assert.equal(report.nestedRedispatch.phase,0)}
++ if(report.otherStates.error){assert.equal(report.otherStates.error.phase,0);assert.equal(report.otherStates.error.current,null);assert.equal(report.otherStates.error.path,0);report.laterReport=JSON.parse(await evaluate(`JSON.stringify((()=>{const before=events.length;reportError(new Error('post-recovery error'));return events.slice(before)})())`));assert.ok(report.laterReport.some(row=>row[0]==='error'&&String(row[1]).includes('post-recovery error')))}
++ report.redispatch=JSON.parse(await evaluate(`JSON.stringify((()=>{const result=input.dispatchEvent(saved);return{result,phase:saved.eventPhase,current:saved.currentTarget?.id??null,path:saved.composedPath().length,eventUndefined:window.event===undefined,trusted:saved.isTrusted}})())`));assert.equal(report.redispatch.phase,0);assert.equal(report.redispatch.current,null);assert.equal(report.redispatch.path,0);assert.equal(report.redispatch.eventUndefined,true);assert.equal(report.redispatch.trusted,false);
++ assert.equal(report.afterTimeout.entered,true);assert.equal(report.afterTimeout.sameDocument,true);assert.deepEqual(report.afterTimeout.names,['first.txt']);assert.deepEqual(report.afterTimeout.sizes,[3]);assert.ok(report.firstError);assert.match(report.firstError.message,/Script execution timed out after 200ms/);assert.ok(report.elapsedMilliseconds<1500);
++ const firstBytes=await send('Runtime.evaluate',{expression:'input.files[0].arrayBuffer().then(b=>Array.from(new Uint8Array(b)))',contextId:context.id,awaitPromise:true,returnByValue:true});assert.equal(firstBytes.exceptionDetails,undefined);report.firstBytes=firstBytes.result.value;assert.deepEqual(report.firstBytes,[65,0,255]);
++ report.second=await send('DOM.setFileInputFiles',{files:[second],objectId});
++ report.afterSecond=JSON.parse(await evaluate(`JSON.stringify({sameDocument:document===originalDocument,names:Array.from(input.files,f=>f.name),events:events.slice()})`));
++ assert.deepEqual(report.afterSecond.names,['second.txt']);assert.equal(report.afterSecond.sameDocument,true);assert.equal(report.afterSecond.events.some(row=>row[0]==='change'),true);
++ const bytes=await send('Runtime.evaluate',{expression:'input.files[0].arrayBuffer().then(b=>Array.from(new Uint8Array(b)))',contextId:context.id,awaitPromise:true,returnByValue:true});assert.equal(bytes.exceptionDetails,undefined);report.secondBytes=bytes.result.value;assert.deepEqual(report.secondBytes,[3,1,4]);
++ await send('Page.close');report.disposed=service.browser.pages.size===0;assert.equal(report.disposed,true);
++ }
++}catch(error){report.failure={name:error.name,message:error.message,stack:error.stack};process.exitCode=1}finally{if(depthObserver)report.depthObservations=depthObserver.errorDepthObservations();await client?.close();await service?.close();if(dir)await rm(dir,{recursive:true,force:true})}
++console.log(JSON.stringify(report));
+--- /dev/null
++++ b/test/fixtures/error-depth-observer.mjs
+@@ -0,0 +1,6 @@
++// Host-only diagnostic graph. No private record is returned to page code.
++const records=new WeakMap(),ids=new WeakMap(),rows=[];let serial=0;
++export function registerErrorDepth(window,record){records.set(window,new WeakRef(record));if(!ids.has(record))ids.set(record,++serial)}
++export function readErrorDepth(window){return records.get(window)?.deref()?.depth}
++export function observeErrorDepth(phase,record){rows.push({phase,owner:ids.get(record),depth:record.depth})}
++export function errorDepthObservations(){return rows.slice()}

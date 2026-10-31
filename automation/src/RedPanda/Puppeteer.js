@@ -87,6 +87,11 @@ export const evaluateHandleStringImpl = handle => expression => async(async () =
   return result;
 });
 export const disposeHandleImpl = handle => async(async () => { await handle.dispose(); });
+export const queryElementImpl = missing => found => page => selector => onError => onSuccess =>
+  async(() => page.$(selector), handle => handle?.dispose())(onError)(handle => onSuccess(handle === null ? missing : found(handle)));
+export const uploadFilesImpl = handle => paths => async(async () => { await handle.uploadFile(...paths); });
+export const disposeElementHandleImpl = handle => async(async () => { await handle.dispose(); });
+export const elementHandleDisposed = handle => () => handle.disposed;
 export const contentImpl = page => async(() => page.content());
 export const waitForFunctionImpl = page => expression => async(async () => {
   const handle = await page.waitForFunction(expression, { timeout: 5000, polling: 20 });

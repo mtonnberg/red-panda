@@ -1,0 +1,357 @@
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -1,3 +1,4 @@
++import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
+ import {formAssociatedState} from './element-internals.js';
+ // Independent selector parsing and state adapter. No native engine is imported.
+ import 'jsdom';
+@@ -229,6 +230,7 @@
+ };
+ for(const name of ['matches','closest']){
+  const original=ElementImpl.prototype[name];ElementImpl.prototype[name]=function(selector){const record=RECORDS.get(this._ownerDocument);if(!record)return original.call(this,selector);const scope=wrapperForImpl(this);if(name==='matches'){try{return match(record,selector,scope,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);throw error;}}
++ if(selector==='')throw record.exception('The string did not match the expected pattern','SyntaxError');
+  try {compiled(record,selector);for(let node=this;node&&node.nodeType===1;node=domSymbolTree.parent(node))if(match(record,selector,wrapperForImpl(node),scope))return wrapperForImpl(node);return null;}
+  catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);if(error?.name==='SyntaxError')throw new record.window.Error(error.message);throw error;}
+  };
+@@ -237,7 +239,7 @@
+  const document=implForWrapper(window.document);const current=RECORDS.get(document);if(current)return current.controller;
+  const signal=page?.documentAbort?.signal;
+  if(page?.closed||signal?.aborted)throw new window.DOMException('Cannot register selectors on a closed document','InvalidStateError');
+- const record={window,document:window.document,documentImpl:document,providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
++ const record={window,document:window.document,documentImpl:document,exception:captureDOMExceptionFactory(window),providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
+  const dispose=()=>{if(record.disposed)return;record.disposed=true;if(RECORDS.get(document)===record)RECORDS.delete(document);signal?.removeEventListener('abort',dispose);page?.off?.('close',dispose);};
+  if(signal)signal.addEventListener('abort',dispose,{once:true});else page?.once?.('close',dispose);
+  record.controller={dispose,selectorForSpecificity};return record.controller;
+--- /dev/null
++++ b/test/closest-empty-parity.test.js
+@@ -0,0 +1,4 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';
++function fixture(t){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();return{page,window:page.dom.window}}
++test('exact-empty closest reports genuine selected-VM DOMException while nonempty parser errors retain their distinct path',t=>{const{page,window:w}=fixture(t),p=w.document.createElement('p');w.document.body.append(p);for(const element of[p,w.document.createElement('i')]){let actual;try{element.closest('')}catch(error){actual=error}assert.ok(actual instanceof w.DOMException);assert.equal(actual.name,'SyntaxError');assert.equal(actual.code,12);assert.equal(actual.message,'The string did not match the expected pattern');assert.ok(getHeapBinding().sameRealm(actual,new w.Array()));Object.setPrototypeOf(actual,null);assert.ok(getHeapBinding().sameRealm(actual,new w.Array()));for(const selector of[' ','\t\n','/**/','[',':has()'])assert.throws(()=>element.closest(selector),error=>error.name==='Error'&&error instanceof w.Error)}assert.equal(p.closest('p'),p);assert.equal(p.closest('article'),null)});
++test('empty selector conversion executes once and preserves an authored thrown value',t=>{const{window:w}=fixture(t),p=w.document.createElement('p');let calls=0;assert.throws(()=>p.closest({toString(){calls++;return''}}),error=>error.name==='SyntaxError'&&error instanceof w.DOMException);assert.equal(calls,1);const reason=new w.RangeError('actual conversion');assert.throws(()=>p.closest({toString(){throw reason}}),error=>error===reason);assert.throws(()=>w.Element.prototype.closest.call({},''),error=>error instanceof w.TypeError)});
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -79,13 +79,24 @@
+ const GENERIC_INLINE=new Set('abbr b bdi bdo cite code dfn em i kbd mark q s samp small span strong sub sup time u var wbr'.split(' '));
+ const HTML_INLINE=new Set([...GENERIC_INLINE,...'a blockquote br del font ins label'.split(' ')]);
+ const ACTIVE_NON_RENDERING=new Set('area base datalist head link meta noscript rp script source style template title track'.split(' '));
++// These typed UA fallbacks are active-context defaults. An authored revert
++// resumes the interface's base display, while ordinary declarations still win
++// by actual cascade rank. Attribute-hidden/dialog defaults remain independent.
++function typedHiddenDisplay(node){
++ if(node._prefix)return false;
++ const name=node._localName,namespace=node._namespaceURI;
++ if(namespace==='http://www.w3.org/2000/svg')return name.replace(/[A-Z]/g,c=>c.toLowerCase())==='param';
++ if(namespace!=='http://www.w3.org/1999/xhtml')return false;
++ return name==='param'||name==='input'&&(node.getAttributeNS(null,'type')??'').replace(/[A-Z]/g,c=>c.toLowerCase())==='hidden';
++}
++function typedDisplayRevert(node,base){return typedHiddenDisplay(node)&&!node.hasAttributeNS(null,'hidden')?base:undefined;}
+ function hasActiveStyleContext(element){return !!implForWrapper(element)._ownerDocument._defaultView;}
+ function elementDefaultDisplay(element,active=hasActiveStyleContext(element)){
+  const implementation=implForWrapper(element),namespace=implementation._namespaceURI,name=implementation._prefix?implementation._prefix+':'+implementation._localName:implementation._localName;
+  const html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';
+  let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';
+  if(!active)return display;
+- if(implementation.hasAttributeNS(null,'hidden'))return 'none';
++ if(implementation.hasAttributeNS(null,'hidden')||typedHiddenDisplay(implementation))return 'none';
+  if((html||svg)&&ACTIVE_NON_RENDERING.has(name))return 'none';
+  const popover=implementation.hasAttributeNS(null,'popover'),popoverOpen=popover&&matchesInScope(element,':popover-open');
+  if((html||svg)&&name==='dialog'&&!implementation.hasAttributeNS(null,'open')&&!popoverOpen)return 'none';
+@@ -552,13 +563,13 @@
+   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
+   for(const{sheet}of authorSheets)if(!flatSheetState(sheet,SHEETS.get(sheet)?.rules))collectLayers(SHEETS.get(sheet)?.rules??sheet.cssRules);
+   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
+-  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false) => {
++  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false,revertValue) => {
+     style = declaration(style);
+     for (let index = 0; index < style.length; index++) {
+       const property = style[index];
+       if(origin===0&&property==='display'&&!elementDisplay)continue;
+       let value = style.getPropertyValue(property);
+-      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order);
++      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order,revertValue);
+     }
+   };
+   const resolveNested=(selector,parent)=>{
+@@ -610,7 +621,7 @@
+     }
+   };
+   walk(uaRulesFor(element), 0);
+-  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true);
++  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true,typedDisplayRevert(implForWrapper(element),elementDefaultDisplay(element,false)));
+   if (element.localName === 'a' && element.hasAttribute('href')) {
+     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
+   }
+@@ -905,13 +916,13 @@
+ // These kernels are shared with the existing public cascade. Canonical reads
+ // supply actual producer entries; rank/importance/shorthand/revert math is one
+ // implementation rather than a renderer-specific table of CSS answers.
+-function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order){
++function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order,revertValue){
+  if(property==='text-transform'){value=textTransformValue(value);if(value===null)return order}
+  if(property==='position'){value=positionValue(value);if(value===null)return order}
+  const entries=expandedEntries(property,value);if(!entries)return order;
+- for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart});values.set(name,list)}return order;
+-}
+-function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer')winner=candidates.find(candidate=>candidate.origin===0);if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
++ for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart,...(name==='display'&&revertValue!==undefined?{revertValue}:{})});values.set(name,list)}return order;
++}
++function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer'){const keyword=winner.value.toLowerCase();winner=candidates.find(candidate=>candidate.origin===0);if(winner&&keyword==='revert'&&winner.revertValue!==undefined)winner={...winner,value:winner.revertValue};}if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
+ 
+ function retireCanonicalStyleSource(record,node){if(record.frameStyleSources.delete(node))record.canonicalDirty=true}
+ function registerFrameStyleSource(record,node,sheet){
+@@ -938,7 +949,7 @@
+ }
+ function canonicalDefaultDisplay(node,active){
+  const namespace=node._namespaceURI,name=node._prefix?node._prefix+':'+node._localName:node._localName,html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';if(!active)return display;
+- if(node.hasAttributeNS(null,'hidden')||(html||svg)&&ACTIVE_NON_RENDERING.has(name))return'none';
++ if(node.hasAttributeNS(null,'hidden')||typedHiddenDisplay(node)||(html||svg)&&ACTIVE_NON_RENDERING.has(name))return'none';
+  if((html||svg)&&name==='dialog'&&!node.hasAttributeNS(null,'open'))return'none';
+  if((html||svg)&&name==='slot')display='contents';const parent=node.parentElement;
+  if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return'none';
+@@ -952,11 +963,11 @@
+  const collect=(entries,parent=rootLayer)=>{for(const entry of entries){const group=entry.group;if(group?.kind==='layerStatement'){for(const name of group.names)register(parent,name,entry)}else if(group?.kind==='layer'){const next=register(parent,group.name,entry);if(next){layerNodes.set(entry,next);collect(group.children,next)}}else if(group?.kind==='media'){if(group.enabled)collect(group.children,parent)}else if(entry.type===4&&entry.enabled)collect(entry.children,parent);else if(entry.type===1)collect(entry.children,parent)}};
+  for(const entries of program.sheets)collect(entries);let rank=0;const rankLayers=layer=>{for(const child of layer.children.values())rankLayers(child);if(layer!==rootLayer)layer.rank=++rank};rankLayers(rootLayer);
+  const relevant=(entries,origin)=>entries?.some(entry=>(origin!==0||entry.name!=='display')&&(CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)||entry.name.startsWith('--')));
+- const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order)}};
++ const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false,revertValue)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order,revertValue)}};
+  const score=selectorText=>{let best=null;for(const selector of splitTopLevel(selectorText)){if(/:host|::slotted|::part/.test(selector))throw Error('Canonical shadow selector is not supported');if(matchCanonicalSelector(node,selector,record.documentImpl.documentElement)){const value=specificity(selector);if(!best||compare(value,best)>0)best=value}}return best};
+  const nested=(selector,parent)=>{if(!parent)return selector;let output='',quote=null,brackets=0,ampersand=false;for(let i=0;i<selector.length;i++){const c=selector[i];if(c==='\\'){output+=c+(selector[++i]??'');continue}if(quote){output+=c;if(c===quote)quote=null;continue}if(c==='"'||c==="'"){quote=c;output+=c;continue}if(c==='[')brackets++;if(c===']')brackets--;if(c==='&'&&!brackets){output+=':is('+parent+')';ampersand=true}else output+=c}return ampersand?output:':is('+parent+') '+output};
+  const walk=(entries,origin,parent=null,layer=rootLayer)=>{for(const entry of entries){const group=entry.group;if(entry.type===1&&entry.declarations){const selector=nested(entry.selector,parent);if(relevant(entry.declarations,origin)){const match=score(selector);if(match)offer(entry.declarations,match,origin,false,layer)}walk(entry.children,origin,selector,layer)}else if(group?.kind==='layer'){const child=layerNodes.get(entry);if(child){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,child)}walk(group.children,origin,parent,child)}}else if(group?.kind==='media'){if(group.enabled){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,layer)}walk(group.children,origin,parent,layer)}}else if(entry.type===4&&entry.enabled)walk(entry.children,origin,parent,layer)}};
+- walk(program.ua,0);offer([{name:'display',value:canonicalDefaultDisplay(node,true),priority:''}],[0,0,0],0,false,rootLayer,true);
++ walk(program.ua,0);offer([{name:'display',value:canonicalDefaultDisplay(node,true),priority:''}],[0,0,0],0,false,rootLayer,true,typedDisplayRevert(node,canonicalDefaultDisplay(node,false)));
+  for(const entries of program.sheets)walk(entries,1);if(node._style)offer(readCSSDeclaration(node._style),[0,0,0],1,true);return cascadeWinners(values);
+ }
+ export function createCanonicalStyleResolver(renderDocument){
+--- /dev/null
++++ b/test/display-typed-defaults-parity.test.js
+@@ -0,0 +1,5 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';import{dumpMarkdownNode}from'../src/markdown-node.js';
++function fixture(t){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();return{page,w:page.dom.window,d:page.dom.window.document}}
++test('typed active defaults and actual author/revert winners depend on genuine namespace, prefix, case and attributes',t=>{const{w,d}=fixture(t),H='http://www.w3.org/1999/xhtml',S='http://www.w3.org/2000/svg';for(const[ns,name,plain,hidden,base]of[[H,'param','none','none','block'],[H,'PARAM','block','block','block'],[H,'q:param','block','block','block'],[H,'input','block','none','block'],[H,'INPUT','block','block','block'],[H,'q:input','block','block','block'],[S,'param','none','none','inline'],[S,'PARAM','none','none','inline'],[S,'q:param','inline','inline','inline'],[S,'input','inline','inline','inline'],['urn:actual','param','block','block','block']]){const e=d.createElementNS(ns,name);d.body.append(e);assert.equal(w.getComputedStyle(e).display,plain,ns+name);e.setAttribute('type','HiDdEn');assert.equal(w.getComputedStyle(e).display,hidden);assert.equal(e.checkVisibility(),hidden!=='none');e.setAttribute('style','display:block');assert.equal(w.getComputedStyle(e).display,'block');e.setAttribute('style','display:inline!important');assert.equal(w.getComputedStyle(e).display,'inline');e.setAttribute('style','display:revert');assert.equal(w.getComputedStyle(e).display,base);e.remove()}});
++test('inactive/adopted actual declarations retain state and default-hidden applies only in the active document',t=>{const{w,d}=fixture(t),inactive=d.implementation.createHTMLDocument('actual');for(const tag of['param','input']){const e=inactive.createElement(tag);e.setAttribute('type','hidden');e.style.display='block';inactive.body.append(e);const style=e.style;assert.equal(w.getComputedStyle(e).display,'block');assert.equal(e.checkVisibility(),false);d.adoptNode(e);d.body.append(e);assert.equal(e.style,style);assert.equal(w.getComputedStyle(e).display,'block');e.style.display='';assert.equal(w.getComputedStyle(e).display,'none');assert.equal(e.checkVisibility(),false);inactive.adoptNode(e);inactive.body.append(e);assert.equal(w.getComputedStyle(e).display,'block');assert.equal(e.style,style)}});
++test('the canonical Markdown renderer shares genuine typed defaults and authored revert behavior',t=>{const{d}=fixture(t),section=d.createElement('section');section.innerHTML='<param><span>visible</span>';const param=section.firstChild;param.append(d.createTextNode('actual fallback text'));d.body.append(section);const read=()=>dumpMarkdownNode(section,{context:d});assert.ok(!read().includes('actual fallback text'));param.setAttribute('style','display:block');assert.ok(read().includes('actual fallback text'));param.setAttribute('style','display:revert');assert.ok(read().includes('actual fallback text'));param.removeAttribute('style');assert.ok(!read().includes('actual fallback text'))});
+--- /dev/null
++++ b/src/composed-layout-tree.js
+@@ -0,0 +1,21 @@
++// Internal layout traversal over the actual canonical tree and slot state.
++// Closed roots and assignment are backend data; public host/getter overrides
++// never select geometry ownership or create a new tree/front.
++import{createRequire}from'node:module';
++const require=createRequire(import.meta.url),{domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const children=domSymbolTree.childrenIterator,parent=domSymbolTree.parent,apply=Reflect.apply;
++export function composedLayoutChildren(node){
++ if(node._shadowRoot)return Array.from(apply(children,domSymbolTree,[node._shadowRoot]));
++ if(node._namespaceURI==='http://www.w3.org/1999/xhtml'&&node._localName==='slot'&&node._assignedNodes?.length)return[...node._assignedNodes];
++ return Array.from(apply(children,domSymbolTree,[node]));
++}
++export function backendTreeRoot(node){let next;while(next=apply(parent,domSymbolTree,[node]))node=next;return node}
++export function retargetLayoutHit(node,scope){
++ for(;;){
++  const root=backendTreeRoot(node);if(!root._host)return node;
++  let contains=false;
++  for(let current=scope;current;){if(current===root){contains=true;break}current=current._host?backendTreeRoot(current._host):null}
++  if(contains)return node;
++  node=root._host;
++ }
++}
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,6 @@
++import{composedLayoutChildren,retargetLayoutHit}from'./composed-layout-tree.js';
++import{platformFactoryRecord}from'./platform-factories.js';
++import{installPlatformFactoryHooks}from'./platform-factory-hooks.js';
+ import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import {captureIDLMemberFactory} from './public-idl-member.js';
+ import{installWindowViewport}from'./window-viewport.js';
+@@ -17,6 +20,8 @@
+ const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
+ const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ const LAYOUTS=new WeakMap(),COMPUTED_VIEWS=new WeakMap();
++// Standalone genuine JSDOM embeddings also observe their real future factories.
++installPlatformFactoryHooks();
+ const ZERO = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
+ const hiddenTags = new Set(['head', 'style', 'script', 'template', 'meta', 'link', 'title', 'base']);
+ const blockTags = new Set(['html', 'body', 'div', 'p', 'main', 'section', 'article', 'aside', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'blockquote']);
+@@ -50,25 +55,22 @@
+     const document = window.document;
+     const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,implForWrapper(document)._version,width,height]);
+     if(fastKey!==null&&cachedFastKey===fastKey)return cached;
+-    const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map();
++    const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map(),parents=new Map();
+     const childNodeLists=new Map(),childElementLists=new Map();
+-    const children=node=>{let list=childNodeLists.get(node);if(!list){list=Array.from(domSymbolTree.childrenIterator(implForWrapper(node)),wrapperForImpl);childNodeLists.set(node,list);}return list;};
++    const children=node=>{let list=childNodeLists.get(node);if(!list){list=composedLayoutChildren(implForWrapper(node)).map(wrapperForImpl);childNodeLists.set(node,list);}return list;};
+     const elements=node=>{let list=childElementLists.get(node);if(!list){list=children(node).filter(child=>child.nodeType===1);childElementLists.set(node,list);}return list;};
+-    const documentImpl=implForWrapper(document),shadowRoots=[],tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
+-    const appendTree=root=>{
+-      for(const implementation of domSymbolTree.treeIterator(root)){
+-        if(implementation.nodeType===11)continue;
+-        const node=wrapperForImpl(implementation);
+-        order.set(node,nodes.length);nodes.push(node);
+-        if(tokens){
+-          if(!identities.has(node))identities.set(node,nextIdentity++);
+-          tokens.push(identities.get(node),node.nodeType,node.nodeValue);
+-          if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
+-        }
+-        if(implementation._shadowRoot)shadowRoots.push(implementation._shadowRoot);
+-      }
+-    };
+-    appendTree(documentImpl);for(let index=0;index<shadowRoots.length;index++)appendTree(shadowRoots[index]);
++    const documentImpl=implForWrapper(document),tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
++    const pending=[{implementation:documentImpl,parent:null}];
++    while(pending.length){
++      const {implementation,parent}=pending.pop(),node=wrapperForImpl(implementation);
++      parents.set(node,parent);order.set(node,nodes.length);nodes.push(node);
++      if(tokens){
++        if(!identities.has(node))identities.set(node,nextIdentity++);
++        tokens.push(identities.get(node),node.nodeType,node.nodeValue);
++        if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
++      }
++      const next=children(node);for(let index=next.length-1;index>=0;index--)pending.push({implementation:implForWrapper(next[index]),parent:node});
++    }
+     if(tokens)for(const sheet of document.styleSheets){try{tokens.push([...sheet.cssRules].map(rule=>rule.cssText));}catch{tokens.push(null);}}
+     const key=fastKey??JSON.stringify(tokens);
+     if(key===cachedKey)return cached;
+@@ -118,10 +120,10 @@
+     const siblingAdvances=new Map();
+     function siblingAdvance(node){
+       if(siblingAdvances.has(node))return siblingAdvances.get(node);
+-      const parent=domSymbolTree.parent(implForWrapper(node));if(!parent)return 0;
++      const parent=parents.get(node);if(!parent)return 0;
+       let sum=0;
+-      for(const implementation of domSymbolTree.childrenIterator(parent)){
+-        const sibling=wrapperForImpl(implementation);siblingAdvances.set(sibling,sum);
++      for(const sibling of children(parent)){
++        siblingAdvances.set(sibling,sum);
+         if(isHidden(sibling))continue;
+         if(sibling.nodeType===1)sum+=horizontal.advance(sibling);
+       }
+@@ -130,7 +132,7 @@
+     function position(node) {
+       if (positions.has(node)) return positions.get(node);
+       if (isHidden(node)) { positions.set(node, ZERO); return ZERO; }
+-      const parent = node.parentNode ?? node.host;
++      const parent = parents.get(node);
+       const parentX = parent ? position(parent).x : 0;
+       let x = parentX;
+       x+=siblingAdvance(node);
+@@ -159,7 +161,7 @@
+       return { rect: position(node), rendered: true };
+     }
+     cachedKey = key;cachedFastKey=fastKey;
+-    cached = { nodes, style, record, horizontal, isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
++    cached = { nodes, style, record, horizontal,parent:node=>parents.get(node), isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
+     return cached;
+   }
+ 
+@@ -174,23 +176,32 @@
+     const value = rect(node), quad = [value.left, value.top, value.right, value.top, value.right, value.bottom, value.left, value.bottom];
+     return { content: [...quad], padding: [...quad], border: [...quad], margin: [...quad], width: Math.trunc(value.width), height: Math.trunc(value.height) };
+   }
+-  function elementsFromPoint(x, y) {
++  function elementsFromPoint(x, y,scope=implForWrapper(window.document)) {
+     if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
+     x = Math.round(x); y = Math.round(y);
+     if (x < 0 || y < 0 || x >= width || y >= height) return [];
+-    const state = snapshot();
+-    return state.nodes.filter(node => {
+-      if (node.nodeType !== 1) return false;
+-      // Document hit testing retargets shadow content to its host. Shadow
+-      // rectangles remain available to privileged geometry/observer consumers.
+-      if (node.getRootNode() !== window.document) return false;
+-      const record = state.record(node), { rendered } = record, box = viewportRect(record.rect);
+-      const declaration = state.style(node);
+-      return rendered && declaration.visibility !== 'hidden' && declaration.visibility !== 'collapse' && declaration.pointerEvents !== 'none' &&
+-        box.width > 0 && box.height > 0 && x >= box.left && x < box.right && y >= box.top && y < box.bottom;
+-    }).reverse();
+-  }
+-  function hitTest(x, y) { return elementsFromPoint(x, y)[0] ?? null; }
++    const state=snapshot(),eligible=node=>{
++      if(node.nodeType!==1||!state.record(node).rendered)return false;
++      const declaration=state.style(node);
++      return declaration.display!=='contents'&&declaration.visibility!=='hidden'&&declaration.visibility!=='collapse'&&declaration.pointerEvents!=='none';
++    };
++    let hit;
++    for(let index=state.nodes.length-1;index>=0;index--){
++      const node=state.nodes[index];if(!eligible(node))continue;
++      const box=viewportRect(state.record(node).rect);
++      if(box.width>0&&box.height>0&&x>=box.left&&x<box.right&&y>=box.top&&y<box.bottom){hit=node;break}
++    }
++    const result=[],seen=new Set();
++    // Native returns the eligible composed ancestry of the actual top hit,
++    // even when a child's real box overflows its ancestor's real box.
++    for(let node=hit;node;node=state.parent(node)){
++      if(!eligible(node))continue;
++      const actual=wrapperForImpl(retargetLayoutHit(implForWrapper(node),scope));
++      if(!seen.has(actual)){seen.add(actual);result.push(actual)}
++    }
++    return result;
++  }
++  function hitTest(x,y,scope){return elementsFromPoint(x,y,scope)[0]??null;}
+   function intersection(node) {
+     const bounds = rect(node);
+     const left = Math.max(0, bounds.left), top = Math.max(0, bounds.top);
+@@ -263,7 +274,7 @@
+   const define = (target, name, descriptor) => {
+     if(target===window.Document.prototype){
+       descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=documentMember(name,slot,descriptor[slot]);
+-    }else if(target===window.Element.prototype||target===window.HTMLElement.prototype){
++    }else if(target===window.Element.prototype||target===window.HTMLElement.prototype||target===window.ShadowRoot.prototype){
+       descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(name,slot,descriptor[slot]);
+     }
+     return Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
+@@ -282,8 +293,23 @@
+   define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
+   define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
+   define(window.HTMLElement.prototype,'offsetLeft',{get(){return ownedLayout(this).absoluteRect(this).x;}});
+-  define(window.Document.prototype, 'elementFromPoint', { writable: true, value(x, y) { return layout.hitTest(Number(x), Number(y)); } });
+-  define(window.Document.prototype, 'elementsFromPoint', { writable: true, value(x, y) { return layout.elementsFromPoint(Number(x), Number(y)); } });
++  const numeric=window.Number,TypeErrorConstructor=window.TypeError,number=value=>{if(typeof value==='symbol')throw new TypeErrorConstructor('Cannot convert a Symbol value to a number');if(typeof value==='bigint')throw new TypeErrorConstructor('Cannot convert a BigInt value to a number');return numeric(value);};
++  for(const[kind,prototype]of[['Document',window.Document.prototype],['ShadowRoot',window.ShadowRoot.prototype]]){
++    const receiver=value=>{const record=platformFactoryRecord(value),implementation=record?.implementation;
++      if(!implementation||(kind==='Document'?!['Document','HTMLDocument','XMLDocument'].includes(record.kind):record.kind!=='ShadowRoot'))throw new TypeErrorConstructor('Illegal invocation');
++      return implementation;
++    };
++    for(const name of['elementFromPoint','elementsFromPoint']){
++      const operation=({[name](x,y){
++        const scope=receiver(this);if(arguments.length<2)throw new TypeErrorConstructor('invalid argument');
++        x=number(x);y=number(y);const document=scope.nodeType===9?scope:scope._ownerDocument,model=document._defaultView&&LAYOUTS.get(document);
++        if(name==='elementFromPoint')return model?.hitTest(x,y,scope)??null;
++        const values=model?.elementsFromPoint(x,y,scope)??[];
++        return clientRectList(ArrayConstructor,set,ErrorConstructor,values);
++      }})[name];
++      define(prototype,name,{writable:true,value:operation});
++    }
++  }
+   define(window, 'innerWidth', { get: () => layout.viewport.width });
+   define(window, 'innerHeight', { get: () => layout.viewport.height });
+   for (const [name, axis] of [['scrollX', 'x'], ['pageXOffset', 'x'], ['scrollY', 'y'], ['pageYOffset', 'y']]) define(window, name, { get: () => layout.scroll[axis] });
+--- a/src/horizontal-layout.js
++++ b/src/horizontal-layout.js
+@@ -1,3 +1,4 @@
++import{composedLayoutChildren}from'./composed-layout-tree.js';
+ import{resolveFlowLength}from './flow-metrics.js';
+ // Independent horizontal model of the measured headless native layout. Intrinsic
+ // advances, used box widths and scrollable extents are deliberately separate:
+@@ -12,7 +13,7 @@
+ const clipped=value=>value&&!['visible','clip'].includes(value);
+ 
+ function physicalParent(node){const impl=implForWrapper(node);return impl?._assignedSlot?wrapperForImpl(impl._assignedSlot):node.parentElement??node.getRootNode().host??null;}
+-function visualChildren(node){const impl=implForWrapper(node);if(impl?._shadowRoot)return Array.from(domSymbolTree.childrenIterator(impl._shadowRoot)).filter(child=>child.nodeType===1).map(wrapperForImpl);if(node.localName==='slot'&&impl?._assignedNodes?.length)return impl._assignedNodes.filter(n=>n.nodeType===1).map(wrapperForImpl);return impl?Array.from(domSymbolTree.childrenIterator(impl)).filter(child=>child.nodeType===1).map(wrapperForImpl):[];}
++function visualChildren(node){const impl=implForWrapper(node);return impl?composedLayoutChildren(impl).filter(child=>child.nodeType===1).map(wrapperForImpl):[];}
+ export function rawTranslation(value){let x=0;for(const match of String(value??'').matchAll(/([\w-]+)\(([^()]*)\)/g)){const name=match[1].toLowerCase(),args=match[2].trim().split(/\s*,\s*|\s+/);let part;if(name==='matrix'&&args.length===6)part=/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(args[4])?Number(args[4]):undefined;else if(name==='matrix3d'&&args.length===16)part=Number(args[12]);else if((name==='translatex'&&args.length===1)||(name==='translate'&&args.length<=2)||(name==='translate3d'&&args.length===3)){const token=args[0];if(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)px$/i.test(token)||/^[+-]?0(?:\.0+)?$/.test(token))part=Number.parseFloat(token);}if(Number.isFinite(part))x+=part;}return x;}
+ 
+ export function createHorizontalLayout(window,{style,hidden,viewportWidth,styleRevision}){
+--- /dev/null
++++ b/test/shadow-layout-parity.test.js
+@@ -0,0 +1,9 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';
++function fixture(t){const browser=new Browser({loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();return{browser,page,w:page.dom.window,d:page.dom.window.document}}
++const labels=list=>Array.from(list,e=>e.id||e.localName),point=e=>{const r=e.getBoundingClientRect();return[r.x+1,r.y+1]};
++test('actual nested open/closed shadow boxes occupy their host flow and scoped hits retarget genuine fronts',t=>{const{d}=fixture(t);d.body.innerHTML='<div id="before" style="width:23px;height:11px">before</div><div id="host" style="width:211px;height:177px"></div><div id="after">after</div>';const host=d.getElementById('host'),root=host.attachShadow({mode:'open'});root.innerHTML='<button id="button" style="width:73px;height:41px">button</button><div id="inner"></div>';const button=root.getElementById('button'),inner=root.getElementById('inner'),closed=inner.attachShadow({mode:'closed'});closed.innerHTML='<b id="deep" style="display:block;width:37px;height:31px">deep</b>';const deep=closed.getElementById('deep'),h=host.getBoundingClientRect(),b=button.getBoundingClientRect();assert.ok(b.y>=h.y&&b.bottom<=h.bottom);assert.equal(d.elementFromPoint(...point(button)),host);assert.equal(root.elementFromPoint(...point(button)),button);assert.equal(closed.elementFromPoint(...point(button)),button);assert.equal(root.elementFromPoint(...point(deep)),inner);assert.equal(closed.elementFromPoint(...point(deep)),deep);assert.deepEqual(labels(closed.elementsFromPoint(...point(deep))).slice(0,3),['deep','inner','host']);assert.ok(d.getElementById('after').getBoundingClientRect().y>deep.getBoundingClientRect().y);assert.equal(root.elementFromPoint(...point(d.getElementById('after'))),d.getElementById('after'))});
++test('real assigned/fallback state selects composed positions and scoped ancestor lists without slot boxes',t=>{const{d}=fixture(t),host=d.body.appendChild(d.createElement('div'));host.id='host';host.innerHTML='<span id="assigned" style="display:block;width:61px;height:27px">actual</span><b id="unassigned" slot="missing">unassigned</b>';const root=host.attachShadow({mode:'open'});root.innerHTML='<p id="before">before</p><div id="wrap"><slot id="slot"><i id="fallback">fallback</i></slot></div>';const assigned=host.firstChild,wrap=root.getElementById('wrap'),slot=root.getElementById('slot'),fallback=root.getElementById('fallback');assert.equal(assigned.assignedSlot,slot);assert.ok(assigned.getBoundingClientRect().y>root.getElementById('before').getBoundingClientRect().y);assert.deepEqual(labels(root.elementsFromPoint(...point(assigned))),['assigned','wrap','host','body','html']);assert.deepEqual(labels(d.elementsFromPoint(...point(assigned))),['assigned','host','body','html']);assert.equal(fallback.getBoundingClientRect().width,0);assert.equal(d.getElementById('unassigned').getBoundingClientRect().width,0);assigned.remove();assert.ok(fallback.getBoundingClientRect().width>0);assert.equal(root.elementFromPoint(...point(fallback)),fallback);assert.deepEqual(labels(root.elementsFromPoint(...point(fallback))),['fallback','wrap','host','body','html']);assert.equal(d.elementFromPoint(...point(fallback)),host);assert.ok(!root.elementsFromPoint(...point(fallback)).includes(slot));assert.ok(root.elementsFromPoint(...point(fallback)).includes(wrap))});
++test('hit ancestry respects real pointer-events/visibility and overflows rather than requiring ancestor rectangle containment',t=>{const{d}=fixture(t),parent=d.body.appendChild(d.createElement('div'));parent.id='owner';parent.style.cssText='pointer-events:none;height:1px;width:2px';const child=parent.appendChild(d.createElement('div'));child.id='target';child.style.cssText='pointer-events:auto;width:83px;height:57px';assert.equal(d.elementFromPoint(...point(child)),child);assert.ok(!d.elementsFromPoint(...point(child)).includes(parent));parent.style.pointerEvents='auto';assert.ok(d.elementsFromPoint(...point(child)).includes(parent));parent.style.visibility='hidden';child.style.visibility='visible';assert.equal(d.elementFromPoint(...point(child)),child);assert.ok(!d.elementsFromPoint(...point(child)).includes(parent));assert.equal(d.elementFromPoint(-1,-1),null);assert.deepEqual(Array.from(d.elementsFromPoint(Infinity,NaN)),[])});
++test('public hit entries, returned arrays and conversion errors are genuine VM allocations with private receiver brands',t=>{const{d,w}=fixture(t),host=d.body.appendChild(d.createElement('div')),root=host.attachShadow({mode:'open'}),binding=getHeapBinding(),anchor=new w.Array();root.innerHTML='<button>actual</button>';for(const[prototype,receiver]of[[w.Document.prototype,d],[w.ShadowRoot.prototype,root]])for(const name of['elementFromPoint','elementsFromPoint']){const fn=prototype[name],values=[fn];let reads=0;const proxy=new Proxy({},{get(){reads++;throw Error('authored')}});assert.throws(()=>fn.call(proxy,1,2),e=>{values.push(e);return e instanceof w.TypeError&&e.message==='Illegal invocation'});assert.equal(reads,0);const fake=Object.create(prototype);for(const key of Reflect.ownKeys(receiver))Object.defineProperty(fake,key,Object.getOwnPropertyDescriptor(receiver,key));assert.throws(()=>fn.call(fake,1,2),e=>e instanceof w.TypeError);assert.throws(()=>fn.call(receiver),e=>e instanceof w.TypeError&&e.message==='invalid argument');assert.throws(()=>fn.call(receiver,Symbol(),0),e=>{values.push(e);return e instanceof w.TypeError});const order=[];fn.call(receiver,{valueOf(){order.push('x');return-1}},{valueOf(){order.push('y');return-1}});assert.deepEqual(order,['x','y']);if(name==='elementsFromPoint')values.push(fn.call(receiver,...point(root.firstChild)));for(const value of values){const proto=Object.getPrototypeOf(value);for(let n=0;n<2;n++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}Object.setPrototypeOf(value,proto)}}});
++test('borrowed scoped hit entries retain the receiver document layout and method-origin result realm',async t=>{const{page}=fixture(t);await page.navigate('data:text/html,<body><iframe></iframe>');const main=page.dom.window,child=main.document.querySelector('iframe').contentWindow,host=child.document.body.appendChild(child.document.createElement('div'));host.id='child-host';const root=host.attachShadow({mode:'open'});root.innerHTML='<button id="child-button" style="width:39px;height:17px">actual</button>';const button=root.firstChild,fn=main.ShadowRoot.prototype.elementsFromPoint,list=fn.call(root,...point(button));assert.equal(list[0],button);assert.ok(list instanceof main.Array);assert.ok(!(list instanceof child.Array));assert.equal(main.Document.prototype.elementFromPoint.call(child.document,...point(button)),host)});
++test('shadow insertion and assignment mutation invalidate real flow without a retained stale box snapshot',t=>{const{d}=fixture(t),host=d.body.appendChild(d.createElement('div')),after=d.body.appendChild(d.createElement('p'));const root=host.attachShadow({mode:'open'});root.innerHTML='<i>one</i>';const before=after.getBoundingClientRect().y;root.appendChild(d.createElement('div')).textContent='two';assert.ok(after.getBoundingClientRect().y>before);const y=after.getBoundingClientRect().y;root.lastChild.remove();assert.equal(after.getBoundingClientRect().y,before);assert.ok(y>before)});

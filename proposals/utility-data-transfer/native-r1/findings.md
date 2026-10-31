@@ -1,0 +1,11 @@
+# Native R1: four complete profiles, fifth partial, stop on cross-world CDP rejection
+
+The exact controller ran once and stopped on the first protocol failure. Node probe671196 exited1; actual Native671204 closed normally exit0. Total0.871s, no deadline. Both PIDs were absent at seal; all539 before/after source/native/Node/helper/external-Native guard inputs were unchanged. Root was not edited; no implementation, retries or later profile jobs ran.
+
+Main and actual Page.createIsolatedWorld utility expose DataTransfer, DataTransferItem, DataTransferItemList, FileList and File as own function-valued globals, writable/configurable and nonenumerable. Both local membership profiles return stable real FileList identity, list and File nominal instanceof true, tag[object FileList], actual name owned.txt, text/plain, size12,lastModified123, item kind=file/type=text/plain, and same file through getAsFile/index/item/iterator. These are four completed actual observations, not Native physical creation-context proofs.
+
+The fifth profile acquired an actual main-context DataTransfer and its actual main FileList. Runtime.callFunctionOn then attempted to pass these ordinary remote handles as arguments into the utility context. Native rejected that RPC with code-32000 and message Argument should belong to the same JavaScript world as target object. The actual borrowed getter body never ran there. It must not be interpreted as a DataTransfer/WebIDL brand result.
+
+All remaining cross-front, actual input membership and empty-branch trust/borrow phases were unobserved. Raw complete wire and context IDs remain in Native.json. No new API policy may be inferred for those phases.
+
+A separate continuation should stay within Native's actual authority: describe/resolve real DOM input nodes into the selected utility context, observe the same actual FileList backend through node getters, and use same-world DataTransfer handles for brand controls. Ordinary foreign DataTransfer/FileList handles must not bypass the measured CDP rejection. Node attributes and actual membership mutation/main re-observation can establish shared DOM backend behavior without fake global aliases or serialized replacement data.

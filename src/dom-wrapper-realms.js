@@ -1,3 +1,5 @@
+import {installURLWrapperRealms} from './url-wrapper-realms.js';
+import {installFileWrapperRealms} from './file-wrapper-realms.js';
 import {isDocumentInterface,transformDocumentInterface} from './document-interface-realms.js';
 import {isFoundationalInterface,transformFoundationalInterface} from './foundational-interface-realms.js';
 import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
@@ -63,6 +65,8 @@ export function createDOMWrapperProxy(target,handler,globalObject,kind){
 }
 export function installDOMWrapperRealms(){
  if(installed)return;installed=true;
+ installFileWrapperRealms(createDOMWrapperShell,createDOMWrapperProxy);
+ installURLWrapperRealms(createDOMWrapperShell);
  const directory=dirname(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'));
  const candidates=[];
  for(const filename of readdirSync(directory).sort()){

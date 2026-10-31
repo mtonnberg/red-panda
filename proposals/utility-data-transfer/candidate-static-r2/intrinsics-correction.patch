@@ -1,0 +1,61 @@
+--- a/src/data-transfer.js
++++ b/src/data-transfer.js
+@@ -68,7 +68,8 @@
+ function install(page,globalObject,context,{utility=false}={}){
+  if(records.has(globalObject))return records.get(globalObject);
+  const selected=vm.isContext(context),intrinsic=name=>selected?vm.runInContext(name,context):globalThis[name];
+- const record=Object.assign(Object.create(null),{page,global:globalObject,context,utility,Object:intrinsic('Object'),Proxy:intrinsic('Proxy'),Array:intrinsic('Array'),TypeError:intrinsic('TypeError'),sourceTimer:globalObject.setTimeout,taskOwner:null});
++ const record=Object.assign(Object.create(null),{page,global:globalObject,context,utility,Object:intrinsic('Object'),Proxy:intrinsic('Proxy'),Array:intrinsic('Array'),TypeError:intrinsic('TypeError'),String:intrinsic('String'),Number:intrinsic('Number'),sourceTimer:globalObject.setTimeout,taskOwner:null});
++ record.conversionGlobals=Object.freeze({TypeError:record.TypeError,String:record.String,Number:record.Number});
+  record.objectPrototype=own(record.Object,'prototype').value;record.ArrayFrom=selected?vm.runInContext('Array.from',context):Array.from;
+  const createList=selected?createUtilityFileListProducer(context,globalObject,{allowLegacy:!page?.browser}):()=>FileList.create(globalObject,[],{});
+  const error=()=>new record.TypeError('invalid argument'),brand=(map,value)=>{const state=map.get(value);if(!state)throw new record.TypeError('Illegal invocation');return state};
+@@ -98,7 +99,7 @@
+   itemString(receiver,callback){const state=brand(items,receiver);if(callback==null)return;if(typeof callback!=='function')throw error();if(state.kind==='string')enqueue(callback,state.data)},
+   length(receiver){return brand(itemLists,receiver).values.length},
+   add(receiver,count,data,type){const state=brand(itemLists,receiver);let item;if(File.is(data))item=makeItem(Object.assign(Object.create(null),{kind:'file',type:fileWrapperImplementation(data)?.type??utils.implForWrapper(data).type,file:data}));else{if(count<2)throw error();item=makeItem(Object.assign(Object.create(null),{kind:'string',type:normalize(type),data:text(data)}))}state.values.push(item);update(state);return item},
+-  remove(receiver,count,at){if(!count)throw error();const state=brand(itemLists,receiver);state.values.splice(conversions['unsigned long'](at,{globals:{TypeError:record.TypeError}}),1);update(state)},
++  remove(receiver,count,at){if(!count)throw error();const state=brand(itemLists,receiver);state.values.splice(conversions['unsigned long'](at,{globals:record.conversionGlobals}),1);update(state)},
+   clearItems(receiver){const state=brand(itemLists,receiver);state.values.length=0;update(state)},
+   iterator(receiver){return Object.assign(Object.create(null),{state:brand(itemLists,receiver),index:0})},
+   next(iterator){const done=iterator.index>=iterator.state.values.length;return result(record,done,done?undefined:iterator.state.values[iterator.index++])},
+@@ -107,7 +108,7 @@
+   getData(receiver,count,format){if(!count)throw error();const state=brand(transfers,receiver),raw=text(format),type=normalize(raw),item=state.values.find(item=>{const entry=items.get(item);return entry.kind==='string'&&entry.type===type});let value=item?items.get(item).data:'';if(raw.toLowerCase()==='url')value=value.split(/\r\n|\r|\n/).find(line=>line&&!line.startsWith('#'))??'';return value},
+   setData(receiver,count,format,data){if(count<2)throw error();const state=brand(transfers,receiver),type=normalize(format),value=text(data),item=state.values.find(item=>{const entry=items.get(item);return entry.kind==='string'&&entry.type===type});if(item)items.get(item).data=value;else state.values.push(makeItem(Object.assign(Object.create(null),{kind:'string',type,data:value})))},
+   clearData(receiver,count,format){const state=brand(transfers,receiver),type=count?normalize(format):null;state.values=state.values.filter(item=>{const entry=items.get(item);return entry.kind!=='string'||type!==null&&entry.type!==type});update(state)},
+-  dragImage(receiver,count,element,x,y){const state=brand(transfers,receiver);if(count<3||!isElement(element))throw error();state.dragImage=Object.assign(Object.create(null),{element,x:conversions.long(x,{globals:{TypeError:record.TypeError}}),y:conversions.long(y,{globals:{TypeError:record.TypeError}})})},
++  dragImage(receiver,count,element,x,y){const state=brand(transfers,receiver);if(count<3||!isElement(element))throw error();state.dragImage=Object.assign(Object.create(null),{element,x:conversions.long(x,{globals:record.conversionGlobals}),y:conversions.long(y,{globals:record.conversionGlobals})})},
+  };
+  if(selected)vm.compileFunction('('+definitions.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);else definitions(bridge);
+  records.set(globalObject,record);return record;
+--- a/src/file-wrapper-realms.js
++++ b/src/file-wrapper-realms.js
+@@ -30,7 +30,7 @@
+  const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
+  if(!context||!vm.isContext(context))return null;
+  const global=vm.runInContext('globalThis',context),Object=vm.runInContext('Object',context);
+- record=realms.get(context);if(!record){record=globalThis.Object.assign(globalThis.Object.create(null),{context,global,Object,TypeError:vm.runInContext('TypeError',context),root:null,iterator:null,prototypes:globalThis.Object.create(null)});realms.set(context,record);realms.set(global,record)}
++ record=realms.get(context);if(!record){record=globalThis.Object.assign(globalThis.Object.create(null),{context,global,Object,TypeError:vm.runInContext('TypeError',context),String:vm.runInContext('String',context),Number:vm.runInContext('Number',context),root:null,iterator:null,prototypes:globalThis.Object.create(null)});realms.set(context,record);realms.set(global,record)}
+  realms.set(globalObject,record);return record;
+ }
+ function scope(record,operation){incumbents.push(record);try{return operation()}finally{if(incumbents.pop()!==record)throw Error('File incumbent scope mismatch')}}
+@@ -198,7 +198,7 @@
+  body=body.replaceAll('utils.implForWrapper(', 'privateImplementation(').replaceAll('esValue[implSymbol]','privateImplementation(esValue)');
+  if(kind==='FileList')change('utils.tryWrapperForImpl(privateImplementation(esValue).item(...args))','wrapFile(privateImplementation(esValue).item(...args), globalObject, true)',1);
+  const assignment='  ctorRegistry[interfaceName] = '+kind+';',publication='  capturePrototype(globalObject, '+JSON.stringify(kind)+', '+kind+'.prototype);\n'+(kind==='FileList'?'  installListIterator(globalObject, FileList.prototype, FileList.prototype.item);\n':'');change(assignment,publication+assignment,1);
+- const conversionGlobals=Object.freeze({TypeError:record.TypeError}),extraNames=['exports','createShell','privateImplementation','newPrivateArguments','wrapFile','capturePrototype','installListIterator','originalTypeError','conversionGlobals','originalIsView'],extraValues=[factory,fileShell,fileWrapperImplementation,()=>[],wrapFile,capturePrototype,installListIterator,record.TypeError,conversionGlobals,vm.runInContext('ArrayBuffer.isView',context)];
++ const conversionGlobals=Object.freeze({TypeError:record.TypeError,String:record.String,Number:record.Number}),extraNames=['exports','createShell','privateImplementation','newPrivateArguments','wrapFile','capturePrototype','installListIterator','originalTypeError','conversionGlobals','originalIsView'],extraValues=[factory,fileShell,fileWrapperImplementation,()=>[],wrapFile,capturePrototype,installListIterator,record.TypeError,conversionGlobals,vm.runInContext('ArrayBuffer.isView',context)];
+  const install=vm.compileFunction('"use strict";\n'+body,['globalObject','globalNames',...names,'exposed','Impl',...extraNames],{parsingContext:context,filename});
+  const facade=Object.assign(Object.create(null),factory),convert=factory.convert;
+  facade.convert=(_global,value,options)=>Reflect.apply(convert,factory,[conversionGlobals,value,options]);
+--- a/test/utility-data-transfer.test.js
++++ b/test/utility-data-transfer.test.js
+@@ -64,7 +64,7 @@
+ });
+ 
+ test('captured utility producer and private conversion arrays ignore replacement globals, registry constructors and numeric Array setters',async t=>{
+- const{world}=await fixture(t);const result=world.evaluate(`(()=>{const Transfer=DataTransfer,FileType=File,BlobType=Blob,OriginalError=Error,OriginalArray=Array,OriginalObject=Object,OriginalSymbol=Symbol,saved=[],priorIndex=Object.getOwnPropertyDescriptor(Array.prototype,'0');let reads=0;const poison=()=>{reads++;throw new OriginalError('authored global')};for(const key of['Object','Proxy','Array','TypeError','FileList','Blob','Symbol']){saved.push([key,OriginalObject.getOwnPropertyDescriptor(globalThis,key)]);OriginalObject.defineProperty(globalThis,key,{get:poison,configurable:true})}OriginalObject.defineProperty(OriginalArray.prototype,'0',{set:poison,configurable:true});try{const transfer=new Transfer(),blob=new BlobType(['a']),file=new FileType(['b'],'b.txt',{lastModified:123}),entry=transfer.items.add(file);const iterator=transfer.items[OriginalSymbol.iterator]();return {values:[transfer.files.length,transfer.files[0]===file,entry.getAsFile()===file,blob.size,transfer.types[0],iterator.next().value===entry],reads}}finally{if(priorIndex)OriginalObject.defineProperty(OriginalArray.prototype,'0',priorIndex);else delete OriginalArray.prototype[0];for(const [key,descriptor]of saved)OriginalObject.defineProperty(globalThis,key,descriptor)}})()`);assert.deepEqual(plain(result),{values:[1,true,true,1,'Files',true],reads:0});
++ const{world}=await fixture(t);const result=world.evaluate(`(()=>{const Transfer=DataTransfer,FileType=File,BlobType=Blob,OriginalError=Error,OriginalArray=Array,OriginalObject=Object,OriginalSymbol=Symbol,saved=[],priorIndex=Object.getOwnPropertyDescriptor(Array.prototype,'0');let reads=0;const poison=()=>{reads++;throw new OriginalError('authored global')};for(const key of['Object','Proxy','Array','TypeError','String','Number','FileList','Blob','Symbol']){saved.push([key,OriginalObject.getOwnPropertyDescriptor(globalThis,key)]);OriginalObject.defineProperty(globalThis,key,{get:poison,configurable:true})}OriginalObject.defineProperty(OriginalArray.prototype,'0',{set:poison,configurable:true});try{const transfer=new Transfer(),blob=new BlobType(['a']),file=new FileType(['b'],'b.txt',{lastModified:123}),entry=transfer.items.add(file);const iterator=transfer.items[OriginalSymbol.iterator]();return {values:[transfer.files.length,transfer.files[0]===file,entry.getAsFile()===file,blob.size,transfer.types[0],iterator.next().value===entry],reads}}finally{if(priorIndex)OriginalObject.defineProperty(OriginalArray.prototype,'0',priorIndex);else delete OriginalArray.prototype[0];for(const [key,descriptor]of saved)OriginalObject.defineProperty(globalThis,key,descriptor)}})()`);assert.deepEqual(plain(result),{values:[1,true,true,1,'Files',true],reads:0});
+ });
+ 
+ test('utility installation is idempotent and DataTransfer string callbacks remain real asynchronous owner tasks',async t=>{

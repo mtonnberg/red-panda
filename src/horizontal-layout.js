@@ -1,3 +1,4 @@
+import{composedLayoutChildren}from'./composed-layout-tree.js';
 import{resolveFlowLength}from './flow-metrics.js';
 // Independent horizontal model of the measured headless native layout. Intrinsic
 // advances, used box widths and scrollable extents are deliberately separate:
@@ -12,7 +13,7 @@ const replaced=new Set(['img','input','textarea','select','button','video','audi
 const clipped=value=>value&&!['visible','clip'].includes(value);
 
 function physicalParent(node){const impl=implForWrapper(node);return impl?._assignedSlot?wrapperForImpl(impl._assignedSlot):node.parentElement??node.getRootNode().host??null;}
-function visualChildren(node){const impl=implForWrapper(node);if(impl?._shadowRoot)return Array.from(domSymbolTree.childrenIterator(impl._shadowRoot)).filter(child=>child.nodeType===1).map(wrapperForImpl);if(node.localName==='slot'&&impl?._assignedNodes?.length)return impl._assignedNodes.filter(n=>n.nodeType===1).map(wrapperForImpl);return impl?Array.from(domSymbolTree.childrenIterator(impl)).filter(child=>child.nodeType===1).map(wrapperForImpl):[];}
+function visualChildren(node){const impl=implForWrapper(node);return impl?composedLayoutChildren(impl).filter(child=>child.nodeType===1).map(wrapperForImpl):[];}
 export function rawTranslation(value){let x=0;for(const match of String(value??'').matchAll(/([\w-]+)\(([^()]*)\)/g)){const name=match[1].toLowerCase(),args=match[2].trim().split(/\s*,\s*|\s+/);let part;if(name==='matrix'&&args.length===6)part=/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(args[4])?Number(args[4]):undefined;else if(name==='matrix3d'&&args.length===16)part=Number(args[12]);else if((name==='translatex'&&args.length===1)||(name==='translate'&&args.length<=2)||(name==='translate3d'&&args.length===3)){const token=args[0];if(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)px$/i.test(token)||/^[+-]?0(?:\.0+)?$/.test(token))part=Number.parseFloat(token);}if(Number.isFinite(part))x+=part;}return x;}
 
 export function createHorizontalLayout(window,{style,hidden,viewportWidth,styleRevision}){

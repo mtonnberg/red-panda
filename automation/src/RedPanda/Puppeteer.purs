@@ -1,5 +1,5 @@
 module RedPanda.Puppeteer
-  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, PreloadScript, Header, ByteArray, Cookie
+  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, ElementHandle, PreloadScript, Header, ByteArray, Cookie
   , Permission(..), GeolocationOptions
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText, responseBytes
@@ -14,6 +14,7 @@ module RedPanda.Puppeteer
   , evaluateString, textContent, waitForSelector, waitForFunction, dispatchClick, content, cookieNames, setCookie
   , cookies, cookieName, cookieValue, deleteCookie
   , evaluateHandle, queryObjects, evaluateHandleString, disposeHandle, withHandle
+  , queryElement, withElementHandle, uploadFiles, disposeElementHandle, elementHandleDisposed
   , Async, fromAsync, quote
   ) where
 
@@ -21,9 +22,9 @@ import Prelude
 
 import Data.Either (Either(..))
 import Effect (Effect)
-import Effect.Aff (Aff, Canceler(..), makeAff, bracket)
+import Effect.Aff (Aff, Canceler(..), makeAff, bracket, throwError)
 import Effect.Class (liftEffect)
-import Effect.Exception (Error)
+import Effect.Exception (Error, error)
 
 foreign import data Browser :: Type
 foreign import data BrowserContext :: Type
@@ -31,6 +32,7 @@ foreign import data Page :: Type
 foreign import data Frame :: Type
 foreign import data Response :: Type
 foreign import data JSHandle :: Type
+foreign import data ElementHandle :: Type
 foreign import data PendingNavigation :: Type
 foreign import data ByteArray :: Type
 foreign import data ProtocolSession :: Type
@@ -105,6 +107,10 @@ foreign import evaluateHandleImpl :: Page -> String -> Async JSHandle
 foreign import queryObjectsImpl :: Page -> JSHandle -> Async JSHandle
 foreign import evaluateHandleStringImpl :: JSHandle -> String -> Async String
 foreign import disposeHandleImpl :: JSHandle -> Async Unit
+foreign import queryElementImpl :: forall a. a -> (ElementHandle -> a) -> Page -> String -> Async a
+foreign import uploadFilesImpl :: ElementHandle -> Array String -> Async Unit
+foreign import disposeElementHandleImpl :: ElementHandle -> Async Unit
+foreign import elementHandleDisposed :: ElementHandle -> Effect Boolean
 foreign import waitForSelectorImpl :: Page -> String -> Async Unit
 foreign import waitForFunctionImpl :: Page -> String -> Async Unit
 foreign import contentImpl :: Page -> Async String
@@ -258,6 +264,23 @@ disposeHandle handle = fromAsync $ disposeHandleImpl handle
 
 withHandle :: forall a. Aff JSHandle -> (JSHandle -> Aff a) -> Aff a
 withHandle acquire = bracket acquire disposeHandle
+
+-- Selector lookup, missing-element policy and handle lifetime belong to PS.
+queryElement :: Page -> String -> Aff ElementHandle
+queryElement page selector = do
+  result <- fromAsync $ queryElementImpl (Left unit) Right page selector
+  case result of
+    Left _ -> throwError $ error $ "No element matches selector: " <> selector
+    Right handle -> pure handle
+
+withElementHandle :: forall a. Page -> String -> (ElementHandle -> Aff a) -> Aff a
+withElementHandle page selector = bracket (queryElement page selector) disposeElementHandle
+
+uploadFiles :: ElementHandle -> Array String -> Aff Unit
+uploadFiles handle paths = fromAsync $ uploadFilesImpl handle paths
+
+disposeElementHandle :: ElementHandle -> Aff Unit
+disposeElementHandle handle = fromAsync $ disposeElementHandleImpl handle
 
 textContent :: Page -> String -> Aff String
 textContent page selector = evaluateString page $

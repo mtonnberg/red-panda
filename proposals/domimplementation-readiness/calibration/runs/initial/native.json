@@ -1,0 +1,911 @@
+{
+  "profile": "native",
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "source": "(async()=>{\n const rows=[],own=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);\n const phase=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};\n const method=document.getElementById,find=id=>method.call(document,id);\n const shape=(d,k,expected)=>{const v=d[k],desc=Object.getOwnPropertyDescriptor(d,k);return{type:typeof v,in:k in d,own:own(d,k),isExpected:v===expected,tag:Object.prototype.toString.call(v),descriptor:desc?{keys:Reflect.ownKeys(desc),hasValue:own(desc,'value'),hasWritable:own(desc,'writable'),writable:desc.writable??null,enumerable:desc.enumerable,configurable:desc.configurable,valueIsExpected:own(desc,'value')?desc.value===expected:null}:null}};\n const summary=d=>({state:d.readyState,url:d.URL,contentType:d.contentType,defaultViewNull:d.defaultView===null,doctype:d.doctype?.name??null,tag:Object.prototype.toString.call(d),isDocument:d instanceof Document,isHTMLDocument:d instanceof HTMLDocument,isXMLDocument:d instanceof XMLDocument,title:d.title,childNames:[...d.childNodes].map(n=>n.nodeName)});\n await phase('factory-readiness',()=>{const entries=[['no-title',()=>document.implementation.createHTMLDocument()],['undefined-title',()=>document.implementation.createHTMLDocument(undefined)],['null-title',()=>document.implementation.createHTMLDocument(null)],['text-title',()=>document.implementation.createHTMLDocument('actual title')],['new-document',()=>new Document()],['xml-factory',()=>document.implementation.createDocument(null,'root',null)],['html-parser',()=>new DOMParser().parseFromString('<p>actual</p>','text/html')]];return entries.map(([name,create])=>{try{return{name,value:summary(create())}}catch(e){return{name,error:{name:e.name,message:e.message}}}})});\n await phase('factory-lifecycle',async()=>{const d=document.implementation.createHTMLDocument(),events=[];for(const type of ['readystatechange','DOMContentLoaded','load'])d.addEventListener(type,()=>events.push({type,state:d.readyState}));const immediate=summary(d);await Promise.resolve();const microtask=summary(d);await new Promise(resolve=>setTimeout(resolve,0));return{immediate,microtask,later:summary(d),events}});\n await phase('initial-named-properties',()=>{document.body.insertAdjacentHTML('beforeend','<form name=\"actualForm\" id=\"f\"><input name=\"entry\" value=\"real\"></form><img name=\"actualPicture\" id=\"pictureId\"><img id=\"idOnly\"><object id=\"actualObject\"></object><div name=\"ignoredName\"></div><form name=\"getElementById\" id=\"builtinForm\"></form><form name=\"actualDup\" id=\"dup1\"></form><embed name=\"actualDup\" id=\"dup2\">');return{keys:Object.keys(document),form:shape(document,'actualForm',find('f')),pictureName:shape(document,'actualPicture',find('pictureId')),pictureId:shape(document,'pictureId',find('pictureId')),idOnly:shape(document,'idOnly',undefined),object:shape(document,'actualObject',find('actualObject')),ignored:shape(document,'ignoredName',undefined),builtinType:typeof document.getElementById,field:document.actualForm?.entry?.value??null}});\n await phase('live-duplicates',()=>{const held=document.actualDup,extra=document.createElement('form');extra.name='actualDup';extra.id='dup3';const snapshot=()=>({tag:Object.prototype.toString.call(held),isCollection:held instanceof HTMLCollection,length:held?.length??null,ids:held?[...held].map(n=>n.id):[]});const before=snapshot();document.body.append(extra);const appended=snapshot();extra.remove();return{before,appended,removed:snapshot(),sameLookupObject:document.actualDup===held}});\n await phase('dynamic-filter-and-keys',()=>{const f=document.createElement('form');f.name='dynamicActual';document.body.append(f);const added=shape(document,'dynamicActual',f);f.name='changedActual';const renamed={old:shape(document,'dynamicActual',undefined),new:shape(document,'changedActual',f),keys:Object.keys(document)};f.remove();const removed=shape(document,'changedActual',undefined);const image=find('pictureId');image.removeAttribute('name');return{added,renamed,removed,imageWithoutName:shape(document,'pictureId',undefined)}});\n await phase('own-shadow-and-delete',()=>{const target=find('f');let write;try{document.actualForm='authored';write='returned'}catch(e){write=e.name}const written=shape(document,'actualForm',target);const deleted=Reflect.deleteProperty(document,'actualForm');const afterDelete=shape(document,'actualForm',target);let define;try{Object.defineProperty(document,'actualForm',{value:'own-value',writable:true,enumerable:true,configurable:true});define='returned'}catch(e){define=e.name}return{write,written,deleted,afterDelete,define,afterDefine:shape(document,'actualForm',target)}});\n await phase('iframe-named-value',()=>{const f=document.querySelector('iframe');f.name='actualFrame';const before=shape(document,'actualFrame',f.contentWindow);f.name='actualFrameMoved';const renamed={old:shape(document,'actualFrame',undefined),new:shape(document,'actualFrameMoved',f.contentWindow)};return{before,renamed}});\n await phase('windowless-named-documents',()=>{const html=document.implementation.createHTMLDocument(),form=html.createElement('form');form.name='inertActual';html.body.append(form);const xml=document.implementation.createDocument(null,'root',null),node=xml.createElement('form');node.setAttribute('name','xmlActual');xml.documentElement.append(node);return{html:shape(html,'inertActual',form),htmlKeys:Object.keys(html),xml:shape(xml,'xmlActual',undefined),xmlKeys:Object.keys(xml)}});\n return {rows,boundary:'Independent authored real DOM/Document factory observations; no fixture/assertion edits or expected-output lookup.'};\n})()\n",
+  "sourceSHA256": "c8c7cadfb610af3bcbf2f8047a744cb3eaa2bdd84e90b02f9ecd107d5e986684",
+  "args": [
+    "--ws-max-concurrent",
+    "50",
+    "--load-resources",
+    "iframe",
+    "--load-resources",
+    "worker"
+  ],
+  "rpcBudgetMs": 3000,
+  "loadBudgetMs": 2000,
+  "requests": [
+    {
+      "url": "/main",
+      "headers": {
+        "host": "127.0.0.1:36957",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "sec-fetch-site": "none",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-user": "?1",
+        "sec-fetch-dest": "document"
+      }
+    },
+    {
+      "url": "/child?id=first",
+      "headers": {
+        "host": "127.0.0.1:36957",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "referer": "http://127.0.0.1:36957/main",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-dest": "iframe"
+      }
+    }
+  ],
+  "stages": [
+    {
+      "name": "load",
+      "status": "observed"
+    }
+  ],
+  "status": "observed",
+  "origin": "http://127.0.0.1:36957",
+  "pid": 705114,
+  "navigation": {
+    "frameId": "FID-0000000001",
+    "loaderId": "LID-0000000001"
+  },
+  "evaluation": {
+    "result": {
+      "type": "object",
+      "value": {
+        "rows": [
+          {
+            "name": "factory-readiness",
+            "value": [
+              {
+                "name": "no-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "undefined-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "null-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "null",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "text-title",
+                "value": {
+                  "state": "complete",
+                  "url": "about:blank",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": "html",
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "actual title",
+                  "childNames": [
+                    "html",
+                    "HTML"
+                  ]
+                }
+              },
+              {
+                "name": "new-document",
+                "value": {
+                  "state": "loading",
+                  "url": "about:blank",
+                  "contentType": "application/xml",
+                  "defaultViewNull": true,
+                  "doctype": null,
+                  "tag": "[object Document]",
+                  "isDocument": true,
+                  "isHTMLDocument": false,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": []
+                }
+              },
+              {
+                "name": "xml-factory",
+                "value": {
+                  "state": "loading",
+                  "url": "about:blank",
+                  "contentType": "application/xml",
+                  "defaultViewNull": true,
+                  "doctype": null,
+                  "tag": "[object XMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": false,
+                  "isXMLDocument": true,
+                  "title": "",
+                  "childNames": [
+                    "root"
+                  ]
+                }
+              },
+              {
+                "name": "html-parser",
+                "value": {
+                  "state": "loading",
+                  "url": "http://127.0.0.1:36957/main",
+                  "contentType": "text/html",
+                  "defaultViewNull": true,
+                  "doctype": null,
+                  "tag": "[object HTMLDocument]",
+                  "isDocument": true,
+                  "isHTMLDocument": true,
+                  "isXMLDocument": false,
+                  "title": "",
+                  "childNames": [
+                    "HTML"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "name": "factory-lifecycle",
+            "value": {
+              "immediate": {
+                "state": "complete",
+                "url": "about:blank",
+                "contentType": "text/html",
+                "defaultViewNull": true,
+                "doctype": "html",
+                "tag": "[object HTMLDocument]",
+                "isDocument": true,
+                "isHTMLDocument": true,
+                "isXMLDocument": false,
+                "title": "",
+                "childNames": [
+                  "html",
+                  "HTML"
+                ]
+              },
+              "microtask": {
+                "state": "complete",
+                "url": "about:blank",
+                "contentType": "text/html",
+                "defaultViewNull": true,
+                "doctype": "html",
+                "tag": "[object HTMLDocument]",
+                "isDocument": true,
+                "isHTMLDocument": true,
+                "isXMLDocument": false,
+                "title": "",
+                "childNames": [
+                  "html",
+                  "HTML"
+                ]
+              },
+              "later": {
+                "state": "complete",
+                "url": "about:blank",
+                "contentType": "text/html",
+                "defaultViewNull": true,
+                "doctype": "html",
+                "tag": "[object HTMLDocument]",
+                "isDocument": true,
+                "isHTMLDocument": true,
+                "isXMLDocument": false,
+                "title": "",
+                "childNames": [
+                  "html",
+                  "HTML"
+                ]
+              },
+              "events": []
+            }
+          },
+          {
+            "name": "initial-named-properties",
+            "value": {
+              "keys": [
+                "location",
+                "actualForm",
+                "pictureId",
+                "actualPicture",
+                "actualObject",
+                "getElementById",
+                "actualDup"
+              ],
+              "form": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLFormElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "pictureName": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLImageElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "pictureId": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLImageElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "idOnly": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "object": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLObjectElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "ignored": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "builtinType": "function",
+              "field": "real"
+            }
+          },
+          {
+            "name": "live-duplicates",
+            "value": {
+              "before": {
+                "tag": "[object HTMLCollection]",
+                "isCollection": true,
+                "length": 2,
+                "ids": [
+                  "dup1",
+                  "dup2"
+                ]
+              },
+              "appended": {
+                "tag": "[object HTMLCollection]",
+                "isCollection": true,
+                "length": 3,
+                "ids": [
+                  "dup1",
+                  "dup2",
+                  "dup3"
+                ]
+              },
+              "removed": {
+                "tag": "[object HTMLCollection]",
+                "isCollection": true,
+                "length": 2,
+                "ids": [
+                  "dup1",
+                  "dup2"
+                ]
+              },
+              "sameLookupObject": false
+            }
+          },
+          {
+            "name": "dynamic-filter-and-keys",
+            "value": {
+              "added": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLFormElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "renamed": {
+                "old": {
+                  "type": "undefined",
+                  "in": false,
+                  "own": false,
+                  "isExpected": true,
+                  "tag": "[object Undefined]",
+                  "descriptor": null
+                },
+                "new": {
+                  "type": "object",
+                  "in": true,
+                  "own": true,
+                  "isExpected": true,
+                  "tag": "[object HTMLFormElement]",
+                  "descriptor": {
+                    "keys": [
+                      "value",
+                      "writable",
+                      "enumerable",
+                      "configurable"
+                    ],
+                    "hasValue": true,
+                    "hasWritable": true,
+                    "writable": true,
+                    "enumerable": true,
+                    "configurable": true,
+                    "valueIsExpected": true
+                  }
+                },
+                "keys": [
+                  "location",
+                  "actualForm",
+                  "pictureId",
+                  "actualPicture",
+                  "actualObject",
+                  "getElementById",
+                  "actualDup",
+                  "changedActual"
+                ]
+              },
+              "removed": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "imageWithoutName": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              }
+            }
+          },
+          {
+            "name": "own-shadow-and-delete",
+            "value": {
+              "write": "returned",
+              "written": {
+                "type": "string",
+                "in": true,
+                "own": true,
+                "isExpected": false,
+                "tag": "[object String]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": false
+                }
+              },
+              "deleted": true,
+              "afterDelete": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLFormElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "define": "returned",
+              "afterDefine": {
+                "type": "string",
+                "in": true,
+                "own": true,
+                "isExpected": false,
+                "tag": "[object String]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": false
+                }
+              }
+            }
+          },
+          {
+            "name": "iframe-named-value",
+            "value": {
+              "before": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object Window]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "renamed": {
+                "old": {
+                  "type": "undefined",
+                  "in": false,
+                  "own": false,
+                  "isExpected": true,
+                  "tag": "[object Undefined]",
+                  "descriptor": null
+                },
+                "new": {
+                  "type": "object",
+                  "in": true,
+                  "own": true,
+                  "isExpected": true,
+                  "tag": "[object Window]",
+                  "descriptor": {
+                    "keys": [
+                      "value",
+                      "writable",
+                      "enumerable",
+                      "configurable"
+                    ],
+                    "hasValue": true,
+                    "hasWritable": true,
+                    "writable": true,
+                    "enumerable": true,
+                    "configurable": true,
+                    "valueIsExpected": true
+                  }
+                }
+              }
+            }
+          },
+          {
+            "name": "windowless-named-documents",
+            "value": {
+              "html": {
+                "type": "object",
+                "in": true,
+                "own": true,
+                "isExpected": true,
+                "tag": "[object HTMLFormElement]",
+                "descriptor": {
+                  "keys": [
+                    "value",
+                    "writable",
+                    "enumerable",
+                    "configurable"
+                  ],
+                  "hasValue": true,
+                  "hasWritable": true,
+                  "writable": true,
+                  "enumerable": true,
+                  "configurable": true,
+                  "valueIsExpected": true
+                }
+              },
+              "htmlKeys": [
+                "location",
+                "inertActual"
+              ],
+              "xml": {
+                "type": "undefined",
+                "in": false,
+                "own": false,
+                "isExpected": true,
+                "tag": "[object Undefined]",
+                "descriptor": null
+              },
+              "xmlKeys": [
+                "location"
+              ]
+            }
+          }
+        ],
+        "boundary": "Independent authored real DOM/Document factory observations; no fixture/assertion edits or expected-output lookup."
+      }
+    }
+  },
+  "events": [
+    {
+      "method": "Target.targetCreated",
+      "params": {
+        "targetInfo": {
+          "url": "about:blank",
+          "title": "",
+          "targetId": "FID-0000000001",
+          "attached": false,
+          "type": "page",
+          "canAccessOpener": false,
+          "browserContextId": "BID-1"
+        }
+      }
+    },
+    {
+      "method": "Target.attachedToTarget",
+      "params": {
+        "sessionId": "SID-1",
+        "targetInfo": {
+          "url": "about:blank",
+          "title": "",
+          "targetId": "FID-0000000001",
+          "attached": true,
+          "type": "page",
+          "canAccessOpener": false,
+          "browserContextId": "BID-1"
+        },
+        "waitingForDebugger": false
+      }
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 1,
+          "origin": "",
+          "name": "",
+          "uniqueId": "3.4",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000001"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "FID-0000000001",
+        "url": "http://127.0.0.1:36957/main",
+        "loaderId": "LID-0000000001",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextsCleared",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "type": "Navigation",
+        "frame": {
+          "id": "FID-0000000001",
+          "loaderId": "LID-0000000001",
+          "url": "http://127.0.0.1:36957/main",
+          "domainAndRegistry": "",
+          "securityOrigin": "http://127.0.0.1:36957",
+          "mimeType": "text/html",
+          "adFrameStatus": {
+            "adFrameType": "none"
+          },
+          "secureContextType": "InsecureScheme",
+          "crossOriginIsolatedContextType": "NotIsolated",
+          "gatedAPIFeatures": []
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 2,
+          "origin": "http://127.0.0.1:36957",
+          "name": "",
+          "uniqueId": "5.6",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000001",
+            "loaderId": "LID-0000000001"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "DOM.documentUpdated",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameAttached",
+      "params": {
+        "frameId": "FID-0000000002",
+        "parentFrameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameRequestedNavigation",
+      "params": {
+        "frameId": "FID-0000000002",
+        "reason": "initialFrameNavigation",
+        "url": "http://127.0.0.1:36957/child?id=first",
+        "disposition": "currentTab"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "FID-0000000002",
+        "url": "http://127.0.0.1:36957/child?id=first",
+        "loaderId": "LID-0000000002",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "FID-0000000002"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.domContentEventFired",
+      "params": {
+        "timestamp": 82890
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameClearedScheduledNavigation",
+      "params": {
+        "frameId": "FID-0000000002"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "type": "Navigation",
+        "frame": {
+          "id": "FID-0000000002",
+          "parentId": "FID-0000000001",
+          "loaderId": "LID-0000000002",
+          "url": "http://127.0.0.1:36957/child?id=first",
+          "domainAndRegistry": "",
+          "securityOrigin": "http://127.0.0.1:36957",
+          "mimeType": "text/html",
+          "adFrameStatus": {
+            "adFrameType": "none"
+          },
+          "secureContextType": "InsecureScheme",
+          "crossOriginIsolatedContextType": "NotIsolated",
+          "gatedAPIFeatures": []
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 3,
+          "origin": "http://127.0.0.1:36957",
+          "name": "",
+          "uniqueId": "7.8",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000002",
+            "loaderId": "LID-0000000002"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "DOM.documentUpdated",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.domContentEventFired",
+      "params": {
+        "timestamp": 82890
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.loadEventFired",
+      "params": {
+        "timestamp": 82890
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "FID-0000000002"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.loadEventFired",
+      "params": {
+        "timestamp": 82890
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    }
+  ],
+  "stderr": "$time=1793486406354 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:39685 max_connections=16078 max_browser_connections=16\n",
+  "exitCode": 0,
+  "signal": null,
+  "cleanup": "owned browser/client/server closed"
+}

@@ -1,3 +1,4 @@
+import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
 import {formAssociatedState} from './element-internals.js';
 // Independent selector parsing and state adapter. No native engine is imported.
 import 'jsdom';
@@ -229,6 +230,7 @@ const getId=DocumentImpl.prototype.getElementById;DocumentImpl.prototype.getElem
 };
 for(const name of ['matches','closest']){
  const original=ElementImpl.prototype[name];ElementImpl.prototype[name]=function(selector){const record=RECORDS.get(this._ownerDocument);if(!record)return original.call(this,selector);const scope=wrapperForImpl(this);if(name==='matches'){try{return match(record,selector,scope,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);throw error;}}
+ if(selector==='')throw record.exception('The string did not match the expected pattern','SyntaxError');
  try {compiled(record,selector);for(let node=this;node&&node.nodeType===1;node=domSymbolTree.parent(node))if(match(record,selector,wrapperForImpl(node),scope))return wrapperForImpl(node);return null;}
  catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);if(error?.name==='SyntaxError')throw new record.window.Error(error.message);throw error;}
  };
@@ -237,7 +239,7 @@ export function installSelectors(page,window,providers={}) {
  const document=implForWrapper(window.document);const current=RECORDS.get(document);if(current)return current.controller;
  const signal=page?.documentAbort?.signal;
  if(page?.closed||signal?.aborted)throw new window.DOMException('Cannot register selectors on a closed document','InvalidStateError');
- const record={window,document:window.document,documentImpl:document,providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
+ const record={window,document:window.document,documentImpl:document,exception:captureDOMExceptionFactory(window),providers,cache:new Map(),predicates:[],matcher:null,disposed:false};RECORDS.set(document,record);
  const dispose=()=>{if(record.disposed)return;record.disposed=true;if(RECORDS.get(document)===record)RECORDS.delete(document);signal?.removeEventListener('abort',dispose);page?.off?.('close',dispose);};
  if(signal)signal.addEventListener('abort',dispose,{once:true});else page?.once?.('close',dispose);
  record.controller={dispose,selectorForSpecificity};return record.controller;

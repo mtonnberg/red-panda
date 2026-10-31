@@ -1,0 +1,19 @@
+--- a/src/document-xml.js
++++ b/src/document-xml.js
+@@ -91,7 +91,7 @@
+  const cookie=Object.getOwnPropertyDescriptor(Document.prototype,'cookie');
+  Object.defineProperty(Document.prototype,'cookie',{...cookie,set(value){brand(this);value=''+value;if(/[\x00-\x1f\x7f-\uffff]/.test(value))return;cookie.set.call(this,value);}});
+  const create=g.DOMImplementation.prototype.createHTMLDocument;
+- g.DOMImplementation.prototype.createHTMLDocument=function(...args){return adopt(create.apply(this,args));};
++ g.DOMImplementation.prototype.createHTMLDocument=function(...args){const document=create.apply(this,args);bridge.completeHTMLDocument(document);return adopt(document);};
+  const parse=g.DOMParser.prototype.parseFromString;
+  g.DOMParser.prototype.parseFromString=function(source,type){if(!bridge.isParser(this)||arguments.length<2)throw new g.TypeError('Invalid DOMParser receiver or arguments');source=''+source;type=''+type;return adopt(parse.call(this,type==='text/html'?source:bridge.normalizeXML(source),type));};
+  if(g.document.contentType==='text/html')Object.setPrototypeOf(g.document,HTMLDocument.prototype);
+@@ -141,6 +141,7 @@
+  const metadata=window.eval(`(${realmMetadata.toString()})`)(window,{
+   normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,
+   html(doc){const impl=implForWrapper(doc);impl._parsingMode='html';impl.contentType='text/html';},
++  completeHTMLDocument(doc){const impl=implForWrapper(doc);impl._currentDocumentReadiness='complete';},
+   hostname(doc){const origin=implForWrapper(doc)._origin;try{return new URL(origin).hostname;}catch{}try{return window.location.hostname;}catch{return'';}},
+   validateDomain(current,value){
+    value=value.toLowerCase();if(!value||/[\s/:?#@]/.test(value)||value.startsWith('.')||value.endsWith('.'))return null;

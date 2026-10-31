@@ -1,0 +1,11 @@
+# Utility/File candidate R1: seven syntax positives, actual 2/6 tests
+
+The exact granted gate ran once and stopped at the new-test stage. All seven changed JS leaves passed Node syntax. The test stage actually ran six cases: two passed, four failed, no skips/cancellation. Raw TAP is authoritative. Controller actualTests0 is a reporting limitation: its count parser runs only after a zero process exit, so it did not include this failed stage. No later owned-profile/Native comparison or 33 protected cases ran.
+
+First physical test passed, recording28 actual sameRealm/creationGlobal rows before and after null prototypes, all selected=true/Host=false/global=true. It also completed original sole FileList Proxy target identity, canonical backend/frontend and Host trap-function assertions. Idempotent utility installation and real asynchronous DataTransfer string callback test passed.
+
+Four failures share the real TypeError StringCtor is not a function from webidl-conversions.DOMString/USVString during actual utility File/Blob construction. The candidate's private conversionGlobals projection includes only captured TypeError; the pinned dependency reads globals.String and, for numeric conversions, globals.Number. This is a production proposal defect, not a fixture/source-excerpt/count-only failure. Membership/bytes/clone/strong-forgery/replaced-global assertions after construction in those failed tests were not completed and are not claimed passed.
+
+Total4.797s; no deadline. All7,694 before/after source/native/dependency/Node/oracle/controller guards are unchanged. Eight listed syntax/test parent PIDs and actual test worker707319 are absent at seal. MaxListeners warnings remain raw; none were suppressed. No Root edit, retry, PS build or Native repeat. R1 source/patch remains frozen.
+
+Smallest proposed new revision: add captured original VM String and Number to the Host-owned conversion projection in file-wrapper-realms, and supply the same complete projection for DataTransfer numeric WebIDL conversions. No public global lookup after startup; retain every existing test/physical/alias/byte/trap assertion and all budgets. This proposal is static only until separately authorized. Final R5 consumer acceptance is separately positive; this failure belongs to the dependent utility candidate.

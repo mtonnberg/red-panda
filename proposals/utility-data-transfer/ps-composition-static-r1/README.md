@@ -1,0 +1,7 @@
+# PureScript upload composition (unrun)
+
+The separate owned copy is `/workspace/shared/utility-data-transfer-ps-r1-20261031`. It contains the unchanged R3 runtime plus the exact frozen five-leaf PS upload patch. Original three PS base leaf hashes matched; private apply and reverse-check passed. Every R3 source input still matches; physical `.spago`, output and cache copies prevent compiler writes to Root. No compilation, fixture creation, browser or network job has run on this copy.
+
+Prepared command: `python3 /workspace/red-panda/proposals/utility-data-transfer/run-ps129-r1.py`.
+
+After an explicit lease, it runs cached offline/pure strict/pedantic build and the real full PS integration on Node24.22. Original117 assertions remain and12 upload assertions use actual Puppeteer APIs;129 is conditional on actual pass. The PS source owns selector/handle brackets, typed path vectors, upload sequencing and assertions. FFI adapts individual operations or owned disk fixtures. The actual Puppeteer empty path is retained; it uses utility DataTransfer and authored input/change, not a substituted CDP call. Existing actual protocol/load/watch budgets stay unchanged. Expected35–60 seconds;180-second administrative cap only. Stop first failure, no retries or source changes. Source/config/locks/compiler/dependencies/three SDK executables/18 native artifacts are guarded; tiny owned disk fixture leftovers are checked. Compiled outputs are separately recorded and allowed to change. Root remains untouched.

@@ -79,13 +79,24 @@ function notSupported(record, message) { return new record.window.DOMException(m
 const GENERIC_INLINE=new Set('abbr b bdi bdo cite code dfn em i kbd mark q s samp small span strong sub sup time u var wbr'.split(' '));
 const HTML_INLINE=new Set([...GENERIC_INLINE,...'a blockquote br del font ins label'.split(' ')]);
 const ACTIVE_NON_RENDERING=new Set('area base datalist head link meta noscript rp script source style template title track'.split(' '));
+// These typed UA fallbacks are active-context defaults. An authored revert
+// resumes the interface's base display, while ordinary declarations still win
+// by actual cascade rank. Attribute-hidden/dialog defaults remain independent.
+function typedHiddenDisplay(node){
+ if(node._prefix)return false;
+ const name=node._localName,namespace=node._namespaceURI;
+ if(namespace==='http://www.w3.org/2000/svg')return name.replace(/[A-Z]/g,c=>c.toLowerCase())==='param';
+ if(namespace!=='http://www.w3.org/1999/xhtml')return false;
+ return name==='param'||name==='input'&&(node.getAttributeNS(null,'type')??'').replace(/[A-Z]/g,c=>c.toLowerCase())==='hidden';
+}
+function typedDisplayRevert(node,base){return typedHiddenDisplay(node)&&!node.hasAttributeNS(null,'hidden')?base:undefined;}
 function hasActiveStyleContext(element){return !!implForWrapper(element)._ownerDocument._defaultView;}
 function elementDefaultDisplay(element,active=hasActiveStyleContext(element)){
  const implementation=implForWrapper(element),namespace=implementation._namespaceURI,name=implementation._prefix?implementation._prefix+':'+implementation._localName:implementation._localName;
  const html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';
  let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';
  if(!active)return display;
- if(implementation.hasAttributeNS(null,'hidden'))return 'none';
+ if(implementation.hasAttributeNS(null,'hidden')||typedHiddenDisplay(implementation))return 'none';
  if((html||svg)&&ACTIVE_NON_RENDERING.has(name))return 'none';
  const popover=implementation.hasAttributeNS(null,'popover'),popoverOpen=popover&&matchesInScope(element,':popover-open');
  if((html||svg)&&name==='dialog'&&!implementation.hasAttributeNS(null,'open')&&!popoverOpen)return 'none';
@@ -552,13 +563,13 @@ function cascade(record, element) {
   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
   for(const{sheet}of authorSheets)if(!flatSheetState(sheet,SHEETS.get(sheet)?.rules))collectLayers(SHEETS.get(sheet)?.rules??sheet.cssRules);
   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
-  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false) => {
+  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false,revertValue) => {
     style = declaration(style);
     for (let index = 0; index < style.length; index++) {
       const property = style[index];
       if(origin===0&&property==='display'&&!elementDisplay)continue;
       let value = style.getPropertyValue(property);
-      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order);
+      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order,revertValue);
     }
   };
   const resolveNested=(selector,parent)=>{
@@ -610,7 +621,7 @@ function cascade(record, element) {
     }
   };
   walk(uaRulesFor(element), 0);
-  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true);
+  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true,typedDisplayRevert(implForWrapper(element),elementDefaultDisplay(element,false)));
   if (element.localName === 'a' && element.hasAttribute('href')) {
     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
   }
@@ -905,13 +916,13 @@ export { inheritanceParent as getStyleInheritanceParent };
 // These kernels are shared with the existing public cascade. Canonical reads
 // supply actual producer entries; rank/importance/shorthand/revert math is one
 // implementation rather than a renderer-specific table of CSS answers.
-function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order){
+function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order,revertValue){
  if(property==='text-transform'){value=textTransformValue(value);if(value===null)return order}
  if(property==='position'){value=positionValue(value);if(value===null)return order}
  const entries=expandedEntries(property,value);if(!entries)return order;
- for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart});values.set(name,list)}return order;
+ for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart,...(name==='display'&&revertValue!==undefined?{revertValue}:{})});values.set(name,list)}return order;
 }
-function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer')winner=candidates.find(candidate=>candidate.origin===0);if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
+function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer'){const keyword=winner.value.toLowerCase();winner=candidates.find(candidate=>candidate.origin===0);if(winner&&keyword==='revert'&&winner.revertValue!==undefined)winner={...winner,value:winner.revertValue};}if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
 
 function retireCanonicalStyleSource(record,node){if(record.frameStyleSources.delete(node))record.canonicalDirty=true}
 function registerFrameStyleSource(record,node,sheet){
@@ -938,7 +949,7 @@ function canonicalStyleProgram(record){
 }
 function canonicalDefaultDisplay(node,active){
  const namespace=node._namespaceURI,name=node._prefix?node._prefix+':'+node._localName:node._localName,html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';if(!active)return display;
- if(node.hasAttributeNS(null,'hidden')||(html||svg)&&ACTIVE_NON_RENDERING.has(name))return'none';
+ if(node.hasAttributeNS(null,'hidden')||typedHiddenDisplay(node)||(html||svg)&&ACTIVE_NON_RENDERING.has(name))return'none';
  if((html||svg)&&name==='dialog'&&!node.hasAttributeNS(null,'open'))return'none';
  if((html||svg)&&name==='slot')display='contents';const parent=node.parentElement;
  if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return'none';
@@ -952,11 +963,11 @@ function canonicalCascade(record,node,program){
  const collect=(entries,parent=rootLayer)=>{for(const entry of entries){const group=entry.group;if(group?.kind==='layerStatement'){for(const name of group.names)register(parent,name,entry)}else if(group?.kind==='layer'){const next=register(parent,group.name,entry);if(next){layerNodes.set(entry,next);collect(group.children,next)}}else if(group?.kind==='media'){if(group.enabled)collect(group.children,parent)}else if(entry.type===4&&entry.enabled)collect(entry.children,parent);else if(entry.type===1)collect(entry.children,parent)}};
  for(const entries of program.sheets)collect(entries);let rank=0;const rankLayers=layer=>{for(const child of layer.children.values())rankLayers(child);if(layer!==rootLayer)layer.rank=++rank};rankLayers(rootLayer);
  const relevant=(entries,origin)=>entries?.some(entry=>(origin!==0||entry.name!=='display')&&(CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)||entry.name.startsWith('--')));
- const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order)}};
+ const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false,revertValue)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order,revertValue)}};
  const score=selectorText=>{let best=null;for(const selector of splitTopLevel(selectorText)){if(/:host|::slotted|::part/.test(selector))throw Error('Canonical shadow selector is not supported');if(matchCanonicalSelector(node,selector,record.documentImpl.documentElement)){const value=specificity(selector);if(!best||compare(value,best)>0)best=value}}return best};
  const nested=(selector,parent)=>{if(!parent)return selector;let output='',quote=null,brackets=0,ampersand=false;for(let i=0;i<selector.length;i++){const c=selector[i];if(c==='\\'){output+=c+(selector[++i]??'');continue}if(quote){output+=c;if(c===quote)quote=null;continue}if(c==='"'||c==="'"){quote=c;output+=c;continue}if(c==='[')brackets++;if(c===']')brackets--;if(c==='&'&&!brackets){output+=':is('+parent+')';ampersand=true}else output+=c}return ampersand?output:':is('+parent+') '+output};
  const walk=(entries,origin,parent=null,layer=rootLayer)=>{for(const entry of entries){const group=entry.group;if(entry.type===1&&entry.declarations){const selector=nested(entry.selector,parent);if(relevant(entry.declarations,origin)){const match=score(selector);if(match)offer(entry.declarations,match,origin,false,layer)}walk(entry.children,origin,selector,layer)}else if(group?.kind==='layer'){const child=layerNodes.get(entry);if(child){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,child)}walk(group.children,origin,parent,child)}}else if(group?.kind==='media'){if(group.enabled){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,layer)}walk(group.children,origin,parent,layer)}}else if(entry.type===4&&entry.enabled)walk(entry.children,origin,parent,layer)}};
- walk(program.ua,0);offer([{name:'display',value:canonicalDefaultDisplay(node,true),priority:''}],[0,0,0],0,false,rootLayer,true);
+ walk(program.ua,0);offer([{name:'display',value:canonicalDefaultDisplay(node,true),priority:''}],[0,0,0],0,false,rootLayer,true,typedDisplayRevert(node,canonicalDefaultDisplay(node,false)));
  for(const entries of program.sheets)walk(entries,1);if(node._style)offer(readCSSDeclaration(node._style),[0,0,0],1,true);return cascadeWinners(values);
 }
 export function createCanonicalStyleResolver(renderDocument){

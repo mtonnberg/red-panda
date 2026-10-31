@@ -1,0 +1,193 @@
+--- a/automation/src/RedPanda/Puppeteer.purs
++++ b/automation/src/RedPanda/Puppeteer.purs
+@@ -1,5 +1,5 @@
+ module RedPanda.Puppeteer
+-  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, PreloadScript, Header, ByteArray, Cookie
++  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, ElementHandle, PreloadScript, Header, ByteArray, Cookie
+   , Permission(..), GeolocationOptions
+   , connect, disconnect, createContext, closeContext, newPage, closePage
+   , goto, gotoResponse, responseStatus, responseText, responseBytes
+@@ -14,6 +14,7 @@
+   , evaluateString, textContent, waitForSelector, waitForFunction, dispatchClick, content, cookieNames, setCookie
+   , cookies, cookieName, cookieValue, deleteCookie
+   , evaluateHandle, queryObjects, evaluateHandleString, disposeHandle, withHandle
++  , queryElement, withElementHandle, uploadFiles, disposeElementHandle, elementHandleDisposed
+   , Async, fromAsync, quote
+   ) where
+ 
+@@ -21,9 +22,9 @@
+ 
+ import Data.Either (Either(..))
+ import Effect (Effect)
+-import Effect.Aff (Aff, Canceler(..), makeAff, bracket)
++import Effect.Aff (Aff, Canceler(..), makeAff, bracket, throwError)
+ import Effect.Class (liftEffect)
+-import Effect.Exception (Error)
++import Effect.Exception (Error, error)
+ 
+ foreign import data Browser :: Type
+ foreign import data BrowserContext :: Type
+@@ -31,6 +32,7 @@
+ foreign import data Frame :: Type
+ foreign import data Response :: Type
+ foreign import data JSHandle :: Type
++foreign import data ElementHandle :: Type
+ foreign import data PendingNavigation :: Type
+ foreign import data ByteArray :: Type
+ foreign import data ProtocolSession :: Type
+@@ -105,6 +107,10 @@
+ foreign import queryObjectsImpl :: Page -> JSHandle -> Async JSHandle
+ foreign import evaluateHandleStringImpl :: JSHandle -> String -> Async String
+ foreign import disposeHandleImpl :: JSHandle -> Async Unit
++foreign import queryElementImpl :: forall a. a -> (ElementHandle -> a) -> Page -> String -> Async a
++foreign import uploadFilesImpl :: ElementHandle -> Array String -> Async Unit
++foreign import disposeElementHandleImpl :: ElementHandle -> Async Unit
++foreign import elementHandleDisposed :: ElementHandle -> Effect Boolean
+ foreign import waitForSelectorImpl :: Page -> String -> Async Unit
+ foreign import waitForFunctionImpl :: Page -> String -> Async Unit
+ foreign import contentImpl :: Page -> Async String
+@@ -259,6 +265,23 @@
+ withHandle :: forall a. Aff JSHandle -> (JSHandle -> Aff a) -> Aff a
+ withHandle acquire = bracket acquire disposeHandle
+ 
++-- Selector lookup, missing-element policy and handle lifetime belong to PS.
++queryElement :: Page -> String -> Aff ElementHandle
++queryElement page selector = do
++  result <- fromAsync $ queryElementImpl (Left unit) Right page selector
++  case result of
++    Left _ -> throwError $ error $ "No element matches selector: " <> selector
++    Right handle -> pure handle
++
++withElementHandle :: forall a. Page -> String -> (ElementHandle -> Aff a) -> Aff a
++withElementHandle page selector = bracket (queryElement page selector) disposeElementHandle
++
++uploadFiles :: ElementHandle -> Array String -> Aff Unit
++uploadFiles handle paths = fromAsync $ uploadFilesImpl handle paths
++
++disposeElementHandle :: ElementHandle -> Aff Unit
++disposeElementHandle handle = fromAsync $ disposeElementHandleImpl handle
++
+ textContent :: Page -> String -> Aff String
+ textContent page selector = evaluateString page $
+   "document.querySelector(" <> quote selector <> ").textContent"
+--- a/automation/src/RedPanda/Puppeteer.js
++++ b/automation/src/RedPanda/Puppeteer.js
+@@ -87,6 +87,11 @@
+   return result;
+ });
+ export const disposeHandleImpl = handle => async(async () => { await handle.dispose(); });
++export const queryElementImpl = missing => found => page => selector => onError => onSuccess =>
++  async(() => page.$(selector), handle => handle?.dispose())(onError)(handle => onSuccess(handle === null ? missing : found(handle)));
++export const uploadFilesImpl = handle => paths => async(async () => { await handle.uploadFile(...paths); });
++export const disposeElementHandleImpl = handle => async(async () => { await handle.dispose(); });
++export const elementHandleDisposed = handle => () => handle.disposed;
+ export const contentImpl = page => async(() => page.content());
+ export const waitForFunctionImpl = page => expression => async(async () => {
+   const handle = await page.waitForFunction(expression, { timeout: 5000, polling: 20 });
+--- /dev/null
++++ b/automation/test/Test/Upload.purs
+@@ -0,0 +1,64 @@
++module Test.Upload (uploadChecks) where
++
++import Prelude
++
++import Data.Either (Either(..))
++import Effect.Aff (Aff, attempt, bracket, throwError)
++import Effect.Class (liftEffect)
++import Effect.Class.Console (log)
++import Effect.Exception (error)
++import RedPanda.Puppeteer as Browser
++
++foreign import data UploadFixture :: Type
++foreign import createFilesImpl :: Browser.Async UploadFixture
++foreign import removeFilesImpl :: UploadFixture -> Browser.Async Unit
++foreign import uploadPaths :: UploadFixture -> Array String
++foreign import firstPath :: UploadFixture -> String
++foreign import missingPath :: UploadFixture -> String
++
++assert :: String -> Boolean -> Aff Unit
++assert label ok = if ok then log $ "PASS " <> label else throwError $ error $ "FAIL " <> label
++
++-- Disk fixture FFI owns no Puppeteer operations. PS acquires each resource,
++-- chooses the selector/path vector, sequences uploads and checks actual values.
++uploadChecks :: Browser.Browser -> String -> Aff Unit
++uploadChecks browser origin =
++  bracket (Browser.fromAsync createFilesImpl) (Browser.fromAsync <<< removeFilesImpl) \fixture ->
++    bracket (Browser.createContext browser) Browser.closeContext \context ->
++      bracket (Browser.newPage context) Browser.closePage \page -> do
++        status <- Browser.goto page $ origin <> "/capability"
++        assert "upload checks navigate a real isolated context" $ status == 200
++        initial <- Browser.evaluateString page "(()=>{document.body.innerHTML='<form><input id=ps-upload-input type=file multiple></form>';const input=document.getElementById('ps-upload-input');globalThis.psUploadList=input.files;globalThis.psUploadEvents=[];for(const type of ['input','change'])input.addEventListener(type,event=>psUploadEvents.push([event.type,event.isTrusted]));return JSON.stringify([input.type,input.multiple,input.files.length,input.files instanceof FileList])})()"
++        assert "upload starts with a genuine empty multiple-file control" $ initial == "[\"file\",true,0,true]"
++        released <- Browser.withElementHandle page "#ps-upload-input" \handle -> do
++          Browser.uploadFiles handle $ uploadPaths fixture
++          metadata <- Browser.evaluateString page "(()=>{const list=document.getElementById('ps-upload-input').files;globalThis.psUploadFirst=list[0];globalThis.psUploadSecond=list[1];return JSON.stringify([list===psUploadList,list instanceof FileList,list.length,Array.from(list,file=>file.name),Array.from(list,file=>file.type),Array.from(list,file=>file.size),Array.from(list,file=>file.lastModified),list[0]===list.item(0),list[1]===list.item(1)])})()"
++          assert "upload reads disk metadata into the same real FileList" $ metadata == "[true,true,2,[\"alpha.txt\",\"binary.redpanda\"],[\"text/plain\",\"application/octet-stream\"],[3,5],[1700000000125,1700000000125],true,true]"
++          bytes <- Browser.evaluateString page "Promise.all(Array.from(document.getElementById('ps-upload-input').files,file=>file.arrayBuffer().then(buffer=>Array.from(new Uint8Array(buffer))))).then(JSON.stringify)"
++          assert "upload retains exact nonUTF8 and NUL bytes from both real files" $ bytes == "[[65,0,255],[3,1,4,0,128]]"
++          events <- Browser.evaluateString page "JSON.stringify(psUploadEvents)"
++          assert "nonempty Puppeteer upload dispatches real trusted input then change" $ events == "[[\"input\",true],[\"change\",true]]"
++          failed <- attempt $ Browser.uploadFiles handle [ firstPath fixture, missingPath fixture ]
++          assert "a later missing disk path rejects the actual uploadFile call" $ case failed of
++            Left _ -> true
++            Right _ -> false
++          retained <- Browser.evaluateString page "(()=>{const list=document.getElementById('ps-upload-input').files;return JSON.stringify([list===psUploadList,list[0]===psUploadFirst,list[1]===psUploadSecond,list.length,Array.from(list,file=>file.name),psUploadEvents.length])})()"
++          assert "missing-path upload is atomic for FileList identity, files and events" $ retained == "[true,true,true,2,[\"alpha.txt\",\"binary.redpanda\"],2]"
++          -- Actual Puppeteer handles [] through utility DataTransfer and authored
++          -- events. Keep this real branch; it requires the separate utility API.
++          Browser.uploadFiles handle []
++          cleared <- Browser.evaluateString page "(()=>{const input=document.getElementById('ps-upload-input');return JSON.stringify([input.files===psUploadList,input.files instanceof FileList,input.files.length,input.files.item(0),input.value])})()"
++          assert "empty Puppeteer upload clears actual stable selection" $ cleared == "[true,true,0,null,\"\"]"
++          emptyEvents <- Browser.evaluateString page "JSON.stringify(psUploadEvents)"
++          assert "Puppeteer's empty branch preserves genuine authored event trust" $ emptyEvents == "[[\"input\",true],[\"change\",true],[\"input\",false],[\"change\",false]]"
++          Browser.uploadFiles handle []
++          repeated <- Browser.evaluateString page "JSON.stringify(psUploadEvents)"
++          assert "repeated empty upload executes the real client branch again" $ repeated == "[[\"input\",true],[\"change\",true],[\"input\",false],[\"change\",false],[\"input\",false],[\"change\",false]]"
++          pure handle
++        disposed <- liftEffect $ Browser.elementHandleDisposed released
++        assert "PS bracket releases the actual Puppeteer ElementHandle" disposed
++        absent <- attempt $ Browser.withElementHandle page "#missing-upload-control" \_ -> pure unit
++        assert "PS selector acquisition rejects a missing element" $ case absent of
++          Left _ -> true
++          Right _ -> false
++        log "PureScript Puppeteer upload: 12 checks passed"
+--- a/automation/test/Test/Main.purs
++++ b/automation/test/Test/Main.purs
+@@ -9,6 +9,7 @@
+ import Effect.Class.Console (log)
+ import Effect.Exception (error)
+ import RedPanda.Puppeteer as Browser
++import Test.Upload (uploadChecks)
+ 
+ foreign import data Fixture :: Type
+ foreign import startImpl :: Browser.Async Fixture
+@@ -372,3 +373,4 @@
+         capabilityChecks fixture browser
+         Browser.closePage page
+         log "PureScript Puppeteer integration: 117 checks passed"
++        uploadChecks browser $ fixtureCapabilityOrigin fixture
+--- /dev/null
++++ b/automation/test/Test/Upload.js
+@@ -0,0 +1,22 @@
++// Only unique owned disk-fixture creation/removal belongs here. No Puppeteer.
++import {mkdtemp,writeFile,utimes,rm} from 'node:fs/promises';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++const async = (task,dispose=()=>{}) => fail => success => () => {
++  let canceled=false;
++  Promise.resolve().then(task).then(value=>{if(canceled)Promise.resolve(dispose(value)).catch(()=>{});else success(value)()},error=>{if(!canceled)fail(error)()});
++  return ()=>{canceled=true};
++};
++export const createFilesImpl=async(async()=>{
++  const directory=await mkdtemp(join(tmpdir(),'red-panda-purescript-upload-'));
++  try{
++    const first=join(directory,'alpha.txt'),second=join(directory,'binary.redpanda');
++    await writeFile(first,Buffer.from([65,0,255]));await writeFile(second,Buffer.from([3,1,4,0,128]));
++    await utimes(first,1700000000.125,1700000000.125);await utimes(second,1700000000.125,1700000000.125);
++    let closing;return{paths:[first,second],first,missing:join(directory,'missing-owned-file'),close:()=>closing??=rm(directory,{recursive:true,force:true})};
++  }catch(error){await rm(directory,{recursive:true,force:true});throw error}
++},fixture=>fixture.close());
++export const removeFilesImpl=fixture=>async(()=>fixture.close());
++export const uploadPaths=fixture=>fixture.paths;
++export const firstPath=fixture=>fixture.first;
++export const missingPath=fixture=>fixture.missing;

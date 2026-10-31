@@ -1,4 +1,5 @@
 import {types} from 'node:util';
+import {beginDispatchRecoveryParticipant,completeDispatchRecoveryParticipant} from './dom-dispatch-recovery.js';
 import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-parity.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
@@ -144,9 +145,11 @@ function installHooks() {
     if (!reporting) return dispatch.call(this, event, ...args);
     // Also covers classic script errors reported by jsdom itself.
     event.message = message(event.error);
+    const previousDepth = record.depth;
+    const recovery = beginDispatchRecoveryParticipant(() => { record.depth = previousDepth; });
     record.depth++;
     try { return dispatch.call(this, event, ...args); }
-    finally { record.depth--; }
+    finally { record.depth--; completeDispatchRecoveryParticipant(recovery); }
   };
   function onUnhandled(reason, promise) {
     let owned = promises.get(promise);
