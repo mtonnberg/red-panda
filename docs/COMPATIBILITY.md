@@ -10,6 +10,17 @@ pedantic builds with zero warnings or errors. The
 [frozen validation](../proposals/phase25-full-accepted/README.md) records 9,995
 unchanged inputs and the exact 44 runtime/test/automation leaves.
 
+Promise rejection attribution now uses actual V8 creation-context equality
+instead of walking mutable public prototypes. Subclasses with null, foreign or
+Proxy prototype chains retain the correct owner without executing authored
+prototype traps; Host-created and unregistered Promises preserve fatal reporting.
+All 21 attribution/error cases pass on each of three SDKs, with 100 separate
+existing regressions and a fresh 49-case main-checkout composition pass.
+[Evidence](../proposals/promise-attribution-authority/acceptance-r2/README.md)
+preserves the failed test-harness epochs and distinguishes these focused checks
+from the complete-suite checkpoint above. External and legacy Host async hooks,
+Native late-handler routing and reusable-global lifecycle parity remain gaps.
+
 This integration adds measured cookie actions and Unicode HTTP transport,
 JavaScript dialog state, actual thrown-object handles, Page close/stop controls,
 canonical Markdown aliases, permissions/geolocation and bounded binary/POST

@@ -1,0 +1,185 @@
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -3,7 +3,8 @@
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ import { createHook } from 'node:async_hooks';
+-import { runInContext } from 'node:vm';
++import { getHeapBinding } from './native-heap.js';
++import { runInContext, isContext } from 'node:vm';
+ 
+ const require = createRequire(import.meta.url);
+ 
+@@ -11,7 +12,15 @@
+ const { DOMString } = require('webidl-conversions');
+ const EventTargetImpl = require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
+ const records = new WeakMap();
++// Actual intrinsic anchors stay rooted by their genuine creation context. The
++// ephemeron value retains inactive ownership while that context remains alive.
++// Weak index entries neither retain old contexts nor use a reusable Window proxy
++// as context authority. Every match uses public V8 GetCreationContext equality.
+ const promiseRealms = new WeakMap();
++const promiseAnchors = new Set();
++const hostRealmAnchor = Object.prototype;
++let legacyHostRecord;
++let legacyHostObserver;
+ const promises = new WeakMap();
+ const getPrototypeOf = Object.getPrototypeOf;
+ let installed = false;
+@@ -61,14 +70,43 @@
+   if (!event.defaultPrevented) forward(record, value);
+ }
+ 
++function registerPromiseRealm(record) {
++  const context = implForWrapper(record.window)._globalObject;
++  if (!isContext(context)) {
++    // Explicit no-runScripts JSDOM installation historically owns subsequent
++    // Host Promise births. Preserve allocation-time ownership across multiple
++    // such installers, without making earlier unrelated Host work owned lazily.
++    // This legacy mode still enables Node Promise hooks and retains their known
++    // interruption hazard; ordinary VM Window installation does not enable it.
++    if (!legacyHostObserver) {
++      const binding = getHeapBinding();
++      legacyHostObserver = createHook({ init(_id, type, _trigger, resource) {
++        if (type === 'PROMISE' && legacyHostRecord && types.isPromise(resource) && binding.sameRealm(resource, hostRealmAnchor)) {
++          promises.set(resource, { record: legacyHostRecord, reason: undefined, reported: false });
++        }
++      } });
++      legacyHostObserver.enable();
++    }
++    legacyHostRecord = record;
++    return;
++  }
++  // The literal has no authored lookups. Its genuine initial prototype is an
++  // intrinsic kept by the actual context even after public globals/prototypes
++  // are replaced. It remains independent of the public Window proxy's identity.
++  const anchor = getPrototypeOf(runInContext('({})', context));
++  if (!promiseRealms.has(anchor)) promiseAnchors.add(new WeakRef(anchor));
++  record.promiseAnchor = anchor;
++  promiseRealms.set(anchor, record);
++}
++
+ function owner(promise) {
+-  try {
+-    let prototype = getPrototypeOf(promise);
+-    for (let depth = 0; prototype && depth < 32; depth++, prototype = getPrototypeOf(prototype)) {
+-      const record = promiseRealms.get(prototype);
+-      if (record) return record;
+-    }
+-  } catch { /* Host thenables and revoked proxies are not owned page Promises. */ }
++  if (!types.isPromise(promise)) return undefined;
++  const binding = getHeapBinding();
++  for (const reference of promiseAnchors) {
++    const anchor = reference.deref();
++    if (!anchor) { promiseAnchors.delete(reference); continue; }
++    if (binding.sameRealm(promise, anchor)) return promiseRealms.get(anchor);
++  }
+ }
+ 
+ function rejectionEvent(record, type, promise, reason) {
+@@ -110,13 +148,15 @@
+     try { return dispatch.call(this, event, ...args); }
+     finally { record.depth--; }
+   };
+-  createHook({ init(_id, type, _trigger, resource) {
+-    if (type !== 'PROMISE') return;
+-    const record = owner(resource);
+-    if (record) promises.set(resource, { record, reason: undefined, reported: false });
+-  } }).enable();
+   function onUnhandled(reason, promise) {
+-    const owned = promises.get(promise);
++    let owned = promises.get(promise);
++    if (!owned) {
++      const record = owner(promise);
++      if (record) {
++        owned = { record, reason: undefined, reported: false };
++        promises.set(promise, owned);
++      }
++    }
+     if (owned) {
+       const { record } = owned;
+       owned.reason = reason;
+@@ -145,7 +185,7 @@
+   const record = { page, window, document: window.document, signal: page.documentAbort?.signal, disposed: false, depth: 0 };
+   records.set(window, record);
+   records.set(implForWrapper(window)._globalObject, record);
+-  promiseRealms.set(window.Promise.prototype, record);
++  registerPromiseRealm(record);
+   installEventAPIParity(window);
+   Object.defineProperty(window, 'reportError', { configurable: true, writable: true, enumerable: true,
+     value: function reportError(value) {
+--- /dev/null
++++ b/test/promise-attribution.test.js
+@@ -0,0 +1,9 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {spawn} from 'node:child_process';
++import {writeFile} from 'node:fs/promises';
++async function child(mode){return await new Promise((resolve,reject)=>{const process=spawn(globalThis.process.execPath,['--expose-gc',new URL('./fixtures/promise-attribution-case.mjs',import.meta.url).pathname,mode],{cwd:new URL('..',import.meta.url),stdio:['ignore','pipe','pipe']});let stdout='',stderr='';process.stdout.on('data',data=>stdout+=data);process.stderr.on('data',data=>stderr+=data);const deadline=setTimeout(()=>{process.kill('SIGKILL');reject(Error('Original 5 second attribution child deadline: '+mode))},5000);process.on('error',reject);process.on('close',(code,signal)=>{clearTimeout(deadline);resolve({mode,pid:process.pid,code,signal,stdout,stderr})})})}
++const rows=[];
++for(const mode of ['authority','handled-order','dispose-before-notify','dispose-in-listener','retained-gc','explicit-host-installer','multiple-host-installers'])test('Promise attribution: '+mode,{timeout:6000},async()=>{const result=await child(mode);rows.push(result);assert.equal(result.code,0,result.stderr);assert.equal(result.signal,null);assert.ok(JSON.parse(result.stdout));});
++for(const mode of ['host-fatal-newtarget','host-fatal-graft','unregistered-fatal','host-before-installer'])test('Promise attribution preserves fatal '+mode,{timeout:6000},async()=>{const result=await child(mode);rows.push(result);assert.equal(result.code,1,result.stderr);assert.equal(result.signal,null);assert.match(result.stderr,new RegExp('actual unrelated failure: '+mode));assert.doesNotMatch(result.stderr,/was swallowed/);const value=JSON.parse(result.stdout);assert.equal(value.armed,true);assert.equal(value.genuine,true);assert.equal(value.Host,mode!=='unregistered-fatal');});
++test.after(async()=>{if(process.env.PROMISE_ATTRIBUTION_EVIDENCE)await writeFile(process.env.PROMISE_ATTRIBUTION_EVIDENCE,JSON.stringify({rows},null,2)+'\n',{flag:'wx'})});
+--- /dev/null
++++ b/test/fixtures/promise-attribution-case.mjs
+@@ -0,0 +1,60 @@
++import assert from 'node:assert/strict';
++import {JSDOM,VirtualConsole} from 'jsdom';
++import {types} from 'node:util';
++import {installErrors} from '../../src/errors.js';
++import {getHeapBinding} from '../../src/native-heap.js';
++const mode=process.argv[2],binding=getHeapBinding(),hostThen=Promise.prototype.then,tick=ms=>new Promise(resolve=>setTimeout(resolve,ms));
++function realm({host=false}={}){const events=[],errors=[],page={closed:false,documentAbort:new AbortController()};let controller;
++ const vc=new VirtualConsole();vc.on('jsdomError',e=>errors.push(e.message));
++ const dom=new JSDOM('<body>',{...(!host?{runScripts:'dangerously'}:{}),virtualConsole:vc,beforeParse(w){controller=installErrors(page,w)}}),w=dom.window;
++ const onUnhandled=e=>{events.push({type:e.type,promise:e.promise,reason:e.reason,trusted:e.isTrusted,cancelable:e.cancelable});e.preventDefault()};
++ w.addEventListener('unhandledrejection',onUnhandled);w.addEventListener('rejectionhandled',e=>events.push({type:e.type,promise:e.promise,reason:e.reason,trusted:e.isTrusted,cancelable:e.cancelable}));
++ return{dom,w,page,controller,events,errors,onUnhandled,close(){page.closed=true;page.documentAbort.abort();dom.window.close()}};
++}
++const defer=C=>{let reject;const promise=new C((_resolve,r)=>{reject=r});return{promise,reject}};
++const handle=promise=>Reflect.apply(hostThen,promise,[undefined,()=>{}]);
++const proof=(value,anchor)=>{const before={genuine:types.isPromise(value),selected:binding.sameRealm(value,anchor),globalSelected:binding.creationGlobal(value)===binding.creationGlobal(anchor),host:binding.sameRealm(value,{})},prototype=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);const after={selected:binding.sameRealm(value,anchor),globalSelected:binding.creationGlobal(value)===binding.creationGlobal(anchor),host:binding.sameRealm(value,{})};Object.setPrototypeOf(value,prototype);return{before,after}};
++const noExtraErrors=f=>assert.deepEqual(f.errors,[]);
++if(mode==='authority'){
++ const a=realm(),b=realm(),rows=[];let traps=0;
++ try{for(const label of ['ordinary','null-after-init','subclass-null-chain','subclass-foreign-chain','vm-constructor-host-newtarget','subclass-proxy-chain']){
++  let result;
++  if(label==='ordinary'||label==='null-after-init')result=defer(a.w.Promise);
++  else if(label==='vm-constructor-host-newtarget'){let reject;result={promise:Reflect.construct(a.w.Promise,[(_resolve,r)=>{reject=r}],Promise),get reject(){return reject}}}
++  else{const C=a.w.eval('(class extends Promise {})');Object.setPrototypeOf(C.prototype,label==='subclass-null-chain'?null:label==='subclass-foreign-chain'?b.w.Promise.prototype:new Proxy(a.w.Promise.prototype,{getPrototypeOf(){traps++;throw Error('must not inspect Promise prototypes')}}));result=defer(C)}
++  if(label==='null-after-init')Object.setPrototypeOf(result.promise,null);
++  const actual=proof(result.promise,a.w.Object.prototype);assert.deepEqual(actual,{before:{genuine:true,selected:true,globalSelected:true,host:false},after:{selected:true,globalSelected:true,host:false}});
++  const start=a.events.length;result.reject(label);await tick(25);handle(result.promise);await tick(25);
++  const events=a.events.slice(start);assert.equal(events.length,2);assert.deepEqual(events.map(e=>[e.type,e.reason,e.trusted,e.cancelable]),[['unhandledrejection',label,false,true],['rejectionhandled',null,false,false]]);assert.ok(events.every(e=>e.promise===result.promise));assert.deepEqual(b.events,[]);rows.push({label,actual});
++ }assert.equal(traps,0);noExtraErrors(a);noExtraErrors(b);console.log(JSON.stringify({mode,rows,traps}));}finally{a.close();b.close()}
++}else if(mode==='handled-order'){
++ const f=realm();try{const trace=[];f.w.addEventListener('unhandledrejection',e=>{trace.push('unhandled-listener');handle(e.promise)});f.w.addEventListener('rejectionhandled',()=>trace.push('handled-listener'));
++  const pre=defer(f.w.Promise);handle(pre.promise);pre.reject('handled before notification');await tick(25);assert.equal(f.events.length,0);
++  const result=defer(f.w.Promise);result.reject('catch from unhandled listener');await tick(50);assert.deepEqual(trace,['unhandled-listener','handled-listener']);assert.equal(f.events.length,2);assert.equal(f.events[0].promise,result.promise);assert.equal(f.events[1].promise,result.promise);assert.equal(f.events[1].reason,null);noExtraErrors(f);console.log(JSON.stringify({mode,trace}));
++ }finally{f.close()}
++}else if(mode==='dispose-before-notify'||mode==='dispose-in-listener'){
++ const f=realm();try{const result=defer(f.w.Promise);
++  if(mode==='dispose-before-notify')f.controller.dispose();else f.w.addEventListener('unhandledrejection',e=>{f.controller.dispose();handle(e.promise)});
++  result.reject(mode);await tick(25);handle(result.promise);await tick(25);assert.equal(f.events.length,mode==='dispose-before-notify'?0:1);noExtraErrors(f);console.log(JSON.stringify({mode,pageEvents:f.events.length,recovered:true}));
++ }finally{f.close()}
++}else if(mode==='retained-gc'){
++ let retained;
++ (()=>{const f=realm(),result=defer(f.w.Promise);Object.setPrototypeOf(result.promise,null);f.controller.dispose();f.close();retained=result})();
++ for(let i=0;i<5;i++){global.gc();await tick(0)}
++ assert.equal(types.isPromise(retained.promise),true);assert.equal(binding.sameRealm(retained.promise,{}),false);retained.reject('retained disposed context');await tick(25);handle(retained.promise);await tick(25);console.log(JSON.stringify({mode,genuine:true,Host:false,recovered:true,gcRounds:5}));
++}else if(mode==='host-fatal-newtarget'||mode==='host-fatal-graft'||mode==='unregistered-fatal'||mode==='host-before-installer'){
++ let result;if(mode==='host-before-installer')result=defer(Promise);
++ const f=realm({host:mode==='host-before-installer'});
++ if(mode==='host-fatal-newtarget'){let reject;result={promise:Reflect.construct(Promise,[(_resolve,r)=>{reject=r}],f.w.Promise),get reject(){return reject}}}
++ else if(mode==='host-fatal-graft'){result=defer(Promise);Object.setPrototypeOf(result.promise,f.w.Promise.prototype)}
++ else if(mode==='unregistered-fatal'){const other=new JSDOM('',{runScripts:'outside-only'});result=defer(other.window.Promise)}
++ console.log(JSON.stringify({mode,armed:true,genuine:types.isPromise(result.promise),Host:binding.sameRealm(result.promise,{})}));result.reject(Error('actual unrelated failure: '+mode));await tick(80);throw Error('fatal unrelated rejection was swallowed');
++}else if(mode==='explicit-host-installer'){
++ const f=realm({host:true});try{const result=defer(Promise);result.reject('explicit Host installer');await tick(25);handle(result.promise);await tick(25);assert.equal(f.events.length,2);assert.ok(f.events.every(e=>e.promise===result.promise));assert.equal(binding.sameRealm(result.promise,{}),true);noExtraErrors(f);console.log(JSON.stringify({mode,Host:true,pageEvents:2}));}finally{f.close()}
++}else if(mode==='multiple-host-installers'){
++ const first=realm({host:true}),one=defer(Promise),disposed=defer(Promise),second=realm({host:true}),two=defer(Promise);
++ try{one.reject('first birth');two.reject('second birth');await tick(25);handle(one.promise);handle(two.promise);await tick(25);
++  assert.equal(first.events.length,2);assert.ok(first.events.every(e=>e.promise===one.promise));assert.equal(second.events.length,2);assert.ok(second.events.every(e=>e.promise===two.promise));
++  first.controller.dispose();disposed.reject('disposed first birth');await tick(25);handle(disposed.promise);await tick(25);assert.equal(first.events.length,2);assert.equal(second.events.length,2);noExtraErrors(first);noExtraErrors(second);console.log(JSON.stringify({mode,firstEvents:2,secondEvents:2,disposedIgnored:true}));
++ }finally{first.close();second.close()}
++}else throw Error('Unknown mode '+mode);

@@ -3,7 +3,8 @@ import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-par
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
 import { createHook } from 'node:async_hooks';
-import { runInContext } from 'node:vm';
+import { getHeapBinding } from './native-heap.js';
+import { runInContext, isContext } from 'node:vm';
 
 const require = createRequire(import.meta.url);
 
@@ -11,7 +12,15 @@ const ErrorEvent = require('jsdom/lib/jsdom/living/generated/ErrorEvent.js');
 const { DOMString } = require('webidl-conversions');
 const EventTargetImpl = require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const records = new WeakMap();
+// Actual intrinsic anchors stay rooted by their genuine creation context. The
+// ephemeron value retains inactive ownership while that context remains alive.
+// Weak index entries neither retain old contexts nor use a reusable Window proxy
+// as context authority. Every match uses public V8 GetCreationContext equality.
 const promiseRealms = new WeakMap();
+const promiseAnchors = new Set();
+const hostRealmAnchor = Object.prototype;
+let legacyHostRecord;
+let legacyHostObserver;
 const promises = new WeakMap();
 const getPrototypeOf = Object.getPrototypeOf;
 let installed = false;
@@ -61,14 +70,43 @@ function report(record, value, callerStack) {
   if (!event.defaultPrevented) forward(record, value);
 }
 
-function owner(promise) {
-  try {
-    let prototype = getPrototypeOf(promise);
-    for (let depth = 0; prototype && depth < 32; depth++, prototype = getPrototypeOf(prototype)) {
-      const record = promiseRealms.get(prototype);
-      if (record) return record;
+function registerPromiseRealm(record) {
+  const context = implForWrapper(record.window)._globalObject;
+  if (!isContext(context)) {
+    // Explicit no-runScripts JSDOM installation historically owns subsequent
+    // Host Promise births. Preserve allocation-time ownership across multiple
+    // such installers, without making earlier unrelated Host work owned lazily.
+    // This legacy mode still enables Node Promise hooks and retains their known
+    // interruption hazard; ordinary VM Window installation does not enable it.
+    if (!legacyHostObserver) {
+      const binding = getHeapBinding();
+      legacyHostObserver = createHook({ init(_id, type, _trigger, resource) {
+        if (type === 'PROMISE' && legacyHostRecord && types.isPromise(resource) && binding.sameRealm(resource, hostRealmAnchor)) {
+          promises.set(resource, { record: legacyHostRecord, reason: undefined, reported: false });
+        }
+      } });
+      legacyHostObserver.enable();
     }
-  } catch { /* Host thenables and revoked proxies are not owned page Promises. */ }
+    legacyHostRecord = record;
+    return;
+  }
+  // The literal has no authored lookups. Its genuine initial prototype is an
+  // intrinsic kept by the actual context even after public globals/prototypes
+  // are replaced. It remains independent of the public Window proxy's identity.
+  const anchor = getPrototypeOf(runInContext('({})', context));
+  if (!promiseRealms.has(anchor)) promiseAnchors.add(new WeakRef(anchor));
+  record.promiseAnchor = anchor;
+  promiseRealms.set(anchor, record);
+}
+
+function owner(promise) {
+  if (!types.isPromise(promise)) return undefined;
+  const binding = getHeapBinding();
+  for (const reference of promiseAnchors) {
+    const anchor = reference.deref();
+    if (!anchor) { promiseAnchors.delete(reference); continue; }
+    if (binding.sameRealm(promise, anchor)) return promiseRealms.get(anchor);
+  }
 }
 
 function rejectionEvent(record, type, promise, reason) {
@@ -110,13 +148,15 @@ function installHooks() {
     try { return dispatch.call(this, event, ...args); }
     finally { record.depth--; }
   };
-  createHook({ init(_id, type, _trigger, resource) {
-    if (type !== 'PROMISE') return;
-    const record = owner(resource);
-    if (record) promises.set(resource, { record, reason: undefined, reported: false });
-  } }).enable();
   function onUnhandled(reason, promise) {
-    const owned = promises.get(promise);
+    let owned = promises.get(promise);
+    if (!owned) {
+      const record = owner(promise);
+      if (record) {
+        owned = { record, reason: undefined, reported: false };
+        promises.set(promise, owned);
+      }
+    }
     if (owned) {
       const { record } = owned;
       owned.reason = reason;
@@ -145,7 +185,7 @@ export function installErrors(page, window) {
   const record = { page, window, document: window.document, signal: page.documentAbort?.signal, disposed: false, depth: 0 };
   records.set(window, record);
   records.set(implForWrapper(window)._globalObject, record);
-  promiseRealms.set(window.Promise.prototype, record);
+  registerPromiseRealm(record);
   installEventAPIParity(window);
   Object.defineProperty(window, 'reportError', { configurable: true, writable: true, enumerable: true,
     value: function reportError(value) {

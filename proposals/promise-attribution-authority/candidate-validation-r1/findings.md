@@ -1,0 +1,13 @@
+# Candidate R1: actual 17/21, fatal-control assertion defect
+
+The exact unchanged gate ran once, with all 7,644 before/after guard inputs unchanged. Test parent exited 1 in 12.862 seconds; no administrative or child deadline expired. All listed parent/child PIDs were absent at seal. No runtime/source changes or retries were made.
+
+The ten existing errors tests passed. Seven positive new tests passed: authority, handled-order, dispose-before-notify, dispose-in-listener, retained-gc, explicit-host-installer, and multiple-host-installers. Authority covers six real genuine VM Promises with before/after-null-prototype sameRealm/creationGlobal proofs and zero authored prototype traps. Retained-gc keeps a null-prototype Promise and its genuine resolver from a disposed/closed context, runs five GC/Host-turn rounds, rejects and handles it, and reaches later positive execution without Host-fatal fallback. This is a targeted retention control, not an unretained-context reclamation proof or future reusable-global lifetime proof.
+
+All four intended fatal children exited 1 with the actual Error: actual unrelated failure: <mode>, with no signal. Their JSON markers record genuine Promise identity and actual Host=true for the Host-newTarget, Host-graft and preexisting-Host cases; the unregistered VM is Host=false. These raw observations are preserved, but all four enclosing tests failed and are not counted as passes.
+
+The cause is the test assertion doesNotMatch(stderr,/was swallowed/). Node prints the source line at the throw's creation site; the real rejection and the later 80ms sentinel are written on the same line, so the excerpt itself contains 'fatal unrelated rejection was swallowed'. The actual Error line is the intended unrelated failure, not the sentinel. The failed assertion executes before the final marker-property assertions; those properties are raw observations rather than completed assertions in this epoch. This is a harness-source formatting error, not evidence that the runtime swallowed the rejection. No failed assertions or raw output may be removed or retroactively relabeled.
+
+Proposed separate revision: split the fixture's real rejection, wait and sentinel onto distinct source lines. Keep all existing assertions, error messages, deadlines and production bytes identical. That makes Node's genuine rejection source excerpt unambiguous without weakening any test. A fresh epoch must rerun all 21 before acceptance.
+
+External/legacy init-hook interruption, Native late-handler targeting, retained removed-frame Native behavior, late VM registration and future reusable-global claims remain outside acceptance. No checkpoint/R3 or Promise.then changes are present.
