@@ -1,0 +1,629 @@
+diff --git a/src/dom-wrapper-realms.js b/src/dom-wrapper-realms.js
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+ import {transformPrivateEventSource} from './dom-event-state.js';
+ import {registerDOMAllocationKind,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
+ // Fresh Node/Event wrappers are allocated in their actual document VM. Generated
+@@ -84,13 +85,14 @@
+    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
+   }
+   if(event)source=transformPrivateEventSource(source,kind);
++  if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
+   candidates.push({factory,kind,full,originalSource,source});
+  }
+  const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
+  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='868d8b79e5309539b7018606ffa46ffd40b56f6295878521854592092211fc1c')throw new Error('Pinned jsdom DOM allocation source changed');
+  for(const {factory,kind,full,source} of candidates){
+   const module={exports:factory};
+-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory);
++  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm);
+   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
+   const setup=factory.setup;
+   factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};
+diff --git a/src/event-idl-realms.js b/src/event-idl-realms.js
+new file mode 100644
+--- /dev/null
++++ b/src/event-idl-realms.js
+@@ -0,0 +1,68 @@
++// Genuine public VM interface objects over captured canonical generated
++// conversions/backends. Private installation state and operation closures are
++// Host-owned; no public function can return a backend or a controller table.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const records=new WeakMap(),HostObject=Object.prototype,HostFunction=Function.prototype;
++const isArray=Array.isArray,isFrozen=Object.isFrozen;
++const own=Reflect.ownKeys,descriptor=Object.getOwnPropertyDescriptor,define=Object.defineProperty,prototype=Object.getPrototypeOf,setPrototype=Object.setPrototypeOf,apply=Reflect.apply;
++function recordFor(globalObject){
++ const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
++ // A genuine JSDOM created without runScripts belongs to the Host realm.
++ // Keep its original generated interface instead of inventing a VM context.
++ if(!context||!vm.isContext(context))return null;
++ let record=records.get(context);if(!record){record=Object.assign(Object.create(null),{context,Array:vm.runInContext('Array',context),TypeError:vm.runInContext('TypeError',context),objectPrototype:vm.runInContext('Object.prototype',context),functionPrototype:vm.runInContext('Function.prototype',context),interfaces:new Map()});records.set(context,record)}return record;
++}
++function member(record,interfaceName,key,kind,original,brand,globalObject){
++ const invoke=(receiver,args)=>{
++  if(interfaceName==='EventTarget'&&receiver==null)receiver=globalObject;
++  if(!brand(receiver))throw new record.TypeError('Illegal invocation');
++  const value=apply(original,receiver,args);
++  if(isArray(value)&&((interfaceName==='Event'&&key==='composedPath')||(interfaceName==='MessageEvent'&&key==='ports'&&!isFrozen(value)))){
++   const result=Reflect.construct(record.Array,[value.length]);for(let i=0;i<value.length;i++)define(result,i,{value:value[i],writable:true,enumerable:true,configurable:true});return result;
++  }
++  return value;
++ };let source;
++ if(kind==='get')source='return Object.getOwnPropertyDescriptor({get [key](){return invoke(this,[])}},key).get;';
++ else if(kind==='set')source='return Object.getOwnPropertyDescriptor({set [key](value){invoke(this,[value])}},key).set;';
++ else source='return ({[key](...args){return invoke(this,args)}})[key];';
++ const value=vm.compileFunction("'use strict';"+source,['key','invoke'],{parsingContext:record.context})(key,invoke);
++ for(const name of['name','length'])define(value,name,descriptor(original,name));return value;
++}
++export function installEventIDLRealm(globalObject,kind,original,constructOperation,brand){
++ const record=recordFor(globalObject);if(!record)return original;
++ // Strict ordinary construction supplies the genuine selected-VM receiver
++ // and performs V8's prototype resolution exactly once before conversion.
++ // Setup initializes that SAME receiver; a call without new never creates a
++ // platform value. All operation/controller state remains Host-private.
++ const construct=(receiver,newTarget,args)=>{if(newTarget===undefined)throw new record.TypeError('invalid argument');return constructOperation(receiver,args)};
++ const value=vm.compileFunction("'use strict';return function "+kind+'(...args){return construct(this,new.target,args)}',['construct'],{parsingContext:record.context})(construct);
++ const parent=prototype(original),base=prototype(original.prototype);
++ setPrototype(value,parent===HostFunction?record.functionPrototype:record.interfaces.get(parent)??parent);
++ setPrototype(value.prototype,base===HostObject?record.objectPrototype:base);
++ delete value.prototype.constructor;
++ const propertyOrder={Event:['type','bubbles','cancelable','composed','target','srcElement','currentTarget','eventPhase','defaultPrevented','timeStamp','preventDefault','stopPropagation','stopImmediatePropagation','composedPath','initEvent','returnValue','cancelBubble','NONE','CAPTURING_PHASE','AT_TARGET','BUBBLING_PHASE','constructor',Symbol.toStringTag],EventTarget:['dispatchEvent','addEventListener','removeEventListener','constructor',Symbol.toStringTag]}[kind]??own(original.prototype);
++ for(const key of propertyOrder){
++  const property=descriptor(original.prototype,key);
++  if(key==='constructor')property.value=value;
++  else for(const type of['value','get','set'])if(typeof property[type]==='function')property[type]=member(record,kind,key,type,property[type],brand,globalObject);
++  define(value.prototype,key,property);
++ }
++ for(const key of own(original))if(key!=='prototype'){
++  const property=descriptor(original,key);
++  for(const type of['value','get','set'])if(typeof property[type]==='function')property[type]=member(record,kind,key,type,property[type],brand,globalObject);
++  define(value,key,property);
++ }
++ define(value,'prototype',{...descriptor(original,'prototype'),value:value.prototype});
++ record.interfaces.set(original,value);return value;
++}
++export function transformEventIDLInstall(source,kind){
++ const start=source.indexOf('exports.install = '),signature=source.indexOf('    constructor(',start);
++ if(start<0||signature<0)throw new Error('Unexpected generated Event installation: '+kind);
++ const open=source.indexOf(') {',signature),end=/      return exports\.setup\(createShell\(globalObject, new\.target\.prototype\), globalObject, (?:args|\[\]|undefined)\);\n    }/g;
++ end.lastIndex=open;const match=end.exec(source);if(!match)throw new Error('Unexpected generated Event constructor: '+kind);
++ const parameters=source.slice(signature+'    constructor('.length,open),body=source.slice(open+3,match.index+match[0].length-'\n    }'.length).replaceAll('createShell(globalObject, new.target.prototype)','receiver');
++ const assignment='  ctorRegistry[interfaceName] = '+kind+';';if(source.split(assignment).length!==2)throw new Error('Unexpected generated Event registry assignment: '+kind);
++ return source.replace(assignment,`  ${kind} = installEventIDLRealm(globalObject, ${JSON.stringify(kind)}, ${kind}, function(receiver, received) { return Reflect.apply(function(${parameters}) {${body}\n  }, undefined, received); }, exports.is);\n`+assignment);
++}
+diff --git a/test/event-idl-realms.test.js b/test/event-idl-realms.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/event-idl-realms.test.js
+@@ -0,0 +1,11 @@
++import{test}from'node:test';import{execFileSync}from'node:child_process';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{createRequire}from'node:module';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{eventImplementation}from'../src/dom-event-state.js';
++const require=createRequire(import.meta.url),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),heap=getHeapBinding(),plain=v=>JSON.parse(JSON.stringify(v));
++async function fixture(action){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();try{await page.navigate('data:text/html,<body>Event IDL');await action({page,w:page.dom.window})}finally{browser.close()}}
++for(const name of['event-construction','event-prototype','event-constructor-shape','event-global-call'])test('public Event Native '+name+' controls match unchanged',()=>fixture(async({page})=>{const source=await readFile(new URL('../docs/reference/event-idl-realms/'+name+'-expression.js',import.meta.url),'utf8'),record=JSON.parse(await readFile(new URL('../docs/reference/event-idl-realms/'+name+'-native.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(source).digest('hex'),record.expressionSHA256);assert.deepEqual(plain(await page.evaluate(source)),record.observations)}));
++test('public Event reflection/borrowed/sequence Native controls retain the explicit inherited path boundary',()=>fixture(async({page})=>{const source=await readFile(new URL('../docs/reference/event-idl-realms/public-event-expression.js',import.meta.url),'utf8'),record=JSON.parse(await readFile(new URL('../docs/reference/event-idl-realms/public-event-native.json',import.meta.url),'utf8')),actual=plain(await page.evaluate(source)),bounds=new Set(['composedPath-array']);assert.equal(createHash('sha256').update(source).digest('hex'),record.expressionSHA256);assert.deepEqual(actual.filter(x=>!bounds.has(x.name)),record.observations.filter(x=>!bounds.has(x.name)));assert.deepEqual(actual.find(x=>x.name==='composedPath-array').value,{before:true,empty:0,during:{array:true,same:true,target:true,fresh:true},after:0})}));
++function realm(value,anchor){const proto=Object.getPrototypeOf(value);for(let i=0;i<2;i++){assert.equal(heap.sameRealm(value,anchor),true);assert.equal(heap.sameRealm(value,{}),false);assert.equal(heap.creationGlobal(value),heap.creationGlobal(anchor));Object.setPrototypeOf(value,null)}Object.setPrototypeOf(value,proto)}
++const families=['EventTarget','Event','CloseEvent','CompositionEvent','CustomEvent','ErrorEvent','FocusEvent','HashChangeEvent','InputEvent','KeyboardEvent','MessageEvent','MouseEvent','PageTransitionEvent','PopStateEvent','ProgressEvent','StorageEvent','SubmitEvent','TouchEvent','UIEvent','WheelEvent'];
++test('every public Event-family constructor/prototype/method/getter/setter has its actual selected VM before/after null prototypes',()=>fixture(async({w})=>{const frame=w.document.createElement('iframe');w.document.body.append(frame);for(const window of[w,frame.contentWindow])for(const name of families){const C=window[name];realm(C,window.Object.prototype);realm(C.prototype,window.Object.prototype);for(const key of Reflect.ownKeys(C.prototype)){const property=Object.getOwnPropertyDescriptor(C.prototype,key);for(const kind of['value','get','set'])if(typeof property[kind]==='function')realm(property[kind],window.Object.prototype)}}}));
++test('native VM allocation passes the exact genuine receiver to setup, including foreign newTarget and captured public intrinsics',()=>fixture(async({w,page})=>{const frame=w.document.createElement('iframe');w.document.body.append(frame);const child=frame.contentWindow,setup=EventIDL.setup;let input;EventIDL.setup=function(value,...args){input=value;return Reflect.apply(setup,this,[value,...args])};let actual;try{actual=Reflect.construct(w.Event,['foreign'],child.Event)}finally{EventIDL.setup=setup}assert.equal(actual,input);assert.equal(Object.getPrototypeOf(actual),child.Event.prototype);realm(actual,w.Object.prototype);assert.ok(eventImplementation(actual));assert.deepEqual(Reflect.ownKeys(actual),['isTrusted']);const result=await page.evaluate(`(()=>{const C=Event,M=Object.getOwnPropertyDescriptor(Event.prototype,'type').get,E=TypeError;globalThis.Object=function(){throw Error('authored Object')};globalThis.Event=function(){throw Error('authored Event')};globalThis.TypeError=function(){throw Error('authored TypeError')};const value=new C('captured');let fake;try{M.call({})}catch(e){fake=e instanceof E}return{type:M.call(value),fake}})()`);assert.deepEqual(plain(result),{type:'captured',fake:true})}));
++
++test('genuine no-runScripts Host JSDOM interface objects retain their actual Host origin',()=>{const source=String.raw`import{JSDOM}from'jsdom';import{installEventIDLRealm}from'./src/event-idl-realms.js';import{getHeapBinding}from'./src/native-heap.js';const dom=new JSDOM('<body>Host origin'),w=dom.window,C=w.Event,h=getHeapBinding(),value=installEventIDLRealm(w,'Event',C,()=>{throw Error('must preserve original Host algorithm')},()=>true);if(value!==C||!h.sameRealm(value,{})||!h.sameRealm(value.prototype,{}))throw Error('Host origin replaced');for(const v of[value,value.prototype]){const p=Object.getPrototypeOf(v);Object.setPrototypeOf(v,null);if(!h.sameRealm(v,{}))throw Error('Host context masked');Object.setPrototypeOf(v,p)}if(new value('real').type!=='real')throw Error('Host functionality lost');dom.window.close();console.log('genuine-Host-origin');`;assert.match(execFileSync(process.execPath,['--input-type=module','-e',source],{cwd:new URL('..',import.meta.url),encoding:'utf8',timeout:15000}),/genuine-Host-origin/)});
+diff --git a/docs/reference/event-idl-realms/README.md b/docs/reference/event-idl-realms/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/README.md
+@@ -0,0 +1,62 @@
++# Genuine Event interface realms
++
++Window and frame generated Event/EventTarget interface objects are now allocated
++in their actual selected VM. Genuine no-runScripts Host JSDOM origins retain
++their original Host interface objects; no VM context is invented. This includes constructors, prototypes, methods,
++getters and setters. The same canonical generated exports, original Host
++conversion algorithms, private EventImpl state and dispatch algorithms remain.
++
++A strict ordinary VM constructor lets V8 create the actual receiver before its
++body runs. The original constructor conversion body initializes that SAME
++receiver through canonical setup. This preserves Native's single observable
++newTarget.prototype read before conversion, actual selected-VM allocation with a
++foreign newTarget, and own/foreign Object.prototype fallback for primitive
++prototype values. Calling without new throws the captured VM TypeError. No
++constructor Proxy, prototype-only context repair or public Event facade is used.
++
++Public methods/accessors are genuine strict VM functions calling captured Host
++operations. The controller/cache tables, original interface objects, conversion
++functions and backend references remain Host-private. Event brands retain the
++shared private map. EventTarget keeps its existing generated backend authority.
++The Host bridge resolves EventTarget's measured unbound/null/undefined Window
++receiver behavior and uses the captured VM TypeError for illegal receivers.
++Names, lengths, descriptors and hierarchy are installed on the actual objects.
++Event/EventTarget properties are physically defined in the measured order.
++Nothing filters reflected keys, heap membership, Function.toString or protocol
++results. Function.toString reports the actual JavaScript implementation.
++
++Event.composedPath returns a genuine fresh Array in the method's realm with the
++actual backend's path entries. Authored MessageEvent.ports returns a fresh
++mutable VM Array. Existing frozen producer ports arrays keep their original
++receiving-realm identity and profile. Utility interfaces were already generated
++in their actual VM; their allocation profile is unchanged and independently
++measured alongside Window/frame interfaces.
++
++The raw Native binary SHA256 is
++9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f.
++Five expressions retain30 Native rows. Candidate matches29 exactly. The one
++explicit inherited difference is the actual path content for a standalone
++EventTarget: jsdom includes that target while Native omits it. Actual path values
++are never replaced by a saved vector or an invented empty path. The controls
++cover descriptors, reflection order, borrowed methods, newTarget, conversion
++ordering, primitive prototype fallback, hierarchy, subclassing, nonconstructible
++methods, illegal receivers, fresh arrays and global calls.
++
++Direct public-V8 proofs cover439 actual constructor/prototype/member/receiver
++values per runtime, before and after null prototypes. All are selected-VM,
++Host=false and creationGlobal matches. The original baseline retained57 Host
++objects among65 sampled public values. These are actual V8 creation-context
++checks, independent of factory metadata or prototype appearance.
++
++Scope:20 generated Window/frame Event/EventTarget interfaces. Worker private
++Event foundation, custom interface dictionaries, original conversion diagnostic
++messages, EventTarget's legacy physical backing, other generated Node interface
++realms, and utility constructor ordering remain separate work. The independently
++owned private-event utility backend recognition correction is a prerequisite for
++correct backend-to-utility callback delivery; it is not duplicated in this patch.
++
++Native Function::New and FunctionTemplate constructor entry experiments are
++retained as contrary evidence only. Their actual selected-VM receiver allocation
++was positive, but both introduced nonconfigurable arguments/caller properties
++absent from Native. No experimental C++ API, source or addon is used here; the
++production runtime.cc remains the frozen c9842bf9 source.
+diff --git a/docs/reference/event-idl-realms/event-construction-expression.js b/docs/reference/event-idl-realms/event-construction-expression.js
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-construction-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[];for(const name of['Event','EventTarget','CustomEvent','MouseEvent']){const order=[],target=new Proxy(function Own(){},{get(target,key,receiver){if(key==='prototype')order.push('prototype');return Reflect.get(target,key,receiver)}}),type={toString(){order.push('type');return'x'}},init={get bubbles(){order.push('bubbles');return false},get detail(){order.push('detail');return 3}},args=name==='EventTarget'?[]:[type,init];const event=Reflect.construct(globalThis[name],args,target);rows.push({name,order,type:event.type===undefined?'undefined':event.type,prototype:Object.getPrototypeOf(event)===target.prototype});}return rows})()
+diff --git a/docs/reference/event-idl-realms/event-construction-native.json b/docs/reference/event-idl-realms/event-construction-native.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-construction-native.json
+@@ -0,0 +1,52 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "f8ca766b2700d6b34ee9282174d644cd5db487a7837c2871dc74ea2f4077da19",
++  "observations": [
++    {
++      "name": "Event",
++      "order": [
++        "prototype",
++        "type",
++        "bubbles",
++        "prototype"
++      ],
++      "type": "undefined",
++      "prototype": true
++    },
++    {
++      "name": "EventTarget",
++      "order": [
++        "prototype",
++        "prototype"
++      ],
++      "type": "undefined",
++      "prototype": true
++    },
++    {
++      "name": "CustomEvent",
++      "order": [
++        "prototype",
++        "type",
++        "bubbles",
++        "detail",
++        "prototype"
++      ],
++      "type": "undefined",
++      "prototype": true
++    },
++    {
++      "name": "MouseEvent",
++      "order": [
++        "prototype",
++        "type",
++        "bubbles",
++        "detail",
++        "prototype"
++      ],
++      "type": "undefined",
++      "prototype": true
++    }
++  ]
++}
+diff --git a/docs/reference/event-idl-realms/event-constructor-shape-expression.js b/docs/reference/event-idl-realms/event-constructor-shape-expression.js
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-constructor-shape-expression.js
+@@ -0,0 +1 @@
++(()=>['Event','EventTarget','CustomEvent','MouseEvent'].map(name=>({name,keys:Reflect.ownKeys(globalThis[name]).map(String),arguments:Object.getOwnPropertyDescriptor(globalThis[name],'arguments')===undefined?'absent':{value:globalThis[name].arguments,configurable:Object.getOwnPropertyDescriptor(globalThis[name],'arguments').configurable},caller:Object.getOwnPropertyDescriptor(globalThis[name],'caller')===undefined?'absent':{value:globalThis[name].caller,configurable:Object.getOwnPropertyDescriptor(globalThis[name],'caller').configurable}})))()
+diff --git a/docs/reference/event-idl-realms/event-constructor-shape-native.json b/docs/reference/event-idl-realms/event-constructor-shape-native.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-constructor-shape-native.json
+@@ -0,0 +1,52 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "145d684b64ed2514b8f0cc574516fe702ebb350157b39c957149e7d6858f1912",
++  "observations": [
++    {
++      "name": "Event",
++      "keys": [
++        "length",
++        "name",
++        "prototype",
++        "NONE",
++        "CAPTURING_PHASE",
++        "AT_TARGET",
++        "BUBBLING_PHASE"
++      ],
++      "arguments": "absent",
++      "caller": "absent"
++    },
++    {
++      "name": "EventTarget",
++      "keys": [
++        "length",
++        "name",
++        "prototype"
++      ],
++      "arguments": "absent",
++      "caller": "absent"
++    },
++    {
++      "name": "CustomEvent",
++      "keys": [
++        "length",
++        "name",
++        "prototype"
++      ],
++      "arguments": "absent",
++      "caller": "absent"
++    },
++    {
++      "name": "MouseEvent",
++      "keys": [
++        "length",
++        "name",
++        "prototype"
++      ],
++      "arguments": "absent",
++      "caller": "absent"
++    }
++  ]
++}
+diff --git a/docs/reference/event-idl-realms/event-global-call-expression.js b/docs/reference/event-idl-realms/event-global-call-expression.js
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-global-call-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[];for(const label of['unbound','null','undefined']){let count=0,error;const add=EventTarget.prototype.addEventListener,remove=EventTarget.prototype.removeEventListener,listener=()=>count++;try{if(label==='unbound')add('owned-global',listener);else add.call(label==='null'?null:undefined,'owned-global',listener);window.dispatchEvent(new Event('owned-global'));remove.call(null,'owned-global',listener)}catch(e){error={name:e.name,message:e.message}}rows.push({label,count,error:error??null})}return rows})()
+diff --git a/docs/reference/event-idl-realms/event-global-call-native.json b/docs/reference/event-idl-realms/event-global-call-native.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-global-call-native.json
+@@ -0,0 +1,23 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "2c0dd7534dc79dc645a532f46d5f5c33ec1ff5b6930197b3764e4d4c892a66b0",
++  "observations": [
++    {
++      "label": "unbound",
++      "count": 1,
++      "error": null
++    },
++    {
++      "label": "null",
++      "count": 1,
++      "error": null
++    },
++    {
++      "label": "undefined",
++      "count": 1,
++      "error": null
++    }
++  ]
++}
+diff --git a/docs/reference/event-idl-realms/event-prototype-expression.js b/docs/reference/event-idl-realms/event-prototype-expression.js
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-prototype-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[],frame=document.createElement('iframe');document.body.append(frame);const child=frame.contentWindow;for(const label of['own','foreign'])for(const proto of[null,1,undefined]){const Target=label==='own'?function Own(){}:child.eval('(function Foreign(){})');Target.prototype=proto;const value=Reflect.construct(Event,['x'],Target);rows.push({label,proto:proto===undefined?'undefined':proto,parent:Object.getPrototypeOf(value)===Object.prototype,child:Object.getPrototypeOf(value)===child.Object.prototype,event:Object.getPrototypeOf(value)===Event.prototype,type:Object.getOwnPropertyDescriptor(Event.prototype,'type').get.call(value)})}frame.remove();return rows})()
+diff --git a/docs/reference/event-idl-realms/event-prototype-native.json b/docs/reference/event-idl-realms/event-prototype-native.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/event-prototype-native.json
+@@ -0,0 +1,56 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "d08b03a06ce9f65a39d3fb6eb6e0eba9d241a313e37ceb0d32d21cf6f8e2b64b",
++  "observations": [
++    {
++      "label": "own",
++      "proto": null,
++      "parent": true,
++      "child": false,
++      "event": false,
++      "type": "x"
++    },
++    {
++      "label": "own",
++      "proto": 1,
++      "parent": true,
++      "child": false,
++      "event": false,
++      "type": "x"
++    },
++    {
++      "label": "own",
++      "proto": "undefined",
++      "parent": true,
++      "child": false,
++      "event": false,
++      "type": "x"
++    },
++    {
++      "label": "foreign",
++      "proto": null,
++      "parent": false,
++      "child": true,
++      "event": false,
++      "type": "x"
++    },
++    {
++      "label": "foreign",
++      "proto": 1,
++      "parent": false,
++      "child": true,
++      "event": false,
++      "type": "x"
++    },
++    {
++      "label": "foreign",
++      "proto": "undefined",
++      "parent": false,
++      "child": true,
++      "event": false,
++      "type": "x"
++    }
++  ]
++}
+diff --git a/docs/reference/event-idl-realms/public-event-expression.js b/docs/reference/event-idl-realms/public-event-expression.js
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/public-event-expression.js
+@@ -0,0 +1,12 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};const C=globalThis.Event,proto=C.prototype,ctor=Object.getOwnPropertyDescriptor(proto,'constructor'),method=Object.getOwnPropertyDescriptor(proto,'preventDefault'),get=Object.getOwnPropertyDescriptor(proto,'type'),set=Object.getOwnPropertyDescriptor(proto,'cancelBubble'),pd=Object.getOwnPropertyDescriptor(C,'prototype');
++await run('Event-shape',()=>({name:C.name,length:C.length,proto:Object.getPrototypeOf(proto)===Object.prototype,fn:Object.getPrototypeOf(C)===Function.prototype,constructor:ctor.value===C,keys:Reflect.ownKeys(proto).map(String),method:{name:method.value.name,length:method.value.length,enum:method.enumerable,config:method.configurable,write:method.writable,own:Reflect.ownKeys(method.value).map(String)},get:{name:get.get.name,length:get.get.length,enum:get.enumerable,config:get.configurable,own:Reflect.ownKeys(get.get).map(String)},set:{name:set.set.name,length:set.set.length},constructorDescriptor:{enum:ctor.enumerable,config:ctor.configurable,write:ctor.writable},prototypeDescriptor:{enum:pd.enumerable,config:pd.configurable,write:pd.writable}}));
++await run('EventTarget-shape',()=>({name:EventTarget.name,length:EventTarget.length,keys:Reflect.ownKeys(EventTarget.prototype).map(String),parent:Object.getPrototypeOf(EventTarget.prototype)===Object.prototype,fn:Object.getPrototypeOf(EventTarget)===Function.prototype}));
++for(const[name,fn]of[['methodConstruct',()=>new method.value()],['getterConstruct',()=>new get.get()],['withoutNew',()=>Event('x')],['wrongType',()=>get.get.call({})],['wrongTarget',()=>EventTarget.prototype.dispatchEvent.call({},new Event('x'))]])await run(name,fn);
++await run('composedPath-array',()=>{const target=new EventTarget(),e=new Event('x'),before=e.composedPath();let during;target.addEventListener('x',()=>{const path=e.composedPath();during={array:path instanceof Array,same:Array.isArray(path),target:path[0]===target,fresh:path!==e.composedPath()}});target.dispatchEvent(e);return{before:before instanceof Array,empty:before.length,during,after:e.composedPath().length}});
++await run('MessageEvent-ports',()=>{const event=new MessageEvent('x'),first=event.ports;return{array:first instanceof Array,own:Object.getPrototypeOf(first)===Array.prototype,frozen:Object.isFrozen(first),same:first===event.ports}});
++const frame=document.createElement('iframe');document.body.append(frame);const child=frame.contentWindow;
++await run('hierarchy',()=>({event:Object.getPrototypeOf(CustomEvent)===Event,prototype:Object.getPrototypeOf(CustomEvent.prototype)===Event.prototype,ui:Object.getPrototypeOf(UIEvent)===Event,mouse:Object.getPrototypeOf(MouseEvent)===UIEvent,node:Object.getPrototypeOf(Node.prototype)===EventTarget.prototype}));
++await run('borrowed',()=>{const e=new child.Event('child',{cancelable:true}),type=Object.getOwnPropertyDescriptor(Event.prototype,'type').get;Event.prototype.preventDefault.call(e);const path=Event.prototype.composedPath.call(e);let error;try{type.call({})}catch(e){error={main:e instanceof TypeError,child:e instanceof child.TypeError}}return{type:type.call(e),canceled:e.defaultPrevented,array:path instanceof Array,childArray:path instanceof child.Array,error}});
++await run('newTarget',()=>{const event=Reflect.construct(Event,['other'],child.Event);return{proto:Object.getPrototypeOf(event)===child.Event.prototype,type:event.type,isTrusted:event.isTrusted}});
++await run('subclass',()=>{class Own extends MouseEvent{constructor(){super('own',{clientX:3});this.author=7}}const e=new Own();return{proto:Object.getPrototypeOf(e)===Own.prototype,type:e.type,x:e.clientX,author:e.author,own:e instanceof Own,mouse:e instanceof MouseEvent,event:e instanceof Event}});
++frame.remove();return rows})()
+diff --git a/docs/reference/event-idl-realms/public-event-native.json b/docs/reference/event-idl-realms/public-event-native.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/event-idl-realms/public-event-native.json
+@@ -0,0 +1,200 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "c1103123c13b40bda1ea7c2c8eca5b18932920d1c23b7a85689ac8b241dd3054",
++  "observations": [
++    {
++      "name": "Event-shape",
++      "value": {
++        "name": "Event",
++        "length": 1,
++        "proto": true,
++        "fn": true,
++        "constructor": true,
++        "keys": [
++          "type",
++          "bubbles",
++          "cancelable",
++          "composed",
++          "target",
++          "srcElement",
++          "currentTarget",
++          "eventPhase",
++          "defaultPrevented",
++          "timeStamp",
++          "preventDefault",
++          "stopPropagation",
++          "stopImmediatePropagation",
++          "composedPath",
++          "initEvent",
++          "returnValue",
++          "cancelBubble",
++          "NONE",
++          "CAPTURING_PHASE",
++          "AT_TARGET",
++          "BUBBLING_PHASE",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "method": {
++          "name": "preventDefault",
++          "length": 0,
++          "enum": true,
++          "config": true,
++          "write": true,
++          "own": [
++            "length",
++            "name"
++          ]
++        },
++        "get": {
++          "name": "get type",
++          "length": 0,
++          "enum": true,
++          "config": true,
++          "own": [
++            "length",
++            "name"
++          ]
++        },
++        "set": {
++          "name": "set cancelBubble",
++          "length": 1
++        },
++        "constructorDescriptor": {
++          "enum": false,
++          "config": true,
++          "write": true
++        },
++        "prototypeDescriptor": {
++          "enum": false,
++          "config": false,
++          "write": false
++        }
++      }
++    },
++    {
++      "name": "EventTarget-shape",
++      "value": {
++        "name": "EventTarget",
++        "length": 0,
++        "keys": [
++          "dispatchEvent",
++          "addEventListener",
++          "removeEventListener",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "parent": true,
++        "fn": true
++      }
++    },
++    {
++      "name": "methodConstruct",
++      "error": {
++        "name": "TypeError",
++        "message": "method.value is not a constructor",
++        "realm": true
++      }
++    },
++    {
++      "name": "getterConstruct",
++      "error": {
++        "name": "TypeError",
++        "message": "get.get is not a constructor",
++        "realm": true
++      }
++    },
++    {
++      "name": "withoutNew",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "wrongType",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "wrongTarget",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "composedPath-array",
++      "value": {
++        "before": true,
++        "empty": 0,
++        "during": {
++          "array": true,
++          "same": true,
++          "target": false,
++          "fresh": true
++        },
++        "after": 0
++      }
++    },
++    {
++      "name": "MessageEvent-ports",
++      "value": {
++        "array": true,
++        "own": true,
++        "frozen": false,
++        "same": false
++      }
++    },
++    {
++      "name": "hierarchy",
++      "value": {
++        "event": true,
++        "prototype": true,
++        "ui": true,
++        "mouse": true,
++        "node": true
++      }
++    },
++    {
++      "name": "borrowed",
++      "value": {
++        "type": "child",
++        "canceled": true,
++        "array": true,
++        "childArray": false,
++        "error": {
++          "main": true,
++          "child": false
++        }
++      }
++    },
++    {
++      "name": "newTarget",
++      "value": {
++        "proto": true,
++        "type": "other",
++        "isTrusted": false
++      }
++    },
++    {
++      "name": "subclass",
++      "value": {
++        "proto": true,
++        "type": "own",
++        "x": 3,
++        "author": 7,
++        "own": true,
++        "mouse": true,
++        "event": true
++      }
++    }
++  ]
++}

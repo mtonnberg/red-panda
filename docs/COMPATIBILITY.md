@@ -92,32 +92,36 @@ network/SameSite/permissions and real media processing remain bounded gaps.
 Frozen proposals and negative-before/positive-after allocation controls preserve
 actual observed differences. Presence of a proposal is not production support.
 
-The current checkpoint adds real audio gain/oscillator/compressor rendering and
-WAV decoding; optional image HTTP/header processing and source selection;
-transactional IndexedDB; owned popup contexts; Sanitizer tree filtering;
-animation state/promises; Storage interceptors and hash ordering; select behavior;
-CSS position/encoding/loading corrections; genuine VM DOM/Event allocation;
-private Event backends, invocation recovery and inactive frame cleanup.
+The current checkpoint adds actual VM Event constructors, prototypes and functions;
+streamed EventSource parsing/reconnection, UTF-8 IDs, CORS and private worker
+transport control; and real Browser-wide WebSocket admission with parent-owned
+worker sockets. The default WebSocket limit is 8; `--ws-max-concurrent` accepts
+0..255. It also matches measured offline audio curve quantum and computed scalar
+state while reducing actual rendering cost. These build on the previous audio,
+image, IndexedDB, popup, Sanitizer, animation, Storage, select and DOM lifecycle work.
 
-All1,507 JavaScript tests,80 PureScript Puppeteer checks,13 Native differential
+All 1,552 JavaScript tests, 84 PureScript Puppeteer checks, 13 native differential
 groups, syntax checks and strict/pedantic PureScript builds pass.
-[Validation](reference/phase18-integration/validation.json) records9,060 unchanged
-declared inputs:1,752 indexed source/reference inputs,18 native build artifacts,
-6,579 Node dependency files,689 cached reference inputs, one controller and21
-unchanged preexisting reference files deliberately excluded from this commit.
-The final paired exact-profile22-fixture replay passes22/22 on both Native and
-Red Panda, under the original separate2000ms load and2000/8000ms assertion
-budgets, with9,051 inputs unchanged.
+[Validation](reference/phase19-integration/validation.json) records 9,275 unchanged
+declared inputs: 1,967 indexed source/reference inputs, 18 native build artifacts,
+6,579 Node dependency files, 689 cached reference inputs, one controller and 21
+unchanged preexisting reference files excluded from this commit.
+Paired native/candidate replays pass 24/24 with the declared profiles, and a
+separate 2/2 WebSocket replay passes with both binaries explicitly configured for
+50 concurrent connections. All use the original separate 2000ms load and
+2000/8000ms assertion budgets; 9,247 inputs remain unchanged. The 193 affected
+checks pass, and the 45 key feature checks pass across Node 24.19.0, 24.22.1 and
+26.13.0. These are bounded compatibility checks, not a performance benchmark.
 
-Both failed full epochs remain recorded:1453/1501 with48 failures, then1504/1507
-with three duplicate standalone frame-cleanup failures. The genuine Host/VM
-Event and lifecycle corrections, native-controlled assertion fixes and audio
-algorithm optimization are linked to their negative/positive controls. The early
-audio source-load timeout is retained separately; no failed row is promoted.
-This remains partial browser coverage. The newly measured future-curve quantum
-and computed-value discrepancy, broader public interface realms, shared worker,
-network quota/SSE, history/Navigation and editing proposals are separate future
-work, not production support in this checkpoint.
+Earlier failed full epochs remain in
+[phase18 evidence](reference/phase18-integration/validation.json). The phase19
+preparation retains a real asynchronous test setup/cleanup race, corrected by
+awaiting owned fixture setup, plus a controller syntax error before tests ran.
+Neither is relabeled as a runtime pass. Public composedPath realm behavior and
+EventSource's inherited EventTarget symbol discrepancy remain explicit gaps.
+SharedWorker, broader networking/WASM/Blob, namespaces/Event parity,
+history/Navigation, editing, form and viewport proposals remain separate work.
+Presence of a proposal is not production support.
 
 The separate complete frozen candidate matrix at ee39586 records338 verified
 passes,98 assertion failures,18 source-load timeouts and one image-option startup
@@ -245,8 +249,9 @@ Native common option families still needing implementation/conformance:
 - Transport/cache/limits: `--http-cache-dir`, `--http-cache-entry-limit`,
   `--http-connect-timeout`, `--http-debug`, `--http-header`,
   `--http-max-concurrent`, `--http-max-host-open`, `--http-max-response-size`,
-  `--http-nav-burst`, `--http-nav-delay`, `--http-timeout`, `--http-version`,
-  `--ws-max-concurrent`. Native response-size default is 1 GiB, compared with
+  `--http-nav-burst`, `--http-nav-delay`, `--http-timeout`, `--http-version`.
+  `--ws-max-concurrent` is implemented with the measured default 8 and 0..255 range.
+  Native response-size default is 1 GiB, compared with
   the prototype's fixed 16 MiB limit.
 - Feature/lifecycle: `--cors-store-entry-limit`, `--disable-features`,
   `--experimental-features`, `--load-resources`, `--watchdog-ms`,

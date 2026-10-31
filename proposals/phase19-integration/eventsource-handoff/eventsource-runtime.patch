@@ -1,0 +1,240 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installWindowEventSource} from './eventsource.js';
+ import {installSelectControls} from './select-controls.js';
+ import {installMediaElements} from './media-elements.js';
+ import {installPaymentRequest} from './payment-request.js';
+@@ -274,6 +275,7 @@
+       installDevicePermissions(this,window);
+       installFonts(window);
+       installFetch(this, window);
++      installWindowEventSource(this,window);
+       const creatorSnapshot=captureWorkerCreator(this,window);
+       const secure=creatorSnapshot().secure;
+       installPaymentRequest(window,{secure});
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installWindowEventSource} from './eventsource.js';
+ import {installPaymentRequest} from './payment-request.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+ import { installWebCrypto } from './web-crypto.js';
+@@ -40,7 +41,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,5 @@
++import {installEventSource} from './eventsource.js';
++import {createParentEventSources,createWorkerEventSourceClient} from './worker-eventsource.js';
+ import { installWebCrypto } from './web-crypto.js';
+ import {installScheduler} from './scheduler.js';
+ import {installWorkerDOMException} from './worker-dom-exception.js';
+@@ -44,7 +46,7 @@
+   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
+   signal?.addEventListener('abort', dispose, { once: true });
+   class Worker extends window.EventTarget {
+-    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map();
++    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map(); #eventSources;
+     constructor(input, options = {}, serviceToken) {
+       super();
+       const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
+@@ -63,6 +65,7 @@
+       if (!enabled&&!service) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
++      this.#eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+       this.#thread = new ThreadWorker(new URL(import.meta.url), {
+         // File-backed workers must not inherit an embedding CLI's --input-type
+         // or --eval flags. Only the VM-module capability is needed here.
+@@ -74,6 +77,7 @@
+       service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
+       owned.add(this);
+       this.#thread.on('message', async message => {
++        if(message.kind==='eventSourceOpen'||message.kind==='eventSourceClose'){this.#eventSources.handle(message);return;}
+         if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
+         if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
+         if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
+@@ -148,7 +152,7 @@
+       this.#thread.on('messageerror', () => {
+         if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
+       });
+-      this.#thread.once('exit', () => { this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
++      this.#thread.once('exit', () => { this.#eventSources?.detach(); this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+       // Installing a message listener refs Node's underlying MessagePort; unref
+       // after installing listeners so workers cannot hold server shutdown open.
+       this.#thread.unref();
+@@ -164,7 +168,7 @@
+     }
+     terminate() {
+       if (this.#terminated) return;
+-      this.#terminated = true; owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
++      this.#terminated = true;this.#eventSources?.detach(); owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
+     }
+   }
+   for (const name of ['message', 'messageerror', 'error']) {
+@@ -186,7 +190,7 @@
+ 
+ async function runWorker() {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,eventSourceClient;
+   let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+@@ -327,6 +331,8 @@
+   installAudioData(vm.runInContext('globalThis', context));
+   installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
++  eventSourceClient=createWorkerEventSourceClient(parentPort);
++  installEventSource(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),baseURL:()=>workerData.url,createTransport:eventSourceClient.create,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),active:()=>!closed,trustEvent:trustWorkerEvent});
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+@@ -336,6 +342,7 @@
+   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
+   parentPort.on('message', message => {
+     if (closed) return;
++    if(message.kind==='eventSourceEvent'){eventSourceClient.handle(message);return;}
+     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+     else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
+     else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -104,5 +104,5 @@
+  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
+  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
+  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
+- return {context,global,realmFunction,createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
++ return {context,global,realmFunction,setupEventTarget(value){return load(join(generatedRoot,'EventTarget.js')).setup(value,global,[]);},createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
+ }
+--- /dev/null
++++ b/src/eventsource.js
+@@ -0,0 +1,39 @@
++import vm from'node:vm';
++import{createRequire}from'node:module';
++import{registerPlatformFactory}from'./platform-factories.js';
++import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';
++import{registerProtocolPrototype}from'./protocol-classes.js';
++import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
++import{captureWorkerCreator}from'./worker-apis.js';
++import{onFrameRetirement}from'./frame-activity.js';
++import{openEventSourceTransport}from'./eventsource-transport.js';
++import{eventSourcePolicy}from'./eventsource-policy.js';
++const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const TargetIDL=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
++const TargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
++const installed=new WeakMap(),states=new WeakMap(),apply=Reflect.apply,record=value=>Object.assign(Object.create(null),value);
++function factory(g,b){
++ 'use strict';const TypeError=g.TypeError,String=g.String,EventTarget=g.EventTarget,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,setPrototype=g.Object.setPrototypeOf,construct=g.Reflect.construct,apply=g.Reflect.apply,description=descriptor(g.Symbol.prototype,'description').get,wellFormed=g.String.prototype.toWellFormed;
++ const invalid=()=>{throw new TypeError('invalid argument')},brand=value=>{if(!b.has(value))throw new TypeError('Illegal invocation')},text=value=>apply(wellFormed,String(typeof value==='symbol'?apply(description,value,[]):value),[]);
++ function EventSource(url){if(!new.target||!arguments.length)invalid();url=text(url);const init=arguments[1];let credentials=false;if(init!==undefined&&init!==null){if(typeof init!=='object'&&typeof init!=='function')invalid();credentials=!!init.withCredentials}b.create(this,url,credentials)}
++ const p={};for(const[name,value]of Object.entries({CONNECTING:0,OPEN:1,CLOSED:2})){define(p,name,{value,enumerable:true});define(EventSource,name,{value,enumerable:true})}
++ for(const name of['url','readyState','withCredentials']){const accessor={get [name](){brand(this);return b.get(this,name)}};define(p,name,{get:descriptor(accessor,name).get,enumerable:true,configurable:true})}
++ for(const name of['onopen','onmessage','onerror']){const accessor={get [name](){brand(this);return b.handler(this,name.slice(2))},set [name](value){brand(this);b.handler(this,name.slice(2),typeof value==='function'?value:null,true)}};define(p,name,{get:descriptor(accessor,name).get,set:descriptor(accessor,name).set,enumerable:true,configurable:true})}
++ const methods={close(){brand(this);b.close(this)}};define(p,'close',{value:methods.close,writable:true,enumerable:true,configurable:true});define(p,'constructor',{value:EventSource,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:'EventSource',configurable:true});setPrototype(p,EventTarget.prototype);setPrototype(EventSource,EventTarget);define(EventSource,'prototype',{value:p,writable:false});define(g,'EventSource',{value:EventSource,writable:true,configurable:true});b.prototype(p);
++}
++export function installEventSource(realm,{evaluate,baseURL,createTransport,signal,active=()=>!signal?.aborted,trustEvent=value=>value,dispatchTrusted,initializeTarget}={}){
++ if(installed.has(realm))return installed.get(realm);registerPlatformFactoryKind('EventSource');const Exception=captureDOMExceptionFactory(realm),Event=realm.Event,MessageEvent=realm.MessageEvent,dispatch=realm.EventTarget.prototype.dispatchEvent,add=realm.EventTarget.prototype.addEventListener,remove=realm.EventTarget.prototype.removeEventListener,live=new Set();
++ const bridge=record({has:value=>states.has(value),prototype:value=>registerProtocolPrototype(value,'EventSource'),
++  create(value,input,credentials){let url;try{url=new URL(input,baseURL()).href}catch{throw Exception('The string did not match the expected pattern','SyntaxError')}initializeTarget(value);const state=record({url,withCredentials:credentials,transport:null,handlers:new Map()});states.set(value,state);registerPlatformFactory(value,{kind:'EventSource',implementation:state,globalObject:realm});
++   state.transport=createTransport(url,credentials,(type,data)=>{if(!active())return;if(type==='error'&&data.readyState===2)live.delete(state);const event=type==='message'?new MessageEvent(data.type,{data:data.data,lastEventId:data.lastEventId,origin:data.origin}):new Event(type);trustEvent(event);if(dispatchTrusted)dispatchTrusted(value,event);else apply(dispatch,value,[event])});live.add(state);
++  },get(value,name){const state=states.get(value);return name==='readyState'?state.transport.get('readyState'):state[name]},
++  close(value){const state=states.get(value);state.transport.close();live.delete(state)},
++  handler(value,type,callback,set){const state=states.get(value),old=state.handlers.get(type);if(!set)return old?.callback??null;if(old){if(callback){old.callback=callback;return}apply(remove,value,[type,old.relay]);state.handlers.delete(type);return}if(!callback)return;const entry=record({callback,relay:event=>apply(entry.callback,value,[event])});state.handlers.set(type,entry);apply(add,value,[type,entry.relay])},
++ });
++ const dispose=()=>{for(const state of live)state.transport.close();live.clear()};const api=record({dispose});installed.set(realm,api);evaluate(`(${factory.toString()})`)(realm,bridge);signal?.addEventListener('abort',dispose,{once:true});return api;
++}
++export function installWindowEventSource(page,realm,{mainWindow=realm,evaluate,initializeTarget}={}){
++ const dispatchGenerated=TargetImpl.prototype._dispatch,creator=captureWorkerCreator(page,mainWindow),document=implForWrapper(mainWindow.document),base=document.baseURLSerialized,context=implForWrapper(mainWindow)?._globalObject,owned=new Set(),policy=eventSourcePolicy(page,{origin:creator().origin,referrer:page.url});
++ const api=installEventSource(realm,{evaluate:evaluate??(source=>vm.runInContext(source,context)),baseURL:()=>Reflect.apply(base,document,[]),signal:page.documentAbort.signal,createTransport:(url,withCredentials,emit)=>openEventSourceTransport({url,withCredentials,emit,policy,owner:owned}),initializeTarget:initializeTarget??(value=>TargetIDL.setup(value,realm,[])),dispatchTrusted:(target,event)=>apply(dispatchGenerated,implForWrapper(target),[implForWrapper(event)]),trustEvent:event=>{const implementation=implForWrapper(event);if(!implementation)throw new TypeError('Real Event implementation required');implementation.isTrusted=true;return event}});
++ onFrameRetirement(mainWindow,()=>setTimeout(()=>api.dispose(),0));return api;
++}
+--- /dev/null
++++ b/src/eventsource-transport.js
+@@ -0,0 +1,39 @@
++// Actual streaming HTTP transports. The parser consumes decoded bytes as they
++// arrive; neither event contents nor success are selected by destination paths.
++const fetchHTTP=globalThis.fetch,Decoder=TextDecoder,Controller=AbortController,schedule=setTimeout,cancel=clearTimeout;
++const record=value=>Object.assign(Object.create(null),value);
++export function createEventStreamParser({event,id,retry}){
++ const decoder=new Decoder('utf-8'),state=record({line:'',skipLF:false,data:'',type:'',id:''});
++ function line(value){
++  if(value===''){id(state.id);if(state.data!=='')event(state.type||'message',state.data.slice(0,-1),state.id);state.data='';state.type='';return}
++  if(value[0]===':')return;const colon=value.indexOf(':'),name=colon<0?value:value.slice(0,colon);let data=colon<0?'':value.slice(colon+1);if(data[0]===' ')data=data.slice(1);
++  if(name==='data')state.data+=data+'\n';else if(name==='event')state.type=data;else if(name==='id'&&!data.includes('\0'))state.id=data;else if(name==='retry'&&/^[0-9]+$/.test(data)){const value=Number(data);if(Number.isSafeInteger(value))retry(value)}
++ }
++ const text=value=>{for(const char of value){if(state.skipLF){state.skipLF=false;if(char==='\n')continue}if(char==='\r'||char==='\n'){line(state.line);state.line='';state.skipLF=char==='\r'}else state.line+=char}};
++ return{write(bytes){text(decoder.decode(bytes,{stream:true}))},end(){text(decoder.decode())},lastId(value){state.id=value}};
++}
++export function openEventSourceTransport({url,withCredentials,policy,emit,owner}){
++ const state=record({readyState:0,closed:false,attempt:null,timer:null,retry:3000,lastId:'',url});
++ const notify=(type,fields={})=>{if(!state.closed)emit(type,fields)};
++ const close=()=>{if(state.closed)return;state.closed=true;state.readyState=2;if(state.timer!==null)cancel(state.timer);state.timer=null;state.attempt?.abort();state.attempt=null;owner?.delete(api)};
++ const fail=fatal=>{if(state.closed)return;state.readyState=fatal?2:0;notify('error',{readyState:state.readyState});if(state.closed)return;if(fatal){state.closed=true;owner?.delete(api)}else{state.timer=schedule(()=>{state.timer=null;void connect()},Math.min(state.retry,2147483647));state.timer.unref?.()}};
++ async function connect(){
++  if(state.closed)return;const abort=new Controller();state.attempt=abort;let response,reader;
++  try{
++   let target=new URL(state.url);if(!['http:','https:'].includes(target.protocol)){fail(true);return}
++   for(let redirects=0;;redirects++){
++    if(redirects>20){fail(true);return}const headers=await policy.headers(target,withCredentials,state.lastId);if(state.closed)return;
++    response=await fetchHTTP(target,{method:'GET',headers,redirect:'manual',signal:abort.signal});
++    await policy.cookies?.(response,target,withCredentials);if(state.closed){await response.body?.cancel();return}
++    if(!policy.cors(response,target,withCredentials)){await response.body?.cancel();fail(true);return}
++    const location=response.headers.get('location');if([301,302,303,307,308].includes(response.status)&&location){await response.body?.cancel();target=new URL(location,target);if(!['http:','https:'].includes(target.protocol)){fail(true);return}continue}break;
++   }
++   if(response.status!==200||response.headers.get('content-type')?.split(';',1)[0].trim().toLowerCase()!=='text/event-stream'){await response.body?.cancel();fail(true);return}
++   state.readyState=1;notify('open',{readyState:1});if(state.closed){await response.body?.cancel();return}
++   const origin=new URL(response.url).origin,parser=createEventStreamParser({id:value=>{state.lastId=value},retry:value=>{state.retry=value},event:(type,data,lastEventId)=>notify('message',{type,data,lastEventId,origin})});parser.lastId(state.lastId);
++   reader=response.body?.getReader();if(reader)for(;;){const chunk=await reader.read();if(state.closed)return;if(chunk.done){parser.end();break}parser.write(chunk.value);if(state.closed)return}
++   fail(false);
++  }catch{if(!state.closed)fail(false)}finally{if(reader)try{reader.releaseLock()}catch{}if(state.attempt===abort)state.attempt=null}
++ }
++ const api=record({get(key){return state[key]},close});owner?.add(api);state.timer=schedule(()=>{state.timer=null;void connect()},0);return api;
++}
+--- /dev/null
++++ b/src/eventsource-policy.js
+@@ -0,0 +1,14 @@
++// Captured real document/worker principals select cookies, CORS and referrers.
++export function eventSourcePolicy(page,{origin,referrer=page.url}){
++ return{
++  async headers(target,credentials,lastId){
++   const headers=new Headers({'accept':'text/event-stream','cache-control':'no-cache'});if(page.userAgent)headers.set('user-agent',page.userAgent);if(page.acceptLanguage)headers.set('accept-language',page.acceptLanguage);
++   const same=target.origin===origin;if(!same)headers.set('origin',origin);if(lastId)headers.set('last-event-id',Buffer.from(lastId,'utf8').toString('latin1'));
++   const referer=page.referrerFor?.(target.href,referrer);if(referer)headers.set('referer',referer);
++   if(credentials||same){const cookie=await page.context?.cookies?.getCookieString(target.href);if(cookie)headers.set('cookie',cookie)}
++   page.extraHTTPHeaders?.forEach((value,name)=>headers.set(name,value));page.cliHTTPHeaders?.forEach((value,name)=>headers.set(name,value));return headers;
++  },
++  cors(response,target,credentials){if(target.origin===origin)return true;const allowed=response.headers.get('access-control-allow-origin');return (allowed===origin||!credentials&&allowed==='*')&&(!credentials||response.headers.get('access-control-allow-credentials')==='true')},
++  async cookies(response,target,credentials){if(credentials||target.origin===origin)for(const cookie of response.headers.getSetCookie())await page.context?.cookies?.setCookie(cookie,target.href,{ignoreError:true})},
++ };
++}
+--- /dev/null
++++ b/src/worker-eventsource.js
+@@ -0,0 +1,19 @@
++// Parent-owned genuine streaming connections, selected by private Worker Host
++// messages. Authored worker postMessage uses the distinct public envelope.
++import{randomUUID}from'node:crypto';
++import{openEventSourceTransport}from'./eventsource-transport.js';
++import{eventSourcePolicy}from'./eventsource-policy.js';
++const owners=new WeakMap(),record=value=>Object.assign(Object.create(null),value);
++function ownerFor(page){let root=page;const seen=new Set();while(root.registry?.page&&root.registry.page!==root&&!seen.has(root)){seen.add(root);root=root.registry.page}let owner=owners.get(root);if(!owner){owner=new Set();owners.set(root,owner);const close=()=>{for(const transport of [...owner])transport.close()};root.once('close',close);if(!page.browser)root.documentAbort?.signal.addEventListener('abort',close,{once:true})}return owner}
++export function createParentEventSources(page,{origin,send,active}){
++ const owner=ownerFor(page),policy=eventSourcePolicy(page,{origin,referrer:page.url}),clients=new Map();let detached=false;
++ return{
++  handle(message){if(detached||!active())return;if(message.kind==='eventSourceOpen'){if(clients.has(message.id))return;const transport=openEventSourceTransport({url:message.url,withCredentials:message.credentials,policy,owner,emit(type,data){if(!detached&&active())send({kind:'eventSourceEvent',id:message.id,type,data})}});clients.set(message.id,transport)}else if(message.kind==='eventSourceClose'){clients.get(message.id)?.close();clients.delete(message.id)}},
++  detach(){detached=true;clients.clear()},
++ };
++}
++export function createWorkerEventSourceClient(port){const clients=new Map();return{
++ create(url,credentials,emit){const id=randomUUID(),state=record({readyState:0,emit});clients.set(id,state);port.postMessage({kind:'eventSourceOpen',id,url,credentials});return record({get:key=>state[key],close(){if(state.readyState===2)return;state.readyState=2;clients.delete(id);port.postMessage({kind:'eventSourceClose',id})}})},
++ handle(message){const state=clients.get(message.id);if(!state)return;if(message.type==='open')state.readyState=1;else if(message.type==='error')state.readyState=message.data.readyState;state.emit(message.type,message.data);if(state.readyState===2)clients.delete(message.id)},
++ };
++}

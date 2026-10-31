@@ -1,0 +1,469 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,5 @@
++import {installWindowWebSocket} from './window-websocket.js';
++import {validateWebSocketLimit,browserWebSocketQuota} from './websocket-transports.js';
+ import {installMediaElements} from './media-elements.js';
+ import {installPaymentRequest} from './payment-request.js';
+ import {installImages} from './images.js';
+@@ -144,7 +146,9 @@
+ export class Browser extends EventEmitter {
+   constructor(options = {}) {
+     super();
++    const wsLimit=validateWebSocketLimit(options.wsMaxConcurrent);
+     this.options = options;
++    browserWebSocketQuota(this,wsLimit);
+     this.syncHTTP = new SyncHTTP();
+     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
+     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
+@@ -236,6 +240,7 @@
+   prepareWindow(window, historyState = null, { main = true } = {}) {
+     preparePopupDocument(this,window);
+     captureProtocolRealm(window);
++    installWindowWebSocket(this,window);
+     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
+     this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
+     alignMainIDLPrototypes(window);
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installWindowWebSocket} from './window-websocket.js';
+ import {installPaymentRequest} from './payment-request.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+ import { installWebCrypto } from './web-crypto.js';
+@@ -40,7 +41,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,4 @@
++import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
+ import { installWebCrypto } from './web-crypto.js';
+ import {installScheduler} from './scheduler.js';
+ import {installWorkerDOMException} from './worker-dom-exception.js';
+@@ -44,7 +45,7 @@
+   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
+   signal?.addEventListener('abort', dispose, { once: true });
+   class Worker extends window.EventTarget {
+-    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map();
++    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map(); #socketTransports;
+     constructor(input, options = {}, serviceToken) {
+       super();
+       const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
+@@ -63,6 +64,7 @@
+       if (!enabled&&!service) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
++      this.#socketTransports=createParentWorkerSockets(page,{origin:url.protocol==='data:'?'null':creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+       this.#thread = new ThreadWorker(new URL(import.meta.url), {
+         // File-backed workers must not inherit an embedding CLI's --input-type
+         // or --eval flags. Only the VM-module capability is needed here.
+@@ -74,6 +76,7 @@
+       service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
+       owned.add(this);
+       this.#thread.on('message', async message => {
++        if(message.kind==='socketStart'||message.kind==='socketSend'||message.kind==='socketClose'||message.kind==='socketCloseDispatched'){this.#socketTransports.handle(message);return;}
+         if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
+         if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
+         if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
+@@ -98,7 +101,7 @@
+         else if (message.kind === 'close') this.terminate();
+         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
+         else if(message.kind==='socketPolicy'){
+-          try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(page,message.url));}
++          try{completeWorkerSocketPolicy(message.sync,message.protocols!==undefined?this.#socketTransports.create(message.url,message.protocols):await workerSocketPolicy(page,message.url));}
+           catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
+         }
+         else if (message.kind === 'request') {
+@@ -148,7 +151,7 @@
+       this.#thread.on('messageerror', () => {
+         if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
+       });
+-      this.#thread.once('exit', () => { this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
++      this.#thread.once('exit', () => { this.#socketTransports?.detach(); this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+       // Installing a message listener refs Node's underlying MessagePort; unref
+       // after installing listeners so workers cannot hold server shutdown open.
+       this.#thread.unref();
+@@ -164,7 +167,7 @@
+     }
+     terminate() {
+       if (this.#terminated) return;
+-      this.#terminated = true; owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
++      this.#terminated = true;this.#socketTransports?.detach(); owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
+     }
+   }
+   for (const name of ['message', 'messageerror', 'error']) {
+@@ -186,7 +189,7 @@
+ 
+ async function runWorker() {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient;
+   let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+@@ -327,7 +330,8 @@
+   installAudioData(vm.runInContext('globalThis', context));
+   installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
+-  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
++  socketClient=createWorkerSocketClient(parentPort,createSyncWorkerSocketPolicy(parentPort));
++  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketFactory:socketClient.create,origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+ 
+@@ -336,6 +340,7 @@
+   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
+   parentPort.on('message', message => {
+     if (closed) return;
++    if(message.kind==='socketEvent'||message.kind==='socketSent'){socketClient.handle(message);return;}
+     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+     else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
+     else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+--- a/src/worker-websocket.js
++++ b/src/worker-websocket.js
+@@ -2,9 +2,10 @@
+ import { readWorkerBlobBytes, workerBlobSize } from './worker-multipart.js';
+ 
+ /** Real dedicated/service-worker socket connections with realm event adapters.
+- * Cookie, proxy and redirect policy integration remain explicit limitations.
++ * Private parent policy supplies cookies/origin and shared transport admission.
++ * Proxy and redirect policy integration remain explicit limitations.
+  */
+-export function installWebSocket(realm, { evaluate, origin, baseURL, socketPolicy, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
++export function installWebSocket(realm, { evaluate, origin, baseURL, socketPolicy, socketFactory, signal, active = () => !signal?.aborted, trustEvent = value => value } = {}) {
+   if (typeof evaluate !== 'function') throw new TypeError('An actual realm evaluator is required');
+   const ownerActive = active; let disposed = false;
+   active = () => !disposed && ownerActive();
+@@ -23,9 +24,9 @@
+       const s = { object, url: url.href, protocol: '', extensions: '', readyState: 0, binaryType: 'blob', pendingBytes: 0, queue: Promise.resolve() };
+       states.set(object, s);
+       if (!active()) throw new realm.DOMException('The worker is disposed', 'InvalidStateError');
+-      const policy=socketPolicy?.(s.url),policyHeaders=new Headers(policy?.headers);
++      const policy=socketFactory?null:socketPolicy?.(s.url),policyHeaders=new Headers(policy?.headers);
+       let socket;
+-      try { socket = new Socket(s.url, [...new Set(list)], {
++      try { socket = socketFactory?socketFactory(s.url,list):new Socket(s.url, [...new Set(list)], {
+         origin: origin ?? realm.location?.origin ?? 'null', perMessageDeflate: false, maxPayload: 16 * 1024 * 1024,
+         // Native accepts duplicate offered protocols and sends them verbatim.
+         // ws validates a unique negotiation set; its public request hook lets
+@@ -34,9 +35,9 @@
+       }); }
+       catch (error) { throw new realm.DOMException(String(error.message), 'SyntaxError'); }
+       s.socket = socket; live.add(s);
+-      socket.on('open', () => { if (!active()) { socket.terminate(); return; } s.readyState = 1; s.protocol = socket.protocol; s.extensions = socket.extensions; emit(object, 'open'); });
++      socket.on('open', () => { if (!active()||s.readyState>=2) { if(!socketFactory)socket.terminate(); return; } s.readyState = 1; s.protocol = socket.protocol; s.extensions = socket.extensions; emit(object, 'open'); });
+       socket.on('message', (bytes, binary) => {
+-        if (!active()) return;
++        if (!active()||s.readyState!==1) return;
+         let data = bytes.toString();
+         if (binary) {
+           const array = new realm.Uint8Array(bytes.length); array.set(bytes);
+@@ -44,17 +45,17 @@
+         }
+         emit(object, 'message', { data, origin: '' });
+       });
+-      socket.on('error', () => { if (active()) emit(object, 'error'); });
+-      socket.on('close', (code, reason) => {
++      socket.on('error', () => { s.readyState=3;if (active()) emit(object, 'error'); });
++      socket.on('close', (code, reason, wasClean=code!==1006) => {
+         live.delete(s); s.readyState = 3;
+-        if (active()) emit(object, 'close', { code, reason: reason.toString(), wasClean: code !== 1006 });
++        if (active()) emit(object, 'close', { code, reason: reason.toString(), wasClean });
+       });
+     },
+     get(object, key) { const s = state(object); return key === 'bufferedAmount' ? s.pendingBytes + (s.socket?.bufferedAmount ?? 0) : s[key]; },
+     binaryType(object, value) { const s = state(object); value = String(value); if (['blob', 'arraybuffer'].includes(value)) s.binaryType = value; },
+     send(object, value) {
+       const s = state(object);
+-      if (s.readyState === 0) throw new realm.DOMException('The object is in an invalid state', 'InvalidStateError');
++      if (s.readyState !== 1) throw new realm.DOMException('The object is in an invalid state', 'InvalidStateError');
+       let data = value, length, binary = false;
+       const blob = value instanceof Blob;
+       if (blob) { length = workerBlobSize(value); binary = true; }
+@@ -75,8 +76,8 @@
+       if (code !== undefined) { code = Number(code) >>> 0; if (code !== 1000 && (code < 3000 || code > 4999)) throw new realm.DOMException('The object does not support the operation or argument', 'InvalidAccessError'); }
+       if (Buffer.byteLength(reason) > 123) throw new realm.DOMException('WebSocket close reason is too long', 'SyntaxError');
+       if (s.readyState >= 2) return;
+-      const connecting = s.readyState === 0; s.readyState = 2;
+-      if (connecting) { s.socket.close(); return; }
++      const connecting = s.readyState === 0; s.readyState = connecting?3:2;
++      if (connecting) { s.socket.close(code,reason); return; }
+       void s.queue.then(() => { if (active()) s.socket.close(code, reason); });
+     },
+   };
+@@ -86,12 +87,12 @@
+       get [Symbol.toStringTag](){return 'CloseEvent'}
+     }
+     class WebSocket extends EventTarget {
+-      constructor(url,protocols){super();if(arguments.length===0)throw new TypeError('A WebSocket URL is required');bridge.open(this,url,protocols)}
++      constructor(url){super();const protocols=arguments[1];if(arguments.length===0)throw new TypeError('A WebSocket URL is required');bridge.open(this,url,protocols)}
+       get url(){return bridge.get(this,'url')}get protocol(){return bridge.get(this,'protocol')}get extensions(){return bridge.get(this,'extensions')}
+       get readyState(){return bridge.get(this,'readyState')}get bufferedAmount(){return bridge.get(this,'bufferedAmount')}
+       get binaryType(){return bridge.get(this,'binaryType')}set binaryType(value){bridge.binaryType(this,value)}
+       send(data){if(arguments.length===0)throw new TypeError('A WebSocket payload is required');return bridge.send(this,data)}
+-      close(code,reason){return bridge.close(this,code,reason)}
++      close(){return bridge.close(this,arguments[0],arguments[1])}
+       get [Symbol.toStringTag](){return 'WebSocket'}
+     }
+     const handlers=new WeakMap();
+@@ -101,7 +102,7 @@
+   })`)({ ...bridge, trust: trustEvent });
+   emit = result.emit;
+   Object.assign(realm, { WebSocket: result.WebSocket, CloseEvent: result.CloseEvent });
+-  const dispose = () => { disposed = true; for (const s of live) { s.readyState = 3; s.socket.terminate(); } live.clear(); signal?.removeEventListener('abort', dispose); };
++  const dispose = () => { disposed = true; for (const s of live) { s.readyState = 3; if(!socketFactory)s.socket.terminate(); } live.clear(); signal?.removeEventListener('abort', dispose); };
+   signal?.addEventListener('abort', dispose, { once: true });
+   return { dispose };
+ }
+--- a/src/worker-sync-transport.js
++++ b/src/worker-sync-transport.js
+@@ -7,9 +7,9 @@
+   destination.set(encoded.subarray(0,destination.length));Atomics.store(state,1,Math.min(encoded.length,destination.length));Atomics.store(state,0,1);Atomics.notify(state,0);
+ }
+ export function createSyncWorkerSocketPolicy(port,{maxBytes=1024*1024,timeoutMs=5000}={}) {
+-  return url=>{
++  return (url,protocols)=>{
+     const shared=new SharedArrayBuffer(maxBytes+8),state=new Int32Array(shared,0,2);
+-    port.postMessage({kind:'socketPolicy',url,sync:shared});
++    port.postMessage({kind:'socketPolicy',url,protocols,sync:shared});
+     if(Atomics.wait(state,0,0,timeoutMs)==='timed-out'||Atomics.load(state,0)!==1)throw new DOMException('Socket policy did not complete','TimeoutError');
+     const result=JSON.parse(new TextDecoder().decode(new Uint8Array(shared,8,Atomics.load(state,1))));
+     if(result.error)throw new DOMException(result.error,'NetworkError');return result.policy;
+--- a/bin/red-panda.js
++++ b/bin/red-panda.js
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env node
+-import {prepareCLIArguments,readCLIWaitScript,parseCLIHTTPHeaders} from '../src/cli-options.js';
++import {parseWebSocketLimit,prepareCLIArguments,readCLIWaitScript,parseCLIHTTPHeaders} from '../src/cli-options.js';
+ import { parseArgs } from 'node:util';
+ import vm from 'node:vm';
+ import { readFile } from 'node:fs/promises';
+@@ -28,6 +28,7 @@
+   red-panda version
+ 
+ Fetch options:
++  --ws-max-concurrent N     Concurrent WebSocket transports (0–255; default 8)
+   --dump FORMAT          html, markdown, semantic_tree, semantic_tree_text,
+                          structured_data, text, links, png or pdf (no flag: no dump; bare --dump: html)
+   --dump-selector CSS    Dump the first matching element
+@@ -74,6 +75,7 @@
+     'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
+     'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' }, 'wait-script-file': { type: 'string' },
+     'http-header': { type: 'string', multiple: true },
++    'ws-max-concurrent': { type: 'string' },
+     'no-javascript': { type: 'boolean' }, 'user-agent': { type: 'string' },
+     'fail-on-http-error': { type: 'boolean' },
+     'inject-script': { type: 'string', multiple: true }, 'inject-script-file': { type: 'string', multiple: true },
+@@ -96,7 +98,7 @@
+   if (loadResources.includes('none')) loadResources = [];
+   const features = values['experimental-features'] ?? [];
+   for (const feature of features) if (feature !== 'serviceworker') throw new Error(`Unsupported experimental feature: ${feature}`);
+-  const options = { experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
++  const options = { wsMaxConcurrent:parseWebSocketLimit(values['ws-max-concurrent']),experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
+   if (command === 'run') {
+     if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
+     if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');
+--- a/src/cli-options.js
++++ b/src/cli-options.js
+@@ -7,6 +7,7 @@
+  const accepted=new Set(formats),result=[];
+  for(let i=0;i<argv.length;i++){
+   const arg=argv[i];result.push(arg);
++  if(arg==='--ws-max-concurrent'&&/^-\d[\d_]*$/.test(argv[i+1]??'')){result[result.length-1]=arg+'='+argv[++i];continue;}
+   if(arg==='--'){result.push(...argv.slice(i+1));break;}
+   if(arg==='--dump'&&!accepted.has(argv[i+1]))result.push('html');
+  }
+@@ -39,3 +40,9 @@
+  }
+  return headers;
+ }
++
++// Native's decimal integer parser accepts a leading sign and separators.
++export function parseWebSocketLimit(value='8'){
++ if(typeof value!=='string'||!/^[-+]?[0-9](?:[0-9_]*[0-9])?(?![\s\S])/.test(value)||!/[0-9]/.test(value))throw new Error('invalid character for --ws-max-concurrent');
++ const number=Number(value.replaceAll('_',''));if(!Number.isInteger(number)||number<0||number>255)throw new Error('range overflow for --ws-max-concurrent');return number;
++}
+--- /dev/null
++++ b/src/websocket-transports.js
+@@ -0,0 +1,59 @@
++// Genuine Node WebSocket transports and Browser/App-owned admission leases.
++// The quota and transport records never enter an authored VM.
++import {WebSocket as Socket} from 'ws';
++const BROWSERS=new WeakMap(),apply=Reflect.apply,schedule=setTimeout,cancel=clearTimeout;
++const record=value=>Object.assign(Object.create(null),value);
++export function validateWebSocketLimit(value=8){if(typeof value!=='number'||!Number.isInteger(value)||value<0||value>255)throw new RangeError('wsMaxConcurrent must be an integer from 0 to 255');return value}
++export function browserWebSocketQuota(browser,selectedLimit){
++ let state=BROWSERS.get(browser);if(!state){const leases=new Set(),limit=validateWebSocketLimit(selectedLimit??browser.options?.wsMaxConcurrent);state=record({limit,
++  acquire(){if(leases.size>=limit)return null;const token=record({});leases.add(token);let released=false;return()=>{if(released)return;released=true;leases.delete(token)}},
++  usage(){return leases.size},
++ });BROWSERS.set(browser,state)}return state;
++}
++const blocked=new Set([1,7,9,11,13,15,17,19,20,21,22,23,25,37,42,43,53,69,77,79,87,95,101,102,103,104,109,110,111,113,115,117,119,123,135,137,139,143,161,179,389,427,465,512,513,514,515,526,530,531,532,540,548,554,556,563,587,601,636,989,990,993,995,1719,1720,1723,2049,3659,4045,5060,5061,6000,6566,6665,6666,6667,6668,6669,6697,10080]);
++export function normalizeWebSocketURL(input,base){const url=new URL(input,base);if(url.protocol==='http:')url.protocol='ws:';if(url.protocol==='https:')url.protocol='wss:';if(!['ws:','wss:'].includes(url.protocol)||url.hash||url.href.includes('#')||url.username||url.password)throw new TypeError('Invalid WebSocket URL');return url}
++export function validWebSocketProtocols(values){return values.every(value=>/^[!#$%&'*+.^_`|~0-9A-Za-z-]+(?![\s\S])/.test(value))}
++export function socketHeaders(page,url){
++ const destination=new URL(url);destination.protocol=destination.protocol==='wss:'?'https:':'http:';
++ const result={'Accept':'*/*'};if(page.userAgent)result['User-Agent']=page.userAgent;if(page.acceptLanguage)result['Accept-Language']=page.acceptLanguage;
++ const cookies=page.context?.cookies?.getCookieStringSync(destination.href);if(cookies)result.Cookie=cookies;return result;
++}
++export function openWebSocketTransport({quota,owner,url,protocols=[],origin,headers,emit,deferUpgrade=false}){
++ const release=blocked.has(Number(new URL(url).port))?null:quota.acquire();
++ const state=record({url,protocol:'',extensions:'',readyState:0,bufferedAmount:0,socket:null,queue:[],pendingBytes:0,closed:false,killed:false,localCancel:false,failed:false,closeRequested:false,timer:null,request:null,startRequested:!deferUpgrade,release});
++ const notify=(type,fields={})=>{if(!state.killed)return emit(type,fields)};
++ const relinquish=()=>{state.release?.();state.release=null};
++ const end=(code,reason,wasClean)=>{if(state.closed||state.killed)return;state.closed=true;state.readyState=3;
++  // Abnormal transport failure has already ended the physical attempt before
++  // JS error dispatch. A client close retains its admission through dispatch.
++  if(!wasClean||!state.closeRequested)relinquish();
++  const finish=()=>{relinquish();owner.delete(api)};try{if(!wasClean)notify('error');const pending=notify('close',{code,reason,wasClean});if(pending&&typeof pending.then==='function')pending.then(finish,finish);else finish()}catch(error){finish();throw error}
++ };
++ const drain=()=>{
++  if(!state.socket||state.socket.readyState!==Socket.OPEN)return;
++  for(const entry of state.queue.splice(0))state.socket.send(entry.data,{binary:entry.binary},()=>{state.pendingBytes-=entry.length;entry.done?.();drain()});
++  if(state.closeRequested&&state.pendingBytes===0){try{state.socket.close(state.closeCode,state.closeReason)}catch{state.failed=true;state.socket.terminate()}}
++ };
++ const api=record({
++  get(key){if(key==='bufferedAmount')return state.pendingBytes;return state[key]},
++  start(){if(state.killed||state.closed)return;state.startRequested=true;if(state.request){const request=state.request;state.request=null;request.end()}},
++  send(data,binary,done){if(state.readyState!==1)return false;const bytes=typeof data==='string'?data:Buffer.from(data),length=typeof bytes==='string'?Buffer.byteLength(bytes):bytes.length;state.pendingBytes+=length;state.queue.push(record({data:bytes,binary,length,done}));queueMicrotask(drain);return true},
++  close(code=1000,reason='',connecting=false){
++   if(state.readyState>=2&&!connecting)return;
++   if(connecting||state.readyState===0){state.localCancel=true;state.closed=true;state.readyState=3;if(state.timer!==null)cancel(state.timer);state.socket?.terminate();relinquish();owner.delete(api);state.timer=schedule(()=>{state.timer=null;notify('close',{code,reason,wasClean:false})},0);return}
++   state.readyState=2;state.closeRequested=true;state.closeCode=code;state.closeReason=reason;drain();
++  },
++  kill(){if(state.killed)return;state.killed=true;state.readyState=3;if(state.timer!==null)cancel(state.timer);state.timer=null;state.socket?.terminate();state.queue.length=0;relinquish();owner.delete(api)},
++ });owner.add(api);
++ if(!release){state.timer=schedule(()=>{state.timer=null;end(1006,'',false)},0);return api}
++ try{
++  const offered=protocols.slice();state.socket=new Socket(url,[...new Set(offered)],{origin,headers,perMessageDeflate:false,maxPayload:1024*1024*1024,
++   finishRequest(request){if(offered.length)request.setHeader('Sec-WebSocket-Protocol',offered.join(', '));if(state.startRequested)request.end();else state.request=request},
++  });
++ }catch{relinquish();state.timer=schedule(()=>{state.timer=null;end(1006,'',false)},0);return api}
++ state.socket.on('open',()=>{if(state.killed||state.localCancel)return;state.readyState=1;state.protocol=state.socket.protocol;state.extensions=state.socket.extensions;notify('open',{protocol:state.protocol,extensions:state.extensions});drain()});
++ state.socket.on('message',(bytes,binary)=>{if(state.readyState===1&&!state.killed)notify('message',{bytes:Buffer.from(bytes),binary})});
++ state.socket.on('error',()=>{state.failed=true});
++ state.socket.on('close',(code,reason)=>{if(!state.localCancel)end(code===1005?1000:code,reason.toString(),!state.failed&&code!==1006)});
++ return api;
++}
+--- /dev/null
++++ b/src/window-websocket.js
+@@ -0,0 +1,56 @@
++import {createRequire} from 'node:module';
++import {browserWebSocketQuota,normalizeWebSocketURL,validWebSocketProtocols,socketHeaders,openWebSocketTransport} from './websocket-transports.js';
++import {captureDOMExceptionFactory} from './worker-dom-exception.js';
++import {onFrameRetirement} from './frame-activity.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const generated=require('jsdom/lib/jsdom/living/generated/WebSocket.js'),module=require('jsdom/lib/jsdom/living/websockets/WebSocket-impl.js');
++const EventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
++const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js'),{setupForSimpleEventAccessors}=require('jsdom/lib/jsdom/living/helpers/create-event-accessor.js');
++const CloseEvent=require('jsdom/lib/jsdom/living/generated/CloseEvent.js'),MessageEvent=require('jsdom/lib/jsdom/living/generated/MessageEvent.js'),Blob=require('jsdom/lib/jsdom/living/generated/Blob.js');
++const OWNERS=new WeakMap(),STATES=new WeakMap(),ROOT_WORKER_OWNERS=new WeakMap();let patched=false;
++const record=value=>Object.assign(Object.create(null),value);
++const rootFor=page=>{const seen=new Set();while(page.registry?.page&&page.registry.page!==page&&!seen.has(page)){seen.add(page);page=page.registry.page}return page};
++function kill(owner){for(const transport of [...owner.transports])transport.kill()}
++export function workerWebSocketOwner(page){const root=rootFor(page);let owner=ROOT_WORKER_OWNERS.get(root);if(!owner){owner=record({quota:browserWebSocketQuota(page.browser??root),transports:new Set()});ROOT_WORKER_OWNERS.set(root,owner);root.once('close',()=>kill(owner));if(!page.browser)root.documentAbort?.signal.addEventListener('abort',()=>kill(owner),{once:true})}return owner}
++export function installWindowWebSocket(page,realm,{mainWindow=realm}={}){
++ patch();if(OWNERS.has(realm))return OWNERS.get(realm);
++ const document=utils.implForWrapper(mainWindow.document),exception=captureDOMExceptionFactory(realm),owner=record({page,realm,document,exception,ArrayType:realm.Uint8Array,arraySet:realm.Uint8Array.prototype.set,quota:browserWebSocketQuota(page.browser),transports:new Set(),disposed:false});
++ OWNERS.set(realm,owner);const impl=utils.implForWrapper(realm);if(mainWindow===realm&&impl?._globalObject)OWNERS.set(impl._globalObject,owner);
++ onFrameRetirement(mainWindow,()=>kill(owner));
++ page.documentAbort?.signal.addEventListener('abort',()=>{owner.disposed=true;kill(owner)},{once:true});return owner;
++}
++function patch(){
++ if(patched)return;patched=true;const Original=module.implementation;
++ class WebSocketImpl extends EventTargetImpl{
++  constructor(global,args,privateData){
++   const owner=OWNERS.get(global);if(!owner)return new Original(global,args,privateData);super(global,args,privateData);
++   let url;try{url=normalizeWebSocketURL(args[0],owner.document.baseURLSerialized())}catch{throw owner.exception('The string did not match the expected pattern','SyntaxError')}
++   const protocols=typeof args[1]==='string'?[args[1]]:args[1]??[];if(!validWebSocketProtocols(protocols))throw owner.exception('The string did not match the expected pattern','SyntaxError');
++   if(owner.disposed)throw owner.exception('The object is in an invalid state','InvalidStateError');
++   const state=record({owner,url:url.href,binaryType:'blob',transport:null});STATES.set(this,state);
++   state.transport=openWebSocketTransport({quota:owner.quota,owner:owner.transports,url:url.href,protocols,origin:owner.document._origin,headers:socketHeaders(owner.page,url),emit:(type,data)=>{
++    if(owner.disposed)return;
++    if(type==='message'){const bytes=new owner.ArrayType(data.bytes.length);Reflect.apply(owner.arraySet,bytes,[data.bytes]);const value=data.binary?(state.binaryType==='arraybuffer'?bytes.buffer:Blob.create(global,[[data.bytes],{type:''}])):data.bytes.toString();fireAnEvent('message',this,MessageEvent,{data:value,origin:'',source:null,lastEventId:'',ports:[]})}
++    else if(type==='close')fireAnEvent(type,this,CloseEvent,data);
++    else fireAnEvent(type,this);
++   }});
++  }
++  get url(){return STATES.get(this).url}
++  get readyState(){return STATES.get(this).transport.get('readyState')}
++  get bufferedAmount(){return STATES.get(this).transport.get('bufferedAmount')}
++  get protocol(){return STATES.get(this).transport.get('protocol')}
++  get extensions(){return STATES.get(this).transport.get('extensions')}
++  get binaryType(){return STATES.get(this).binaryType}
++  set binaryType(value){if(value==='blob'||value==='arraybuffer')STATES.get(this).binaryType=value}
++  send(data){const state=STATES.get(this);if(state.transport.get('readyState')!==1)throw state.owner.exception('The object is in an invalid state','InvalidStateError');let binary=false;if(Blob.isImpl(data)){data=data._buffer;binary=true}else if(typeof data!=='string'){data=new Uint8Array(data.buffer??data,data.byteOffset??0,data.byteLength).slice();binary=true}state.transport.send(data,binary)}
++  close(code,reason){const state=STATES.get(this);if(state.transport.get('readyState')>=2)return;if(code!==undefined&&code!==1000&&(code<3000||code>4999))throw state.owner.exception('The object does not support the operation or argument','InvalidAccessError');if(Buffer.byteLength(reason??'')>123)throw state.owner.exception('The string did not match the expected pattern','SyntaxError');state.transport.close(code??1000,reason??'')}
++  _makeDisappear(){const state=STATES.get(this);this._eventListeners=Object.create(null);state.transport.kill()}
++ }
++ setupForSimpleEventAccessors(WebSocketImpl.prototype,['open','message','error','close']);
++ module.implementation=WebSocketImpl;
++ // Keep genuine unowned jsdom instances compatible with the pinned factory;
++ // owned sockets use the successful private backend record, never a tag.
++ generated.isImpl=value=>STATES.has(value)||value instanceof Original;
++ generated.is=value=>utils.isObject(value)&&utils.hasOwn(value,utils.implSymbol)&&generated.isImpl(utils.implForWrapper(value));
++ const cleanup=Original.cleanUpWindow;Original.cleanUpWindow=window=>{const owner=OWNERS.get(window._globalProxy??window);if(owner)kill(owner);return cleanup.call(Original,window)};
++}
+--- /dev/null
++++ b/src/worker-socket-transports.js
+@@ -0,0 +1,53 @@
++// Private parent-owned physical sockets for real worker clients. A terminated
++// Native worker parks its still-open transports until the owning Page ends.
++import {randomUUID} from 'node:crypto';
++import {EventEmitter} from 'node:events';
++import {workerWebSocketOwner} from './window-websocket.js';
++import {normalizeWebSocketURL,validWebSocketProtocols,socketHeaders,openWebSocketTransport} from './websocket-transports.js';
++export function createParentWorkerSockets(page,{origin,send,active}){
++ const owner=workerWebSocketOwner(page),transports=new Map(),acknowledgements=new Map();let detached=false;
++ return{
++  create(url,protocols){
++   url=normalizeWebSocketURL(url);if(!Array.isArray(protocols)||!validWebSocketProtocols(protocols))throw new TypeError('Invalid socket protocols');
++   const id=randomUUID(),transport=openWebSocketTransport({quota:owner.quota,owner:owner.transports,url:url.href,protocols,origin,deferUpgrade:true,headers:socketHeaders(page,url),emit(type,data){
++    if(detached||!active())return;
++    let pending;if(type==='close')pending=new Promise(resolve=>acknowledgements.set(id,resolve));
++    send({kind:'socketEvent',id,type,data:type==='message'?{bytes:new Uint8Array(data.bytes),binary:data.binary}:data});return pending;
++   }});transports.set(id,transport);return{transportId:id};
++  },
++  handle(message){
++   const transport=transports.get(message.socketId);if(!transport)return;
++   if(message.kind==='socketCloseDispatched'){acknowledgements.get(message.socketId)?.();acknowledgements.delete(message.socketId);transports.delete(message.socketId);return}
++   if(detached||!active())return;
++   if(message.kind==='socketStart')transport.start();
++   else if(message.kind==='socketSend'){const accepted=transport.send(message.data,message.binary,()=>send({kind:'socketSent',id:message.socketId,requestId:message.requestId,bufferedAmount:transport.get('bufferedAmount')}));if(!accepted)send({kind:'socketSent',id:message.socketId,requestId:message.requestId,bufferedAmount:transport.get('bufferedAmount')})}
++   else if(message.kind==='socketClose')transport.close(message.code,message.reason,message.connecting);
++  },
++  detach(){if(detached)return;detached=true;for(const resolve of acknowledgements.values())resolve();acknowledgements.clear();
++   // Actual open Node sockets remain in the real Page-owned transport set.
++   // No empty reservation is retained after an actual remote close.
++   for(const transport of transports.values())transport.start();transports.clear();
++  },
++ };
++}
++export function createWorkerSocketClient(port,policy){
++ const sockets=new Map();let nextId=0;
++ class RemoteSocket extends EventEmitter{
++  constructor(url,protocols){super();const result=policy(url,protocols);this.id=result.transportId;this.readyState=0;this.bufferedAmount=0;this.protocol='';this.extensions='';this.callbacks=new Map();sockets.set(this.id,this);setImmediate(()=>{if(this.readyState===0)port.postMessage({kind:'socketStart',socketId:this.id})})}
++  send(data,options,callback){const id=++nextId;this.callbacks.set(id,callback);port.postMessage({kind:'socketSend',socketId:this.id,requestId:id,data:typeof data==='string'?data:new Uint8Array(data),binary:!!options?.binary})}
++  close(code=1000,reason=''){const connecting=this.readyState===0;if(this.readyState>=2)return;this.readyState=connecting?3:2;port.postMessage({kind:'socketClose',socketId:this.id,code:code??1000,reason:reason??'',connecting})}
++  terminate(){this.close()}
++ }
++ return{
++  create:(url,protocols)=>new RemoteSocket(url,protocols),
++  handle(message){
++   const socket=sockets.get(message.id);if(!socket)return;
++   if(message.kind==='socketSent'){socket.bufferedAmount=message.bufferedAmount;const callback=socket.callbacks.get(message.requestId);socket.callbacks.delete(message.requestId);callback?.();return}
++   const data=message.data??{};
++   if(message.type==='open'){socket.readyState=1;socket.protocol=data.protocol;socket.extensions=data.extensions;socket.emit('open')}
++   else if(message.type==='message')socket.emit('message',Buffer.from(data.bytes),data.binary);
++   else if(message.type==='error'){socket.readyState=3;socket.emit('error')}
++   else if(message.type==='close'){socket.readyState=3;try{socket.emit('close',data.code,Buffer.from(data.reason),data.wasClean)}finally{port.postMessage({kind:'socketCloseDispatched',socketId:socket.id});sockets.delete(socket.id)}}
++  },
++ };
++}

@@ -1,0 +1,338 @@
+{
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
+  "sourceSHA256": "fa8853b8af826af0c2d0373a9e74a567ca2d681bedc6e4e12b1f7ff37e7f4c45",
+  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
+  "origin": "http://127.0.0.1:37575",
+  "endpoint": "ws://127.0.0.1:37575",
+  "args": [
+    "--ws-max-concurrent",
+    "1"
+  ],
+  "expression": "(async()=>{const rows=[],held=[],attempt=(C,label,url=\"ws://127.0.0.1:37575\"+'/')=>new Promise(resolve=>{const events=[],ws=new C(url+'?id='+label);held.push(ws);events.push(['created',ws.readyState]);ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({ws,events})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({ws,events})}}),first=await attempt(WebSocket,'main');rows.push(['main',first.events]);const frame=document.createElement('iframe');document.body.appendChild(frame);const second=await attempt(frame.contentWindow.WebSocket,'frame');rows.push(['frame',second.events]);first.ws.close(1000,'first');await new Promise(r=>first.ws.onclose=r);const worker=new Worker('/worker.js'),call=(command,id,count)=>new Promise(resolve=>{worker.onmessage=e=>{if(e.data.id===id)resolve(e.data)};worker.postMessage({command,id,count})});rows.push(['worker',await call('hold','first-worker',1)]);rows.push(['blocked-main', (await attempt(WebSocket,'after-worker')).events]);worker.terminate();const after=await attempt(WebSocket,'after-terminate');rows.push(['terminate-immediate',after.events]);after.ws.close();frame.remove();return JSON.stringify(rows)})()\n",
+  "result": {
+    "result": {
+      "type": "string",
+      "value": "[[\"main\",[[\"created\",0],[\"open\",1]]],[\"frame\",[[\"created\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"worker\",{\"id\":\"first-worker\",\"rows\":[{\"i\":0,\"events\":[[\"constructed\",0],[\"open\",1]]}]}],[\"blocked-main\",[[\"created\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"terminate-immediate\",[[\"created\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]]]"
+    }
+  },
+  "requests": [
+    {
+      "url": "/?id=main",
+      "headers": [
+        "Host",
+        "127.0.0.1:37575",
+        "Accept",
+        "*/*",
+        "Accept-Encoding",
+        "deflate, gzip, br, zstd",
+        "Upgrade",
+        "websocket",
+        "Sec-WebSocket-Version",
+        "13",
+        "Sec-WebSocket-Key",
+        "pFCAwGzAQB7GPJxqQln0SQ==",
+        "User-Agent",
+        "Lightpanda/1.0",
+        "Sec-Ch-Ua",
+        "\"Lightpanda\";v=\"1\"",
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "Accept-Language",
+        "en-US,en;q=0.9",
+        "Origin",
+        "http://127.0.0.1:37575",
+        "Connection",
+        "Upgrade"
+      ],
+      "status": "closed",
+      "messages": [],
+      "code": 1000,
+      "reason": "first"
+    },
+    {
+      "url": "/?worker=first-worker&i=0",
+      "headers": [
+        "Host",
+        "127.0.0.1:37575",
+        "Accept",
+        "*/*",
+        "Accept-Encoding",
+        "deflate, gzip, br, zstd",
+        "Upgrade",
+        "websocket",
+        "Sec-WebSocket-Version",
+        "13",
+        "Sec-WebSocket-Key",
+        "j4jYRt6DBYLxsuFJLmajrA==",
+        "User-Agent",
+        "Lightpanda/1.0",
+        "Sec-Ch-Ua",
+        "\"Lightpanda\";v=\"1\"",
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "Accept-Language",
+        "en-US,en;q=0.9",
+        "Origin",
+        "http://127.0.0.1:37575",
+        "Connection",
+        "Upgrade"
+      ],
+      "status": "open",
+      "messages": []
+    }
+  ],
+  "events": [
+    {
+      "method": "Target.targetCreated",
+      "params": {
+        "targetInfo": {
+          "url": "about:blank",
+          "title": "",
+          "targetId": "FID-0000000001",
+          "attached": false,
+          "type": "page",
+          "canAccessOpener": false,
+          "browserContextId": "BID-1"
+        }
+      }
+    },
+    {
+      "method": "Target.attachedToTarget",
+      "params": {
+        "sessionId": "SID-1",
+        "targetInfo": {
+          "url": "about:blank",
+          "title": "",
+          "targetId": "FID-0000000001",
+          "attached": true,
+          "type": "page",
+          "canAccessOpener": false,
+          "browserContextId": "BID-1"
+        },
+        "waitingForDebugger": false
+      }
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 1,
+          "origin": "",
+          "name": "",
+          "uniqueId": "3.4",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000001"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "FID-0000000001",
+        "url": "http://127.0.0.1:37575/",
+        "loaderId": "LID-0000000001",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextsCleared",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "type": "Navigation",
+        "frame": {
+          "id": "FID-0000000001",
+          "loaderId": "LID-0000000001",
+          "url": "http://127.0.0.1:37575/",
+          "domainAndRegistry": "",
+          "securityOrigin": "http://127.0.0.1:37575",
+          "mimeType": "text/html",
+          "adFrameStatus": {
+            "adFrameType": "none"
+          },
+          "secureContextType": "InsecureScheme",
+          "crossOriginIsolatedContextType": "NotIsolated",
+          "gatedAPIFeatures": []
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 2,
+          "origin": "http://127.0.0.1:37575",
+          "name": "",
+          "uniqueId": "5.6",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000001",
+            "loaderId": "LID-0000000001"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "DOM.documentUpdated",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.domContentEventFired",
+      "params": {
+        "timestamp": 36135
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.loadEventFired",
+      "params": {
+        "timestamp": 36135
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameAttached",
+      "params": {
+        "frameId": "FID-0000000002",
+        "parentFrameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameRequestedNavigation",
+      "params": {
+        "frameId": "FID-0000000002",
+        "reason": "initialFrameNavigation",
+        "url": "about:blank",
+        "disposition": "currentTab"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "FID-0000000002",
+        "url": "about:blank",
+        "loaderId": "LID-0000000002",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "FID-0000000002"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameClearedScheduledNavigation",
+      "params": {
+        "frameId": "FID-0000000002"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "type": "Navigation",
+        "frame": {
+          "id": "FID-0000000002",
+          "parentId": "FID-0000000001",
+          "loaderId": "LID-0000000002",
+          "url": "about:blank",
+          "domainAndRegistry": "",
+          "securityOrigin": "http://127.0.0.1:37575",
+          "mimeType": "text/html",
+          "adFrameStatus": {
+            "adFrameType": "none"
+          },
+          "secureContextType": "InsecureScheme",
+          "crossOriginIsolatedContextType": "NotIsolated",
+          "gatedAPIFeatures": []
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 3,
+          "origin": "http://127.0.0.1:37575",
+          "name": "",
+          "uniqueId": "7.8",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000002",
+            "loaderId": "LID-0000000002"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "DOM.documentUpdated",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.domContentEventFired",
+      "params": {
+        "timestamp": 36135
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.loadEventFired",
+      "params": {
+        "timestamp": 36135
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "FID-0000000002"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameDetached",
+      "params": {
+        "frameId": "FID-0000000002",
+        "reason": "remove"
+      },
+      "sessionId": "SID-1"
+    }
+  ],
+  "stderr": "$time=1793439651279 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:38839 max_connections=16127 max_browser_connections=16\n"
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {prepareCLIArguments,readCLIWaitScript,parseCLIHTTPHeaders} from '../src/cli-options.js';
+import {parseWebSocketLimit,prepareCLIArguments,readCLIWaitScript,parseCLIHTTPHeaders} from '../src/cli-options.js';
 import { parseArgs } from 'node:util';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
@@ -28,6 +28,7 @@ Usage:
   red-panda version
 
 Fetch options:
+  --ws-max-concurrent N     Concurrent WebSocket transports (0–255; default 8)
   --dump FORMAT          html, markdown, semantic_tree, semantic_tree_text,
                          structured_data, text, links, png or pdf (no flag: no dump; bare --dump: html)
   --dump-selector CSS    Dump the first matching element
@@ -74,6 +75,7 @@ export async function main(argv = process.argv.slice(2)) {
     'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
     'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' }, 'wait-script-file': { type: 'string' },
     'http-header': { type: 'string', multiple: true },
+    'ws-max-concurrent': { type: 'string' },
     'no-javascript': { type: 'boolean' }, 'user-agent': { type: 'string' },
     'fail-on-http-error': { type: 'boolean' },
     'inject-script': { type: 'string', multiple: true }, 'inject-script-file': { type: 'string', multiple: true },
@@ -96,7 +98,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (loadResources.includes('none')) loadResources = [];
   const features = values['experimental-features'] ?? [];
   for (const feature of features) if (feature !== 'serviceworker') throw new Error(`Unsupported experimental feature: ${feature}`);
-  const options = { experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
+  const options = { wsMaxConcurrent:parseWebSocketLimit(values['ws-max-concurrent']),experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
   if (command === 'run') {
     if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
     if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');

@@ -7,9 +7,9 @@ export function completeWorkerSocketPolicy(shared,policy,error) {
   destination.set(encoded.subarray(0,destination.length));Atomics.store(state,1,Math.min(encoded.length,destination.length));Atomics.store(state,0,1);Atomics.notify(state,0);
 }
 export function createSyncWorkerSocketPolicy(port,{maxBytes=1024*1024,timeoutMs=5000}={}) {
-  return url=>{
+  return (url,protocols)=>{
     const shared=new SharedArrayBuffer(maxBytes+8),state=new Int32Array(shared,0,2);
-    port.postMessage({kind:'socketPolicy',url,sync:shared});
+    port.postMessage({kind:'socketPolicy',url,protocols,sync:shared});
     if(Atomics.wait(state,0,0,timeoutMs)==='timed-out'||Atomics.load(state,0)!==1)throw new DOMException('Socket policy did not complete','TimeoutError');
     const result=JSON.parse(new TextDecoder().decode(new Uint8Array(shared,8,Atomics.load(state,1))));
     if(result.error)throw new DOMException(result.error,'NetworkError');return result.policy;

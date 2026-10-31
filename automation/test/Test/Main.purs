@@ -15,6 +15,8 @@ foreign import startImpl :: Browser.Async Fixture
 foreign import stopImpl :: Fixture -> Browser.Async Unit
 foreign import fixtureUrl :: Fixture -> String
 foreign import fixtureEndpoint :: Fixture -> String
+foreign import fixtureStreamUrl :: Fixture -> String
+foreign import fixtureSocketUrl :: Fixture -> String
 
 assert :: String -> Boolean -> Aff Unit
 assert label ok = if ok then log $ "PASS " <> label else throwError $ error $ "FAIL " <> label
@@ -265,5 +267,13 @@ main = launchAff_ $
         assert "PureScript Puppeteer creates, writes, reuses and closes a genuine popup document" $ popupValues == "[true,\"red panda\",true,true]"
         imageValues <- Browser.evaluateString page "new Promise((resolve,reject)=>{const img=new Image();img.onerror=()=>reject(Error('unexpected image error'));img.onload=e=>resolve(JSON.stringify([img.complete,img.currentSrc===new URL('/not-fetched.png',location.href).href,img.naturalWidth,e.isTrusted,e.target===img]));img.src='/not-fetched.png'})"
         assert "PureScript Puppeteer follows the measured default image selection event lifecycle" $ imageValues == "[true,true,0,true,true]"
+        quantumAudioValues <- Browser.evaluateString page "(async()=>{const c=new OfflineAudioContext(1,16,8192),source=c.createConstantSource(),gain=c.createGain();gain.gain.setValueCurveAtTime([8,10],4/8192,4/8192);source.connect(gain).connect(c.destination);source.start();const samples=(await c.startRendering()).getChannelData(0);return JSON.stringify([samples.length,Array.from(samples).every(value=>value===1),gain.gain.value])})()"
+        assert "PureScript Puppeteer observes actual quantum-rendered samples and intrinsic parameter state" $ quantumAudioValues == "[16,true,1]"
+        publicEventRealmValues <- Browser.evaluateString page "(()=>{const event=new Event('actual');return JSON.stringify([Object.getPrototypeOf(Event)===Function.prototype,Object.getPrototypeOf(EventTarget.prototype.dispatchEvent)===Function.prototype,Object.getPrototypeOf(Object.getOwnPropertyDescriptor(Event.prototype,'type').get)===Function.prototype,event.isTrusted,Object.getOwnPropertySymbols(event).length])})()"
+        assert "PureScript Puppeteer observes genuine Event interface realms and private backing" $ publicEventRealmValues == "[true,true,true,false,0]"
+        eventSourceTransportValues <- Browser.evaluateString page $ "new Promise((resolve,reject)=>{const source=new EventSource(" <> show (fixtureStreamUrl fixture) <> ");const timer=setTimeout(()=>{source.close();reject(Error('SSE deadline'))},5000);source.onerror=()=>{clearTimeout(timer);source.close();reject(Error('SSE transport'))};source.addEventListener('panda',event=>{clearTimeout(timer);const row=[event.data,event.lastEventId,event.target===source,event.isTrusted];source.close();row.push(source.readyState);resolve(JSON.stringify(row))})})"
+        assert "PureScript Puppeteer receives actual streamed SSE fields and closes the real transport" $ eventSourceTransportValues == "[\"red-panda\",\"17\",true,true,2]"
+        socketTransportValues <- Browser.evaluateString page $ "new Promise((resolve,reject)=>{const socket=new WebSocket(" <> show (fixtureSocketUrl fixture) <> ");let row;const timer=setTimeout(()=>{socket.close();reject(Error('WebSocket deadline'))},5000);socket.onopen=()=>socket.send('red-panda');socket.onmessage=event=>{row=[event.data,event.isTrusted,event.target===socket];socket.close()};socket.onerror=()=>{clearTimeout(timer);socket.close();reject(Error('WebSocket transport'))};socket.onclose=()=>{clearTimeout(timer);row?resolve(JSON.stringify(row)):reject(Error('WebSocket closed before echo'))}})"
+        assert "PureScript Puppeteer receives genuine WebSocket echo bytes and events" $ socketTransportValues == "[\"echo:red-panda\",true,true]"
         Browser.closePage page
-        log "PureScript Puppeteer integration: 80 checks passed"
+        log "PureScript Puppeteer integration: 84 checks passed"

@@ -1,0 +1,4 @@
+import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{Browser}from'../src/browser.js';
+test('Native backdated/tied timelines and curve cancellation preserve actual samples and errors',async()=>{const browser=new Browser({timeout:2000}),page=browser.createPage();try{await page.navigate('data:text/html,<body>Audio timeline');const source=await readFile(new URL('../docs/reference/audio-timeline-performance/audio-order-expression.js',import.meta.url),'utf8'),contract=JSON.parse(await readFile(new URL('../docs/reference/audio-timeline-performance/audio-order-native.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(source).digest('hex'),contract.expressionSHA256);const actual=JSON.parse(JSON.stringify(await page.evaluate(source)));
+ assert.deepEqual(actual,contract.observations);
+ }finally{browser.close()}});

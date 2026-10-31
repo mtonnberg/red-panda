@@ -1,0 +1,3918 @@
+--- /dev/null
++++ b/test/websocket-quota.test.js
+@@ -0,0 +1,10 @@
++import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{WebSocketServer}from'ws';import{Browser}from'../src/browser.js';import{browserWebSocketQuota}from'../src/websocket-transports.js';import{parseWebSocketLimit,prepareCLIArguments}from'../src/cli-options.js';
++let server,wss,origin,endpoint,worker;const sockets=new Set(),upgrades=[];
++before(async()=>{worker=await readFile(new URL('../proposals/websocket-quota/worker.js',import.meta.url),'utf8');wss=new WebSocketServer({noServer:true});server=http.createServer((q,s)=>{s.setHeader('content-type',q.url==='/worker.js'?'text/javascript':'text/html');s.end(q.url==='/worker.js'?worker.replaceAll('ENDPOINT',JSON.stringify(endpoint)):'<!doctype html><body>Owned quota')});server.on('connection',s=>{sockets.add(s);s.on('error',()=>{});s.on('close',()=>sockets.delete(s))});server.on('upgrade',(q,s,h)=>{upgrades.push(q.url);if(q.url.startsWith('/hang'))return;if(q.url.startsWith('/reject')){s.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');return}wss.handleUpgrade(q,s,h,ws=>{ws.on('message',(bytes,binary)=>{if(bytes.toString()==='please-close')ws.close(1001,'remote');else ws.send(bytes,{binary})});ws.on('error',()=>{})})});server.listen(0,'127.0.0.1');await once(server,'listening');origin='http://127.0.0.1:'+server.address().port;endpoint='ws://127.0.0.1:'+server.address().port});after(async()=>{for(const s of sockets)s.destroy();await new Promise(r=>server.close(r));await new Promise(r=>wss.close(r))});
++async function fixture(t,limit=1){const browser=new Browser({...(limit===null?{}:{wsMaxConcurrent:limit}),loadResources:['iframe','worker']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate(origin);return{browser,page,w:page.dom.window}}
++const plain=x=>JSON.parse(JSON.stringify(x));
++for(const[name,report]of[['ownership.js','native-ownership1.json'],['failure-order.js','native-failure-order1.json'],['termination.js','native-termination1.json'],['frame-release.js','native-frame-release1.json'],['worker-frame-release.js','native-worker-frame-release1.json'],['handshake-failure.js','native-handshake-failure1.json'],['pending.js','native-pending1.json'],['remote-close.js','native-remote-close1.json'],['worker-cancel.js','native-worker-cancel1.json']])test('WebSocket genuine quota/transport Native control '+name,{timeout:12000},async t=>{const{page}=await fixture(t),source=await readFile(new URL('../proposals/websocket-quota/'+name,import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../proposals/websocket-quota/'+report,import.meta.url),'utf8'));assert.equal(createHash('sha256').update(source).digest('hex'),native.sourceSHA256);const actual=JSON.parse(await page.evaluate(source.replaceAll('ENDPOINT',JSON.stringify(endpoint))));assert.deepEqual(actual,JSON.parse(native.result.result.value));if(name==='worker-cancel.js')assert.equal(upgrades.includes('/hang?worker-cancel'),false)});
++test('WebSocket default8 and explicit50 admit only actual shared Node transport starts',{timeout:10000},async t=>{for(const[limit,count]of[[null,8],[50,16]]){const{browser,page}=await fixture(t,limit),start=upgrades.length,rows=await page.evaluate(`(async()=>{const held=[];const rows=await Promise.all(Array.from({length:16},(_,i)=>new Promise(resolve=>{const w=new WebSocket(${JSON.stringify(endpoint)}+'/?sixteen='+i);held.push(w);w.onopen=()=>resolve('open');w.onerror=()=>{};w.onclose=()=>resolve('closed')})));await Promise.all(held.map(w=>w.readyState===3?undefined:new Promise(resolve=>{w.onclose=resolve;w.close()})));return rows})()`);assert.equal(rows.filter(x=>x==='open').length,count);assert.equal(upgrades.length-start,count);await new Promise(r=>setImmediate(r));assert.equal(browserWebSocketQuota(browser).usage(),0)}});
++test('WebSocket closed/terminated worker transports remain real until owning Page teardown; Browser controllers are independent',{timeout:10000},async t=>{const{browser,page}=await fixture(t),held=await page.evaluate(`new Promise(resolve=>{globalThis.worker=new Worker('/worker.js');worker.onmessage=()=>{worker.terminate();resolve(true)};worker.postMessage({command:'hold',id:'owner',count:1})})`);assert.equal(held,true);assert.equal(browserWebSocketQuota(browser).usage(),1);const other=browser.createPage();await other.navigate(origin);assert.equal(await other.evaluate(`new Promise(resolve=>{const s=new WebSocket(${JSON.stringify(endpoint)});s.onerror=()=>{};s.onclose=()=>resolve('denied');s.onopen=()=>resolve('open')})`),'denied');page.close();assert.equal(browserWebSocketQuota(browser).usage(),0);assert.equal(await other.evaluate(`new Promise(resolve=>{globalThis.socket=new WebSocket(${JSON.stringify(endpoint)});socket.onopen=()=>resolve('open')})`),'open');const independent=new Browser({wsMaxConcurrent:1});t.after(()=>independent.close());const p=independent.createPage();await p.navigate(origin);assert.equal(await p.evaluate(`new Promise(resolve=>{globalThis.socket=new WebSocket(${JSON.stringify(endpoint)});socket.onopen=()=>resolve('open')})`),'open')});
++test('WebSocket main transport data uses the real receiving VM and private backend records',{timeout:6000},async t=>{const{page,w}=await fixture(t),result=await page.evaluate(`new Promise(resolve=>{const s=new WebSocket(${JSON.stringify(endpoint)});s.binaryType='arraybuffer';s.onopen=()=>s.send(new Uint8Array([3,1,4]));s.onmessage=e=>{s.close();resolve({s,bytes:e.data})}})`),{getHeapBinding}=await import('../src/native-heap.js'),binding=getHeapBinding(),anchor=w.eval('[]');assert.equal(binding.sameRealm(result.bytes,anchor),true);const proto=Object.getPrototypeOf(result.bytes);Object.setPrototypeOf(result.bytes,null);assert.equal(binding.sameRealm(result.bytes,anchor),true);Object.setPrototypeOf(result.bytes,proto);assert.deepEqual(Array.from(new w.Uint8Array(result.bytes)),[3,1,4]);const symbols=Object.getOwnPropertySymbols(result.s),impl=result.s[symbols.find(s=>s.description==='impl')];assert.ok(impl);assert.equal(Object.keys(impl).some(key=>/socket|transport|lease|quota|headers/i.test(key)),false);assert.throws(()=>Object.getOwnPropertyDescriptor(w.WebSocket.prototype,'readyState').get.call(Object.create(w.WebSocket.prototype)),e=>e instanceof w.TypeError)});
++test('WebSocket quota decimal CLI grammar matches actual Native accepted and rejected flags',async()=>{const native=JSON.parse(await readFile(new URL('../proposals/websocket-quota/native-cli-validation-v3.json',import.meta.url),'utf8'));for(const row of native.rows){if(row.exitCode===0)assert.ok(parseWebSocketLimit(row.value)>=0,row.value);else assert.throws(()=>parseWebSocketLimit(row.value),Error,row.value)}assert.deepEqual(prepareCLIArguments(['serve','--ws-max-concurrent','-0'],[]),['serve','--ws-max-concurrent=-0']);for(const value of[-1,256,1.2,NaN,'8'])assert.throws(()=>new Browser({wsMaxConcurrent:value}),RangeError)});
+--- /dev/null
++++ b/proposals/websocket-quota/context-marker.js
+@@ -0,0 +1,2 @@
++// The context-probe driver performs real CDP context/connection/process actions.
++// Each socket payload and response is generated by actual authored WebSocket API.
+--- /dev/null
++++ b/proposals/websocket-quota/failure-order.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],all=[],attempt=(label,path='/')=>new Promise(resolve=>{const events=[],ws=new WebSocket(ENDPOINT+path+'?id='+label);all.push(ws);events.push(['constructed',ws.readyState]);Promise.resolve().then(()=>events.push(['microtask',ws.readyState]));ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({events,ws})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({events,ws})}});const first=await attempt('hold');rows.push(['held',first.events]);const denied=await attempt('denied');rows.push(['denied',denied.events]);first.ws.close(1000,'release');rows.push(['closing-state',first.ws.readyState]);const onclose=new Promise(resolve=>first.ws.onclose=async()=>{const q=await attempt('inside-close');rows.push(['inside-close',q.events]);q.ws.close();resolve()});await onclose;await new Promise(r=>setTimeout(r,10));const pending=new WebSocket(ENDPOINT+'/hang');const events=[['constructed',pending.readyState]];pending.onopen=()=>events.push('unexpected-open');pending.onerror=()=>events.push('error');const complete=new Promise(resolve=>pending.onclose=e=>{events.push(['close',e.code,e.reason,e.wasClean,pending.readyState]);resolve()});pending.close(3000,'cancel');events.push(['after-close',pending.readyState]);const next=await attempt('after-pending-cancel');rows.push(['pending-cancel',events],['after-cancel',next.events]);next.ws.close();await complete;return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/frame-release.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],f=document.createElement('iframe');document.body.appendChild(f);const ws=new f.contentWindow.WebSocket(ENDPOINT+'/?frame=held');await new Promise(r=>ws.onopen=r);f.remove();const after=label=>new Promise(resolve=>{const s=new WebSocket(ENDPOINT+'/?main='+label),events=[['created',s.readyState]];s.onopen=()=>{events.push('open');s.close()};s.onerror=()=>events.push('error');s.onclose=e=>{events.push(['close',e.code,e.wasClean]);resolve(events)}});rows.push(['after-remove',await after('immediate')]);await new Promise(r=>setTimeout(r,20));rows.push(['after-task',await after('task')]);return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/handshake-failure.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],events=[],first=new WebSocket(ENDPOINT+'/reject');events.push(['constructed',first.readyState]);Promise.resolve().then(()=>events.push(['microtask',first.readyState]));let retry;first.onerror=()=>{events.push(['error',first.readyState]);retry=new WebSocket(ENDPOINT+'/?inside=error');retry.onopen=()=>{events.push('retry-open');retry.close(1000,'done')};retry.onerror=()=>events.push('retry-error')};await new Promise(resolve=>{first.onclose=e=>{events.push(['close',first.readyState,e.code,e.wasClean]);if(retry)retry.onclose=x=>{events.push(['retry-close',x.code]);resolve()};else resolve()}});rows.push(['reject',events]);return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/native-cli-validation-v2.json
+@@ -0,0 +1,415 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "f4c5381c94218a08662b47ea05acdc66e265cc0903726952e84928e9e1ee468a",
++  "origin": "http://127.0.0.1:41889",
++  "rows": [
++    {
++      "value": "0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "8",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "8",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "50",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "50",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "255",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "255",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "256",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "256",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440513410 $scope=app $level=fatal $msg=\"range overflow\" arg=--ws-max-concurrent value=256\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "-1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "-1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440513414 $scope=app $level=fatal $msg=\"range overflow\" arg=--ws-max-concurrent value=-1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1.5",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1.5",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440513418 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=1.5\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "abc",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "abc",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440513421 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=abc\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "01",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "01",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "0xff",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0xff",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440513788 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=0xff\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "0b10",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0b10",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440513791 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=0b10\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1_0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1_0",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": " 1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        " 1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514025 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\" 1\"\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1 ",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1 ",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514029 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\"1 \"\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514034 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "_1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "_1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514037 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=_1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1_",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1_",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514041 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=1_\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+_1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+_1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514045 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=+_1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "_",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "_",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514050 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=_\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514053 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=+\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "-0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "-0",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "++1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "++1",
++        "http://127.0.0.1:41889"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440514364 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=++1\n",
++      "exitCode": 1,
++      "signal": null
++    }
++  ]
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-cli-validation-v3.json
+@@ -0,0 +1,483 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "b0dff298a3b6cdd5b35b69bd4c0a69861e80370193527b37d29ce2891769f497",
++  "origin": "http://127.0.0.1:38693",
++  "rows": [
++    {
++      "value": "0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "8",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "8",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "50",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "50",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "255",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "255",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "256",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "256",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440614770 $scope=app $level=fatal $msg=\"range overflow\" arg=--ws-max-concurrent value=256\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "-1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "-1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440614774 $scope=app $level=fatal $msg=\"range overflow\" arg=--ws-max-concurrent value=-1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1.5",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1.5",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440614776 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=1.5\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "abc",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "abc",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440614779 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=abc\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "01",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "01",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "0xff",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0xff",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615094 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=0xff\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "0b10",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0b10",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615097 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=0b10\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1_0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1_0",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": " 1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        " 1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615269 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\" 1\"\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1 ",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1 ",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615273 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\"1 \"\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615275 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "_1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "_1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615278 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=_1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1_",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1_",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615282 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=1_\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+_1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+_1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615284 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=+_1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "_",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "_",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615287 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=_\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615290 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=+\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "-0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "-0",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "++1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "++1",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440615474 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=++1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1__0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "1__0",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "0_0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "0_0",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "+0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "+0",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "00_8",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "1000",
++        "--ws-max-concurrent",
++        "00_8",
++        "http://127.0.0.1:38693"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    }
++  ]
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-cli-validation.json
+@@ -0,0 +1,296 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "cbb9d120d9dcbcc9da51aad8263543b7011273dc0bd8df2249cf38863121c92e",
++  "origin": "http://127.0.0.1:46465",
++  "rows": [
++    {
++      "value": "0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "0",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "1",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "8",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "8",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "50",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "50",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "255",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "255",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "256",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "256",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440001364 $scope=app $level=fatal $msg=\"range overflow\" arg=--ws-max-concurrent value=256\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "-1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "-1",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440001368 $scope=app $level=fatal $msg=\"range overflow\" arg=--ws-max-concurrent value=-1\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1.5",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "1.5",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440001376 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=1.5\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "abc",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "abc",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440001379 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=abc\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "+1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "+1",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "01",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "01",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": "0xff",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "0xff",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440001934 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=0xff\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "0b10",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "0b10",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440001937 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=0b10\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1_0",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "1_0",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "<!DOCTYPE html>\n<html><head></head><body>quota</body></html>",
++      "stderr": "",
++      "exitCode": 0,
++      "signal": null
++    },
++    {
++      "value": " 1",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        " 1",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440002109 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\" 1\"\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "1 ",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "1 ",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440002113 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\"1 \"\n",
++      "exitCode": 1,
++      "signal": null
++    },
++    {
++      "value": "",
++      "args": [
++        "fetch",
++        "--dump",
++        "html",
++        "--wait-ms",
++        "0",
++        "--ws-max-concurrent",
++        "",
++        "http://127.0.0.1:46465"
++      ],
++      "stdout": "",
++      "stderr": "$time=1793440002116 $scope=app $level=fatal $msg=\"invalid character\" arg=--ws-max-concurrent value=\n",
++      "exitCode": 1,
++      "signal": null
++    }
++  ]
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-contexts-v2-1.json
+@@ -0,0 +1,317 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "b5bd15c38c8847066fb05f3a9b20fde77a7e327062d7312080361bea39cee2d1",
++  "sourceSHA256": "eefd92a12268d6a51ddf97d89dbafc93c1e83c89b601b24a368554a315d6d948",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:40743",
++  "endpoint": "ws://127.0.0.1:40743",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "// The context-probe driver performs real CDP context/connection/process actions.\n// Each socket payload and response is generated by actual authored WebSocket API.\n",
++  "result": [
++    [
++      "A-hold",
++      {
++        "result": {
++          "type": "string",
++          "value": "open"
++        }
++      }
++    ],
++    [
++      "B-blocked",
++      {
++        "result": {
++          "type": "object",
++          "value": [
++            0,
++            [
++              "error",
++              3
++            ],
++            [
++              "close",
++              1006,
++              false
++            ]
++          ]
++        }
++      }
++    ],
++    [
++      "B-after-close-A",
++      {
++        "result": {
++          "type": "string",
++          "value": "open"
++        }
++      }
++    ],
++    [
++      "different-process",
++      {
++        "result": {
++          "type": "string",
++          "value": "open"
++        }
++      }
++    ]
++  ],
++  "requests": [
++    {
++      "url": "/?scope=A",
++      "headers": [
++        "Host",
++        "127.0.0.1:40743",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "q81ohgRAYLEJmy6EkwAFTg==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:40743",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1006,
++      "reason": ""
++    },
++    {
++      "url": "/?scope=B",
++      "headers": [
++        "Host",
++        "127.0.0.1:40743",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "AkrbN6yUo56/NtBZP+5ptQ==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:40743",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "open",
++      "messages": []
++    },
++    {
++      "url": "/?scope=different-process",
++      "headers": [
++        "Host",
++        "127.0.0.1:40743",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "gPvuS2q04Fx+2uLc1M964w==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:40743",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "open",
++      "messages": []
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:40743/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:40743/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:40743",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:40743",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 37055
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 37055
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Inspector.detached",
++      "params": {
++        "reason": "Render process gone."
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Target.detachedFromTarget",
++      "params": {
++        "targetId": "FID-0000000001",
++        "sessionId": "SID-1",
++        "reason": "Render process gone."
++      }
++    },
++    {
++      "method": "Target.targetDestroyed",
++      "params": {
++        "targetId": "FID-0000000001"
++      }
++    }
++  ],
++  "stderr": "$time=1793440571496 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:45691 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-failure-order1.json
+@@ -0,0 +1,224 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "f5786af48dc3ec121cce57292f992d53b0680906d2876bf51191c17af3d600e7",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:38171",
++  "endpoint": "ws://127.0.0.1:38171",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],all=[],attempt=(label,path='/')=>new Promise(resolve=>{const events=[],ws=new WebSocket(\"ws://127.0.0.1:38171\"+path+'?id='+label);all.push(ws);events.push(['constructed',ws.readyState]);Promise.resolve().then(()=>events.push(['microtask',ws.readyState]));ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({events,ws})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({events,ws})}});const first=await attempt('hold');rows.push(['held',first.events]);const denied=await attempt('denied');rows.push(['denied',denied.events]);first.ws.close(1000,'release');rows.push(['closing-state',first.ws.readyState]);const onclose=new Promise(resolve=>first.ws.onclose=async()=>{const q=await attempt('inside-close');rows.push(['inside-close',q.events]);q.ws.close();resolve()});await onclose;await new Promise(r=>setTimeout(r,10));const pending=new WebSocket(\"ws://127.0.0.1:38171\"+'/hang');const events=[['constructed',pending.readyState]];pending.onopen=()=>events.push('unexpected-open');pending.onerror=()=>events.push('error');const complete=new Promise(resolve=>pending.onclose=e=>{events.push(['close',e.code,e.reason,e.wasClean,pending.readyState]);resolve()});pending.close(3000,'cancel');events.push(['after-close',pending.readyState]);const next=await attempt('after-pending-cancel');rows.push(['pending-cancel',events],['after-cancel',next.events]);next.ws.close();await complete;return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"held\",[[\"constructed\",0],[\"microtask\",0],[\"open\",1]]],[\"denied\",[[\"constructed\",0],[\"microtask\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"closing-state\",2],[\"inside-close\",[[\"constructed\",0],[\"microtask\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"pending-cancel\",[[\"constructed\",0],[\"after-close\",3],[\"close\",3000,\"cancel\",false,3]]],[\"after-cancel\",[[\"constructed\",0],[\"microtask\",0],[\"open\",1]]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?id=hold",
++      "headers": [
++        "Host",
++        "127.0.0.1:38171",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "fRXtLKt/1LAgMz9bOiMGRw==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:38171",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": "release"
++    },
++    {
++      "url": "/?id=after-pending-cancel",
++      "headers": [
++        "Host",
++        "127.0.0.1:38171",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "mZPcRxs13ESaYfBVoabW8w==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:38171",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": ""
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:38171/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:38171/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:38171",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:38171",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36136
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36136
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793439651878 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:43455 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-frame-release1.json
+@@ -0,0 +1,373 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "20bfc7e38a7744c1457a10679cbdc0db801b4eab35df704adf0fbe510614fe34",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:44145",
++  "endpoint": "ws://127.0.0.1:44145",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],f=document.createElement('iframe');document.body.appendChild(f);const ws=new f.contentWindow.WebSocket(\"ws://127.0.0.1:44145\"+'/?frame=held');await new Promise(r=>ws.onopen=r);f.remove();const after=label=>new Promise(resolve=>{const s=new WebSocket(\"ws://127.0.0.1:44145\"+'/?main='+label),events=[['created',s.readyState]];s.onopen=()=>{events.push('open');s.close()};s.onerror=()=>events.push('error');s.onclose=e=>{events.push(['close',e.code,e.wasClean]);resolve(events)}});rows.push(['after-remove',await after('immediate')]);await new Promise(r=>setTimeout(r,20));rows.push(['after-task',await after('task')]);return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"after-remove\",[[\"created\",0],\"open\",[\"close\",1000,true]]],[\"after-task\",[[\"created\",0],\"open\",[\"close\",1000,true]]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?frame=held",
++      "headers": [
++        "Host",
++        "127.0.0.1:44145",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "SEONCBRU1rA01foVylwlbg==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "null",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1006,
++      "reason": ""
++    },
++    {
++      "url": "/?main=immediate",
++      "headers": [
++        "Host",
++        "127.0.0.1:44145",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "SNm1fyBgD3i/ylb0Ohh2qA==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:44145",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": ""
++    },
++    {
++      "url": "/?main=task",
++      "headers": [
++        "Host",
++        "127.0.0.1:44145",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "L9TlAe1QYTD+2mkmXjiXBw==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:44145",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": ""
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:44145/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:44145/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:44145",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:44145",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36157
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36157
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameAttached",
++      "params": {
++        "frameId": "FID-0000000002",
++        "parentFrameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameRequestedNavigation",
++      "params": {
++        "frameId": "FID-0000000002",
++        "reason": "initialFrameNavigation",
++        "url": "about:blank",
++        "disposition": "currentTab"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000002",
++        "url": "about:blank",
++        "loaderId": "LID-0000000002",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameClearedScheduledNavigation",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000002",
++          "parentId": "FID-0000000001",
++          "loaderId": "LID-0000000002",
++          "url": "about:blank",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:44145",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 3,
++          "origin": "http://127.0.0.1:44145",
++          "name": "",
++          "uniqueId": "7.8",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000002",
++            "loaderId": "LID-0000000002"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36157
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36157
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameDetached",
++      "params": {
++        "frameId": "FID-0000000002",
++        "reason": "remove"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793439673215 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:44989 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-handshake-failure1.json
+@@ -0,0 +1,222 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "929e40e42db040b4f1087bd35d0654b97418a20d0153de9d2f644c5fb9389fec",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:41793",
++  "endpoint": "ws://127.0.0.1:41793",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],events=[],first=new WebSocket(\"ws://127.0.0.1:41793\"+'/reject');events.push(['constructed',first.readyState]);Promise.resolve().then(()=>events.push(['microtask',first.readyState]));let retry;first.onerror=()=>{events.push(['error',first.readyState]);retry=new WebSocket(\"ws://127.0.0.1:41793\"+'/?inside=error');retry.onopen=()=>{events.push('retry-open');retry.close(1000,'done')};retry.onerror=()=>events.push('retry-error')};await new Promise(resolve=>{first.onclose=e=>{events.push(['close',first.readyState,e.code,e.wasClean]);if(retry)retry.onclose=x=>{events.push(['retry-close',x.code]);resolve()};else resolve()}});rows.push(['reject',events]);return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"reject\",[[\"constructed\",0],[\"microtask\",0],[\"error\",3],[\"close\",3,1006,false],\"retry-open\",[\"retry-close\",1000]]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/reject",
++      "headers": [
++        "Host",
++        "127.0.0.1:41793",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "0H2pNqyNOav7P/QFsSv2hg==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:41793",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "rejected",
++      "messages": []
++    },
++    {
++      "url": "/?inside=error",
++      "headers": [
++        "Host",
++        "127.0.0.1:41793",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "CMw7gDjf1avgZyco0t2HDQ==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:41793",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": "done"
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:41793/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:41793/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:41793",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:41793",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36458
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36458
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793439974593 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:38877 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-ownership1.json
+@@ -0,0 +1,338 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "fa8853b8af826af0c2d0373a9e74a567ca2d681bedc6e4e12b1f7ff37e7f4c45",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:37575",
++  "endpoint": "ws://127.0.0.1:37575",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],held=[],attempt=(C,label,url=\"ws://127.0.0.1:37575\"+'/')=>new Promise(resolve=>{const events=[],ws=new C(url+'?id='+label);held.push(ws);events.push(['created',ws.readyState]);ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({ws,events})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({ws,events})}}),first=await attempt(WebSocket,'main');rows.push(['main',first.events]);const frame=document.createElement('iframe');document.body.appendChild(frame);const second=await attempt(frame.contentWindow.WebSocket,'frame');rows.push(['frame',second.events]);first.ws.close(1000,'first');await new Promise(r=>first.ws.onclose=r);const worker=new Worker('/worker.js'),call=(command,id,count)=>new Promise(resolve=>{worker.onmessage=e=>{if(e.data.id===id)resolve(e.data)};worker.postMessage({command,id,count})});rows.push(['worker',await call('hold','first-worker',1)]);rows.push(['blocked-main', (await attempt(WebSocket,'after-worker')).events]);worker.terminate();const after=await attempt(WebSocket,'after-terminate');rows.push(['terminate-immediate',after.events]);after.ws.close();frame.remove();return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"main\",[[\"created\",0],[\"open\",1]]],[\"frame\",[[\"created\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"worker\",{\"id\":\"first-worker\",\"rows\":[{\"i\":0,\"events\":[[\"constructed\",0],[\"open\",1]]}]}],[\"blocked-main\",[[\"created\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"terminate-immediate\",[[\"created\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?id=main",
++      "headers": [
++        "Host",
++        "127.0.0.1:37575",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "pFCAwGzAQB7GPJxqQln0SQ==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:37575",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": "first"
++    },
++    {
++      "url": "/?worker=first-worker&i=0",
++      "headers": [
++        "Host",
++        "127.0.0.1:37575",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "j4jYRt6DBYLxsuFJLmajrA==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:37575",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "open",
++      "messages": []
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:37575/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:37575/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:37575",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:37575",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36135
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36135
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameAttached",
++      "params": {
++        "frameId": "FID-0000000002",
++        "parentFrameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameRequestedNavigation",
++      "params": {
++        "frameId": "FID-0000000002",
++        "reason": "initialFrameNavigation",
++        "url": "about:blank",
++        "disposition": "currentTab"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000002",
++        "url": "about:blank",
++        "loaderId": "LID-0000000002",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameClearedScheduledNavigation",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000002",
++          "parentId": "FID-0000000001",
++          "loaderId": "LID-0000000002",
++          "url": "about:blank",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:37575",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 3,
++          "origin": "http://127.0.0.1:37575",
++          "name": "",
++          "uniqueId": "7.8",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000002",
++            "loaderId": "LID-0000000002"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36135
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36135
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameDetached",
++      "params": {
++        "frameId": "FID-0000000002",
++        "reason": "remove"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793439651279 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:38839 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-pending1.json
+@@ -0,0 +1,222 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "359eafab018d15160c9a48d5b0ad4d581238d9d1ff36414c7613d8128bef53d5",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:43855",
++  "endpoint": "ws://127.0.0.1:43855",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],pending=new WebSocket(\"ws://127.0.0.1:43855\"+'/hang?pending');await new Promise(r=>setTimeout(r,20));rows.push(['pending',pending.readyState]);const blocked=await new Promise(resolve=>{const s=new WebSocket(\"ws://127.0.0.1:43855\"+'/?after=pending'),events=[s.readyState];s.onerror=()=>events.push('error');s.onclose=e=>{events.push([e.code,e.wasClean]);resolve(events)}});rows.push(['blocked',blocked]);const closed=new Promise(r=>pending.onclose=e=>r([e.code,e.reason,e.wasClean,pending.readyState]));pending.close(3001,'pending');rows.push(['cancel-state',pending.readyState]);rows.push(['replacement',await new Promise(resolve=>{const s=new WebSocket(\"ws://127.0.0.1:43855\"+'/?after=cancel'),events=[];s.onopen=()=>{events.push('open');s.close()};s.onerror=()=>events.push('error');s.onclose=e=>{events.push([e.code,e.wasClean]);resolve(events)}})]);rows.push(['cancel',await closed]);return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"pending\",0],[\"blocked\",[0,\"error\",[1006,false]]],[\"cancel-state\",3],[\"replacement\",[\"open\",[1000,true]]],[\"cancel\",[3001,\"pending\",false,3]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/hang?pending",
++      "headers": [
++        "Host",
++        "127.0.0.1:43855",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "BPXnwIyQmaLNRxjSyEwhTg==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:43855",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "pending",
++      "messages": []
++    },
++    {
++      "url": "/?after=cancel",
++      "headers": [
++        "Host",
++        "127.0.0.1:43855",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "AgCyFIQDZfaXC0k2gqXmlg==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:43855",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": ""
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:43855/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:43855/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:43855",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:43855",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 37036
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 37036
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793440552078 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:41925 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-remote-close1.json
+@@ -0,0 +1,242 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "b9c5afcd9edded4154afb14f1b05c0cbb10a48432419decceeaf70d4c25e7d09",
++  "sourceSHA256": "aa2cd6b20706abbb98bb0027db89bdc86989c5db37831e34da9f95b5bfed92f6",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:38443",
++  "endpoint": "ws://127.0.0.1:38443",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const events=[],first=new WebSocket(\"ws://127.0.0.1:38443\"+'/?remote');first.onopen=()=>first.send('please-close');await new Promise(resolve=>first.onclose=event=>{events.push(['first-close',event.code,event.wasClean]);const next=new WebSocket(\"ws://127.0.0.1:38443\"+'/?inside=remote-close');events.push(['created',next.readyState]);next.onopen=()=>{events.push('next-open');next.close()};next.onerror=()=>events.push('next-error');next.onclose=e=>{events.push(['next-close',e.code,e.wasClean]);resolve()}});return JSON.stringify(events)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"first-close\",1001,true],[\"created\",0],\"next-open\",[\"next-close\",1000,true]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?remote",
++      "headers": [
++        "Host",
++        "127.0.0.1:38443",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "seR5O/bydwz6YDAm7T7Tlw==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:38443",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [
++        {
++          "bytes": [
++            112,
++            108,
++            101,
++            97,
++            115,
++            101,
++            45,
++            99,
++            108,
++            111,
++            115,
++            101
++          ],
++          "binary": false
++        }
++      ],
++      "code": 1001,
++      "reason": "remote"
++    },
++    {
++      "url": "/?inside=remote-close",
++      "headers": [
++        "Host",
++        "127.0.0.1:38443",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "NKdgeBwmvTDkfzF93DWHAQ==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:38443",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": ""
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:38443/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:38443/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:38443",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:38443",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 37509
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 37509
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793441025071 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:37965 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-termination1.json
+@@ -0,0 +1,189 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "4647875b6b7b950ad6774e694cdeb77e8e6dc78d99df4949bfaae4325249125f",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:38073",
++  "endpoint": "ws://127.0.0.1:38073",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],attempt=label=>new Promise(resolve=>{const ws=new WebSocket(\"ws://127.0.0.1:38073\"+'/?main='+label),events=[['constructed',ws.readyState]];ws.onopen=()=>resolve({ws,events:[...events,'open']});ws.onerror=()=>events.push('error');ws.onclose=e=>resolve({ws,events:[...events,['close',e.code,e.wasClean]]})}),worker=new Worker('/worker.js'),done=new Promise(r=>worker.onmessage=e=>r(e.data));worker.postMessage({command:'hold',id:'terminate',count:1});rows.push(['worker',await done]);worker.terminate();for(const delay of[0,10,100]){if(delay)await new Promise(r=>setTimeout(r,delay));const r=await attempt('after'+delay);rows.push(['after-'+delay,r.events]);if(r.ws.readyState===1){r.ws.close();await new Promise(resolve=>r.ws.onclose=resolve)}}return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"worker\",{\"id\":\"terminate\",\"rows\":[{\"i\":0,\"events\":[[\"constructed\",0],[\"open\",1]]}]}],[\"after-0\",[[\"constructed\",0],\"error\",[\"close\",1006,false]]],[\"after-10\",[[\"constructed\",0],\"error\",[\"close\",1006,false]]],[\"after-100\",[[\"constructed\",0],\"error\",[\"close\",1006,false]]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?worker=terminate&i=0",
++      "headers": [
++        "Host",
++        "127.0.0.1:38073",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "ve+BJIM1s6yunXyQ9DSMYA==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:38073",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "open",
++      "messages": []
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:38073/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:38073/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:38073",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:38073",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36156
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36156
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793439672522 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:34673 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-worker-cancel1.json
+@@ -0,0 +1,191 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "0a7922e12f9e5bee10316ef25b53161fa58e1ea801d3a8e80a4b8439926a83f7",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:46189",
++  "endpoint": "ws://127.0.0.1:46189",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const code=`const events=[],first=new WebSocket(${JSON.stringify(\"ws://127.0.0.1:46189\"+'/hang?worker-cancel')});events.push(['first',first.readyState]);first.onclose=e=>events.push(['first-close',e.code,e.reason,e.wasClean]);first.onerror=()=>events.push('first-error');first.close(3002,'worker-cancel');events.push(['after-close',first.readyState]);const second=new WebSocket(${JSON.stringify(\"ws://127.0.0.1:46189\"+'/?after=worker-cancel')});events.push(['second',second.readyState]);second.onopen=()=>{events.push('second-open');second.close(1000,'done')};second.onerror=()=>events.push('second-error');second.onclose=e=>{events.push(['second-close',e.code,e.wasClean]);postMessage(events)}`;const url=URL.createObjectURL(new Blob([code],{type:'text/javascript'})),worker=new Worker(url),events=await new Promise(r=>worker.onmessage=e=>r(e.data));worker.terminate();URL.revokeObjectURL(url);return JSON.stringify(events)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"first\",0],[\"after-close\",3],[\"second\",0],[\"first-close\",3002,\"worker-cancel\",false],\"second-open\",[\"second-close\",1000,true]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?after=worker-cancel",
++      "headers": [
++        "Host",
++        "127.0.0.1:46189",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "kqe+UnpzXtqVyABGMMDhJQ==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "null",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "closed",
++      "messages": [],
++      "code": 1000,
++      "reason": "done"
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:46189/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:46189/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:46189",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:46189",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 37842
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 37842
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793441357890 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:44161 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/native-worker-frame-release1.json
+@@ -0,0 +1,305 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
++  "sourceSHA256": "583b808b0375315955096b311acfcd75bc70a93a760c59d2e6de0935675af0d4",
++  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
++  "origin": "http://127.0.0.1:44765",
++  "endpoint": "ws://127.0.0.1:44765",
++  "args": [
++    "--ws-max-concurrent",
++    "1"
++  ],
++  "expression": "(async()=>{const rows=[],f=document.createElement('iframe');document.body.appendChild(f);const worker=new f.contentWindow.Worker('/worker.js'),ready=new Promise(r=>worker.onmessage=e=>r(e.data));worker.postMessage({command:'hold',id:'frame-worker',count:1});rows.push(['held',await ready]);f.remove();for(const delay of[0,20]){if(delay)await new Promise(r=>setTimeout(r,delay));rows.push(['after-'+delay,await new Promise(resolve=>{const s=new WebSocket(\"ws://127.0.0.1:44765\"+'/?main=frameWorker'+delay),events=[];s.onopen=()=>{events.push('open');s.close()};s.onerror=()=>events.push('error');s.onclose=e=>{events.push(['close',e.code,e.wasClean]);resolve(events)}})])}return JSON.stringify(rows)})()\n",
++  "result": {
++    "result": {
++      "type": "string",
++      "value": "[[\"held\",{\"id\":\"frame-worker\",\"rows\":[{\"i\":0,\"events\":[[\"constructed\",0],[\"open\",1]]}]}],[\"after-0\",[\"error\",[\"close\",1006,false]]],[\"after-20\",[\"error\",[\"close\",1006,false]]]]"
++    }
++  },
++  "requests": [
++    {
++      "url": "/?worker=frame-worker&i=0",
++      "headers": [
++        "Host",
++        "127.0.0.1:44765",
++        "Accept",
++        "*/*",
++        "Accept-Encoding",
++        "deflate, gzip, br, zstd",
++        "Upgrade",
++        "websocket",
++        "Sec-WebSocket-Version",
++        "13",
++        "Sec-WebSocket-Key",
++        "Hq+csdimBnticv+n44Epag==",
++        "User-Agent",
++        "Lightpanda/1.0",
++        "Sec-Ch-Ua",
++        "\"Lightpanda\";v=\"1\"",
++        "Sec-Ch-Ua-Full-Version-List",
++        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
++        "Accept-Language",
++        "en-US,en;q=0.9",
++        "Origin",
++        "http://127.0.0.1:44765",
++        "Connection",
++        "Upgrade"
++      ],
++      "status": "open",
++      "messages": []
++    }
++  ],
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 1,
++          "origin": "",
++          "name": "",
++          "uniqueId": "3.4",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "http://127.0.0.1:44765/",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "http://127.0.0.1:44765/",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:44765",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 2,
++          "origin": "http://127.0.0.1:44765",
++          "name": "",
++          "uniqueId": "5.6",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000001",
++            "loaderId": "LID-0000000001"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36458
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36458
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameAttached",
++      "params": {
++        "frameId": "FID-0000000002",
++        "parentFrameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameRequestedNavigation",
++      "params": {
++        "frameId": "FID-0000000002",
++        "reason": "initialFrameNavigation",
++        "url": "about:blank",
++        "disposition": "currentTab"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000002",
++        "url": "about:blank",
++        "loaderId": "LID-0000000002",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameClearedScheduledNavigation",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000002",
++          "parentId": "FID-0000000001",
++          "loaderId": "LID-0000000002",
++          "url": "about:blank",
++          "domainAndRegistry": "",
++          "securityOrigin": "http://127.0.0.1:44765",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextCreated",
++      "params": {
++        "context": {
++          "id": 3,
++          "origin": "http://127.0.0.1:44765",
++          "name": "",
++          "uniqueId": "7.8",
++          "auxData": {
++            "isDefault": true,
++            "type": "default",
++            "frameId": "FID-0000000002",
++            "loaderId": "LID-0000000002"
++          }
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 36458
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 36458
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000002"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameDetached",
++      "params": {
++        "frameId": "FID-0000000002",
++        "reason": "remove"
++      },
++      "sessionId": "SID-1"
++    }
++  ],
++  "stderr": "$time=1793439973734 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:37101 max_connections=16127 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/proposals/websocket-quota/ownership.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],held=[],attempt=(C,label,url=ENDPOINT+'/')=>new Promise(resolve=>{const events=[],ws=new C(url+'?id='+label);held.push(ws);events.push(['created',ws.readyState]);ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({ws,events})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({ws,events})}}),first=await attempt(WebSocket,'main');rows.push(['main',first.events]);const frame=document.createElement('iframe');document.body.appendChild(frame);const second=await attempt(frame.contentWindow.WebSocket,'frame');rows.push(['frame',second.events]);first.ws.close(1000,'first');await new Promise(r=>first.ws.onclose=r);const worker=new Worker('/worker.js'),call=(command,id,count)=>new Promise(resolve=>{worker.onmessage=e=>{if(e.data.id===id)resolve(e.data)};worker.postMessage({command,id,count})});rows.push(['worker',await call('hold','first-worker',1)]);rows.push(['blocked-main', (await attempt(WebSocket,'after-worker')).events]);worker.terminate();const after=await attempt(WebSocket,'after-terminate');rows.push(['terminate-immediate',after.events]);after.ws.close();frame.remove();return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/pending.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],pending=new WebSocket(ENDPOINT+'/hang?pending');await new Promise(r=>setTimeout(r,20));rows.push(['pending',pending.readyState]);const blocked=await new Promise(resolve=>{const s=new WebSocket(ENDPOINT+'/?after=pending'),events=[s.readyState];s.onerror=()=>events.push('error');s.onclose=e=>{events.push([e.code,e.wasClean]);resolve(events)}});rows.push(['blocked',blocked]);const closed=new Promise(r=>pending.onclose=e=>r([e.code,e.reason,e.wasClean,pending.readyState]));pending.close(3001,'pending');rows.push(['cancel-state',pending.readyState]);rows.push(['replacement',await new Promise(resolve=>{const s=new WebSocket(ENDPOINT+'/?after=cancel'),events=[];s.onopen=()=>{events.push('open');s.close()};s.onerror=()=>events.push('error');s.onclose=e=>{events.push([e.code,e.wasClean]);resolve(events)}})]);rows.push(['cancel',await closed]);return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/remote-close.js
+@@ -0,0 +1 @@
++(async()=>{const events=[],first=new WebSocket(ENDPOINT+'/?remote');first.onopen=()=>first.send('please-close');await new Promise(resolve=>first.onclose=event=>{events.push(['first-close',event.code,event.wasClean]);const next=new WebSocket(ENDPOINT+'/?inside=remote-close');events.push(['created',next.readyState]);next.onopen=()=>{events.push('next-open');next.close()};next.onerror=()=>events.push('next-error');next.onclose=e=>{events.push(['next-close',e.code,e.wasClean]);resolve()}});return JSON.stringify(events)})()
+--- /dev/null
++++ b/proposals/websocket-quota/serial.js
+@@ -0,0 +1 @@
++(async()=>{const serial=[],run=(label,data,commands=[])=>new Promise(resolve=>{const events=[],ws=new WebSocket(ENDPOINT+'/?case='+label);ws.binaryType='arraybuffer';const timer=setTimeout(()=>{ws.close();resolve({label,events,timeout:true})},3000);ws.onopen=()=>{events.push(['open',ws.readyState]);ws.send(data);for(const text of commands)ws.send(text)};ws.onmessage=e=>{events.push(['message',typeof e.data==='string'?e.data:Array.from(new Uint8Array(e.data))]);ws.close(1000,'done')};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{clearTimeout(timer);events.push(['close',e.code,e.reason,e.wasClean]);resolve({label,events})}});for(const[label,data]of[['text','hello'],['u8',new Uint8Array([1,2,3,4,5])],['buffer',new Uint8Array([10,20,30,40]).buffer],['i32',new Int32Array([0x01020304,0x05060708])],['blob',new Blob(['hello'])],['large','send-large:10000'],['server-close','close:1001:going away'],['cookie','get-cookie'],['origin','get-origin']]){document.cookie='ws_token=session_xyz; path=/';serial.push(await run(label,data))}return JSON.stringify(serial)})()
+--- /dev/null
++++ b/proposals/websocket-quota/termination.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],attempt=label=>new Promise(resolve=>{const ws=new WebSocket(ENDPOINT+'/?main='+label),events=[['constructed',ws.readyState]];ws.onopen=()=>resolve({ws,events:[...events,'open']});ws.onerror=()=>events.push('error');ws.onclose=e=>resolve({ws,events:[...events,['close',e.code,e.wasClean]]})}),worker=new Worker('/worker.js'),done=new Promise(r=>worker.onmessage=e=>r(e.data));worker.postMessage({command:'hold',id:'terminate',count:1});rows.push(['worker',await done]);worker.terminate();for(const delay of[0,10,100]){if(delay)await new Promise(r=>setTimeout(r,delay));const r=await attempt('after'+delay);rows.push(['after-'+delay,r.events]);if(r.ws.readyState===1){r.ws.close();await new Promise(resolve=>r.ws.onclose=resolve)}}return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/worker-cancel.js
+@@ -0,0 +1 @@
++(async()=>{const code=`const events=[],first=new WebSocket(${JSON.stringify(ENDPOINT+'/hang?worker-cancel')});events.push(['first',first.readyState]);first.onclose=e=>events.push(['first-close',e.code,e.reason,e.wasClean]);first.onerror=()=>events.push('first-error');first.close(3002,'worker-cancel');events.push(['after-close',first.readyState]);const second=new WebSocket(${JSON.stringify(ENDPOINT+'/?after=worker-cancel')});events.push(['second',second.readyState]);second.onopen=()=>{events.push('second-open');second.close(1000,'done')};second.onerror=()=>events.push('second-error');second.onclose=e=>{events.push(['second-close',e.code,e.wasClean]);postMessage(events)}`;const url=URL.createObjectURL(new Blob([code],{type:'text/javascript'})),worker=new Worker(url),events=await new Promise(r=>worker.onmessage=e=>r(e.data));worker.terminate();URL.revokeObjectURL(url);return JSON.stringify(events)})()
+--- /dev/null
++++ b/proposals/websocket-quota/worker-frame-release.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],f=document.createElement('iframe');document.body.appendChild(f);const worker=new f.contentWindow.Worker('/worker.js'),ready=new Promise(r=>worker.onmessage=e=>r(e.data));worker.postMessage({command:'hold',id:'frame-worker',count:1});rows.push(['held',await ready]);f.remove();for(const delay of[0,20]){if(delay)await new Promise(r=>setTimeout(r,delay));rows.push(['after-'+delay,await new Promise(resolve=>{const s=new WebSocket(ENDPOINT+'/?main=frameWorker'+delay),events=[];s.onopen=()=>{events.push('open');s.close()};s.onerror=()=>events.push('error');s.onclose=e=>{events.push(['close',e.code,e.wasClean]);resolve(events)}})])}return JSON.stringify(rows)})()
+--- /dev/null
++++ b/proposals/websocket-quota/worker.js
+@@ -0,0 +1 @@
++const held=[];onmessage=async e=>{const{command,id,count}=e.data;if(command==='hold'){const rows=[];for(let i=0;i<count;i++)rows.push(new Promise(resolve=>{const ws=new WebSocket(ENDPOINT+'/?worker='+id+'&i='+i),events=[['constructed',ws.readyState]];held.push(ws);ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({i,events})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({i,events})}}));postMessage({id,rows:await Promise.all(rows)})}else if(command==='close'){for(const ws of held)ws.close(1000,'worker');postMessage({id,states:held.map(ws=>ws.readyState)})}else if(command==='self-close'){postMessage({id});close()}};

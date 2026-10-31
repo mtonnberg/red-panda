@@ -1,0 +1,108 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installWindowEventSource} from './eventsource.js';
+ import {installSelectControls} from './select-controls.js';
+ import {installWindowWebSocket} from './window-websocket.js';
+ import {validateWebSocketLimit,browserWebSocketQuota} from './websocket-transports.js';
+@@ -279,6 +280,7 @@
+       installDevicePermissions(this,window);
+       installFonts(window);
+       installFetch(this, window);
++      installWindowEventSource(this,window);
+       const creatorSnapshot=captureWorkerCreator(this,window);
+       const secure=creatorSnapshot().secure;
+       installPaymentRequest(window,{secure});
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installWindowEventSource} from './eventsource.js';
+ import {installWindowWebSocket} from './window-websocket.js';
+ import {installPaymentRequest} from './payment-request.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+@@ -41,7 +42,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,5 @@
++import {installEventSource} from './eventsource.js';
++import {createParentEventSources,createWorkerEventSourceClient} from './worker-eventsource.js';
+ import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
+ import { installWebCrypto } from './web-crypto.js';
+ import {installScheduler} from './scheduler.js';
+@@ -45,7 +47,7 @@
+   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
+   signal?.addEventListener('abort', dispose, { once: true });
+   class Worker extends window.EventTarget {
+-    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map(); #socketTransports;
++    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map(); #eventSources; #socketTransports;
+     constructor(input, options = {}, serviceToken) {
+       super();
+       const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
+@@ -64,6 +66,7 @@
+       if (!enabled&&!service) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
++      this.#eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+       this.#socketTransports=createParentWorkerSockets(page,{origin:url.protocol==='data:'?'null':creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+       this.#thread = new ThreadWorker(new URL(import.meta.url), {
+         // File-backed workers must not inherit an embedding CLI's --input-type
+@@ -76,6 +79,7 @@
+       service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
+       owned.add(this);
+       this.#thread.on('message', async message => {
++        if(message.kind==='eventSourceOpen'||message.kind==='eventSourceClose'){this.#eventSources.handle(message);return;}
+         if(message.kind==='socketStart'||message.kind==='socketSend'||message.kind==='socketClose'||message.kind==='socketCloseDispatched'){this.#socketTransports.handle(message);return;}
+         if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
+         if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
+@@ -151,7 +155,7 @@
+       this.#thread.on('messageerror', () => {
+         if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
+       });
+-      this.#thread.once('exit', () => { this.#socketTransports?.detach(); this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
++      this.#thread.once('exit', () => { this.#eventSources?.detach(); this.#socketTransports?.detach(); this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+       // Installing a message listener refs Node's underlying MessagePort; unref
+       // after installing listeners so workers cannot hold server shutdown open.
+       this.#thread.unref();
+@@ -167,7 +171,7 @@
+     }
+     terminate() {
+       if (this.#terminated) return;
+-      this.#terminated = true;this.#socketTransports?.detach(); owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
++      this.#terminated = true;this.#eventSources?.detach();this.#socketTransports?.detach(); owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
+     }
+   }
+   for (const name of ['message', 'messageerror', 'error']) {
+@@ -189,7 +193,7 @@
+ 
+ async function runWorker() {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient;
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient;
+   let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+@@ -330,6 +334,8 @@
+   installAudioData(vm.runInContext('globalThis', context));
+   installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
++  eventSourceClient=createWorkerEventSourceClient(parentPort);
++  installEventSource(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),baseURL:()=>workerData.url,createTransport:eventSourceClient.create,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),active:()=>!closed,trustEvent:trustWorkerEvent});
+   socketClient=createWorkerSocketClient(parentPort,createSyncWorkerSocketPolicy(parentPort));
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketFactory:socketClient.create,origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+@@ -340,6 +346,7 @@
+   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
+   parentPort.on('message', message => {
+     if (closed) return;
++    if(message.kind==='eventSourceEvent'){eventSourceClient.handle(message);return;}
+     if(message.kind==='socketEvent'||message.kind==='socketSent'){socketClient.handle(message);return;}
+     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+     else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}

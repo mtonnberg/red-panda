@@ -1,3 +1,6 @@
+import {installEventSource} from './eventsource.js';
+import {createParentEventSources,createWorkerEventSourceClient} from './worker-eventsource.js';
+import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
 import { installWebCrypto } from './web-crypto.js';
 import {installScheduler} from './scheduler.js';
 import {installWorkerDOMException} from './worker-dom-exception.js';
@@ -44,7 +47,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
   function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
   signal?.addEventListener('abort', dispose, { once: true });
   class Worker extends window.EventTarget {
-    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map();
+    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map(); #eventSources; #socketTransports;
     constructor(input, options = {}, serviceToken) {
       super();
       const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
@@ -63,6 +66,8 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       if (!enabled&&!service) return;
       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
+      this.#eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+      this.#socketTransports=createParentWorkerSockets(page,{origin:url.protocol==='data:'?'null':creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
       this.#thread = new ThreadWorker(new URL(import.meta.url), {
         // File-backed workers must not inherit an embedding CLI's --input-type
         // or --eval flags. Only the VM-module capability is needed here.
@@ -74,6 +79,8 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
       owned.add(this);
       this.#thread.on('message', async message => {
+        if(message.kind==='eventSourceOpen'||message.kind==='eventSourceClose'){this.#eventSources.handle(message);return;}
+        if(message.kind==='socketStart'||message.kind==='socketSend'||message.kind==='socketClose'||message.kind==='socketCloseDispatched'){this.#socketTransports.handle(message);return;}
         if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
         if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
         if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
@@ -98,7 +105,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
         else if (message.kind === 'close') this.terminate();
         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
         else if(message.kind==='socketPolicy'){
-          try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(page,message.url));}
+          try{completeWorkerSocketPolicy(message.sync,message.protocols!==undefined?this.#socketTransports.create(message.url,message.protocols):await workerSocketPolicy(page,message.url));}
           catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
         }
         else if (message.kind === 'request') {
@@ -148,7 +155,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       this.#thread.on('messageerror', () => {
         if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
       });
-      this.#thread.once('exit', () => { this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+      this.#thread.once('exit', () => { this.#eventSources?.detach(); this.#socketTransports?.detach(); this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
       // Installing a message listener refs Node's underlying MessagePort; unref
       // after installing listeners so workers cannot hold server shutdown open.
       this.#thread.unref();
@@ -164,7 +171,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
     }
     terminate() {
       if (this.#terminated) return;
-      this.#terminated = true; owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
+      this.#terminated = true;this.#eventSources?.detach();this.#socketTransports?.detach(); owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
     }
   }
   for (const name of ['message', 'messageerror', 'error']) {
@@ -186,7 +193,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
 
 async function runWorker() {
   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
+  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient;
   let dispatchError = value => report(value);
   const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
@@ -327,7 +334,10 @@ async function runWorker() {
   installAudioData(vm.runInContext('globalThis', context));
   installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
-  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+  eventSourceClient=createWorkerEventSourceClient(parentPort);
+  installEventSource(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),baseURL:()=>workerData.url,createTransport:eventSourceClient.create,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),active:()=>!closed,trustEvent:trustWorkerEvent});
+  socketClient=createWorkerSocketClient(parentPort,createSyncWorkerSocketPolicy(parentPort));
+  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketFactory:socketClient.create,origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
 
@@ -336,6 +346,8 @@ async function runWorker() {
   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
   parentPort.on('message', message => {
     if (closed) return;
+    if(message.kind==='eventSourceEvent'){eventSourceClient.handle(message);return;}
+    if(message.kind==='socketEvent'||message.kind==='socketSent'){socketClient.handle(message);return;}
     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
     else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
     else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}

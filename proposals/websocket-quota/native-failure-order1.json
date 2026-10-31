@@ -1,0 +1,224 @@
+{
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "driverSHA256": "e461ea686e1311841f1ee0e5295e46be29f3772ccd66da6b8992223e2e563cc5",
+  "sourceSHA256": "f5786af48dc3ec121cce57292f992d53b0680906d2876bf51191c17af3d600e7",
+  "workerSHA256": "62fb94581d68b4d46ba8e2a81739e8939b4ddbee1d395df8b1e7f81149f4d646",
+  "origin": "http://127.0.0.1:38171",
+  "endpoint": "ws://127.0.0.1:38171",
+  "args": [
+    "--ws-max-concurrent",
+    "1"
+  ],
+  "expression": "(async()=>{const rows=[],all=[],attempt=(label,path='/')=>new Promise(resolve=>{const events=[],ws=new WebSocket(\"ws://127.0.0.1:38171\"+path+'?id='+label);all.push(ws);events.push(['constructed',ws.readyState]);Promise.resolve().then(()=>events.push(['microtask',ws.readyState]));ws.onopen=()=>{events.push(['open',ws.readyState]);resolve({events,ws})};ws.onerror=()=>events.push(['error',ws.readyState]);ws.onclose=e=>{events.push(['close',ws.readyState,e.code,e.reason,e.wasClean]);resolve({events,ws})}});const first=await attempt('hold');rows.push(['held',first.events]);const denied=await attempt('denied');rows.push(['denied',denied.events]);first.ws.close(1000,'release');rows.push(['closing-state',first.ws.readyState]);const onclose=new Promise(resolve=>first.ws.onclose=async()=>{const q=await attempt('inside-close');rows.push(['inside-close',q.events]);q.ws.close();resolve()});await onclose;await new Promise(r=>setTimeout(r,10));const pending=new WebSocket(\"ws://127.0.0.1:38171\"+'/hang');const events=[['constructed',pending.readyState]];pending.onopen=()=>events.push('unexpected-open');pending.onerror=()=>events.push('error');const complete=new Promise(resolve=>pending.onclose=e=>{events.push(['close',e.code,e.reason,e.wasClean,pending.readyState]);resolve()});pending.close(3000,'cancel');events.push(['after-close',pending.readyState]);const next=await attempt('after-pending-cancel');rows.push(['pending-cancel',events],['after-cancel',next.events]);next.ws.close();await complete;return JSON.stringify(rows)})()\n",
+  "result": {
+    "result": {
+      "type": "string",
+      "value": "[[\"held\",[[\"constructed\",0],[\"microtask\",0],[\"open\",1]]],[\"denied\",[[\"constructed\",0],[\"microtask\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"closing-state\",2],[\"inside-close\",[[\"constructed\",0],[\"microtask\",0],[\"error\",3],[\"close\",3,1006,\"\",false]]],[\"pending-cancel\",[[\"constructed\",0],[\"after-close\",3],[\"close\",3000,\"cancel\",false,3]]],[\"after-cancel\",[[\"constructed\",0],[\"microtask\",0],[\"open\",1]]]]"
+    }
+  },
+  "requests": [
+    {
+      "url": "/?id=hold",
+      "headers": [
+        "Host",
+        "127.0.0.1:38171",
+        "Accept",
+        "*/*",
+        "Accept-Encoding",
+        "deflate, gzip, br, zstd",
+        "Upgrade",
+        "websocket",
+        "Sec-WebSocket-Version",
+        "13",
+        "Sec-WebSocket-Key",
+        "fRXtLKt/1LAgMz9bOiMGRw==",
+        "User-Agent",
+        "Lightpanda/1.0",
+        "Sec-Ch-Ua",
+        "\"Lightpanda\";v=\"1\"",
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "Accept-Language",
+        "en-US,en;q=0.9",
+        "Origin",
+        "http://127.0.0.1:38171",
+        "Connection",
+        "Upgrade"
+      ],
+      "status": "closed",
+      "messages": [],
+      "code": 1000,
+      "reason": "release"
+    },
+    {
+      "url": "/?id=after-pending-cancel",
+      "headers": [
+        "Host",
+        "127.0.0.1:38171",
+        "Accept",
+        "*/*",
+        "Accept-Encoding",
+        "deflate, gzip, br, zstd",
+        "Upgrade",
+        "websocket",
+        "Sec-WebSocket-Version",
+        "13",
+        "Sec-WebSocket-Key",
+        "mZPcRxs13ESaYfBVoabW8w==",
+        "User-Agent",
+        "Lightpanda/1.0",
+        "Sec-Ch-Ua",
+        "\"Lightpanda\";v=\"1\"",
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "Accept-Language",
+        "en-US,en;q=0.9",
+        "Origin",
+        "http://127.0.0.1:38171",
+        "Connection",
+        "Upgrade"
+      ],
+      "status": "closed",
+      "messages": [],
+      "code": 1000,
+      "reason": ""
+    }
+  ],
+  "events": [
+    {
+      "method": "Target.targetCreated",
+      "params": {
+        "targetInfo": {
+          "url": "about:blank",
+          "title": "",
+          "targetId": "FID-0000000001",
+          "attached": false,
+          "type": "page",
+          "canAccessOpener": false,
+          "browserContextId": "BID-1"
+        }
+      }
+    },
+    {
+      "method": "Target.attachedToTarget",
+      "params": {
+        "sessionId": "SID-1",
+        "targetInfo": {
+          "url": "about:blank",
+          "title": "",
+          "targetId": "FID-0000000001",
+          "attached": true,
+          "type": "page",
+          "canAccessOpener": false,
+          "browserContextId": "BID-1"
+        },
+        "waitingForDebugger": false
+      }
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 1,
+          "origin": "",
+          "name": "",
+          "uniqueId": "3.4",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000001"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedNavigating",
+      "params": {
+        "frameId": "FID-0000000001",
+        "url": "http://127.0.0.1:38171/",
+        "loaderId": "LID-0000000001",
+        "navigationType": "differentDocument"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStartedLoading",
+      "params": {
+        "frameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextsCleared",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameNavigated",
+      "params": {
+        "type": "Navigation",
+        "frame": {
+          "id": "FID-0000000001",
+          "loaderId": "LID-0000000001",
+          "url": "http://127.0.0.1:38171/",
+          "domainAndRegistry": "",
+          "securityOrigin": "http://127.0.0.1:38171",
+          "mimeType": "text/html",
+          "adFrameStatus": {
+            "adFrameType": "none"
+          },
+          "secureContextType": "InsecureScheme",
+          "crossOriginIsolatedContextType": "NotIsolated",
+          "gatedAPIFeatures": []
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Runtime.executionContextCreated",
+      "params": {
+        "context": {
+          "id": 2,
+          "origin": "http://127.0.0.1:38171",
+          "name": "",
+          "uniqueId": "5.6",
+          "auxData": {
+            "isDefault": true,
+            "type": "default",
+            "frameId": "FID-0000000001",
+            "loaderId": "LID-0000000001"
+          }
+        }
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "DOM.documentUpdated",
+      "params": {},
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.domContentEventFired",
+      "params": {
+        "timestamp": 36136
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.loadEventFired",
+      "params": {
+        "timestamp": 36136
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Page.frameStoppedLoading",
+      "params": {
+        "frameId": "FID-0000000001"
+      },
+      "sessionId": "SID-1"
+    }
+  ],
+  "stderr": "$time=1793439651878 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:43455 max_connections=16127 max_browser_connections=16\n"
+}

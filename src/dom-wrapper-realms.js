@@ -1,3 +1,4 @@
+import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
 import {transformPrivateEventSource} from './dom-event-state.js';
 import {registerDOMAllocationKind,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
 // Fresh Node/Event wrappers are allocated in their actual document VM. Generated
@@ -84,13 +85,14 @@ export function installDOMWrapperRealms(){
    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
   }
   if(event)source=transformPrivateEventSource(source,kind);
+  if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
   candidates.push({factory,kind,full,originalSource,source});
  }
  const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='868d8b79e5309539b7018606ffa46ffd40b56f6295878521854592092211fc1c')throw new Error('Pinned jsdom DOM allocation source changed');
  for(const {factory,kind,full,source} of candidates){
   const module={exports:factory};
-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory);
+  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm);
   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
   const setup=factory.setup;
   factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};

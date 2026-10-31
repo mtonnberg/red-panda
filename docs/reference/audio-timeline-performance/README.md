@@ -25,14 +25,14 @@ Both runs used ephemeral static origins, real source registration flags and the
 unchanged Native harness. No fixture assertion was edited.
 
 Seven fresh Native controls cover reverse chronological insertion, time ties,
-ramps, cancellation, held curves and point-overlap errors. Six rendered rows match
-exactly. The seventh reveals a preexisting independent-renderer discrepancy:
-following cancel(0), re-adding a curve then rejecting a point inside it leaves that
-curve rendered here, while Native renders the original1. Both original and
-optimized Root produce exactly the same seven complete observations. The raw
-Native expectation is retained unchanged; the new bounded test checks the six
-exact rows and the seventh error identity. This performance delta does not claim
-to fix that separate curve lifecycle behavior.
+ramps, cancellation, held curves and point-overlap errors. At the performance-only
+checkpoint, six rendered rows matched exactly and the seventh retained a baseline
+difference. Subsequent independent Native controls proved that difference was
+per-quantum rate selection, unrelated to cancellation or overlap rejection.
+The audio-curve-quantum followup now uses the measured selection and actual
+computed-value state for gain/offset; all seven unchanged Native observations are
+asserted exactly. The performance-only before/after observations remain in their
+immutable proposal archive.
 
 No duplicate event coalescing, event/node/sample cap, silent deep-graph fallback,
 recorded output vector or native engine import is introduced. Host-private state,

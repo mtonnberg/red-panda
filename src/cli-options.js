@@ -7,6 +7,7 @@ export function prepareCLIArguments(argv,formats) {
  const accepted=new Set(formats),result=[];
  for(let i=0;i<argv.length;i++){
   const arg=argv[i];result.push(arg);
+  if(arg==='--ws-max-concurrent'&&/^-\d[\d_]*$/.test(argv[i+1]??'')){result[result.length-1]=arg+'='+argv[++i];continue;}
   if(arg==='--'){result.push(...argv.slice(i+1));break;}
   if(arg==='--dump'&&!accepted.has(argv[i+1]))result.push('html');
  }
@@ -38,4 +39,10 @@ export function parseCLIHTTPHeaders(values=[]) {
   try{headers.set(name,value);}catch(error){throw new Error(`Invalid --http-header ${name}: ${error.message}`,{cause:error});}
  }
  return headers;
+}
+
+// Native's decimal integer parser accepts a leading sign and separators.
+export function parseWebSocketLimit(value='8'){
+ if(typeof value!=='string'||!/^[-+]?[0-9](?:[0-9_]*[0-9])?(?![\s\S])/.test(value)||!/[0-9]/.test(value))throw new Error('invalid character for --ws-max-concurrent');
+ const number=Number(value.replaceAll('_',''));if(!Number.isInteger(number)||number<0||number>255)throw new Error('range overflow for --ws-max-concurrent');return number;
 }

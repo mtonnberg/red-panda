@@ -1,4 +1,7 @@
+import {installWindowEventSource} from './eventsource.js';
 import {installSelectControls} from './select-controls.js';
+import {installWindowWebSocket} from './window-websocket.js';
+import {validateWebSocketLimit,browserWebSocketQuota} from './websocket-transports.js';
 import {installMediaElements} from './media-elements.js';
 import {installPaymentRequest} from './payment-request.js';
 import {installImages} from './images.js';
@@ -145,7 +148,9 @@ class PageResources extends ResourceLoader {
 export class Browser extends EventEmitter {
   constructor(options = {}) {
     super();
+    const wsLimit=validateWebSocketLimit(options.wsMaxConcurrent);
     this.options = options;
+    browserWebSocketQuota(this,wsLimit);
     this.syncHTTP = new SyncHTTP();
     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
@@ -242,6 +247,7 @@ export class Page extends EventEmitter {
   prepareWindow(window, historyState = null, { main = true } = {}) {
     preparePopupDocument(this,window);
     captureProtocolRealm(window);
+    installWindowWebSocket(this,window);
     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
     this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
     alignMainIDLPrototypes(window);
@@ -274,6 +280,7 @@ export class Page extends EventEmitter {
       installDevicePermissions(this,window);
       installFonts(window);
       installFetch(this, window);
+      installWindowEventSource(this,window);
       const creatorSnapshot=captureWorkerCreator(this,window);
       const secure=creatorSnapshot().secure;
       installPaymentRequest(window,{secure});

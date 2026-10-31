@@ -115,14 +115,14 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 
 | Surface | Supported |
 | --- | --- |
-| Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
+| Fetch | Streaming EventSource with reconnect, IDs, cookies and CORS; HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket and FileReaderSync |
+| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket/EventSource and FileReaderSync; Browser-wide WebSocket admission (default 8, `--ws-max-concurrent 0..255`) |
 | Web APIs | Real HTMLDDA collections, CSS.escape/supports namespaces, Selection and Range geometry, actual Web Crypto keys/bytes, Cookie Store, Web Locks, Scheduler, form-associated custom elements, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Canvas | Genuine context/Path2D state, measured transparent pixel reads and independently encoded PNG output; the target profile has no Canvas rasterizer |
 | Storage | UTF-8 value-byte quota, context/origin backing state and genuine shared frame wrappers; key order and legacy reflection remain incomplete |
 | Media values | Genuine ImageData, AudioData and VideoFrame bytes/planes/clones, encoded chunks and VideoColorSpace; codec task/error behavior without fabricated processing output |
-| Offline audio | Real AudioBuffer channel data and scheduled buffer-source rendering, resampling, loops, playback rate/detune and completion events; wider audio nodes remain incomplete |
+| Offline audio | Real AudioBuffer channel data and scheduled buffer-source rendering, resampling, loops, gain/oscillator/compressor nodes, WAV decoding and completion events, including measured curve quantum and cached parameter state; wider audio nodes remain incomplete |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
@@ -228,7 +228,9 @@ available. These bounds apply to the implemented subset, not full network parity
 
 Dedicated workers use actual isolated threads and are terminated when their
 document is disposed. Blob worker URLs and transferred MessagePorts are supported;
-SharedWorker, nested workers and Blob/File message cloning remain unsupported.
+SharedWorker and nested workers remain unsupported. Blob/File message cloning is supported.
+Worker-owned SSE and WebSocket connections retain the measured transport lifetime
+after worker closure and close when their owning Page closes.
 Keyboard Tab traversal currently covers
 the light DOM; it does not traverse frame or shadow trees. CLI fetch/serve enable
 no optional resources by default; MCP defaults to stylesheet loading. Repeated
@@ -270,16 +272,18 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 80 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 84 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes1,507 JavaScript tests,80 PureScript Puppeteer
-checks and13 Native differential groups, plus syntax and strict PureScript checks.
-[Source-bound validation](docs/reference/phase18-integration/validation.json)
-retains both failed full epochs and the final22/22 paired fixture replays.
+The current checkpoint passes 1,552 JavaScript tests, 84 PureScript Puppeteer
+checks and 13 native differential groups, plus syntax and strict PureScript checks.
+[Source-bound validation](docs/reference/phase19-integration/validation.json)
+records all 9,275 unchanged inputs and paired native/candidate fixture replays:
+24/24 with their declared profiles, plus 2/2 with an explicit WebSocket limit of 50.
+Earlier failed epochs remain recorded. Full browser equivalence remains incomplete.
 
 ## REA investigation and comparison
 
