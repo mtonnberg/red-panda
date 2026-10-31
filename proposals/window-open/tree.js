@@ -1,0 +1,1 @@
+(async()=>{const rows=[];globalThis.popup=open('about:blank','tree');const p=open('/popup','loaded');await new Promise(r=>setTimeout(r,30));rows.push(['popup',popup.closed,p.closed,p.document.title]);return JSON.stringify(rows)})()

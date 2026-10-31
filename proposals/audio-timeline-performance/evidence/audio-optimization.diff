@@ -1,0 +1,54 @@
+diff --git a/evidence/audio-core.js.before-optimization b/src/audio-core.js
+index 4e62c3b..16c87b0 100644
+--- a/evidence/audio-core.js.before-optimization
++++ b/src/audio-core.js
+@@ -49,13 +49,16 @@ function audioFactory(g,bridge){
+   copyFromChannel(destination,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(destination))throw new TypeError('');const source=channel(state,index),offset=uint(start),length=min(arrayLength(destination),max(0,arrayLength(source)-offset));for(let at=0;at<length;at++)destination[at]=source[offset+at];}
+   copyToChannel(source,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(source))throw new TypeError('');const destination=channel(state,index),offset=uint(start),length=min(arrayLength(source),max(0,arrayLength(destination)-offset));const snapshot=internal();for(let at=0;at<length;at++)snapshot.push(source[at]);for(let at=0;at<length;at++)destination[offset+at]=snapshot[at];}
+  }
+- function makeParam(context,value,automation='k-rate'){const key=record(),state=record({context,canonical:key,wrapper:null,value:fround(value),defaultValue:fround(value),automation,fixed:automation==='k-rate',incoming:new Set(),events:internal(),sequence:0});params.set(key,state);return key;}
++ function makeParam(context,value,automation='k-rate'){const key=record(),state=record({context,canonical:key,wrapper:null,value:fround(value),defaultValue:fround(value),automation,fixed:automation==='k-rate',incoming:new Set(),events:internal(),curveCount:0,sequence:0});params.set(key,state);return key;}
+  function initialParam(value,input){const state=brand(params,value);state.value=max(state.min??-constant,min(state.max??constant,float(input)));}
+  function paramView(value){const state=brand(params,value);if(!state.wrapper){const wrapper=allocate(AudioParam.prototype);params.set(wrapper,state);state.wrapper=wrapper;publish(wrapper,'AudioParam');}return state.wrapper;}
+ 
+- function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);automationOverlap(state,time);state.events.push(record({type,value,time,extra,sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return object;}
+- function paramValue(state,time){let value=state.value,previousTime=0,target=null;
+-  const current=at=>target?(target.constant===0?target.value:target.value+(value-target.value)*exp(-(at-previousTime)/target.constant)):value;
++ // Fresh events have increasing sequence numbers. Insert after the existing
++ // events at the same time, preserving the exact former stable-sort order.
++ function insertParamEvent(state,event){const values=state.events;if(!values.length||event.time>=values[values.length-1].time){values.push(event);return;}let low=0,high=values.length;while(low<high){const at=floor((low+high)/2);if(values[at].time<=event.time)low=at+1;else high=at;}values.splice(low,0,event);}
++ function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);automationOverlap(state,time);insertParamEvent(state,record({type,value,time,extra,sequence:state.sequence++}));return object;}
++ function paramValue(state,time){if(!state.events.length)return state.value;let value=state.value,previousTime=0,target=null;
++  const current=at=>target?(target.extra===0?target.value:target.value+(value-target.value)*exp(-(at-previousTime)/target.extra)):value;
+   for(const event of state.events){
+    if(event.type==='linear'||event.type==='exponential'){
+     if(event.time>time){const fraction=event.time===previousTime?1:max(0,min(1,(time-previousTime)/(event.time-previousTime)));return event.type==='linear'?value+(event.value-value)*fraction:value*pow(event.value/value,fraction);}
+@@ -63,13 +66,13 @@ function audioFactory(g,bridge){
+    }
+    if(event.time>time)break;
+    value=current(event.time);target=null;
+-   if(event.type==='target'){target=record({value:event.value,constant:event.extra});previousTime=event.time;}
++   if(event.type==='target'){target=event;previousTime=event.time;}
+    else if(event.type==='curve'){const curve=event.extra;const end=curve.hold??(event.time+curve.duration);if(time<end){const at=min(curve.values.length-1,max(0,(time-event.time)/curve.duration*(curve.values.length-1))),low=floor(at);return curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}const at=min(curve.values.length-1,max(0,(end-event.time)/curve.duration*(curve.values.length-1))),low=floor(at);value=curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);previousTime=end;}
+    else{value=event.value;previousTime=event.time;}
+   }
+   return current(time);
+  }
+- function automationOverlap(state,time,end=time){for(const event of state.events){const otherEnd=event.type==='curve'?(event.extra.hold??(event.time+event.extra.duration)):event.time;if(event.type==='curve'&&(end===time?time>event.time&&time<otherEnd:time<otherEnd&&end>event.time)||end>time&&event.time>time&&event.time<end)throw dom('NotSupportedError');}}
++ function automationOverlap(state,time,end=time){if(end===time&&!state.curveCount)return;for(const event of state.events){const otherEnd=event.type==='curve'?(event.extra.hold??(event.time+event.extra.duration)):event.time;if(event.type==='curve'&&(end===time?time>event.time&&time<otherEnd:time<otherEnd&&end>event.time)||end>time&&event.time>time&&event.time<end)throw dom('NotSupportedError');}}
+ 
+  class AudioParam{
+   constructor(){illegal();}
+@@ -84,9 +87,9 @@ function audioFactory(g,bridge){
+   linearRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'linear',value,time);}
+   exponentialRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();value=float(value);if(value<=0)throw new RangeError('');return addParam(this,'exponential',value,time);}
+   setTargetAtTime(value,time,constant){brand(params,this);if(arguments.length<3)throw error();constant=nonnegative(constant);return addParam(this,'target',value,time,constant);}
+-  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));state.events.push(record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return this;}
+-  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);return this;}
+-  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
++  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));insertParamEvent(state,record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.curveCount++;return this;}
++  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);return this;}
++  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
+  }
+  function handler(target,state,key,value){const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next&&!state.relays[key]){const relay=event=>{const callback=state.handlers[key];if(callback)apply(callback,target,[event]);};state.relays[key]=relay;bridge.listen(target,key,relay,true);}else if(!next&&state.relays[key]){bridge.listen(target,key,state.relays[key],false);delete state.relays[key];}}
+  function nodeCount(state,value){value=uint(value);if(!value||value>32||state.maxChannels&&value>state.maxChannels)throw dom('NotSupportedError');if(state.kind==='destination'&&contexts.get(state.context).realtime&&value>2)throw dom('IndexSizeError');state.channelCount=value;}

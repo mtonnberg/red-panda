@@ -1,3 +1,5 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+import{stylesheetParserBytes}from'./stylesheet-decoder.js';
 import { parseDocumentWriteFragment } from './shadow.js';
 import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
 import { prepareInputParserAdapter } from './input-controls.js';
@@ -13,9 +15,10 @@ const ResourceLoader = require('jsdom/lib/jsdom/browser/resources/per-document-r
 const DocumentImpl = require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
 const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/browser/parser/html.js'));
 const parse5 = jsdomRequire('parse5');
-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+
 const documents = new WeakMap(), flags = new WeakMap();
 const hintKeys = new WeakMap();
+const stylesheetRequests=new WeakMap(),stylesheetDeliveries=new WeakMap();
 let patched = false;
 const scriptTypes = new Set(['application/ecmascript', 'application/javascript', 'application/x-ecmascript',
   'application/x-javascript', 'text/ecmascript', 'text/javascript', 'text/javascript1.0', 'text/javascript1.1',
@@ -146,7 +149,7 @@ function makeParser(record, options) {
 // Queue ownership remains with the real loader. Drop only delivery into an
 // inactive Document; completed bytes/error cleanup still drain the retired
 // queue without dispatching late events or invoking its DOM callbacks.
-function fetchOwnedResource(record, loader, fetch, url, options) {
+function fetchOwnedResource(record, loader, fetch, url, options, delivery) {
   const names = ['_queue', '_deferQueue', '_asyncQueue'];
   const previous = names.map(name => loader[name]);
   for (let index = 0; index < names.length; index++) {
@@ -154,7 +157,12 @@ function fetchOwnedResource(record, loader, fetch, url, options) {
     loader[names[index]] = Object.create(queue, { push: { value(request, loaded, failed, ...args) {
       const guard = callback => typeof callback === 'function'
         ? (...values) => {
-          if (active(record)) return callback(...values);
+          if (active(record) && (!delivery||delivery.current())) {
+            if(!delivery)return callback(...values);
+            stylesheetDeliveries.set(delivery.element,delivery);
+            let result;try{result=callback(...values)}catch(error){if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);throw error}
+            return Promise.resolve(result).finally(()=>{if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element)});
+          }
           loader._requestManager.remove(request);
           return Promise.resolve();
         }
@@ -178,12 +186,15 @@ function patch() {
   const parse = parse5.parse;
   const closeDocument = DocumentImpl.prototype.close;
   const openDocument = DocumentImpl.prototype.open, writeDocument = DocumentImpl.prototype.write;
-  const attachLink = LinkImpl.prototype._attach, modifyLink = LinkImpl.prototype._attrModified, dispatchLink = LinkImpl.prototype._dispatch;
+  const attachLink = LinkImpl.prototype._attach, modifyLink = LinkImpl.prototype._attrModified, dispatchLink = LinkImpl.prototype._dispatch, detachLink=LinkImpl.prototype._detach;
   LinkImpl.prototype._dispatch = function (...args) {
-    const result = dispatchLink.apply(this, args), record = documents.get(this._ownerDocument);
+    const record=documents.get(this._ownerDocument),delivery=stylesheetDeliveries.get(this);
+    if(record&&args[0].isTrusted&&['load','error'].includes(args[0].type)&&(!active(record)||!this._attached||delivery&&!delivery.current()))return true;
+    const result = dispatchLink.apply(this, args);
     if (record && args[0].isTrusted && ['load', 'error'].includes(args[0].type)) record.styles.delete(this);
     return result;
   };
+  LinkImpl.prototype._detach=function(){stylesheetRequests.delete(this);const record=documents.get(this._ownerDocument);record?.styles.delete(this);return detachLink.call(this);};
   LinkImpl.prototype._attach = function () {
     attachLink.call(this); const record = documents.get(this._ownerDocument); if (record) preload(record, this);
   };
@@ -318,7 +329,9 @@ function patch() {
     const record = documents.get(this._document), element = options.element;
     if (!record) return fetchResource.call(this, url, options);
     if (element.localName === 'link' && (element.getAttributeNS(null, 'rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet')) {
-      const request = fetchOwnedResource(record, this, fetchResource, url, options);
+      const delivery={element,current:()=>active(record)&&element._attached&&stylesheetRequests.get(element)===delivery};
+      stylesheetRequests.set(element,delivery);
+      const request = fetchOwnedResource(record, this, fetchResource, url, {...options,onLoad(data){return options.onLoad?.(stylesheetParserBytes(data,request.response,element));}},delivery);
       if (request?.then) record.styles.add(element);
       return request;
     }

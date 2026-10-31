@@ -1,9 +1,10 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
 import { createHook } from 'node:async_hooks';
 import { runInContext } from 'node:vm';
 
 const require = createRequire(import.meta.url);
-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+
 const ErrorEvent = require('jsdom/lib/jsdom/living/generated/ErrorEvent.js');
 const { DOMString } = require('webidl-conversions');
 const EventTargetImpl = require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;

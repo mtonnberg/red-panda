@@ -1,14 +1,14 @@
 import{test,before,after}from'node:test';
 import assert from'node:assert/strict';
 import http from'node:http';import{once}from'node:events';import{createRequire}from'node:module';
-import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';
+import{JSDOM}from'jsdom';import{platformFactoryRecord}from'../src/platform-factories.js';import{getHeapBinding}from'../src/native-heap.js';import{Browser}from'../src/browser.js';
 const require=createRequire(import.meta.url),StorageIDL=require('jsdom/lib/jsdom/living/generated/Storage.js'),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
 let server,origin;
 before(async()=>{server=http.createServer((q,s)=>{if(q.url==='/redirect-child'){s.writeHead(302,{location:origin.replace('127.0.0.1','localhost')+'/final-child'});s.end();return;}s.setHeader('content-type','text/html');s.end('<!doctype html><body>owned storage test')});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`;});
 after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));});
 const fixture=async(t,options={})=>{const b=new Browser(options);t.after(()=>b.close());const p=b.createPage();await p.navigate(origin);return{b,p,w:p.dom.window};};
-test('Storage keeps generated proxy identity and genuine implementation records',async t=>{
- const{w}=await fixture(t);for(const kind of ['localStorage','sessionStorage']){const s=w[kind];assert.ok(StorageIDL.is(s));assert.ok(StorageIDL.isImpl(implForWrapper(s)));assert.strictEqual(s,w[kind]);assert.strictEqual(Object.getPrototypeOf(s),w.Storage.prototype);assert.equal(Object.prototype.toString.call(s),'[object Storage]');}
+test('Storage uses genuine ordinary native objects and private allocation brands',async t=>{
+ const{w}=await fixture(t);for(const kind of ['localStorage','sessionStorage']){const s=w[kind];assert.equal(platformFactoryRecord(s)?.kind,'Storage');assert.equal(Object.getPrototypeOf(platformFactoryRecord(s).implementation),null);assert.equal(getHeapBinding().sameRealm(s,w.Object.prototype),true);assert.strictEqual(s,w[kind]);assert.strictEqual(Object.getPrototypeOf(s),w.Storage.prototype);assert.equal(Object.prototype.toString.call(s),'[object Storage]');}
  assert.deepEqual(Reflect.ownKeys(w.Storage.prototype).map(String),['length','getItem','setItem','removeItem','clear','key','constructor','Symbol(Symbol.toStringTag)']);
  assert.throws(()=>new w.Storage(),e=>e instanceof w.TypeError);
 });
@@ -57,5 +57,5 @@ test('unowned jsdom windows retain their original quota and SecurityError behavi
 test('redirected frame origin changes cannot retarget a previously published genuine area',async t=>{
  const{p,w}=await fixture(t,{loadResources:['iframe']});p.newDocumentScripts.set('storage-redirect',{source:"globalThis.provisionalStorage=localStorage;provisionalStorage.setItem('early','owned')"});
  const f=w.document.createElement('iframe');f.src=origin+'/redirect-child';const loaded=new Promise(r=>f.onload=r);w.document.body.append(f);await loaded;const child=f.contentWindow;
- assert.notStrictEqual(child.localStorage,child.provisionalStorage);assert.equal(child.localStorage.getItem('early'),null);assert.equal(child.provisionalStorage.getItem('early'),'owned');assert.strictEqual(w.localStorage,child.provisionalStorage);assert.equal(w.localStorage.getItem('early'),'owned');assert.ok(StorageIDL.is(child.localStorage));
+ assert.notStrictEqual(child.localStorage,child.provisionalStorage);assert.equal(child.localStorage.getItem('early'),null);assert.equal(child.provisionalStorage.getItem('early'),'owned');assert.strictEqual(w.localStorage,child.provisionalStorage);assert.equal(w.localStorage.getItem('early'),'owned');assert.equal(platformFactoryRecord(child.localStorage)?.kind,'Storage');
 });

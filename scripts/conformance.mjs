@@ -11,12 +11,15 @@ const usage = `Usage: node scripts/conformance.mjs --root /path/to/upstream/src/
   --test node/is_equal_node.html [--test document_fragment/document_fragment.html]
   [--tests-file /path/to/selection.json] [--isolate]
   [--browser-arg=--load-resources --browser-arg=iframe]
+  [--runner-global-arg=--ws-max-concurrent --runner-global-arg=50]
   [--timeout 5000] [--settle-ms 0] [--port 9582] [--report /new/report.json]
   [--registration-map /path/to/registration-map.json] [--source-load-contract] [--websocket-port 9584]
   [--fixture-profile static|xhr-subset|upstream | --fixture-origin http://127.0.0.1:9582]
 
 Runs unchanged upstream fixture assertions through raw CDP. Both targets use
 Lightpanda/1.0 solely within this runner so testing.js takes identical branches.
+Runner-global arguments are explicit process configuration, recorded separately
+from immutable per-fixture registration profiles; none are supplied by default.
 The default owned server serves static files. xhr-subset enables documented test
 routes. --fixture-origin uses a caller-owned server, which this runner never stops.
 The native harness requires origin http://127.0.0.1:9582 for its dynamic routes.
@@ -134,7 +137,7 @@ async function runFixture(client, server, selection, timeout, settleMs = 0, inje
 async function main() {
   const { values, positionals } = parseArgs({ allowPositionals:true, options:{
     root:{type:'string'}, endpoint:{type:'string'}, binary:{type:'string'}, test:{type:'string',multiple:true},
-    'tests-file':{type:'string'}, isolate:{type:'boolean'}, 'browser-arg':{type:'string',multiple:true},
+    'tests-file':{type:'string'}, isolate:{type:'boolean'}, 'browser-arg':{type:'string',multiple:true},'runner-global-arg':{type:'string',multiple:true},
     timeout:{type:'string'}, 'settle-ms':{type:'string',default:'0'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
     'fixture-origin':{type:'string'}, 'fixture-profile':{type:'string'},
     'registration-map':{type:'string'},'websocket-port':{type:'string'},'source-load-contract':{type:'boolean'},
@@ -143,6 +146,7 @@ async function main() {
   if (!values.root || Boolean(values.endpoint) === Boolean(values.binary)) throw new Error(usage);
   if (values.isolate && !values.binary) throw new Error('--isolate requires --binary (the runner never kills an externally owned endpoint)');
   if (values['browser-arg']?.length && !values.binary) throw new Error('--browser-arg requires --binary');
+  if (values['runner-global-arg']?.length && !values.binary) throw new Error('--runner-global-arg requires --binary');
   if (values['fixture-origin'] && (values['fixture-profile'] || values.port !== '9582')) throw new Error('--fixture-origin cannot be combined with --fixture-profile or a custom --port');
   const profile = values['fixture-profile'] ?? 'static';
   if (!['static','xhr-subset','upstream'].includes(profile)) throw new Error('--fixture-profile must be static, xhr-subset or upstream');
@@ -169,6 +173,7 @@ async function main() {
     selections.push({ path:relative(root,canonical).split(sep).join('/'), sha256:createHash('sha256').update(bytes).digest('hex'), tagged:/<meta\s+name=["']?lp-mode["']?\s+content=["']?test["']?\s*\/?>/i.test(bytes.toString()) });
   }
   const browserArgs = values['browser-arg'] ?? [];
+  const runnerGlobalArgs = values['runner-global-arg'] ?? [];
   const registrationMap=values['registration-map']?JSON.parse(await readFile(values['registration-map'],'utf8')):null;
   if(registrationMap&&(!values.isolate||browserArgs.length))throw new Error('--registration-map requires --isolate and supplies its own browser arguments');
   const webSocketPort=values['websocket-port']===undefined?null:Number(values['websocket-port']);
@@ -197,7 +202,7 @@ async function main() {
     } : null;
     let version = null;
     if (!values.isolate) {
-      if (values.binary) browser = await startReference(resolve(values.binary),{args:browserArgs});
+      if (values.binary) browser = await startReference(resolve(values.binary),{args:[...runnerGlobalArgs,...browserArgs]});
       endpoint = browser?.endpoint ?? values.endpoint;
       client = await connect(endpoint,{timeout});
       version = await client.send('Browser.getVersion');
@@ -207,7 +212,8 @@ async function main() {
       const sourceProfile=selection.sourceProfile;
       const effectiveTimeout=values.timeout===undefined&&sourceProfile?sourceProfile.sourceTimeoutMs:timeout;
       if(settleMs>=effectiveTimeout)throw new Error('Settle delay exceeds selected source budget');
-      const effectiveArgs=sourceProfile?sourceProfile.nativeResourceAndFeatureArgs:browserArgs;
+      const fixtureBrowserArgs=sourceProfile?sourceProfile.nativeResourceAndFeatureArgs:browserArgs;
+      const effectiveArgs=[...runnerGlobalArgs,...fixtureBrowserArgs];
       let stateReset=false;
       if(server.owned&&profile==='upstream'){const reset=await fetch(server.origin+'/reset',{signal:AbortSignal.timeout(5000)});if(reset.status!==200)throw new Error('Fixture state reset failed');await reset.arrayBuffer();stateReset=true;}
       let result;
@@ -231,7 +237,7 @@ async function main() {
         result.ownedBrowser = { pid:ownedBrowser?.process.pid ?? null,exitCode:ownedBrowser?.process.exitCode ?? null,signal:ownedBrowser?.process.signalCode ?? null,stderr:ownedBrowser?.stderr??null,stderrTruncated:ownedBrowser?.stderrTruncated??null };
         result.totalDurationMs = Date.now()-started;
       } else result = await runFixture(client,server,selection,timeout,settleMs,null,!!values['source-load-contract']);
-      result.configuration={sourceProfile:sourceProfile??null,browserArgs:effectiveArgs,fixtureBudgetMs:effectiveTimeout,budgetKind:sourceProfile&&effectiveTimeout===sourceProfile.sourceTimeoutMs?(values['source-load-contract']?'source-registration-load-then-assert':'source-registration'):'diagnostic-override',fixtureStateReset:stateReset};
+      result.configuration={sourceProfile:sourceProfile??null,runnerGlobalArgs,fixtureBrowserArgs,browserArgs:effectiveArgs,fixtureBudgetMs:effectiveTimeout,budgetKind:sourceProfile&&effectiveTimeout===sourceProfile.sourceTimeoutMs?(values['source-load-contract']?'source-registration-load-then-assert':'source-registration'):'diagnostic-override',fixtureStateReset:stateReset};
       results.push(result);
       console.error(`${result.status.toUpperCase()} ${result.path}${result.error ? ': '+result.error : ''}`);
     }
@@ -239,12 +245,13 @@ async function main() {
     for (const result of results) counts[result.status]++;
     const report = { schemaVersion:1, target:version, binary:binaryIdentity, root, endpoint, sourceHarnessSHA256:createHash('sha256').update(harness).digest('hex'),
       harnessSourceUnchanged:true, testUserAgent:'Lightpanda/1.0', externalRunnerFlag:true,
-      isolatedBrowserPerFixture:!!values.isolate, browserArgs, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
+      isolatedBrowserPerFixture:!!values.isolate, browserArgs, runnerGlobalArgs, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
       configurationCoverage:{
         sourceLoadContract:!!values['source-load-contract'],sourceLoadBudgetMs:values['source-load-contract']?2000:null,
         sourceHtmlRunnerDefaults:['--load-resources','iframe','--load-resources','worker'],
         sourceDefaultsNote:'src/testing.zig HtmlRunnerOpts enables iframe and worker; individual registrations may override resources, experimental features or injected scripts.',
         fixtureSpecificOptionsVerified:!!registrationMap,
+        runnerGlobalConfiguration:{explicitArgs:runnerGlobalArgs,sourceTestGlobalsAutomaticallyApplied:false,note:'Explicit CLI process arguments are separate from per-fixture source registrations; defaults and other source test-runner globals require independent verification.'},
         registrationMapSHA256:values['registration-map']?createHash('sha256').update(await readFile(values['registration-map'])).digest('hex'):null,
         unrunConfigurationDimensions:[...(registrationMap?[]:['Per-fixture registration profiles not supplied']),...(profile==='upstream'?['All-registration runtime result matrix not implied by server support']:['Full pinned route transport not selected']),...(!server.webSocket?['WebSocket transport not owned by this runner']:[])],
       },

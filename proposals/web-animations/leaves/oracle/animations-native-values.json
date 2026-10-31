@@ -1,0 +1,769 @@
+{
+  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
+  "name": "values",
+  "source": "(async()=>{\n const out=[],norm=x=>x===undefined?'__undefined__':typeof x==='number'&&!Number.isFinite(x)?String(x):x;\n const record=a=>{const r={tag:Object.prototype.toString.call(a),target:a instanceof EventTarget,own:Object.keys(a)};for(const k of['playState','pending','effect','timeline','startTime','currentTime','playbackRate','id','replaceState','onfinish','oncancel','onremove'])r[k]=norm(a[k]);r.readyPromise=a.ready instanceof Promise;r.finishedPromise=a.finished instanceof Promise;r.readySame=a.ready===a.ready;r.finishedSame=a.finished===a.finished;return r};\n const attempt=(name,fn)=>{try{out.push([name,{value:fn()}]);}catch(e){out.push([name,{error:e.name,message:e.message}]);}};\n const el=document.createElement('div');document.body.append(el);\n for(const[name,args]of[['none',[]],['null',[null]],['empty',[[]]],['number',[1]],['symbol',[Symbol('x')]],['options',[null,{duration:1e6,id:'wanted'}]],['throws-options',[{get opacity(){throw Error('keyframes read')}},new Proxy({},{get(){throw Error('options read')}})]],['infinite',[null,{duration:Infinity,iterations:Infinity,delay:1e9,fill:'both'}]]])attempt('animate:'+name,()=>{const a=el.animate(...args);const r=record(a);a.finished.catch(()=>{});a.cancel();return r});\n attempt('element-getAnimations',()=>{const a=el.animate(null,{duration:1e9}),r={array:el.getAnimations()instanceof Array,list:el.getAnimations().map(x=>x===a),fresh:el.getAnimations()!==el.getAnimations(),all:document.body.getAnimations().length,subtree:document.body.getAnimations({subtree:true}).length};a.finished.catch(()=>{});a.cancel();return r});\n const a=el.animate();a.finished.catch(()=>{});a.cancel();\n for(const key of['startTime','effect','timeline'])for(const[label,value]of[['undefined',undefined],['null',null],['number',42.5],['string','7.25'],['nan',NaN],['infinity',Infinity],['symbol',Symbol('v')],['object',{toString(){return'converted'},valueOf(){return 4.5}}]])attempt('set:'+key+':'+label,()=>{a[key]=value;return norm(a[key])});\n for(const[name,fn]of[['animate-method-length',()=>Element.prototype.animate.length],['getAnimations-method-length',()=>Element.prototype.getAnimations.length],['getAnimations-options',()=>{let reads=[];const list=el.getAnimations(new Proxy({},{get(t,k){reads.push(String(k));throw Error('read')}}));return{length:list.length,reads}}],['animate-illegal',()=>Element.prototype.animate.call({})],['getAnimations-illegal',()=>Element.prototype.getAnimations.call({})]])attempt(name,fn);\n for(const[key,method]of Object.entries(Object.getOwnPropertyDescriptors(Animation.prototype))){if(key==='constructor')continue;if(method.get)attempt('fake-get:'+key,()=>norm(method.get.call({})));if(method.value instanceof Function)attempt('fake-method:'+key,()=>norm(method.value.call({})));}\n for(const[desc,value]of[['null',null],['undefined',undefined],['object',{}],['number',3],['callable',()=>{}]])attempt('handler:'+desc,()=>{a.onfinish=value;return{same:a.onfinish===value,type:typeof a.onfinish,value:a.onfinish===null?'null':'other'}});\n for(const[label,args]of[['missing',[]],['type-only',['finish']],['null-init',['x',null]],['values',['done',{currentTime:42.5,timelineTime:9,bubbles:true,cancelable:true,composed:true}]],['coerce',['x',{currentTime:'3.5',timelineTime:false}]],['bad',['x',{currentTime:NaN}]],['inf',['x',{timelineTime:Infinity}]],['symbol',['x',{currentTime:Symbol('n')}]],['symbol-type',[Symbol('name')]],['primitive-init',['x',1]]])attempt('event:'+label,()=>{const e=new AnimationPlaybackEvent(...args);return{tag:Object.prototype.toString.call(e),event:e instanceof Event,type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,currentTime:norm(e.currentTime),timelineTime:norm(e.timelineTime),trusted:e.isTrusted}});\n const ev=new AnimationPlaybackEvent('x');for(const key of['currentTime','timelineTime'])attempt('event-fake-get:'+key,()=>norm(Object.getOwnPropertyDescriptor(AnimationPlaybackEvent.prototype,key).get.call({})));\n for(const value of[a,ev,Object.create(Animation.prototype),Object.create(AnimationPlaybackEvent.prototype)])attempt('clone:'+Object.prototype.toString.call(value),()=>({keys:Object.keys(structuredClone(value))}));\n return out;\n})()\n",
+  "sourceSHA256": "618646649d93fa12a2d31555d0bc82cba20177086ced4473a9ae3c9a02d4cabf",
+  "binary": {
+    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
+  },
+  "args": [
+    "--load-resources",
+    "iframe",
+    "--load-resources",
+    "worker"
+  ],
+  "version": {
+    "protocolVersion": "1.3",
+    "product": "Chrome/124.0.6367.29",
+    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jsVersion": "12.4.254.8"
+  },
+  "result": [
+    [
+      "animate:none",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:null",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:empty",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:number",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:symbol",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:options",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:throws-options",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "animate:infinite",
+      {
+        "value": {
+          "tag": "[object Animation]",
+          "target": true,
+          "own": [],
+          "playState": "running",
+          "pending": false,
+          "effect": null,
+          "timeline": null,
+          "startTime": null,
+          "currentTime": "__undefined__",
+          "playbackRate": "__undefined__",
+          "id": "__undefined__",
+          "replaceState": "__undefined__",
+          "onfinish": null,
+          "oncancel": null,
+          "onremove": "__undefined__",
+          "readyPromise": true,
+          "finishedPromise": true,
+          "readySame": true,
+          "finishedSame": true
+        }
+      }
+    ],
+    [
+      "element-getAnimations",
+      {
+        "value": {
+          "array": true,
+          "list": [],
+          "fresh": true,
+          "all": 0,
+          "subtree": 0
+        }
+      }
+    ],
+    [
+      "set:startTime:undefined",
+      {
+        "value": null
+      }
+    ],
+    [
+      "set:startTime:null",
+      {
+        "value": null
+      }
+    ],
+    [
+      "set:startTime:number",
+      {
+        "value": 42.5
+      }
+    ],
+    [
+      "set:startTime:string",
+      {
+        "value": 7.25
+      }
+    ],
+    [
+      "set:startTime:nan",
+      {
+        "value": "NaN"
+      }
+    ],
+    [
+      "set:startTime:infinity",
+      {
+        "value": "Infinity"
+      }
+    ],
+    [
+      "set:startTime:symbol",
+      {
+        "error": "TypeError",
+        "message": "Cannot convert a Symbol value to a number"
+      }
+    ],
+    [
+      "set:startTime:object",
+      {
+        "value": 4.5
+      }
+    ],
+    [
+      "set:effect:undefined",
+      {
+        "value": null
+      }
+    ],
+    [
+      "set:effect:null",
+      {
+        "value": null
+      }
+    ],
+    [
+      "set:effect:number",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:effect:string",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:effect:nan",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:effect:infinity",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:effect:symbol",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:effect:object",
+      {
+        "value": {}
+      }
+    ],
+    [
+      "set:timeline:undefined",
+      {
+        "value": null
+      }
+    ],
+    [
+      "set:timeline:null",
+      {
+        "value": null
+      }
+    ],
+    [
+      "set:timeline:number",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:timeline:string",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:timeline:nan",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:timeline:infinity",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:timeline:symbol",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "set:timeline:object",
+      {
+        "value": {}
+      }
+    ],
+    [
+      "animate-method-length",
+      {
+        "value": 0
+      }
+    ],
+    [
+      "getAnimations-method-length",
+      {
+        "value": 0
+      }
+    ],
+    [
+      "getAnimations-options",
+      {
+        "value": {
+          "length": 0,
+          "reads": []
+        }
+      }
+    ],
+    [
+      "animate-illegal",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "getAnimations-illegal",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-method:play",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-method:pause",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-method:cancel",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-method:finish",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-method:reverse",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:playState",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:finished",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:ready",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:effect",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:timeline",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:startTime",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:onfinish",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "fake-get:oncancel",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "handler:null",
+      {
+        "value": {
+          "same": true,
+          "type": "object",
+          "value": "null"
+        }
+      }
+    ],
+    [
+      "handler:undefined",
+      {
+        "value": {
+          "same": false,
+          "type": "object",
+          "value": "null"
+        }
+      }
+    ],
+    [
+      "handler:object",
+      {
+        "value": {
+          "same": false,
+          "type": "object",
+          "value": "null"
+        }
+      }
+    ],
+    [
+      "handler:number",
+      {
+        "value": {
+          "same": false,
+          "type": "object",
+          "value": "null"
+        }
+      }
+    ],
+    [
+      "handler:callable",
+      {
+        "value": {
+          "same": true,
+          "type": "function",
+          "value": "other"
+        }
+      }
+    ],
+    [
+      "event:missing",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "event:type-only",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "finish",
+          "bubbles": false,
+          "cancelable": false,
+          "composed": false,
+          "currentTime": null,
+          "timelineTime": null,
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:null-init",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "x",
+          "bubbles": false,
+          "cancelable": false,
+          "composed": false,
+          "currentTime": null,
+          "timelineTime": null,
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:values",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "done",
+          "bubbles": true,
+          "cancelable": true,
+          "composed": true,
+          "currentTime": 42.5,
+          "timelineTime": 9,
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:coerce",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "x",
+          "bubbles": false,
+          "cancelable": false,
+          "composed": false,
+          "currentTime": 3.5,
+          "timelineTime": 0,
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:bad",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "x",
+          "bubbles": false,
+          "cancelable": false,
+          "composed": false,
+          "currentTime": "NaN",
+          "timelineTime": null,
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:inf",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "x",
+          "bubbles": false,
+          "cancelable": false,
+          "composed": false,
+          "currentTime": null,
+          "timelineTime": "Infinity",
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:symbol",
+      {
+        "error": "TypeError",
+        "message": "Cannot convert a Symbol value to a number"
+      }
+    ],
+    [
+      "event:symbol-type",
+      {
+        "value": {
+          "tag": "[object AnimationPlaybackEvent]",
+          "event": true,
+          "type": "name",
+          "bubbles": false,
+          "cancelable": false,
+          "composed": false,
+          "currentTime": null,
+          "timelineTime": null,
+          "trusted": false
+        }
+      }
+    ],
+    [
+      "event:primitive-init",
+      {
+        "error": "TypeError",
+        "message": "invalid argument"
+      }
+    ],
+    [
+      "event-fake-get:currentTime",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "event-fake-get:timelineTime",
+      {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    ],
+    [
+      "clone:[object Animation]",
+      {
+        "error": "DataCloneError",
+        "message": "The object can not be cloned"
+      }
+    ],
+    [
+      "clone:[object AnimationPlaybackEvent]",
+      {
+        "error": "DataCloneError",
+        "message": "The object can not be cloned"
+      }
+    ],
+    [
+      "clone:[object Animation]",
+      {
+        "value": {
+          "keys": []
+        }
+      }
+    ],
+    [
+      "clone:[object AnimationPlaybackEvent]",
+      {
+        "value": {
+          "keys": []
+        }
+      }
+    ]
+  ],
+  "events": [],
+  "ownedBrowser": {
+    "pid": 139310,
+    "exitCode": 0,
+    "signal": null,
+    "stderr": "$time=1793436203944 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:43077 max_connections=16120 max_browser_connections=16\n",
+    "stderrTruncated": false
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 200,
+      "routeKnown": true
+    }
+  ]
+}

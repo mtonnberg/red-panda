@@ -1,0 +1,128 @@
+--- a/src/animations.js
++++ b/src/animations.js
+@@ -9,11 +9,16 @@
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
+ const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
++const EventListener=require('jsdom/lib/jsdom/living/generated/EventListener.js');
++const TargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const addImpl=TargetImpl.prototype.addEventListener,removeImpl=TargetImpl.prototype.removeEventListener,dispatchImpl=TargetImpl.prototype._dispatch;
++const preventImpl=require('jsdom/lib/jsdom/living/events/Event-impl.js').implementation.prototype.preventDefault;
+ const installed=new WeakMap(),animations=new WeakMap(),playbackEvents=new WeakMap();
+-const hidden=value=>Object.assign(Object.create(null),value),apply=Reflect.apply,setPrototype=Object.setPrototypeOf;
++const hidden=value=>Object.assign(Object.create(null),value),apply=Reflect.apply;
+ 
+ function factory(g,bridge){
+- const TypeError=g.TypeError,Exception=g.DOMException,Array=g.Array,Object=g.Object,define=Object.defineProperty,prototype=Object.getPrototypeOf,apply=g.Reflect.apply;
++ const TypeError=g.TypeError,Exception=g.DOMException,Array=g.Array,Object=g.Object,define=Object.defineProperty,setPrototype=Object.setPrototypeOf,apply=g.Reflect.apply;
+  const String=g.String,symbolDescription=Object.getOwnPropertyDescriptor(g.Symbol.prototype,'description').get;
+  const text=value=>typeof value==='symbol'?apply(symbolDescription,value,[])??'':String(value);
+  const object=value=>value!==null&&(typeof value==='object'||typeof value==='function');
+@@ -53,7 +58,7 @@
+   let currentTime=null,timelineTime=null;
+   if(input!=null&&'currentTime'in input){const value=input.currentTime;currentTime=value==null?null:+value}
+   if(input!=null&&'timelineTime'in input){const value=input.timelineTime;timelineTime=value==null?null:+value}
+-  return bridge.event(name,bubbles,cancelable,composed,currentTime,timelineTime,prototype(this));
++  return bridge.event(this,name,bubbles,cancelable,composed,currentTime,timelineTime);
+  }
+  const playbackPrototype={
+   get currentTime(){if(!bridge.hasEvent(this))illegal();return bridge.eventTime(this,'currentTime')},
+@@ -62,9 +67,9 @@
+  Object.setPrototypeOf(playbackPrototype,g.Event.prototype);Object.setPrototypeOf(AnimationPlaybackEvent,g.Event);
+  define(AnimationPlaybackEvent,'prototype',{value:playbackPrototype,writable:false});
+  define(playbackPrototype,'constructor',{value:AnimationPlaybackEvent,writable:true,configurable:true});define(playbackPrototype,g.Symbol.toStringTag,{value:'AnimationPlaybackEvent',configurable:true});
+- bridge.prototypes(animationPrototype,playbackPrototype);
++ bridge.prototypes(animationPrototype,playbackPrototype,AnimationPlaybackEvent);
+  define(g,'Animation',{value:Animation,writable:true,configurable:true});define(g,'AnimationPlaybackEvent',{value:AnimationPlaybackEvent,writable:true,configurable:true});
+- function animate(){if(!bridge.isElement(this))illegal();return bridge.animate()}
++ function animate(){if(!bridge.isElement(this))illegal();const value={};setPrototype(value,animationPrototype);return bridge.animate(value)}
+  function getAnimations(){if(!bridge.isElement(this))illegal();return new Array()}
+  define(g.Element.prototype,'animate',{value:animate,writable:true,configurable:true,enumerable:true});define(g.Element.prototype,'getAnimations',{value:getAnimations,writable:true,configurable:true,enumerable:true});
+ }
+@@ -72,21 +77,27 @@
+ export function installAnimations(page,realm){
+  if(installed.has(realm))return;
+  registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
+- const Promise=realm.Promise,preventDefault=realm.Event.prototype.preventDefault,add=realm.EventTarget.prototype.addEventListener,remove=realm.EventTarget.prototype.removeEventListener;
++ const Promise=realm.Promise,convertListener=EventListener.convert;
+  const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
+- const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,disposed:false,automatic:new Set(),events:new Set()});
++ const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,playbackConstructor:null,disposed:false,automatic:new Set(),events:new Set()});
+  const task=(callback,automatic=false)=>{
+   if(runtime.disposed)return;
+   const tasks=automatic?runtime.automatic:runtime.events;let id;
+   id=apply(setTimer,realm,[()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0]);tasks.add(id);
+  };
+- function event(type,bubbles,cancelable,composed,currentTime,timelineTime,prototype,trusted=false){
+-  const value=Event.create(realm,[type,{bubbles,cancelable,composed}],{isTrusted:trusted});setPrototype(value,prototype);
+-  const implementation=platformFactoryRecord(value)?.implementation;
+-  const state=hidden({currentTime,timelineTime});playbackEvents.set(value,state);registerPlatformFactory(value,{kind:'AnimationPlaybackEvent',implementation:state,globalObject:realm});
+-  return{value,implementation};
++ function event(value,type,bubbles,cancelable,composed,currentTime,timelineTime){
++  // Setup preserves the exact object allocated by its actual VM constructor.
++  Event.setup(value,realm,[type,{bubbles,cancelable,composed}],{isTrusted:false});
++  const implementation=implForWrapper(value);
++  const state=hidden({currentTime,timelineTime,implementation});playbackEvents.set(value,state);registerPlatformFactory(value,{kind:'AnimationPlaybackEvent',implementation:state,globalObject:realm});
++  return value;
+  }
+- runtime.emit=(state,type)=>task(()=>{const e=event(type,false,false,false,null,null,runtime.playbackPrototype,true);state.target._dispatch(e.implementation)});
++ runtime.emit=(state,type)=>task(()=>{
++  // The captured ordinary VM constructor cannot be replaced by page globals;
++  // it allocates the real receiver that Event.setup initializes above.
++  const value=new runtime.playbackConstructor(type),implementation=playbackEvents.get(value).implementation;
++  implementation.isTrusted=true;apply(dispatchImpl,state.target,[implementation]);
++ });
+  runtime.automaticTask=callback=>task(callback,true);
+  const finish=state=>{if(state.playState==='finished')return;state.playState='finished';state.finishedResolve?.(state.value);state.runtime.emit(state,'finish')};
+  const play=state=>{if(state.playState==='running')return;state.playState='running';state.runtime.automaticTask(()=>{if(state.playState==='running')finish(state)})};
+@@ -99,13 +110,13 @@
+  };
+  const bridge=hidden({
+   hasAnimation:value=>animations.has(value),hasEvent:value=>playbackEvents.has(value),
+-  isElement:value=>Boolean(platformFactoryRecord(value)&&Element.is(value)),
+-  prototypes(animation,playback){runtime.animationPrototype=animation;runtime.playbackPrototype=playback},
++  isElement:value=>Boolean(Element.isImpl(platformFactoryRecord(value)?.implementation)),
++  prototypes(animation,playback,constructor){runtime.animationPrototype=animation;runtime.playbackPrototype=playback;runtime.playbackConstructor=constructor},
+   read(value,key){const state=animations.get(value);return key==='playState'||key==='startTime'||key==='effect'||key==='timeline'||key==='onfinish'||key==='oncancel'?state[key]:undefined},
+   set(value,key,data){if(key==='startTime'||key==='effect'||key==='timeline')animations.get(value)[key]=data},
+   promise(value,key){const state=animations.get(value);return key==='ready'||key==='finished'?state[key]??makePromise(state,key):undefined},
+-  animate(){
+-   const value=EventTarget.create(realm,[],{}),target=platformFactoryRecord(value)?.implementation;setPrototype(value,runtime.animationPrototype);
++  animate(value){
++   EventTarget.setup(value,realm,[],{});const target=implForWrapper(value);
+    const state=hidden({value,target,runtime,playState:'idle',startTime:null,effect:null,timeline:null,ready:null,finished:null,finishedResolve:null,finishedReject:null,onfinish:null,oncancel:null,finishListener:null,cancelListener:null});
+    animations.set(value,state);registerPlatformFactory(value,{kind:'Animation',implementation:state,globalObject:realm});play(state);return value;
+   },
+@@ -119,10 +130,10 @@
+   },
+   handler(value,type,callback){
+    const state=animations.get(value),field=type==='finish'?'onfinish':'oncancel',listener=type==='finish'?'finishListener':'cancelListener';
+-   if(!callback&&state[listener]){apply(remove,value,[type,state[listener]]);state[listener]=null}state[field]=callback;
+-   if(callback&&!state[listener]){state[listener]=e=>{const result=apply(state[field],value,[e]);if(result===false)apply(preventDefault,e,[])};apply(add,value,[type,state[listener]])}
++   if(!callback&&state[listener]){apply(removeImpl,state.target,[type,state[listener],false]);state[listener]=null}state[field]=callback;
++   if(callback&&!state[listener]){state[listener]=convertListener(realm,e=>{const result=apply(state[field],value,[e]);if(result===false){const implementation=playbackEvents.get(e)?.implementation??platformFactoryRecord(e)?.implementation;if(Event.isImpl(implementation))apply(preventImpl,implementation,[])}});apply(addImpl,state.target,[type,state[listener],false])}
+   },
+-  event:(...args)=>event(...args).value,
++  event,
+   eventTime(value,key){return key==='currentTime'||key==='timelineTime'?playbackEvents.get(value)[key]:undefined},
+  });
+  realm.eval(`(${factory.toString()})`)(realm,bridge);
+--- /dev/null
++++ b/test/animations-allocation.test.js
+@@ -0,0 +1,15 @@
++import test from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{writeFile}from'node:fs/promises';
++async function fixture(t){const browser=new Browser({timeout:10000});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body>VM allocations</body>');return{browser,page,w:page.dom.window};}
++test('direct public V8 creation proof keeps actual VM context before and after null prototype',async t=>{
++ const{w}=await fixture(t),binding=getHeapBinding(),vm=w.Object.prototype,host={};
++ const a=w.document.createElement('div').animate();a.pause();const e=new w.AnimationPlaybackEvent('proof'),ready=a.ready,finished=a.finished;
++ const targets=[['animation',a],['authored-playback-event',e],['Animation-constructor',w.Animation],['PlaybackEvent-constructor',w.AnimationPlaybackEvent],['Element.animate',w.Element.prototype.animate],['Element.getAnimations',w.Element.prototype.getAnimations],['ready-getter',Object.getOwnPropertyDescriptor(w.Animation.prototype,'ready').get],['finished-getter',Object.getOwnPropertyDescriptor(w.Animation.prototype,'finished').get],['currentTime-getter',Object.getOwnPropertyDescriptor(w.AnimationPlaybackEvent.prototype,'currentTime').get],['ready-Promise',ready],['finished-Promise',finished]];
++ for(const type of['finish','cancel']){const value=w.document.createElement('div').animate();value.finished.catch(()=>{});const event=await new Promise(resolve=>{value['on'+type]=resolve;value[type]()});targets.push(['trusted-'+type+'-event',event]);}
++ const proof=value=>({vm:binding.sameRealm(value,vm),host:binding.sameRealm(value,host),globalVM:binding.creationGlobal(value)===binding.creationGlobal(vm)}),expected={vm:true,host:false,globalVM:true},rows=[];
++ for(const[name,value]of targets){const before=proof(value),proto=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);const after=proof(value);Object.setPrototypeOf(value,proto);rows.push({name,before,after});assert.deepEqual(before,expected,name+' before');assert.deepEqual(after,expected,name+' after');}
++ if(process.env.ANIMATION_CONTEXT_EVIDENCE)await writeFile(process.env.ANIMATION_CONTEXT_EVIDENCE,JSON.stringify({scope:'Actual publicV8 sameRealm/creationGlobal, not factory/prototype hints',rows},null,2)+'\n',{flag:'wx'});
++});
++test('owned setup and trusted event backend ignore authored implementation-symbol getters',async t=>{
++ const{page}=await fixture(t);const result=await page.evaluate(`(async()=>{let reads=0;const element=document.createElement('div'),elementImpl=Object.getOwnPropertySymbols(element).find(s=>s.description==='impl');Object.defineProperty(element,elementImpl,{get(){reads++;throw Error('element impl getter')},configurable:true});const a=element.animate(),impl=Object.getOwnPropertySymbols(a).find(s=>s.description==='impl');Object.defineProperty(a,impl,{get(){reads++;throw Error('animation impl getter')},configurable:true});const event=await new Promise(resolve=>{a.onfinish=resolve;a.finish()});a.onfinish=null;return{reads,state:a.playState,event:event instanceof AnimationPlaybackEvent,trusted:event.isTrusted,target:event.target===a};})()`);
++ assert.deepEqual(JSON.parse(JSON.stringify(result)),{reads:0,state:'finished',event:true,trusted:true,target:true});
++});

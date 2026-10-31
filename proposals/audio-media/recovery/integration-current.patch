@@ -1,0 +1,841 @@
+--- a/src/audio-core.js
++++ b/src/audio-core.js
+@@ -1,3 +1,5 @@
++import {decodeAudioWav} from './audio-wav.js';
++import {captureDOMExceptionFactory} from './worker-dom-exception.js';
+ import {makeAudioWave,basicAudioWave,renderAudioWave,audioWaveScale} from './audio-waves.js';
+ import 'jsdom';
+ import {createRequire} from 'node:module';
+@@ -20,7 +22,7 @@
+  const finite=Number.isFinite,fround=Math.fround,ceil=Math.ceil,floor=Math.floor,round=Math.round,min=Math.min,max=Math.max,abs=Math.abs,pow=Math.pow,exp=Math.exp;
+  const constant=3.4028234663852886e38,token=bridge.token,record=bridge.record,apply=Reflect.apply;
+  const error=()=>new TypeError('invalid argument'),illegal=()=>{throw new TypeError('Illegal Constructor')};
+- const dom=(name)=>new Exception({NotSupportedError:'The operation is not supported',IndexSizeError:'Index or size is negative or greater than the allowed amount',InvalidStateError:'The object is in an invalid state',InvalidAccessError:'The object does not support the operation or argument'}[name]??'The operation is not supported',name);
++ const dom=(name)=>bridge.exception({NotSupportedError:'The operation is not supported',IndexSizeError:'Index or size is negative or greater than the allowed amount',InvalidStateError:'The object is in an invalid state',InvalidAccessError:'The object does not support the operation or argument'}[name]??'The operation is not supported',name);
+  const brand=(map,value)=>{const state=map.get(value);if(!state)throw new TypeError('Illegal invocation');return state};
+  const dictionary=value=>{if(value==null)return{};if(typeof value!=='object'&&typeof value!=='function')throw error();return value};
+  const number=value=>+value,uint=value=>number(value)>>>0,restricted=value=>{const result=number(value);if(!finite(result))throw new TypeError('');return result;},float=value=>{const result=fround(number(value));if(!finite(result))throw new TypeError('');return result};
+@@ -86,17 +88,20 @@
+   cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
+  }
+  function handler(target,state,key,value){const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next&&!state.relays[key]){const relay=event=>{const callback=state.handlers[key];if(callback)apply(callback,target,[event]);};state.relays[key]=relay;bridge.listen(target,key,relay,true);}else if(!next&&state.relays[key]){bridge.listen(target,key,state.relays[key],false);delete state.relays[key];}}
++ function nodeCount(state,value){value=uint(value);if(!value||value>32||state.maxChannels&&value>state.maxChannels)throw dom('NotSupportedError');if(state.kind==='destination'&&contexts.get(state.context).realtime&&value>2)throw dom('IndexSizeError');state.channelCount=value;}
++ function nodeMode(state,value){value=audioText(value);if(['max','clamped-max','explicit'].includes(value)){if(state.noMax&&value==='max')throw dom('NotSupportedError');state.mode=value;}}
++ function nodeInterpretation(state,value){value=audioText(value);if(['speakers','discrete'].includes(value))state.interpretation=value;}
+  class AudioNode extends EventTarget{
+   constructor(context,key){if(key!==token)illegal();brand(contexts,context);const value=allocate(new.target.prototype);bridge.target(value);nodes.set(value,record({context,inputs:1,outputs:1,channelCount:2,mode:'max',interpretation:'speakers',connections:new Set(),incoming:new Set(),handlers:record(),relays:record()}));return value;}
+   get context(){return brand(nodes,this).context;}
+   get numberOfInputs(){return brand(nodes,this).inputs;}
+   get numberOfOutputs(){return brand(nodes,this).outputs;}
+   get channelCount(){return brand(nodes,this).channelCount;}
+-  set channelCount(value){const state=brand(nodes,this);value=uint(value);if(!value||value>32)throw dom('NotSupportedError');if(state.kind==='destination'&&contexts.get(state.context).realtime&&value>2)throw dom('IndexSizeError');state.channelCount=value;}
++  set channelCount(value){nodeCount(brand(nodes,this),value);}
+   get channelCountMode(){return brand(nodes,this).mode;}
+-  set channelCountMode(value){const state=brand(nodes,this);value=String(value);if(['max','clamped-max','explicit'].includes(value))state.mode=value;}
++  set channelCountMode(value){nodeMode(brand(nodes,this),value);}
+   get channelInterpretation(){return brand(nodes,this).interpretation;}
+-  set channelInterpretation(value){const state=brand(nodes,this);value=String(value);if(['speakers','discrete'].includes(value))state.interpretation=value;}
++  set channelInterpretation(value){nodeInterpretation(brand(nodes,this),value);}
+   connect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length)throw error();const next=nodes.get(destination)??params.get(destination);if(!next)throw error();output=uint(output);if(!params.has(destination))input=uint(input);if(next.context!==state.context)throw dom('InvalidAccessError');if(params.has(destination)&&!next.inputSupported)throw dom('NotSupportedError');if(output>=state.outputs||!params.has(destination)&&input>=next.inputs)throw dom('IndexSizeError');state.connections.add(params.has(destination)?next.canonical:destination);next.incoming.add(this);return params.has(destination)?undefined:destination;}
+   disconnect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length||typeof destination==='number'){if(arguments.length&&uint(destination)>=state.outputs)throw dom('IndexSizeError');for(const value of state.connections)(nodes.get(value)??params.get(value)).incoming.delete(this);state.connections.clear();return;}const next=nodes.get(destination)??params.get(destination);if(!next)throw error();if(uint(output)>=state.outputs||!params.has(destination)&&uint(input)>=next.inputs)throw dom('IndexSizeError');if(!state.connections.delete(params.has(destination)?next.canonical:destination))throw dom('InvalidAccessError');next.incoming.delete(this);}
+ 
+@@ -126,7 +131,7 @@
+   set loopEnd(value){bufferBrand(this).loopEnd=restricted(value);}
+   start(when=0,offset=0,duration){const state=bufferBrand(this);when=nonnegative(when);offset=nonnegative(offset);if(duration!==undefined)duration=nonnegative(duration);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=contexts.get(state.context).realtime?max(when,updateClock(contexts.get(state.context))/contexts.get(state.context).rate):when;state.offset=offset;state.duration=duration;}
+  }
+- function nodeOptions(value,options){const state=nodes.get(value);for(const key of['channelCount','channelCountMode','channelInterpretation']){const entry=options[key];if(entry!==undefined){if(key==='channelCountMode'&&!['max','clamped-max','explicit'].includes(String(entry))||key==='channelInterpretation'&&!['speakers','discrete'].includes(String(entry)))throw error();value[key]=entry;}}}
++ function nodeOptions(value,options){const state=nodes.get(value);for(const key of['channelCount','channelCountMode','channelInterpretation']){const entry=options[key];if(entry!==undefined){if(key==='channelCount')nodeCount(state,entry);else if(key==='channelCountMode'){const converted=audioText(entry);if(!['max','clamped-max','explicit'].includes(converted))throw error();nodeMode(state,converted);}else{const converted=audioText(entry);if(!['speakers','discrete'].includes(converted))throw error();nodeInterpretation(state,converted);}}}}
+  class GainNode extends AudioNode{
+   constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();super(context,token);options=dictionary(options);nodeOptions(this,options);const state=nodes.get(this);state.kind='gain';state.gain=makeParam(context,1,'a-rate');params.get(state.gain).inputSupported=true;const gain=options.gain;if(gain!==undefined)initialParam(state.gain,gain);publish(this,'GainNode');}
+   get gain(){const state=brand(nodes,this);if(state.kind!=='gain')throw new TypeError('Illegal invocation');return paramView(state.gain);}
+@@ -149,6 +154,15 @@
+   get frequency(){return paramView(oscillatorBrand(this).frequency);}
+   get detune(){return paramView(oscillatorBrand(this).detune);}
+   setPeriodicWave(value){const state=oscillatorBrand(this),wave=waves.get(value);if(!wave)throw error();state.type='custom';state.wave=wave;}
++ }
++ function convolverBrand(value){const state=brand(nodes,value);if(state.kind!=='convolver')throw new TypeError('Illegal invocation');return state;}
++ function convolverBuffer(state,value){if(value!==null&&!buffers.has(value))throw error();if(value!==null){const data=buffers.get(value);if(![1,2,4].includes(data.channels.length)||data.rate!==contexts.get(state.context).rate)throw dom('NotSupportedError');}state.response=value;}
++ class ConvolverNode extends AudioNode{
++  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();options=dictionary(options);const buffer=options.buffer;if(buffer!==undefined&&buffer!==null&&!buffers.has(buffer))throw error();super(context,token);const state=nodes.get(this);state.kind='convolver';state.mode='clamped-max';state.maxChannels=2;state.noMax=true;state.response=null;nodeOptions(this,options);state.normalize=!options.disableNormalization;if(buffer!==undefined)convolverBuffer(state,buffer);publish(this,'ConvolverNode');}
++  get buffer(){return convolverBrand(this).response;}
++  set buffer(value){convolverBuffer(convolverBrand(this),value);}
++  get normalize(){return convolverBrand(this).normalize;}
++  set normalize(value){convolverBrand(this).normalize=!!value;}
+  }
+  class BaseAudioContext extends EventTarget{
+   constructor(key){if(key!==token)illegal();const value=allocate(new.target.prototype);bridge.target(value);return value;}
+@@ -161,6 +175,8 @@
+   createBuffer(channels,length,rate){brand(contexts,this);if(arguments.length<3)throw error();return makeBuffer(uint(length),uint(channels),fround(number(rate)));}
+   createBufferSource(){brand(contexts,this);return new AudioBufferSourceNode(this);}
+   createConstantSource(){brand(contexts,this);return new ConstantSourceNode(this);}
++  createConvolver(){brand(contexts,this);return new ConvolverNode(this);}
++  decodeAudioData(input){const state=contexts.get(this),success=arguments[1],failure=arguments[2];if(!state)return apply(promiseReject,Promise,[error()]);if(success!=null&&typeof success!=='function'||failure!=null&&typeof failure!=='function')return apply(promiseReject,Promise,[error()]);if(!bridge.isBuffer(input))return apply(promiseReject,Promise,[new TypeError('')]);let data,buffer=null;try{data=bridge.decode(input,state.rate);if(data){buffer=makeBuffer(data.length,data.channels.length,state.rate);const target=buffers.get(buffer);for(let ch=0;ch<data.channels.length;ch++)for(let i=0;i<data.length;i++)target.channels[ch][i]=data.channels[ch][i];}}catch{buffer=null;}return new Promise((resolve,reject)=>schedule(()=>{if(buffer){if(success)try{apply(success,this,[buffer]);}catch(error){bridge.report(error);}resolve(buffer);}else{const error=bridge.exception('Unable to decode audio data','EncodingError');if(failure)try{apply(failure,this,[error]);}catch(error){bridge.report(error);}reject(error);}}));}
+   createGain(){brand(contexts,this);return new GainNode(this);}
+   createOscillator(){brand(contexts,this);return new OscillatorNode(this);}
+   createPeriodicWave(real,imag,options={}){brand(contexts,this);if(arguments.length<2)throw error();options=dictionary(options);return new PeriodicWave(this,{disableNormalization:options.disableNormalization,real,imag});}
+@@ -209,6 +225,9 @@
+    channels=ns.kind==='destination'?state.channels:ns.mode==='explicit'?ns.channelCount:ns.mode==='clamped-max'?min(ns.channelCount,channels):channels;
+    allocated+=channels*128;if(allocated>33554432)throw dom('NotSupportedError');
+    const data=mix(inputs,channels,ns.interpretation);
++   // The measured Native Convolver profile gates real input on IR presence;
++   // IR coefficients and normalize currently do not process those samples.
++   if(ns.kind==='convolver'&&ns.response===null)for(const channel of data)for(let frame=0;frame<128;frame++)channel[frame]=0;
+    if(ns.kind==='gain'){const ps=params.get(ns.gain),modulations=internal();for(const source of ps.incoming){const value=cache.get(source);if(value)modulations.push(value);}const input=mix(modulations,1,'speakers');for(let frame=0;frame<128;frame++){const time=(ps.automation==='k-rate'?start:start+frame)/state.rate,gain=paramValue(ps,time)+input[0][frame];for(let ch=0;ch<channels;ch++)data[ch][frame]*=gain;}}
+    cache.set(node,data);visiting.delete(node);
+   }
+@@ -234,8 +253,8 @@
+   suspend(when){const state=brand(contexts,this);let time;try{time=restricted(when);}catch(error){return apply(promiseReject,Promise,[error]);}const frame=ceil(time*state.rate/128)*128;if(time<0||frame<state.frame||time>=state.length/state.rate||state.state==='closed'||state.suspensions.has(frame))return apply(promiseReject,Promise,[dom('InvalidStateError')]);return new Promise(resolve=>state.suspensions.set(frame,record({resolve})));}
+   resume(){const state=brand(contexts,this);if(!state.rendered||state.state==='closed')return apply(promiseReject,Promise,[dom('InvalidStateError')]);if(state.state==='suspended'){state.state='running';schedule(()=>fire(this,'statechange'));schedule(()=>render(this,state));}return new Promise(resolve=>resolve());}
+  }
+- for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioContext,GainNode,ConstantSourceNode,OscillatorNode,PeriodicWave,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
+-  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioContext:0,GainNode:1,ConstantSourceNode:1,OscillatorNode:1,PeriodicWave:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
++ for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioContext,GainNode,ConstantSourceNode,OscillatorNode,PeriodicWave,ConvolverNode,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
++  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioContext:0,GainNode:1,ConstantSourceNode:1,OscillatorNode:1,PeriodicWave:1,ConvolverNode:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
+   const constructor=getDescriptor(Constructor.prototype,'constructor');delete Constructor.prototype.constructor;
+   for(const key of keys(Constructor.prototype)){const descriptor=getDescriptor(Constructor.prototype,key);define(Constructor.prototype,key,{...descriptor,enumerable:true});}
+   define(Constructor.prototype,'constructor',constructor);define(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});define(g,name,{value:Constructor,writable:true,configurable:true,enumerable:false});
+@@ -244,10 +263,11 @@
+ }
+ export function installAudioCore(page,window){
+  if(installed.has(window))return installed.get(window);
+- for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioContext','GainNode','ConstantSourceNode','OscillatorNode','PeriodicWave','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
++ for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioContext','GainNode','ConstantSourceNode','OscillatorNode','PeriodicWave','ConvolverNode','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
+  const signal=page.documentAbort?.signal,timers=new Set(),invoke=createInvocationTrampoline(implForWrapper(window)._globalObject),deadline={timeout:Math.min(page.timeout??2000,2000),displayErrors:false};let disposed=false;
+  const active=()=>!disposed&&!page.closed&&!signal?.aborted&&!!window.document;
+- const bridge={shared,Array,Map,Set,now:hostNow,makeWave:makeAudioWave,basicWave:basicAudioWave,renderWave:renderAudioWave,waveScale:audioWaveScale,token:Symbol('audio-construction'),record:properties=>Object.assign(Object.create(null),properties),isFloat32:types.isFloat32Array,isArray:Array.isArray,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
++ const exception=captureDOMExceptionFactory(window);
++ const bridge={shared,Array,Map,Set,decode:decodeAudioWav,isBuffer:types.isArrayBuffer,exception,report:error=>reportException(window,error),now:hostNow,makeWave:makeAudioWave,basicWave:basicAudioWave,renderWave:renderAudioWave,waveScale:audioWaveScale,token:Symbol('audio-construction'),record:properties=>Object.assign(Object.create(null),properties),isFloat32:types.isFloat32Array,isArray:Array.isArray,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
+   schedule(callback,delay=0){if(!active())return;const id=hostSetTimeout(()=>{timers.delete(id);if(active()){try{invoke.invoke(callback,window,[],deadline);}catch(error){if(active())reportException(window,error);}}},delay);timers.add(id);},
+   target(value){setupTarget(value,window);targetBackends.set(value,implForWrapper(value));registerPlatformFactory(value,{kind:'EventTarget',implementation:targetBackends.get(value),globalObject:window});listenerBackends.set(value,new Map());},
+   listen(value,type,callback,add){const backend=targetBackends.get(value),listeners=listenerBackends.get(value);let listener=listeners.get(callback);if(add){if(!listener){listener=convertListener(window,callback);listeners.set(callback,listener);}backend.addEventListener(type,listener,false);}else if(listener){backend.removeEventListener(type,listener,false);listeners.delete(callback);}},
+--- /dev/null
++++ b/src/audio-wav.js
+@@ -0,0 +1,23 @@
++// Independent RIFF/WAVE parsing and real PCM conversion. No media samples or
++// native decoding library are embedded. Unsupported encodings return null.
++import {types} from 'node:util';
++const U8=Uint8Array,F32=Float32Array,View=DataView,f=Math.fround,floor=Math.floor,min=Math.min,max=Math.max;
++const length=Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get;
++const byte=View.prototype.getUint8,u16=View.prototype.getUint16,u32=View.prototype.getUint32,i16=View.prototype.getInt16,i32=View.prototype.getInt32,f32=View.prototype.getFloat32,f64=View.prototype.getFloat64,apply=Reflect.apply;
++const slot=fields=>Object.assign(Object.create(null),fields);
++export function decodeAudioWav(input,outputRate){
++ if(!types.isArrayBuffer(input))return null;
++ let bytes;try{length.call(input);bytes=new U8(new U8(input))}catch{return null}
++ const view=new View(bytes.buffer),get=(method,at)=>apply(method,view,[at,true]),tag=(at,name)=>{if(at+name.length>bytes.length)return false;for(let i=0;i<name.length;i++)if(bytes[at+i]!==name.charCodeAt(i))return false;return true};
++ if(bytes.length<12||!tag(0,'RIFF')||!tag(8,'WAVE'))return null;
++ let format=null,data=null;for(let at=12;at+8<=bytes.length;){const size=min(get(u32,at+4),bytes.length-at-8),start=at+8;if(tag(at,'fmt '))format=slot({start,size});else if(tag(at,'data')){data=slot({start,size});if(format)break}at=start+size+(size%2)}
++ if(!format||format.size<16||!data)return null;
++ const base=format.start,channels=get(u16,base+2),rate=f(get(u32,base+4)),alignment=get(u16,base+12),bits=get(u16,base+14);let encoding=get(u16,base);
++ if(encoding===65534){if(format.size<26)return null;encoding=get(u16,base+24)}
++ const width=bits/8;if(!channels||channels>32||!rate||alignment!==channels*width||encoding===1&&![8,16,24,32].includes(bits)||encoding===3&&![32,64].includes(bits)||![1,3].includes(encoding))return null;
++ const frames=floor(data.size/alignment);if(!frames)return null;
++ const count=rate===outputRate?frames:max(1,min(4294967295,floor(frames*outputRate/rate)));if(count*channels>33554432)return null;
++ const read=(frame,channel)=>{const at=data.start+(frame*channels+channel)*width;if(encoding===3)return bits===32?get(f32,at):f(get(f64,at));if(bits===8)return f((get(byte,at)-128)/128);if(bits===16)return f(get(i16,at)/32768);if(bits===24){let value=bytes[at]+bytes[at+1]*256+bytes[at+2]*65536;if(value>=8388608)value-=16777216;return f(value/8388608)}return f(get(i32,at)/2147483648)};
++ const step=rate/outputRate,output=[];for(let channel=0;channel<channels;channel++){const values=new F32(count);for(let i=0;i<count;i++){if(rate===outputRate){values[i]=read(i,channel);continue}const position=i*step,index=min(floor(position),frames-1),t=f(position-index),a=read(index,channel),b=read(min(index+1,frames-1),channel);values[i]=f(a+f(f(b-a)*t))}output.push(values)}
++ return slot({channels:output,length:count,rate:outputRate});
++}
+--- /dev/null
++++ b/test/audio-media.test.js
+@@ -0,0 +1,16 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{Browser}from'../src/browser.js';
++const plain=value=>JSON.parse(JSON.stringify(value));async function fixture(action){const browser=new Browser({timeout:3000}),page=browser.createPage();try{await page.navigate('data:text/html,<body>Audio media');await action({page,w:page.dom.window})}finally{browser.close()}}
++test('real PCM decoding, linear resampling, callback ownership and explicit Native Convolver profile',()=>fixture(async({page})=>{
++ const input=await readFile(new URL('../docs/reference/audio-media/audio-media-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-media/audio-media-native.json',import.meta.url),'utf8')).observations,excluded=new Set(['exposed','compressorState','compressor-quiet','compressor-loud','compressor-long']);
++ assert.deepEqual(plain(await page.evaluate(input)).filter(row=>!excluded.has(row.name)),expected.filter(row=>!excluded.has(row.name)));
++}));
++test('decoding snapshots genuine input, forwards actual callback receiver and errors, and ignores authored metadata',()=>fixture(async({page})=>{
++ const input=await readFile(new URL('../docs/reference/audio-media/audio-decode-extra-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-media/audio-decode-extra-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(plain(await page.evaluate(input)),expected);
++}));
++test('untouched pinned audio_context fixture executes real convolver/clock/WAV assertions',async t=>{
++ const{upstreamTestRoot}=await import('./upstream-reference.js'),{startFixtureServer}=await import('../scripts/upstream-fixture-server.mjs'),{createHash}=await import('node:crypto');const root=await upstreamTestRoot(),path='webaudio/audio_context.html',source=await readFile(`${root}/${path}`);assert.equal(createHash('sha256').update(source).digest('hex'),'5fe4545027f8ea1f11e06f61dc385e4c4846b5ee4efa78a345254bd33e3a96c3');const server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());const browser=new Browser({userAgent:'Lightpanda/1.0'});t.after(()=>browser.close());const page=browser.createPage(),errors=[];page.on('console',e=>{if(e.type==='error')errors.push(e.args.map(String).join(' '))});page.newDocumentScripts.set('external',{source:'globalThis.__lp_external_runner=true;'});await page.navigate(`${server.origin}/src/browser/tests/${path}`);let passed=false;for(let i=0;i<200;i++){passed=page.evaluate('testing.assertOk()')===true;if(passed)break;await new Promise(r=>setTimeout(r,20))}assert.equal(page.evaluate('testing.IS_TEST_RUNNER'),true);assert.equal(passed,true,JSON.stringify(errors));assert.deepEqual(errors,[]);
++});
++test('decoded values/errors and real convolver/events have actual VM creation contexts',()=>fixture(async({w})=>{
++ const{getHeapBinding}=await import('../src/native-heap.js'),heap=getHeapBinding(),c=new w.OfflineAudioContext(1,4,8000),n=c.createConvolver(),source=c.createConstantSource();source.connect(n).connect(c.destination);source.start();source.stop(4/8000);let complete,ended;c.oncomplete=e=>complete=e;source.onended=e=>ended=e;const output=await c.startRendering(),input=new w.ArrayBuffer(48),v=new w.DataView(input);for(const[at,text]of[[0,'RIFF'],[8,'WAVEfmt '],[36,'data']])for(let i=0;i<text.length;i++)v.setUint8(at+i,text.charCodeAt(i));v.setUint32(4,40,true);v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,8000,true);v.setUint32(28,16000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);v.setUint32(40,4,true);v.setInt16(44,16384,true);const promise=c.decodeAudioData(input),decoded=await promise;let error;try{await c.decodeAudioData(new w.ArrayBuffer(0))}catch(e){error=e}const anchor=w.Object.prototype,host={};for(const[name,value]of Object.entries({convolver:n,complete,ended,output,promise,decoded,channel:decoded.getChannelData(0),error,convolverFunction:w.ConvolverNode,bufferGetter:Object.getOwnPropertyDescriptor(w.ConvolverNode.prototype,'buffer').get})){assert.equal(heap.sameRealm(value,anchor),true,name);assert.equal(heap.sameRealm(value,host),false,name);assert.equal(heap.creationGlobal(value),heap.creationGlobal(anchor),name);Object.setPrototypeOf(value,null);assert.equal(heap.sameRealm(value,anchor),true,name);assert.equal(heap.sameRealm(value,host),false,name)}
++}));
+--- /dev/null
++++ b/docs/reference/audio-media/README.md
+@@ -0,0 +1,46 @@
++Convolver profile and actual WAV decoding
++
++This followup depends on the frozen gain and wave patches. The dedicated Native
++controls retain both exposed compressor behavior and the scope implemented here.
++Compressor rows are explicitly excluded until its real DSP is implemented.
++
++ConvolverNode has genuine AudioNode/EventTarget state, private buffer identity,
++normalization state and measured channel/rate validation. Actual Native does not
++convolve: it emits silence without a response and passes actual mixed input
++unchanged with any valid response, including an all-zero or two-tap response.
++Normalization currently changes state only. The implementation reproduces that
++explicit gate, rather than claiming impulse-response convolution or using a
++generic silent node substitute.
++
++decodeAudioData parses actual RIFF/WAVE chunks and independently converts PCM
++8/16/24/32 and IEEE float32/64 samples. It splits interleaved channels and linearly
++resamples actual samples to the context rate, with measured output length and
++float rounding. Input is snapshotted synchronously and remains attached. Optional
++callbacks run with this=context before Promise reactions; failure callback and
++Promise rejection share the same genuine EncodingError. Invalid inputs and
++unsupported encodings reject. No synthetic decoded data or captured sample
++vectors are returned. The existing bounded AudioBuffer allocation limit applies.
++
++The callback queue uses owned document timers and actual VM promises. Public
++buffers/channel arrays and Convolver wrappers use the genuine VM allocation and
++private backends established in the wave followup. DOM exceptions use the existing
++captured scalar factory, preserving real VM Error allocation and actual generated
++DOMException slots. Constructor channel options now use captured private helpers
++rather than authored public setters.
++
++Validation is focused and serial on Node24.22.1: four tests pass, including the
++unchanged pinned webaudio/audio_context.html fixture. Native and candidate CDP
++runs of that original fixture both pass, using ephemeral ports and identical
++explicit diagnostic timing settings. All35 in-scope Native rows match exactly.
++Frozen-source direct public V8 checks cover10 public values/functions/getter,
++including decoded data, Promise, EncodingError and actual completion/ended events;
++all remain in their actual VM and outside Host after nulling prototypes. These
++checks perform no heap enumeration. Raw source/input/binary hashes and output
++are retained in the proposal.
++
++Compressor DSP remains the next gap; the full offline_audio_context.html fixture
++is not claimed to pass. Compressed formats beyond the measured PCM/float WAVE
++profile reject with EncodingError. Malformed/extension/large-resource cases and
++all cross-realm callback combinations are not exhaustively calibrated. Prior
++source-parameter modulation and depth-policy differences remain explicit. No
++broad/full, heap-enumeration or PureScript suite ran during Root's matrix.
+--- /dev/null
++++ b/docs/reference/audio-media/audio-decode-extra-native-expression.js
+@@ -0,0 +1,10 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++function wav(){const b=new ArrayBuffer(48),v=new DataView(b);for(const[at,s]of[[0,'RIFF'],[8,'WAVEfmt '],[36,'data']])for(let i=0;i<s.length;i++)v.setUint8(at+i,s.charCodeAt(i));v.setUint32(4,40,true);v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,8000,true);v.setUint32(28,16000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);v.setUint32(40,4,true);v.setInt16(44,16384,true);v.setInt16(46,-16384,true);return b}
++await run('receiver',async()=>{const c=new OfflineAudioContext(1,128,8000);let result;const success=function(b){result={undefined:this===undefined,null:this===null,context:this===c,global:this===globalThis,self:this===success,tag:Object.prototype.toString.call(this)}};await c.decodeAudioData(wav(),success);return result});
++await run('snapshot',async()=>{const c=new OfflineAudioContext(1,128,8000),b=wav(),p=c.decodeAudioData(b);new DataView(b).setInt16(44,0,true);return Array.from((await p).getChannelData(0))});
++await run('metadata',async()=>{const c=new OfflineAudioContext(1,128,8000),b=wav();Object.defineProperty(b,'byteLength',{get(){throw Error('author')}});Object.defineProperty(b,Symbol.toStringTag,{get(){throw Error('tag')}});return Array.from((await c.decodeAudioData(b)).getChannelData(0))});
++for(const[name,success,failure]of[['successNumber',3,null],['failureObject',null,{}],['bothNull',null,null]])await run(name,async()=>{const c=new OfflineAudioContext(1,128,8000),b=wav();let p;try{p=c.decodeAudioData(b,success,failure)}catch(e){return{sync:true,name:e.name,message:e.message}}try{return{sync:false,data:Array.from((await p).getChannelData(0))}}catch(e){return{sync:false,name:e.name,message:e.message}}});
++await run('empty',()=>new OfflineAudioContext(1,128,8000).decodeAudioData(new ArrayBuffer(0)));
++await run('fakeThis',()=>BaseAudioContext.prototype.decodeAudioData.call(Object.create(BaseAudioContext.prototype),wav()));
++await run('zeroConvolver',async()=>{const c=new OfflineAudioContext(1,4,8000),s=c.createBufferSource(),b=c.createBuffer(1,4,8000),n=c.createConvolver();b.getChannelData(0).set([1,2,3,-4]);s.buffer=b;n.buffer=c.createBuffer(1,4,8000);s.connect(n).connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-media/audio-decode-extra-native.json
+@@ -0,0 +1,84 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "9a7342e2ff61df3a2e879c9a5ec1f22ee5250ac9f91cba5d05b2fdae052d5724",
++  "observations": [
++    {
++      "name": "receiver",
++      "value": {
++        "undefined": false,
++        "null": false,
++        "context": true,
++        "global": false,
++        "self": false,
++        "tag": "[object OfflineAudioContext]"
++      }
++    },
++    {
++      "name": "snapshot",
++      "value": [
++        0.5,
++        -0.5
++      ]
++    },
++    {
++      "name": "metadata",
++      "value": [
++        0.5,
++        -0.5
++      ]
++    },
++    {
++      "name": "successNumber",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "failureObject",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "bothNull",
++      "value": {
++        "sync": false,
++        "data": [
++          0.5,
++          -0.5
++        ]
++      }
++    },
++    {
++      "name": "empty",
++      "error": {
++        "name": "EncodingError",
++        "message": "Unable to decode audio data",
++        "realm": false
++      }
++    },
++    {
++      "name": "fakeThis",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "zeroConvolver",
++      "value": [
++        1,
++        2,
++        3,
++        -4
++      ]
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-media/audio-media-native-expression.js
+@@ -0,0 +1,15 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('exposed',()=>({compressor:typeof DynamicsCompressorNode,convolver:typeof ConvolverNode,filter:typeof BiquadFilterNode,delay:typeof DelayNode,analyser:typeof AnalyserNode,context:Reflect.ownKeys(BaseAudioContext.prototype).map(String)}));
++await run('convolverState',()=>{const c=new OfflineAudioContext(1,128,8000),n=c.createConvolver();return{buffer:n.buffer,normalize:n.normalize,count:n.channelCount,mode:n.channelCountMode,inputs:n.numberOfInputs,outputs:n.numberOfOutputs,keys:Reflect.ownKeys(ConvolverNode.prototype).map(String)}});
++for(const[name,configure]of[['noIR',()=>{}],['identity', (n,c)=>{n.normalize=false;const b=c.createBuffer(1,1,c.sampleRate);b.getChannelData(0)[0]=1;n.buffer=b}],['twoTap',(n,c)=>{n.normalize=false;const b=c.createBuffer(1,2,c.sampleRate);b.getChannelData(0).set([1,.5]);n.buffer=b}],['normalized',(n,c)=>{const b=c.createBuffer(1,1,c.sampleRate);b.getChannelData(0)[0]=1;n.buffer=b}]])await run('convolver-'+name,async()=>{const c=new OfflineAudioContext(1,8,8000),s=new ConstantSourceNode(c,{offset:2}),n=c.createConvolver();configure(n,c);s.connect(n).connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++for(const[name,fn]of[['count',n=>{n.channelCount=3}],['mode',n=>{n.channelCountMode='max'}],['rate', (n,c)=>{n.buffer=c.createBuffer(1,4,44100)}],['channels',(n,c)=>{n.buffer=c.createBuffer(3,4,8000)}],['four',(n,c)=>{n.buffer=c.createBuffer(4,4,8000);return n.buffer.numberOfChannels}],['twice',(n,c)=>{n.buffer=c.createBuffer(1,4,8000);n.buffer=c.createBuffer(2,4,8000);return n.buffer.numberOfChannels}],['fake',n=>{n.buffer=Object.create(AudioBuffer.prototype)}]])await run('convolver-'+name,()=>{const c=new OfflineAudioContext(1,128,8000);return fn(c.createConvolver(),c)});
++await run('compressorState',()=>{const c=new OfflineAudioContext(1,128,8000),n=c.createDynamicsCompressor(),out={reduction:n.reduction,count:n.channelCount,mode:n.channelCountMode,keys:Reflect.ownKeys(DynamicsCompressorNode.prototype).map(String)};for(const key of['threshold','knee','ratio','attack','release']){const p=n[key];out[key]={value:p.value,min:p.minValue,max:p.maxValue,rate:p.automationRate}}return out});
++for(const [name,amplitude,length]of[['quiet',.001,1024],['loud',1,1024],['long',1,8192]])await run('compressor-'+name,async()=>{const c=new OfflineAudioContext(1,length,8000),s=new ConstantSourceNode(c,{offset:amplitude}),n=c.createDynamicsCompressor();s.connect(n).connect(c.destination);s.start();const d=(await c.startRendering()).getChannelData(0);return{samples:[0,47,48,49,63,127,255,511,length-1].map(i=>d[i]),sum:d.reduce((a,b)=>a+Math.abs(b),0),reduction:n.reduction}});
++function wav(samples,rate=8000,{format=1,bits=16,channels=1}={}){const width=bits/8,frames=samples.length/channels,buffer=new ArrayBuffer(44+samples.length*width),v=new DataView(buffer),text=(at,s)=>{for(let i=0;i<s.length;i++)v.setUint8(at+i,s.charCodeAt(i))};text(0,'RIFF');v.setUint32(4,buffer.byteLength-8,true);text(8,'WAVEfmt ');v.setUint32(16,16,true);v.setUint16(20,format,true);v.setUint16(22,channels,true);v.setUint32(24,rate,true);v.setUint32(28,rate*channels*width,true);v.setUint16(32,channels*width,true);v.setUint16(34,bits,true);text(36,'data');v.setUint32(40,samples.length*width,true);for(let i=0;i<samples.length;i++){const at=44+i*width,x=samples[i];if(format===3){bits===64?v.setFloat64(at,x,true):v.setFloat32(at,x,true)}else if(bits===8)v.setUint8(at,x);else if(bits===16)v.setInt16(at,x,true);else if(bits===24){v.setUint8(at,x&255);v.setUint8(at+1,(x>>8)&255);v.setUint8(at+2,(x>>16)&255)}else v.setInt32(at,x,true)}return buffer}
++for(const[name,samples,options]of[['pcm8',[0,128,255],{bits:8}],['pcm16',[0,16384,-16384,32767],{}],['pcm24',[0,4194304,-4194304,8388607],{bits:24}],['pcm32',[0,1073741824,-1073741824,2147483647],{bits:32}],['float32',[0,.5,-.5,2],{format:3,bits:32}],['float64',[0,.5,-.5,2],{format:3,bits:64}],['stereo',[0,16384,32767,-32768],{channels:2}]])await run('decode-'+name,async()=>{const c=new OfflineAudioContext(1,128,8000),input=wav(samples,8000,options),size=input.byteLength,p=c.decodeAudioData(input),immediate=input.byteLength,b=await p;return{length:b.length,rate:b.sampleRate,channels:b.numberOfChannels,data:Array.from({length:b.numberOfChannels},(_,i)=>Array.from(b.getChannelData(i))),input:[size,immediate,input.byteLength],realm:b instanceof AudioBuffer,array:b.getChannelData(0) instanceof Float32Array}});
++for(const[rate,samples]of[[4000,[0,16384,-16384,0]],[12000,[0,16384,-16384,0]],[44100,[16384]]])await run('resample-'+rate,async()=>{const b=await new OfflineAudioContext(1,128,8000).decodeAudioData(wav(samples,rate));return{length:b.length,data:Array.from(b.getChannelData(0))}});
++await run('decodeOrder',async()=>{const c=new OfflineAudioContext(1,128,8000),out=[],input=wav([0,16384]);const p=c.decodeAudioData(input,function(b){out.push(['callback',this===globalThis,b.length])});out.push(['returned',p instanceof Promise]);const b=await p.then(value=>{out.push('then');return value});return out});
++await run('decodeErrors',async()=>{const c=new OfflineAudioContext(1,128,8000),out=[];let callback;try{await c.decodeAudioData(new Uint8Array([1,2,3]).buffer,null,e=>callback=e)}catch(e){out.push([e.name,e.message,e instanceof DOMException,callback===e])}for(const input of[new Uint8Array(4),{},null,undefined,Object.create(ArrayBuffer.prototype)]){let sync=false,p;try{p=c.decodeAudioData(input)}catch(e){sync=true;out.push([sync,e.name,e.message,e instanceof TypeError]);continue}try{await p}catch(e){out.push([sync,e.name,e.message,e instanceof TypeError])}}return out});
++await run('decodeClosed',async()=>{const c=new AudioContext({sampleRate:8000});await c.close();return(await c.decodeAudioData(wav([16384]))).getChannelData(0)[0]});
++await run('decodeLength',()=>BaseAudioContext.prototype.decodeAudioData.length);
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-media/audio-media-native.json
+@@ -0,0 +1,516 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "fc188dbf86988c878bc0a1f5b0261c07b85e2b1e0e1ccab00caaccb55587b00c",
++  "observations": [
++    {
++      "name": "exposed",
++      "value": {
++        "compressor": "function",
++        "convolver": "function",
++        "filter": "undefined",
++        "delay": "undefined",
++        "analyser": "undefined",
++        "context": [
++          "destination",
++          "sampleRate",
++          "currentTime",
++          "state",
++          "onstatechange",
++          "createBuffer",
++          "createBufferSource",
++          "createConstantSource",
++          "createConvolver",
++          "decodeAudioData",
++          "createDynamicsCompressor",
++          "createGain",
++          "createOscillator",
++          "createPeriodicWave",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "convolverState",
++      "value": {
++        "buffer": null,
++        "normalize": true,
++        "count": 2,
++        "mode": "clamped-max",
++        "inputs": 1,
++        "outputs": 1,
++        "keys": [
++          "buffer",
++          "normalize",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "convolver-noIR",
++      "value": [
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0
++      ]
++    },
++    {
++      "name": "convolver-identity",
++      "value": [
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "convolver-twoTap",
++      "value": [
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "convolver-normalized",
++      "value": [
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "convolver-count",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-mode",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-rate",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-channels",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-four",
++      "value": 4
++    },
++    {
++      "name": "convolver-twice",
++      "value": 2
++    },
++    {
++      "name": "convolver-fake",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "compressorState",
++      "value": {
++        "reduction": 0,
++        "count": 2,
++        "mode": "clamped-max",
++        "keys": [
++          "threshold",
++          "knee",
++          "ratio",
++          "attack",
++          "release",
++          "reduction",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "threshold": {
++          "value": -24,
++          "min": -100,
++          "max": 0,
++          "rate": "k-rate"
++        },
++        "knee": {
++          "value": 30,
++          "min": 0,
++          "max": 40,
++          "rate": "k-rate"
++        },
++        "ratio": {
++          "value": 12,
++          "min": 1,
++          "max": 20,
++          "rate": "k-rate"
++        },
++        "attack": {
++          "value": 0.003000000026077032,
++          "min": 0,
++          "max": 1,
++          "rate": "k-rate"
++        },
++        "release": {
++          "value": 0.25,
++          "min": 0,
++          "max": 1,
++          "rate": "k-rate"
++        }
++      }
++    },
++    {
++      "name": "compressor-quiet",
++      "value": {
++        "samples": [
++          0,
++          0,
++          0.0003760384861379862,
++          0.00037620513467118144,
++          0.0003785458975471556,
++          0.00042368954746052623,
++          0.0005952079663984478,
++          0.0009551619295962155,
++          0.0013395703863352537
++        ],
++        "sum": 0.8994434222113341,
++        "reduction": -9.840773582458496
++      }
++    },
++    {
++      "name": "compressor-loud",
++      "value": {
++        "samples": [
++          0,
++          0,
++          0.3765937387943268,
++          0.3767933249473572,
++          0.379598468542099,
++          0.4037037193775177,
++          0.45340344309806824,
++          0.5369738340377808,
++          0.6697742342948914
++        ],
++        "sum": 523.5815997421741,
++        "reduction": -11.223238945007324
++      }
++    },
++    {
++      "name": "compressor-long",
++      "value": {
++        "samples": [
++          0,
++          0,
++          0.3765937387943268,
++          0.3767933249473572,
++          0.379598468542099,
++          0.4037037193775177,
++          0.45340344309806824,
++          0.5369738340377808,
++          0.7550625801086426
++        ],
++        "sum": 5919.649486035109,
++        "reduction": -6.43103551864624
++      }
++    },
++    {
++      "name": "decode-pcm8",
++      "value": {
++        "length": 3,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            -1,
++            0,
++            0.9921875
++          ]
++        ],
++        "input": [
++          47,
++          47,
++          47
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-pcm16",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            0.999969482421875
++          ]
++        ],
++        "input": [
++          52,
++          52,
++          52
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-pcm24",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            0.9999998807907104
++          ]
++        ],
++        "input": [
++          56,
++          56,
++          56
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-pcm32",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            1
++          ]
++        ],
++        "input": [
++          60,
++          60,
++          60
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-float32",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            2
++          ]
++        ],
++        "input": [
++          60,
++          60,
++          60
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-float64",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            2
++          ]
++        ],
++        "input": [
++          76,
++          76,
++          76
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-stereo",
++      "value": {
++        "length": 2,
++        "rate": 8000,
++        "channels": 2,
++        "data": [
++          [
++            0,
++            0.999969482421875
++          ],
++          [
++            0.5,
++            -1
++          ]
++        ],
++        "input": [
++          52,
++          52,
++          52
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "resample-4000",
++      "value": {
++        "length": 8,
++        "data": [
++          0,
++          0.25,
++          0.5,
++          0,
++          -0.5,
++          -0.25,
++          0,
++          0
++        ]
++      }
++    },
++    {
++      "name": "resample-12000",
++      "value": {
++        "length": 2,
++        "data": [
++          0,
++          0
++        ]
++      }
++    },
++    {
++      "name": "resample-44100",
++      "value": {
++        "length": 1,
++        "data": [
++          0.5
++        ]
++      }
++    },
++    {
++      "name": "decodeOrder",
++      "value": [
++        [
++          "returned",
++          true
++        ],
++        [
++          "callback",
++          false,
++          2
++        ],
++        "then"
++      ]
++    },
++    {
++      "name": "decodeErrors",
++      "value": [
++        [
++          "EncodingError",
++          "Unable to decode audio data",
++          true,
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ]
++      ]
++    },
++    {
++      "name": "decodeClosed",
++      "value": 0.5
++    },
++    {
++      "name": "decodeLength",
++      "value": 1
++    }
++  ]
++}

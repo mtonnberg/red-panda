@@ -1,0 +1,10 @@
+from pathlib import Path
+import json,subprocess,time,hashlib
+r=Path.cwd();out=r/'.cache/validation/phase18';paths=[p for name in ['src','test','native','bin','scripts','automation/src','automation/test','oracle','docs/reference']for p in(r/name).rglob('*')if p.is_file()and '__pycache__'not in p.parts]+[r/'package.json',r/'package-lock.json']
+def snapshot():return{str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest()for p in sorted(paths)}
+before=snapshot();(out/'source22-before.json').write_text(json.dumps(before,indent=2));status=[]
+for name,binary in [('native','/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux'),('candidate',str(r/'bin/red-panda.js'))]:
+ command=['node','scripts/conformance.mjs','--root',str(r/'.cache/lightpanda-reference/browser-948d773786/src/browser/tests'),'--binary',binary,'--isolate','--fixture-profile','upstream','--source-load-contract','--websocket-port','9584','--registration-map','proposals/fixture-routes/evidence/registration-map.json','--port','9582','--tests-file',str(out/'source22.json'),'--report',str(out/('source22-'+name+'.json'))];start=time.monotonic()
+ with(out/('source22-'+name+'.log')).open('w')as f:completed=subprocess.run(command,stdout=f,stderr=subprocess.STDOUT)
+ status.append({'name':name,'exit':completed.returncode,'seconds':time.monotonic()-start,'command':command})
+after=snapshot();(out/'source22-after.json').write_text(json.dumps(after,indent=2));(out/'source22-status.json').write_text(json.dumps({'status':status,'unchanged':before==after,'inputs':len(before)},indent=2));print(json.dumps({'status':status,'unchanged':before==after}));raise SystemExit(0 if before==after and all(x['exit']==0 for x in status)else 1)

@@ -17,7 +17,10 @@ const { getComputedOrUsedColor } = require('jsdom/lib/jsdom/living/helpers/color
 const HTMLElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
 const SVGElementImpl = require('jsdom/lib/jsdom/living/nodes/SVGElement-impl.js').implementation;
 const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
-const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
+const stylesheetBackend=require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
+const { removeStylesheet } = stylesheetBackend;
+const whatwgURL=require('whatwg-url');
+const REPLACING_EXTERNAL=new WeakMap();
 const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
 const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\narea,base,datalist,head,link,meta,noscript,param,script,source,style,template,title,track { display: none; } details:not([open]) > :not(summary) { display: none; } [popover]:not(:popover-open):not(dialog[open]) { display:none; } dialog:popover-open {display:block;}\n');
 const RECORDS = new WeakMap();
@@ -133,7 +136,7 @@ function declaration(style) {
 
 function normalizeRules(rules, sheet, parent = null) {
   for (const rule of rules) {
-    rule.parentStyleSheet = sheet; rule.parentRule = parent;
+    rule.parentStyleSheet = rule.type===2?null:sheet; rule.parentRule = parent;
     if (rule.style) {
       rule.style = declaration(rule.style);
       Object.defineProperty(rule.style, 'parentRule', { configurable: true, value: rule });
@@ -168,6 +171,28 @@ function normalizeRules(rules, sheet, parent = null) {
 function parse(record, text) {
   return parseStyleSheet(String(text), { window: record.window, onUnsupported: value => record.unsupported.add(value) });
 }
+
+const originalExternalCreate=stylesheetBackend.createStylesheet;
+stylesheetBackend.removeStylesheet=function(sheet,element){
+ const record=recordFor(wrapperForImpl(element._ownerDocument));
+ const index=element._ownerDocument.styleSheets._list.indexOf(sheet);
+ if(record&&element.localName==='link'&&element._attached)REPLACING_EXTERNAL.set(element,{record,sheet,index});
+ return removeStylesheet(sheet,element);
+};
+stylesheetBackend.createStylesheet=function(text,element,baseURL){
+ const record=recordFor(wrapperForImpl(element._ownerDocument));
+ if(!record||record.disposed||element.localName!=='link')return originalExternalCreate(text,element,baseURL);
+ const replacement=REPLACING_EXTERNAL.get(element);REPLACING_EXTERNAL.delete(element);
+ const parsed=parse(record,text);
+ // Keep the existing real import loader for its supported import path.
+ if([...parsed.cssRules].some(rule=>rule.type===3)){originalExternalCreate(text,element,baseURL);if(element.sheet){upgradeSheet(record,element.sheet);element.sheet.ownerNode=wrapperForImpl(element);element.sheet.href=whatwgURL.serializeURL(baseURL);}return;}
+ const retained=replacement?.record===record?replacement.sheet:null,sheet=retained?upgradeSheet(record,retained):upgradeSheet(record,parsed);
+ if(retained){for(const rule of sheet.cssRules){rule.parentStyleSheet=null;rule.parentRule=null;}normalizeRules(parsed.cssRules,sheet);spliceRules(sheet.cssRules,0,sheet.cssRules.length,...parsed.cssRules);}
+ sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;
+ const list=element._ownerDocument.styleSheets._list,index=replacement?.index;
+ if(!list.includes(sheet)){if(index>=0)list.splice(Math.min(index,list.length),0,sheet);else list.push(sheet);}
+ invalidateStyleCache(element);
+};
 
 function operation(record, sheet, name, args) {
   const method = SHEETS.get(sheet)?.operations?.[name];
@@ -413,6 +438,17 @@ function localToken(record, element) {
   return JSON.stringify(tokens);
 }
 
+// Native's position accessor uses a typed keyword candidate from the actual
+// cascade, while CSSOM retains the authored declaration token stream. Unknown
+// keywords/variables and inherited/reset keywords other than initial do not
+// supply a position candidate; a genuine lower-ranked declaration can win.
+function positionValue(value) {
+  const keyword=value.trim().toLowerCase();
+  if(keyword==='initial')return 'static';
+  if(keyword==='-webkit-sticky')return 'sticky';
+  return ['static','relative','absolute','fixed','sticky'].includes(keyword)?keyword:null;
+}
+
 function overflowAxes(value) {
   const parts = value.trim().toLowerCase().split(/\s+/);
   if (parts.length === 1 && ['inherit', 'initial', 'unset', 'revert', 'revert-layer'].includes(parts[0])) return [parts[0], parts[0]];
@@ -475,6 +511,7 @@ function cascade(record, element) {
       const property = style[index];
       let value = style.getPropertyValue(property);
       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
+      if (property === 'position') { value = positionValue(value); if (value === null) continue; }
       const important = style.getPropertyPriority(property) === 'important';
       const entries=expandedEntries(property,value);if(!entries)continue;
       // cssstyle's pinned parsed value map includes genuine shorthand

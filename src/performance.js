@@ -1,7 +1,8 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 // Independent timing from recorded calls and Page transport/lifecycle events.
 import { createRequire } from 'node:module';
 const require=createRequire(import.meta.url);
-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+
 const installed = new WeakMap(), trackers=new WeakMap();
 const hostNow=()=>globalThis.performance.now();
 

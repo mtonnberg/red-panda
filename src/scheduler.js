@@ -1,3 +1,4 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import {addAbortListener} from 'node:events';
 // Independent timer-backed task execution calibrated against the pinned Native.
 // Priority metadata/events are real; that target currently runs priority hints
@@ -7,7 +8,7 @@ import {createInvocationTrampoline} from './invocation.js';
 import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import {onFrameRetirement} from './frame-activity.js';
-const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+const require=createRequire(import.meta.url);
 const installed=new WeakMap(),controllers=new WeakMap(),signals=new WeakMap(),events=new WeakMap(),schedulers=new WeakMap();
 const apply=Reflect.apply,microtask=queueMicrotask;
 const nodeAborted=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'aborted').get,nodeReason=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'reason').get,disposeSymbol=Symbol.dispose;

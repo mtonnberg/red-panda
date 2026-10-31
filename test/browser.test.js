@@ -216,15 +216,17 @@ test('external scripts retain headers, redirects and separate Set-Cookie values 
   } finally { browser.close(); }
 });
 
-test('HTTP script failures report a page error while the document finishes loading', async () => {
+test('HTTP script failures retain resource diagnostics without reporting authored exceptions', async () => {
   const browser = new Browser();
   try {
     const page = browser.createPage();
-    const errors = []; page.on('pageError', error => errors.push(error));
+    const errors = [], resources = []; page.on('pageError', error => errors.push(error)); page.on('resourceError', error => resources.push(error));
     await page.navigate(`${fixture.url}resource-error-page`);
     assert.equal(page.evaluate("document.querySelector('h1').textContent"), 'Document survived');
-    assert.equal(errors.length, 1);
-    assert.match(errors[0].message, /Could not load script/);
+    assert.deepEqual(errors, []);
+    assert.equal(resources.length, 1);
+    assert.match(resources[0].message, /Could not load script/);
+    assert.equal(page.evaluate('document.readyState'), 'complete');
   } finally { browser.close(); }
 });
 

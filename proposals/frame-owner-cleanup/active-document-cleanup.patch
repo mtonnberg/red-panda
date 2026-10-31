@@ -1,0 +1,19 @@
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -293,12 +293,14 @@
+       record = { id: randomUUID(), parentId: operation.owner.record.id, element: implementation, generation: 0 };
+       elements.set(implementation, record); records.set(record.id, record);
+     } else {
+-      const previousWindow = record.window;
++      const previousWindow = record.window, previousDocument = implForWrapper(record.document);
+       destroyDocument(record);
+       // Public close() is a measured no-op for ordinary frame windows. A real
+       // navigation must still release the old browsing authority through its
+       // captured owner cleanup while preserving the actual inactive DOM tree.
+-      disposeBrowsingWindow(previousWindow._globalProxy ?? previousWindow, { retain: true });
++      // Standalone jsdom may already have closed this document before creating
++      // the replacement Window. Only a still-active owner needs cleanup here.
++      if (previousDocument._defaultView !== null) disposeBrowsingWindow(previousWindow._globalProxy ?? previousWindow, { retain: true });
+     }
+     const parentWindow = operation.owner.record.window;
+     childWindow._parent = parentWindow._globalProxy ?? parentWindow;

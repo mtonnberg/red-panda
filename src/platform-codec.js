@@ -31,10 +31,11 @@ export function createPlatformCodec(realm){
  const failure=message=>new Exception(message,'DataCloneError');
  function serialize(value){
   const provenance=platformFactoryRecord(value);
+  if(provenance?.kind==='PeriodicWave'||provenance?.kind==='OscillatorNode')throw failure('The object can not be cloned');
   const exception=domExceptionRecord(value);if(exception)return exception;
   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
-  if(['VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
+  if(['Animation','AnimationPlaybackEvent','Storage','StorageEvent','PaymentRequest','PaymentResponse','PaymentRequestUpdateEvent','PaymentMethodChangeEvent','VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
   const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}

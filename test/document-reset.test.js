@@ -112,14 +112,14 @@ test('an already-running dynamic module continues while the new cycle has indepe
   release(); await until(() => f.window.oldModuleFinished === true); assert.equal(f.page.documentAbort.signal.aborted, false); assert.deepEqual(f.errors, []);
 });
 
-test('raw Window.close aborts a real pending written external without stale parser continuation', async t => {
+test('owned Page.close aborts a real pending written external without stale parser continuation', async t => {
   let received = false, disconnected = false;
   const f = await fixture(t, undefined, { '/never.js': (request,response) => { received = true; response.on('close', () => { disconnected = true; }); } });
   f.page.evaluate(`document.open();document.write('<script src="/never.js"><\/script><p id="tail">tail</p>');document.close();`);
-  await until(() => received); f.window.close(); const afterClose = f.document.querySelectorAll('*').length;
+  await until(() => received); f.page.close(); const afterClose = f.document.querySelectorAll('*').length;
   await until(() => disconnected); await tick(); await tick();
   assert.equal(f.document.querySelectorAll('*').length, afterClose); assert.equal(f.document.getElementById('tail'), null);
-  assert.equal(f.page.closed, false); assert.equal(f.page.documentAbort.signal.aborted, false);
+  assert.equal(f.page.closed, true); assert.equal(f.page.documentAbort.signal.aborted, true);
 });
 
 test('post-load iframe writes retain the actual child Window, Document and VM context', async t => {

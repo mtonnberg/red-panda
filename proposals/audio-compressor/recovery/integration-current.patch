@@ -1,0 +1,1263 @@
+--- a/src/audio-core.js
++++ b/src/audio-core.js
+@@ -1,3 +1,4 @@
++import {createAudioCompressor,processAudioCompressor} from './audio-compressor.js';
+ import {decodeAudioWav} from './audio-wav.js';
+ import {captureDOMExceptionFactory} from './worker-dom-exception.js';
+ import {makeAudioWave,basicAudioWave,renderAudioWave,audioWaveScale} from './audio-waves.js';
+@@ -73,9 +74,9 @@
+  class AudioParam{
+   constructor(){illegal();}
+   get value(){const state=brand(params,this),context=contexts.get(state.context);return context.realtime||context.frame?max(state.min??-constant,min(state.max??constant,fround(paramValue(state,updateClock(context)/context.rate)))):state.value;}
+-  set value(value){const state=brand(params,this);state.value=max(state.min??-constant,min(state.max??constant,float(value)));}
++  set value(value){const state=brand(params,this);state.value=max(state.min??-constant,min(state.max??constant,float(value)));const context=contexts.get(state.context);addParam(this,'set',state.value,updateClock(context)/context.rate);}
+   get automationRate(){return brand(params,this).automation;}
+-  set automationRate(value){const state=brand(params,this);value=String(value);if(!['a-rate','k-rate'].includes(value))return;if(value!==state.automation&&state.fixed)throw dom('InvalidStateError');state.automation=value;}
++  set automationRate(value){const state=brand(params,this);value=audioText(value);if(!['a-rate','k-rate'].includes(value))return;if(value!==state.automation&&state.fixed)throw dom('InvalidStateError');state.automation=value;}
+   get defaultValue(){return brand(params,this).defaultValue;}
+   get minValue(){return brand(params,this).min??-constant;}
+   get maxValue(){return brand(params,this).max??constant;}
+@@ -164,6 +165,16 @@
+   get normalize(){return convolverBrand(this).normalize;}
+   set normalize(value){convolverBrand(this).normalize=!!value;}
+  }
++ function compressorBrand(value){const state=brand(nodes,value);if(state.kind!=='compressor')throw new TypeError('Illegal invocation');return state;}
++ class DynamicsCompressorNode extends AudioNode{
++  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();options=dictionary(options);super(context,token);const state=nodes.get(this);state.kind='compressor';state.mode='clamped-max';state.maxChannels=2;state.noMax=true;state.reduction=0;state.processor=bridge.makeCompressor(contexts.get(context).rate);for(const[key,value,low,high]of[['threshold',-24,-100,0],['knee',30,0,40],['ratio',12,1,20],['attack',.003,0,1],['release',.25,0,1]]){state[key]=makeParam(context,value);const data=params.get(state[key]);data.min=low;data.max=high;}const attack=options.attack;if(attack!==undefined)initialParam(state.attack,attack);nodeOptions(this,options);for(const key of['knee','ratio','release','threshold']){const value=options[key];if(value!==undefined)initialParam(state[key],value);}publish(this,'DynamicsCompressorNode');}
++  get threshold(){return paramView(compressorBrand(this).threshold);}
++  get knee(){return paramView(compressorBrand(this).knee);}
++  get ratio(){return paramView(compressorBrand(this).ratio);}
++  get attack(){return paramView(compressorBrand(this).attack);}
++  get release(){return paramView(compressorBrand(this).release);}
++  get reduction(){return compressorBrand(this).reduction;}
++ }
+  class BaseAudioContext extends EventTarget{
+   constructor(key){if(key!==token)illegal();const value=allocate(new.target.prototype);bridge.target(value);return value;}
+   get destination(){return brand(contexts,this).destination;}
+@@ -177,6 +188,7 @@
+   createConstantSource(){brand(contexts,this);return new ConstantSourceNode(this);}
+   createConvolver(){brand(contexts,this);return new ConvolverNode(this);}
+   decodeAudioData(input){const state=contexts.get(this),success=arguments[1],failure=arguments[2];if(!state)return apply(promiseReject,Promise,[error()]);if(success!=null&&typeof success!=='function'||failure!=null&&typeof failure!=='function')return apply(promiseReject,Promise,[error()]);if(!bridge.isBuffer(input))return apply(promiseReject,Promise,[new TypeError('')]);let data,buffer=null;try{data=bridge.decode(input,state.rate);if(data){buffer=makeBuffer(data.length,data.channels.length,state.rate);const target=buffers.get(buffer);for(let ch=0;ch<data.channels.length;ch++)for(let i=0;i<data.length;i++)target.channels[ch][i]=data.channels[ch][i];}}catch{buffer=null;}return new Promise((resolve,reject)=>schedule(()=>{if(buffer){if(success)try{apply(success,this,[buffer]);}catch(error){bridge.report(error);}resolve(buffer);}else{const error=bridge.exception('Unable to decode audio data','EncodingError');if(failure)try{apply(failure,this,[error]);}catch(error){bridge.report(error);}reject(error);}}));}
++  createDynamicsCompressor(){brand(contexts,this);return new DynamicsCompressorNode(this);}
+   createGain(){brand(contexts,this);return new GainNode(this);}
+   createOscillator(){brand(contexts,this);return new OscillatorNode(this);}
+   createPeriodicWave(real,imag,options={}){brand(contexts,this);if(arguments.length<2)throw error();options=dictionary(options);return new PeriodicWave(this,{disableNormalization:options.disableNormalization,real,imag});}
+@@ -196,7 +208,8 @@
+  function fire(target,type,buffer){const event=allocate(Event.prototype);bridge.event(event,type,{bubbles:false,cancelable:false,composed:false},true);if(type==='complete'){setPrototype(event,OfflineAudioCompletionEvent.prototype);events.set(event,buffer);}bridge.dispatch(target,event);}
+  function schedule(action,delay=0){bridge.schedule(action,delay);}
+ 
+- function sourceFrames(source,ctx,quantumFrames,startFrame=0){const state=nodes.get(source);if(!state.started||state.ended)return record({ended:false,samples:null});if(state.kind==='oscillator'){const data=new F32(quantumFrames),start=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),offset=max(0,start-startFrame),count=max(0,min(quantumFrames,stop-startFrame)-offset),fp=params.get(state.frequency),dp=params.get(state.detune),frequencies=internal(),accurate=fp.automation==='a-rate'&&fp.events.length>0||dp.automation==='a-rate'&&dp.events.length>0;for(let i=0;i<count;i++){const absolute=startFrame+(accurate?i:offset),time=absolute/ctx.rate,fv=max(fp.min,min(fp.max,paramValue(fp,fp.automation==='k-rate'?startFrame/ctx.rate:time))),dv=max(dp.min,min(dp.max,paramValue(dp,dp.automation==='k-rate'?startFrame/ctx.rate:time)));frequencies.push(max(-ctx.rate/2,min(ctx.rate/2,fround(fround(fv)*fround(pow(2,fround(dv/1200)))))));}if(count){if(!state.played){state.phase=(start-state.when*ctx.rate)*(accurate?0:frequencies[0])*bridge.waveScale(state.wave);state.played=true;}const result=bridge.renderWave(state.wave,state.phase,frequencies,accurate);state.phase=result.phase;for(let i=0;i<count;i++)data[offset+i]=result.samples[i];}const samples=internal();samples.push(data);return record({ended:stop<=startFrame+quantumFrames,samples});}if(state.kind==='constant'){const data=new F32(quantumFrames),when=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),p=params.get(state.offsetParam);for(let frame=0;frame<quantumFrames;frame++){const absolute=startFrame+frame;if(absolute>=when&&absolute<stop)data[frame]=paramValue(p,(p.automation==='k-rate'?floor(absolute/128)*128:absolute)/ctx.rate);}const samples=internal();samples.push(data);return record({ended:stop<=startFrame+quantumFrames,samples});}const b=state.buffer===null?null:buffers.get(state.buffer),samples=internal();for(let ch=0;ch<(b?.channels.length??1);ch++)samples.push(new F32(quantumFrames));
++ function sampleAccurateParam(state,start,end){if(state.automation!=='a-rate'||!state.events.length)return false;let index=0;for(let i=0;i<state.events.length;i++)if(state.events[i].time<=start)index=i;const event=state.events[index];if(event.time>end&&['target','set','curve'].includes(event.type))return false;if(state.events.length-index>=2)return true;if(event.type==='target')return event.time<=end;if(event.type==='curve')return event.time<=start&&start<event.time+event.extra.duration;return event.time>=start;}
++ function sourceFrames(source,ctx,quantumFrames,startFrame=0){const state=nodes.get(source);if(!state.started||state.ended)return record({ended:false,samples:null});if(state.kind==='oscillator'){const data=new F32(quantumFrames),start=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),offset=max(0,start-startFrame),count=max(0,min(quantumFrames,stop-startFrame)-offset),fp=params.get(state.frequency),dp=params.get(state.detune),frequencies=internal(),accurate=sampleAccurateParam(fp,startFrame/ctx.rate,(startFrame+quantumFrames)/ctx.rate)||sampleAccurateParam(dp,startFrame/ctx.rate,(startFrame+quantumFrames)/ctx.rate);for(let i=0;i<count;i++){const absolute=startFrame+(accurate?i:offset),time=absolute/ctx.rate,fv=max(fp.min,min(fp.max,paramValue(fp,fp.automation==='k-rate'?startFrame/ctx.rate:time))),dv=max(dp.min,min(dp.max,paramValue(dp,dp.automation==='k-rate'?startFrame/ctx.rate:time)));frequencies.push(max(-ctx.rate/2,min(ctx.rate/2,fround(fround(fv)*fround(pow(2,fround(dv/1200)))))));}if(count){if(!state.played){state.phase=(start-state.when*ctx.rate)*(accurate?0:frequencies[0])*bridge.waveScale(state.wave);state.played=true;}const result=bridge.renderWave(state.wave,state.phase,frequencies,accurate);state.phase=result.phase;for(let i=0;i<count;i++)data[offset+i]=result.samples[i];}const samples=internal();samples.push(data);return record({ended:stop<=startFrame+quantumFrames,samples});}if(state.kind==='constant'){const data=new F32(quantumFrames),when=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),p=params.get(state.offsetParam);for(let frame=0;frame<quantumFrames;frame++){const absolute=startFrame+frame;if(absolute>=when&&absolute<stop)data[frame]=paramValue(p,(p.automation==='k-rate'?floor(absolute/128)*128:absolute)/ctx.rate);}const samples=internal();samples.push(data);return record({ended:stop<=startFrame+quantumFrames,samples});}const b=state.buffer===null?null:buffers.get(state.buffer),samples=internal();for(let ch=0;ch<(b?.channels.length??1);ch++)samples.push(new F32(quantumFrames));
+   let position=state.position??(b?round((state.offset??0)*b.rate):0),consumed=state.consumed??0,started=false,ended=false;
+   let loopStart=0,loopEnd=b?.length??0;
+   if(b&&state.loop){const start=max(0,min(b.length,round(state.loopStart*b.rate))),end=state.loopEnd>0?max(0,min(b.length,round(state.loopEnd*b.rate))):b.length;if(start<b.length&&end>start){loopStart=start;loopEnd=end;}if(state.position===undefined&&position>=loopEnd)position=loopStart;}
+@@ -224,10 +237,11 @@
+    const inputs=internal();let channels=1;for(const source of ns.incoming){const value=cache.get(source);if(value){inputs.push(value);channels=max(channels,value.length);}}
+    channels=ns.kind==='destination'?state.channels:ns.mode==='explicit'?ns.channelCount:ns.mode==='clamped-max'?min(ns.channelCount,channels):channels;
+    allocated+=channels*128;if(allocated>33554432)throw dom('NotSupportedError');
+-   const data=mix(inputs,channels,ns.interpretation);
++   let data=mix(inputs,channels,ns.interpretation);
+    // The measured Native Convolver profile gates real input on IR presence;
+    // IR coefficients and normalize currently do not process those samples.
+    if(ns.kind==='convolver'&&ns.response===null)for(const channel of data)for(let frame=0;frame<128;frame++)channel[frame]=0;
++   if(ns.kind==='compressor'){const settings=record();for(const key of['threshold','knee','ratio','attack','release']){const p=params.get(ns[key]);settings[key]=max(p.min,min(p.max,fround(paramValue(p,start/state.rate))));}const result=bridge.compress(ns.processor,data,settings);data=result.channels;ns.reduction=result.reduction;}
+    if(ns.kind==='gain'){const ps=params.get(ns.gain),modulations=internal();for(const source of ps.incoming){const value=cache.get(source);if(value)modulations.push(value);}const input=mix(modulations,1,'speakers');for(let frame=0;frame<128;frame++){const time=(ps.automation==='k-rate'?start:start+frame)/state.rate,gain=paramValue(ps,time)+input[0][frame];for(let ch=0;ch<channels;ch++)data[ch][frame]*=gain;}}
+    cache.set(node,data);visiting.delete(node);
+   }
+@@ -253,8 +267,8 @@
+   suspend(when){const state=brand(contexts,this);let time;try{time=restricted(when);}catch(error){return apply(promiseReject,Promise,[error]);}const frame=ceil(time*state.rate/128)*128;if(time<0||frame<state.frame||time>=state.length/state.rate||state.state==='closed'||state.suspensions.has(frame))return apply(promiseReject,Promise,[dom('InvalidStateError')]);return new Promise(resolve=>state.suspensions.set(frame,record({resolve})));}
+   resume(){const state=brand(contexts,this);if(!state.rendered||state.state==='closed')return apply(promiseReject,Promise,[dom('InvalidStateError')]);if(state.state==='suspended'){state.state='running';schedule(()=>fire(this,'statechange'));schedule(()=>render(this,state));}return new Promise(resolve=>resolve());}
+  }
+- for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioContext,GainNode,ConstantSourceNode,OscillatorNode,PeriodicWave,ConvolverNode,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
+-  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioContext:0,GainNode:1,ConstantSourceNode:1,OscillatorNode:1,PeriodicWave:1,ConvolverNode:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
++ for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioContext,GainNode,ConstantSourceNode,OscillatorNode,PeriodicWave,ConvolverNode,DynamicsCompressorNode,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
++  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioContext:0,GainNode:1,ConstantSourceNode:1,OscillatorNode:1,PeriodicWave:1,ConvolverNode:1,DynamicsCompressorNode:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
+   const constructor=getDescriptor(Constructor.prototype,'constructor');delete Constructor.prototype.constructor;
+   for(const key of keys(Constructor.prototype)){const descriptor=getDescriptor(Constructor.prototype,key);define(Constructor.prototype,key,{...descriptor,enumerable:true});}
+   define(Constructor.prototype,'constructor',constructor);define(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});define(g,name,{value:Constructor,writable:true,configurable:true,enumerable:false});
+@@ -263,11 +277,11 @@
+ }
+ export function installAudioCore(page,window){
+  if(installed.has(window))return installed.get(window);
+- for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioContext','GainNode','ConstantSourceNode','OscillatorNode','PeriodicWave','ConvolverNode','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
++ for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioContext','GainNode','ConstantSourceNode','OscillatorNode','PeriodicWave','ConvolverNode','DynamicsCompressorNode','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
+  const signal=page.documentAbort?.signal,timers=new Set(),invoke=createInvocationTrampoline(implForWrapper(window)._globalObject),deadline={timeout:Math.min(page.timeout??2000,2000),displayErrors:false};let disposed=false;
+  const active=()=>!disposed&&!page.closed&&!signal?.aborted&&!!window.document;
+  const exception=captureDOMExceptionFactory(window);
+- const bridge={shared,Array,Map,Set,decode:decodeAudioWav,isBuffer:types.isArrayBuffer,exception,report:error=>reportException(window,error),now:hostNow,makeWave:makeAudioWave,basicWave:basicAudioWave,renderWave:renderAudioWave,waveScale:audioWaveScale,token:Symbol('audio-construction'),record:properties=>Object.assign(Object.create(null),properties),isFloat32:types.isFloat32Array,isArray:Array.isArray,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
++ const bridge={shared,Array,Map,Set,makeCompressor:createAudioCompressor,compress:processAudioCompressor,decode:decodeAudioWav,isBuffer:types.isArrayBuffer,exception,report:error=>reportException(window,error),now:hostNow,makeWave:makeAudioWave,basicWave:basicAudioWave,renderWave:renderAudioWave,waveScale:audioWaveScale,token:Symbol('audio-construction'),record:properties=>Object.assign(Object.create(null),properties),isFloat32:types.isFloat32Array,isArray:Array.isArray,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
+   schedule(callback,delay=0){if(!active())return;const id=hostSetTimeout(()=>{timers.delete(id);if(active()){try{invoke.invoke(callback,window,[],deadline);}catch(error){if(active())reportException(window,error);}}},delay);timers.add(id);},
+   target(value){setupTarget(value,window);targetBackends.set(value,implForWrapper(value));registerPlatformFactory(value,{kind:'EventTarget',implementation:targetBackends.get(value),globalObject:window});listenerBackends.set(value,new Map());},
+   listen(value,type,callback,add){const backend=targetBackends.get(value),listeners=listenerBackends.get(value);let listener=listeners.get(callback);if(add){if(!listener){listener=convertListener(window,callback);listeners.set(callback,listener);}backend.addEventListener(type,listener,false);}else if(listener){backend.removeEventListener(type,listener,false);listeners.delete(callback);}},
+--- /dev/null
++++ b/src/audio-compressor.js
+@@ -0,0 +1,28 @@
++// Independent scalar dynamics processing: a soft-knee transfer, adaptive
++// envelope, lookahead delay and decibel meter. Tables contain no output samples.
++const f=Math.fround,abs=Math.abs,min=Math.min,max=Math.max,pow=Math.pow,log10=Math.log10,exp=Math.exp,sin=Math.sin,asin=Math.asin,sqrt=Math.sqrt,floor=Math.floor;
++const add=(a,b)=>f(a+b),sub=(a,b)=>f(a-b),mul=(a,b)=>f(a*b),div=(a,b)=>f(a/b),db=x=>mul(20,f(log10(x))),amplitude=x=>f(pow(10,mul(f(.05),x))),finite=(x,fallback)=>Number.isFinite(x)?x:fallback;
++const Float=Float32Array,filters=new WeakMap(),slot=fields=>Object.assign(Object.create(null),fields),halfPi=f(Math.PI/2);
++// A quartic through four release zones has one free coefficient. Select the
++// column-normalized minimum-norm fit. Deriving it from the interpolation grid
++// avoids embedding an implementation's fitted coefficient matrix.
++function releaseFit(values){const delta1=values[1]-values[0],delta2=values[2]-2*values[1]+values[0],delta3=values[3]-3*values[2]+3*values[1]-values[0],base=[values[0],delta1-delta2/2+delta3/3,delta2/2-delta3/2,delta3/6,0],nullPolynomial=[0,-6,11,-6,1];let numerator=0,denominator=0;for(let degree=1;degree<=4;degree++){let weight=0;for(let x=0;x<4;x++)weight+=pow(x,2*degree);numerator+=weight*base[degree]*nullPolynomial[degree];denominator+=weight*nullPolynomial[degree]*nullPolynomial[degree]}const shift=-numerator/denominator;return base.map((coefficient,i)=>coefficient+shift*nullPolynomial[i])}
++const columns=[0,1,2,3].map(index=>releaseFit([0,1,2,3].map(i=>i===index?1:0))),zones=[f(.09),f(.16),f(.42),f(.98)],releaseBase=[0,1,2,3,4].map(degree=>{let sum=0;for(let i=0;i<4;i++)sum=add(sum,mul(f(columns[i][degree]),zones[i]));return sum});
++export function createAudioCompressor(rate){const token=Object.freeze(Object.create(null));filters.set(token,slot({rate,delay:[new Float(1024),new Float(1024)],read:0,write:-1,detector:0,envelope:1,meter:1,meterStep:f(1-exp(-1/(f(.325)*rate))),peak:-1,curve:null}));return token}
++function knee(curve,x,k){return x<curve.threshold?x:add(curve.threshold,div(sub(1,f(exp(-mul(k,sub(x,curve.threshold))))),k))}
++function transfer(curve,x){if(x<curve.end)return knee(curve,x,curve.k);return amplitude(add(curve.outputDb,mul(curve.slope,sub(db(x),curve.endDb))))}
++function staticCurve(previous,threshold,kneeDb,ratio){if(previous&&previous.thresholdDb===threshold&&previous.kneeDb===kneeDb&&previous.ratio===ratio)return previous;const curve=slot({thresholdDb:threshold,kneeDb,ratio,threshold:amplitude(threshold),slope:div(1,ratio),endDb:add(threshold,kneeDb)}),x=amplitude(curve.endDb),x2=f(x*1.001),x2Db=db(x2);let low=f(.1),high=10000,k=5;for(let i=0;i<15;i++){const slope=x<curve.threshold?1:div(sub(db(knee(curve,x2,k)),db(knee(curve,x,k))),sub(x2Db,curve.endDb));if(slope<curve.slope)high=k;else low=k;k=f(sqrt(mul(low,high)))}curve.k=k;curve.end=amplitude(curve.endDb);curve.outputDb=db(knee(curve,curve.end,k));return curve}
++export function processAudioCompressor(token,input,settings){const state=filters.get(token);if(!state)throw new TypeError('Invalid private compressor');const frames=input[0]?.length??128,output=[new Float(frames),new Float(frames)],curve=state.curve=staticCurve(state.curve,settings.threshold,settings.knee,settings.ratio),makeup=f(pow(div(1,transfer(curve,1)),f(.6))),attack=mul(max(f(.001),settings.attack),state.rate),release=mul(state.rate,settings.release),detectorFrames=mul(f(.0025),state.rate),coefficients=releaseBase.map(value=>mul(release,value));
++ const delay=min(1023,floor(mul(f(.006),state.rate)));if(state.write<0||state.delayFrames!==delay){for(const channel of state.delay)channel.fill(0);state.read=0;state.write=delay;state.delayFrames=delay}
++ for(let block=0;block<frames;block+=32){state.detector=finite(state.detector,1);const target=div(f(asin(state.detector)),halfPi),releasing=target>state.envelope;let difference=target===0?(releasing?-1:1):db(div(state.envelope,target)),speed;
++  if(releasing){state.peak=-1;const x=mul(f(.25),add(max(-12,min(0,finite(difference,-1))),12)),x2=mul(x,x),x3=mul(x2,x),x4=mul(x2,x2);let duration=coefficients[0];for(const[i,power]of [[1,x],[2,x2],[3,x3],[4,x4]])duration=add(duration,mul(coefficients[i],power));speed=amplitude(div(5,duration));}
++  else{difference=finite(difference,1);state.peak=max(state.peak,difference);const strength=max(f(.5),state.peak);speed=sub(1,f(pow(div(f(.25),strength),div(1,attack))));}
++  const end=min(frames,block+32);for(let at=block;at<end;at++){let magnitude=0;for(let channel=0;channel<2;channel++){const sample=(input[channel]??input[0])[at];state.delay[channel][state.write]=sample;const positive=sample>0?sample:-sample;if(magnitude<positive)magnitude=positive}
++   const attenuation=magnitude<=.0001?1:div(transfer(curve,magnitude),magnitude),attenuationDb=max(2,-db(attenuation)),recovery=sub(amplitude(div(attenuationDb,detectorFrames)),1),step=attenuation>state.detector?recovery:1;state.detector=finite(min(1,add(state.detector,mul(sub(attenuation,state.detector),step))),1);
++   state.envelope=speed<1?add(state.envelope,mul(sub(target,state.envelope),speed)):min(1,mul(state.envelope,speed));const warped=f(sin(mul(halfPi,state.envelope))),gain=mul(makeup,warped),gainDb=db(warped);state.meter=gainDb<state.meter?gainDb:add(state.meter,mul(sub(gainDb,state.meter),state.meterStep));
++   for(let channel=0;channel<2;channel++)output[channel][at]=mul(state.delay[channel][state.read],gain);state.read=(state.read+1)%1024;state.write=(state.write+1)%1024;
++  }
++  if(abs(state.detector)<1.1754943508222875e-38)state.detector=0;if(abs(state.envelope)<1.1754943508222875e-38)state.envelope=0;
++ }
++ return slot({channels:output,reduction:state.meter});
++}
+--- /dev/null
++++ b/test/audio-compressor.test.js
+@@ -0,0 +1,20 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{Browser}from'../src/browser.js';
++const plain=value=>JSON.parse(JSON.stringify(value));async function fixture(action){const browser=new Browser({timeout:3000}),page=browser.createPage();try{await page.navigate('data:text/html,<body>Compressor');await action({page,w:page.dom.window})}finally{browser.close()}}
++test('real compressor samples, sums, meters, parameters and complete Native media probe match exactly',()=>fixture(async({page})=>{
++ const input=await readFile(new URL('../docs/reference/audio-compressor/audio-media-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-compressor/audio-media-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(plain(await page.evaluate(input)),expected);
++}));
++test('untouched pinned offline_audio_context fixture executes actual compressor fingerprint assertions',async t=>{
++ const{upstreamTestRoot}=await import('./upstream-reference.js'),{startFixtureServer}=await import('../scripts/upstream-fixture-server.mjs'),{createHash}=await import('node:crypto');const root=await upstreamTestRoot(),path='webaudio/offline_audio_context.html',source=await readFile(`${root}/${path}`);assert.equal(createHash('sha256').update(source).digest('hex'),'9b55e8c2a1b8750ac924ee02476969fec199b82640877d1dd629548884aa7496');const server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());const browser=new Browser({userAgent:'Lightpanda/1.0'});t.after(()=>browser.close());const page=browser.createPage(),errors=[];page.on('console',e=>{if(e.type==='error')errors.push(e.args.map(String).join(' '))});page.newDocumentScripts.set('external',{source:'globalThis.__lp_external_runner=true;'});await page.navigate(`${server.origin}/src/browser/tests/${path}`);let passed=false;for(let i=0;i<200;i++){try{passed=page.evaluate('testing.assertOk()')===true}catch(error){throw new Error(JSON.stringify(errors),{cause:error})}if(passed)break;await new Promise(r=>setTimeout(r,20))}assert.equal(page.evaluate('testing.IS_TEST_RUNNER'),true);assert.equal(passed,true,JSON.stringify(errors));assert.deepEqual(errors,[]);
++});
++test('actual compressor impulse/stereo/rate/automation/suspension and parameter rules match Native',()=>fixture(async({page})=>{
++ const input=await readFile(new URL('../docs/reference/audio-compressor/compressor-controls-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-compressor/compressor-controls-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(plain(await page.evaluate(input)),expected);
++}));
++test('constructor-path fingerprint remains distinct from public-setter path exactly as Native',()=>fixture(async({page})=>{
++ const input=await readFile(new URL('../docs/reference/audio-compressor/compressor-fingerprint-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-compressor/compressor-fingerprint-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(plain(await page.evaluate(input)),expected);
++}));
++test('compressor public nodes/parameters/output/errors/events are actual VM objects with private DSP state',()=>fixture(async({w})=>{
++ const{getHeapBinding}=await import('../src/native-heap.js'),heap=getHeapBinding(),c=new w.OfflineAudioContext(1,256,8000),s=c.createConstantSource(),n=c.createDynamicsCompressor();s.connect(n).connect(c.destination);s.start();s.stop(128/8000);let ended,complete,error;s.onended=e=>ended=e;c.oncomplete=e=>complete=e;try{n.attack.automationRate='a-rate'}catch(e){error=e}const rendering=c.startRendering(),buffer=await rendering,channel=buffer.getChannelData(0),anchor=w.Object.prototype,host={};for(const[name,value]of Object.entries({node:n,threshold:n.threshold,knee:n.knee,ratio:n.ratio,attack:n.attack,release:n.release,rendering,buffer,channel,ended,complete,error,constructor:w.DynamicsCompressorNode,getter:Object.getOwnPropertyDescriptor(w.DynamicsCompressorNode.prototype,'threshold').get})){assert.equal(heap.sameRealm(value,anchor),true,name);assert.equal(heap.sameRealm(value,host),false,name);assert.equal(heap.creationGlobal(value),heap.creationGlobal(anchor),name);Object.setPrototypeOf(value,null);assert.equal(heap.sameRealm(value,anchor),true,name);assert.equal(heap.sameRealm(value,host),false,name)}
++}));
+--- /dev/null
++++ b/docs/reference/audio-compressor/README.md
+@@ -0,0 +1,51 @@
++Real compressor and AudioParam timeline followup
++
++This patch follows the frozen gain, wave and media slices. DynamicsCompressorNode
++uses actual independent sample processing: a soft-knee transfer, adaptive level
++detector/envelope, real lookahead ring storage, makeup gain and decibel meter.
++Stereo detection and output use real source samples. Float rounding, parameters,
++automation, suspension and persistent processor history follow measured Native
++controls. No observed output vectors or precomputed audio buffers are embedded.
++The release polynomial is derived from interpolation and a column-normalized
++minimum-norm fit through four release zones; the Native coefficient matrix is
++not embedded. Pinned source was read as reference after runtime measurement;
++this is not a clean-room claim. Reference hashes are retained.
++
++Public AudioParam.value assignment now updates its intrinsic value and schedules
++an actual set event at the private current time. Constructor initialization stays
++separate. Oscillator a-rate selection follows active events in the current
++quantum, then returns to constant processing when appropriate. Both behaviors
++are necessary for actual Native sample fidelity, not cosmetic bookkeeping.
++
++The constructor-options fingerprint and the source fixture's public-setter
++fingerprint legitimately differ. An early probe matched the Native constructor
++path but failed the unchanged fixture. A fresh unchanged Native replay passed;
++comparison isolated the missing setter timeline event, then quantum selection.
++All contrary probes and failed candidate runs remain in evidence. The final
++implementation matches both paths exactly; no fixture assertions were changed
++and no incompatible-literal classification is retained.
++
++Validation on exact frozen source:
++
++- All54 Native rows match exactly, including actual samples, aggregate sums,
++  reduction, multiple rates, stereo impulses, automation and suspension.
++- Direct public V8 sameRealm/creationGlobal checks cover14 public values,
++  functions/getter, parameters, output, promises, errors and delivered events.
++  All remain actual VM objects and outside Host after nulling prototypes.
++- The serial audio regression passes35/35 across core/gain/wave/media/compressor.
++  The two existing heap-enumeration tests are explicitly skipped; these direct
++  V8 checks perform no enumeration. All three original webaudio fixtures pass.
++- Fresh unchanged offline_audio_context.html Native and candidate CDP runs both
++  pass with the source load/assert contract (2000ms each), unchanged harness and
++  source bytes, actual Native branch, and ephemeral ports.
++
++There are no Root production edits or native-engine runtime imports. No broad,
++heap-enumeration, other-runtime or PureScript suite ran for this followup.
++
++Existing bounds remain explicit: source-parameter modulation beyond gain rejects,
++Native's deep-graph depth policy differs from the independent iterative graph,
++Convolver uses the measured Native gate rather than convolution, real-time audio
++follows its measured clock/state profile, and decoding supports the measured
++PCM/float WAVE formats. Numerical/automation edge combinations and wider channel
++layouts are not exhaustively calibrated; this is not a claim of whole-browser
++replication.
+--- /dev/null
++++ b/docs/reference/audio-compressor/audio-media-native-expression.js
+@@ -0,0 +1,15 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('exposed',()=>({compressor:typeof DynamicsCompressorNode,convolver:typeof ConvolverNode,filter:typeof BiquadFilterNode,delay:typeof DelayNode,analyser:typeof AnalyserNode,context:Reflect.ownKeys(BaseAudioContext.prototype).map(String)}));
++await run('convolverState',()=>{const c=new OfflineAudioContext(1,128,8000),n=c.createConvolver();return{buffer:n.buffer,normalize:n.normalize,count:n.channelCount,mode:n.channelCountMode,inputs:n.numberOfInputs,outputs:n.numberOfOutputs,keys:Reflect.ownKeys(ConvolverNode.prototype).map(String)}});
++for(const[name,configure]of[['noIR',()=>{}],['identity', (n,c)=>{n.normalize=false;const b=c.createBuffer(1,1,c.sampleRate);b.getChannelData(0)[0]=1;n.buffer=b}],['twoTap',(n,c)=>{n.normalize=false;const b=c.createBuffer(1,2,c.sampleRate);b.getChannelData(0).set([1,.5]);n.buffer=b}],['normalized',(n,c)=>{const b=c.createBuffer(1,1,c.sampleRate);b.getChannelData(0)[0]=1;n.buffer=b}]])await run('convolver-'+name,async()=>{const c=new OfflineAudioContext(1,8,8000),s=new ConstantSourceNode(c,{offset:2}),n=c.createConvolver();configure(n,c);s.connect(n).connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++for(const[name,fn]of[['count',n=>{n.channelCount=3}],['mode',n=>{n.channelCountMode='max'}],['rate', (n,c)=>{n.buffer=c.createBuffer(1,4,44100)}],['channels',(n,c)=>{n.buffer=c.createBuffer(3,4,8000)}],['four',(n,c)=>{n.buffer=c.createBuffer(4,4,8000);return n.buffer.numberOfChannels}],['twice',(n,c)=>{n.buffer=c.createBuffer(1,4,8000);n.buffer=c.createBuffer(2,4,8000);return n.buffer.numberOfChannels}],['fake',n=>{n.buffer=Object.create(AudioBuffer.prototype)}]])await run('convolver-'+name,()=>{const c=new OfflineAudioContext(1,128,8000);return fn(c.createConvolver(),c)});
++await run('compressorState',()=>{const c=new OfflineAudioContext(1,128,8000),n=c.createDynamicsCompressor(),out={reduction:n.reduction,count:n.channelCount,mode:n.channelCountMode,keys:Reflect.ownKeys(DynamicsCompressorNode.prototype).map(String)};for(const key of['threshold','knee','ratio','attack','release']){const p=n[key];out[key]={value:p.value,min:p.minValue,max:p.maxValue,rate:p.automationRate}}return out});
++for(const [name,amplitude,length]of[['quiet',.001,1024],['loud',1,1024],['long',1,8192]])await run('compressor-'+name,async()=>{const c=new OfflineAudioContext(1,length,8000),s=new ConstantSourceNode(c,{offset:amplitude}),n=c.createDynamicsCompressor();s.connect(n).connect(c.destination);s.start();const d=(await c.startRendering()).getChannelData(0);return{samples:[0,47,48,49,63,127,255,511,length-1].map(i=>d[i]),sum:d.reduce((a,b)=>a+Math.abs(b),0),reduction:n.reduction}});
++function wav(samples,rate=8000,{format=1,bits=16,channels=1}={}){const width=bits/8,frames=samples.length/channels,buffer=new ArrayBuffer(44+samples.length*width),v=new DataView(buffer),text=(at,s)=>{for(let i=0;i<s.length;i++)v.setUint8(at+i,s.charCodeAt(i))};text(0,'RIFF');v.setUint32(4,buffer.byteLength-8,true);text(8,'WAVEfmt ');v.setUint32(16,16,true);v.setUint16(20,format,true);v.setUint16(22,channels,true);v.setUint32(24,rate,true);v.setUint32(28,rate*channels*width,true);v.setUint16(32,channels*width,true);v.setUint16(34,bits,true);text(36,'data');v.setUint32(40,samples.length*width,true);for(let i=0;i<samples.length;i++){const at=44+i*width,x=samples[i];if(format===3){bits===64?v.setFloat64(at,x,true):v.setFloat32(at,x,true)}else if(bits===8)v.setUint8(at,x);else if(bits===16)v.setInt16(at,x,true);else if(bits===24){v.setUint8(at,x&255);v.setUint8(at+1,(x>>8)&255);v.setUint8(at+2,(x>>16)&255)}else v.setInt32(at,x,true)}return buffer}
++for(const[name,samples,options]of[['pcm8',[0,128,255],{bits:8}],['pcm16',[0,16384,-16384,32767],{}],['pcm24',[0,4194304,-4194304,8388607],{bits:24}],['pcm32',[0,1073741824,-1073741824,2147483647],{bits:32}],['float32',[0,.5,-.5,2],{format:3,bits:32}],['float64',[0,.5,-.5,2],{format:3,bits:64}],['stereo',[0,16384,32767,-32768],{channels:2}]])await run('decode-'+name,async()=>{const c=new OfflineAudioContext(1,128,8000),input=wav(samples,8000,options),size=input.byteLength,p=c.decodeAudioData(input),immediate=input.byteLength,b=await p;return{length:b.length,rate:b.sampleRate,channels:b.numberOfChannels,data:Array.from({length:b.numberOfChannels},(_,i)=>Array.from(b.getChannelData(i))),input:[size,immediate,input.byteLength],realm:b instanceof AudioBuffer,array:b.getChannelData(0) instanceof Float32Array}});
++for(const[rate,samples]of[[4000,[0,16384,-16384,0]],[12000,[0,16384,-16384,0]],[44100,[16384]]])await run('resample-'+rate,async()=>{const b=await new OfflineAudioContext(1,128,8000).decodeAudioData(wav(samples,rate));return{length:b.length,data:Array.from(b.getChannelData(0))}});
++await run('decodeOrder',async()=>{const c=new OfflineAudioContext(1,128,8000),out=[],input=wav([0,16384]);const p=c.decodeAudioData(input,function(b){out.push(['callback',this===globalThis,b.length])});out.push(['returned',p instanceof Promise]);const b=await p.then(value=>{out.push('then');return value});return out});
++await run('decodeErrors',async()=>{const c=new OfflineAudioContext(1,128,8000),out=[];let callback;try{await c.decodeAudioData(new Uint8Array([1,2,3]).buffer,null,e=>callback=e)}catch(e){out.push([e.name,e.message,e instanceof DOMException,callback===e])}for(const input of[new Uint8Array(4),{},null,undefined,Object.create(ArrayBuffer.prototype)]){let sync=false,p;try{p=c.decodeAudioData(input)}catch(e){sync=true;out.push([sync,e.name,e.message,e instanceof TypeError]);continue}try{await p}catch(e){out.push([sync,e.name,e.message,e instanceof TypeError])}}return out});
++await run('decodeClosed',async()=>{const c=new AudioContext({sampleRate:8000});await c.close();return(await c.decodeAudioData(wav([16384]))).getChannelData(0)[0]});
++await run('decodeLength',()=>BaseAudioContext.prototype.decodeAudioData.length);
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-compressor/audio-media-native.json
+@@ -0,0 +1,516 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "fc188dbf86988c878bc0a1f5b0261c07b85e2b1e0e1ccab00caaccb55587b00c",
++  "observations": [
++    {
++      "name": "exposed",
++      "value": {
++        "compressor": "function",
++        "convolver": "function",
++        "filter": "undefined",
++        "delay": "undefined",
++        "analyser": "undefined",
++        "context": [
++          "destination",
++          "sampleRate",
++          "currentTime",
++          "state",
++          "onstatechange",
++          "createBuffer",
++          "createBufferSource",
++          "createConstantSource",
++          "createConvolver",
++          "decodeAudioData",
++          "createDynamicsCompressor",
++          "createGain",
++          "createOscillator",
++          "createPeriodicWave",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "convolverState",
++      "value": {
++        "buffer": null,
++        "normalize": true,
++        "count": 2,
++        "mode": "clamped-max",
++        "inputs": 1,
++        "outputs": 1,
++        "keys": [
++          "buffer",
++          "normalize",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "convolver-noIR",
++      "value": [
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++        0
++      ]
++    },
++    {
++      "name": "convolver-identity",
++      "value": [
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "convolver-twoTap",
++      "value": [
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "convolver-normalized",
++      "value": [
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "convolver-count",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-mode",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-rate",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-channels",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "convolver-four",
++      "value": 4
++    },
++    {
++      "name": "convolver-twice",
++      "value": 2
++    },
++    {
++      "name": "convolver-fake",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "compressorState",
++      "value": {
++        "reduction": 0,
++        "count": 2,
++        "mode": "clamped-max",
++        "keys": [
++          "threshold",
++          "knee",
++          "ratio",
++          "attack",
++          "release",
++          "reduction",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "threshold": {
++          "value": -24,
++          "min": -100,
++          "max": 0,
++          "rate": "k-rate"
++        },
++        "knee": {
++          "value": 30,
++          "min": 0,
++          "max": 40,
++          "rate": "k-rate"
++        },
++        "ratio": {
++          "value": 12,
++          "min": 1,
++          "max": 20,
++          "rate": "k-rate"
++        },
++        "attack": {
++          "value": 0.003000000026077032,
++          "min": 0,
++          "max": 1,
++          "rate": "k-rate"
++        },
++        "release": {
++          "value": 0.25,
++          "min": 0,
++          "max": 1,
++          "rate": "k-rate"
++        }
++      }
++    },
++    {
++      "name": "compressor-quiet",
++      "value": {
++        "samples": [
++          0,
++          0,
++          0.0003760384861379862,
++          0.00037620513467118144,
++          0.0003785458975471556,
++          0.00042368954746052623,
++          0.0005952079663984478,
++          0.0009551619295962155,
++          0.0013395703863352537
++        ],
++        "sum": 0.8994434222113341,
++        "reduction": -9.840773582458496
++      }
++    },
++    {
++      "name": "compressor-loud",
++      "value": {
++        "samples": [
++          0,
++          0,
++          0.3765937387943268,
++          0.3767933249473572,
++          0.379598468542099,
++          0.4037037193775177,
++          0.45340344309806824,
++          0.5369738340377808,
++          0.6697742342948914
++        ],
++        "sum": 523.5815997421741,
++        "reduction": -11.223238945007324
++      }
++    },
++    {
++      "name": "compressor-long",
++      "value": {
++        "samples": [
++          0,
++          0,
++          0.3765937387943268,
++          0.3767933249473572,
++          0.379598468542099,
++          0.4037037193775177,
++          0.45340344309806824,
++          0.5369738340377808,
++          0.7550625801086426
++        ],
++        "sum": 5919.649486035109,
++        "reduction": -6.43103551864624
++      }
++    },
++    {
++      "name": "decode-pcm8",
++      "value": {
++        "length": 3,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            -1,
++            0,
++            0.9921875
++          ]
++        ],
++        "input": [
++          47,
++          47,
++          47
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-pcm16",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            0.999969482421875
++          ]
++        ],
++        "input": [
++          52,
++          52,
++          52
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-pcm24",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            0.9999998807907104
++          ]
++        ],
++        "input": [
++          56,
++          56,
++          56
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-pcm32",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            1
++          ]
++        ],
++        "input": [
++          60,
++          60,
++          60
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-float32",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            2
++          ]
++        ],
++        "input": [
++          60,
++          60,
++          60
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-float64",
++      "value": {
++        "length": 4,
++        "rate": 8000,
++        "channels": 1,
++        "data": [
++          [
++            0,
++            0.5,
++            -0.5,
++            2
++          ]
++        ],
++        "input": [
++          76,
++          76,
++          76
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "decode-stereo",
++      "value": {
++        "length": 2,
++        "rate": 8000,
++        "channels": 2,
++        "data": [
++          [
++            0,
++            0.999969482421875
++          ],
++          [
++            0.5,
++            -1
++          ]
++        ],
++        "input": [
++          52,
++          52,
++          52
++        ],
++        "realm": true,
++        "array": true
++      }
++    },
++    {
++      "name": "resample-4000",
++      "value": {
++        "length": 8,
++        "data": [
++          0,
++          0.25,
++          0.5,
++          0,
++          -0.5,
++          -0.25,
++          0,
++          0
++        ]
++      }
++    },
++    {
++      "name": "resample-12000",
++      "value": {
++        "length": 2,
++        "data": [
++          0,
++          0
++        ]
++      }
++    },
++    {
++      "name": "resample-44100",
++      "value": {
++        "length": 1,
++        "data": [
++          0.5
++        ]
++      }
++    },
++    {
++      "name": "decodeOrder",
++      "value": [
++        [
++          "returned",
++          true
++        ],
++        [
++          "callback",
++          false,
++          2
++        ],
++        "then"
++      ]
++    },
++    {
++      "name": "decodeErrors",
++      "value": [
++        [
++          "EncodingError",
++          "Unable to decode audio data",
++          true,
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ],
++        [
++          false,
++          "TypeError",
++          "",
++          true
++        ]
++      ]
++    },
++    {
++      "name": "decodeClosed",
++      "value": 0.5
++    },
++    {
++      "name": "decodeLength",
++      "value": 1
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-compressor/compressor-controls-native-expression.js
+@@ -0,0 +1,11 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++async function render(rate,length,options={},kind='constant',configure=()=>{}){const c=new OfflineAudioContext(2,length,rate),n=new DynamicsCompressorNode(c,options);let s;if(kind==='buffer'){s=c.createBufferSource();const b=c.createBuffer(2,length,rate);for(let i=0;i<length;i++){b.getChannelData(0)[i]=i===0?1:0;b.getChannelData(1)[i]=i===1?-.5:0}s.buffer=b}else s=new ConstantSourceNode(c,{offset:kind==='quiet'?.001:1});s.connect(n).connect(c.destination);configure(c,n,s);s.start();const b=await c.startRendering(),a=b.getChannelData(0),d=b.getChannelData(1);return{data:[0,1,Math.min(length-1,Math.floor(.006*rate)),Math.min(length-1,Math.floor(.006*rate)+1),length-1].map(i=>[a[i],d[i]]),sum:a.reduce((sum,x)=>sum+Math.abs(x),0),reduction:n.reduction}}
++for(const[rate,length]of[[8000,1024],[44100,1024],[96000,2048]])for(const[mode,options]of[['ratio1',{ratio:1}],['hard',{threshold:-12,knee:0,ratio:4,attack:0,release:.1}],['release0',{release:0}]])await run('render-'+rate+'-'+mode,()=>render(rate,length,options));
++await run('stereoImpulse',()=>render(8000,512,{},'buffer'));
++await run('automation',()=>render(8000,1024,{},'constant',(c,n)=>{n.threshold.setValueAtTime(-60,256/c.sampleRate);n.attack.setValueAtTime(.1,512/c.sampleRate)}));
++await run('suspend',()=>render(8000,1024,{},'constant',(c,n)=>{c.suspend(256/c.sampleRate).then(()=>{n.threshold.value=-60;c.resume()})}));
++await run('clamps',()=>{const n=new OfflineAudioContext(1,128,8000).createDynamicsCompressor(),out={};for(const[key,value]of[['threshold',100],['knee',100],['ratio',0],['attack',-1],['release',100]]){n[key].value=value;out[key]=n[key].value}return out});
++await run('constructorOrder',()=>{const c=new OfflineAudioContext(1,128,8000),order=[],options={},fields={attack:0,channelCount:1,channelCountMode:'explicit',channelInterpretation:'discrete',knee:20,ratio:4,release:.2,threshold:-10};for(const key of Object.keys(fields))Object.defineProperty(options,key,{get(){order.push(key);return fields[key]}});new DynamicsCompressorNode(c,options);return order});
++for(const[name,fn]of[['count',n=>{n.channelCount=3}],['mode',n=>{n.channelCountMode='max'}],['rate',n=>{n.threshold.automationRate='a-rate'}],['fake',()=>Object.getOwnPropertyDescriptor(DynamicsCompressorNode.prototype,'reduction').get.call(Object.create(DynamicsCompressorNode.prototype))]])await run(name,()=>fn(new OfflineAudioContext(1,128,8000).createDynamicsCompressor()));
++await run('symbolRate',()=>{const n=new OfflineAudioContext(1,128,8000).createDynamicsCompressor();n.threshold.automationRate=Symbol('a-rate');return n.threshold.automationRate});
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-compressor/compressor-controls-native.json
+@@ -0,0 +1,419 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "24ea84a0ed4e5f4b6e945bdcd0008a8fec30461fd45f714cbb7b16e42acec3fe",
++  "observations": [
++    {
++      "name": "render-8000-ratio1",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.25309276580810547,
++            0.25309276580810547
++          ],
++          [
++            0.2531960606575012,
++            0.2531960606575012
++          ],
++          [
++            0.8174871802330017,
++            0.8174871802330017
++          ]
++        ],
++        "sum": 559.1578679978848,
++        "reduction": -10.038561820983887
++      }
++    },
++    {
++      "name": "render-8000-hard",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.013088921085000038,
++            0.013088921085000038
++          ],
++          [
++            0.01319398544728756,
++            0.01319398544728756
++          ],
++          [
++            0.6701012849807739,
++            0.6701012849807739
++          ]
++        ],
++        "sum": 330.4248277563602,
++        "reduction": -35.95406723022461
++      }
++    },
++    {
++      "name": "render-8000-release0",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            1.5241435766220093,
++            1.5241435766220093
++          ],
++          [
++            1.5241435766220093,
++            1.5241435766220093
++          ],
++          [
++            0.7550617456436157,
++            0.7550617456436157
++          ]
++        ],
++        "sum": 848.4584974646568,
++        "reduction": -9.998379707336426
++      }
++    },
++    {
++      "name": "render-44100-ratio1",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.19566915929317474,
++            0.19566915929317474
++          ],
++          [
++            0.19571396708488464,
++            0.19571396708488464
++          ],
++          [
++            0.2823128402233124,
++            0.2823128402233124
++          ]
++        ],
++        "sum": 176.7375573515892,
++        "reduction": -14.469849586486816
++      }
++    },
++    {
++      "name": "render-44100-hard",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.24417346715927124,
++            0.24417346715927124
++          ],
++          [
++            0.24437353014945984,
++            0.24437353014945984
++          ],
++          [
++            0.3810426592826843,
++            0.3810426592826843
++          ]
++        ],
++        "sum": 240.96182353794575,
++        "reduction": -18.498943328857422
++      }
++    },
++    {
++      "name": "render-44100-release0",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.6389713883399963,
++            0.6389713883399963
++          ],
++          [
++            0.6380758285522461,
++            0.6380758285522461
++          ],
++          [
++            0.7604437470436096,
++            0.7604437470436096
++          ]
++        ],
++        "sum": 749.7241418361664,
++        "reduction": -11.958465576171875
++      }
++    },
++    {
++      "name": "render-96000-ratio1",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.18695135414600372,
++            0.18695135414600372
++          ],
++          [
++            0.1869741827249527,
++            0.1869741827249527
++          ],
++          [
++            0.26174867153167725,
++            0.26174867153167725
++          ]
++        ],
++        "sum": 322.8247027695179,
++        "reduction": -14.919485092163086
++      }
++    },
++    {
++      "name": "render-96000-hard",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.250264048576355,
++            0.250264048576355
++          ],
++          [
++            0.25035354495048523,
++            0.25035354495048523
++          ],
++          [
++            0.3714880049228668,
++            0.3714880049228668
++          ]
++        ],
++        "sum": 462.48971274495125,
++        "reduction": -18.32383918762207
++      }
++    },
++    {
++      "name": "render-96000-release0",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            1.394574761390686,
++            1.394574761390686
++          ],
++          [
++            1.3884683847427368,
++            1.3884683847427368
++          ],
++          [
++            1.5241435766220093,
++            1.5241435766220093
++          ]
++        ],
++        "sum": 1376.6118253469467,
++        "reduction": -12.452337265014648
++      }
++    },
++    {
++      "name": "stereoImpulse",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.3761189877986908,
++            0
++          ],
++          [
++            0,
++            -0.1881452202796936
++          ],
++          [
++            0,
++            0
++          ]
++        ],
++        "sum": 0.3761189877986908,
++        "reduction": -11.49338150024414
++      }
++    },
++    {
++      "name": "automation",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.3765937387943268,
++            0.3765937387943268
++          ],
++          [
++            0.3767933249473572,
++            0.3767933249473572
++          ],
++          [
++            0.17040997743606567,
++            0.17040997743606567
++          ]
++        ],
++        "sum": 367.89749178290367,
++        "reduction": -38.42525100708008
++      }
++    },
++    {
++      "name": "suspend",
++      "value": {
++        "data": [
++          [
++            0,
++            0
++          ],
++          [
++            0,
++            0
++          ],
++          [
++            0.3765937387943268,
++            0.3765937387943268
++          ],
++          [
++            0.3767933249473572,
++            0.3767933249473572
++          ],
++          [
++            0.17040997743606567,
++            0.17040997743606567
++          ]
++        ],
++        "sum": 367.89749178290367,
++        "reduction": -38.42525100708008
++      }
++    },
++    {
++      "name": "clamps",
++      "value": {
++        "threshold": 0,
++        "knee": 40,
++        "ratio": 1,
++        "attack": 0,
++        "release": 1
++      }
++    },
++    {
++      "name": "constructorOrder",
++      "value": [
++        "attack",
++        "channelCount",
++        "channelCountMode",
++        "channelInterpretation",
++        "knee",
++        "ratio",
++        "release",
++        "threshold"
++      ]
++    },
++    {
++      "name": "count",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "mode",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "rate",
++      "error": {
++        "name": "InvalidStateError",
++        "message": "The object is in an invalid state",
++        "realm": false
++      }
++    },
++    {
++      "name": "fake",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "symbolRate",
++      "error": {
++        "name": "InvalidStateError",
++        "message": "The object is in an invalid state",
++        "realm": false
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-compressor/compressor-fingerprint-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{const out=[];for(const[type,frequency,release]of[['sine',1000,.2],['triangle',10000,.25]]){const c=new OfflineAudioContext(1,5000,44100),o=new OscillatorNode(c,{type,frequency}),n=new DynamicsCompressorNode(c,{threshold:-50,knee:40,ratio:12,attack:0,release});o.connect(n).connect(c.destination);o.start();const d=(await c.startRendering()).getChannelData(0);out.push({type,sum:d.reduce((a,b)=>a+Math.abs(b),0),reduction:n.reduction,samples:[0,263,264,265,266,1000,2000,4999].map(i=>d[i])})}return out})()
+--- /dev/null
++++ b/docs/reference/audio-compressor/compressor-fingerprint-native.json
+@@ -0,0 +1,38 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "49238edc980ccce86941138d2e9b63167fce97f36adc4a7ae3e414bdc7655872",
++  "observations": [
++    {
++      "type": "sine",
++      "sum": 1168.90683095625,
++      "reduction": -21.242456436157227,
++      "samples": [
++        0,
++        0,
++        0,
++        0.05116436257958412,
++        0.10129941999912262,
++        -0.35500049591064453,
++        0.29163116216659546,
++        0.28600355982780457
++      ]
++    },
++    {
++      "type": "triangle",
++      "sum": 1085.3714036465558,
++      "reduction": -20.538284301757812,
++      "samples": [
++        0,
++        0,
++        0,
++        0.3056756854057312,
++        0.0889708623290062,
++        -0.20305635035037994,
++        -0.2846115231513977,
++        -0.3617536425590515
++      ]
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-compressor/compressor-setter-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{const out=[];for(const[type,frequency,release]of[['sine',1000,.2],['triangle',10000,.25]]){const c=new OfflineAudioContext(1,5000,44100),o=c.createOscillator(),n=c.createDynamicsCompressor();o.type=type;o.frequency.value=frequency;n.threshold.value=-50;n.knee.value=40;n.ratio.value=12;n.attack.value=0;n.release.value=release;o.connect(n).connect(c.destination);o.start();const d=(await c.startRendering()).getChannelData(0);out.push({type,sum:d.reduce((a,b)=>a+Math.abs(b),0),reduction:n.reduction,samples:[0,263,264,265,266,1000,2000,4999].map(i=>d[i])})}return out})()
+--- /dev/null
++++ b/docs/reference/audio-compressor/compressor-setter-native.json
+@@ -0,0 +1,38 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "262dedb1fc75a80aa27a3779b4e5c35c4e858c7e636c2100d2d15a2889384263",
++  "observations": [
++    {
++      "type": "sine",
++      "sum": 1168.9068321697632,
++      "reduction": -21.242456436157227,
++      "samples": [
++        0,
++        0,
++        0,
++        0.05116436257958412,
++        0.10129941999912262,
++        -0.35500049591064453,
++        0.29163116216659546,
++        0.28600355982780457
++      ]
++    },
++    {
++      "type": "triangle",
++      "sum": 1085.3711545854421,
++      "reduction": -20.538288116455078,
++      "samples": [
++        0,
++        0,
++        0,
++        0.3056756258010864,
++        0.0889708399772644,
++        -0.20305629074573517,
++        -0.28461140394210815,
++        -0.3617536425590515
++      ]
++    }
++  ]
++}

@@ -1,3 +1,4 @@
+import {installPrivateEventUtils,transformPrivateEventSource,isPrivateEventKind,eventImplementation,bindEventImplementation} from './dom-event-state.js';
 import {restoreWindowGlobalInheritance} from './window-global.js';
 import {installConsole,consoleProtocolType} from './console.js';
 import {registerPlatformFactory} from './platform-factories.js';
@@ -27,7 +28,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
- const localUtils=utilsModule.exports,modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
+ const localUtils=utilsModule.exports;installPrivateEventUtils(localUtils,context);const modules=new Map(),wrappers=new WeakMap(),wrapperImpls=new WeakMap(),mainWrappers=new WeakMap(),arrayWrappers=new WeakMap();
  const metadata={context,global,mainWindow,signal,disposed:false};const pendingFactories=[];let factoryReady=false;
  const register=(wrapper,impl,interfaceName)=>{wrapperImpls.set(wrapper,impl);const entry={...metadata,impl,interfaceName,get disposed(){return metadata.disposed}};WORLD_WRAPPERS.set(wrapper,entry);registerPlatformFactory(wrapper,{kind:interfaceName,implementation:impl,globalObject:global});if(factoryReady)onWrapper?.(wrapper,global,entry);else pendingFactories.push([wrapper,entry]);};
  const utilityPrototypes=new Map();
@@ -45,7 +46,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
-  Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+  if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
   wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);
   return wrapper;
  }
@@ -53,10 +54,11 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   if(!objectLike(value))return value;if(value===mainWindow||value===mainWindow._globalProxy)return global;if(value===global||wrapperImpls.has(value))return value;const otherWindow=resolveWindow?.(value);if(otherWindow)return otherWindow;
   const known=mainWrappers.get(value);if(known)return wrapImpl(known);
   if(types.isProxy(value))return value;
+  const privateEvent=eventImplementation(value);if(privateEvent)return wrapImpl(privateEvent);
   const candidate=own(value,hostUtils.implSymbol)?.value;
   if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
   const canonical=own(value,hostUtils.wrapperSymbol)?.value;
-  if(canonical&&objectLike(canonical)&&own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);
+  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical);if(event?event===value:own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
   if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
   return value;
  }
@@ -67,13 +69,13 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   // wrapper. Never replace an existing implementation's main wrapper to enter a world.
   const hostGenerated=require(join(generatedRoot,name+'.js'));
   if(typeof hostGenerated.new==='function'&&mainWindow[name]){
-   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
+   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];if(eventImplementation(canonical))bindEventImplementation(canonical,impl);else Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
   }
   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
  }
  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
-  const source=readFileSync(filename,'utf8');const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
+  let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
    // Measured native producer quirk: MO arguments are real main-world values,
    // while the authored callback itself continues in its genuine utility realm.

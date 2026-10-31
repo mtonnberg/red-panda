@@ -1,3 +1,4 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import vm from 'node:vm';
 import {createRequire} from 'node:module';
 import {isIP} from 'node:net';
@@ -8,7 +9,7 @@ import {createInvocationTrampoline} from './invocation.js';
 import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import {registerProtocolPrototype} from './protocol-classes.js';
-const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+const require=createRequire(import.meta.url);
 const EventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const installed=new WeakMap(),stores=new WeakMap(),events=new WeakMap(),windows=new WeakMap();
 const apply=Reflect.apply,define=Object.defineProperty,create=Object.create,construct=Reflect.construct,schedule=setTimeout,cancel=clearTimeout;

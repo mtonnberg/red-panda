@@ -1,3 +1,4 @@
+import {callDOMFactory} from './dom-factory-scope.js';
 import {atomicFormMove} from './element-internals.js';
 // Independent proposal. Existing jsdom DOM/parser/XPath components are reused;
 // target implementation source is neither imported nor copied.
@@ -13,6 +14,27 @@ const{domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.
 const makeXPath=require('jsdom/lib/jsdom/level3/xpath.js');
 const{decodeHTMLStrict}=require('entities');
 const{parse:parseHost}=require('tldts');
+const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
+const UnknownElement=require('jsdom/lib/jsdom/living/generated/HTMLUnknownElement.js');
+const validateNames=require('jsdom/lib/jsdom/living/helpers/validate-names.js');
+const {HTML_NS,SVG_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
+let xmlFactoriesPatched=false;
+function patchXMLFactories(){
+ if(xmlFactoriesPatched)return;xmlFactoriesPatched=true;
+ const create=DocumentImpl.prototype.createElement,createNS=DocumentImpl.prototype.createElementNS;
+ const unknown=(document,namespace,prefix,localName)=>UnknownElement.createImpl(document._globalObject,[],{ownerDocument:document,localName,namespace,prefix,ceState:'uncustomized',ceDefinition:null,isValue:null});
+ DocumentImpl.prototype.createElement=function(localName,...args){
+  if(this._parsingMode!=='xml')return Reflect.apply(create,this,[localName,...args]);
+  validateNames.name(this._globalObject,localName);
+  const colon=localName.indexOf(':'),prefix=colon<0?null:localName.slice(0,colon);
+  return unknown(this,null,prefix,colon<0?localName:localName.slice(colon+1));
+ };
+ DocumentImpl.prototype.createElementNS=function(namespace,qualifiedName,...args){
+  if(this._parsingMode!=='xml'||namespace===HTML_NS||namespace===SVG_NS)return Reflect.apply(createNS,this,[namespace,qualifiedName,...args]);
+  const extracted=validateNames.validateAndExtract(this._globalObject,namespace,qualifiedName);
+  return unknown(this,extracted.namespace,extracted.prefix,extracted.localName);
+ };
+}
 const installed=new WeakMap();
 
 // XML5-style compatibility: known HTML entities are numeric-escaped into the
@@ -106,12 +128,13 @@ function moveFactory(g,bridge){
 }
 
 export function installDocumentXML(page,window){
+ patchXMLFactories();
  if(installed.has(window))return installed.get(window);
  const document=window.document;
  const docBrand=value=>DocumentInterface.is(value);
  const metadata=window.eval(`(${realmMetadata.toString()})`)(window,{
   normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,
-  attribute(doc,name){const impl=implForWrapper(doc);if(impl._parsingMode==='html')name=name.replace(/[A-Z]/g,letter=>letter.toLowerCase());return wrapperForImpl(impl._createAttribute({localName:name}));},
+  attribute(doc,name){const impl=implForWrapper(doc);if(impl._parsingMode==='html')name=name.replace(/[A-Z]/g,letter=>letter.toLowerCase());return wrapperForImpl(callDOMFactory(window,impl,'_createAttribute',[{localName:name}]));},
   html(doc){const impl=implForWrapper(doc);impl._parsingMode='html';impl.contentType='text/html';},
   hostname(doc){const origin=implForWrapper(doc)._origin;try{return new URL(origin).hostname;}catch{}try{return window.location.hostname;}catch{return'';}},
   validateDomain(current,value){

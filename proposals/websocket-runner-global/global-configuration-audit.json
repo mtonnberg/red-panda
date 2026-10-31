@@ -1,0 +1,103 @@
+{
+  "sourceCommit": "948d773786380bae36f046639fc61e2ddddd212a",
+  "rows": [
+    {
+      "setting": "WebSocket concurrent transports",
+      "sourceInProcessTest": 50,
+      "nativeCLIDefault": 8,
+      "sourceReferences": [
+        "src/testing.zig:562",
+        "src/Config.zig:748",
+        "src/network/Network.zig:211"
+      ],
+      "verification": "Fresh real-wire16 sockets: default8 opens8; explicit50 opens16. Canonical unchanged fixture: default8 fails; explicit50 passes.",
+      "remainingGap": false
+    },
+    {
+      "setting": "TLS verification flag",
+      "sourceInProcessTest": "insecure_disable_tls_host_verification=true",
+      "nativeCLIDefault": "false",
+      "sourceReferences": [
+        "src/testing.zig:560",
+        "src/Config.zig:582"
+      ],
+      "verification": "Real owned HTTPS endpoint with self-signed wrong-host certificate: default rejects before HTTP; the sole insecure flag returns actual generated body over TLS. UA-only suffix control still rejects.",
+      "remainingGap": "Source test disables verification; frozen matrix did not. No claim that other TLS fixtures were revalidated."
+    },
+    {
+      "setting": "User agent",
+      "sourceInProcessTest": "user_agent_suffix=internal-tester",
+      "frozenExternalRunner": "Network.setUserAgentOverride Lightpanda/1.0",
+      "sourceReferences": [
+        "src/testing.zig:561",
+        "src/Config.zig:776",
+        "scripts/conformance.mjs:53"
+      ],
+      "verification": "Native default navigator UA Lightpanda/1.0; sole suffix option produces Lightpanda/1.0 internal-tester. The frozen raw matrix deliberately uses its separate exact instrumentation UA.",
+      "remainingGap": "Exact test-global UA suffix is not reproduced by instrumentation; both retain Lightpanda harness branch."
+    },
+    {
+      "setting": "Watchdog",
+      "sourceInProcessTest": 0,
+      "nativeCLIDefault": 30000,
+      "units": "milliseconds;0 disables",
+      "sourceReferences": [
+        "src/testing.zig:564",
+        "src/Config.zig:633"
+      ],
+      "verification": "Source audited. --watchdog-ms0 accepted in owned positive TLS control, but no long busy-loop/watchdog behavior test was run.",
+      "remainingGap": "Different process-global stall policy; source-only behavioral audit."
+    },
+    {
+      "setting": "Resource defaults",
+      "sourceInProcessTest": [
+        "iframe",
+        "worker"
+      ],
+      "frozenExternalRunner": [
+        "iframe",
+        "worker"
+      ],
+      "sourceReferences": [
+        "src/testing.zig:563",
+        "src/testing.zig HtmlRunnerOpts",
+        "registration-map.json"
+      ],
+      "verification": "Global default agrees; exact per-fixture overrides remain selected from unchanged registration map.",
+      "remainingGap": false
+    },
+    {
+      "setting": "Other HttpClient configuration defaults",
+      "sourceInProcessTest": {
+        "mode": "serve",
+        "httpMaxConcurrent": 128,
+        "httpMaxHostOpen": 6,
+        "httpConnectTimeoutMs": 8000,
+        "httpTimeoutMs": 15000,
+        "httpMaxResponseSizeBytes": 1073741824,
+        "httpNavDelay": null,
+        "httpNavBurst": 1,
+        "httpVersion": "auto",
+        "httpMaxRedirects": 20
+      },
+      "nativeCLIDefault": "Same getters/defaults because test config is serve with default cdp_max_connections16 and no overrides for these fields.",
+      "sourceReferences": [
+        "src/Config.zig:416",
+        "src/Config.zig:686-735",
+        "src/network/HttpClient.zig:242"
+      ],
+      "verification": "Source getter audit only; no concurrency stress/timeouts/max-body probes for these settings.",
+      "remainingGap": "Do not infer runtime equivalence from source audit alone."
+    },
+    {
+      "setting": "Test port routing",
+      "sourceInProcessTest": "TestHTTPServer/TestWSServer start on ephemeral ports; routeTestPorts rewrites canonical destinations internally",
+      "externalReplay": "Real owned canonical9582/9584 listeners",
+      "sourceReferences": [
+        "src/testing.zig:538-555"
+      ],
+      "verification": "Exact unchanged HTTP/WS canonical fixture replay succeeded under explicit source WS quota.",
+      "remainingGap": "External server/driver is not the compiled in-process Zig test runner."
+    }
+  ]
+}

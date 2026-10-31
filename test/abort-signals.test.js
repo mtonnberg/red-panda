@@ -96,8 +96,9 @@ test('post-load document.open retains the real signal listener and timeout witho
  doc.open();doc.write('<!doctype html><title>reset</title><body>new document');doc.close();c.abort('retained');await delay(40);assert.deepEqual(seen,['abort','timeout']);assert.equal(page.dom.window,w);assert.equal(w.document,doc);assert.equal(signal,c.signal);assert.equal(signal.reason,'retained');
 }));
 
-test('raw Window close cancels pending timeout jobs and actual fetch resources',()=>fixture(async({page,window:w,requests,aborted})=>{
- let n=0;w.AbortSignal.timeout(30).onabort=()=>n++;const pending=w.fetch('/slow');pending.catch(()=>{});while(!requests.includes('/slow'))await delay(2);w.close();await delay(60);assert.equal(n,0);assert.equal(page.closed,false);assert.equal(aborted.length,1);
+test('main Window.close retains timeout and fetch work while owned Page.close cancels both',()=>fixture(async({page,window:w,requests,aborted})=>{
+ const document=w.document;let n=0;w.AbortSignal.timeout(30).onabort=()=>n++;const pending=w.fetch('/slow');while(!requests.includes('/slow'))await delay(2);w.close();await delay(60);assert.equal(n,1);assert.equal(page.closed,false);assert.equal(w.document,document);assert.equal(w.closed,false);assert.equal(aborted.length,0);assert.equal(await (await pending).text(),'late');
+ const next=w.fetch('/slow');next.catch(()=>{});while(requests.filter(path=>path==='/slow').length<2)await delay(2);w.AbortSignal.timeout(30).onabort=()=>n++;page.close();await delay(60);assert.equal(n,1);assert.equal(page.closed,true);assert.equal(aborted.length,1);
 }));
 
 test('installer disposal is idempotent and removes timeout scheduling without changing public constructors',()=>fixture(async({page,window:w})=>{

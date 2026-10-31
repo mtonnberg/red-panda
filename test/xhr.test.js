@@ -17,6 +17,11 @@ async function fixture(action, options = {}) {
       const body = Buffer.concat(chunks);
       requests.push({ index, path: url.pathname, method: req.method, headers: req.headers, body });
       if (url.pathname === '/') return void res.end('<!doctype html><title>XHR fixture</title>');
+      if (url.pathname === '/held-response') {
+        const entry = requests[requests.length - 1];
+        res.once('close', () => { entry.closedBeforeEnd = !res.writableEnded; });
+        res.writeHead(200, { 'content-type': 'text/plain' }); res.write('actual pending bytes'); return;
+      }
       if (url.pathname === '/slow') {
         await delay(120); if (res.destroyed) return; res.end('slow body'); return;
       }
@@ -213,19 +218,28 @@ test('network errors are observable and request reuse from error/load handlers c
   assert.equal(count, 2);
 }));
 
-test('navigation and page closure silently dispose outstanding old-document XHR callbacks', async () => fixture(async ({ browser, window, page, base }) => {
+test('navigation and owned Page closure dispose XHR while main Window.close preserves the live request', async () => fixture(async ({ browser, window, page, base, requests }) => {
   let callbacks = 0;
   const xhr = new window.XMLHttpRequest();
   for (const kind of ['load', 'error', 'abort', 'timeout', 'loadend']) xhr.addEventListener(kind, () => callbacks++);
-  xhr.open('GET', `${base}/slow`); xhr.timeout = 30; xhr.send();
+  // Keep a real response pending until commit: a short XHR timeout may
+  // legitimately fire while the navigation's HTTP response is still pending.
+  xhr.open('GET', `${base}/held-response`); xhr.send();
+  const deadline = Date.now() + 1000;
+  while (!requests.some(entry => entry.path === '/held-response') && Date.now() < deadline) await delay(2);
+  assert.ok(requests.some(entry => entry.path === '/held-response'));
   await page.navigate(`${base}/json`); await delay(150);
+  assert.equal(requests.find(entry => entry.path === '/held-response').closedBeforeEnd, true);
   assert.equal(callbacks, 0); assert.throws(() => { xhr.open('GET', `${base}/json`); xhr.send(); }, { name: 'InvalidStateError' });
   const nextWindow = page.dom.window; installXHR(page, nextWindow);
   const pending = new nextWindow.XMLHttpRequest(); pending.onload = () => callbacks++; pending.onerror = () => callbacks++;
-  pending.open('GET', `${base}/slow`); pending.send(); page.close(); await delay(150); assert.equal(callbacks, 0);
+  pending.open('GET', `${base}/slow`); pending.timeout = 30; pending.send(); page.close(); await delay(150); assert.equal(callbacks, 0);
   const thirdPage = browser.createPage(); await thirdPage.navigate(base); const third = thirdPage.dom.window; installXHR(thirdPage, third);
   const closedWindow = new third.XMLHttpRequest(); closedWindow.onload = () => callbacks++; closedWindow.onerror = () => callbacks++;
-  closedWindow.open('GET', `${base}/slow`); closedWindow.send(); third.close(); await delay(150); assert.equal(callbacks, 0);
+  const originalDocument = third.document;
+  closedWindow.open('GET', `${base}/slow`); closedWindow.send(); third.close(); await delay(150);
+  assert.equal(callbacks, 1); assert.equal(third.closed, false); assert.strictEqual(third.document, originalDocument);
+  assert.equal(closedWindow.readyState, 4); assert.equal(closedWindow.status, 200);
 }));
 
 test('cross-origin requests enforce preflight, credentials, response exposure and redirect restrictions', async () => fixture(async ({ page, window, base, cross, requests }) => {

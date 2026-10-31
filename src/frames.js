@@ -1,3 +1,4 @@
+import {disposeBrowsingWindow} from './popup-pages.js';
 import {retireFrameActivity} from './frame-activity.js';
 import { completeInitialBlankFrame } from './document-reset.js';
 import { createInvocationTrampoline } from './invocation.js';
@@ -261,7 +262,7 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     if (!record || !records.has(record.id)) return;
     if(destroy||registry.closing)destroyDocument(record);else retireDocument(record);
     records.delete(record.id); elements.delete(implementation);
-    if(destroy||registry.closing)record.window.close();
+    if(destroy||registry.closing)disposeBrowsingWindow(record.window._globalProxy??record.window);
     if(announce)registry.announce('frameDetached', { frameId: record.id, reason: 'remove' });
   };
   function resourceLoader(framePage, inherited) {
@@ -291,7 +292,16 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     if (!record) {
       record = { id: randomUUID(), parentId: operation.owner.record.id, element: implementation, generation: 0 };
       elements.set(implementation, record); records.set(record.id, record);
-    } else destroyDocument(record);
+    } else {
+      const previousWindow = record.window, previousDocument = implForWrapper(record.document);
+      destroyDocument(record);
+      // Public close() is a measured no-op for ordinary frame windows. A real
+      // navigation must still release the old browsing authority through its
+      // captured owner cleanup while preserving the actual inactive DOM tree.
+      // Standalone jsdom may already have closed this document before creating
+      // the replacement Window. Only a still-active owner needs cleanup here.
+      if (previousDocument._defaultView !== null) disposeBrowsingWindow(previousWindow._globalProxy ?? previousWindow, { retain: true });
+    }
     const parentWindow = operation.owner.record.window;
     childWindow._parent = parentWindow._globalProxy ?? parentWindow;
     childWindow._top = parentWindow.top; childWindow._frameElement = implementation;
@@ -438,7 +448,7 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     if (registry.disposed) return;
     registry.closing=true;
     for (const child of children(root)) registry.detach(child.element,{destroy:true});
-    for(const record of retired){destroyDocument(record);record.window.close();}retired.clear();
+    for(const record of retired){destroyDocument(record);disposeBrowsingWindow(record.window._globalProxy??record.window);}retired.clear();
     for (let index = 0; index < window._length; index++) Reflect.deleteProperty(window, String(index));
     window._length = 0;
     registry.disposed = true; contexts.clear(); registry.frames.clear(); DOCUMENTS.delete(implForWrapper(document));

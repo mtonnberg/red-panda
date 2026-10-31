@@ -1,0 +1,142 @@
+{
+  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
+  "name": "style",
+  "source": "(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');document.body.append(el);el.style.cssText='opacity:0.4;width:12px;transform:translateX(3px)';const read=()=>({opacity:getComputedStyle(el).opacity,width:getComputedStyle(el).width,transform:getComputedStyle(el).transform});const before=read(),a=el.animate([{opacity:0,width:'10px',transform:'translateX(0px)'},{opacity:1,width:'200px',transform:'translateX(100px)'}],{duration:1e9,fill:'forwards',iterations:Infinity});out.push(['start',{before,after:read(),state:a.playState,all:el.getAnimations().length}]);await a.finished;out.push(['after-finished',{style:read(),state:a.playState,all:el.getAnimations().length}]);a.cancel();out.push(['after-cancel',{style:read(),state:a.playState}]);\nfor(const mode of['play','reverse']){const a=el.animate();a.finished.catch(()=>{});const events=[];a.onfinish=()=>events.push('finished');setTimeout(()=>{a[mode]();events.push('acted')},6);setTimeout(()=>events.push('middle:'+a.playState),12);await wait(35);out.push(['timer:'+mode,events]);a.cancel();}\nfor(const mode of['replace','clear-and-replace']){const a=el.animate(),events=[];a.addEventListener('finish',()=>events.push('first'));a.onfinish=()=>events.push('old');a.addEventListener('finish',()=>events.push('last'));if(mode==='clear-and-replace')a.onfinish=null;a.onfinish=()=>events.push('new');a.finish();await wait(20);out.push(['handler-order:'+mode,events]);}\n{const a=el.animate();a.pause();const events=[];a.onfinish=e=>{events.push(['handler',e.defaultPrevented]);return false};a.addEventListener('finish',e=>events.push(['listener',e.defaultPrevented]));const e=new AnimationPlaybackEvent('finish',{cancelable:true});out.push(['handler-return',{returned:a.dispatchEvent(e),prevented:e.defaultPrevented,events}]);a.finished.catch(()=>{});a.cancel();}\n{const gets=[],init=new Proxy({currentTime:2,timelineTime:3},{get(t,k){gets.push(String(k));return t[k]}});const e=new AnimationPlaybackEvent({toString(){gets.push('type');return'x'}},init);out.push(['event-order',{gets,currentTime:e.currentTime,timelineTime:e.timelineTime}]);}\nreturn out;})()\n",
+  "sourceSHA256": "335a71e69085aa644b6c084cf3a7f9595f8fa1f215533f66d984492822f113b2",
+  "binary": {
+    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
+  },
+  "args": [
+    "--load-resources",
+    "iframe",
+    "--load-resources",
+    "worker"
+  ],
+  "version": {
+    "protocolVersion": "1.3",
+    "product": "Chrome/124.0.6367.29",
+    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jsVersion": "12.4.254.8"
+  },
+  "result": [
+    [
+      "start",
+      {
+        "before": {
+          "opacity": "0.4",
+          "width": "12px",
+          "transform": "matrix(1, 0, 0, 1, 3, 0)"
+        },
+        "after": {
+          "opacity": "0.4",
+          "width": "12px",
+          "transform": "matrix(1, 0, 0, 1, 3, 0)"
+        },
+        "state": "running",
+        "all": 0
+      }
+    ],
+    [
+      "after-finished",
+      {
+        "style": {
+          "opacity": "0.4",
+          "width": "12px",
+          "transform": "matrix(1, 0, 0, 1, 3, 0)"
+        },
+        "state": "finished",
+        "all": 0
+      }
+    ],
+    [
+      "after-cancel",
+      {
+        "style": {
+          "opacity": "0.4",
+          "width": "12px",
+          "transform": "matrix(1, 0, 0, 1, 3, 0)"
+        },
+        "state": "idle"
+      }
+    ],
+    [
+      "timer:play",
+      [
+        "acted",
+        "finished",
+        "middle:finished"
+      ]
+    ],
+    [
+      "timer:reverse",
+      [
+        "acted",
+        "finished",
+        "middle:finished"
+      ]
+    ],
+    [
+      "handler-order:replace",
+      [
+        "first",
+        "new",
+        "last"
+      ]
+    ],
+    [
+      "handler-order:clear-and-replace",
+      [
+        "first",
+        "last",
+        "new"
+      ]
+    ],
+    [
+      "handler-return",
+      {
+        "returned": false,
+        "prevented": true,
+        "events": [
+          [
+            "handler",
+            false
+          ],
+          [
+            "listener",
+            true
+          ]
+        ]
+      }
+    ],
+    [
+      "event-order",
+      {
+        "gets": [
+          "type",
+          "currentTime",
+          "timelineTime"
+        ],
+        "currentTime": 2,
+        "timelineTime": 3
+      }
+    ]
+  ],
+  "events": [],
+  "ownedBrowser": {
+    "pid": 141239,
+    "exitCode": 0,
+    "signal": null,
+    "stderr": "$time=1793436428746 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:43277 max_connections=16120 max_browser_connections=16\n",
+    "stderrTruncated": false
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 200,
+      "routeKnown": true
+    }
+  ]
+}

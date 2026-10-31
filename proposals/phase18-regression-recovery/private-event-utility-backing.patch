@@ -1,0 +1,11 @@
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -58,7 +58,7 @@
+   const candidate=own(value,hostUtils.implSymbol)?.value;
+   if(candidate&&own(candidate,hostUtils.wrapperSymbol)?.value===value)return wrapImpl(candidate);
+   const canonical=own(value,hostUtils.wrapperSymbol)?.value;
+-  if(canonical&&objectLike(canonical)&&own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);
++  if(canonical&&objectLike(canonical)){const event=eventImplementation(canonical);if(event?event===value:own(canonical,hostUtils.implSymbol)?.value===value)return wrapImpl(value);}
+   if(Array.isArray(value)&&Object.getPrototypeOf(value)!==global.Array.prototype){let array=arrayWrappers.get(value);if(array)return array;array=new global.Array();arrayWrappers.set(value,array);for(let i=0;i<value.length;i++)if(i in value)Object.defineProperty(array,String(i),{value:wrap(value[i]),writable:true,enumerable:true,configurable:true});return array;}
+   return value;
+  }

@@ -198,12 +198,12 @@ test('inherited iframe origins remain same-origin and cannot be forged through w
   assert.equal((await (await child.fetch(foreignRequest)).json()).body, 'cross-realm request');
 }));
 
-test('document navigation, window close and page close suppress old-realm promise callbacks', async () => fixture(async ({ browser, page, window, base }) => {
+test('navigation and owned Page.close suppress old-realm callbacks while main Window.close retains fetch', async () => fixture(async ({ browser, page, window, base }) => {
   let callbacks = 0;
   window.fetch('/slow').then(() => callbacks++, () => callbacks++);
   await page.navigate(`${base}/echo`); await delay(130); assert.equal(callbacks, 0);
   let current = page.dom.window; installFetch(page, current);
   current.fetch('/slow').then(() => callbacks++, () => callbacks++); page.close(); await delay(130); assert.equal(callbacks, 0);
   const other = browser.createPage(); await other.navigate(base); current = other.dom.window; installFetch(other, current);
-  current.fetch('/slow').then(() => callbacks++, () => callbacks++); current.close(); await delay(130); assert.equal(callbacks, 0);
+  const document = current.document, pending = current.fetch('/slow').then(response => { callbacks++; return response.text(); }); current.close(); assert.equal(await pending, 'late body'); assert.equal(callbacks, 1); assert.equal(current.document, document); assert.equal(current.closed, false); assert.equal(other.closed, false);
 }));

@@ -1,0 +1,302 @@
+--- a/src/dom-event-state.js
++++ b/src/dom-event-state.js
+@@ -15,20 +15,28 @@
+ const define=Object.defineProperty,descriptor=Object.getOwnPropertyDescriptor,legacyImpl=utils.implForWrapper;
+ 
+ export function eventImplementation(value){return values.get(value)}
++// Stable owned-module lookup: private Events first, current genuine utility
++// graph for all other wrappers. Captured pre-install symbol readers stay old.
++export function implementationForWrapper(value){return values.get(value)??utils.implForWrapper(value)}
+ export function bindEventImplementation(value,implementation){
+  if(!implementation||!(implementation instanceof EventImpl))throw new TypeError('A genuine generated Event implementation is required');
+  values.set(value,implementation);backends.add(implementation);return implementation;
+ }
+ function captureRealm(globalObject,selected){
+- const context=selected??(vm.isContext(globalObject)?globalObject:contexts.get(globalObject)??legacyImpl(globalObject)?._globalObject);
+- if(!context||!vm.isContext(context))throw new TypeError('An actual Event VM context is required');
+- contexts.set(globalObject,context);contexts.set(context,context);contexts.set(vm.runInContext('globalThis',context),context);return context;
++ const context=selected??(vm.isContext(globalObject)?globalObject:contexts.get(globalObject)??legacyImpl(globalObject)?._globalObject??globalObject);
++ if(vm.isContext(context)){
++  contexts.set(globalObject,context);contexts.set(context,context);contexts.set(vm.runInContext('globalThis',context),context);return context;
++ }
++ // Genuine no-runScripts jsdom Windows use the actual Host intrinsics. Keep
++ // that real Host origin; an invented VM would change standalone semantics.
++ if(context===globalObject&&globalObject?._globalObject===globalObject&&globalObject.Object===Object){contexts.set(globalObject,globalObject);return globalObject;}
++ throw new TypeError('An actual Event originating realm is required');
+ }
+ function trustGetter(context){
+  let getter=getters.get(context);if(getter)return getter;
+  // Capture the actual VM TypeError before authored code. The only values that
+  // cross these private closures are a receiver and a boolean, never a backend.
+- getter=vm.compileFunction(`'use strict';const TypeError=globalThis.TypeError;return Object.getOwnPropertyDescriptor({get isTrusted(){if(!has(this))throw new TypeError('Illegal invocation');return read(this)}},'isTrusted').get;`,['has','read'],{parsingContext:context})(value=>values.has(value),value=>!!values.get(value).isTrusted);
++ getter=vm.compileFunction(`'use strict';const TypeError=globalThis.TypeError;return Object.getOwnPropertyDescriptor({get isTrusted(){if(!has(this))throw new TypeError('Illegal invocation');return read(this)}},'isTrusted').get;`,['has','read'],vm.isContext(context)?{parsingContext:context}:{})(value=>values.has(value),value=>!!values.get(value).isTrusted);
+  getters.set(context,getter);return getter;
+ }
+ export function preparePrivateEvent(value,globalObject){
+--- a/src/audio-core.js
++++ b/src/audio-core.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {createAudioCompressor,processAudioCompressor} from './audio-compressor.js';
+ import {decodeAudioWav} from './audio-wav.js';
+ import {captureDOMExceptionFactory} from './worker-dom-exception.js';
+@@ -8,7 +9,7 @@
+ import {createInvocationTrampoline} from './invocation.js';
+ import {registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+-const require=createRequire(import.meta.url),{implForWrapper,wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const require=createRequire(import.meta.url),{wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const {setup:setupTarget}=require('jsdom/lib/jsdom/living/generated/EventTarget.js'),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),{convert:convertListener}=require('jsdom/lib/jsdom/living/generated/EventListener.js');
+ const targetBackends=new WeakMap(),eventBackends=new WeakMap(),listenerBackends=new WeakMap();
+ const reportException=require('jsdom/lib/jsdom/living/helpers/runtime-script-errors.js');
+--- a/src/animations.js
++++ b/src/animations.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ // Independent, Native-calibrated Web Animations state/tasks. The target does
+ // not evaluate keyframes or expose effect/timeline constructors; no pixels,
+ // interpolated styles, or advertised media timing are fabricated here.
+@@ -11,7 +12,7 @@
+ const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
+ const EventListener=require('jsdom/lib/jsdom/living/generated/EventListener.js');
+ const TargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
+-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const addImpl=TargetImpl.prototype.addEventListener,removeImpl=TargetImpl.prototype.removeEventListener,dispatchImpl=TargetImpl.prototype._dispatch;
+ const preventImpl=require('jsdom/lib/jsdom/living/events/Event-impl.js').implementation.prototype.preventDefault;
+ const installed=new WeakMap(),animations=new WeakMap(),playbackEvents=new WeakMap();
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import{stylesheetParserBytes}from'./stylesheet-decoder.js';
+ import { parseDocumentWriteFragment } from './shadow.js';
+ import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
+@@ -14,7 +15,7 @@
+ const DocumentImpl = require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
+ const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/browser/parser/html.js'));
+ const parse5 = jsdomRequire('parse5');
+-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const documents = new WeakMap(), flags = new WeakMap();
+ const hintKeys = new WeakMap();
+ const stylesheetRequests=new WeakMap(),stylesheetDeliveries=new WeakMap();
+--- a/src/cookie-store.js
++++ b/src/cookie-store.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import vm from 'node:vm';
+ import {createRequire} from 'node:module';
+ import {isIP} from 'node:net';
+@@ -8,7 +9,7 @@
+ import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {registerProtocolPrototype} from './protocol-classes.js';
+-const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const require=createRequire(import.meta.url);
+ const EventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
+ const installed=new WeakMap(),stores=new WeakMap(),events=new WeakMap(),windows=new WeakMap();
+ const apply=Reflect.apply,define=Object.defineProperty,create=Object.create,construct=Reflect.construct,schedule=setTimeout,cancel=clearTimeout;
+--- a/src/dialogs.js
++++ b/src/dialogs.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ // Independent dialog and popover state, events, and default actions.
+ import { createRequire } from 'node:module';
+ // Bootstrap jsdom's interface registry before accessing pinned internal IDL.
+@@ -7,7 +8,7 @@
+ const Dialog = require('jsdom/lib/jsdom/living/generated/HTMLDialogElement.js');
+ const HTMLElement = require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
+ const HTMLElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
+-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const documents = new WeakMap(), states = new WeakMap(), installed = new WeakMap();
+ let patched = false;
+ 
+--- a/src/dom-events.js
++++ b/src/dom-events.js
+@@ -1,7 +1,8 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import 'jsdom';
+ import { createRequire } from 'node:module';
+ const require=createRequire(import.meta.url);
+-const{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
+ const File=require('jsdom/lib/jsdom/living/generated/File.js');
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,9 +1,10 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ import { createHook } from 'node:async_hooks';
+ import { runInContext } from 'node:vm';
+ 
+ const require = createRequire(import.meta.url);
+-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const ErrorEvent = require('jsdom/lib/jsdom/living/generated/ErrorEvent.js');
+ const { DOMString } = require('webidl-conversions');
+ const EventTargetImpl = require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
+--- a/src/fonts.js
++++ b/src/fonts.js
+@@ -1,7 +1,8 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const installed = new WeakMap(), faces = new WeakMap(), sets = new WeakSet(), documents = new WeakMap();
+ 
+ // Measured native profile: FontFace is loaded metadata, not a decoded font.
+--- a/src/forms.js
++++ b/src/forms.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {appendFormAssociatedValue} from './element-internals.js';
+ import { submitDialogForm } from './dialogs.js';
+ import { createRequire } from 'node:module';
+@@ -10,7 +11,7 @@
+ const DataImpl = require('jsdom/lib/jsdom/living/xhr/FormData-impl.js').implementation;
+ const HTMLElement = require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
+ const FormDataIDL = require('jsdom/lib/jsdom/living/generated/FormData.js');
+-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const { isDisabled, isSubmitButton } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
+ const DOCUMENTS = new WeakMap();
+ const DATA_WINDOWS = new WeakSet();
+--- a/src/indexeddb.js
++++ b/src/indexeddb.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {types} from 'node:util';
+ import * as backend from 'fake-indexeddb';
+ import {createRequire} from 'node:module';
+@@ -5,7 +6,7 @@
+ import {createIndexedDBClone} from './indexeddb-clone.js';
+ import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+-const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const require=createRequire(import.meta.url);
+ const scopes=new WeakMap(),installed=new WeakMap(),values=new WeakMap(),wrappers=new WeakMap(),eventVersions=new WeakMap(),windows=new WeakMap();
+ const apply=Reflect.apply,nil=()=>Object.create(null),numberIndex=k=>typeof k==='string'&&/^(?:0|[1-9]\d*)$/.test(k);
+ const schema=Object.freeze({
+--- a/src/input.js
++++ b/src/input.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { requestDialogClose } from './dialogs.js';
+ import { createRequire } from 'node:module';
+ import { installFocus, advanceFocus } from './focus.js';
+@@ -6,7 +7,7 @@
+ // page-created events untrusted; its pinned internal dispatch path preserves
+ // the trusted flag for events created by this driver instead.
+ const require = createRequire(import.meta.url);
+-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const { isSubmitButton } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
+ 
+ const METHODS = new Set(['Input.dispatchKeyEvent', 'Input.insertText', 'Input.dispatchMouseEvent']);
+--- a/src/media.js
++++ b/src/media.js
+@@ -1,6 +1,7 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {createRequire} from 'node:module';
+ const require=createRequire(import.meta.url);
+-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const INSTALLED=new WeakMap(),LISTS=new WeakMap(),EVENTS=new WeakMap(),SCREENS=new WeakMap();
+ 
+ function queries(text){let depth=0,start=0;const result=[];for(let i=0;i<text.length;i++){if(text[i]==='(')depth++;else if(text[i]===')')depth--;else if(text[i]===','&&depth===0){result.push(text.slice(start,i));start=i+1}if(depth<0)return[]}if(depth)return[];result.push(text.slice(start));return result}
+--- a/src/mutations.js
++++ b/src/mutations.js
+@@ -1,9 +1,10 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+ const ObserverImpl = require('jsdom/lib/jsdom/living/mutation-observer/MutationObserver-impl.js').implementation;
+ const ErrorEvent = require('jsdom/lib/jsdom/living/generated/ErrorEvent.js');
+-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
++const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const windows = new WeakMap(), observers = new WeakMap(), agents = new WeakMap();
+ let patched = false;
+ 
+--- a/src/performance.js
++++ b/src/performance.js
+@@ -1,7 +1,8 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ // Independent timing from recorded calls and Page transport/lifecycle events.
+ import { createRequire } from 'node:module';
+ const require=createRequire(import.meta.url);
+-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++
+ const installed = new WeakMap(), trackers=new WeakMap();
+ const hostNow=()=>globalThis.performance.now();
+ 
+--- a/src/scheduler.js
++++ b/src/scheduler.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {addAbortListener} from 'node:events';
+ // Independent timer-backed task execution calibrated against the pinned Native.
+ // Priority metadata/events are real; that target currently runs priority hints
+@@ -7,7 +8,7 @@
+ import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {onFrameRetirement} from './frame-activity.js';
+-const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const require=createRequire(import.meta.url);
+ const installed=new WeakMap(),controllers=new WeakMap(),signals=new WeakMap(),events=new WeakMap(),schedulers=new WeakMap();
+ const apply=Reflect.apply,microtask=queueMicrotask;
+ const nodeAborted=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'aborted').get,nodeReason=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'reason').get,disposeSymbol=Symbol.dispose;
+--- a/src/storage-event.js
++++ b/src/storage-event.js
+@@ -1,7 +1,8 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import {createRequire} from 'node:module';
+ import {registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+-const require=createRequire(import.meta.url),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const require=createRequire(import.meta.url),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js');
+ const events=new WeakMap(),installed=new WeakSet(),record=properties=>Object.assign(Object.create(null),properties);
+ function factory(g,bridge){
+  const TypeError=g.TypeError,String=g.String,apply=Reflect.apply,define=Object.defineProperty,setPrototype=Object.setPrototypeOf;
+--- a/src/text-tracks.js
++++ b/src/text-tracks.js
+@@ -1,3 +1,4 @@
++import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import 'jsdom';
+ import {createRequire} from 'node:module';
+ import {types} from 'node:util';
+@@ -5,7 +6,7 @@
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {parseWebVTT,renderVTTCue} from './vtt-parser.js';
+ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+-const {implForWrapper,wrapperForImpl}=utils;
++const {wrapperForImpl}=utils;
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const MediaImpl=require('jsdom/lib/jsdom/living/nodes/HTMLMediaElement-impl.js').implementation;
+ const TrackImpl=require('jsdom/lib/jsdom/living/nodes/HTMLTrackElement-impl.js').implementation;
+--- /dev/null
++++ b/test/event-backend-initialization.test.js
+@@ -0,0 +1,17 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createRequire} from 'node:module';
++import {JSDOM} from 'jsdom';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++// Capture the exact legacy function before private Event installation, just as
++// early imported producers did in the phase18 regressions.
++const legacy=utils.implForWrapper;
++const {implementationForWrapper,eventImplementation}=await import('../src/dom-event-state.js');
++const {installPlatformFactoryHooks}=await import('../src/platform-factory-hooks.js');
++const {getHeapBinding}=await import('../src/native-heap.js');
++installPlatformFactoryHooks();
++const binding=getHeapBinding();
++function realm(value,anchor){const prototype=Object.getPrototypeOf(value);try{assert.equal(binding.sameRealm(value,anchor),true);Object.setPrototypeOf(value,null);assert.equal(binding.sameRealm(value,anchor),true);}finally{Object.setPrototypeOf(value,prototype);}}
++test('no-runScripts Window keeps its real Host Event/getter origin and private backing',t=>{const dom=new JSDOM('<body>actual Host'),w=dom.window;t.after(()=>w.close());const event=new w.Event('owned'),getter=Object.getOwnPropertyDescriptor(event,'isTrusted').get;assert.equal(Object.getPrototypeOf(w.Object.prototype),null);assert.strictEqual(w.Object,Object);realm(event,[]);realm(getter,[]);assert.equal(event.isTrusted,false);assert.equal(event instanceof w.Event,true);assert.deepEqual(Reflect.ownKeys(event),['isTrusted']);assert.throws(()=>getter.call({}),e=>e instanceof w.TypeError);assert.strictEqual(implementationForWrapper(event),eventImplementation(event));});
++test('stable lookup survives a genuinely captured old symbol reader without changing nonEvent identity',t=>{const dom=new JSDOM('<body>'),w=dom.window;t.after(()=>w.close());const event=new w.Event('owned'),backend=eventImplementation(event),node=w.document.createElement('div');assert.equal(legacy(event),undefined);assert.strictEqual(implementationForWrapper(event),backend);assert.strictEqual(implementationForWrapper(node),legacy(node));backend.isTrusted=true;let actual;node.addEventListener('owned',e=>actual=e);assert.equal(implementationForWrapper(node)._dispatch(backend),true);assert.strictEqual(actual,event);assert.equal(actual.isTrusted,true);const fake={};Object.defineProperty(fake,utils.implSymbol,{value:backend});assert.equal(implementationForWrapper(fake),null);assert.equal(implementationForWrapper(Object.create(event)),undefined);});
++test('actual VM Event getters retain VM origin and error realm while using the same private-first lookup',t=>{const dom=new JSDOM('<body>',{runScripts:'outside-only'}),w=dom.window;t.after(()=>w.close());const event=new w.Event('owned'),getter=Object.getOwnPropertyDescriptor(event,'isTrusted').get,anchor=w.eval('[]');realm(event,anchor);realm(getter,anchor);assert.equal(binding.sameRealm(getter,[]),false);assert.throws(()=>getter.call({}),e=>e instanceof w.TypeError);assert.equal(legacy(event),undefined);assert.strictEqual(implementationForWrapper(event),eventImplementation(event));assert.deepEqual(Reflect.ownKeys(event),['isTrusted']);});

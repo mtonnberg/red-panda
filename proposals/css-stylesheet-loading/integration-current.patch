@@ -1,0 +1,176 @@
+--- /dev/null
++++ b/src/stylesheet-decoder.js
+@@ -0,0 +1,14 @@
++// Host-only CSS byte decoding. The real response headers, leading encoding
++// declaration, owning document and optional link label choose the decoder.
++// A UTF-8 BOM carries that already-decoded text through jsdom's existing byte
++// parser entry without allowing its document-only fallback to decode it again.
++import{createRequire}from'node:module';
++const require=createRequire(import.meta.url),encoding=require('whatwg-encoding'),MIME=require('whatwg-mimetype');
++const BOM=Buffer.from([0xef,0xbb,0xbf]);
++export function stylesheetParserBytes(bytes,response,element){
++ const mime=MIME.parse(response?.headers?.['content-type']??''),header=mime?.parameters.get('charset');
++ const declaration=/^@charset "([^"\r\n]*)";/.exec(bytes.subarray(0,1024).toString('latin1'));
++ const fallback=encoding.labelToName(element.getAttributeNS(null,'charset')??'')??element._ownerDocument._encoding??'UTF-8';
++ const label=encoding.labelToName(header??'')??encoding.labelToName(declaration?.[1]??'')??fallback;
++ return Buffer.concat([BOM,Buffer.from(encoding.decode(bytes,label),'utf8')]);
++}
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -1,3 +1,4 @@
++import{stylesheetParserBytes}from'./stylesheet-decoder.js';
+ import { parseDocumentWriteFragment } from './shadow.js';
+ import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
+ import { prepareInputParserAdapter } from './input-controls.js';
+@@ -16,6 +17,7 @@
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ const documents = new WeakMap(), flags = new WeakMap();
+ const hintKeys = new WeakMap();
++const stylesheetRequests=new WeakMap(),stylesheetDeliveries=new WeakMap();
+ let patched = false;
+ const scriptTypes = new Set(['application/ecmascript', 'application/javascript', 'application/x-ecmascript',
+   'application/x-javascript', 'text/ecmascript', 'text/javascript', 'text/javascript1.0', 'text/javascript1.1',
+@@ -146,7 +148,7 @@
+ // Queue ownership remains with the real loader. Drop only delivery into an
+ // inactive Document; completed bytes/error cleanup still drain the retired
+ // queue without dispatching late events or invoking its DOM callbacks.
+-function fetchOwnedResource(record, loader, fetch, url, options) {
++function fetchOwnedResource(record, loader, fetch, url, options, delivery) {
+   const names = ['_queue', '_deferQueue', '_asyncQueue'];
+   const previous = names.map(name => loader[name]);
+   for (let index = 0; index < names.length; index++) {
+@@ -154,7 +156,12 @@
+     loader[names[index]] = Object.create(queue, { push: { value(request, loaded, failed, ...args) {
+       const guard = callback => typeof callback === 'function'
+         ? (...values) => {
+-          if (active(record)) return callback(...values);
++          if (active(record) && (!delivery||delivery.current())) {
++            if(!delivery)return callback(...values);
++            stylesheetDeliveries.set(delivery.element,delivery);
++            let result;try{result=callback(...values)}catch(error){if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);throw error}
++            return Promise.resolve(result).finally(()=>{if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element)});
++          }
+           loader._requestManager.remove(request);
+           return Promise.resolve();
+         }
+@@ -178,12 +185,15 @@
+   const parse = parse5.parse;
+   const closeDocument = DocumentImpl.prototype.close;
+   const openDocument = DocumentImpl.prototype.open, writeDocument = DocumentImpl.prototype.write;
+-  const attachLink = LinkImpl.prototype._attach, modifyLink = LinkImpl.prototype._attrModified, dispatchLink = LinkImpl.prototype._dispatch;
++  const attachLink = LinkImpl.prototype._attach, modifyLink = LinkImpl.prototype._attrModified, dispatchLink = LinkImpl.prototype._dispatch, detachLink=LinkImpl.prototype._detach;
+   LinkImpl.prototype._dispatch = function (...args) {
+-    const result = dispatchLink.apply(this, args), record = documents.get(this._ownerDocument);
++    const record=documents.get(this._ownerDocument),delivery=stylesheetDeliveries.get(this);
++    if(record&&args[0].isTrusted&&['load','error'].includes(args[0].type)&&(!active(record)||!this._attached||delivery&&!delivery.current()))return true;
++    const result = dispatchLink.apply(this, args);
+     if (record && args[0].isTrusted && ['load', 'error'].includes(args[0].type)) record.styles.delete(this);
+     return result;
+   };
++  LinkImpl.prototype._detach=function(){stylesheetRequests.delete(this);const record=documents.get(this._ownerDocument);record?.styles.delete(this);return detachLink.call(this);};
+   LinkImpl.prototype._attach = function () {
+     attachLink.call(this); const record = documents.get(this._ownerDocument); if (record) preload(record, this);
+   };
+@@ -318,7 +328,9 @@
+     const record = documents.get(this._document), element = options.element;
+     if (!record) return fetchResource.call(this, url, options);
+     if (element.localName === 'link' && (element.getAttributeNS(null, 'rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet')) {
+-      const request = fetchOwnedResource(record, this, fetchResource, url, options);
++      const delivery={element,current:()=>active(record)&&element._attached&&stylesheetRequests.get(element)===delivery};
++      stylesheetRequests.set(element,delivery);
++      const request = fetchOwnedResource(record, this, fetchResource, url, {...options,onLoad(data){return options.onLoad?.(stylesheetParserBytes(data,request.response,element));}},delivery);
+       if (request?.then) record.styles.add(element);
+       return request;
+     }
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -349,6 +349,8 @@
+       rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+       const names=prelude.replace(/^@layer\s*/i,'').trim();
+       NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
++    } else if(/^@charset(?:\s|$)/i.test(prelude)&&body===null) {
++      rule=new cssom.CSSRule();rule.type=2;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+     } else if(/^@import\b/i.test(prelude)&&body===null) {
+       try{rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
+     } else if(prelude.startsWith('@')) {
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -17,7 +17,10 @@
+ const HTMLElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
+ const SVGElementImpl = require('jsdom/lib/jsdom/living/nodes/SVGElement-impl.js').implementation;
+ const StyleElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLStyleElement-impl.js').implementation;
+-const { removeStylesheet } = require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
++const stylesheetBackend=require('jsdom/lib/jsdom/living/helpers/stylesheets.js');
++const { removeStylesheet } = stylesheetBackend;
++const whatwgURL=require('whatwg-url');
++const REPLACING_EXTERNAL=new WeakMap();
+ const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
+ const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\narea,base,datalist,head,link,meta,noscript,param,script,source,style,template,title,track { display: none; } details:not([open]) > :not(summary) { display: none; } [popover]:not(:popover-open):not(dialog[open]) { display:none; } dialog:popover-open {display:block;}\n');
+ const RECORDS = new WeakMap();
+@@ -133,7 +136,7 @@
+ 
+ function normalizeRules(rules, sheet, parent = null) {
+   for (const rule of rules) {
+-    rule.parentStyleSheet = sheet; rule.parentRule = parent;
++    rule.parentStyleSheet = rule.type===2?null:sheet; rule.parentRule = parent;
+     if (rule.style) {
+       rule.style = declaration(rule.style);
+       Object.defineProperty(rule.style, 'parentRule', { configurable: true, value: rule });
+@@ -168,6 +171,28 @@
+ function parse(record, text) {
+   return parseStyleSheet(String(text), { window: record.window, onUnsupported: value => record.unsupported.add(value) });
+ }
++
++const originalExternalCreate=stylesheetBackend.createStylesheet;
++stylesheetBackend.removeStylesheet=function(sheet,element){
++ const record=recordFor(wrapperForImpl(element._ownerDocument));
++ const index=element._ownerDocument.styleSheets._list.indexOf(sheet);
++ if(record&&element.localName==='link'&&element._attached)REPLACING_EXTERNAL.set(element,{record,sheet,index});
++ return removeStylesheet(sheet,element);
++};
++stylesheetBackend.createStylesheet=function(text,element,baseURL){
++ const record=recordFor(wrapperForImpl(element._ownerDocument));
++ if(!record||record.disposed||element.localName!=='link')return originalExternalCreate(text,element,baseURL);
++ const replacement=REPLACING_EXTERNAL.get(element);REPLACING_EXTERNAL.delete(element);
++ const parsed=parse(record,text);
++ // Keep the existing real import loader for its supported import path.
++ if([...parsed.cssRules].some(rule=>rule.type===3)){originalExternalCreate(text,element,baseURL);if(element.sheet){upgradeSheet(record,element.sheet);element.sheet.ownerNode=wrapperForImpl(element);element.sheet.href=whatwgURL.serializeURL(baseURL);}return;}
++ const retained=replacement?.record===record?replacement.sheet:null,sheet=retained?upgradeSheet(record,retained):upgradeSheet(record,parsed);
++ if(retained){for(const rule of sheet.cssRules){rule.parentStyleSheet=null;rule.parentRule=null;}normalizeRules(parsed.cssRules,sheet);spliceRules(sheet.cssRules,0,sheet.cssRules.length,...parsed.cssRules);}
++ sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;
++ const list=element._ownerDocument.styleSheets._list,index=replacement?.index;
++ if(!list.includes(sheet)){if(index>=0)list.splice(Math.min(index,list.length),0,sheet);else list.push(sheet);}
++ invalidateStyleCache(element);
++};
+ 
+ function operation(record, sheet, name, args) {
+   const method = SHEETS.get(sheet)?.operations?.[name];
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -218,7 +218,12 @@
+ 
+   createDOM(html, historyState = null) {
+     const virtualConsole = new VirtualConsole();
+-    virtualConsole.on('jsdomError', error => this.emit('pageError', error));
++    virtualConsole.on('jsdomError', error => {
++      // Fetch diagnostics are distinct from uncaught authored JavaScript.
++      // Preserve their backend signal without reporting Runtime.exceptionThrown.
++      if(error.type==='resource loading')this.emit('resourceError',error);
++      else this.emit('pageError',error.type==='unhandled exception'&&Object.hasOwn(error,'detail')?error.detail:error);
++    });
+     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
+       virtualConsole.on(type, (...args) => this.emit('console', { type, args }));
+     }
+--- /dev/null
++++ b/test/stylesheet-loading.test.js
+@@ -0,0 +1,10 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{createServer}from'node:http';import{Browser}from'../src/browser.js';
++async function fixture(t){const requests=[],timers=new Set(),server=createServer((request,response)=>{const u=new URL(request.url,'http://owned.invalid');requests.push(u.pathname);if(u.pathname==='/'){response.setHeader('Content-Type','text/html; charset=utf-8');response.end('<!doctype html><body><div class=probe></div>');return}let bytes=Buffer.from('.'+u.pathname.slice(1)+'{display:none;--name:"'+u.pathname.slice(1)+'"}'),type='text/css';if(u.pathname==='/header'){bytes=Buffer.from('.probe{display:none;--name:"café"}','latin1');type+='; charset=iso-8859-1'}if(u.pathname==='/charset')bytes=Buffer.from('@charset "windows-1252"; .probe{display:none;--name:"café"}','latin1');if(u.pathname==='/bom'){bytes=Buffer.from('\ufeff.probe{display:none;--name:"café"}');type+='; charset=iso-8859-1'}const finish=()=>{response.writeHead(Number(u.searchParams.get('status'))||200,{'Content-Type':type});response.end(bytes)};const delay=Number(u.searchParams.get('delay'));if(delay){const timer=setTimeout(()=>{timers.delete(timer);finish()},delay);timers.add(timer)}else finish()});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+server.address().port,browser=new Browser({loadResources:['stylesheet']}),page=browser.createPage();t.after(async()=>{await browser.close();for(const timer of timers)clearTimeout(timer);server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});await page.navigate(origin+'/');const w=page.dom.window,d=w.document;const create=path=>{const link=d.createElement('link');link.rel='stylesheet';link.href=path;return link};const sheet=link=>[...d.styleSheets].find(value=>value.ownerNode===link);const completion=link=>new Promise(resolve=>{link.addEventListener('load',()=>resolve('load'),{once:true});link.addEventListener('error',()=>resolve('error'),{once:true})});return{browser,page,w,d,requests,create,sheet,completion}}
++test('actual HTTP charset, leading CSS charset and BOM decode real fetched bytes before parsing',async t=>{const{w,d,create,sheet,completion}=await fixture(t);for(const path of['/header','/charset','/bom']){const link=create(path),done=completion(link);d.head.append(link);assert.equal(await done,'load');const actual=sheet(link),rule=[...actual.cssRules].find(rule=>rule.type===1);assert.equal(actual.href,link.href);assert.equal(actual.ownerNode,link);assert.equal(rule.style.getPropertyValue('--name'),'"café"');assert.equal(w.getComputedStyle(d.querySelector('.probe')).display,'none');if(path==='/charset'){const charset=actual.cssRules[0];assert.equal(charset.type,2);assert.equal(charset.cssText,'@charset "windows-1252";');assert.equal(charset.parentStyleSheet,null);assert.equal('encoding'in charset,false)}link.remove();assert.equal(d.styleSheets.length,0)}});
++test('actual sheet and rule-list identities remain stable through replacement without reordering other real sheets',async t=>{const{d,create,sheet,completion}=await fixture(t),a=create('/one'),b=create('/two');for(const link of[a,b]){const done=completion(link);d.head.append(link);await done}const before=sheet(a),list=before.cssRules,rule=list[0],done=completion(a);a.href='/three';await done;assert.equal(sheet(a),before);assert.equal(before.cssRules,list);assert.equal(list.length,1);assert.equal(list[0].selectorText,'.three');assert.equal(rule.parentStyleSheet,null);assert.deepEqual([...d.styleSheets],[before,sheet(b)]);assert.equal(before.href,a.href);a.remove();assert.deepEqual([...d.styleSheets],[sheet(b)])});
++test('removed links retain actual network activity while delivering no stale completion event or registered sheet',async t=>{const{d,requests,create}=await fixture(t);for(const status of[200,404]){const link=create('/removed?delay=25&status='+status),events=[];link.onload=()=>events.push('load');link.onerror=()=>events.push('error');d.head.append(link);link.remove();await new Promise(resolve=>setTimeout(resolve,80));assert.deepEqual(events,[]);assert.equal(d.styleSheets.length,0)}assert.equal(requests.filter(path=>path==='/removed').length,2)});
++test('superseded responses drain the real queue while only the current link request installs rules and dispatches completion',async t=>{const{d,requests,create,sheet}=await fixture(t);for(const status of[200,404]){const link=create('/first?delay=30&status='+status),events=[];link.onload=event=>events.push([event.type,event.isTrusted]);link.onerror=event=>events.push([event.type,event.isTrusted]);d.head.append(link);link.href='/second?delay=1';await new Promise(resolve=>setTimeout(resolve,90));assert.deepEqual(events,[['load',true]]);assert.equal(sheet(link).cssRules[0].selectorText,'.second');assert.equal(sheet(link).href,link.href);link.remove()}assert.equal(requests.filter(path=>path==='/second').length,2)});
++test('same href updates and detach/reappend use real request generations without duplicate completion',async t=>{const{d,create,sheet}=await fixture(t);for(const update of[link=>link.setAttribute('href',link.getAttribute('href')),link=>{link.remove();d.head.append(link)}]){const link=create('/current?delay=20'),events=[];link.onload=()=>events.push('load');link.onerror=()=>events.push('error');d.head.append(link);update(link);await new Promise(resolve=>setTimeout(resolve,90));assert.deepEqual(events,['load']);assert.equal(sheet(link).cssRules[0].selectorText,'.current');link.remove()}});
++test('genuine asynchronous load follows append and authored microtasks',async t=>{const{d,create,completion}=await fixture(t),link=create('/ordered?delay=5'),events=[],done=completion(link);link.addEventListener('load',()=>events.push('load'));d.head.append(link);events.push('append');queueMicrotask(()=>events.push('microtask'));assert.equal(await done,'load');assert.deepEqual(events,['append','microtask','load'])});
++
++test('failed real resource delivery stays observable without becoming an authored JavaScript exception',async t=>{const{page,w,d,create,completion}=await fixture(t),resources=[],errors=[];page.on('resourceError',error=>resources.push(error));page.on('pageError',error=>errors.push(error));const link=create('/missing?status=404'),done=completion(link);d.head.append(link);assert.equal(await done,'error');await new Promise(resolve=>setTimeout(resolve,10));assert.equal(resources.length,1);assert.equal(resources[0].type,'resource loading');assert.equal(errors.length,0);w.eval('globalThis.cssAuthoredFault=new TypeError("authored-css-control");setTimeout(()=>{throw cssAuthoredFault},0)');await new Promise(resolve=>setTimeout(resolve,25));assert.equal(errors.length,1);assert.equal(errors[0],w.cssAuthoredFault);assert.equal(errors[0].name,'TypeError');assert.match(errors[0].message,/authored-css-control/);assert.equal(resources.length,1)});

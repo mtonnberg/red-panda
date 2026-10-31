@@ -1,0 +1,243 @@
+diff --git a/src/audio-core.js b/src/audio-core.js
+--- a/src/audio-core.js
++++ b/src/audio-core.js
+@@ -50,13 +50,16 @@
+   copyFromChannel(destination,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(destination))throw new TypeError('');const source=channel(state,index),offset=uint(start),length=min(arrayLength(destination),max(0,arrayLength(source)-offset));for(let at=0;at<length;at++)destination[at]=source[offset+at];}
+   copyToChannel(source,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(source))throw new TypeError('');const destination=channel(state,index),offset=uint(start),length=min(arrayLength(source),max(0,arrayLength(destination)-offset));const snapshot=internal();for(let at=0;at<length;at++)snapshot.push(source[at]);for(let at=0;at<length;at++)destination[offset+at]=snapshot[at];}
+  }
+- function makeParam(context,value,automation='k-rate'){const key=record(),state=record({context,canonical:key,wrapper:null,value:fround(value),defaultValue:fround(value),automation,fixed:automation==='k-rate',incoming:new Set(),events:internal(),sequence:0});params.set(key,state);return key;}
++ function makeParam(context,value,automation='k-rate'){const key=record(),state=record({context,canonical:key,wrapper:null,value:fround(value),defaultValue:fround(value),automation,fixed:automation==='k-rate',incoming:new Set(),events:internal(),curveCount:0,sequence:0});params.set(key,state);return key;}
+  function initialParam(value,input){const state=brand(params,value);state.value=max(state.min??-constant,min(state.max??constant,float(input)));}
+  function paramView(value){const state=brand(params,value);if(!state.wrapper){const wrapper=allocate(AudioParam.prototype);params.set(wrapper,state);state.wrapper=wrapper;publish(wrapper,'AudioParam');}return state.wrapper;}
+ 
+- function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);automationOverlap(state,time);state.events.push(record({type,value,time,extra,sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return object;}
+- function paramValue(state,time){let value=state.value,previousTime=0,target=null;
+-  const current=at=>target?(target.constant===0?target.value:target.value+(value-target.value)*exp(-(at-previousTime)/target.constant)):value;
++ // Fresh events have increasing sequence numbers. Insert after the existing
++ // events at the same time, preserving the exact former stable-sort order.
++ function insertParamEvent(state,event){const values=state.events;if(!values.length||event.time>=values[values.length-1].time){values.push(event);return;}let low=0,high=values.length;while(low<high){const at=floor((low+high)/2);if(values[at].time<=event.time)low=at+1;else high=at;}values.splice(low,0,event);}
++ function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);automationOverlap(state,time);insertParamEvent(state,record({type,value,time,extra,sequence:state.sequence++}));return object;}
++ function paramValue(state,time){if(!state.events.length)return state.value;let value=state.value,previousTime=0,target=null;
++  const current=at=>target?(target.extra===0?target.value:target.value+(value-target.value)*exp(-(at-previousTime)/target.extra)):value;
+   for(const event of state.events){
+    if(event.type==='linear'||event.type==='exponential'){
+     if(event.time>time){const fraction=event.time===previousTime?1:max(0,min(1,(time-previousTime)/(event.time-previousTime)));return event.type==='linear'?value+(event.value-value)*fraction:value*pow(event.value/value,fraction);}
+@@ -64,13 +67,13 @@
+    }
+    if(event.time>time)break;
+    value=current(event.time);target=null;
+-   if(event.type==='target'){target=record({value:event.value,constant:event.extra});previousTime=event.time;}
++   if(event.type==='target'){target=event;previousTime=event.time;}
+    else if(event.type==='curve'){const curve=event.extra;const end=curve.hold??(event.time+curve.duration);if(time<end){const at=min(curve.values.length-1,max(0,(time-event.time)/curve.duration*(curve.values.length-1))),low=floor(at);return curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}const at=min(curve.values.length-1,max(0,(end-event.time)/curve.duration*(curve.values.length-1))),low=floor(at);value=curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);previousTime=end;}
+    else{value=event.value;previousTime=event.time;}
+   }
+   return current(time);
+  }
+- function automationOverlap(state,time,end=time){for(const event of state.events){const otherEnd=event.type==='curve'?(event.extra.hold??(event.time+event.extra.duration)):event.time;if(event.type==='curve'&&(end===time?time>event.time&&time<otherEnd:time<otherEnd&&end>event.time)||end>time&&event.time>time&&event.time<end)throw dom('NotSupportedError');}}
++ function automationOverlap(state,time,end=time){if(end===time&&!state.curveCount)return;for(const event of state.events){const otherEnd=event.type==='curve'?(event.extra.hold??(event.time+event.extra.duration)):event.time;if(event.type==='curve'&&(end===time?time>event.time&&time<otherEnd:time<otherEnd&&end>event.time)||end>time&&event.time>time&&event.time<end)throw dom('NotSupportedError');}}
+ 
+  class AudioParam{
+   constructor(){illegal();}
+@@ -85,9 +88,9 @@
+   linearRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'linear',value,time);}
+   exponentialRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();value=float(value);if(value<=0)throw new RangeError('');return addParam(this,'exponential',value,time);}
+   setTargetAtTime(value,time,constant){brand(params,this);if(arguments.length<3)throw error();constant=nonnegative(constant);return addParam(this,'target',value,time,constant);}
+-  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));state.events.push(record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return this;}
+-  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);return this;}
+-  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
++  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));insertParamEvent(state,record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.curveCount++;return this;}
++  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);return this;}
++  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
+  }
+  function handler(target,state,key,value){const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next&&!state.relays[key]){const relay=event=>{const callback=state.handlers[key];if(callback)apply(callback,target,[event]);};state.relays[key]=relay;bridge.listen(target,key,relay,true);}else if(!next&&state.relays[key]){bridge.listen(target,key,state.relays[key],false);delete state.relays[key];}}
+  function nodeCount(state,value){value=uint(value);if(!value||value>32||state.maxChannels&&value>state.maxChannels)throw dom('NotSupportedError');if(state.kind==='destination'&&contexts.get(state.context).realtime&&value>2)throw dom('IndexSizeError');state.channelCount=value;}
+diff --git a/test/audio-timeline-performance.test.js b/test/audio-timeline-performance.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/audio-timeline-performance.test.js
+@@ -0,0 +1,8 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{Browser}from'../src/browser.js';
++test('Native backdated/tied timelines and curve cancellation preserve actual samples and errors',async()=>{const browser=new Browser({timeout:2000}),page=browser.createPage();try{await page.navigate('data:text/html,<body>Audio timeline');const source=await readFile(new URL('../docs/reference/audio-timeline-performance/audio-order-expression.js',import.meta.url),'utf8'),contract=JSON.parse(await readFile(new URL('../docs/reference/audio-timeline-performance/audio-order-native.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(source).digest('hex'),contract.expressionSHA256);const actual=JSON.parse(JSON.stringify(await page.evaluate(source)));
++ // This performance delta retains a separately recorded baseline discrepancy:
++ // after cancel(0), re-adding a curve then rejecting an inside-point event,
++ // Native renders1 while the original independent renderer retains that curve.
++ // Preserve the raw Native expectation; verify all six other rows exactly.
++ const scope=rows=>rows.filter(row=>row.name!=='curve-readd');assert.deepEqual(scope(actual),scope(contract.observations));const native=contract.observations.find(row=>row.name==='curve-readd'),candidate=actual.find(row=>row.name==='curve-readd');assert.equal(candidate.error,native.error);assert.deepEqual(native.samples,[1,1,1,1,1,1,1,1,1,1]);
++ }finally{browser.close()}});
+diff --git a/docs/reference/audio-timeline-performance/README.md b/docs/reference/audio-timeline-performance/README.md
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/audio-timeline-performance/README.md
+@@ -0,0 +1,40 @@
++# Audio timeline cost and preserved ordering
++
++The unchanged pinned audio_graph.html (SHA256
++10b6ad114dbac171e38167a6a62c4cd55021e545e825bd4ba03a712206b53a64)
++timed out at its original2000ms source-load contract. CPU profiling identified
++repeated full event sorts, scans that could not find a curve, and per-sample target
++record allocations. This delta changes those general algorithms; graph depth,
++DSP, samples, event count and deadlines remain.
++
++Fresh events have increasing sequence numbers. Binary upper-bound insertion after
++all events at the same time produces exactly the previous stable time/sequence
++order. Monotonic events append directly. The private curve count allows a point
++query with no curves to return immediately; interval queries still validate every
++existing event. Both cancellation methods recompute the count. Evaluation reads
++the original immutable target event rather than copying two scalar fields into a
++new Host record each visit. An empty timeline returns its unchanged base value
++without allocating a per-call closure.
++
++An isolated exact Root baseline took~776ms to schedule the combined2000 events
++and~2239ms total diagnostic time; optimized~48ms and~1280ms. These instrumented
++numbers are observations, not test deadlines or guaranteed benchmarks. The actual
++unchanged source fixture reproduced load timeout2417ms before the change, then
++passed with load1402ms and assertion2ms under the unchanged2000+2000 contract.
++Both runs used ephemeral static origins, real source registration flags and the
++unchanged Native harness. No fixture assertion was edited.
++
++Seven fresh Native controls cover reverse chronological insertion, time ties,
++ramps, cancellation, held curves and point-overlap errors. Six rendered rows match
++exactly. The seventh reveals a preexisting independent-renderer discrepancy:
++following cancel(0), re-adding a curve then rejecting a point inside it leaves that
++curve rendered here, while Native renders the original1. Both original and
++optimized Root produce exactly the same seven complete observations. The raw
++Native expectation is retained unchanged; the new bounded test checks the six
++exact rows and the seventh error identity. This performance delta does not claim
++to fix that separate curve lifecycle behavior.
++
++No duplicate event coalescing, event/node/sample cap, silent deep-graph fallback,
++recorded output vector or native engine import is introduced. Host-private state,
++actual VM buffers/arrays/events, captured public interfaces, lifetime and genuine
++sample math remain. New private fields are Host records just like existing state.
+diff --git a/docs/reference/audio-timeline-performance/audio-order-expression.js b/docs/reference/audio-timeline-performance/audio-order-expression.js
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/audio-timeline-performance/audio-order-expression.js
+@@ -0,0 +1,2 @@
++(async()=>{const rows=[],sr=8192,points=[0,2,4,6,7,8,10,11,12,15];const cases=[['backdated-sets',p=>{p.setValueAtTime(3,12/sr);p.setValueAtTime(1,0);p.setValueAtTime(2,4/sr)}],['same-time-sets',p=>{p.setValueAtTime(1,8/sr);p.setValueAtTime(3,4/sr);p.setValueAtTime(2,8/sr)}],['reversed-linear',p=>{p.linearRampToValueAtTime(3,12/sr);p.setValueAtTime(1,4/sr)}],['curve-cancel-point',p=>{p.setValueCurveAtTime([2,4],8/sr,8/sr);p.cancelScheduledValues(0);p.setValueAtTime(7,10/sr)}],['curve-hold-point',p=>{p.setValueCurveAtTime([2,4],0,16/sr);p.cancelAndHoldAtTime(8/sr);p.setValueAtTime(5,12/sr)}],['multiple-curves-cancel',p=>{p.setValueCurveAtTime([1,3],0,4/sr);p.setValueCurveAtTime([5,7],8/sr,4/sr);p.cancelScheduledValues(8/sr);let error;try{p.setValueAtTime(9,2/sr)}catch(e){error=e.name}p.setValueAtTime(11,10/sr);return error}],['curve-readd',p=>{p.setValueCurveAtTime([1,3],0,4/sr);p.cancelScheduledValues(0);p.setValueCurveAtTime([8,10],4/sr,4/sr);try{p.setValueAtTime(9,6/sr)}catch(e){return e.name}}]];
++for(const[name,schedule]of cases){const ctx=new OfflineAudioContext(1,16,sr),source=new ConstantSourceNode(ctx),gain=ctx.createGain();source.connect(gain).connect(ctx.destination);const error=schedule(gain.gain);source.start();const data=(await ctx.startRendering()).getChannelData(0);rows.push({name,error:error??null,samples:points.map(i=>data[i])})}return rows})()
+diff --git a/docs/reference/audio-timeline-performance/audio-order-native.json b/docs/reference/audio-timeline-performance/audio-order-native.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/audio-timeline-performance/audio-order-native.json
+@@ -0,0 +1,120 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "66115015b70876c8f9b0e1fd9dc0a5e07f99166bafbdfc251a4ec43cda2bca71",
++  "observations": [
++    {
++      "name": "backdated-sets",
++      "error": null,
++      "samples": [
++        1,
++        1,
++        2,
++        2,
++        2,
++        2,
++        2,
++        2,
++        3,
++        3
++      ]
++    },
++    {
++      "name": "same-time-sets",
++      "error": null,
++      "samples": [
++        1,
++        1,
++        3,
++        3,
++        3,
++        2,
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "reversed-linear",
++      "error": null,
++      "samples": [
++        1,
++        1,
++        1,
++        1.5,
++        1.75,
++        2,
++        2.5,
++        2.75,
++        3,
++        3
++      ]
++    },
++    {
++      "name": "curve-cancel-point",
++      "error": null,
++      "samples": [
++        1,
++        1,
++        1,
++        1,
++        1,
++        1,
++        7,
++        7,
++        7,
++        7
++      ]
++    },
++    {
++      "name": "curve-hold-point",
++      "error": null,
++      "samples": [
++        2,
++        2.25,
++        2.5,
++        2.75,
++        2.875,
++        3,
++        3,
++        3,
++        5,
++        5
++      ]
++    },
++    {
++      "name": "multiple-curves-cancel",
++      "error": "NotSupportedError",
++      "samples": [
++        1,
++        2,
++        3,
++        3,
++        3,
++        3,
++        11,
++        11,
++        11,
++        11
++      ]
++    },
++    {
++      "name": "curve-readd",
++      "error": "NotSupportedError",
++      "samples": [
++        1,
++        1,
++        1,
++        1,
++        1,
++        1,
++        1,
++        1,
++        1,
++        1
++      ]
++    }
++  ]
++}

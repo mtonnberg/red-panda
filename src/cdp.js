@@ -378,7 +378,7 @@ class Session {
         const contextId = this.objects.get(params.objectId).contextId;
         const group = this.objects.get(params.objectId).group;
         const result = Object.getOwnPropertyNames(object).map(name => {
-          const descriptor = Object.getOwnPropertyDescriptor(object, name);
+          const descriptor = Object.getOwnPropertyDescriptor(object, name) ?? {};
           return { name, configurable: !!descriptor.configurable, enumerable: !!descriptor.enumerable,
             isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, group, contextId), writable: !!descriptor.writable } : {}),
             ...(descriptor.get ? { get: this.remote(descriptor.get, false, group, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, group, contextId) } : {}) };

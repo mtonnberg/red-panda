@@ -1,7 +1,8 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import 'jsdom';
 import { createRequire } from 'node:module';
 const require=createRequire(import.meta.url);
-const{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+
 const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
 const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
 const File=require('jsdom/lib/jsdom/living/generated/File.js');

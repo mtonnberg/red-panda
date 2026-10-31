@@ -26,7 +26,7 @@ export function installFrameActivity(page,window){
   if(!activities.has(window)){const getter=vm.compileFunction('return {get closed(){return state();}}',['state'],{parsingContext:implForWrapper(window)._globalObject})(()=>Boolean(page.retired||page.closed));Object.defineProperty(window,'closed',{...Object.getOwnPropertyDescriptor(getter,'closed'),configurable:true,enumerable:true});}
   if(!page.registry||activities.has(window))return;
   const source={setTimeout:window.setTimeout,setInterval:window.setInterval,clear:window.clearTimeout,request:window.requestAnimationFrame,cancel:window.cancelAnimationFrame};
-  const context=page.dom.getInternalVMContext(),invocation=createInvocationTrampoline(context),timers=new Set(),frames=new Set(),signal=page.documentAbort.signal;
+  const context=implForWrapper(window)._globalObject,invocation=createInvocationTrampoline(context),timers=new Set(),frames=new Set(),signal=page.documentAbort.signal;
   const options={timeout:Math.min(page.timeout,2000),displayErrors:false};let disposed=false;
   const bridge={
     timer(repeat,callback,delay,args){let id;const invoke=()=>{if(!repeat)timers.delete(id);if(disposed)return;if(typeof callback==='function')return invocation.invoke(callback,window,args,options);return vm.runInContext(callback,context,options);};id=apply(source[repeat?'setInterval':'setTimeout'],window,[invoke,delay]);timers.add(id);return id;},

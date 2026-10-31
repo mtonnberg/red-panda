@@ -1,0 +1,28 @@
+// Independent scalar dynamics processing: a soft-knee transfer, adaptive
+// envelope, lookahead delay and decibel meter. Tables contain no output samples.
+const f=Math.fround,abs=Math.abs,min=Math.min,max=Math.max,pow=Math.pow,log10=Math.log10,exp=Math.exp,sin=Math.sin,asin=Math.asin,sqrt=Math.sqrt,floor=Math.floor;
+const add=(a,b)=>f(a+b),sub=(a,b)=>f(a-b),mul=(a,b)=>f(a*b),div=(a,b)=>f(a/b),db=x=>mul(20,f(log10(x))),amplitude=x=>f(pow(10,mul(f(.05),x))),finite=(x,fallback)=>Number.isFinite(x)?x:fallback;
+const Float=Float32Array,filters=new WeakMap(),slot=fields=>Object.assign(Object.create(null),fields),halfPi=f(Math.PI/2);
+// A quartic through four release zones has one free coefficient. Select the
+// column-normalized minimum-norm fit. Deriving it from the interpolation grid
+// avoids embedding an implementation's fitted coefficient matrix.
+function releaseFit(values){const delta1=values[1]-values[0],delta2=values[2]-2*values[1]+values[0],delta3=values[3]-3*values[2]+3*values[1]-values[0],base=[values[0],delta1-delta2/2+delta3/3,delta2/2-delta3/2,delta3/6,0],nullPolynomial=[0,-6,11,-6,1];let numerator=0,denominator=0;for(let degree=1;degree<=4;degree++){let weight=0;for(let x=0;x<4;x++)weight+=pow(x,2*degree);numerator+=weight*base[degree]*nullPolynomial[degree];denominator+=weight*nullPolynomial[degree]*nullPolynomial[degree]}const shift=-numerator/denominator;return base.map((coefficient,i)=>coefficient+shift*nullPolynomial[i])}
+const columns=[0,1,2,3].map(index=>releaseFit([0,1,2,3].map(i=>i===index?1:0))),zones=[f(.09),f(.16),f(.42),f(.98)],releaseBase=[0,1,2,3,4].map(degree=>{let sum=0;for(let i=0;i<4;i++)sum=add(sum,mul(f(columns[i][degree]),zones[i]));return sum});
+export function createAudioCompressor(rate){const token=Object.freeze(Object.create(null));filters.set(token,slot({rate,delay:[new Float(1024),new Float(1024)],read:0,write:-1,detector:0,envelope:1,meter:1,meterStep:f(1-exp(-1/(f(.325)*rate))),peak:-1,curve:null}));return token}
+function knee(curve,x,k){return x<curve.threshold?x:add(curve.threshold,div(sub(1,f(exp(-mul(k,sub(x,curve.threshold))))),k))}
+function transfer(curve,x){if(x<curve.end)return knee(curve,x,curve.k);return amplitude(add(curve.outputDb,mul(curve.slope,sub(db(x),curve.endDb))))}
+function staticCurve(previous,threshold,kneeDb,ratio){if(previous&&previous.thresholdDb===threshold&&previous.kneeDb===kneeDb&&previous.ratio===ratio)return previous;const curve=slot({thresholdDb:threshold,kneeDb,ratio,threshold:amplitude(threshold),slope:div(1,ratio),endDb:add(threshold,kneeDb)}),x=amplitude(curve.endDb),x2=f(x*1.001),x2Db=db(x2);let low=f(.1),high=10000,k=5;for(let i=0;i<15;i++){const slope=x<curve.threshold?1:div(sub(db(knee(curve,x2,k)),db(knee(curve,x,k))),sub(x2Db,curve.endDb));if(slope<curve.slope)high=k;else low=k;k=f(sqrt(mul(low,high)))}curve.k=k;curve.end=amplitude(curve.endDb);curve.outputDb=db(knee(curve,curve.end,k));return curve}
+export function processAudioCompressor(token,input,settings){const state=filters.get(token);if(!state)throw new TypeError('Invalid private compressor');const frames=input[0]?.length??128,output=[new Float(frames),new Float(frames)],curve=state.curve=staticCurve(state.curve,settings.threshold,settings.knee,settings.ratio),makeup=f(pow(div(1,transfer(curve,1)),f(.6))),attack=mul(max(f(.001),settings.attack),state.rate),release=mul(state.rate,settings.release),detectorFrames=mul(f(.0025),state.rate),coefficients=releaseBase.map(value=>mul(release,value));
+ const delay=min(1023,floor(mul(f(.006),state.rate)));if(state.write<0||state.delayFrames!==delay){for(const channel of state.delay)channel.fill(0);state.read=0;state.write=delay;state.delayFrames=delay}
+ for(let block=0;block<frames;block+=32){state.detector=finite(state.detector,1);const target=div(f(asin(state.detector)),halfPi),releasing=target>state.envelope;let difference=target===0?(releasing?-1:1):db(div(state.envelope,target)),speed;
+  if(releasing){state.peak=-1;const x=mul(f(.25),add(max(-12,min(0,finite(difference,-1))),12)),x2=mul(x,x),x3=mul(x2,x),x4=mul(x2,x2);let duration=coefficients[0];for(const[i,power]of [[1,x],[2,x2],[3,x3],[4,x4]])duration=add(duration,mul(coefficients[i],power));speed=amplitude(div(5,duration));}
+  else{difference=finite(difference,1);state.peak=max(state.peak,difference);const strength=max(f(.5),state.peak);speed=sub(1,f(pow(div(f(.25),strength),div(1,attack))));}
+  const end=min(frames,block+32);for(let at=block;at<end;at++){let magnitude=0;for(let channel=0;channel<2;channel++){const sample=(input[channel]??input[0])[at];state.delay[channel][state.write]=sample;const positive=sample>0?sample:-sample;if(magnitude<positive)magnitude=positive}
+   const attenuation=magnitude<=.0001?1:div(transfer(curve,magnitude),magnitude),attenuationDb=max(2,-db(attenuation)),recovery=sub(amplitude(div(attenuationDb,detectorFrames)),1),step=attenuation>state.detector?recovery:1;state.detector=finite(min(1,add(state.detector,mul(sub(attenuation,state.detector),step))),1);
+   state.envelope=speed<1?add(state.envelope,mul(sub(target,state.envelope),speed)):min(1,mul(state.envelope,speed));const warped=f(sin(mul(halfPi,state.envelope))),gain=mul(makeup,warped),gainDb=db(warped);state.meter=gainDb<state.meter?gainDb:add(state.meter,mul(sub(gainDb,state.meter),state.meterStep));
+   for(let channel=0;channel<2;channel++)output[channel][at]=mul(state.delay[channel][state.read],gain);state.read=(state.read+1)%1024;state.write=(state.write+1)%1024;
+  }
+  if(abs(state.detector)<1.1754943508222875e-38)state.detector=0;if(abs(state.envelope)<1.1754943508222875e-38)state.envelope=0;
+ }
+ return slot({channels:output,reduction:state.meter});
+}

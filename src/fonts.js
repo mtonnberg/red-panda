@@ -1,7 +1,8 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+
 const installed = new WeakMap(), faces = new WeakMap(), sets = new WeakSet(), documents = new WeakMap();
 
 // Measured native profile: FontFace is loaded metadata, not a decoded font.

@@ -46,7 +46,7 @@ Fetch options:
   --fail-on-http-error    Dump HTTP errors and exit 22
   --user-agent STRING    Override the user agent
   --experimental-features FEATURE  Enable serviceworker (repeatable)
-  --load-resources KIND  Enable stylesheet, iframe, worker or beacon requests (repeatable)
+  --load-resources KIND  Enable stylesheet, iframe, worker, image or beacon requests (repeatable)
   --inject-script JS     Run before page scripts (repeatable, in CLI order)
   --inject-script-file PATH  Read a preload script from a file
   --cookie PATH          Load a JSON or Netscape cookie file into each page
@@ -92,7 +92,7 @@ export async function main(argv = process.argv.slice(2)) {
   const timeout = integer(values['wait-ms'], '--wait-ms');
   const cliHTTPHeaders = parseCLIHTTPHeaders(values['http-header']);
   let loadResources = values['load-resources'] ?? (command === 'mcp' ? ['stylesheet'] : []);
-  for (const resource of loadResources) if (!['none', 'stylesheet', 'iframe', 'worker', 'beacon'].includes(resource)) throw new Error(`Unsupported resource loading: ${resource}`);
+  for (const resource of loadResources) if (!['none', 'stylesheet', 'iframe', 'worker', 'image', 'beacon'].includes(resource)) throw new Error(`Unsupported resource loading: ${resource}`);
   if (loadResources.includes('none')) loadResources = [];
   const features = values['experimental-features'] ?? [];
   for (const feature of features) if (feature !== 'serviceworker') throw new Error(`Unsupported experimental feature: ${feature}`);

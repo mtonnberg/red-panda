@@ -1,0 +1,1173 @@
+--- a/src/audio-core.js
++++ b/src/audio-core.js
+@@ -9,11 +9,11 @@
+ const reportException=require('jsdom/lib/jsdom/living/helpers/runtime-script-errors.js');
+ const installed=new WeakMap(),shared={buffers:new WeakMap(),contexts:new WeakMap(),nodes:new WeakMap(),params:new WeakMap(),events:new WeakMap()};
+ const typed=Object.getPrototypeOf(Float32Array.prototype),typedLength=Object.getOwnPropertyDescriptor(typed,'length').get;
+-const hostSetTimeout=setTimeout,hostClearTimeout=clearTimeout;
++const hostSetTimeout=setTimeout,hostClearTimeout=clearTimeout,hostNow=performance.now.bind(performance);
+ function audioFactory(g,bridge){
+  const {buffers,contexts,nodes,params,events}=bridge.shared;
+  const TypeError=g.TypeError,RangeError=g.RangeError,Exception=g.DOMException,EventTarget=g.EventTarget,Event=g.Event,Promise=g.Promise,F32=g.Float32Array;
+- const Set=bridge.Set,String=g.String,internal=()=>new bridge.Array(),promiseReject=Promise.reject,addListener=EventTarget.prototype.addEventListener,removeListener=EventTarget.prototype.removeEventListener;
++ const Map=bridge.Map,Set=bridge.Set,String=g.String,internal=()=>new bridge.Array(),promiseReject=Promise.reject,addListener=EventTarget.prototype.addEventListener,removeListener=EventTarget.prototype.removeEventListener;
+  const define=Object.defineProperty,create=Object.create,setPrototype=Object.setPrototypeOf,getDescriptor=Object.getOwnPropertyDescriptor,keys=Object.getOwnPropertyNames;
+  const finite=Number.isFinite,fround=Math.fround,ceil=Math.ceil,floor=Math.floor,round=Math.round,min=Math.min,max=Math.max,abs=Math.abs,pow=Math.pow,exp=Math.exp;
+  const constant=3.4028234663852886e38,token=bridge.token,record=bridge.record,apply=Reflect.apply;
+@@ -39,30 +39,31 @@
+   copyFromChannel(destination,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(destination))throw new TypeError('');const source=channel(state,index),offset=uint(start),length=min(arrayLength(destination),max(0,arrayLength(source)-offset));for(let at=0;at<length;at++)destination[at]=source[offset+at];}
+   copyToChannel(source,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(source))throw new TypeError('');const destination=channel(state,index),offset=uint(start),length=min(arrayLength(source),max(0,arrayLength(destination)-offset));const snapshot=internal();for(let at=0;at<length;at++)snapshot.push(source[at]);for(let at=0;at<length;at++)destination[offset+at]=snapshot[at];}
+  }
+- function makeParam(context,value,automation='k-rate'){const object=create(AudioParam.prototype);params.set(object,record({context,value:fround(value),defaultValue:fround(value),automation,events:internal(),sequence:0}));return publish(object,'AudioParam');}
+- function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);state.events.push(record({type,value,time,extra,sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return object;}
+- function paramValue(state,time){let value=state.value,previousTime=0,target=null,curve=null;
++ function makeParam(context,value,automation='k-rate'){const object=create(AudioParam.prototype);params.set(object,record({context,value:fround(value),defaultValue:fround(value),automation,fixed:automation==='k-rate',incoming:new Set(),events:internal(),sequence:0}));return publish(object,'AudioParam');}
++ function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);automationOverlap(state,time);state.events.push(record({type,value,time,extra,sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return object;}
++ function paramValue(state,time){let value=state.value,previousTime=0,target=null;
++  const current=at=>target?(target.constant===0?target.value:target.value+(value-target.value)*exp(-(at-previousTime)/target.constant)):value;
+   for(const event of state.events){
+    if(event.type==='linear'||event.type==='exponential'){
+     if(event.time>time){const fraction=event.time===previousTime?1:max(0,min(1,(time-previousTime)/(event.time-previousTime)));return event.type==='linear'?value+(event.value-value)*fraction:value*pow(event.value/value,fraction);}
+-    value=event.value;previousTime=event.time;target=null;curve=null;continue;
++    value=event.value;previousTime=event.time;target=null;continue;
+    }
+    if(event.time>time)break;
+-   if(target)value=target.value+(value-target.value)*exp(-(event.time-previousTime)/target.constant);
+-   if(curve){const at=min(curve.values.length-1,max(0,(event.time-previousTime)/curve.duration*(curve.values.length-1))),low=floor(at);value=curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}
+-   if(event.type==='target'){target={value:event.value,constant:event.extra};curve=null;}else if(event.type==='curve'){curve={values:event.extra.values,duration:event.extra.duration};target=null;value=curve.values[0];}else{value=event.value;target=null;curve=null;}
+-   previousTime=event.time;
++   value=current(event.time);target=null;
++   if(event.type==='target'){target=record({value:event.value,constant:event.extra});previousTime=event.time;}
++   else if(event.type==='curve'){const curve=event.extra;const end=curve.hold??(event.time+curve.duration);if(time<end){const at=min(curve.values.length-1,max(0,(time-event.time)/curve.duration*(curve.values.length-1))),low=floor(at);return curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}const at=min(curve.values.length-1,max(0,(end-event.time)/curve.duration*(curve.values.length-1))),low=floor(at);value=curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);previousTime=end;}
++   else{value=event.value;previousTime=event.time;}
+   }
+-  if(target)return target.constant===0?target.value:target.value+(value-target.value)*exp(-(time-previousTime)/target.constant);
+-  if(curve){const at=min(curve.values.length-1,max(0,(time-previousTime)/curve.duration*(curve.values.length-1))),low=floor(at);return curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}
+-  return value;
+- }
++  return current(time);
++ }
++ function automationOverlap(state,time,end=time){for(const event of state.events){const otherEnd=event.type==='curve'?(event.extra.hold??(event.time+event.extra.duration)):event.time;if(event.type==='curve'&&(end===time?time>event.time&&time<otherEnd:time<otherEnd&&end>event.time)||end>time&&event.time>time&&event.time<end)throw dom('NotSupportedError');}}
++
+  class AudioParam{
+   constructor(){illegal();}
+-  get value(){const state=brand(params,this),context=contexts.get(state.context);return context.frame?fround(paramValue(state,context.frame/context.rate)):state.value;}
++  get value(){const state=brand(params,this),context=contexts.get(state.context);return context.realtime||context.frame?fround(paramValue(state,updateClock(context)/context.rate)):state.value;}
+   set value(value){brand(params,this).value=float(value);}
+   get automationRate(){return brand(params,this).automation;}
+-  set automationRate(value){const state=brand(params,this);value=String(value);if(!['a-rate','k-rate'].includes(value))return;if(value!==state.automation)throw dom('InvalidStateError');}
++  set automationRate(value){const state=brand(params,this);value=String(value);if(!['a-rate','k-rate'].includes(value))return;if(value!==state.automation&&state.fixed)throw dom('InvalidStateError');state.automation=value;}
+   get defaultValue(){return brand(params,this).defaultValue;}
+   get minValue(){brand(params,this);return -constant;}
+   get maxValue(){brand(params,this);return constant;}
+@@ -70,112 +71,145 @@
+   linearRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'linear',value,time);}
+   exponentialRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();value=float(value);if(value<=0)throw new RangeError('');return addParam(this,'exponential',value,time);}
+   setTargetAtTime(value,time,constant){brand(params,this);if(arguments.length<3)throw error();constant=nonnegative(constant);return addParam(this,'target',value,time,constant);}
+-  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();if(!bridge.isFloat32(values))throw new TypeError('');const length=arrayLength(values);if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));state.events.push(record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return this;}
++  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));state.events.push(record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return this;}
+   cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);return this;}
+-  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);state.events=state.events.filter(event=>event.time<time);return addParam(this,'set',value,time);}
+- }
+- function handler(target,state,key,value){const previous=state.handlers[key];if(previous)apply(removeListener,target,[key,previous]);const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next)apply(addListener,target,[key,next]);}
++  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
++ }
++ function handler(target,state,key,value){const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next&&!state.relays[key]){const relay=event=>{const callback=state.handlers[key];if(callback)apply(callback,target,[event]);};state.relays[key]=relay;apply(addListener,target,[key,relay]);}else if(!next&&state.relays[key]){apply(removeListener,target,[key,state.relays[key]]);delete state.relays[key];}}
+  class AudioNode extends EventTarget{
+-  constructor(context,key){super();if(key!==token)illegal();brand(contexts,context);nodes.set(this,record({context,inputs:1,outputs:1,channelCount:2,mode:'max',interpretation:'speakers',connections:new Set(),handlers:record()}));}
++  constructor(context,key){super();if(key!==token)illegal();brand(contexts,context);nodes.set(this,record({context,inputs:1,outputs:1,channelCount:2,mode:'max',interpretation:'speakers',connections:new Set(),incoming:new Set(),handlers:record(),relays:record()}));}
+   get context(){return brand(nodes,this).context;}
+   get numberOfInputs(){return brand(nodes,this).inputs;}
+   get numberOfOutputs(){return brand(nodes,this).outputs;}
+   get channelCount(){return brand(nodes,this).channelCount;}
+-  set channelCount(value){const state=brand(nodes,this);value=uint(value);if(!value||value>32)throw dom('NotSupportedError');state.channelCount=value;}
++  set channelCount(value){const state=brand(nodes,this);value=uint(value);if(!value||value>32)throw dom('NotSupportedError');if(state.kind==='destination'&&contexts.get(state.context).realtime&&value>2)throw dom('IndexSizeError');state.channelCount=value;}
+   get channelCountMode(){return brand(nodes,this).mode;}
+   set channelCountMode(value){const state=brand(nodes,this);value=String(value);if(['max','clamped-max','explicit'].includes(value))state.mode=value;}
+   get channelInterpretation(){return brand(nodes,this).interpretation;}
+   set channelInterpretation(value){const state=brand(nodes,this);value=String(value);if(['speakers','discrete'].includes(value))state.interpretation=value;}
+-  connect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length)throw error();const next=nodes.get(destination);if(!next){if(params.has(destination))throw dom('NotSupportedError');throw error();}output=uint(output);input=uint(input);if(next.context!==state.context)throw dom('InvalidAccessError');if(output>=state.outputs||input>=next.inputs)throw dom('IndexSizeError');state.connections.add(destination);return destination;}
+-  disconnect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length){state.connections.clear();return;}if(typeof destination==='number'){if(uint(destination)>=state.outputs)throw dom('IndexSizeError');state.connections.clear();return;}const next=nodes.get(destination);if(!next)throw error();if(uint(output)>=state.outputs||uint(input)>=next.inputs)throw dom('IndexSizeError');if(!state.connections.delete(destination))throw dom('InvalidAccessError');}
++  connect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length)throw error();const next=nodes.get(destination)??params.get(destination);if(!next)throw error();output=uint(output);if(!params.has(destination))input=uint(input);if(next.context!==state.context)throw dom('InvalidAccessError');if(params.has(destination)&&!next.inputSupported)throw dom('NotSupportedError');if(output>=state.outputs||!params.has(destination)&&input>=next.inputs)throw dom('IndexSizeError');state.connections.add(destination);next.incoming.add(this);return params.has(destination)?undefined:destination;}
++  disconnect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length||typeof destination==='number'){if(arguments.length&&uint(destination)>=state.outputs)throw dom('IndexSizeError');for(const value of state.connections)(nodes.get(value)??params.get(value)).incoming.delete(this);state.connections.clear();return;}const next=nodes.get(destination)??params.get(destination);if(!next)throw error();if(uint(output)>=state.outputs||!params.has(destination)&&uint(input)>=next.inputs)throw dom('IndexSizeError');if(!state.connections.delete(destination))throw dom('InvalidAccessError');next.incoming.delete(this);}
++
+  }
+  class AudioDestinationNode extends AudioNode{constructor(context,key){super(context,key);if(key!==token)illegal();const state=nodes.get(this),ctx=contexts.get(context);state.channelCount=ctx.channels;state.mode='explicit';state.kind='destination';publish(this,'AudioDestinationNode');}get maxChannelCount(){return brand(contexts,brand(nodes,this).context).channels;}}
++ function sourceBrand(value){const state=brand(nodes,value);if(!['buffer','constant'].includes(state.kind))throw new TypeError('Illegal invocation');return state;}
++ function bufferBrand(value){const state=brand(nodes,value);if(state.kind!=='buffer')throw new TypeError('Illegal invocation');return state;}
+  class AudioScheduledSourceNode extends AudioNode{
+   constructor(context,key){super(context,key);if(key!==token)illegal();const state=nodes.get(this);state.kind='source';state.inputs=0;state.started=false;state.ended=false;state.stop=Infinity;contexts.get(context).sources.add(this);}
+-  start(when=0){const state=brand(nodes,this);when=nonnegative(when);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=when;}
+-  stop(when=0){const state=brand(nodes,this);when=nonnegative(when);if(!state.started)throw dom('InvalidStateError');state.stop=when;}
+-  get onended(){return brand(nodes,this).handlers.ended??null;}
+-  set onended(value){handler(this,brand(nodes,this),'ended',value);}
++  start(when=0){const state=sourceBrand(this);when=nonnegative(when);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=contexts.get(state.context).realtime?max(when,updateClock(contexts.get(state.context))/contexts.get(state.context).rate):when;}
++  stop(when=0){const state=sourceBrand(this);when=nonnegative(when);if(!state.started)throw dom('InvalidStateError');state.stop=when;}
++  get onended(){return sourceBrand(this).handlers.ended??null;}
++  set onended(value){handler(this,sourceBrand(this),'ended',value);}
+  }
+  class AudioBufferSourceNode extends AudioScheduledSourceNode{
+-  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();super(context,token);options=dictionary(options);const state=nodes.get(this);state.buffer=null;state.bufferSet=false;state.playbackRate=makeParam(context,1);state.detune=makeParam(context,0);state.loop=false;state.loopStart=0;state.loopEnd=0;
++  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();super(context,token);options=dictionary(options);const state=nodes.get(this);state.kind='buffer';state.buffer=null;state.bufferSet=false;state.playbackRate=makeParam(context,1);state.detune=makeParam(context,0);state.loop=false;state.loopStart=0;state.loopEnd=0;
+    const buffer=options.buffer;if(buffer!==undefined)this.buffer=buffer;const detune=options.detune;if(detune!==undefined)state.detune.value=detune;const loop=options.loop;if(loop!==undefined)state.loop=!!loop;const loopEnd=options.loopEnd;if(loopEnd!==undefined)state.loopEnd=restricted(loopEnd);const loopStart=options.loopStart;if(loopStart!==undefined)state.loopStart=restricted(loopStart);const playback=options.playbackRate;if(playback!==undefined)state.playbackRate.value=playback;publish(this,'AudioBufferSourceNode');}
+-  get buffer(){return brand(nodes,this).buffer;}
+-  set buffer(value){const state=brand(nodes,this);if(value!==null&&!buffers.has(value))throw error();if(value!==null&&state.bufferSet)throw dom('InvalidStateError');state.buffer=value;if(value!==null)state.bufferSet=true;}
+-  get playbackRate(){return brand(nodes,this).playbackRate;}
+-  get detune(){return brand(nodes,this).detune;}
+-  get loop(){return brand(nodes,this).loop;}
+-  set loop(value){brand(nodes,this).loop=!!value;}
+-  get loopStart(){return brand(nodes,this).loopStart;}
+-  set loopStart(value){brand(nodes,this).loopStart=restricted(value);}
+-  get loopEnd(){return brand(nodes,this).loopEnd;}
+-  set loopEnd(value){brand(nodes,this).loopEnd=restricted(value);}
+-  start(when=0,offset=0,duration){const state=brand(nodes,this);when=nonnegative(when);offset=nonnegative(offset);if(duration!==undefined)duration=nonnegative(duration);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=when;state.offset=offset;state.duration=duration;}
+- }
++  get buffer(){return bufferBrand(this).buffer;}
++  set buffer(value){const state=bufferBrand(this);if(value!==null&&!buffers.has(value))throw error();if(value!==null&&state.bufferSet)throw dom('InvalidStateError');state.buffer=value;if(value!==null)state.bufferSet=true;}
++  get playbackRate(){return bufferBrand(this).playbackRate;}
++  get detune(){return bufferBrand(this).detune;}
++  get loop(){return bufferBrand(this).loop;}
++  set loop(value){bufferBrand(this).loop=!!value;}
++  get loopStart(){return bufferBrand(this).loopStart;}
++  set loopStart(value){bufferBrand(this).loopStart=restricted(value);}
++  get loopEnd(){return bufferBrand(this).loopEnd;}
++  set loopEnd(value){bufferBrand(this).loopEnd=restricted(value);}
++  start(when=0,offset=0,duration){const state=bufferBrand(this);when=nonnegative(when);offset=nonnegative(offset);if(duration!==undefined)duration=nonnegative(duration);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=contexts.get(state.context).realtime?max(when,updateClock(contexts.get(state.context))/contexts.get(state.context).rate):when;state.offset=offset;state.duration=duration;}
++ }
++ function nodeOptions(value,options){const state=nodes.get(value);for(const key of['channelCount','channelCountMode','channelInterpretation']){const entry=options[key];if(entry!==undefined){if(key==='channelCountMode'&&!['max','clamped-max','explicit'].includes(String(entry))||key==='channelInterpretation'&&!['speakers','discrete'].includes(String(entry)))throw error();value[key]=entry;}}}
++ class GainNode extends AudioNode{
++  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();super(context,token);options=dictionary(options);nodeOptions(this,options);const state=nodes.get(this);state.kind='gain';state.gain=makeParam(context,1,'a-rate');params.get(state.gain).inputSupported=true;const gain=options.gain;if(gain!==undefined)state.gain.value=gain;publish(this,'GainNode');}
++  get gain(){const state=brand(nodes,this);if(state.kind!=='gain')throw new TypeError('Illegal invocation');return state.gain;}
++ }
++ class ConstantSourceNode extends AudioScheduledSourceNode{
++  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();super(context,token);options=dictionary(options);nodeOptions(this,options);const state=nodes.get(this);state.kind='constant';state.offsetParam=makeParam(context,1,'a-rate');const offset=options.offset;if(offset!==undefined)state.offsetParam.value=offset;publish(this,'ConstantSourceNode');}
++  get offset(){const state=brand(nodes,this);if(state.kind!=='constant')throw new TypeError('Illegal invocation');return state.offsetParam;}
++ }
++ function updateClock(state){if(state.realtime&&state.state==='running')state.frame=state.clockFrame+floor(max(0,(bridge.now()-state.clockStart))*state.rate/128000)*128;return state.frame;}
+  class BaseAudioContext extends EventTarget{
+   constructor(key){super();if(key!==token)illegal();}
+   get destination(){return brand(contexts,this).destination;}
+   get sampleRate(){return brand(contexts,this).rate;}
+-  get currentTime(){const state=brand(contexts,this);return state.frame/state.rate;}
++  get currentTime(){const state=brand(contexts,this);return updateClock(state)/state.rate;}
+   get state(){return brand(contexts,this).state;}
+   get onstatechange(){return brand(contexts,this).handlers.statechange??null;}
+   set onstatechange(value){handler(this,brand(contexts,this),'statechange',value);}
+   createBuffer(channels,length,rate){brand(contexts,this);if(arguments.length<3)throw error();return makeBuffer(uint(length),uint(channels),fround(number(rate)));}
+   createBufferSource(){brand(contexts,this);return new AudioBufferSourceNode(this);}
++  createConstantSource(){brand(contexts,this);return new ConstantSourceNode(this);}
++  createGain(){brand(contexts,this);return new GainNode(this);}
++ }
++ class AudioContext extends BaseAudioContext{
++  constructor(options={}){super(token);options=dictionary(options);const sample=options.sampleRate,rate=sample===undefined?48000:fround(number(sample));validate(2,1,rate);const state=record({channels:2,rate,frame:0,state:'running',realtime:true,sources:new Set(),handlers:record(),relays:record(),clockFrame:0,clockStart:0});contexts.set(this,state);state.destination=new AudioDestinationNode(this,token);state.clockStart=bridge.now();publish(this,'AudioContext');schedule(()=>fire(this,'statechange'));}
++  get baseLatency(){const state=brand(contexts,this);if(!state.realtime)throw new TypeError('Illegal invocation');return fround(256/state.rate);}
++  get outputLatency(){const state=brand(contexts,this);if(!state.realtime)throw new TypeError('Illegal invocation');return 0;}
++  resume(){const state=contexts.get(this);if(!state?.realtime)return apply(promiseReject,Promise,[error()]);if(state.state==='closed')return apply(promiseReject,Promise,[dom('InvalidStateError')]);if(state.state==='suspended'){state.clockFrame=state.frame;state.clockStart=bridge.now();state.state='running';schedule(()=>fire(this,'statechange'));}return new Promise(resolve=>resolve());}
++  suspend(){const state=contexts.get(this);if(!state?.realtime)return apply(promiseReject,Promise,[error()]);if(state.state==='closed')return apply(promiseReject,Promise,[dom('InvalidStateError')]);if(state.state==='running'){updateClock(state);state.state='suspended';schedule(()=>fire(this,'statechange'));}return new Promise(resolve=>resolve());}
++  close(){const state=contexts.get(this);if(!state?.realtime)return apply(promiseReject,Promise,[error()]);if(state.state==='closed')return apply(promiseReject,Promise,[dom('InvalidStateError')]);updateClock(state);state.state='closed';schedule(()=>fire(this,'statechange'));return new Promise(resolve=>resolve());}
+  }
+  class OfflineAudioCompletionEvent extends Event{
+   constructor(type,init){if(arguments.length<2)throw error();init=dictionary(init);const buffer=init.renderedBuffer;if(!buffers.has(buffer))throw error();super(type,init);events.set(this,buffer);}
+   get renderedBuffer(){if(!events.has(this))throw new TypeError('Illegal invocation');return events.get(this);}
+  }
+  function fire(target,type,buffer){const event=bridge.event(target,type);if(type==='complete'){setPrototype(event,OfflineAudioCompletionEvent.prototype);events.set(event,buffer);}bridge.dispatch(target,event);}
+- function schedule(action){bridge.schedule(action);}
+- function sourceFrames(source,ctx,quantumFrames){const state=nodes.get(source);if(!state.started||state.ended)return record({ended:false,samples:null});const b=state.buffer===null?null:buffers.get(state.buffer),samples=internal();for(let ch=0;ch<(b?.channels.length??1);ch++)samples.push(new F32(quantumFrames));
+-  let position=b?round((state.offset??0)*b.rate):0,consumed=0,started=false,ended=false;
++ function schedule(action,delay=0){bridge.schedule(action,delay);}
++
++ function sourceFrames(source,ctx,quantumFrames,startFrame=0){const state=nodes.get(source);if(!state.started||state.ended)return record({ended:false,samples:null});if(state.kind==='constant'){const data=new F32(quantumFrames),when=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),p=params.get(state.offsetParam);for(let frame=0;frame<quantumFrames;frame++){const absolute=startFrame+frame;if(absolute>=when&&absolute<stop)data[frame]=paramValue(p,(p.automation==='k-rate'?floor(absolute/128)*128:absolute)/ctx.rate);}const samples=internal();samples.push(data);return record({ended:stop<=startFrame+quantumFrames,samples});}const b=state.buffer===null?null:buffers.get(state.buffer),samples=internal();for(let ch=0;ch<(b?.channels.length??1);ch++)samples.push(new F32(quantumFrames));
++  let position=state.position??(b?round((state.offset??0)*b.rate):0),consumed=state.consumed??0,started=false,ended=false;
+   let loopStart=0,loopEnd=b?.length??0;
+-  if(b&&state.loop){const start=max(0,min(b.length,round(state.loopStart*b.rate))),end=state.loopEnd>0?max(0,min(b.length,round(state.loopEnd*b.rate))):b.length;if(start<b.length&&end>start){loopStart=start;loopEnd=end;}if(position>=loopEnd)position=loopStart;}
++  if(b&&state.loop){const start=max(0,min(b.length,round(state.loopStart*b.rate))),end=state.loopEnd>0?max(0,min(b.length,round(state.loopEnd*b.rate))):b.length;if(start<b.length&&end>start){loopStart=start;loopEnd=end;}if(state.position===undefined&&position>=loopEnd)position=loopStart;}
+   const when=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),duration=b&&state.duration!==undefined?state.duration*b.rate:Infinity;
+   for(let frame=0;frame<quantumFrames;frame++){
+-   if(frame<when)continue;
+-   if(frame>=stop||!b||consumed>=duration||!state.loop&&(position<0||position>=b.length)){ended=true;break;}
++   const absolute=startFrame+frame;if(absolute<when)continue;
++   if(absolute>=stop||!b||consumed>=duration||!state.loop&&(position<0||position>=b.length)){ended=true;break;}
+    started=true;
+    if(state.loop){const span=loopEnd-loopStart;if(position>=loopEnd)position=loopStart+(position-loopEnd)%span;if(position<0){ended=true;break;}}
+    const lower=floor(position),fraction=position-lower,next=state.loop&&lower+1>=loopEnd?loopStart:min(lower+1,b.length-1);
+    for(let ch=0;ch<b.channels.length;ch++){const data=b.channels[ch];samples[ch][frame]=data[lower]+(data[next]-data[lower])*fraction;}
+-   const time=floor(frame/128)*128/ctx.rate,step=paramValue(params.get(state.playbackRate),time)*pow(2,paramValue(params.get(state.detune),time)/1200)*b.rate/ctx.rate;
++   const time=floor((startFrame+frame)/128)*128/ctx.rate,step=paramValue(params.get(state.playbackRate),time)*pow(2,paramValue(params.get(state.detune),time)/1200)*b.rate/ctx.rate;
+    position+=step;consumed+=abs(step);
+   }
+   // The engine executes the full final quantum, even though only requested
+   // output frames are returned. A source ending exactly at that boundary ends.
+-  if(started&&b&&!state.loop&&(position<0||position>=b.length)||started&&consumed>=duration||stop<=quantumFrames)ended=true;
+-  return record({ended,samples});
+- }
+- function render(context,state){if(!bridge.active())return;const frames=ceil(state.length/128)*128,output=makeBuffer(state.length,state.channels,state.rate),out=buffers.get(output),finished=internal();
+-  for(const source of state.sources){const result=sourceFrames(source,state,frames),sourceState=nodes.get(source);if(result.ended){sourceState.ended=true;finished.push(source);}if(!sourceState.connections.has(state.destination)||!result.samples)continue;
+-   const channels=result.samples.length;
+-   for(let ch=0;ch<state.channels;ch++)for(let frame=0;frame<state.length;frame++){
+-    let value=0;if(sourceState.interpretation==='discrete'){if(ch<channels)value=result.samples[ch][frame];}
+-    else if(channels===1)value=result.samples[0][frame];else if(state.channels===1&&channels===2)value=(result.samples[0][frame]+result.samples[1][frame])*.5;else if(ch<channels)value=result.samples[ch][frame];
+-    out.channels[ch][frame]+=value;
+-   }
++  if(started&&b&&!state.loop&&(position<0||position>=b.length)||started&&consumed>=duration||stop<=startFrame+quantumFrames)ended=true;
++  state.position=position;state.consumed=consumed;return record({ended,samples});
++ }
++ function mix(samples,count,interpretation){const out=internal();for(let ch=0;ch<count;ch++)out.push(new F32(128));for(const source of samples){const channels=source.length;for(let ch=0;ch<count;ch++)for(let frame=0;frame<128;frame++){let value=0;if(interpretation==='discrete'){if(ch<channels)value=source[ch][frame];}else if(channels===1)value=source[0][frame];else if(count===1&&channels===2)value=(source[0][frame]+source[1][frame])*.5;else if(ch<channels)value=source[ch][frame];out[ch][frame]+=value;}}return out;}
++ function graphQuantum(context,state,sourceOutputs,start){
++  const cache=new Map(sourceOutputs),visiting=new Set(),stack=internal();stack.push(record({node:state.destination,done:false}));let allocated=0;
++  while(stack.length){const entry=stack.pop(),node=entry.node;if(cache.has(node))continue;const ns=nodes.get(node);
++   if(!entry.done){if(visiting.has(node))continue;visiting.add(node);stack.push(record({node,done:true}));for(const source of ns.incoming)if(!cache.has(source)&&!visiting.has(source))stack.push(record({node:source,done:false}));if(ns.gain)for(const source of params.get(ns.gain).incoming)if(!cache.has(source)&&!visiting.has(source))stack.push(record({node:source,done:false}));continue;}
++   const inputs=internal();let channels=1;for(const source of ns.incoming){const value=cache.get(source);if(value){inputs.push(value);channels=max(channels,value.length);}}
++   channels=ns.kind==='destination'?state.channels:ns.mode==='explicit'?ns.channelCount:ns.mode==='clamped-max'?min(ns.channelCount,channels):channels;
++   allocated+=channels*128;if(allocated>33554432)throw dom('NotSupportedError');
++   const data=mix(inputs,channels,ns.interpretation);
++   if(ns.kind==='gain'){const ps=params.get(ns.gain),modulations=internal();for(const source of ps.incoming){const value=cache.get(source);if(value)modulations.push(value);}const input=mix(modulations,1,'speakers');for(let frame=0;frame<128;frame++){const time=(ps.automation==='k-rate'?start:start+frame)/state.rate,gain=paramValue(ps,time)+input[0][frame];for(let ch=0;ch<channels;ch++)data[ch][frame]*=gain;}}
++   cache.set(node,data);visiting.delete(node);
+   }
+-  state.frame=frames;
+-  for(const source of finished)schedule(()=>fire(source,'ended'));
+-  schedule(()=>{if(!bridge.active())return;state.state='closed';fire(context,'complete',output);state.resolve(output);schedule(()=>fire(context,'statechange'));});
++  return cache.get(state.destination);
++ }
++ function render(context,state){if(!bridge.active()||state.state!=='running')return;
++  if(!state.output)state.output=makeBuffer(state.length,state.channels,state.rate);const out=buffers.get(state.output),limit=ceil(state.length/128)*128;
++  try{while(state.frame<limit){const suspension=state.suspensions.get(state.frame);if(suspension){state.suspensions.delete(state.frame);state.state='suspended';schedule(()=>fire(context,'statechange'));suspension.resolve();return;}
++   const start=state.frame,sourceOutputs=new Map();for(const source of state.sources){const result=sourceFrames(source,state,128,start),sourceState=nodes.get(source);if(result.ended&&!sourceState.ended){sourceState.ended=true;schedule(()=>fire(source,'ended'));}if(result.samples)sourceOutputs.set(source,result.samples);}
++   const data=graphQuantum(context,state,sourceOutputs,start),count=min(128,state.length-start);if(data)for(let ch=0;ch<state.channels;ch++)for(let frame=0;frame<count;frame++)out.channels[ch][start+frame]=data[ch][frame];state.frame+=128;
++  }}catch(error){state.state='closed';state.reject(error);return;}
++  schedule(()=>{if(!bridge.active())return;state.state='closed';fire(context,'complete',state.output);state.resolve(state.output);schedule(()=>fire(context,'statechange'));});
+  }
+  class OfflineAudioContext extends BaseAudioContext{
+   constructor(options,length,rate){if(!arguments.length)throw error();super(token);let channels;
+    if(arguments.length===1){if(options!=null&&typeof options!=='object'&&typeof options!=='function')throw new TypeError('');options=dictionary(options);const lengthValue=options.length;if(!('length'in options))throw error();length=uint(lengthValue);const count=options.numberOfChannels;channels=count===undefined?1:uint(count);if(!('sampleRate'in options))throw error();const sample=options.sampleRate;rate=fround(number(sample));}
+    else{if(arguments.length<3)throw new TypeError('');channels=uint(options);length=uint(length);rate=fround(number(rate));}
+-   validate(channels,length,rate);const state=record({channels,length,rate,frame:0,state:'suspended',sources:new Set(),handlers:record(),rendered:false});contexts.set(this,state);state.destination=new AudioDestinationNode(this,token);publish(this,'OfflineAudioContext');}
+-  get length(){return brand(contexts,this).length;}
++   validate(channels,length,rate);const state=record({channels,length,rate,frame:0,state:'suspended',sources:new Set(),handlers:record(),relays:record(),suspensions:new Map(),rendered:false});contexts.set(this,state);state.destination=new AudioDestinationNode(this,token);publish(this,'OfflineAudioContext');}
++  get length(){const state=brand(contexts,this);if(state.realtime)throw new TypeError('Illegal invocation');return state.length;}
+   get oncomplete(){return brand(contexts,this).handlers.complete??null;}
+   set oncomplete(value){handler(this,brand(contexts,this),'complete',value);}
+-  startRendering(){const state=brand(contexts,this);if(state.rendered||!bridge.active())return apply(promiseReject,Promise,[dom('InvalidStateError')]);state.rendered=true;state.state='running';const promise=new Promise(resolve=>{state.resolve=resolve;});schedule(()=>fire(this,'statechange'));schedule(()=>render(this,state));return promise;}
+-  suspend(){brand(contexts,this);return apply(promiseReject,Promise,[dom('NotSupportedError')]);}
+-  resume(){brand(contexts,this);return apply(promiseReject,Promise,[dom('NotSupportedError')]);}
+- }
+- for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
+-  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
++  startRendering(){const state=contexts.get(this);if(!state||state.realtime)return apply(promiseReject,Promise,[error()]);if(state.rendered||!bridge.active())return apply(promiseReject,Promise,[dom('InvalidStateError')]);state.rendered=true;state.state='running';const promise=new Promise((resolve,reject)=>{state.resolve=resolve;state.reject=reject;});schedule(()=>fire(this,'statechange'));schedule(()=>render(this,state));return promise;}
++  suspend(when){const state=brand(contexts,this);let time;try{time=restricted(when);}catch(error){return apply(promiseReject,Promise,[error]);}const frame=ceil(time*state.rate/128)*128;if(time<0||frame<state.frame||time>=state.length/state.rate||state.state==='closed'||state.suspensions.has(frame))return apply(promiseReject,Promise,[dom('InvalidStateError')]);return new Promise(resolve=>state.suspensions.set(frame,record({resolve})));}
++  resume(){const state=brand(contexts,this);if(!state.rendered||state.state==='closed')return apply(promiseReject,Promise,[dom('InvalidStateError')]);if(state.state==='suspended'){state.state='running';schedule(()=>fire(this,'statechange'));schedule(()=>render(this,state));}return new Promise(resolve=>resolve());}
++ }
++ for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioContext,GainNode,ConstantSourceNode,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
++  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioContext:0,GainNode:1,ConstantSourceNode:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
+   const constructor=getDescriptor(Constructor.prototype,'constructor');delete Constructor.prototype.constructor;
+   for(const key of keys(Constructor.prototype)){const descriptor=getDescriptor(Constructor.prototype,key);define(Constructor.prototype,key,{...descriptor,enumerable:true});}
+   define(Constructor.prototype,'constructor',constructor);define(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});define(g,name,{value:Constructor,writable:true,configurable:true,enumerable:false});
+@@ -184,11 +218,11 @@
+ }
+ export function installAudioCore(page,window){
+  if(installed.has(window))return installed.get(window);
+- for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
++ for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioContext','GainNode','ConstantSourceNode','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
+  const signal=page.documentAbort?.signal,timers=new Set(),invoke=createInvocationTrampoline(implForWrapper(window)._globalObject),deadline={timeout:Math.min(page.timeout??2000,2000),displayErrors:false};let disposed=false;
+  const active=()=>!disposed&&!page.closed&&!signal?.aborted&&!!window.document;
+- const bridge={shared,Array,Set,token:Symbol('audio-construction'),record:properties=>Object.assign(Object.create(null),properties),isFloat32:types.isFloat32Array,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
+-  schedule(callback){if(!active())return;const id=hostSetTimeout(()=>{timers.delete(id);if(active()){try{invoke.invoke(callback,window,[],deadline);}catch(error){if(active())reportException(window,error);}}},0);timers.add(id);},
++ const bridge={shared,Array,Map,Set,now:hostNow,token:Symbol('audio-construction'),record:properties=>Object.assign(Object.create(null),properties),isFloat32:types.isFloat32Array,isArray:Array.isArray,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
++  schedule(callback,delay=0){if(!active())return;const id=hostSetTimeout(()=>{timers.delete(id);if(active()){try{invoke.invoke(callback,window,[],deadline);}catch(error){if(active())reportException(window,error);}}},delay);timers.add(id);},
+   event:(target,type)=>wrapperForImpl(createAnEvent(type,implForWrapper(target)._globalObject)),
+   dispatch:(target,event)=>implForWrapper(target)._dispatch(implForWrapper(event)),
+  };
+--- /dev/null
++++ b/test/audio-graph.test.js
+@@ -0,0 +1,26 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(action){const browser=new Browser({timeout:3000}),page=browser.createPage();try{await page.navigate('data:text/html,<body>Audio graph');await action({page,w:page.dom.window});}finally{browser.close();}}
++test('genuine gain/constant graphs and real AudioContext clock match measured Native controls',()=>fixture(async({page})=>{
++ const expression=await readFile(new URL('../docs/reference/audio-graph/audio-graph-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-graph/audio-graph-native.json',import.meta.url),'utf8')).observations;
++ const actual=plain(await page.evaluate(expression));
++ const excluded=new Set(['interfaces','oscDefault','convolverDefault']);
++ assert.deepEqual(actual.filter(row=>!excluded.has(row.name)),expected.filter(row=>!excluded.has(row.name)));
++}));
++test('AudioParam timelines, private graph modulation and offline suspension match actual Native samples',()=>fixture(async({page})=>{
++ const expression=await readFile(new URL('../docs/reference/audio-graph/audio-automation-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-graph/audio-automation-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(plain(await page.evaluate(expression)),expected);
++}));
++test('Audio concrete private brands, real clock-only Native behavior and suspended buffer ownership',()=>fixture(async({page})=>{
++ const expression=await readFile(new URL('../docs/reference/audio-graph/audio-ownership-v2-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-graph/audio-ownership-v2-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(plain(await page.evaluate(expression)),expected);
++}));
++test('Graph processing handles long chains and actual curve/ramp cancellation without changing prior samples',()=>fixture(async({page})=>{
++ const expression=await readFile(new URL('../docs/reference/audio-graph/audio-graph-extra-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/audio-graph/audio-graph-extra-native.json',import.meta.url),'utf8')).observations;
++ const actual=plain(await page.evaluate(expression)),excluded=new Set(['constantOffsetInput','longChain']);assert.deepEqual(actual.filter(row=>!excluded.has(row.name)),expected.filter(row=>!excluded.has(row.name)));
++ // This measured Native long-chain mismatch is explicit: retain genuine sample math.
++ assert.deepEqual(expected.find(row=>row.name==='longChain').value,[128,0,0,false]);assert.deepEqual(actual.find(row=>row.name==='longChain').value,[128,.5,.5,false]);
++}));
+--- /dev/null
++++ b/docs/reference/audio-graph/README.md
+@@ -0,0 +1,54 @@
++Audio gain/constant/clock/suspension slice
++
++This bounded extension adds genuine AudioContext, GainNode and
++ConstantSourceNode public values to the existing private audio core. All inherit
++the actual selected-VM EventTarget/AudioNode hierarchy and use Host-private
++records. No authored object properties or implementation-symbol copies supply
++node/context/parameter brands. The existing live AudioBuffer channel arrays and
++buffer-source sample renderer remain in use.
++
++Offline graphs process actual samples in128-frame quanta. Iterative dependency
++traversal mixes real inputs, applies gain and additive gain-parameter modulation,
++and evaluates scheduled a-rate/k-rate parameter math. A visiting dependency
++contributes no back-edge input; unrelated genuine inputs remain audible.
++Suspension stops actual processing at the calibrated quantum, retains source
++positions/output storage, and resumes with live buffer/parameter changes. Curves,
++linear/exponential ramps, targets, cancellation and tested hold operations produce
++actual float samples. Constructor/property conversion and concrete interface
++brands use the observed VM exceptions.
++
++AudioContext uses a captured monotonic clock quantized to128frames, freezes while
++suspended/closed, reports f32(256/sampleRate) latency and dispatches actual trusted
++state events. A Native probe waiting for a real-time source ended event timed out.
++A separate bounded30ms control observed an advancing clock and no ended event.
++This slice implements that measured clock/state behavior and introduces no
++claimed real-time rendering or decoded output.
++
++The raw Native executable SHA256 is
++9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f.
++All inputs, raw tables, executable/input hashes and candidate tables are retained
++in the proposal. The final focused run passed21tests: all17 existing audio core
++checks plus four new tests. The new tests assert52 matching Native rows and
++explicitly retain the following differences; they do not claim full parity.
++
++Known bounds and measured differences:
++
++- Native's2,000-unit-gain chain outputs zero; the independent iterative graph
++  computes0.5. Tests explicitly assert both retained Native zero and actual
++  candidate0.5, with no fabricated silence. A modest independent Native probe
++  found chains8/64/128 output0.5, chains256/512/1024 output zero, while parallel
++  64/256/1024 branches produce32/128/512. The exact depth policy remains open.
++- Connections to source offset/playback/detune parameters reject explicitly;
++  additive modulation is currently supported for GainNode.gain only.
++- Oscillator/PeriodicWave, compressor, convolver and decoding remain absent.
++  The three complete upstream fixtures are not claimed to pass. Their exact
++  source hashes are recorded in the proposal manifest.
++- Channel routing is calibrated for mono/stereo and the existing core behavior;
++  wider speaker layouts, all automation combinations, latencyHint options and
++  additional real-time device behavior remain uncalibrated.
++
++The first graph regression run exposed lost ended-event dispatch while refactoring
++rendering; the corrected final run preserves the exact existing40-row Native
++buffer renderer table and all existing event ordering/privacy tests. All failed
++runs and the Native await timeout remain in the proposal. No full/broad,
++other-runtime or PureScript suite ran.
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-automation-native-expression.js
+@@ -0,0 +1,12 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++async function render(length,configure){const c=new OfflineAudioContext(1,length,8192),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);configure(g.gain,c,s);s.start();const b=await c.startRendering();return{data:Array.from(b.getChannelData(0)),value:g.gain.value}}
++await run('fullAutomation',async()=>{const out=await render(1024,(p,c)=>{p.setValueAtTime(0,0);p.linearRampToValueAtTime(1,256/c.sampleRate);p.setValueAtTime(2,512/c.sampleRate);p.exponentialRampToValueAtTime(8,768/c.sampleRate);p.setValueCurveAtTime([8,0],768/c.sampleRate,128/c.sampleRate)});return{data:[0,128,300,512,640,768,832,1000].map(i=>out.data[i]),value:out.value}});
++await run('curveThenRamp',async()=>{const out=await render(1024,(p,c)=>{p.setValueCurveAtTime([0,4,4],128/c.sampleRate,256/c.sampleRate);p.linearRampToValueAtTime(8,640/c.sampleRate)});return[128,192,256,320,384,512,700].map(i=>out.data[i])});
++await run('targetCancel',async()=>{const out=await render(1024,(p,c)=>{p.setValueAtTime(0,0);p.setTargetAtTime(1,0,256/c.sampleRate);p.cancelAndHoldAtTime(512/c.sampleRate);p.setValueAtTime(5,768/c.sampleRate);p.cancelScheduledValues(768/c.sampleRate)});return[0,256,512,1000].map(i=>out.data[i])});
++await run('kRateGain',async()=>{const out=await render(300,(p,c)=>{p.automationRate='k-rate';p.setValueAtTime(0,0);p.linearRampToValueAtTime(1,256/c.sampleRate)});return[0,127,128,255,256,299].map(i=>out.data[i])});
++for(const[name,fn]of[['insideCurve',p=>{p.setValueCurveAtTime([0,1],0,1);p.setValueAtTime(3,.5)}],['overlapCurve',p=>{p.setValueCurveAtTime([0,1],0,1);p.setValueCurveAtTime([0,1],.5,1)}],['curveOverSet',p=>{p.setValueAtTime(4,.5);p.setValueCurveAtTime([0,1],0,1)}],['curveSingleton',p=>p.setValueCurveAtTime([1],0,1)],['float64Curve',p=>{p.setValueCurveAtTime(new Float64Array([0,1]),0,1);return true}]])await run(name,()=>fn(new OfflineAudioContext(1,128,8000).createGain().gain));
++await run('gainParamDisconnect',()=>{const c=new OfflineAudioContext(1,128,8000),s=c.createConstantSource(),g=c.createGain();const ret=s.connect(g.gain,0,999);s.disconnect(g.gain);let name;try{s.disconnect(g.gain)}catch(e){name=e.name}return{ret:ret===undefined,name}});
++await run('stateRepeat',async()=>{const c=new AudioContext(),out=[];await c.suspend();await c.suspend();out.push(c.state);await c.resume();await c.resume();out.push(c.state);await c.close();return out});
++await run('resumeBeforeRender',()=>new OfflineAudioContext(1,128,8000).resume());
++await run('suspendErrors',async()=>{const c=new OfflineAudioContext(1,1024,8000),out=[];const pending=c.suspend(200/8000);for(const when of[-1,2000/8000,256/8000])try{await c.suspend(when)}catch(e){out.push([e.name,e.message])}pending.then(()=>c.resume());await c.startRendering();return out});
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-automation-native.json
+@@ -0,0 +1,135 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "87f01b1a6f0b99df7dcfc7a3eed6f840e4cdd7359bdfe390362e6af2ae58663e",
++  "observations": [
++    {
++      "name": "fullAutomation",
++      "value": {
++        "data": [
++          0,
++          0.5,
++          1,
++          2,
++          4,
++          8,
++          4,
++          0
++        ],
++        "value": 0
++      }
++    },
++    {
++      "name": "curveThenRamp",
++      "value": [
++        0,
++        2,
++        4,
++        4,
++        4,
++        6,
++        8
++      ]
++    },
++    {
++      "name": "targetCancel",
++      "value": [
++        0,
++        0.6321205496788025,
++        0.8646647334098816,
++        0.8646647334098816
++      ]
++    },
++    {
++      "name": "kRateGain",
++      "value": [
++        0,
++        0,
++        0.5,
++        0.5,
++        1,
++        1
++      ]
++    },
++    {
++      "name": "insideCurve",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "overlapCurve",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "curveOverSet",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "curveSingleton",
++      "error": {
++        "name": "InvalidStateError",
++        "message": "The object is in an invalid state",
++        "realm": false
++      }
++    },
++    {
++      "name": "float64Curve",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "gainParamDisconnect",
++      "value": {
++        "ret": true,
++        "name": "InvalidAccessError"
++      }
++    },
++    {
++      "name": "stateRepeat",
++      "value": [
++        "suspended",
++        "running"
++      ]
++    },
++    {
++      "name": "resumeBeforeRender",
++      "error": {
++        "name": "InvalidStateError",
++        "message": "The object is in an invalid state",
++        "realm": false
++      }
++    },
++    {
++      "name": "suspendErrors",
++      "value": [
++        [
++          "InvalidStateError",
++          "The object is in an invalid state"
++        ],
++        [
++          "InvalidStateError",
++          "The object is in an invalid state"
++        ],
++        [
++          "InvalidStateError",
++          "The object is in an invalid state"
++        ]
++      ]
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-depth-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[];for(const count of[8,64,128,256,512,1024]){const c=new OfflineAudioContext(1,128,8000),s=new ConstantSourceNode(c,{offset:.5});let last=s;for(let i=0;i<count;i++){const g=c.createGain();last.connect(g);last=g}last.connect(c.destination);s.start();const data=(await c.startRendering()).getChannelData(0);rows.push({kind:'chain',count,first:data[0],last:data[127]})}for(const count of[64,256,1024]){const c=new OfflineAudioContext(1,128,8000),s=new ConstantSourceNode(c,{offset:.5});for(let i=0;i<count;i++){const g=c.createGain();s.connect(g).connect(c.destination)}s.start();const data=(await c.startRendering()).getChannelData(0);rows.push({kind:'parallel',count,first:data[0],last:data[127]})}return rows})()
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-depth-native.json
+@@ -0,0 +1,62 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "37544a04a8a69bf14e9a4b2eb2ecaa96c05766313005c7c6da2a1da56e262edf",
++  "observations": [
++    {
++      "kind": "chain",
++      "count": 8,
++      "first": 0.5,
++      "last": 0.5
++    },
++    {
++      "kind": "chain",
++      "count": 64,
++      "first": 0.5,
++      "last": 0.5
++    },
++    {
++      "kind": "chain",
++      "count": 128,
++      "first": 0.5,
++      "last": 0.5
++    },
++    {
++      "kind": "chain",
++      "count": 256,
++      "first": 0,
++      "last": 0
++    },
++    {
++      "kind": "chain",
++      "count": 512,
++      "first": 0,
++      "last": 0
++    },
++    {
++      "kind": "chain",
++      "count": 1024,
++      "first": 0,
++      "last": 0
++    },
++    {
++      "kind": "parallel",
++      "count": 64,
++      "first": 32,
++      "last": 32
++    },
++    {
++      "kind": "parallel",
++      "count": 256,
++      "first": 128,
++      "last": 128
++    },
++    {
++      "kind": "parallel",
++      "count": 1024,
++      "first": 512,
++      "last": 512
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-graph-extra-native-expression.js
+@@ -0,0 +1,8 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('longChain',async()=>{const c=new OfflineAudioContext(1,128,8000),s=new ConstantSourceNode(c,{offset:.5});let last=s;for(let i=0;i<2000;i++){const g=c.createGain();last.connect(g);last=g}last.connect(c.destination);s.start();const d=(await c.startRendering()).getChannelData(0);return[d.length,d[0],d[127],d.some(isNaN)]});
++await run('gainStereoMono',async()=>{const c=new OfflineAudioContext(1,4,8000),s=c.createBufferSource(),b=c.createBuffer(2,4,8000),g=new GainNode(c,{gain:.5,channelCount:1,channelCountMode:'explicit'});b.getChannelData(0).fill(2);b.getChannelData(1).fill(6);s.buffer=b;s.connect(g).connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('curveHold',async()=>{const c=new OfflineAudioContext(1,8,8000),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);g.gain.setValueCurveAtTime([0,1],0,8/8000);g.gain.cancelAndHoldAtTime(4/8000);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('linearHold',async()=>{const c=new OfflineAudioContext(1,8,8000),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);g.gain.setValueAtTime(0,0);g.gain.linearRampToValueAtTime(1,8/8000);g.gain.cancelAndHoldAtTime(4/8000);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('curveIterator',()=>{const c=new OfflineAudioContext(1,8,8000),p=c.createGain().gain,values=[0,1];values[Symbol.iterator]=()=>{throw Error('authored')};p.setValueCurveAtTime(values,0,1);return true});
++await run('constantOffsetInput',()=>{const c=new OfflineAudioContext(1,128,8000),s=c.createConstantSource(),g=c.createGain();return g.connect(s.offset)===undefined});
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-graph-extra-native.json
+@@ -0,0 +1,60 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "a8ed2b87e80c919a0baeff6f0de508154be5e07d93244aaaca9518ec1dc9323c",
++  "observations": [
++    {
++      "name": "longChain",
++      "value": [
++        128,
++        0,
++        0,
++        false
++      ]
++    },
++    {
++      "name": "gainStereoMono",
++      "value": [
++        2,
++        2,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "curveHold",
++      "value": [
++        0,
++        0.125,
++        0.25,
++        0.375,
++        0.5,
++        0.5,
++        0.5,
++        0.5
++      ]
++    },
++    {
++      "name": "linearHold",
++      "value": [
++        0,
++        0.125,
++        0.25,
++        0.375,
++        0.5,
++        0.5,
++        0.5,
++        0.5
++      ]
++    },
++    {
++      "name": "curveIterator",
++      "value": true
++    },
++    {
++      "name": "constantOffsetInput",
++      "value": true
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-graph-native-expression.js
+@@ -0,0 +1,23 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('interfaces',()=>({context:Reflect.ownKeys(AudioContext.prototype).map(String),base:Reflect.ownKeys(BaseAudioContext.prototype).map(String),gain:Reflect.ownKeys(GainNode.prototype).map(String),constant:Reflect.ownKeys(ConstantSourceNode.prototype).map(String),oscillator:Reflect.ownKeys(OscillatorNode.prototype).map(String),convolver:Reflect.ownKeys(ConvolverNode.prototype).map(String)}));
++await run('contextDefaults',async()=>{const c=new AudioContext(),d=c.destination,v={state:c.state,rate:c.sampleRate,time:c.currentTime,base:c.baseLatency,output:c.outputLatency,destination:d.maxChannelCount,inputs:d.numberOfInputs,outputs:d.numberOfOutputs};await c.close();return v});
++for(const value of[3000,8000,44100,768000,2999,768001,NaN])await run('rate-'+String(value),async()=>{const c=new AudioContext({sampleRate:value});const out={rate:c.sampleRate,base:c.baseLatency};await c.close();return out});
++await run('contextClock',async()=>{const c=new AudioContext(),out=[],events=[];c.onstatechange=e=>events.push([c.state,e.isTrusted,e.target===c]);const a=c.currentTime;await new Promise(r=>setTimeout(r,20));const b=c.currentTime;await c.suspend();const s=c.currentTime;await new Promise(r=>setTimeout(r,10));const still=c.currentTime;await c.resume();await new Promise(r=>setTimeout(r,10));await c.close();await new Promise(r=>setTimeout(r,5));for(const m of['resume','suspend','close'])try{await c[m]()}catch(e){out.push([e.name,e.message,e instanceof DOMException])}return{advanced:b>a,quantum:Math.round(b*c.sampleRate)%128,frozen:s===still,state:c.state,events,errors:out}});
++await run('gainDefault',()=>{const c=new OfflineAudioContext(2,128,8000),g=c.createGain();return{node:g instanceof AudioNode,ctx:g.context===c,inputs:g.numberOfInputs,outputs:g.numberOfOutputs,channels:g.channelCount,mode:g.channelCountMode,gain:g.gain.value,rate:g.gain.automationRate,min:g.gain.minValue,max:g.gain.maxValue}});
++await run('constantDefault',()=>{const c=new OfflineAudioContext(1,128,8000),s=c.createConstantSource();return{source:s instanceof AudioScheduledSourceNode,offset:s.offset.value,rate:s.offset.automationRate,min:s.offset.minValue,max:s.offset.maxValue,inputs:s.numberOfInputs}});
++await run('oscDefault',()=>{const c=new OfflineAudioContext(1,128,8000),s=c.createOscillator();return{type:s.type,f:s.frequency.value,min:s.frequency.minValue,max:s.frequency.maxValue,detune:s.detune.value,rate:s.frequency.automationRate}});
++await run('gainRender',async()=>{const c=new OfflineAudioContext(2,8,8000),s=new ConstantSourceNode(c,{offset:2}),g=new GainNode(c,{gain:0.25});s.connect(g).connect(c.destination);s.start();const b=await c.startRendering();return Array.from({length:2},(_,i)=>Array.from(b.getChannelData(i)))});
++await run('bufferGain',async()=>{const c=new OfflineAudioContext(1,5,8000),b=c.createBuffer(1,5,8000),s=c.createBufferSource(),g=c.createGain();b.getChannelData(0).set([1,2,-1,0,4]);s.buffer=b;g.gain.value=.5;s.connect(g).connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('paramInput',async()=>{const c=new OfflineAudioContext(1,4,8000),s=new ConstantSourceNode(c,{offset:2}),m=new ConstantSourceNode(c,{offset:.5}),g=new GainNode(c,{gain:1});const ret=m.connect(g.gain);s.connect(g).connect(c.destination);s.start();m.start();return{ret:ret===undefined,data:Array.from((await c.startRendering()).getChannelData(0))}});
++await run('parallelGain',async()=>{const c=new OfflineAudioContext(1,4,8000),s=new ConstantSourceNode(c,{offset:2}),a=new GainNode(c,{gain:.5}),b=new GainNode(c,{gain:.25});s.connect(a).connect(c.destination);s.connect(b).connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('cycle',async()=>{const c=new OfflineAudioContext(1,4,8000),s=new ConstantSourceNode(c,{offset:.5}),g=new GainNode(c,{gain:1});s.connect(g);g.connect(g.gain);g.connect(c.destination);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('constantTiming',async()=>{const c=new OfflineAudioContext(1,8,8000),s=new ConstantSourceNode(c,{offset:2});s.connect(c.destination);s.start(2/8000);s.stop(6/8000);return Array.from((await c.startRendering()).getChannelData(0))});
++await run('gainRateChange',()=>{const c=new OfflineAudioContext(1,128,8000),p=c.createGain().gain;p.automationRate='k-rate';return p.automationRate});
++await run('constantRateChange',()=>{const c=new OfflineAudioContext(1,128,8000),p=c.createConstantSource().offset;p.automationRate='k-rate';return p.automationRate});
++await run('curveArray',async()=>{const c=new OfflineAudioContext(1,5,8000),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);g.gain.setValueCurveAtTime([0,1],0,4/8000);s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++await run('gainAutomation',async()=>{const c=new OfflineAudioContext(1,8,8000),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);g.gain.setValueAtTime(0,0);g.gain.linearRampToValueAtTime(1,4/8000);s.start();return{data:Array.from((await c.startRendering()).getChannelData(0)),value:g.gain.value}});
++await run('options',()=>{const c=new OfflineAudioContext(2,128,8000),g=new GainNode(c,{gain:.25,channelCount:1,channelCountMode:'explicit',channelInterpretation:'discrete'}),s=new ConstantSourceNode(c,{offset:4});return{gain:g.gain.value,channels:g.channelCount,mode:g.channelCountMode,interpret:g.channelInterpretation,offset:s.offset.value}});
++await run('destinationLimit',async()=>{const c=new AudioContext();try{c.destination.channelCount=3}finally{await c.close()}});
++await run('offlineSuspend',async()=>{const c=new OfflineAudioContext(1,512,8000),s=c.createConstantSource(),out=[];s.connect(c.destination);s.start();const suspend=c.suspend(100/8000).then(async()=>{out.push([c.currentTime*8000,c.state]);s.offset.value=.5;await c.resume()});const b=await c.startRendering();await suspend;return{out,data:[b.getChannelData(0)[127],b.getChannelData(0)[128],b.getChannelData(0)[511]],time:c.currentTime*8000}});
++for(const [name,fn]of[['gainFake',()=>Object.getOwnPropertyDescriptor(GainNode.prototype,'gain').get.call(Object.create(GainNode.prototype))],['contextFake',()=>AudioContext.prototype.resume.call(Object.create(AudioContext.prototype))],['convolverDefault',()=>{const c=new OfflineAudioContext(2,128,8000),n=c.createConvolver();return{buffer:n.buffer,normalize:n.normalize,mode:n.channelCountMode}}]])await run(name,fn);
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-graph-native.json
+@@ -0,0 +1,385 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "f97cec93feb688a11c148362cbe17bfecdf310d4baf8f92e34aa890dd10bfe8e",
++  "observations": [
++    {
++      "name": "interfaces",
++      "value": {
++        "context": [
++          "baseLatency",
++          "outputLatency",
++          "resume",
++          "suspend",
++          "close",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "base": [
++          "destination",
++          "sampleRate",
++          "currentTime",
++          "state",
++          "onstatechange",
++          "createBuffer",
++          "createBufferSource",
++          "createConstantSource",
++          "createConvolver",
++          "decodeAudioData",
++          "createDynamicsCompressor",
++          "createGain",
++          "createOscillator",
++          "createPeriodicWave",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "gain": [
++          "gain",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "constant": [
++          "offset",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "oscillator": [
++          "type",
++          "frequency",
++          "detune",
++          "setPeriodicWave",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "convolver": [
++          "buffer",
++          "normalize",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "contextDefaults",
++      "value": {
++        "state": "running",
++        "rate": 48000,
++        "time": 0,
++        "base": 0.005333333276212215,
++        "output": 0,
++        "destination": 2,
++        "inputs": 1,
++        "outputs": 1
++      }
++    },
++    {
++      "name": "rate-3000",
++      "value": {
++        "rate": 3000,
++        "base": 0.08533333241939545
++      }
++    },
++    {
++      "name": "rate-8000",
++      "value": {
++        "rate": 8000,
++        "base": 0.03200000151991844
++      }
++    },
++    {
++      "name": "rate-44100",
++      "value": {
++        "rate": 44100,
++        "base": 0.00580498855561018
++      }
++    },
++    {
++      "name": "rate-768000",
++      "value": {
++        "rate": 768000,
++        "base": 0.00033333332976326346
++      }
++    },
++    {
++      "name": "rate-2999",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "rate-768001",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "rate-NaN",
++      "error": {
++        "name": "NotSupportedError",
++        "message": "The operation is not supported",
++        "realm": false
++      }
++    },
++    {
++      "name": "contextClock",
++      "value": {
++        "advanced": true,
++        "quantum": 0,
++        "frozen": true,
++        "state": "closed",
++        "events": [
++          [
++            "running",
++            true,
++            true
++          ],
++          [
++            "suspended",
++            true,
++            true
++          ],
++          [
++            "running",
++            true,
++            true
++          ],
++          [
++            "closed",
++            true,
++            true
++          ]
++        ],
++        "errors": [
++          [
++            "InvalidStateError",
++            "The object is in an invalid state",
++            true
++          ],
++          [
++            "InvalidStateError",
++            "The object is in an invalid state",
++            true
++          ],
++          [
++            "InvalidStateError",
++            "The object is in an invalid state",
++            true
++          ]
++        ]
++      }
++    },
++    {
++      "name": "gainDefault",
++      "value": {
++        "node": true,
++        "ctx": true,
++        "inputs": 1,
++        "outputs": 1,
++        "channels": 2,
++        "mode": "max",
++        "gain": 1,
++        "rate": "a-rate",
++        "min": -3.4028234663852886e+38,
++        "max": 3.4028234663852886e+38
++      }
++    },
++    {
++      "name": "constantDefault",
++      "value": {
++        "source": true,
++        "offset": 1,
++        "rate": "a-rate",
++        "min": -3.4028234663852886e+38,
++        "max": 3.4028234663852886e+38,
++        "inputs": 0
++      }
++    },
++    {
++      "name": "oscDefault",
++      "value": {
++        "type": "sine",
++        "f": 440,
++        "min": -4000,
++        "max": 4000,
++        "detune": 0,
++        "rate": "a-rate"
++      }
++    },
++    {
++      "name": "gainRender",
++      "value": [
++        [
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5
++        ],
++        [
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5,
++          0.5
++        ]
++      ]
++    },
++    {
++      "name": "bufferGain",
++      "value": [
++        0.5,
++        1,
++        -0.5,
++        0,
++        2
++      ]
++    },
++    {
++      "name": "paramInput",
++      "value": {
++        "ret": true,
++        "data": [
++          3,
++          3,
++          3,
++          3
++        ]
++      }
++    },
++    {
++      "name": "parallelGain",
++      "value": [
++        1.5,
++        1.5,
++        1.5,
++        1.5
++      ]
++    },
++    {
++      "name": "cycle",
++      "value": [
++        0.5,
++        0.5,
++        0.5,
++        0.5
++      ]
++    },
++    {
++      "name": "constantTiming",
++      "value": [
++        0,
++        0,
++        2,
++        2,
++        2,
++        2,
++        0,
++        0
++      ]
++    },
++    {
++      "name": "gainRateChange",
++      "value": "k-rate"
++    },
++    {
++      "name": "constantRateChange",
++      "value": "k-rate"
++    },
++    {
++      "name": "curveArray",
++      "value": [
++        0,
++        0.25,
++        0.5,
++        0.75,
++        1
++      ]
++    },
++    {
++      "name": "gainAutomation",
++      "value": {
++        "data": [
++          0,
++          0.25,
++          0.5,
++          0.75,
++          1,
++          1,
++          1,
++          1
++        ],
++        "value": 1
++      }
++    },
++    {
++      "name": "options",
++      "value": {
++        "gain": 0.25,
++        "channels": 1,
++        "mode": "explicit",
++        "interpret": "discrete",
++        "offset": 4
++      }
++    },
++    {
++      "name": "destinationLimit",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount",
++        "realm": false
++      }
++    },
++    {
++      "name": "offlineSuspend",
++      "value": {
++        "out": [
++          [
++            128,
++            "suspended"
++          ]
++        ],
++        "data": [
++          1,
++          0.5,
++          0.5
++        ],
++        "time": 512
++      }
++    },
++    {
++      "name": "gainFake",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "contextFake",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "convolverDefault",
++      "value": {
++        "buffer": null,
++        "normalize": true,
++        "mode": "clamped-max"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-ownership-v2-native-expression.js
+@@ -0,0 +1,11 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('ctxGetterOffline',()=>Object.getOwnPropertyDescriptor(AudioContext.prototype,'baseLatency').get.call(new OfflineAudioContext(1,128,8000)));
++await run('ctxResumeOffline',()=>AudioContext.prototype.resume.call(new OfflineAudioContext(1,128,8000)));
++await run('offlineStartCtx',async()=>{const c=new AudioContext();try{return await OfflineAudioContext.prototype.startRendering.call(c)}finally{await c.close()}});
++await run('offlineLengthCtx',async()=>{const c=new AudioContext();try{return Object.getOwnPropertyDescriptor(OfflineAudioContext.prototype,'length').get.call(c)}finally{await c.close()}});
++await run('constantOnGain',()=>Object.getOwnPropertyDescriptor(ConstantSourceNode.prototype,'offset').get.call(new OfflineAudioContext(1,128,8000).createGain()));
++await run('sourceOnGain',()=>AudioScheduledSourceNode.prototype.start.call(new OfflineAudioContext(1,128,8000).createGain()));
++await run('liveEnded',async()=>{const c=new AudioContext({sampleRate:8000}),s=c.createConstantSource();let out;const ended=new Promise(r=>s.onended=e=>{out={trusted:e.isTrusted,target:e.target===s,state:c.state,time:c.currentTime>0};r()});s.connect(c.destination);s.start();s.stop(16/8000);await new Promise(r=>setTimeout(r,30));const result={fired:out!==undefined,clock:c.currentTime>0};await c.close();return result});
++await run('bufferSuspendOwnership',async()=>{const c=new OfflineAudioContext(1,512,8000),s=c.createBufferSource(),b=c.createBuffer(1,512,8000);b.getChannelData(0).fill(1);s.buffer=b;s.connect(c.destination);s.start();c.suspend(129/8000).then(()=>{b.getChannelData(0).fill(2);c.resume()});const r=await c.startRendering();return[0,127,255,256,511].map(i=>r.getChannelData(0)[i])});
++await run('gainPrivate',async()=>{const c=new OfflineAudioContext(1,4,8000),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);const param=g.gain;s.offset.value=2;param.value=.25;for(const[k,v]of[[s,'offset'],[g,'gain']])Object.defineProperty(k,v,{get(){throw Error('author')}});Object.defineProperty(param,'value',{get(){throw Error('author')}});s.start();return Array.from((await c.startRendering()).getChannelData(0))});
++return rows})()
+--- /dev/null
++++ b/docs/reference/audio-graph/audio-ownership-v2-native.json
+@@ -0,0 +1,82 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "d38629c706bf5bbe63dfc05a88a65765950635854bbe5fde48210bdd5667801d",
++  "observations": [
++    {
++      "name": "ctxGetterOffline",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "ctxResumeOffline",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "offlineStartCtx",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument",
++        "realm": true
++      }
++    },
++    {
++      "name": "offlineLengthCtx",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "constantOnGain",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "sourceOnGain",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation",
++        "realm": true
++      }
++    },
++    {
++      "name": "liveEnded",
++      "value": {
++        "fired": false,
++        "clock": true
++      }
++    },
++    {
++      "name": "bufferSuspendOwnership",
++      "value": [
++        1,
++        1,
++        1,
++        2,
++        2
++      ]
++    },
++    {
++      "name": "gainPrivate",
++      "value": [
++        0.5,
++        0.5,
++        0.5,
++        0.5
++      ]
++    }
++  ]
++}

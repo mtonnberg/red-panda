@@ -1,6 +1,7 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url);
-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+
 const INSTALLED=new WeakMap(),LISTS=new WeakMap(),EVENTS=new WeakMap(),SCREENS=new WeakMap();
 
 function queries(text){let depth=0,start=0;const result=[];for(let i=0;i<text.length;i++){if(text[i]==='(')depth++;else if(text[i]===')')depth--;else if(text[i]===','&&depth===0){result.push(text.slice(start,i));start=i+1}if(depth<0)return[]}if(depth)return[];result.push(text.slice(start));return result}

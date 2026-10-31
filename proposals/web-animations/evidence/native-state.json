@@ -1,0 +1,635 @@
+{
+  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
+  "name": "state",
+  "source": "(async()=>{\n const rows=[],norm=x=>x===undefined?'__undefined__':typeof x==='number'&&!Number.isFinite(x)?String(x):x;\n const wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');\n const snapshot=a=>({state:a.playState,startTime:norm(a.startTime),effect:a.effect===null?'null':typeof a.effect,timeline:a.timeline===null?'null':typeof a.timeline,pending:a.pending});\n const make=()=>{const a=el.animate([{opacity:0},{opacity:1}],{duration:1e9,iterations:Infinity});a.finished.catch(()=>{});return a};\n for(const action of['play','pause','finish','reverse','cancel']){\n  const a=make(),firstReady=a.ready,firstFinished=a.finished,events=[];a.onfinish=e=>events.push(['finish',e.currentTime,e.timelineTime,e.isTrusted,a.playState]);a.oncancel=e=>events.push(['cancel',e.currentTime,e.timelineTime,e.isTrusted,a.playState]);\n  firstReady.then(x=>events.push(['ready',x===a,a.playState]));firstFinished.then(x=>events.push(['resolved',x===a,a.playState]),e=>events.push(['rejected',e.name,e.message,a.playState]));\n  const before=snapshot(a),returned=a[action](),after=snapshot(a),same={ready:firstReady===a.ready,finished:firstFinished===a.finished};a.finished.catch(()=>{});await Promise.resolve();const micro=events.slice();await wait(35);rows.push([action,{before,returned:norm(returned),after,same,micro,events,end:snapshot(a)}]);a.cancel();a.finished.catch(()=>{});\n }\n for(const start of['running','paused','idle','finished'])for(const action of['play','pause','finish','reverse','cancel']){\n  const a=make();if(start==='paused')a.pause();if(start==='idle')a.cancel();if(start==='finished')a.finish();a.finished.catch(()=>{});const r=a.ready,f=a.finished;let returned,error;try{returned=norm(a[action]())}catch(e){error=[e.name,e.message]}a.finished.catch(()=>{});rows.push(['transition:'+start+':'+action,{state:a.playState,returned,error,readySame:r===a.ready,finishedSame:f===a.finished,startTime:norm(a.startTime)}]);a.cancel();a.finished.catch(()=>{});\n }\n {const a=make(),order=[];a.finished.then(()=>order.push('promise'));a.addEventListener('finish',()=>order.push('first-listener'));a.onfinish=()=>order.push('handler');a.addEventListener('finish',()=>order.push('last-listener'));a.finish();order.push('sync');await Promise.resolve();const micro=order.slice();await wait(25);rows.push(['finish-order',{micro,order}]);}\n {const a=make(),events=[];a.addEventListener('finish',()=>events.push('finish'));a.addEventListener('cancel',()=>events.push('cancel'));a.finish();a.cancel();a.finished.catch(()=>{});await wait(25);rows.push(['finish-then-cancel',{events,state:a.playState}]);}\n {const a=make(),events=[];a.addEventListener('finish',()=>events.push('finish'));a.addEventListener('cancel',()=>events.push('cancel'));a.cancel();a.play();a.finished.catch(()=>{});await wait(35);rows.push(['cancel-then-play',{events,state:a.playState}]);}\n {const a=make(),events=[];a.finished.then(()=>events.push('old-promise'),()=>events.push('old-reject'));a.finish();a.play();a.finished.then(()=>events.push('new-promise'),()=>events.push('new-reject'));a.addEventListener('finish',()=>events.push('event'));await wait(35);rows.push(['finish-then-play',{events,state:a.playState}]);}\n {const a=make(),events=[];a.pause();await wait(25);events.push(snapshot(a));a.startTime=33;a.play();await a.finished;events.push(snapshot(a));rows.push(['pause-resume',events]);}\n {const a=make();a.startTime=77;a.pause();const paused=a.startTime;a.finish();const finished=a.startTime;a.cancel();rows.push(['time-mutators',{paused,finished,canceled:a.startTime}]);}\n return rows;\n})()\n",
+  "sourceSHA256": "470c1381e946f5f020c6aab34489ec1a27ed8f3adb14802f67180bf82cddc126",
+  "binary": {
+    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
+  },
+  "args": [
+    "--load-resources",
+    "iframe",
+    "--load-resources",
+    "worker"
+  ],
+  "version": {
+    "protocolVersion": "1.3",
+    "product": "Chrome/124.0.6367.29",
+    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jsVersion": "12.4.254.8"
+  },
+  "result": [
+    [
+      "play",
+      {
+        "before": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "returned": "__undefined__",
+        "after": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "same": {
+          "ready": true,
+          "finished": true
+        },
+        "micro": [
+          [
+            "ready",
+            true,
+            "running"
+          ]
+        ],
+        "events": [
+          [
+            "ready",
+            true,
+            "running"
+          ],
+          [
+            "resolved",
+            true,
+            "finished"
+          ],
+          [
+            "finish",
+            null,
+            null,
+            true,
+            "finished"
+          ],
+          [
+            "cancel",
+            null,
+            null,
+            true,
+            "idle"
+          ]
+        ],
+        "end": {
+          "state": "finished",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        }
+      }
+    ],
+    [
+      "pause",
+      {
+        "before": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "returned": "__undefined__",
+        "after": {
+          "state": "paused",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "same": {
+          "ready": true,
+          "finished": true
+        },
+        "micro": [
+          [
+            "ready",
+            true,
+            "paused"
+          ]
+        ],
+        "events": [
+          [
+            "ready",
+            true,
+            "paused"
+          ],
+          [
+            "rejected",
+            "AbortError",
+            "The operation was aborted",
+            "idle"
+          ],
+          [
+            "cancel",
+            null,
+            null,
+            true,
+            "idle"
+          ]
+        ],
+        "end": {
+          "state": "paused",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        }
+      }
+    ],
+    [
+      "finish",
+      {
+        "before": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "returned": "__undefined__",
+        "after": {
+          "state": "finished",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "same": {
+          "ready": true,
+          "finished": true
+        },
+        "micro": [
+          [
+            "ready",
+            true,
+            "finished"
+          ],
+          [
+            "resolved",
+            true,
+            "finished"
+          ]
+        ],
+        "events": [
+          [
+            "ready",
+            true,
+            "finished"
+          ],
+          [
+            "resolved",
+            true,
+            "finished"
+          ],
+          [
+            "finish",
+            null,
+            null,
+            true,
+            "finished"
+          ],
+          [
+            "cancel",
+            null,
+            null,
+            true,
+            "idle"
+          ]
+        ],
+        "end": {
+          "state": "finished",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        }
+      }
+    ],
+    [
+      "reverse",
+      {
+        "before": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "returned": "__undefined__",
+        "after": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "same": {
+          "ready": true,
+          "finished": true
+        },
+        "micro": [
+          [
+            "ready",
+            true,
+            "running"
+          ]
+        ],
+        "events": [
+          [
+            "ready",
+            true,
+            "running"
+          ],
+          [
+            "resolved",
+            true,
+            "finished"
+          ],
+          [
+            "finish",
+            null,
+            null,
+            true,
+            "finished"
+          ],
+          [
+            "cancel",
+            null,
+            null,
+            true,
+            "idle"
+          ]
+        ],
+        "end": {
+          "state": "finished",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        }
+      }
+    ],
+    [
+      "cancel",
+      {
+        "before": {
+          "state": "running",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "returned": "__undefined__",
+        "after": {
+          "state": "idle",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        "same": {
+          "ready": true,
+          "finished": false
+        },
+        "micro": [
+          [
+            "ready",
+            true,
+            "idle"
+          ],
+          [
+            "rejected",
+            "AbortError",
+            "The operation was aborted",
+            "idle"
+          ]
+        ],
+        "events": [
+          [
+            "ready",
+            true,
+            "idle"
+          ],
+          [
+            "rejected",
+            "AbortError",
+            "The operation was aborted",
+            "idle"
+          ],
+          [
+            "cancel",
+            null,
+            null,
+            true,
+            "idle"
+          ]
+        ],
+        "end": {
+          "state": "idle",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        }
+      }
+    ],
+    [
+      "transition:running:play",
+      {
+        "state": "running",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:running:pause",
+      {
+        "state": "paused",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:running:finish",
+      {
+        "state": "finished",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:running:reverse",
+      {
+        "state": "running",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:running:cancel",
+      {
+        "state": "idle",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": false,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:paused:play",
+      {
+        "state": "running",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:paused:pause",
+      {
+        "state": "paused",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:paused:finish",
+      {
+        "state": "finished",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:paused:reverse",
+      {
+        "state": "paused",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:paused:cancel",
+      {
+        "state": "idle",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": false,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:idle:play",
+      {
+        "state": "running",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:idle:pause",
+      {
+        "state": "paused",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:idle:finish",
+      {
+        "state": "finished",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:idle:reverse",
+      {
+        "state": "idle",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:idle:cancel",
+      {
+        "state": "idle",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:finished:play",
+      {
+        "state": "running",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:finished:pause",
+      {
+        "state": "paused",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:finished:finish",
+      {
+        "state": "finished",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:finished:reverse",
+      {
+        "state": "finished",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": true,
+        "startTime": null
+      }
+    ],
+    [
+      "transition:finished:cancel",
+      {
+        "state": "idle",
+        "returned": "__undefined__",
+        "readySame": true,
+        "finishedSame": false,
+        "startTime": null
+      }
+    ],
+    [
+      "finish-order",
+      {
+        "micro": [
+          "sync",
+          "promise"
+        ],
+        "order": [
+          "sync",
+          "promise",
+          "first-listener",
+          "handler",
+          "last-listener"
+        ]
+      }
+    ],
+    [
+      "finish-then-cancel",
+      {
+        "events": [
+          "finish",
+          "cancel"
+        ],
+        "state": "idle"
+      }
+    ],
+    [
+      "cancel-then-play",
+      {
+        "events": [
+          "cancel",
+          "finish"
+        ],
+        "state": "finished"
+      }
+    ],
+    [
+      "finish-then-play",
+      {
+        "events": [
+          "old-promise",
+          "new-promise",
+          "event",
+          "event"
+        ],
+        "state": "finished"
+      }
+    ],
+    [
+      "pause-resume",
+      [
+        {
+          "state": "paused",
+          "startTime": null,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        },
+        {
+          "state": "finished",
+          "startTime": 33,
+          "effect": "null",
+          "timeline": "null",
+          "pending": false
+        }
+      ]
+    ],
+    [
+      "time-mutators",
+      {
+        "paused": 77,
+        "finished": 77,
+        "canceled": 77
+      }
+    ]
+  ],
+  "events": [],
+  "ownedBrowser": {
+    "pid": 140402,
+    "exitCode": 0,
+    "signal": null,
+    "stderr": "$time=1793436296668 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:42595 max_connections=16120 max_browser_connections=16\n",
+    "stderrTruncated": false
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 200,
+      "routeKnown": true
+    }
+  ]
+}

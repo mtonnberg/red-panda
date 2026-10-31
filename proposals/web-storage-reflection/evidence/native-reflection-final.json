@@ -1,0 +1,816 @@
+{
+  "name": "reflection",
+  "source": "(()=>{const s=localStorage,p=Storage.prototype,rows=[],safe=fn=>{try{return fn()}catch(e){return{error:e.name,message:e.message}}},val=v=>v===undefined?'__undefined__':typeof v==='function'?'__function__':typeof v==='symbol'?String(v):v!==null&&typeof v==='object'?'__object__:'+Object.prototype.toString.call(v):v;\n const desc=k=>{const d=Object.getOwnPropertyDescriptor(s,k);if(!d)return null;return{value:val(d.value),get:typeof d.get,set:typeof d.set,writable:d.writable,enumerable:d.enumerable,configurable:d.configurable}};\n const snap=label=>rows.push({label,length:Object.getOwnPropertyDescriptor(p,'length').get.call(s),keys:Object.keys(s),own:Reflect.ownKeys(s).map(String),area:Array.from({length:Object.getOwnPropertyDescriptor(p,'length').get.call(s)},(_,i)=>[p.key.call(s,i),p.getItem.call(s,p.key.call(s,i))]),descriptors:Object.fromEntries(Reflect.ownKeys(s).map(k=>[String(k),desc(k)])),json:safe(()=>JSON.stringify(s))});\n p.clear.call(s);snap('empty');\n for(const key of['ordinary','getItem','length','setItem','key','clear','removeItem','constructor','toString','__proto__','hasOwnProperty'])p.setItem.call(s,key,'stored:'+key);snap('reserved');\n for(const key of['getItem','length','constructor','toString','__proto__'])rows.push({label:'assign:'+key,result:safe(()=>{s[key]='physical:'+key;return{value:val(s[key]),stored:p.getItem.call(s,key),descriptor:desc(key)}})});snap('after-assignment');\n for(const[key,d]of[['defined',{value:'value',enumerable:false,writable:false,configurable:false}],['accessor',{get(){return'getter-value'},enumerable:true,configurable:true}],['getItem',{value:'explicit-method',enumerable:false,writable:false,configurable:true}],['length',{value:99,enumerable:true,configurable:true}]])rows.push({label:'define:'+key,result:safe(()=>{Object.defineProperty(s,key,d);return{value:val(s[key]),stored:p.getItem.call(s,key),descriptor:desc(key)}})});snap('after-definitions');\n const symbol=Symbol('author');s[symbol]={real:true};rows.push({label:'symbol',value:s[symbol],desc:desc(symbol),symbols:Object.getOwnPropertySymbols(s).map(String),length:Object.getOwnPropertyDescriptor(p,'length').get.call(s)});\n for(const key of['defined','accessor','getItem','length','ordinary'])rows.push({label:'delete:'+key,result:safe(()=>({deleted:delete s[key],value:val(s[key]),stored:p.getItem.call(s,key),descriptor:desc(key)}))});snap('after-delete');p.clear.call(s);snap('clear');\n rows.push({label:'nonextensible',result:safe(()=>{Object.preventExtensions(s);return Object.isExtensible(s)}),extensible:Object.isExtensible(s)});return rows;})()\n",
+  "sourceSHA256": "0aa41d9d92c05e900d13b0518f99564c3a415d89954df6daae2b6dffa1d60e67",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "origin": "http://127.0.0.1:35863",
+  "version": {
+    "protocolVersion": "1.3",
+    "product": "Chrome/124.0.6367.29",
+    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jsVersion": "12.4.254.8"
+  },
+  "result": [
+    {
+      "label": "empty",
+      "length": 0,
+      "keys": [],
+      "own": [],
+      "area": [],
+      "descriptors": {},
+      "json": "{}"
+    },
+    {
+      "label": "reserved",
+      "length": 11,
+      "keys": [
+        "removeItem",
+        "__proto__",
+        "ordinary",
+        "key",
+        "getItem",
+        "setItem",
+        "toString",
+        "constructor",
+        "hasOwnProperty",
+        "clear",
+        "length"
+      ],
+      "own": [
+        "removeItem",
+        "__proto__",
+        "ordinary",
+        "key",
+        "getItem",
+        "setItem",
+        "toString",
+        "constructor",
+        "hasOwnProperty",
+        "clear",
+        "length"
+      ],
+      "area": [
+        [
+          "removeItem",
+          "stored:removeItem"
+        ],
+        [
+          "__proto__",
+          "stored:__proto__"
+        ],
+        [
+          "ordinary",
+          "stored:ordinary"
+        ],
+        [
+          "key",
+          "stored:key"
+        ],
+        [
+          "getItem",
+          "stored:getItem"
+        ],
+        [
+          "setItem",
+          "stored:setItem"
+        ],
+        [
+          "toString",
+          "stored:toString"
+        ],
+        [
+          "constructor",
+          "stored:constructor"
+        ],
+        [
+          "hasOwnProperty",
+          "stored:hasOwnProperty"
+        ],
+        [
+          "clear",
+          "stored:clear"
+        ],
+        [
+          "length",
+          "stored:length"
+        ]
+      ],
+      "descriptors": {
+        "removeItem": null,
+        "__proto__": null,
+        "ordinary": {
+          "value": "stored:ordinary",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "key": null,
+        "getItem": null,
+        "setItem": null,
+        "toString": null,
+        "constructor": null,
+        "hasOwnProperty": null,
+        "clear": null,
+        "length": null
+      },
+      "json": {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    },
+    {
+      "label": "assign:getItem",
+      "result": {
+        "value": "physical:getItem",
+        "stored": "stored:getItem",
+        "descriptor": {
+          "value": "physical:getItem",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "assign:length",
+      "result": {
+        "value": 11,
+        "stored": "stored:length",
+        "descriptor": null
+      }
+    },
+    {
+      "label": "assign:constructor",
+      "result": {
+        "value": "physical:constructor",
+        "stored": "stored:constructor",
+        "descriptor": {
+          "value": "physical:constructor",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "assign:toString",
+      "result": {
+        "value": "physical:toString",
+        "stored": "stored:toString",
+        "descriptor": {
+          "value": "physical:toString",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "assign:__proto__",
+      "result": {
+        "value": "__object__:[object Storage]",
+        "stored": "stored:__proto__",
+        "descriptor": null
+      }
+    },
+    {
+      "label": "after-assignment",
+      "length": 11,
+      "keys": [
+        "getItem",
+        "constructor",
+        "toString",
+        "removeItem",
+        "__proto__",
+        "ordinary",
+        "key",
+        "setItem",
+        "hasOwnProperty",
+        "clear",
+        "length"
+      ],
+      "own": [
+        "getItem",
+        "constructor",
+        "toString",
+        "removeItem",
+        "__proto__",
+        "ordinary",
+        "key",
+        "setItem",
+        "hasOwnProperty",
+        "clear",
+        "length"
+      ],
+      "area": [
+        [
+          "removeItem",
+          "stored:removeItem"
+        ],
+        [
+          "__proto__",
+          "stored:__proto__"
+        ],
+        [
+          "ordinary",
+          "stored:ordinary"
+        ],
+        [
+          "key",
+          "stored:key"
+        ],
+        [
+          "getItem",
+          "stored:getItem"
+        ],
+        [
+          "setItem",
+          "stored:setItem"
+        ],
+        [
+          "toString",
+          "stored:toString"
+        ],
+        [
+          "constructor",
+          "stored:constructor"
+        ],
+        [
+          "hasOwnProperty",
+          "stored:hasOwnProperty"
+        ],
+        [
+          "clear",
+          "stored:clear"
+        ],
+        [
+          "length",
+          "stored:length"
+        ]
+      ],
+      "descriptors": {
+        "getItem": {
+          "value": "physical:getItem",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "constructor": {
+          "value": "physical:constructor",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "toString": {
+          "value": "physical:toString",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "removeItem": null,
+        "__proto__": null,
+        "ordinary": {
+          "value": "stored:ordinary",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "key": null,
+        "setItem": null,
+        "hasOwnProperty": null,
+        "clear": null,
+        "length": null
+      },
+      "json": {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    },
+    {
+      "label": "define:defined",
+      "result": {
+        "value": "value",
+        "stored": "value",
+        "descriptor": {
+          "value": "value",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "define:accessor",
+      "result": {
+        "value": "getter-value",
+        "stored": null,
+        "descriptor": {
+          "value": "__undefined__",
+          "get": "function",
+          "set": "undefined",
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "define:getItem",
+      "result": {
+        "value": "explicit-method",
+        "stored": "stored:getItem",
+        "descriptor": {
+          "value": "explicit-method",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": false,
+          "enumerable": false,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "define:length",
+      "result": {
+        "value": 99,
+        "stored": "stored:length",
+        "descriptor": {
+          "value": 99,
+          "get": "undefined",
+          "set": "undefined",
+          "writable": false,
+          "enumerable": true,
+          "configurable": true
+        }
+      }
+    },
+    {
+      "label": "after-definitions",
+      "length": 12,
+      "keys": [
+        "constructor",
+        "toString",
+        "accessor",
+        "length",
+        "removeItem",
+        "__proto__",
+        "defined",
+        "ordinary",
+        "key",
+        "getItem",
+        "setItem",
+        "hasOwnProperty",
+        "clear"
+      ],
+      "own": [
+        "getItem",
+        "constructor",
+        "toString",
+        "accessor",
+        "length",
+        "removeItem",
+        "__proto__",
+        "defined",
+        "ordinary",
+        "key",
+        "setItem",
+        "hasOwnProperty",
+        "clear"
+      ],
+      "area": [
+        [
+          "removeItem",
+          "stored:removeItem"
+        ],
+        [
+          "__proto__",
+          "stored:__proto__"
+        ],
+        [
+          "defined",
+          "value"
+        ],
+        [
+          "ordinary",
+          "stored:ordinary"
+        ],
+        [
+          "key",
+          "stored:key"
+        ],
+        [
+          "getItem",
+          "stored:getItem"
+        ],
+        [
+          "setItem",
+          "stored:setItem"
+        ],
+        [
+          "toString",
+          "stored:toString"
+        ],
+        [
+          "constructor",
+          "stored:constructor"
+        ],
+        [
+          "hasOwnProperty",
+          "stored:hasOwnProperty"
+        ],
+        [
+          "clear",
+          "stored:clear"
+        ],
+        [
+          "length",
+          "stored:length"
+        ]
+      ],
+      "descriptors": {
+        "getItem": {
+          "value": "explicit-method",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": false,
+          "enumerable": false,
+          "configurable": true
+        },
+        "constructor": {
+          "value": "physical:constructor",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "toString": {
+          "value": "physical:toString",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "accessor": {
+          "value": "__undefined__",
+          "get": "function",
+          "set": "undefined",
+          "enumerable": true,
+          "configurable": true
+        },
+        "length": {
+          "value": 99,
+          "get": "undefined",
+          "set": "undefined",
+          "writable": false,
+          "enumerable": true,
+          "configurable": true
+        },
+        "removeItem": null,
+        "__proto__": null,
+        "defined": {
+          "value": "value",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "ordinary": {
+          "value": "stored:ordinary",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "key": null,
+        "setItem": null,
+        "hasOwnProperty": null,
+        "clear": null
+      },
+      "json": {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    },
+    {
+      "label": "symbol",
+      "value": {
+        "real": true
+      },
+      "desc": {
+        "value": "__object__:[object Object]",
+        "get": "undefined",
+        "set": "undefined",
+        "writable": true,
+        "enumerable": true,
+        "configurable": true
+      },
+      "symbols": [
+        "Symbol(author)"
+      ],
+      "length": 12
+    },
+    {
+      "label": "delete:defined",
+      "result": {
+        "deleted": true,
+        "value": "__undefined__",
+        "stored": null,
+        "descriptor": null
+      }
+    },
+    {
+      "label": "delete:accessor",
+      "result": {
+        "deleted": true,
+        "value": "__undefined__",
+        "stored": null,
+        "descriptor": null
+      }
+    },
+    {
+      "label": "delete:getItem",
+      "result": {
+        "deleted": true,
+        "value": "__function__",
+        "stored": "stored:getItem",
+        "descriptor": null
+      }
+    },
+    {
+      "label": "delete:length",
+      "result": {
+        "deleted": true,
+        "value": 11,
+        "stored": "stored:length",
+        "descriptor": null
+      }
+    },
+    {
+      "label": "delete:ordinary",
+      "result": {
+        "deleted": true,
+        "value": "__undefined__",
+        "stored": null,
+        "descriptor": null
+      }
+    },
+    {
+      "label": "after-delete",
+      "length": 10,
+      "keys": [
+        "constructor",
+        "toString",
+        "removeItem",
+        "__proto__",
+        "key",
+        "getItem",
+        "setItem",
+        "hasOwnProperty",
+        "clear",
+        "length"
+      ],
+      "own": [
+        "constructor",
+        "toString",
+        "Symbol(author)",
+        "removeItem",
+        "__proto__",
+        "key",
+        "getItem",
+        "setItem",
+        "hasOwnProperty",
+        "clear",
+        "length"
+      ],
+      "area": [
+        [
+          "removeItem",
+          "stored:removeItem"
+        ],
+        [
+          "__proto__",
+          "stored:__proto__"
+        ],
+        [
+          "key",
+          "stored:key"
+        ],
+        [
+          "getItem",
+          "stored:getItem"
+        ],
+        [
+          "setItem",
+          "stored:setItem"
+        ],
+        [
+          "toString",
+          "stored:toString"
+        ],
+        [
+          "constructor",
+          "stored:constructor"
+        ],
+        [
+          "hasOwnProperty",
+          "stored:hasOwnProperty"
+        ],
+        [
+          "clear",
+          "stored:clear"
+        ],
+        [
+          "length",
+          "stored:length"
+        ]
+      ],
+      "descriptors": {
+        "constructor": {
+          "value": "physical:constructor",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "toString": {
+          "value": "physical:toString",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "Symbol(author)": {
+          "value": "__object__:[object Object]",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "removeItem": null,
+        "__proto__": null,
+        "key": null,
+        "getItem": null,
+        "setItem": null,
+        "hasOwnProperty": null,
+        "clear": null,
+        "length": null
+      },
+      "json": {
+        "error": "TypeError",
+        "message": "Illegal invocation"
+      }
+    },
+    {
+      "label": "clear",
+      "length": 0,
+      "keys": [
+        "constructor",
+        "toString"
+      ],
+      "own": [
+        "constructor",
+        "toString",
+        "Symbol(author)"
+      ],
+      "area": [],
+      "descriptors": {
+        "constructor": {
+          "value": "physical:constructor",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "toString": {
+          "value": "physical:toString",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        },
+        "Symbol(author)": {
+          "value": "__object__:[object Object]",
+          "get": "undefined",
+          "set": "undefined",
+          "writable": true,
+          "enumerable": true,
+          "configurable": true
+        }
+      },
+      "json": "{\"constructor\":\"physical:constructor\",\"toString\":\"physical:toString\"}"
+    },
+    {
+      "label": "nonextensible",
+      "result": {
+        "error": "TypeError",
+        "message": "Cannot prevent extensions"
+      },
+      "extensible": true
+    }
+  ],
+  "handle": {
+    "result": {
+      "type": "object",
+      "className": "Storage",
+      "description": "Storage",
+      "objectId": "2.2.1"
+    }
+  },
+  "byValue": {
+    "result": {
+      "type": "object",
+      "value": {
+        "constructor": "physical:constructor",
+        "toString": "physical:toString"
+      }
+    }
+  },
+  "properties": {
+    "result": [
+      {
+        "name": "constructor",
+        "value": {
+          "type": "string",
+          "value": "physical:constructor"
+        },
+        "writable": true,
+        "configurable": true,
+        "enumerable": true,
+        "isOwn": true
+      },
+      {
+        "name": "toString",
+        "value": {
+          "type": "string",
+          "value": "physical:toString"
+        },
+        "writable": true,
+        "configurable": true,
+        "enumerable": true,
+        "isOwn": true
+      },
+      {
+        "name": "Symbol(author)",
+        "value": {
+          "type": "object",
+          "className": "Object",
+          "description": "Object",
+          "objectId": "2.2.2"
+        },
+        "writable": true,
+        "configurable": true,
+        "enumerable": true,
+        "isOwn": true,
+        "symbol": {
+          "type": "symbol",
+          "description": "Symbol(author)",
+          "objectId": "2.2.3"
+        }
+      }
+    ],
+    "internalProperties": [
+      {
+        "name": "[[Prototype]]",
+        "value": {
+          "type": "object",
+          "className": "Storage",
+          "description": "Storage",
+          "objectId": "2.2.4"
+        }
+      }
+    ]
+  },
+  "ownedBrowser": {
+    "pid": 194047,
+    "exitCode": 0,
+    "signal": null,
+    "stderr": "$time=1793439063489 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:37507 max_connections=16120 max_browser_connections=16\n"
+  }
+}

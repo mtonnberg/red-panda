@@ -1,0 +1,5 @@
+import {Browser} from '../src/browser.js';
+import {readFile,writeFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+const sha=bytes=>createHash('sha256').update(bytes).digest('hex'),source=await readFile(new URL('../src/audio-core.js',import.meta.url)),browser=new Browser({timeout:3000}),page=browser.createPage();
+try{await page.navigate('data:text/html,<body>Audio graph evidence');const observations=[];for(const name of['audio-graph-native','audio-automation-native','audio-ownership-v2-native','audio-graph-extra-native']){const expression=await readFile(new URL(name+'-expression.js',import.meta.url),'utf8');observations.push({name,inputSHA256:sha(expression),value:JSON.parse(JSON.stringify(await page.evaluate(expression)))})}if(sha(source)!==sha(await readFile(new URL('../src/audio-core.js',import.meta.url))))throw Error('Candidate source changed');await writeFile(new URL('candidate-audio.json',import.meta.url),JSON.stringify({node:process.version,sourceSHA256:sha(source),observations},null,2)+'\n',{flag:'wx'})}finally{browser.close()}

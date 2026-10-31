@@ -1,0 +1,2871 @@
+--- /dev/null
++++ b/src/animations.js
+@@ -0,0 +1,133 @@
++// Independent, Native-calibrated Web Animations state/tasks. The target does
++// not evaluate keyframes or expose effect/timeline constructors; no pixels,
++// interpolated styles, or advertised media timing are fabricated here.
++import {createRequire} from 'node:module';
++import {platformFactoryRecord,registerPlatformFactory} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++import {onFrameRetirement} from './frame-activity.js';
++const require=createRequire(import.meta.url);
++const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
++const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
++const Element=require('jsdom/lib/jsdom/living/generated/Element.js');
++const installed=new WeakMap(),animations=new WeakMap(),playbackEvents=new WeakMap();
++const hidden=value=>Object.assign(Object.create(null),value),apply=Reflect.apply,setPrototype=Object.setPrototypeOf;
++
++function factory(g,bridge){
++ const TypeError=g.TypeError,Exception=g.DOMException,Array=g.Array,Object=g.Object,define=Object.defineProperty,prototype=Object.getPrototypeOf,apply=g.Reflect.apply;
++ const String=g.String,symbolDescription=Object.getOwnPropertyDescriptor(g.Symbol.prototype,'description').get;
++ const text=value=>typeof value==='symbol'?apply(symbolDescription,value,[])??'':String(value);
++ const object=value=>value!==null&&(typeof value==='object'||typeof value==='function');
++ const illegal=()=>{throw new TypeError('Illegal invocation')};
++ const check=value=>{if(!bridge.hasAnimation(value))illegal()};
++ const read=(value,key)=>{check(value);return bridge.read(value,key)};
++ function Animation(){throw new TypeError('Illegal Constructor')}
++ const animationPrototype={
++  play(){check(this);bridge.action(this,'play')},
++  pause(){check(this);bridge.action(this,'pause')},
++  cancel(){check(this);bridge.action(this,'cancel',new Exception('The operation was aborted','AbortError'))},
++  finish(){check(this);bridge.action(this,'finish')},
++  reverse(){check(this)},
++  get playState(){return read(this,'playState')},
++  pending:false,
++  get finished(){check(this);return bridge.promise(this,'finished')},
++  get ready(){check(this);return bridge.promise(this,'ready')},
++  get effect(){return read(this,'effect')},
++  set effect(value){check(this);if(value!=null&&!object(value))throw new TypeError('invalid argument');bridge.set(this,'effect',value??null)},
++  get timeline(){return read(this,'timeline')},
++  set timeline(value){check(this);if(value!=null&&!object(value))throw new TypeError('invalid argument');bridge.set(this,'timeline',value??null)},
++  get startTime(){return read(this,'startTime')},
++  set startTime(value){check(this);bridge.set(this,'startTime',value==null?null:+value)},
++  get onfinish(){return read(this,'onfinish')},
++  set onfinish(value){check(this);bridge.handler(this,'finish',typeof value==='function'?value:null)},
++  get oncancel(){return read(this,'oncancel')},
++  set oncancel(value){check(this);bridge.handler(this,'cancel',typeof value==='function'?value:null)},
++ };
++ Object.setPrototypeOf(animationPrototype,g.EventTarget.prototype);Object.setPrototypeOf(Animation,g.EventTarget);
++ define(Animation,'prototype',{value:animationPrototype,writable:false});
++ define(animationPrototype,'pending',{value:false,writable:false,enumerable:true,configurable:false});
++ define(animationPrototype,'constructor',{value:Animation,writable:true,configurable:true});define(animationPrototype,g.Symbol.toStringTag,{value:'Animation',configurable:true});
++ function AnimationPlaybackEvent(type){
++  if(new.target===undefined||arguments.length===0)throw new TypeError('invalid argument');
++  const name=text(type),input=arguments[1];if(input!=null&&!object(input))throw new TypeError('invalid argument');
++  const bubbles=input!=null&&'bubbles'in input?!!input.bubbles:false,cancelable=input!=null&&'cancelable'in input?!!input.cancelable:false,composed=input!=null&&'composed'in input?!!input.composed:false;
++  let currentTime=null,timelineTime=null;
++  if(input!=null&&'currentTime'in input){const value=input.currentTime;currentTime=value==null?null:+value}
++  if(input!=null&&'timelineTime'in input){const value=input.timelineTime;timelineTime=value==null?null:+value}
++  return bridge.event(name,bubbles,cancelable,composed,currentTime,timelineTime,prototype(this));
++ }
++ const playbackPrototype={
++  get currentTime(){if(!bridge.hasEvent(this))illegal();return bridge.eventTime(this,'currentTime')},
++  get timelineTime(){if(!bridge.hasEvent(this))illegal();return bridge.eventTime(this,'timelineTime')},
++ };
++ Object.setPrototypeOf(playbackPrototype,g.Event.prototype);Object.setPrototypeOf(AnimationPlaybackEvent,g.Event);
++ define(AnimationPlaybackEvent,'prototype',{value:playbackPrototype,writable:false});
++ define(playbackPrototype,'constructor',{value:AnimationPlaybackEvent,writable:true,configurable:true});define(playbackPrototype,g.Symbol.toStringTag,{value:'AnimationPlaybackEvent',configurable:true});
++ bridge.prototypes(animationPrototype,playbackPrototype);
++ define(g,'Animation',{value:Animation,writable:true,configurable:true});define(g,'AnimationPlaybackEvent',{value:AnimationPlaybackEvent,writable:true,configurable:true});
++ function animate(){if(!bridge.isElement(this))illegal();return bridge.animate()}
++ function getAnimations(){if(!bridge.isElement(this))illegal();return new Array()}
++ define(g.Element.prototype,'animate',{value:animate,writable:true,configurable:true,enumerable:true});define(g.Element.prototype,'getAnimations',{value:getAnimations,writable:true,configurable:true,enumerable:true});
++}
++
++export function installAnimations(page,realm){
++ if(installed.has(realm))return;
++ registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
++ const Promise=realm.Promise,preventDefault=realm.Event.prototype.preventDefault,add=realm.EventTarget.prototype.addEventListener,remove=realm.EventTarget.prototype.removeEventListener;
++ const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
++ const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,disposed:false,automatic:new Set(),events:new Set()});
++ const task=(callback,automatic=false)=>{
++  if(runtime.disposed)return;
++  const tasks=automatic?runtime.automatic:runtime.events;let id;
++  id=apply(setTimer,realm,[()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0]);tasks.add(id);
++ };
++ function event(type,bubbles,cancelable,composed,currentTime,timelineTime,prototype,trusted=false){
++  const value=Event.create(realm,[type,{bubbles,cancelable,composed}],{isTrusted:trusted});setPrototype(value,prototype);
++  const implementation=platformFactoryRecord(value)?.implementation;
++  const state=hidden({currentTime,timelineTime});playbackEvents.set(value,state);registerPlatformFactory(value,{kind:'AnimationPlaybackEvent',implementation:state,globalObject:realm});
++  return{value,implementation};
++ }
++ runtime.emit=(state,type)=>task(()=>{const e=event(type,false,false,false,null,null,runtime.playbackPrototype,true);state.target._dispatch(e.implementation)});
++ runtime.automaticTask=callback=>task(callback,true);
++ const finish=state=>{if(state.playState==='finished')return;state.playState='finished';state.finishedResolve?.(state.value);state.runtime.emit(state,'finish')};
++ const play=state=>{if(state.playState==='running')return;state.playState='running';state.runtime.automaticTask(()=>{if(state.playState==='running')finish(state)})};
++ const makePromise=(state,key)=>{
++  // First getter's actual VM owns this genuine Promise; state stays Host-only.
++  let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no});
++  if(key==='ready'){state.ready=promise;resolve(state.value)}
++  else{state.finished=promise;state.finishedResolve=resolve;state.finishedReject=reject;if(state.playState==='finished')resolve(state.value)}
++  return promise;
++ };
++ const bridge=hidden({
++  hasAnimation:value=>animations.has(value),hasEvent:value=>playbackEvents.has(value),
++  isElement:value=>Boolean(platformFactoryRecord(value)&&Element.is(value)),
++  prototypes(animation,playback){runtime.animationPrototype=animation;runtime.playbackPrototype=playback},
++  read(value,key){const state=animations.get(value);return key==='playState'||key==='startTime'||key==='effect'||key==='timeline'||key==='onfinish'||key==='oncancel'?state[key]:undefined},
++  set(value,key,data){if(key==='startTime'||key==='effect'||key==='timeline')animations.get(value)[key]=data},
++  promise(value,key){const state=animations.get(value);return key==='ready'||key==='finished'?state[key]??makePromise(state,key):undefined},
++  animate(){
++   const value=EventTarget.create(realm,[],{}),target=platformFactoryRecord(value)?.implementation;setPrototype(value,runtime.animationPrototype);
++   const state=hidden({value,target,runtime,playState:'idle',startTime:null,effect:null,timeline:null,ready:null,finished:null,finishedResolve:null,finishedReject:null,onfinish:null,oncancel:null,finishListener:null,cancelListener:null});
++   animations.set(value,state);registerPlatformFactory(value,{kind:'Animation',implementation:state,globalObject:realm});play(state);return value;
++  },
++  action(value,kind,error){
++   const state=animations.get(value);
++   if(kind==='play')play(state);else if(kind==='pause')state.playState='paused';else if(kind==='finish')finish(state);else if(kind==='cancel'&&state.playState!=='idle'){
++    state.playState='idle';
++    if(state.finished){page.browser.runtimeBinding.markPromiseHandled(state.finished);state.finishedReject(error)}
++    state.finished=null;state.finishedResolve=null;state.finishedReject=null;state.runtime.emit(state,'cancel');
++   }
++  },
++  handler(value,type,callback){
++   const state=animations.get(value),field=type==='finish'?'onfinish':'oncancel',listener=type==='finish'?'finishListener':'cancelListener';
++   if(!callback&&state[listener]){apply(remove,value,[type,state[listener]]);state[listener]=null}state[field]=callback;
++   if(callback&&!state[listener]){state[listener]=e=>{const result=apply(state[field],value,[e]);if(result===false)apply(preventDefault,e,[])};apply(add,value,[type,state[listener]])}
++  },
++  event:(...args)=>event(...args).value,
++  eventTime(value,key){return key==='currentTime'||key==='timelineTime'?playbackEvents.get(value)[key]:undefined},
++ });
++ realm.eval(`(${factory.toString()})`)(realm,bridge);
++ const clear=tasks=>{for(const id of tasks)apply(clearTimer,realm,[id]);tasks.clear()};
++ onFrameRetirement(realm,()=>{clear(runtime.automatic);clear(runtime.events)});
++ page.documentAbort?.signal.addEventListener('abort',()=>{runtime.disposed=true;clear(runtime.automatic);clear(runtime.events)},{once:true});
++ installed.set(realm,runtime);
++}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -60,6 +60,7 @@
+ import { loadCollectionsBinding, installCollections } from './collections.js';
+ import { installStyles } from './styles.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
++import { installAnimations } from './animations.js';
+ import { installVideoFrame } from './video-frame.js';
+ import { installAudioData } from './audio-data.js';
+ import { installWebCodecsValues } from './webcodecs-values.js';
+@@ -284,6 +285,7 @@
+       installAudioData(window);
+       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
+       installWebCodecsProcessors(window);
++      installAnimations(this,window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -34,7 +34,7 @@
+   const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+-  if(['VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
++  if(['VideoColorSpace','URLPattern','Animation','AnimationPlaybackEvent','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+   const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
+   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+--- a/native/runtime.cc
++++ b/native/runtime.cc
+@@ -80,10 +80,21 @@
+   if (expression->Exec(context, info[1].As<String>()).ToLocal(&result)) info.GetReturnValue().Set(result);
+ }
+ 
++// Mark only an actual owned Promise handled without allocating a derived
++// Promise or invoking authored .then hooks. This public-V8 seam is privileged.
++void MarkPromiseHandled(const FunctionCallbackInfo<Value>& info) {
++  if (info.Length() != 1 || !info[0]->IsPromise()) {
++    info.GetIsolate()->ThrowException(Exception::TypeError(String::NewFromUtf8Literal(info.GetIsolate(), "An actual Promise is required")));
++    return;
++  }
++  info[0].As<Promise>()->MarkAsHandled();
++}
++
+ NODE_MODULE_INIT() {
+   Isolate* isolate = Isolate::GetCurrent();
+   auto* state = new State();
+   node::AddEnvironmentCleanupHook(isolate, [](void* pointer) { delete static_cast<State*>(pointer); }, state);
++  exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "markPromiseHandled"), Function::New(context, MarkPromiseHandled).ToLocalChecked()).Check();
+   exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "checkpoint"), Function::New(context, Checkpoint, External::New(isolate, state)).ToLocalChecked()).Check();
+   exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "createEntry"), Function::New(context, CreateEntry).ToLocalChecked()).Check();
+   exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "boundedRegExp"), Function::New(context, BoundedRegExp).ToLocalChecked()).Check();
+--- /dev/null
++++ b/test/animations.test.js
+@@ -0,0 +1,32 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++import {createFixture} from './fixture.js';
++import {getRuntimeBinding} from '../src/native-runtime.js';
++import {execFile} from 'node:child_process';
++import {promisify} from 'node:util';
++import {fileURLToPath} from 'node:url';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t){const browser=new Browser({timeout:10000,loadResources:['iframe','worker']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body>animations</body>');return{page,browser,w:page.dom.window};}
++for(const [group,label]of[['surface','surface-final'],['values','values'],['state','state-final'],['detail','detail-stable'],['promises','promises'],['realm','realm'],['retirement','retirement'],['edge','edge'],['style','style-stable']])test('actual Native animation '+group+' observations match',async t=>{
++ const {page}=await fixture(t);if(group==='realm'||group==='promises'||group==='detail'||group==='retirement'){const server=await createFixture();t.after(()=>server.close());await page.navigate(server.url);}
++ const expression=await readFile(new URL('../oracle/animations-'+group+'-expression.js',import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../oracle/animations-native-'+label+'.json',import.meta.url),'utf8'));
++ assert.ok(Array.isArray(native.result),'actual Native control must produce observations');let result;
++ if(group==='promises'){
++  // The node:test host flags even Window-prevented unhandled rejections.
++  // Keep the positive rejection control intact in its own actual process.
++  const {stdout}=await promisify(execFile)(process.execPath,['--experimental-vm-modules',fileURLToPath(new URL('./animation-promise-case.js',import.meta.url))],{timeout:10000});result=JSON.parse(stdout);
++ }else result=plain(await page.evaluate(expression));
++ assert.deepEqual(result,native.result);
++});
++test('keyframes never invent style output and actual public objects keep correct realms/brands',async t=>{
++ const {page}=await fixture(t);const result=plain(await page.evaluate(`(async()=>{const element=document.createElement('div');element.style.cssText='opacity:0.4;width:12px;transform:translateX(3px)';document.body.append(element);const read=()=>({opacity:getComputedStyle(element).opacity,width:getComputedStyle(element).width,transform:getComputedStyle(element).transform});const before=read(),animation=element.animate([{opacity:0,width:'10px',transform:'translateX(0px)'},{opacity:1,width:'200px',transform:'translateX(100px)'}],{duration:1e9,iterations:Infinity,fill:'forwards'}),started=read();await animation.finished;const finished=read();animation.cancel();return{before,started,finished,canceled:read(),state:animation.playState,array:element.getAnimations()instanceof Array,empty:element.getAnimations().length}})()`));
++ assert.deepEqual(result.started,result.before);assert.deepEqual(result.finished,result.before);assert.deepEqual(result.canceled,result.before);assert.equal(result.before.opacity,'0.4');assert.equal(result.before.width,'12px');assert.equal(result.state,'idle');assert.equal(result.array,true);assert.equal(result.empty,0);
++});
++test('author changes to public constructors and functions do not create brands or hijack internal events',async t=>{
++ const {page}=await fixture(t);const value=plain(await page.evaluate(`(async()=>{const OriginalAnimation=Animation,OriginalEvent=AnimationPlaybackEvent,element=document.createElement('div');globalThis.Animation=function(){throw Error('public Animation used')};globalThis.AnimationPlaybackEvent=function(){throw Error('public event used')};const animation=element.animate();const event=await new Promise(resolve=>{animation.onfinish=resolve;animation.finish()});const fake=Object.create(OriginalAnimation.prototype);fake.note='authored';let rejected;try{OriginalAnimation.prototype.finish.call(fake)}catch(e){rejected=e instanceof TypeError}const clone=structuredClone(fake);return{animation:animation instanceof OriginalAnimation,event:event instanceof OriginalEvent,trusted:event.isTrusted,rejected,clone:clone.note,pending:fake.pending}})()`));assert.deepEqual(value,{animation:true,event:true,trusted:true,rejected:true,clone:'authored',pending:false});
++});
++test('the privileged handled-Promise bridge accepts genuine Promises only without reading proxy traps',()=>{
++ const binding=getRuntimeBinding();assert.equal(typeof binding.markPromiseHandled,'function');assert.equal(binding.markPromiseHandled(new Promise(()=>{})),undefined);assert.throws(()=>binding.markPromiseHandled({}),/actual Promise/);let reads=0;assert.throws(()=>binding.markPromiseHandled(new Proxy(new Promise(()=>{}),{get(){reads++;throw Error('trap')}})),/actual Promise/);assert.equal(reads,0);
++});
+--- /dev/null
++++ b/test/animations-privacy.test.js
+@@ -0,0 +1,13 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {Browser}from'../src/browser.js';
++import{queryHeapObjects}from'../src/heap-query.js';
++test('actual heap keeps public animations and authored records without private VM slots or factory tables',async t=>{
++ const browser=new Browser({timeout:10000});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body>privacy</body>');const w=page.dom.window,context=page.dom.getInternalVMContext();
++ await page.evaluate(`globalThis.animationForHeap=document.createElement('div').animate();animationForHeap.pause();globalThis.authoredState={value:animationForHeap,playState:'paused',finished:animationForHeap.finished};globalThis.authoredFactoryTable={Animation,AnimationPlaybackEvent};true`);
++ const objects=queryHeapObjects(w.Object.prototype,context).objects,own=(value,key)=>Object.getOwnPropertyDescriptor(value,key)?.value;
++ assert.ok(objects.includes(w.authoredState));assert.ok(objects.includes(w.authoredFactoryTable));
++ assert.deepEqual([...objects.filter(value=>own(value,'value')===w.animationForHeap&&own(value,'playState')==='paused'&&own(value,'finished')===w.authoredState.finished)],[w.authoredState]);
++ assert.deepEqual([...objects.filter(value=>{const a=Object.getOwnPropertyDescriptor(value,'Animation'),e=Object.getOwnPropertyDescriptor(value,'AnimationPlaybackEvent');return a?.enumerable&&e?.enumerable&&a.value===w.Animation&&e.value===w.AnimationPlaybackEvent})],[w.authoredFactoryTable]);
++ const animations=queryHeapObjects(w.Animation.prototype,context).objects;assert.ok(animations instanceof w.Array);assert.ok(animations.includes(w.animationForHeap));w.animationForHeap.cancel();
++});
+--- /dev/null
++++ b/test/animation-promise-case.js
+@@ -0,0 +1,5 @@
++import {readFile}from'node:fs/promises';
++import {Browser}from'../src/browser.js';
++import {createFixture}from'./fixture.js';
++const server=await createFixture(),browser=new Browser({timeout:10000,loadResources:['iframe','worker']});
++try{const page=browser.createPage();await page.navigate(server.url);const expression=await readFile(new URL('../oracle/animations-promises-expression.js',import.meta.url),'utf8');console.log(JSON.stringify(await page.evaluate(expression)));}finally{browser.close();await server.close();}
+--- /dev/null
++++ b/oracle/animations-detail-expression.js
+@@ -0,0 +1,9 @@
++(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');
++for(const mode of['pause-play','cancel-play','finish-play']){const a=el.animate(),events=[];a.finished.catch(()=>{});a.onfinish=()=>events.push('finish');a.oncancel=()=>events.push('cancel');setTimeout(()=>{a[mode.split('-')[0]]();events.push('first')},4);setTimeout(()=>{a.play();a.finished.catch(()=>{});events.push('play')},6);setTimeout(()=>events.push('middle:'+a.playState),12);await wait(35);await wait(0);out.push([mode,{actions:events.filter(x=>x==='first'||x==='play'),samples:events.filter(x=>x.startsWith('middle:')),finishEvents:events.filter(x=>x==='finish').length,cancelEvents:events.filter(x=>x==='cancel').length,state:a.playState}]);a.finished.catch(()=>{});a.cancel();}
++{const log=[],p=new Proxy({bubbles:true,cancelable:true,composed:true,currentTime:{valueOf(){log.push('current-number');return 1}},timelineTime:{valueOf(){log.push('timeline-number');return 2}}},{get(t,k){log.push('get:'+String(k));return Reflect.get(t,k)},has(t,k){log.push('has:'+String(k));return Reflect.has(t,k)},getOwnPropertyDescriptor(t,k){log.push('own:'+String(k));return Reflect.getOwnPropertyDescriptor(t,k)}});const e=new AnimationPlaybackEvent({toString(){log.push('type');return'x'}},p);out.push(['event-init-proxy',{log,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed}]);}
++{const log=[],base={get bubbles(){log.push('bubbles');return true},get cancelable(){log.push('cancelable');return true},get composed(){log.push('composed');return true}},init=Object.create(base);const e=new AnimationPlaybackEvent('x',init);out.push(['event-inherited',{log,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed}]);}
++{const a=el.animate(),effect=()=>{},timeline=new Proxy({},{get(){throw Error('getter')}});a.effect=effect;a.timeline=timeline;a.pause();out.push(['object-identity',{effect:a.effect===effect,timeline:a.timeline===timeline}]);a.finished.catch(()=>{});a.cancel();}
++const frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow;
++for(const [name,create,finish]of[['main-child-finish',()=>el.animate(),child.Animation.prototype.finish],['child-main-finish',()=>child.document.createElement('div').animate(),Animation.prototype.finish]]){const a=create();const event=await new Promise(resolve=>{a.onfinish=resolve;finish.call(a)});out.push([name,{main:event instanceof AnimationPlaybackEvent,child:event instanceof child.AnimationPlaybackEvent,target:event.target===a}]);}
++for(const[name,make,cancel]of[['main-child-cancel',()=>el.animate(),child.Animation.prototype.cancel],['child-main-cancel',()=>child.document.createElement('div').animate(),Animation.prototype.cancel]]){const a=make(),first=a.finished;first.catch(()=>{});const event=await new Promise(resolve=>{a.oncancel=resolve;cancel.call(a)});a.finished.catch(()=>{});let error;await first.catch(e=>error={main:e instanceof DOMException,child:e instanceof child.DOMException});out.push([name,{main:event instanceof AnimationPlaybackEvent,child:event instanceof child.AnimationPlaybackEvent,error}]);}
++frame.remove();return out;})()
+--- /dev/null
++++ b/oracle/animations-edge-expression.js
+@@ -0,0 +1,8 @@
++(()=>{const out=[],attempt=(name,fn)=>{try{const value=fn();out.push([name,{value:value===undefined?'__undefined__':value}])}catch(e){out.push([name,{error:e.name,message:e.message}])}};
++attempt('constructor-parents',()=>({animation:Object.getPrototypeOf(Animation)===EventTarget,event:Object.getPrototypeOf(AnimationPlaybackEvent)===Event}));
++for(const C of[Animation,AnimationPlaybackEvent])attempt('constructor-prototype:'+C.name,()=>{const d=Object.getOwnPropertyDescriptor(C,'prototype');return{writable:d.writable,enumerable:d.enumerable,configurable:d.configurable}});
++attempt('playback-event-call',()=>{const e=AnimationPlaybackEvent('x');return{type:e.type,instance:e instanceof AnimationPlaybackEvent}});
++attempt('derived-event',()=>{class Derived extends AnimationPlaybackEvent{}const e=new Derived('derived',{currentTime:1});return{derived:e instanceof Derived,base:e instanceof AnimationPlaybackEvent,event:e instanceof Event,currentTime:e.currentTime}});
++attempt('eventtarget-as-animation',()=>{const fake=Reflect.construct(EventTarget,[],Animation);Animation.prototype.play.call(fake);return true});
++attempt('changed-constructor-parent',()=>{const C=AnimationPlaybackEvent,old=Object.getPrototypeOf(C);try{Object.setPrototypeOf(C,function(){throw Error('authored superclass')});const e=new C('original');return{type:e.type,event:e instanceof Event}}finally{Object.setPrototypeOf(C,old)}});
++return out;})()
+--- /dev/null
++++ b/oracle/animations-native-detail-stable.json
+@@ -0,0 +1,173 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "detail",
++  "source": "(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');\nfor(const mode of['pause-play','cancel-play','finish-play']){const a=el.animate(),events=[];a.finished.catch(()=>{});a.onfinish=()=>events.push('finish');a.oncancel=()=>events.push('cancel');setTimeout(()=>{a[mode.split('-')[0]]();events.push('first')},4);setTimeout(()=>{a.play();a.finished.catch(()=>{});events.push('play')},6);setTimeout(()=>events.push('middle:'+a.playState),12);await wait(35);await wait(0);out.push([mode,{actions:events.filter(x=>x==='first'||x==='play'),samples:events.filter(x=>x.startsWith('middle:')),finishEvents:events.filter(x=>x==='finish').length,cancelEvents:events.filter(x=>x==='cancel').length,state:a.playState}]);a.finished.catch(()=>{});a.cancel();}\n{const log=[],p=new Proxy({bubbles:true,cancelable:true,composed:true,currentTime:{valueOf(){log.push('current-number');return 1}},timelineTime:{valueOf(){log.push('timeline-number');return 2}}},{get(t,k){log.push('get:'+String(k));return Reflect.get(t,k)},has(t,k){log.push('has:'+String(k));return Reflect.has(t,k)},getOwnPropertyDescriptor(t,k){log.push('own:'+String(k));return Reflect.getOwnPropertyDescriptor(t,k)}});const e=new AnimationPlaybackEvent({toString(){log.push('type');return'x'}},p);out.push(['event-init-proxy',{log,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed}]);}\n{const log=[],base={get bubbles(){log.push('bubbles');return true},get cancelable(){log.push('cancelable');return true},get composed(){log.push('composed');return true}},init=Object.create(base);const e=new AnimationPlaybackEvent('x',init);out.push(['event-inherited',{log,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed}]);}\n{const a=el.animate(),effect=()=>{},timeline=new Proxy({},{get(){throw Error('getter')}});a.effect=effect;a.timeline=timeline;a.pause();out.push(['object-identity',{effect:a.effect===effect,timeline:a.timeline===timeline}]);a.finished.catch(()=>{});a.cancel();}\nconst frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow;\nfor(const [name,create,finish]of[['main-child-finish',()=>el.animate(),child.Animation.prototype.finish],['child-main-finish',()=>child.document.createElement('div').animate(),Animation.prototype.finish]]){const a=create();const event=await new Promise(resolve=>{a.onfinish=resolve;finish.call(a)});out.push([name,{main:event instanceof AnimationPlaybackEvent,child:event instanceof child.AnimationPlaybackEvent,target:event.target===a}]);}\nfor(const[name,make,cancel]of[['main-child-cancel',()=>el.animate(),child.Animation.prototype.cancel],['child-main-cancel',()=>child.document.createElement('div').animate(),Animation.prototype.cancel]]){const a=make(),first=a.finished;first.catch(()=>{});const event=await new Promise(resolve=>{a.oncancel=resolve;cancel.call(a)});a.finished.catch(()=>{});let error;await first.catch(e=>error={main:e instanceof DOMException,child:e instanceof child.DOMException});out.push([name,{main:event instanceof AnimationPlaybackEvent,child:event instanceof child.AnimationPlaybackEvent,error}]);}\nframe.remove();return out;})()\n",
++  "sourceSHA256": "24d79a1441d63a24e3449726681e5e3e03fbd28a139ba37cbd41ee582bead653",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "pause-play",
++      {
++        "actions": [
++          "first",
++          "play"
++        ],
++        "samples": [
++          "middle:finished"
++        ],
++        "finishEvents": 1,
++        "cancelEvents": 0,
++        "state": "finished"
++      }
++    ],
++    [
++      "cancel-play",
++      {
++        "actions": [
++          "first",
++          "play"
++        ],
++        "samples": [
++          "middle:finished"
++        ],
++        "finishEvents": 1,
++        "cancelEvents": 1,
++        "state": "finished"
++      }
++    ],
++    [
++      "finish-play",
++      {
++        "actions": [
++          "first",
++          "play"
++        ],
++        "samples": [
++          "middle:finished"
++        ],
++        "finishEvents": 2,
++        "cancelEvents": 0,
++        "state": "finished"
++      }
++    ],
++    [
++      "event-init-proxy",
++      {
++        "log": [
++          "type",
++          "has:bubbles",
++          "get:bubbles",
++          "has:cancelable",
++          "get:cancelable",
++          "has:composed",
++          "get:composed",
++          "has:currentTime",
++          "get:currentTime",
++          "current-number",
++          "has:timelineTime",
++          "get:timelineTime",
++          "timeline-number"
++        ],
++        "bubbles": true,
++        "cancelable": true,
++        "composed": true
++      }
++    ],
++    [
++      "event-inherited",
++      {
++        "log": [
++          "bubbles",
++          "cancelable",
++          "composed"
++        ],
++        "bubbles": true,
++        "cancelable": true,
++        "composed": true
++      }
++    ],
++    [
++      "object-identity",
++      {
++        "effect": true,
++        "timeline": true
++      }
++    ],
++    [
++      "main-child-finish",
++      {
++        "main": true,
++        "child": false,
++        "target": true
++      }
++    ],
++    [
++      "child-main-finish",
++      {
++        "main": false,
++        "child": true,
++        "target": true
++      }
++    ],
++    [
++      "main-child-cancel",
++      {
++        "main": true,
++        "child": false,
++        "error": {
++          "main": false,
++          "child": true
++        }
++      }
++    ],
++    [
++      "child-main-cancel",
++      {
++        "main": false,
++        "child": true,
++        "error": {
++          "main": true,
++          "child": false
++        }
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 150219,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793437263510 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:38071 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    },
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-edge.json
+@@ -0,0 +1,104 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "edge",
++  "source": "(()=>{const out=[],attempt=(name,fn)=>{try{const value=fn();out.push([name,{value:value===undefined?'__undefined__':value}])}catch(e){out.push([name,{error:e.name,message:e.message}])}};\nattempt('constructor-parents',()=>({animation:Object.getPrototypeOf(Animation)===EventTarget,event:Object.getPrototypeOf(AnimationPlaybackEvent)===Event}));\nfor(const C of[Animation,AnimationPlaybackEvent])attempt('constructor-prototype:'+C.name,()=>{const d=Object.getOwnPropertyDescriptor(C,'prototype');return{writable:d.writable,enumerable:d.enumerable,configurable:d.configurable}});\nattempt('playback-event-call',()=>{const e=AnimationPlaybackEvent('x');return{type:e.type,instance:e instanceof AnimationPlaybackEvent}});\nattempt('derived-event',()=>{class Derived extends AnimationPlaybackEvent{}const e=new Derived('derived',{currentTime:1});return{derived:e instanceof Derived,base:e instanceof AnimationPlaybackEvent,event:e instanceof Event,currentTime:e.currentTime}});\nattempt('eventtarget-as-animation',()=>{const fake=Reflect.construct(EventTarget,[],Animation);Animation.prototype.play.call(fake);return true});\nattempt('changed-constructor-parent',()=>{const C=AnimationPlaybackEvent,old=Object.getPrototypeOf(C);try{Object.setPrototypeOf(C,function(){throw Error('authored superclass')});const e=new C('original');return{type:e.type,event:e instanceof Event}}finally{Object.setPrototypeOf(C,old)}});\nreturn out;})()\n",
++  "sourceSHA256": "4fbbe0e75c1f75e5b8ae694ad5396a6f81ef6793c55a19d0a46ae2b5ef19dbcc",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "constructor-parents",
++      {
++        "value": {
++          "animation": true,
++          "event": true
++        }
++      }
++    ],
++    [
++      "constructor-prototype:Animation",
++      {
++        "value": {
++          "writable": false,
++          "enumerable": false,
++          "configurable": false
++        }
++      }
++    ],
++    [
++      "constructor-prototype:AnimationPlaybackEvent",
++      {
++        "value": {
++          "writable": false,
++          "enumerable": false,
++          "configurable": false
++        }
++      }
++    ],
++    [
++      "playback-event-call",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "derived-event",
++      {
++        "value": {
++          "derived": true,
++          "base": true,
++          "event": true,
++          "currentTime": 1
++        }
++      }
++    ],
++    [
++      "eventtarget-as-animation",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "changed-constructor-parent",
++      {
++        "value": {
++          "type": "original",
++          "event": true
++        }
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 151105,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793437321796 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:35349 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-promises.json
+@@ -0,0 +1,137 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "promises",
++  "source": "(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div'),unhandled=[];addEventListener('unhandledrejection',e=>{unhandled.push(e.reason?.name??e.reason);e.preventDefault()});\n{Promise.reject('positive-unhandled');await wait(20);out.push(['unhandled-positive',unhandled.splice(0)]);}\n{const a=el.animate();a.cancel();await wait(20);out.push(['unhandled-no-get',unhandled.splice(0)]);}\n{const a=el.animate();const p=a.finished;a.cancel();await wait(20);out.push(['unhandled-get',unhandled.splice(0)]);p.catch(()=>{});}\n{const a=el.animate(),events=[];a.finish();a.play();a.finished.then(()=>events.push('resolved'));await Promise.resolve();const micro=events.slice();await wait(25);out.push(['finish-play-lazy',{micro,events}]);a.finished.catch(()=>{});a.cancel();}\nconst frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow;\nfor(const key of['ready','finished'])for(const[name,make,get]of[['main-child-get',()=>el.animate(),Object.getOwnPropertyDescriptor(child.Animation.prototype,key).get],['child-main-get',()=>child.document.createElement('div').animate(),Object.getOwnPropertyDescriptor(Animation.prototype,key).get]]){const a=make(),p=get.call(a);out.push([key+':'+name,{main:p instanceof Promise,child:p instanceof child.Promise,same:p===a[key]}]);a.finished.catch(()=>{});a.cancel();}\nfor(const[name,make,cancel,get]of[['main-child-cancel-parent-get',()=>el.animate(),child.Animation.prototype.cancel,Object.getOwnPropertyDescriptor(Animation.prototype,'finished').get],['child-parent-cancel-child-get',()=>child.document.createElement('div').animate(),Animation.prototype.cancel,Object.getOwnPropertyDescriptor(child.Animation.prototype,'finished').get]]){const a=make(),first=a.finished;first.catch(()=>{});cancel.call(a);const p=get.call(a);out.push([name,{main:p instanceof Promise,child:p instanceof child.Promise,replaced:first!==p}]);}\n{const a=child.document.createElement('div').animate(),events=[];a.finished.then(()=>events.push('resolved'),()=>events.push('rejected'));a.onfinish=()=>events.push('finish');frame.remove();a.finish();await wait(25);out.push(['retired-explicit-finish',{state:a.playState,events}]);}\n{const a=el.animate(),events=[];a.startTime=88;a.effect={get currentTime(){throw Error('effect consulted')}};a.timeline={get currentTime(){throw Error('timeline consulted')}};a.onfinish=e=>events.push([e.currentTime,e.timelineTime]);a.finish();await wait(20);out.push(['event-times-ignore-slots',events]);}\nreturn out;})()\n",
++  "sourceSHA256": "72b2c0045c6aa945a99e154fcd78d8293faaf75bd3e97431b3dbdf5d1e42a05b",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "unhandled-positive",
++      [
++        "positive-unhandled"
++      ]
++    ],
++    [
++      "unhandled-no-get",
++      []
++    ],
++    [
++      "unhandled-get",
++      []
++    ],
++    [
++      "finish-play-lazy",
++      {
++        "micro": [],
++        "events": [
++          "resolved"
++        ]
++      }
++    ],
++    [
++      "ready:main-child-get",
++      {
++        "main": false,
++        "child": true,
++        "same": true
++      }
++    ],
++    [
++      "ready:child-main-get",
++      {
++        "main": true,
++        "child": false,
++        "same": true
++      }
++    ],
++    [
++      "finished:main-child-get",
++      {
++        "main": false,
++        "child": true,
++        "same": true
++      }
++    ],
++    [
++      "finished:child-main-get",
++      {
++        "main": true,
++        "child": false,
++        "same": true
++      }
++    ],
++    [
++      "main-child-cancel-parent-get",
++      {
++        "main": true,
++        "child": false,
++        "replaced": true
++      }
++    ],
++    [
++      "child-parent-cancel-child-get",
++      {
++        "main": false,
++        "child": true,
++        "replaced": true
++      }
++    ],
++    [
++      "retired-explicit-finish",
++      {
++        "state": "finished",
++        "events": [
++          "resolved",
++          "finish"
++        ]
++      }
++    ],
++    [
++      "event-times-ignore-slots",
++      [
++        [
++          null,
++          null
++        ]
++      ]
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 143046,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793436679789 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:40413 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    },
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-realm.json
+@@ -0,0 +1,126 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "realm",
++  "source": "(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow,main=document.createElement('div'),other=child.document.createElement('div');\nfor(const[name,fn,target]of[['main-main',Element.prototype.animate,main],['child-child',child.Element.prototype.animate,other],['main-child',Element.prototype.animate,other],['child-main',child.Element.prototype.animate,main]]){const a=fn.call(target),pr=Object.getOwnPropertyDescriptor(Animation.prototype,'ready').get,cr=Object.getOwnPropertyDescriptor(child.Animation.prototype,'ready').get;out.push([name,{main:a instanceof Animation,child:a instanceof child.Animation,readyMain:a.ready instanceof Promise,readyChild:a.ready instanceof child.Promise,borrowedReadySame:pr.call(a)===cr.call(a),effect:a.effect,timeline:a.timeline,childArray:child.Element.prototype.getAnimations.call(target)instanceof child.Array,mainArray:Element.prototype.getAnimations.call(target)instanceof Array}]);a.finished.catch(()=>{});a.cancel();}\n{const a=Element.prototype.animate.call(other),f=a.finished;let rejection;f.catch(e=>rejection={main:e instanceof DOMException,child:e instanceof child.DOMException,name:e.name,message:e.message});child.Animation.prototype.cancel.call(a);a.finished.catch(()=>{});await Promise.resolve();out.push(['borrow-cancel-error',rejection]);}\n{const a=other.animate(),events=[];a.finished.then(()=>events.push('promise'),()=>events.push('reject'));a.addEventListener('finish',()=>events.push('finish'));frame.remove();await wait(30);out.push(['retired-existing',{state:a.playState,events:events.slice()}]);a.play();await wait(30);out.push(['retired-replay',{state:a.playState,events:events.slice()}]);a.finished.catch(()=>{});a.cancel();}\nreturn out;})()\n",
++  "sourceSHA256": "28ef8389b447552ae655767ebd836ca49cecf6fd53a2ca95b0b0a8eb3b5a1bca",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "main-main",
++      {
++        "main": true,
++        "child": false,
++        "readyMain": true,
++        "readyChild": false,
++        "borrowedReadySame": true,
++        "effect": null,
++        "timeline": null,
++        "childArray": true,
++        "mainArray": true
++      }
++    ],
++    [
++      "child-child",
++      {
++        "main": false,
++        "child": true,
++        "readyMain": false,
++        "readyChild": true,
++        "borrowedReadySame": true,
++        "effect": null,
++        "timeline": null,
++        "childArray": true,
++        "mainArray": true
++      }
++    ],
++    [
++      "main-child",
++      {
++        "main": true,
++        "child": false,
++        "readyMain": true,
++        "readyChild": false,
++        "borrowedReadySame": true,
++        "effect": null,
++        "timeline": null,
++        "childArray": true,
++        "mainArray": true
++      }
++    ],
++    [
++      "child-main",
++      {
++        "main": false,
++        "child": true,
++        "readyMain": false,
++        "readyChild": true,
++        "borrowedReadySame": true,
++        "effect": null,
++        "timeline": null,
++        "childArray": true,
++        "mainArray": true
++      }
++    ],
++    [
++      "borrow-cancel-error",
++      {
++        "main": false,
++        "child": true,
++        "name": "AbortError",
++        "message": "The operation was aborted"
++      }
++    ],
++    [
++      "retired-existing",
++      {
++        "state": "running",
++        "events": []
++      }
++    ],
++    [
++      "retired-replay",
++      {
++        "state": "running",
++        "events": []
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 141262,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793436429838 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:37753 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    },
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-retirement.json
+@@ -0,0 +1,88 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "retirement",
++  "source": "(async()=>{const rows=[],wait=ms=>new Promise(r=>setTimeout(r,ms));for(const mode of['pause-play','new-animation','queued-finish']){const frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow,el=child.document.createElement('div'),a=el.animate(),events=[];a.finished.then(()=>events.push('resolved'),()=>events.push('rejected'));a.onfinish=()=>events.push('finish');if(mode==='queued-finish')a.finish();frame.remove();if(mode==='pause-play'){a.pause();a.play()}else if(mode==='new-animation'){const b=el.animate();b.finished.then(()=>events.push('new-resolved'),()=>events.push('new-rejected'));b.onfinish=()=>events.push('new-finish');}await wait(35);rows.push([mode,{state:a.playState,events:events.slice()}]);}return rows;})()\n",
++  "sourceSHA256": "a610958620edcc2d125880413c9d0a6eeb08230ef8e9cae4988768aedd237798",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "pause-play",
++      {
++        "state": "finished",
++        "events": [
++          "resolved",
++          "finish"
++        ]
++      }
++    ],
++    [
++      "new-animation",
++      {
++        "state": "running",
++        "events": [
++          "new-resolved",
++          "new-finish"
++        ]
++      }
++    ],
++    [
++      "queued-finish",
++      {
++        "state": "finished",
++        "events": [
++          "resolved"
++        ]
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 147623,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793437064574 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:33067 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    },
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    },
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    },
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-state-final.json
+@@ -0,0 +1,601 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "state",
++  "source": "(async()=>{\n const rows=[],norm=x=>x===undefined?'__undefined__':typeof x==='number'&&!Number.isFinite(x)?String(x):x;\n const wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');\n const snapshot=a=>({state:a.playState,startTime:norm(a.startTime),effect:a.effect===null?'null':typeof a.effect,timeline:a.timeline===null?'null':typeof a.timeline,pending:a.pending});\n const make=()=>{const a=el.animate([{opacity:0},{opacity:1}],{duration:1e9,iterations:Infinity});a.finished.catch(()=>{});return a};\n for(const action of['play','pause','finish','reverse','cancel']){\n  const a=make(),firstReady=a.ready,firstFinished=a.finished,events=[];a.onfinish=e=>events.push(['finish',e.currentTime,e.timelineTime,e.isTrusted,a.playState]);a.oncancel=e=>events.push(['cancel',e.currentTime,e.timelineTime,e.isTrusted,a.playState]);\n  firstReady.then(x=>events.push(['ready',x===a,a.playState]));firstFinished.then(x=>events.push(['resolved',x===a,a.playState]),e=>events.push(['rejected',e.name,e.message,a.playState]));\n  const before=snapshot(a),returned=a[action](),after=snapshot(a),same={ready:firstReady===a.ready,finished:firstFinished===a.finished};a.finished.catch(()=>{});await Promise.resolve();const micro=events.slice();await wait(35);rows.push([action,{before,returned:norm(returned),after,same,micro,events:events.slice(),end:snapshot(a)}]);a.cancel();a.finished.catch(()=>{});\n }\n for(const start of['running','paused','idle','finished'])for(const action of['play','pause','finish','reverse','cancel']){\n  const a=make();if(start==='paused')a.pause();if(start==='idle')a.cancel();if(start==='finished')a.finish();a.finished.catch(()=>{});const r=a.ready,f=a.finished;let returned,error;try{returned=norm(a[action]())}catch(e){error=[e.name,e.message]}a.finished.catch(()=>{});rows.push(['transition:'+start+':'+action,{state:a.playState,returned,error,readySame:r===a.ready,finishedSame:f===a.finished,startTime:norm(a.startTime)}]);a.cancel();a.finished.catch(()=>{});\n }\n {const a=make(),order=[];a.finished.then(()=>order.push('promise'));a.addEventListener('finish',()=>order.push('first-listener'));a.onfinish=()=>order.push('handler');a.addEventListener('finish',()=>order.push('last-listener'));a.finish();order.push('sync');await Promise.resolve();const micro=order.slice();await wait(25);rows.push(['finish-order',{micro,order}]);}\n {const a=make(),events=[];a.addEventListener('finish',()=>events.push('finish'));a.addEventListener('cancel',()=>events.push('cancel'));a.finish();a.cancel();a.finished.catch(()=>{});await wait(25);rows.push(['finish-then-cancel',{events,state:a.playState}]);}\n {const a=make(),events=[];a.addEventListener('finish',()=>events.push('finish'));a.addEventListener('cancel',()=>events.push('cancel'));a.cancel();a.play();a.finished.catch(()=>{});await wait(35);rows.push(['cancel-then-play',{events,state:a.playState}]);}\n {const a=make(),events=[];a.finished.then(()=>events.push('old-promise'),()=>events.push('old-reject'));a.finish();a.play();a.finished.then(()=>events.push('new-promise'),()=>events.push('new-reject'));a.addEventListener('finish',()=>events.push('event'));await wait(35);rows.push(['finish-then-play',{events,state:a.playState}]);}\n {const a=make(),events=[];a.pause();await wait(25);events.push(snapshot(a));a.startTime=33;a.play();await a.finished;events.push(snapshot(a));rows.push(['pause-resume',events]);}\n {const a=make();a.startTime=77;a.pause();const paused=a.startTime;a.finish();const finished=a.startTime;a.cancel();rows.push(['time-mutators',{paused,finished,canceled:a.startTime}]);}\n return rows;\n})()\n",
++  "sourceSHA256": "157c45b853c806cc316f0697fac3fce301b630e08313d2239fefaaaa68cc8315",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "play",
++      {
++        "before": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "returned": "__undefined__",
++        "after": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "same": {
++          "ready": true,
++          "finished": true
++        },
++        "micro": [
++          [
++            "ready",
++            true,
++            "running"
++          ]
++        ],
++        "events": [
++          [
++            "ready",
++            true,
++            "running"
++          ],
++          [
++            "resolved",
++            true,
++            "finished"
++          ],
++          [
++            "finish",
++            null,
++            null,
++            true,
++            "finished"
++          ]
++        ],
++        "end": {
++          "state": "finished",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        }
++      }
++    ],
++    [
++      "pause",
++      {
++        "before": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "returned": "__undefined__",
++        "after": {
++          "state": "paused",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "same": {
++          "ready": true,
++          "finished": true
++        },
++        "micro": [
++          [
++            "ready",
++            true,
++            "paused"
++          ]
++        ],
++        "events": [
++          [
++            "ready",
++            true,
++            "paused"
++          ]
++        ],
++        "end": {
++          "state": "paused",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        }
++      }
++    ],
++    [
++      "finish",
++      {
++        "before": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "returned": "__undefined__",
++        "after": {
++          "state": "finished",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "same": {
++          "ready": true,
++          "finished": true
++        },
++        "micro": [
++          [
++            "ready",
++            true,
++            "finished"
++          ],
++          [
++            "resolved",
++            true,
++            "finished"
++          ]
++        ],
++        "events": [
++          [
++            "ready",
++            true,
++            "finished"
++          ],
++          [
++            "resolved",
++            true,
++            "finished"
++          ],
++          [
++            "finish",
++            null,
++            null,
++            true,
++            "finished"
++          ]
++        ],
++        "end": {
++          "state": "finished",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        }
++      }
++    ],
++    [
++      "reverse",
++      {
++        "before": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "returned": "__undefined__",
++        "after": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "same": {
++          "ready": true,
++          "finished": true
++        },
++        "micro": [
++          [
++            "ready",
++            true,
++            "running"
++          ]
++        ],
++        "events": [
++          [
++            "ready",
++            true,
++            "running"
++          ],
++          [
++            "resolved",
++            true,
++            "finished"
++          ],
++          [
++            "finish",
++            null,
++            null,
++            true,
++            "finished"
++          ]
++        ],
++        "end": {
++          "state": "finished",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        }
++      }
++    ],
++    [
++      "cancel",
++      {
++        "before": {
++          "state": "running",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "returned": "__undefined__",
++        "after": {
++          "state": "idle",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        "same": {
++          "ready": true,
++          "finished": false
++        },
++        "micro": [
++          [
++            "ready",
++            true,
++            "idle"
++          ],
++          [
++            "rejected",
++            "AbortError",
++            "The operation was aborted",
++            "idle"
++          ]
++        ],
++        "events": [
++          [
++            "ready",
++            true,
++            "idle"
++          ],
++          [
++            "rejected",
++            "AbortError",
++            "The operation was aborted",
++            "idle"
++          ],
++          [
++            "cancel",
++            null,
++            null,
++            true,
++            "idle"
++          ]
++        ],
++        "end": {
++          "state": "idle",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        }
++      }
++    ],
++    [
++      "transition:running:play",
++      {
++        "state": "running",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:running:pause",
++      {
++        "state": "paused",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:running:finish",
++      {
++        "state": "finished",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:running:reverse",
++      {
++        "state": "running",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:running:cancel",
++      {
++        "state": "idle",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": false,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:paused:play",
++      {
++        "state": "running",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:paused:pause",
++      {
++        "state": "paused",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:paused:finish",
++      {
++        "state": "finished",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:paused:reverse",
++      {
++        "state": "paused",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:paused:cancel",
++      {
++        "state": "idle",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": false,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:idle:play",
++      {
++        "state": "running",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:idle:pause",
++      {
++        "state": "paused",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:idle:finish",
++      {
++        "state": "finished",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:idle:reverse",
++      {
++        "state": "idle",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:idle:cancel",
++      {
++        "state": "idle",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:finished:play",
++      {
++        "state": "running",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:finished:pause",
++      {
++        "state": "paused",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:finished:finish",
++      {
++        "state": "finished",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:finished:reverse",
++      {
++        "state": "finished",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": true,
++        "startTime": null
++      }
++    ],
++    [
++      "transition:finished:cancel",
++      {
++        "state": "idle",
++        "returned": "__undefined__",
++        "readySame": true,
++        "finishedSame": false,
++        "startTime": null
++      }
++    ],
++    [
++      "finish-order",
++      {
++        "micro": [
++          "sync",
++          "promise"
++        ],
++        "order": [
++          "sync",
++          "promise",
++          "first-listener",
++          "handler",
++          "last-listener"
++        ]
++      }
++    ],
++    [
++      "finish-then-cancel",
++      {
++        "events": [
++          "finish",
++          "cancel"
++        ],
++        "state": "idle"
++      }
++    ],
++    [
++      "cancel-then-play",
++      {
++        "events": [
++          "cancel",
++          "finish"
++        ],
++        "state": "finished"
++      }
++    ],
++    [
++      "finish-then-play",
++      {
++        "events": [
++          "old-promise",
++          "new-promise",
++          "event",
++          "event"
++        ],
++        "state": "finished"
++      }
++    ],
++    [
++      "pause-resume",
++      [
++        {
++          "state": "paused",
++          "startTime": null,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        },
++        {
++          "state": "finished",
++          "startTime": 33,
++          "effect": "null",
++          "timeline": "null",
++          "pending": false
++        }
++      ]
++    ],
++    [
++      "time-mutators",
++      {
++        "paused": 77,
++        "finished": 77,
++        "canceled": 77
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 141216,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793436427852 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:36561 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-style-stable.json
+@@ -0,0 +1,152 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "style",
++  "source": "(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');document.body.append(el);el.style.cssText='opacity:0.4;width:12px;transform:translateX(3px)';const read=()=>({opacity:getComputedStyle(el).opacity,width:getComputedStyle(el).width,transform:getComputedStyle(el).transform});const before=read(),a=el.animate([{opacity:0,width:'10px',transform:'translateX(0px)'},{opacity:1,width:'200px',transform:'translateX(100px)'}],{duration:1e9,fill:'forwards',iterations:Infinity});out.push(['start',{before,after:read(),state:a.playState,all:el.getAnimations().length}]);await a.finished;out.push(['after-finished',{style:read(),state:a.playState,all:el.getAnimations().length}]);a.cancel();out.push(['after-cancel',{style:read(),state:a.playState}]);\nfor(const mode of['play','reverse']){const a=el.animate();a.finished.catch(()=>{});const events=[];a.onfinish=()=>events.push('finished');setTimeout(()=>{a[mode]();events.push('acted')},6);setTimeout(()=>events.push('middle:'+a.playState),12);await wait(35);await wait(0);out.push(['timer:'+mode,{actions:events.filter(x=>x==='acted'),samples:events.filter(x=>x.startsWith('middle:')),finishEvents:events.filter(x=>x==='finished').length,state:a.playState}]);a.cancel();}\nfor(const mode of['replace','clear-and-replace']){const a=el.animate(),events=[];a.addEventListener('finish',()=>events.push('first'));a.onfinish=()=>events.push('old');a.addEventListener('finish',()=>events.push('last'));if(mode==='clear-and-replace')a.onfinish=null;a.onfinish=()=>events.push('new');a.finish();await wait(20);out.push(['handler-order:'+mode,events]);}\n{const a=el.animate();a.pause();const events=[];a.onfinish=e=>{events.push(['handler',e.defaultPrevented]);return false};a.addEventListener('finish',e=>events.push(['listener',e.defaultPrevented]));const e=new AnimationPlaybackEvent('finish',{cancelable:true});out.push(['handler-return',{returned:a.dispatchEvent(e),prevented:e.defaultPrevented,events}]);a.finished.catch(()=>{});a.cancel();}\n{const gets=[],init=new Proxy({currentTime:2,timelineTime:3},{get(t,k){gets.push(String(k));return t[k]}});const e=new AnimationPlaybackEvent({toString(){gets.push('type');return'x'}},init);out.push(['event-order',{gets,currentTime:e.currentTime,timelineTime:e.timelineTime}]);}\nreturn out;})()\n",
++  "sourceSHA256": "a518b64e4e41b648d956fb19ee0fe0d034063e5dffd54d52c0e07dd95333d208",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "start",
++      {
++        "before": {
++          "opacity": "0.4",
++          "width": "12px",
++          "transform": "matrix(1, 0, 0, 1, 3, 0)"
++        },
++        "after": {
++          "opacity": "0.4",
++          "width": "12px",
++          "transform": "matrix(1, 0, 0, 1, 3, 0)"
++        },
++        "state": "running",
++        "all": 0
++      }
++    ],
++    [
++      "after-finished",
++      {
++        "style": {
++          "opacity": "0.4",
++          "width": "12px",
++          "transform": "matrix(1, 0, 0, 1, 3, 0)"
++        },
++        "state": "finished",
++        "all": 0
++      }
++    ],
++    [
++      "after-cancel",
++      {
++        "style": {
++          "opacity": "0.4",
++          "width": "12px",
++          "transform": "matrix(1, 0, 0, 1, 3, 0)"
++        },
++        "state": "idle"
++      }
++    ],
++    [
++      "timer:play",
++      {
++        "actions": [
++          "acted"
++        ],
++        "samples": [
++          "middle:finished"
++        ],
++        "finishEvents": 1,
++        "state": "finished"
++      }
++    ],
++    [
++      "timer:reverse",
++      {
++        "actions": [
++          "acted"
++        ],
++        "samples": [
++          "middle:finished"
++        ],
++        "finishEvents": 1,
++        "state": "finished"
++      }
++    ],
++    [
++      "handler-order:replace",
++      [
++        "first",
++        "new",
++        "last"
++      ]
++    ],
++    [
++      "handler-order:clear-and-replace",
++      [
++        "first",
++        "last",
++        "new"
++      ]
++    ],
++    [
++      "handler-return",
++      {
++        "returned": false,
++        "prevented": true,
++        "events": [
++          [
++            "handler",
++            false
++          ],
++          [
++            "listener",
++            true
++          ]
++        ]
++      }
++    ],
++    [
++      "event-order",
++      {
++        "gets": [
++          "type",
++          "currentTime",
++          "timelineTime"
++        ],
++        "currentTime": 2,
++        "timelineTime": 3
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 151562,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793437356355 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:46233 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-surface-final.json
+@@ -0,0 +1,330 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "surface",
++  "source": "(()=>{\n const out=[],names=['Animation','AnimationPlaybackEvent','AnimationEffect','KeyframeEffect','AnimationTimeline','DocumentTimeline'];\n const norm=value=>value===undefined?'__undefined__':typeof value==='number'&&!Number.isFinite(value)?String(value):value;\n const attempt=(name,fn)=>{try{out.push([name,{value:fn()}]);}catch(e){out.push([name,{error:e.name,message:e.message}]);}};\n for(const name of names)attempt('global:'+name,()=>({type:typeof globalThis[name],own:Object.hasOwn(globalThis,name),prototype:typeof globalThis[name]==='function'?Object.getOwnPropertyNames(globalThis[name].prototype):null}));\n attempt('document-surface',()=>({timeline:norm(document.timeline),getAnimations:typeof document.getAnimations,elementAnimate:typeof Element.prototype.animate,elementGetAnimations:typeof Element.prototype.getAnimations,shadowGetAnimations:typeof ShadowRoot.prototype.getAnimations}));\n for(const [label,args]of [['none',[]],['null',[null]],['objects',[{},{}]],['numeric',[12,42]]])attempt('new Animation:'+label,()=>{const a=new Animation(...args);const row={tag:Object.prototype.toString.call(a),eventTarget:a instanceof EventTarget,keys:Object.keys(a)};for(const key of ['id','currentTime','startTime','playbackRate','playState','pending','replaceState','effect','timeline','ready','finished','onfinish','oncancel','onremove'])row[key]=['ready','finished'].includes(key)?{promise:a[key] instanceof Promise}:norm(a[key]);a.finished?.catch(()=>{});a.cancel?.();return row;});\n attempt('Animation-call',()=>norm(Animation()));\n for(const name of names)if(typeof globalThis[name]==='function')attempt('shape:'+name,()=>({length:globalThis[name].length,constructorDescriptor:Object.getOwnPropertyDescriptor(globalThis[name].prototype,'constructor'),descriptors:Object.fromEntries(Reflect.ownKeys(globalThis[name].prototype).map(key=>{const d=Object.getOwnPropertyDescriptor(globalThis[name].prototype,key);return[String(key),{enumerable:d.enumerable,configurable:d.configurable,writable:d.writable,get:d.get?.name,set:d.set?.name,valueType:typeof d.value,length:typeof d.value==='function'?d.value.length:undefined}]}))}));\n return out;\n})()\n",
++  "sourceSHA256": "27b258ac55b8d68e746b842251d6436caa2c95dc2eca814b4374bcbfa7c1760f",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "global:Animation",
++      {
++        "value": {
++          "type": "function",
++          "own": true,
++          "prototype": [
++            "play",
++            "pause",
++            "cancel",
++            "finish",
++            "reverse",
++            "playState",
++            "pending",
++            "finished",
++            "ready",
++            "effect",
++            "timeline",
++            "startTime",
++            "onfinish",
++            "oncancel",
++            "constructor"
++          ]
++        }
++      }
++    ],
++    [
++      "global:AnimationPlaybackEvent",
++      {
++        "value": {
++          "type": "function",
++          "own": true,
++          "prototype": [
++            "currentTime",
++            "timelineTime",
++            "constructor"
++          ]
++        }
++      }
++    ],
++    [
++      "global:AnimationEffect",
++      {
++        "value": {
++          "type": "undefined",
++          "own": false,
++          "prototype": null
++        }
++      }
++    ],
++    [
++      "global:KeyframeEffect",
++      {
++        "value": {
++          "type": "undefined",
++          "own": false,
++          "prototype": null
++        }
++      }
++    ],
++    [
++      "global:AnimationTimeline",
++      {
++        "value": {
++          "type": "undefined",
++          "own": false,
++          "prototype": null
++        }
++      }
++    ],
++    [
++      "global:DocumentTimeline",
++      {
++        "value": {
++          "type": "undefined",
++          "own": false,
++          "prototype": null
++        }
++      }
++    ],
++    [
++      "document-surface",
++      {
++        "value": {
++          "timeline": "__undefined__",
++          "getAnimations": "undefined",
++          "elementAnimate": "function",
++          "elementGetAnimations": "function",
++          "shadowGetAnimations": "undefined"
++        }
++      }
++    ],
++    [
++      "new Animation:none",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "new Animation:null",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "new Animation:objects",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "new Animation:numeric",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "Animation-call",
++      {
++        "error": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    ],
++    [
++      "shape:Animation",
++      {
++        "value": {
++          "length": 0,
++          "constructorDescriptor": {
++            "writable": true,
++            "enumerable": false,
++            "configurable": true
++          },
++          "descriptors": {
++            "play": {
++              "enumerable": true,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 0
++            },
++            "pause": {
++              "enumerable": true,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 0
++            },
++            "cancel": {
++              "enumerable": true,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 0
++            },
++            "finish": {
++              "enumerable": true,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 0
++            },
++            "reverse": {
++              "enumerable": true,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 0
++            },
++            "playState": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get playState",
++              "valueType": "undefined"
++            },
++            "pending": {
++              "enumerable": true,
++              "configurable": false,
++              "writable": false,
++              "valueType": "boolean"
++            },
++            "finished": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get finished",
++              "valueType": "undefined"
++            },
++            "ready": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get ready",
++              "valueType": "undefined"
++            },
++            "effect": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get effect",
++              "set": "set effect",
++              "valueType": "undefined"
++            },
++            "timeline": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get timeline",
++              "set": "set timeline",
++              "valueType": "undefined"
++            },
++            "startTime": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get startTime",
++              "set": "set startTime",
++              "valueType": "undefined"
++            },
++            "onfinish": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get onfinish",
++              "set": "set onfinish",
++              "valueType": "undefined"
++            },
++            "oncancel": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get oncancel",
++              "set": "set oncancel",
++              "valueType": "undefined"
++            },
++            "constructor": {
++              "enumerable": false,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 0
++            },
++            "Symbol(Symbol.toStringTag)": {
++              "enumerable": false,
++              "configurable": true,
++              "writable": false,
++              "valueType": "string"
++            }
++          }
++        }
++      }
++    ],
++    [
++      "shape:AnimationPlaybackEvent",
++      {
++        "value": {
++          "length": 1,
++          "constructorDescriptor": {
++            "writable": true,
++            "enumerable": false,
++            "configurable": true
++          },
++          "descriptors": {
++            "currentTime": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get currentTime",
++              "valueType": "undefined"
++            },
++            "timelineTime": {
++              "enumerable": true,
++              "configurable": true,
++              "get": "get timelineTime",
++              "valueType": "undefined"
++            },
++            "constructor": {
++              "enumerable": false,
++              "configurable": true,
++              "writable": true,
++              "valueType": "function",
++              "length": 1
++            },
++            "Symbol(Symbol.toStringTag)": {
++              "enumerable": false,
++              "configurable": true,
++              "writable": false,
++              "valueType": "string"
++            }
++          }
++        }
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 139039,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793436154163 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:46529 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-native-values.json
+@@ -0,0 +1,769 @@
++{
++  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
++  "name": "values",
++  "source": "(async()=>{\n const out=[],norm=x=>x===undefined?'__undefined__':typeof x==='number'&&!Number.isFinite(x)?String(x):x;\n const record=a=>{const r={tag:Object.prototype.toString.call(a),target:a instanceof EventTarget,own:Object.keys(a)};for(const k of['playState','pending','effect','timeline','startTime','currentTime','playbackRate','id','replaceState','onfinish','oncancel','onremove'])r[k]=norm(a[k]);r.readyPromise=a.ready instanceof Promise;r.finishedPromise=a.finished instanceof Promise;r.readySame=a.ready===a.ready;r.finishedSame=a.finished===a.finished;return r};\n const attempt=(name,fn)=>{try{out.push([name,{value:fn()}]);}catch(e){out.push([name,{error:e.name,message:e.message}]);}};\n const el=document.createElement('div');document.body.append(el);\n for(const[name,args]of[['none',[]],['null',[null]],['empty',[[]]],['number',[1]],['symbol',[Symbol('x')]],['options',[null,{duration:1e6,id:'wanted'}]],['throws-options',[{get opacity(){throw Error('keyframes read')}},new Proxy({},{get(){throw Error('options read')}})]],['infinite',[null,{duration:Infinity,iterations:Infinity,delay:1e9,fill:'both'}]]])attempt('animate:'+name,()=>{const a=el.animate(...args);const r=record(a);a.finished.catch(()=>{});a.cancel();return r});\n attempt('element-getAnimations',()=>{const a=el.animate(null,{duration:1e9}),r={array:el.getAnimations()instanceof Array,list:el.getAnimations().map(x=>x===a),fresh:el.getAnimations()!==el.getAnimations(),all:document.body.getAnimations().length,subtree:document.body.getAnimations({subtree:true}).length};a.finished.catch(()=>{});a.cancel();return r});\n const a=el.animate();a.finished.catch(()=>{});a.cancel();\n for(const key of['startTime','effect','timeline'])for(const[label,value]of[['undefined',undefined],['null',null],['number',42.5],['string','7.25'],['nan',NaN],['infinity',Infinity],['symbol',Symbol('v')],['object',{toString(){return'converted'},valueOf(){return 4.5}}]])attempt('set:'+key+':'+label,()=>{a[key]=value;return norm(a[key])});\n for(const[name,fn]of[['animate-method-length',()=>Element.prototype.animate.length],['getAnimations-method-length',()=>Element.prototype.getAnimations.length],['getAnimations-options',()=>{let reads=[];const list=el.getAnimations(new Proxy({},{get(t,k){reads.push(String(k));throw Error('read')}}));return{length:list.length,reads}}],['animate-illegal',()=>Element.prototype.animate.call({})],['getAnimations-illegal',()=>Element.prototype.getAnimations.call({})]])attempt(name,fn);\n for(const[key,method]of Object.entries(Object.getOwnPropertyDescriptors(Animation.prototype))){if(key==='constructor')continue;if(method.get)attempt('fake-get:'+key,()=>norm(method.get.call({})));if(method.value instanceof Function)attempt('fake-method:'+key,()=>norm(method.value.call({})));}\n for(const[desc,value]of[['null',null],['undefined',undefined],['object',{}],['number',3],['callable',()=>{}]])attempt('handler:'+desc,()=>{a.onfinish=value;return{same:a.onfinish===value,type:typeof a.onfinish,value:a.onfinish===null?'null':'other'}});\n for(const[label,args]of[['missing',[]],['type-only',['finish']],['null-init',['x',null]],['values',['done',{currentTime:42.5,timelineTime:9,bubbles:true,cancelable:true,composed:true}]],['coerce',['x',{currentTime:'3.5',timelineTime:false}]],['bad',['x',{currentTime:NaN}]],['inf',['x',{timelineTime:Infinity}]],['symbol',['x',{currentTime:Symbol('n')}]],['symbol-type',[Symbol('name')]],['primitive-init',['x',1]]])attempt('event:'+label,()=>{const e=new AnimationPlaybackEvent(...args);return{tag:Object.prototype.toString.call(e),event:e instanceof Event,type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,currentTime:norm(e.currentTime),timelineTime:norm(e.timelineTime),trusted:e.isTrusted}});\n const ev=new AnimationPlaybackEvent('x');for(const key of['currentTime','timelineTime'])attempt('event-fake-get:'+key,()=>norm(Object.getOwnPropertyDescriptor(AnimationPlaybackEvent.prototype,key).get.call({})));\n for(const value of[a,ev,Object.create(Animation.prototype),Object.create(AnimationPlaybackEvent.prototype)])attempt('clone:'+Object.prototype.toString.call(value),()=>({keys:Object.keys(structuredClone(value))}));\n return out;\n})()\n",
++  "sourceSHA256": "618646649d93fa12a2d31555d0bc82cba20177086ced4473a9ae3c9a02d4cabf",
++  "binary": {
++    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
++  },
++  "args": [
++    "--load-resources",
++    "iframe",
++    "--load-resources",
++    "worker"
++  ],
++  "version": {
++    "protocolVersion": "1.3",
++    "product": "Chrome/124.0.6367.29",
++    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++    "jsVersion": "12.4.254.8"
++  },
++  "result": [
++    [
++      "animate:none",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:null",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:empty",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:number",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:symbol",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:options",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:throws-options",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "animate:infinite",
++      {
++        "value": {
++          "tag": "[object Animation]",
++          "target": true,
++          "own": [],
++          "playState": "running",
++          "pending": false,
++          "effect": null,
++          "timeline": null,
++          "startTime": null,
++          "currentTime": "__undefined__",
++          "playbackRate": "__undefined__",
++          "id": "__undefined__",
++          "replaceState": "__undefined__",
++          "onfinish": null,
++          "oncancel": null,
++          "onremove": "__undefined__",
++          "readyPromise": true,
++          "finishedPromise": true,
++          "readySame": true,
++          "finishedSame": true
++        }
++      }
++    ],
++    [
++      "element-getAnimations",
++      {
++        "value": {
++          "array": true,
++          "list": [],
++          "fresh": true,
++          "all": 0,
++          "subtree": 0
++        }
++      }
++    ],
++    [
++      "set:startTime:undefined",
++      {
++        "value": null
++      }
++    ],
++    [
++      "set:startTime:null",
++      {
++        "value": null
++      }
++    ],
++    [
++      "set:startTime:number",
++      {
++        "value": 42.5
++      }
++    ],
++    [
++      "set:startTime:string",
++      {
++        "value": 7.25
++      }
++    ],
++    [
++      "set:startTime:nan",
++      {
++        "value": "NaN"
++      }
++    ],
++    [
++      "set:startTime:infinity",
++      {
++        "value": "Infinity"
++      }
++    ],
++    [
++      "set:startTime:symbol",
++      {
++        "error": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    ],
++    [
++      "set:startTime:object",
++      {
++        "value": 4.5
++      }
++    ],
++    [
++      "set:effect:undefined",
++      {
++        "value": null
++      }
++    ],
++    [
++      "set:effect:null",
++      {
++        "value": null
++      }
++    ],
++    [
++      "set:effect:number",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:effect:string",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:effect:nan",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:effect:infinity",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:effect:symbol",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:effect:object",
++      {
++        "value": {}
++      }
++    ],
++    [
++      "set:timeline:undefined",
++      {
++        "value": null
++      }
++    ],
++    [
++      "set:timeline:null",
++      {
++        "value": null
++      }
++    ],
++    [
++      "set:timeline:number",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:timeline:string",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:timeline:nan",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:timeline:infinity",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:timeline:symbol",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "set:timeline:object",
++      {
++        "value": {}
++      }
++    ],
++    [
++      "animate-method-length",
++      {
++        "value": 0
++      }
++    ],
++    [
++      "getAnimations-method-length",
++      {
++        "value": 0
++      }
++    ],
++    [
++      "getAnimations-options",
++      {
++        "value": {
++          "length": 0,
++          "reads": []
++        }
++      }
++    ],
++    [
++      "animate-illegal",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "getAnimations-illegal",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-method:play",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-method:pause",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-method:cancel",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-method:finish",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-method:reverse",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:playState",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:finished",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:ready",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:effect",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:timeline",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:startTime",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:onfinish",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "fake-get:oncancel",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "handler:null",
++      {
++        "value": {
++          "same": true,
++          "type": "object",
++          "value": "null"
++        }
++      }
++    ],
++    [
++      "handler:undefined",
++      {
++        "value": {
++          "same": false,
++          "type": "object",
++          "value": "null"
++        }
++      }
++    ],
++    [
++      "handler:object",
++      {
++        "value": {
++          "same": false,
++          "type": "object",
++          "value": "null"
++        }
++      }
++    ],
++    [
++      "handler:number",
++      {
++        "value": {
++          "same": false,
++          "type": "object",
++          "value": "null"
++        }
++      }
++    ],
++    [
++      "handler:callable",
++      {
++        "value": {
++          "same": true,
++          "type": "function",
++          "value": "other"
++        }
++      }
++    ],
++    [
++      "event:missing",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "event:type-only",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "finish",
++          "bubbles": false,
++          "cancelable": false,
++          "composed": false,
++          "currentTime": null,
++          "timelineTime": null,
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:null-init",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "x",
++          "bubbles": false,
++          "cancelable": false,
++          "composed": false,
++          "currentTime": null,
++          "timelineTime": null,
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:values",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "done",
++          "bubbles": true,
++          "cancelable": true,
++          "composed": true,
++          "currentTime": 42.5,
++          "timelineTime": 9,
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:coerce",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "x",
++          "bubbles": false,
++          "cancelable": false,
++          "composed": false,
++          "currentTime": 3.5,
++          "timelineTime": 0,
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:bad",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "x",
++          "bubbles": false,
++          "cancelable": false,
++          "composed": false,
++          "currentTime": "NaN",
++          "timelineTime": null,
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:inf",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "x",
++          "bubbles": false,
++          "cancelable": false,
++          "composed": false,
++          "currentTime": null,
++          "timelineTime": "Infinity",
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:symbol",
++      {
++        "error": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    ],
++    [
++      "event:symbol-type",
++      {
++        "value": {
++          "tag": "[object AnimationPlaybackEvent]",
++          "event": true,
++          "type": "name",
++          "bubbles": false,
++          "cancelable": false,
++          "composed": false,
++          "currentTime": null,
++          "timelineTime": null,
++          "trusted": false
++        }
++      }
++    ],
++    [
++      "event:primitive-init",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "event-fake-get:currentTime",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "event-fake-get:timelineTime",
++      {
++        "error": "TypeError",
++        "message": "Illegal invocation"
++      }
++    ],
++    [
++      "clone:[object Animation]",
++      {
++        "error": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    ],
++    [
++      "clone:[object AnimationPlaybackEvent]",
++      {
++        "error": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    ],
++    [
++      "clone:[object Animation]",
++      {
++        "value": {
++          "keys": []
++        }
++      }
++    ],
++    [
++      "clone:[object AnimationPlaybackEvent]",
++      {
++        "value": {
++          "keys": []
++        }
++      }
++    ]
++  ],
++  "events": [],
++  "ownedBrowser": {
++    "pid": 139310,
++    "exitCode": 0,
++    "signal": null,
++    "stderr": "$time=1793436203944 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:43077 max_connections=16120 max_browser_connections=16\n",
++    "stderrTruncated": false
++  },
++  "requests": [
++    {
++      "method": "GET",
++      "path": "/",
++      "status": 200,
++      "routeKnown": true
++    }
++  ]
++}
+--- /dev/null
++++ b/oracle/animations-promises-expression.js
+@@ -0,0 +1,11 @@
++(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div'),unhandled=[];addEventListener('unhandledrejection',e=>{unhandled.push(e.reason?.name??e.reason);e.preventDefault()});
++{Promise.reject('positive-unhandled');await wait(20);out.push(['unhandled-positive',unhandled.splice(0)]);}
++{const a=el.animate();a.cancel();await wait(20);out.push(['unhandled-no-get',unhandled.splice(0)]);}
++{const a=el.animate();const p=a.finished;a.cancel();await wait(20);out.push(['unhandled-get',unhandled.splice(0)]);p.catch(()=>{});}
++{const a=el.animate(),events=[];a.finish();a.play();a.finished.then(()=>events.push('resolved'));await Promise.resolve();const micro=events.slice();await wait(25);out.push(['finish-play-lazy',{micro,events}]);a.finished.catch(()=>{});a.cancel();}
++const frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow;
++for(const key of['ready','finished'])for(const[name,make,get]of[['main-child-get',()=>el.animate(),Object.getOwnPropertyDescriptor(child.Animation.prototype,key).get],['child-main-get',()=>child.document.createElement('div').animate(),Object.getOwnPropertyDescriptor(Animation.prototype,key).get]]){const a=make(),p=get.call(a);out.push([key+':'+name,{main:p instanceof Promise,child:p instanceof child.Promise,same:p===a[key]}]);a.finished.catch(()=>{});a.cancel();}
++for(const[name,make,cancel,get]of[['main-child-cancel-parent-get',()=>el.animate(),child.Animation.prototype.cancel,Object.getOwnPropertyDescriptor(Animation.prototype,'finished').get],['child-parent-cancel-child-get',()=>child.document.createElement('div').animate(),Animation.prototype.cancel,Object.getOwnPropertyDescriptor(child.Animation.prototype,'finished').get]]){const a=make(),first=a.finished;first.catch(()=>{});cancel.call(a);const p=get.call(a);out.push([name,{main:p instanceof Promise,child:p instanceof child.Promise,replaced:first!==p}]);}
++{const a=child.document.createElement('div').animate(),events=[];a.finished.then(()=>events.push('resolved'),()=>events.push('rejected'));a.onfinish=()=>events.push('finish');frame.remove();a.finish();await wait(25);out.push(['retired-explicit-finish',{state:a.playState,events}]);}
++{const a=el.animate(),events=[];a.startTime=88;a.effect={get currentTime(){throw Error('effect consulted')}};a.timeline={get currentTime(){throw Error('timeline consulted')}};a.onfinish=e=>events.push([e.currentTime,e.timelineTime]);a.finish();await wait(20);out.push(['event-times-ignore-slots',events]);}
++return out;})()
+--- /dev/null
++++ b/oracle/animations-realm-expression.js
+@@ -0,0 +1,5 @@
++(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow,main=document.createElement('div'),other=child.document.createElement('div');
++for(const[name,fn,target]of[['main-main',Element.prototype.animate,main],['child-child',child.Element.prototype.animate,other],['main-child',Element.prototype.animate,other],['child-main',child.Element.prototype.animate,main]]){const a=fn.call(target),pr=Object.getOwnPropertyDescriptor(Animation.prototype,'ready').get,cr=Object.getOwnPropertyDescriptor(child.Animation.prototype,'ready').get;out.push([name,{main:a instanceof Animation,child:a instanceof child.Animation,readyMain:a.ready instanceof Promise,readyChild:a.ready instanceof child.Promise,borrowedReadySame:pr.call(a)===cr.call(a),effect:a.effect,timeline:a.timeline,childArray:child.Element.prototype.getAnimations.call(target)instanceof child.Array,mainArray:Element.prototype.getAnimations.call(target)instanceof Array}]);a.finished.catch(()=>{});a.cancel();}
++{const a=Element.prototype.animate.call(other),f=a.finished;let rejection;f.catch(e=>rejection={main:e instanceof DOMException,child:e instanceof child.DOMException,name:e.name,message:e.message});child.Animation.prototype.cancel.call(a);a.finished.catch(()=>{});await Promise.resolve();out.push(['borrow-cancel-error',rejection]);}
++{const a=other.animate(),events=[];a.finished.then(()=>events.push('promise'),()=>events.push('reject'));a.addEventListener('finish',()=>events.push('finish'));frame.remove();await wait(30);out.push(['retired-existing',{state:a.playState,events:events.slice()}]);a.play();await wait(30);out.push(['retired-replay',{state:a.playState,events:events.slice()}]);a.finished.catch(()=>{});a.cancel();}
++return out;})()
+--- /dev/null
++++ b/oracle/animations-retirement-expression.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],wait=ms=>new Promise(r=>setTimeout(r,ms));for(const mode of['pause-play','new-animation','queued-finish']){const frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow,el=child.document.createElement('div'),a=el.animate(),events=[];a.finished.then(()=>events.push('resolved'),()=>events.push('rejected'));a.onfinish=()=>events.push('finish');if(mode==='queued-finish')a.finish();frame.remove();if(mode==='pause-play'){a.pause();a.play()}else if(mode==='new-animation'){const b=el.animate();b.finished.then(()=>events.push('new-resolved'),()=>events.push('new-rejected'));b.onfinish=()=>events.push('new-finish');}await wait(35);rows.push([mode,{state:a.playState,events:events.slice()}]);}return rows;})()
+--- /dev/null
++++ b/oracle/animations-state-expression.js
+@@ -0,0 +1,21 @@
++(async()=>{
++ const rows=[],norm=x=>x===undefined?'__undefined__':typeof x==='number'&&!Number.isFinite(x)?String(x):x;
++ const wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');
++ const snapshot=a=>({state:a.playState,startTime:norm(a.startTime),effect:a.effect===null?'null':typeof a.effect,timeline:a.timeline===null?'null':typeof a.timeline,pending:a.pending});
++ const make=()=>{const a=el.animate([{opacity:0},{opacity:1}],{duration:1e9,iterations:Infinity});a.finished.catch(()=>{});return a};
++ for(const action of['play','pause','finish','reverse','cancel']){
++  const a=make(),firstReady=a.ready,firstFinished=a.finished,events=[];a.onfinish=e=>events.push(['finish',e.currentTime,e.timelineTime,e.isTrusted,a.playState]);a.oncancel=e=>events.push(['cancel',e.currentTime,e.timelineTime,e.isTrusted,a.playState]);
++  firstReady.then(x=>events.push(['ready',x===a,a.playState]));firstFinished.then(x=>events.push(['resolved',x===a,a.playState]),e=>events.push(['rejected',e.name,e.message,a.playState]));
++  const before=snapshot(a),returned=a[action](),after=snapshot(a),same={ready:firstReady===a.ready,finished:firstFinished===a.finished};a.finished.catch(()=>{});await Promise.resolve();const micro=events.slice();await wait(35);rows.push([action,{before,returned:norm(returned),after,same,micro,events:events.slice(),end:snapshot(a)}]);a.cancel();a.finished.catch(()=>{});
++ }
++ for(const start of['running','paused','idle','finished'])for(const action of['play','pause','finish','reverse','cancel']){
++  const a=make();if(start==='paused')a.pause();if(start==='idle')a.cancel();if(start==='finished')a.finish();a.finished.catch(()=>{});const r=a.ready,f=a.finished;let returned,error;try{returned=norm(a[action]())}catch(e){error=[e.name,e.message]}a.finished.catch(()=>{});rows.push(['transition:'+start+':'+action,{state:a.playState,returned,error,readySame:r===a.ready,finishedSame:f===a.finished,startTime:norm(a.startTime)}]);a.cancel();a.finished.catch(()=>{});
++ }
++ {const a=make(),order=[];a.finished.then(()=>order.push('promise'));a.addEventListener('finish',()=>order.push('first-listener'));a.onfinish=()=>order.push('handler');a.addEventListener('finish',()=>order.push('last-listener'));a.finish();order.push('sync');await Promise.resolve();const micro=order.slice();await wait(25);rows.push(['finish-order',{micro,order}]);}
++ {const a=make(),events=[];a.addEventListener('finish',()=>events.push('finish'));a.addEventListener('cancel',()=>events.push('cancel'));a.finish();a.cancel();a.finished.catch(()=>{});await wait(25);rows.push(['finish-then-cancel',{events,state:a.playState}]);}
++ {const a=make(),events=[];a.addEventListener('finish',()=>events.push('finish'));a.addEventListener('cancel',()=>events.push('cancel'));a.cancel();a.play();a.finished.catch(()=>{});await wait(35);rows.push(['cancel-then-play',{events,state:a.playState}]);}
++ {const a=make(),events=[];a.finished.then(()=>events.push('old-promise'),()=>events.push('old-reject'));a.finish();a.play();a.finished.then(()=>events.push('new-promise'),()=>events.push('new-reject'));a.addEventListener('finish',()=>events.push('event'));await wait(35);rows.push(['finish-then-play',{events,state:a.playState}]);}
++ {const a=make(),events=[];a.pause();await wait(25);events.push(snapshot(a));a.startTime=33;a.play();await a.finished;events.push(snapshot(a));rows.push(['pause-resume',events]);}
++ {const a=make();a.startTime=77;a.pause();const paused=a.startTime;a.finish();const finished=a.startTime;a.cancel();rows.push(['time-mutators',{paused,finished,canceled:a.startTime}]);}
++ return rows;
++})()
+--- /dev/null
++++ b/oracle/animations-style-expression.js
+@@ -0,0 +1,6 @@
++(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div');document.body.append(el);el.style.cssText='opacity:0.4;width:12px;transform:translateX(3px)';const read=()=>({opacity:getComputedStyle(el).opacity,width:getComputedStyle(el).width,transform:getComputedStyle(el).transform});const before=read(),a=el.animate([{opacity:0,width:'10px',transform:'translateX(0px)'},{opacity:1,width:'200px',transform:'translateX(100px)'}],{duration:1e9,fill:'forwards',iterations:Infinity});out.push(['start',{before,after:read(),state:a.playState,all:el.getAnimations().length}]);await a.finished;out.push(['after-finished',{style:read(),state:a.playState,all:el.getAnimations().length}]);a.cancel();out.push(['after-cancel',{style:read(),state:a.playState}]);
++for(const mode of['play','reverse']){const a=el.animate();a.finished.catch(()=>{});const events=[];a.onfinish=()=>events.push('finished');setTimeout(()=>{a[mode]();events.push('acted')},6);setTimeout(()=>events.push('middle:'+a.playState),12);await wait(35);await wait(0);out.push(['timer:'+mode,{actions:events.filter(x=>x==='acted'),samples:events.filter(x=>x.startsWith('middle:')),finishEvents:events.filter(x=>x==='finished').length,state:a.playState}]);a.cancel();}
++for(const mode of['replace','clear-and-replace']){const a=el.animate(),events=[];a.addEventListener('finish',()=>events.push('first'));a.onfinish=()=>events.push('old');a.addEventListener('finish',()=>events.push('last'));if(mode==='clear-and-replace')a.onfinish=null;a.onfinish=()=>events.push('new');a.finish();await wait(20);out.push(['handler-order:'+mode,events]);}
++{const a=el.animate();a.pause();const events=[];a.onfinish=e=>{events.push(['handler',e.defaultPrevented]);return false};a.addEventListener('finish',e=>events.push(['listener',e.defaultPrevented]));const e=new AnimationPlaybackEvent('finish',{cancelable:true});out.push(['handler-return',{returned:a.dispatchEvent(e),prevented:e.defaultPrevented,events}]);a.finished.catch(()=>{});a.cancel();}
++{const gets=[],init=new Proxy({currentTime:2,timelineTime:3},{get(t,k){gets.push(String(k));return t[k]}});const e=new AnimationPlaybackEvent({toString(){gets.push('type');return'x'}},init);out.push(['event-order',{gets,currentTime:e.currentTime,timelineTime:e.timelineTime}]);}
++return out;})()
+--- /dev/null
++++ b/oracle/animations-surface-expression.js
+@@ -0,0 +1,11 @@
++(()=>{
++ const out=[],names=['Animation','AnimationPlaybackEvent','AnimationEffect','KeyframeEffect','AnimationTimeline','DocumentTimeline'];
++ const norm=value=>value===undefined?'__undefined__':typeof value==='number'&&!Number.isFinite(value)?String(value):value;
++ const attempt=(name,fn)=>{try{out.push([name,{value:fn()}]);}catch(e){out.push([name,{error:e.name,message:e.message}]);}};
++ for(const name of names)attempt('global:'+name,()=>({type:typeof globalThis[name],own:Object.hasOwn(globalThis,name),prototype:typeof globalThis[name]==='function'?Object.getOwnPropertyNames(globalThis[name].prototype):null}));
++ attempt('document-surface',()=>({timeline:norm(document.timeline),getAnimations:typeof document.getAnimations,elementAnimate:typeof Element.prototype.animate,elementGetAnimations:typeof Element.prototype.getAnimations,shadowGetAnimations:typeof ShadowRoot.prototype.getAnimations}));
++ for(const [label,args]of [['none',[]],['null',[null]],['objects',[{},{}]],['numeric',[12,42]]])attempt('new Animation:'+label,()=>{const a=new Animation(...args);const row={tag:Object.prototype.toString.call(a),eventTarget:a instanceof EventTarget,keys:Object.keys(a)};for(const key of ['id','currentTime','startTime','playbackRate','playState','pending','replaceState','effect','timeline','ready','finished','onfinish','oncancel','onremove'])row[key]=['ready','finished'].includes(key)?{promise:a[key] instanceof Promise}:norm(a[key]);a.finished?.catch(()=>{});a.cancel?.();return row;});
++ attempt('Animation-call',()=>norm(Animation()));
++ for(const name of names)if(typeof globalThis[name]==='function')attempt('shape:'+name,()=>({length:globalThis[name].length,constructorDescriptor:Object.getOwnPropertyDescriptor(globalThis[name].prototype,'constructor'),descriptors:Object.fromEntries(Reflect.ownKeys(globalThis[name].prototype).map(key=>{const d=Object.getOwnPropertyDescriptor(globalThis[name].prototype,key);return[String(key),{enumerable:d.enumerable,configurable:d.configurable,writable:d.writable,get:d.get?.name,set:d.set?.name,valueType:typeof d.value,length:typeof d.value==='function'?d.value.length:undefined}]}))}));
++ return out;
++})()
+--- /dev/null
++++ b/oracle/animations-values-expression.js
+@@ -0,0 +1,17 @@
++(async()=>{
++ const out=[],norm=x=>x===undefined?'__undefined__':typeof x==='number'&&!Number.isFinite(x)?String(x):x;
++ const record=a=>{const r={tag:Object.prototype.toString.call(a),target:a instanceof EventTarget,own:Object.keys(a)};for(const k of['playState','pending','effect','timeline','startTime','currentTime','playbackRate','id','replaceState','onfinish','oncancel','onremove'])r[k]=norm(a[k]);r.readyPromise=a.ready instanceof Promise;r.finishedPromise=a.finished instanceof Promise;r.readySame=a.ready===a.ready;r.finishedSame=a.finished===a.finished;return r};
++ const attempt=(name,fn)=>{try{out.push([name,{value:fn()}]);}catch(e){out.push([name,{error:e.name,message:e.message}]);}};
++ const el=document.createElement('div');document.body.append(el);
++ for(const[name,args]of[['none',[]],['null',[null]],['empty',[[]]],['number',[1]],['symbol',[Symbol('x')]],['options',[null,{duration:1e6,id:'wanted'}]],['throws-options',[{get opacity(){throw Error('keyframes read')}},new Proxy({},{get(){throw Error('options read')}})]],['infinite',[null,{duration:Infinity,iterations:Infinity,delay:1e9,fill:'both'}]]])attempt('animate:'+name,()=>{const a=el.animate(...args);const r=record(a);a.finished.catch(()=>{});a.cancel();return r});
++ attempt('element-getAnimations',()=>{const a=el.animate(null,{duration:1e9}),r={array:el.getAnimations()instanceof Array,list:el.getAnimations().map(x=>x===a),fresh:el.getAnimations()!==el.getAnimations(),all:document.body.getAnimations().length,subtree:document.body.getAnimations({subtree:true}).length};a.finished.catch(()=>{});a.cancel();return r});
++ const a=el.animate();a.finished.catch(()=>{});a.cancel();
++ for(const key of['startTime','effect','timeline'])for(const[label,value]of[['undefined',undefined],['null',null],['number',42.5],['string','7.25'],['nan',NaN],['infinity',Infinity],['symbol',Symbol('v')],['object',{toString(){return'converted'},valueOf(){return 4.5}}]])attempt('set:'+key+':'+label,()=>{a[key]=value;return norm(a[key])});
++ for(const[name,fn]of[['animate-method-length',()=>Element.prototype.animate.length],['getAnimations-method-length',()=>Element.prototype.getAnimations.length],['getAnimations-options',()=>{let reads=[];const list=el.getAnimations(new Proxy({},{get(t,k){reads.push(String(k));throw Error('read')}}));return{length:list.length,reads}}],['animate-illegal',()=>Element.prototype.animate.call({})],['getAnimations-illegal',()=>Element.prototype.getAnimations.call({})]])attempt(name,fn);
++ for(const[key,method]of Object.entries(Object.getOwnPropertyDescriptors(Animation.prototype))){if(key==='constructor')continue;if(method.get)attempt('fake-get:'+key,()=>norm(method.get.call({})));if(method.value instanceof Function)attempt('fake-method:'+key,()=>norm(method.value.call({})));}
++ for(const[desc,value]of[['null',null],['undefined',undefined],['object',{}],['number',3],['callable',()=>{}]])attempt('handler:'+desc,()=>{a.onfinish=value;return{same:a.onfinish===value,type:typeof a.onfinish,value:a.onfinish===null?'null':'other'}});
++ for(const[label,args]of[['missing',[]],['type-only',['finish']],['null-init',['x',null]],['values',['done',{currentTime:42.5,timelineTime:9,bubbles:true,cancelable:true,composed:true}]],['coerce',['x',{currentTime:'3.5',timelineTime:false}]],['bad',['x',{currentTime:NaN}]],['inf',['x',{timelineTime:Infinity}]],['symbol',['x',{currentTime:Symbol('n')}]],['symbol-type',[Symbol('name')]],['primitive-init',['x',1]]])attempt('event:'+label,()=>{const e=new AnimationPlaybackEvent(...args);return{tag:Object.prototype.toString.call(e),event:e instanceof Event,type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,currentTime:norm(e.currentTime),timelineTime:norm(e.timelineTime),trusted:e.isTrusted}});
++ const ev=new AnimationPlaybackEvent('x');for(const key of['currentTime','timelineTime'])attempt('event-fake-get:'+key,()=>norm(Object.getOwnPropertyDescriptor(AnimationPlaybackEvent.prototype,key).get.call({})));
++ for(const value of[a,ev,Object.create(Animation.prototype),Object.create(AnimationPlaybackEvent.prototype)])attempt('clone:'+Object.prototype.toString.call(value),()=>({keys:Object.keys(structuredClone(value))}));
++ return out;
++})()

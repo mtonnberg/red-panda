@@ -1,0 +1,11 @@
+(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
+await run('ctxGetterOffline',()=>Object.getOwnPropertyDescriptor(AudioContext.prototype,'baseLatency').get.call(new OfflineAudioContext(1,128,8000)));
+await run('ctxResumeOffline',()=>AudioContext.prototype.resume.call(new OfflineAudioContext(1,128,8000)));
+await run('offlineStartCtx',async()=>{const c=new AudioContext();try{return await OfflineAudioContext.prototype.startRendering.call(c)}finally{await c.close()}});
+await run('offlineLengthCtx',async()=>{const c=new AudioContext();try{return Object.getOwnPropertyDescriptor(OfflineAudioContext.prototype,'length').get.call(c)}finally{await c.close()}});
+await run('constantOnGain',()=>Object.getOwnPropertyDescriptor(ConstantSourceNode.prototype,'offset').get.call(new OfflineAudioContext(1,128,8000).createGain()));
+await run('sourceOnGain',()=>AudioScheduledSourceNode.prototype.start.call(new OfflineAudioContext(1,128,8000).createGain()));
+await run('liveEnded',async()=>{const c=new AudioContext({sampleRate:8000}),s=c.createConstantSource();let out;const ended=new Promise(r=>s.onended=e=>{out={trusted:e.isTrusted,target:e.target===s,state:c.state,time:c.currentTime>0};r()});s.connect(c.destination);s.start();s.stop(16/8000);await ended;await c.close();return out});
+await run('bufferSuspendOwnership',async()=>{const c=new OfflineAudioContext(1,512,8000),s=c.createBufferSource(),b=c.createBuffer(1,512,8000);b.getChannelData(0).fill(1);s.buffer=b;s.connect(c.destination);s.start();c.suspend(129/8000).then(()=>{b.getChannelData(0).fill(2);c.resume()});const r=await c.startRendering();return[0,127,255,256,511].map(i=>r.getChannelData(0)[i])});
+await run('gainPrivate',async()=>{const c=new OfflineAudioContext(1,4,8000),s=c.createConstantSource(),g=c.createGain();s.connect(g).connect(c.destination);s.offset.value=2;g.gain.value=.25;for(const[k,v]of[[s,'offset'],[g,'gain']])Object.defineProperty(k,v,{get(){throw Error('author')}});Object.defineProperty(g.gain??{},'value',{get(){throw Error('author')}});s.start();return Array.from((await c.startRendering()).getChannelData(0))});
+return rows})()

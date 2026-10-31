@@ -85,6 +85,9 @@ function normalizeAnchors(value) {
 
 export function normalizeCSSValue(property, value) {
   if(typeof value !== 'string') return value;
+  // Position's public CSSOM token stream retains direct setter whitespace;
+  // stylesheet/cssText declaration parsing already trims its own boundaries.
+  if(property==='position')return value;
   value=value.trim();
   if(property === 'opacity') value=value.replace(/^([+-]?)\.(?=\d)/, (_, sign) => sign + '0.');
   if(LENGTHS.test(property) && /^[+-]?0(?:\.0+)?$/.test(value))value='0px';
@@ -215,7 +218,7 @@ for(const [name,descriptor] of Object.entries(Object.getOwnPropertyDescriptors(B
     return change(this,()=>{
       const input=normalizeCSSValue(property,typeof value==='number'?String(value):value);
       const before = MUTATIONS.get(this);
-      if (property === 'opacity' && typeof input === 'string' && input !== '') this._setProperty(property, input);
+      if ((property === 'opacity'||property==='position') && typeof input === 'string' && input !== '') this._setProperty(property, input);
       else descriptor.set.call(this,parserInput(input,property));
       if(typeof input==='string' && LENGTHS.test(property) && /^anchor-size\(/i.test(input) && balancedEnd(input,input.indexOf('('))===input.length-1)this._setProperty(property,input);
       if(typeof input==='string' && MUTATIONS.get(this)!==before)restoreUnquotedURLs(this,input,property);
@@ -250,7 +253,7 @@ Object.defineProperties(COMPAT, {
       const before=MUTATIONS.get(this), previousPriority=this.getPropertyPriority(property);
       if(AXES.has(property)){axisSet(this,property,normalized,priority.toLowerCase());return;}
       if(property==='-webkit-border-radius'){if(normalized==='')this.removeProperty(property);else this._setProperty(property,normalized,priority.toLowerCase());return;}
-      if (property.toLowerCase() === 'opacity' && normalized !== '') this._setProperty('opacity', normalized, priority.toLowerCase());
+      if (['opacity','position'].includes(property.toLowerCase()) && normalized !== '') this._setProperty(property.toLowerCase(), normalized, priority.toLowerCase());
       else BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
       if(MUTATIONS.get(this)===before && normalized!=='') {
         if(previousPriority)this._priorities.set(property,previousPriority);else this._priorities.delete(property);
@@ -346,6 +349,8 @@ export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
       rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
       const names=prelude.replace(/^@layer\s*/i,'').trim();
       NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
+    } else if(/^@charset(?:\s|$)/i.test(prelude)&&body===null) {
+      rule=new cssom.CSSRule();rule.type=2;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
     } else if(/^@import\b/i.test(prelude)&&body===null) {
       try{rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
     } else if(prelude.startsWith('@')) {

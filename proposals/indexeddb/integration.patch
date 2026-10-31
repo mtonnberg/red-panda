@@ -1,0 +1,205 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,5 +1,6 @@
+ import {installPaymentRequest} from './payment-request.js';
+ import { installWebCrypto } from './web-crypto.js';
++import { installIndexedDB } from './indexeddb.js';
+ import {installCookieStore} from './cookie-store.js';
+ import { installScheduler } from './scheduler.js';
+ import {installDevicePermissions} from './device-permissions.js';
+@@ -278,6 +279,7 @@
+       installBroadcast(this, window);
+       installImageData(window);
+       installWebCrypto(window);
++      installIndexedDB(this, window);
+       installURLPattern(window);
+       installCanvas(window);
+       installGeometry(window);
+--- /dev/null
++++ b/src/indexeddb.js
+@@ -0,0 +1,119 @@
++import {types} from 'node:util';
++import * as backend from 'fake-indexeddb';
++import {createRequire} from 'node:module';
++import {createInvocationTrampoline} from './invocation.js';
++import {createIndexedDBClone} from './indexeddb-clone.js';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const scopes=new WeakMap(),installed=new WeakMap(),values=new WeakMap(),wrappers=new WeakMap(),eventVersions=new WeakMap(),windows=new WeakMap();
++const apply=Reflect.apply,nil=()=>Object.create(null),numberIndex=k=>typeof k==='string'&&/^(?:0|[1-9]\d*)$/.test(k);
++const schema=Object.freeze({
++ IDBFactory:{methods:['open','deleteDatabase','databases','cmp']},
++ IDBRequest:{parent:'EventTarget',attrs:['readyState','result','source','transaction','error'],handlers:['success','error']},
++ IDBOpenDBRequest:{parent:'IDBRequest',handlers:['blocked','upgradeneeded']},
++ IDBDatabase:{parent:'EventTarget',attrs:['name','version','objectStoreNames'],methods:['createObjectStore','deleteObjectStore','transaction','close'],handlers:['error','abort']},
++ IDBTransaction:{parent:'EventTarget',attrs:['mode','durability','db','objectStoreNames','error'],methods:['objectStore','abort','commit'],handlers:['complete','error','abort']},
++ IDBObjectStore:{attrs:['name','keyPath','autoIncrement','transaction'],methods:['add','put','get','getKey','delete','clear','count','getAll','getAllKeys','getAllRecords','openCursor','openKeyCursor'],laterAttrs:['indexNames'],laterMethods:['createIndex','deleteIndex','index'],writable:['name']},
++ IDBIndex:{attrs:['name','keyPath','unique','multiEntry','objectStore'],methods:['get','getKey','getAll','getAllKeys','getAllRecords','count','openCursor','openKeyCursor'],writable:['name']},
++ IDBCursor:{attrs:['key','primaryKey','direction','source'],methods:['continue','continuePrimaryKey','advance','update','delete']},
++ IDBCursorWithValue:{parent:'IDBCursor',attrs:['value']},
++ IDBKeyRange:{attrs:['lower','upper','lowerOpen','upperOpen'],methods:['includes'],statics:['only','lowerBound','upperBound','bound']},
++ IDBRecord:{attrs:['key','primaryKey','value']},
++ DOMStringList:{attrs:['length'],methods:['contains','item','keys','values','entries']},
++});
++const errors={AbortError:'The operation was aborted',ConstraintError:'A mutation operation in the transaction failed because a constraint was not satisfied',DataCloneError:'The object can not be cloned',DataError:'The provided data is inadequate',InvalidAccessError:'The object does not support the operation or argument',InvalidStateError:'The object is in an invalid state',NotFoundError:'The object can not be found here',ReadOnlyError:'The mutating operation was attempted in a readonly transaction',TransactionInactiveError:'The transaction is inactive or finished',VersionError:'An attempt was made to open a database using a lower version than the existing version',SecurityError:'The operation is insecure'};
++function realmFactory(g,bridge){'use strict';
++ const TypeError=g.TypeError,define=Object.defineProperty,getDescriptor=Object.getOwnPropertyDescriptor,constructors=new Map();
++ const token=bridge.token,Event=g.Event,EventTarget=g.EventTarget;
++ for(const name of bridge.names){
++  const parent=bridge.parent(name),Parent=parent==='EventTarget'?EventTarget:constructors.get(parent);
++  const C=Parent?class extends Parent{constructor(){super(token);bridge.tokenCheck(arguments[0]);}}:class{constructor(){bridge.tokenCheck(arguments[0]);}};
++  define(C,'name',{value:name,configurable:true});define(C,'length',{value:0,configurable:true});constructors.set(name,C);
++  const p=C.prototype,constructor=getDescriptor(p,'constructor');delete p.constructor;
++  function attribute(key){define(p,key,{get(){return bridge.get(this,name,key);},...(bridge.writable(name,key)?{set(value){bridge.set(this,name,key,value);}}:{}),enumerable:true,configurable:true});}
++  function method(key){const fn=function(){return bridge.call(this,name,key,arguments);};define(fn,'name',{value:key,configurable:true});define(fn,'length',{value:bridge.arity(name,key),configurable:true});define(p,key,{value:fn,writable:true,enumerable:true,configurable:true});}
++  for(const key of bridge.attrs(name,false))attribute(key);for(const key of bridge.methods(name,false))method(key);for(const key of bridge.attrs(name,true))attribute(key);for(const key of bridge.methods(name,true))method(key);
++  for(const type of bridge.handlers(name))define(p,'on'+type,{get(){return bridge.handler(this,name,type);},set(value){bridge.handler(this,name,type,value);},enumerable:true,configurable:true});
++  define(p,'constructor',constructor);if(name==='DOMStringList')define(p,g.Symbol.iterator,{value:p.values,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:name,configurable:true});
++  for(const key of bridge.statics(name)){const fn=function(){return bridge.staticCall(name,key,arguments);};define(fn,'name',{value:key,configurable:true});define(C,key,{value:fn,writable:true,enumerable:true,configurable:true});}
++  define(g,name,{value:C,writable:true,configurable:true});bridge.constructor(name,C);
++ }
++ class IDBVersionChangeEvent extends Event{constructor(type,options={}){if(!arguments.length)throw new TypeError('invalid argument');super(type,options);bridge.event(this,options.oldVersion===undefined?0:Number(options.oldVersion),options.newVersion==null?null:Number(options.newVersion));}get oldVersion(){return bridge.version(this,false);}get newVersion(){return bridge.version(this,true);}}
++ define(IDBVersionChangeEvent,'length',{value:1,configurable:true});const ep=IDBVersionChangeEvent.prototype,ec=getDescriptor(ep,'constructor');delete ep.constructor;for(const key of ['oldVersion','newVersion'])define(ep,key,{...getDescriptor(ep,key),enumerable:true});define(ep,'constructor',ec);define(ep,g.Symbol.toStringTag,{value:'IDBVersionChangeEvent',configurable:true});define(g,'IDBVersionChangeEvent',{value:IDBVersionChangeEvent,writable:true,configurable:true});bridge.constructor('IDBVersionChangeEvent',IDBVersionChangeEvent);
++ const access={get indexedDB(){return bridge.factory(this);}};define(g,'indexedDB',{...getDescriptor(access,'indexedDB'),enumerable:true,configurable:true});
++}
++function kindOf(value){for(const name of ['IDBOpenDBRequest','IDBCursorWithValue','IDBRequest','IDBDatabase','IDBTransaction','IDBObjectStore','IDBIndex','IDBCursor','IDBKeyRange','IDBRecord'])if(value instanceof backend[name])return name;return null;}
++function isKind(state,kind){if(state.kind===kind)return true;for(let current=state.kind;schema[current]?.parent;){current=schema[current].parent;if(current===kind)return true;}return false;}
++function error(record,value){if(value===null||value===undefined)return value;if(record.errors.has(value))return record.errors.get(value);if(typeof value!=='object')return value;const name=value.name;if(name!=='TypeError'&&!Object.hasOwn(errors,name))return value;const result=name==='TypeError'?new record.TypeError('invalid argument'):new record.Exception(errors[name]??value.message,name??'UnknownError');if(typeof value==='object')record.errors.set(value,result);return result;}
++function stateFor(record,value,kind){const state=values.get(value);if(!state||!isKind(state,kind))throw new record.TypeError('Illegal invocation');return state;}
++function scopeFor(record){const origin=record.document._origin;if(origin==='null')throw new record.Exception(errors.SecurityError,'SecurityError');let origins=scopes.get(record.context);if(!origins){origins=new Map();scopes.set(record.context,origins);}let scope=origins.get(origin);if(!scope){scope=Object.assign(nil(),{factory:new backend.IDBFactory(),connections:new Set()});origins.set(origin,scope);}return scope;}
++function refreshConnection(database){if(database._rawDatabase)database.objectStoreNames=new database.objectStoreNames.constructor(...[...database._rawDatabase.rawObjectStores.keys()].sort());}
++function bypassGates(scope,name){const raw=scope.factory._databases.get(name);if(raw)raw.connections.length=0;return raw;}
++function list(record,names){const target=new record.constructors.DOMStringList(record.token),data=Object.assign(nil(),{kind:'DOMStringList',record,list:[...names],handlers:new Map()});const proxy=new record.Proxy(target,{get(t,key,receiver){if(numberIndex(key))return data.list[Number(key)];return Reflect.get(t,key,receiver);}});values.set(proxy,data);registerPlatformFactory(proxy,{kind:'DOMStringList',globalObject:record.window});return proxy;}
++function releaseListeners(state){for(const entry of state.listeners){if(state.record.listeners.delete(entry))entry.target.removeEventListener(entry.type,entry.listener);}state.listeners.clear();}
++function wrap(record,value){if(Array.isArray(value)&&value.length&&value.every(item=>item instanceof backend.IDBRecord)){const result=new record.Array(value.length);for(let i=0;i<value.length;i++)Object.defineProperty(result,i,{value:wrap(record,value[i]),writable:true,enumerable:true,configurable:true});return result;}if(value===null||value===undefined||typeof value!=='object')return value;const kind=kindOf(value);if(!kind)return record.clone.toRealm(value);let map=wrappers.get(value);if(!map){map=new WeakMap();wrappers.set(value,map);}const previous=map.get(record)?.deref();if(previous)return previous;
++ const object=new record.constructors[kind](record.token),state=Object.assign(nil(),{kind,record,backend:value,front:new WeakRef(object),handlers:new Map(),cache:new Map(),listeners:new Set()});values.set(object,state);map.set(record,new WeakRef(object));registerPlatformFactory(object,{kind,globalObject:record.window});
++ if(kind==='IDBDatabase'){record.connections.add(value);state.scope=scopeFor(record);state.scope.connections.add(value);}
++ if(kind.includes('Request'))record.pending.add(object);
++ if(['IDBRequest','IDBOpenDBRequest','IDBDatabase','IDBTransaction'].includes(kind)){
++  const impl=implForWrapper(object);impl._getTheParent=()=>{const parent=kind.includes('Request')?value.transaction:kind==='IDBTransaction'?value.db:null;return parent?implForWrapper(wrap(record,parent)):null;};
++  const types=kind==='IDBOpenDBRequest'?['upgradeneeded','success','error','blocked']:kind==='IDBRequest'?['success','error']:kind==='IDBTransaction'?['complete','abort','error']:['error','abort'];
++  for(const type of types){
++   const listener=event=>{
++    if(event.target!==value)return;
++    if(type==='success'&&state.deletedRaw){state.deletedRaw.rawObjectStores.clear();for(const connection of state.scope.connections)if(connection._rawDatabase===state.deletedRaw)refreshConnection(connection);}
++    if(record.disposed){if(kind.includes('Request')&&value.readyState==='done'&&value.result instanceof backend.IDBDatabase)value.result.close();return;}
++    const cursorDelivery=kind.includes('Request')&&type==='success'&&value._result instanceof backend.IDBCursor;state.cache.clear();const front=state.front.deref();if(!front)return;
++    const init={bubbles:event.bubbles,cancelable:event.cancelable};const actual=type==='upgradeneeded'||type==='blocked'?new record.constructors.IDBVersionChangeEvent(type,{...init,oldVersion:event.oldVersion,newVersion:event.newVersion}):new record.Event(type,init);
++    const implementation=implForWrapper(actual);implementation.isTrusted=true;
++    const failures=[];record.dispatches.push(failures);let allowed;try{allowed=record.invocation.invoke(()=>implForWrapper(front)._dispatch(implementation),record.window,[],record.deadline);}finally{record.dispatches.pop();}if(!allowed)event.preventDefault();
++    if(kind.includes('Request')&&(type==='error'||type==='success'&&!cursorDelivery)){record.pending.delete(front);releaseListeners(state);}
++    if(kind==='IDBTransaction'&&(type==='complete'||type==='abort')){releaseListeners(state);for(const pending of record.pending){const request=values.get(pending);if(request.kind!=='IDBOpenDBRequest'&&request.backend.transaction===value){record.pending.delete(pending);releaseListeners(request);}}}
++    if(failures.length)throw new AggregateError(failures);
++   };
++   const entry={target:value,type,listener};state.listeners.add(entry);record.listeners.add(entry);value.addEventListener(type,listener);
++  }
++ }
++ return object;
++}
++function key(record,value){const state=values.get(value);if(state?.kind==='IDBKeyRange')return state.backend;if(value===null||value===undefined||typeof value==='number'||typeof value==='string'||typeof value==='boolean')return value;if(types.isDate(value)||Array.isArray(value)||types.isArrayBuffer(value)||ArrayBuffer.isView(value)){try{return record.clone.toHost(value);}catch{throw new record.Exception(errors.DataError,'DataError');}}throw new record.Exception(errors.DataError,'DataError');}
++function unwrap(value){return values.get(value)?.backend??value;}
++function options(record,value,dictionary){if(dictionary&&value&&typeof value==='object'&&!values.has(value)&&!Array.isArray(value)&&!ArrayBuffer.isView(value)&&!types.isAnyArrayBuffer(value)&&!types.isDate(value))return{...value,query:key(record,value.query)};return key(record,value);}
++function invoke(record,state,name,argsLike){const args=Array.from(argsLike),value=state.backend;
++ if(state.kind==='DOMStringList'){const a=state.list;if(name==='contains')return a.includes(String(args[0]));if(name==='item')return a[Number(args[0])>>>0]??null;const data=name==='keys'?a.map((_,i)=>i):name==='entries'?a.map((v,i)=>[i,v]):a;return record.array(data)[Symbol.iterator]();}
++ if(state.kind==='IDBFactory'){
++  const scope=scopeFor(state.record),factory=scope.factory;
++  if(name==='open'||name==='deleteDatabase'){if(!args.length)throw new record.TypeError('invalid argument');args[0]=record.text(args[0]);const raw=bypassGates(scope,args[0]);const request=apply(factory[name],factory,args),front=wrap(record,request);if(name==='deleteDatabase'&&raw){const state=values.get(front);state.deletedRaw=raw;state.scope=scope;}return front;}
++  if(name==='databases')return new record.Promise((resolve,reject)=>factory.databases().then(value=>resolve(record.clone.toRealm(value)),value=>reject(error(record,value))));
++  if(name==='cmp')return factory.cmp(...args.map(value=>key(record,value)));
++ }
++ if(state.kind==='IDBDatabase'&&name==='transaction')refreshConnection(value);
++ if(name==='add'||name==='put'||name==='update'){
++  const tx=state.kind.includes('Cursor')?(value.source.objectStore??value.source).transaction:value.transaction;
++  if(tx._state!=='active')throw new record.Exception(errors.TransactionInactiveError,'TransactionInactiveError');if(tx.mode==='readonly')throw new record.Exception(errors.ReadOnlyError,'ReadOnlyError');
++  const before=tx._state;tx._state='inactive';try{args[0]=record.clone.toHost(args[0]);}finally{if(tx._state==='inactive')tx._state=before;}
++ }
++ if(['get','getKey','getAll','getAllKeys','getAllRecords','count','delete','openCursor','openKeyCursor','includes'].includes(name)&&args.length)args[0]=options(record,args[0],['getAll','getAllKeys','getAllRecords'].includes(name));
++ if(name==='transaction'&&values.get(args[0])?.kind==='DOMStringList')args[0]=values.get(args[0]).list;
++ if(name==='continuePrimaryKey'){args[0]=key(record,args[0]);args[1]=key(record,args[1]);}if(name==='continue'&&args[0]!==undefined)args[0]=key(record,args[0]);if((name==='add'||name==='put')&&args[1]!==undefined)args[1]=key(record,args[1]);
++ if(name==='createObjectStore'||name==='deleteObjectStore'||name==='objectStore'||name==='createIndex'||name==='deleteIndex'||name==='index')if(args.length)args[0]=record.text(args[0]);
++ const result=apply(value[name],value,args);if(name==='close'&&state.kind==='IDBDatabase'){releaseListeners(state);record.connections.delete(value);state.scope?.connections.delete(value);}if(name==='createIndex')value._indexesCache.set(args[0],result);return kindOf(result)?wrap(record,result):result;
++}
++export function installIndexedDB(page,window){if(installed.has(window))return installed.get(window);
++ const record=Object.assign(nil(),{window,page,context:page.context,document:implForWrapper(window.document),token:Symbol('indexeddb-construction'),constructors:nil(),errors:new WeakMap(),connections:new Set(),pending:new Set(),listeners:new Set(),dispatches:[],disposed:false,TypeError:window.TypeError,Exception:window.DOMException,Event:window.Event,Promise:window.Promise,Proxy:window.Proxy,Object:window.Object,Array:window.Array,create:window.Object.create,from:window.Array.from,define:window.Object.defineProperty,String:window.String,symbolDescription:Object.getOwnPropertyDescriptor(window.Symbol.prototype,'description').get,add:window.EventTarget.prototype.addEventListener,remove:window.EventTarget.prototype.removeEventListener,invocation:createInvocationTrampoline(implForWrapper(window)._globalObject),deadline:{timeout:Math.min(page.timeout??2000,2000),displayErrors:false}});
++ windows.set(window,record);windows.set(implForWrapper(window)._globalObject,record);record.errorObserver=event=>{const active=record.dispatches.at(-1);if(active)active.push(event.error);};apply(record.add,window,['error',record.errorObserver]);record.clone=createIndexedDBClone(window);record.array=data=>record.clone.toRealm(data);record.text=value=>typeof value==='symbol'?apply(record.String,undefined,[apply(record.symbolDescription,value,[])]):apply(record.String,undefined,[value]);
++ const bridge=Object.assign(nil(),{token:record.token,names:Object.keys(schema),parent:name=>schema[name].parent,attrs:(name,later)=>schema[name][later?'laterAttrs':'attrs']??[],methods:(name,later)=>schema[name][later?'laterMethods':'methods']??[],handlers:name=>schema[name].handlers??[],statics:name=>schema[name].statics??[],writable:(name,key)=>schema[name].writable?.includes(key),arity:(kind,name)=>kind==='IDBFactory'?({open:1,deleteDatabase:1,cmp:2,databases:0}[name]):0,
++  factory(value){if(value==null)return record.factory;const owner=windows.get(value);if(!owner)throw new record.TypeError('Illegal invocation');return owner.factory;},
++  tokenCheck(value){if(value!==record.token)throw new record.TypeError('Illegal Constructor');},constructor(name,C){record.constructors[name]=C;registerPlatformFactoryKind(name);},
++  event(value,oldVersion,newVersion){eventVersions.set(value,{oldVersion,newVersion});registerPlatformFactory(value,{kind:'IDBVersionChangeEvent',globalObject:window});},version(value,next){const data=eventVersions.get(value);if(!data)throw new record.TypeError('Illegal invocation');return next?data.newVersion:data.oldVersion;},
++  get(object,kind,name){const s=stateFor(record,object,kind),b=s.backend;try{if(s.kind==='DOMStringList')return s.list.length;if(name==='objectStoreNames')return list(record,s.kind==='IDBDatabase'?[...b._rawDatabase.rawObjectStores.keys()].sort():[...b.objectStoreNames]);if(name==='indexNames')return list(record,b.indexNames);if(name==='result'){const result=b.result;if(result===null||typeof result!=='object')return result;if(!s.cache.has(name))s.cache.set(name,wrap(s.record,result));return s.cache.get(name);}if(name==='error')return error(record,b.error??null);const value=b[name];if(name==='value'&&s.kind==='IDBCursorWithValue'&&value&&typeof value==='object'){if(s.cache.get('cursorSource')!==value){s.cache.set('cursorSource',value);s.cache.set('cursorValue',s.record.clone.toRealm(value));}return s.cache.get('cursorValue');}if(kindOf(value))return wrap(s.record,value);if(value&&typeof value==='object')return record.clone.toRealm(value);return value;}catch(e){throw error(record,e);}},
++  set(object,kind,name,value){const s=stateFor(record,object,kind);try{s.backend[name]=record.text(value);}catch(e){throw error(record,e);}},
++  call(object,kind,name,args){const s=stateFor(record,object,kind);try{return invoke(record,s,name,args);}catch(e){throw error(record,e);}},
++  staticCall(kind,name,args){try{return wrap(record,apply(backend[kind][name],backend[kind],Array.from(args,(value,index)=>index<(name==='bound'?2:1)?key(record,value):value)));}catch(e){throw error(record,e);}},
++  handler(object,kind,type,value){const s=stateFor(record,object,kind);if(arguments.length<4)return s.handlers.get(type)??null;const before=s.handlers.get(type);if(before)apply(record.remove,object,[type,before]);s.handlers.delete(type);if(typeof value==='function'){s.handlers.set(type,value);apply(record.add,object,[type,value]);}},
++ });
++ window.eval(`(${realmFactory.toString()})`)(window,bridge);
++ const factory=new record.constructors.IDBFactory(record.token);values.set(factory,Object.assign(nil(),{kind:'IDBFactory',record,handlers:new Map()}));registerPlatformFactory(factory,{kind:'IDBFactory',globalObject:window});record.factory=factory;
++ const signal=page.documentAbort.signal;const dispose=()=>{if(record.disposed)return;record.disposed=true;for(const connection of record.connections){try{backend.forceCloseDatabase(connection);}catch{connection.close();}}for(const entry of record.listeners)entry.target.removeEventListener(entry.type,entry.listener);record.listeners.clear();for(const connection of record.connections){for(const scope of scopes.get(record.context)?.values()??[])scope.connections.delete(connection);}record.connections.clear();record.pending.clear();apply(record.remove,window,['error',record.errorObserver]);signal.removeEventListener('abort',dispose);};signal.addEventListener('abort',dispose,{once:true});const previousClose=window.close;window.close=function close(...args){dispose();return apply(previousClose,this,args);};const api=Object.assign(nil(),{dispose});installed.set(window,api);return api;
++}
+--- /dev/null
++++ b/src/indexeddb-clone.js
+@@ -0,0 +1,41 @@
++import {cloneObjectKind} from './clone-object-kind.js';
++import {types} from 'node:util';
++import {cryptoKeyRecord,deserializeCryptoKey} from './web-crypto.js';
++import {platformFactoryRecord} from './platform-factories.js';
++const apply=Reflect.apply,keys=Object.keys,define=Object.defineProperty;
++const typed=Object.getPrototypeOf(Uint8Array.prototype),getter=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
++const typedName=getter(typed,Symbol.toStringTag),typedBuffer=getter(typed,'buffer'),typedOffset=getter(typed,'byteOffset'),typedLength=getter(typed,'length');
++const dataBuffer=getter(DataView.prototype,'buffer'),dataOffset=getter(DataView.prototype,'byteOffset'),dataLength=getter(DataView.prototype,'byteLength');
++const bufferLength=getter(ArrayBuffer.prototype,'byteLength'),dateTime=Date.prototype.getTime;
++const mapEntries=Map.prototype.entries,mapSet=Map.prototype.set,setValues=Set.prototype.values,setAdd=Set.prototype.add;
++const regexpSource=getter(RegExp.prototype,'source'),regexpFlags=[['hasIndices','d'],['global','g'],['ignoreCase','i'],['multiline','m'],['dotAll','s'],['unicode','u'],['unicodeSets','v'],['sticky','y']].map(([name,flag])=>[Object.getOwnPropertyDescriptor(RegExp.prototype,name)?.get,flag]).filter(([get])=>get);
++const names=['Object','Array','ArrayBuffer','Map','Set','Date','RegExp','DataView','Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array','Int32Array','Uint32Array','Float16Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array','Error','EvalError','RangeError','ReferenceError','SyntaxError','TypeError','URIError'];
++export function createIndexedDBClone(realm){
++ const target=Object.create(null),host=Object.create(null);for(const name of names){if(typeof realm[name]==='function')target[name]=realm[name];if(typeof globalThis[name]==='function')host[name]=globalThis[name];}
++ const Exception=realm.DOMException;
++ const fail=()=>{throw new Exception('The object can not be cloned','DataCloneError');};
++ function copy(value,toRealm,seen){
++  if(typeof value==='symbol'||typeof value==='function')return fail();
++  if(value===null||typeof value!=='object')return value;
++  if(seen.has(value))return seen.get(value);
++  if(types.isProxy(value)||types.isSharedArrayBuffer(value))return fail();
++  if(toRealm&&types.isCryptoKey(value)){const result=deserializeCryptoKey(realm,{kind:'CryptoKey',key:value});seen.set(value,result);return result;}
++  const crypto=cryptoKeyRecord(value);if(crypto){seen.set(value,crypto.key);return crypto.key;}
++  if(types.isCryptoKey(value)){seen.set(value,value);return value;}
++  if(platformFactoryRecord(value)||types.isPromise(value)||types.isWeakMap(value)||types.isWeakSet(value)||types.isExternal(value)||types.isGeneratorObject(value)||types.isMapIterator(value)||types.isSetIterator(value))return fail();
++  const C=toRealm?target:host;
++  if(types.isArrayBuffer(value)){const result=new C.ArrayBuffer(apply(bufferLength,value,[]));seen.set(value,result);new Uint8Array(result).set(new Uint8Array(value));return result;}
++  if(ArrayBuffer.isView(value)){
++   const data=types.isDataView(value),buffer=apply(data?dataBuffer:typedBuffer,value,[]),offset=apply(data?dataOffset:typedOffset,value,[]),length=apply(data?dataLength:typedLength,value,[]),name=data?'DataView':apply(typedName,value,[]);
++   if(!C[name])return fail();const result=new C[name](copy(buffer,toRealm,seen),offset,length);seen.set(value,result);return result;
++  }
++  if(types.isDate(value)){const result=new C.Date(apply(dateTime,value,[]));seen.set(value,result);return result;}
++  if(types.isRegExp(value)){const result=new C.RegExp(apply(regexpSource,value,[]),regexpFlags.filter(([get])=>apply(get,value,[])).map(([,flag])=>flag).join(''));seen.set(value,result);return result;}
++  if(types.isMap(value)){const result=new C.Map();seen.set(value,result);for(const[key,item]of apply(mapEntries,value,[]))apply(mapSet,result,[copy(key,toRealm,seen),copy(item,toRealm,seen)]);return result;}
++  if(types.isSet(value)){const result=new C.Set();seen.set(value,result);for(const item of apply(setValues,value,[]))apply(setAdd,result,[copy(item,toRealm,seen)]);return result;}
++  if(types.isNativeError(value)){const name=['EvalError','RangeError','ReferenceError','SyntaxError','TypeError','URIError'].includes(value.name)?value.name:'Error';const result=new C[name](value.message);seen.set(value,result);if(Object.hasOwn(value,'cause'))define(result,'cause',{value:copy(value.cause,toRealm,seen),writable:true,configurable:true});return result;}
++  if(types.isBoxedPrimitive(value)||types.isAnyArrayBuffer(value)||!['Object','Array'].includes(cloneObjectKind(value)))return fail();
++  const result=Array.isArray(value)?new C.Array(value.length):new C.Object();seen.set(value,result);for(const key of keys(value))define(result,key,{value:copy(value[key],toRealm,seen),enumerable:true,writable:true,configurable:true});return result;
++ }
++ return Object.assign(Object.create(null),{toHost:value=>copy(value,false,new Map()),toRealm:value=>copy(value,true,new Map())});
++}
+--- /dev/null
++++ b/test/indexeddb.test.js
+@@ -0,0 +1,19 @@
++import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{Browser}from'../src/browser.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++let server,origin;before(async()=>{server=http.createServer((q,s)=>{s.setHeader('content-type','text/html');s.end('<!doctype html><body>Owned IndexedDB test')});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`});after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r))});
++const result=r=>new Promise((resolve,reject)=>{r.onsuccess=()=>resolve(r.result);r.onerror=e=>{e.preventDefault();reject(r.error)}}),done=t=>new Promise((resolve,reject)=>{t.oncomplete=resolve;t.onabort=()=>reject(t.error)}),plain=v=>JSON.parse(JSON.stringify(v));
++async function fixture(t){const browser=new Browser({loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate(origin);return{browser,page,w:page.dom.window};}
++async function open(w,name='owned',version=1,upgrade=db=>db.createObjectStore('s')){const r=w.indexedDB.open(name,version);r.onupgradeneeded=()=>upgrade(r.result,r.transaction);return result(r);}
++test('real realm factories, requests, events and nullable pending/result state',{timeout:5000},async t=>{const{w}=await fixture(t),r=w.indexedDB.open('surface',1);assert.ok(r instanceof w.IDBRequest);assert.ok(r instanceof w.IDBOpenDBRequest);assert.ok(r instanceof w.EventTarget);assert.equal(platformFactoryRecord(r).kind,'IDBOpenDBRequest');assert.equal(r.readyState,'pending');assert.equal(r.source,null);assert.equal(r.transaction,null);assert.throws(()=>r.result,e=>e instanceof w.DOMException&&e.name==='InvalidStateError');const events=[];r.onupgradeneeded=function(e){'use strict';assert.strictEqual(this,r);assert.ok(e instanceof w.IDBVersionChangeEvent);assert.equal(e.isTrusted,true);assert.strictEqual(e.target,r);events.push([e.oldVersion,e.newVersion]);r.result.createObjectStore('s')};const db=await result(r);assert.deepEqual(events,[[0,1]]);assert.ok(db instanceof w.IDBDatabase);assert.equal(r.error,null);assert.equal(r.transaction,null);assert.equal(r.readyState,'done');const get=db.transaction('s').objectStore('s').get('missing');await result(get);assert.equal(get.error,null);assert.equal(get.result,undefined);db.close();});
++test('strong private brands reject inherited/copied/proxy receivers without traps',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w),store=db.transaction('s').objectStore('s');let hits=0;for(const receiver of [{},Object.create(store),new Proxy(store,{get(){hits++;throw 23}})])assert.throws(()=>w.IDBObjectStore.prototype.get.call(receiver,'x'),e=>e instanceof w.TypeError&&e.message==='Illegal invocation');assert.equal(hits,0);for(const name of ['IDBFactory','IDBDatabase','IDBTransaction','IDBObjectStore','IDBIndex','IDBCursor','IDBCursorWithValue','IDBRequest','IDBOpenDBRequest','IDBKeyRange','IDBRecord','DOMStringList'])assert.throws(()=>new w[name](),e=>e instanceof w.TypeError);db.close();});
++test('object stores retain actual data, inline/generated keys and call-time graph bytes',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w,'records',1,d=>d.createObjectStore('s',{keyPath:'id',autoIncrement:true})),tx=db.transaction('s','readwrite'),s=tx.objectStore('s'),completed=done(tx);const value=w.eval('(()=>{const buffer=new Uint8Array([1,2,3]).buffer,x={buffer,view:new Uint8Array(buffer),date:new Date(123),map:new Map(),set:new Set([1,2])};x.self=x;x.alias={value:1};x.map.set("alias",x.alias);return x})()');const key=await result(s.put(value));value.alias.value=9;new w.Uint8Array(value.buffer)[0]=9;await completed;assert.equal(key,1);assert.equal(value.id,undefined);const copy=await result(db.transaction('s').objectStore('s').get(1));assert.strictEqual(copy.self,copy);assert.strictEqual(copy.alias,copy.map.get('alias'));assert.strictEqual(copy.buffer,copy.view.buffer);assert.equal(copy.alias.value,1);assert.deepEqual([...copy.view],[1,2,3]);assert.ok(copy.date instanceof w.Date);assert.ok(copy.map instanceof w.Map);assert.ok(copy.set instanceof w.Set);assert.strictEqual(Object.getPrototypeOf(copy),w.Object.prototype);db.close();});
++test('binary/date/array key ordering uses actual cloned key values',{timeout:5000},async t=>{const{w}=await fixture(t);assert.equal(w.indexedDB.cmp(new w.Uint8Array([1,2]),new w.Uint8Array([1,3])),-1);assert.equal(w.indexedDB.cmp(1,new w.Date(0)),-1);assert.equal(w.indexedDB.cmp(new w.Date(1),'a'),-1);const db=await open(w),tx=db.transaction('s','readwrite'),s=tx.objectStore('s'),completed=done(tx);s.put('array',new w.Array('a',1));s.put('binary',new w.Uint8Array([1,2]));s.put('date',new w.Date(123));await completed;assert.equal(await result(db.transaction('s').objectStore('s').get(['a',1])),'array');assert.equal(await result(db.transaction('s').objectStore('s').get(new w.Uint8Array([1,2]))),'binary');const keys=await result(db.transaction('s').objectStore('s').getAllKeys());assert.ok(keys[0] instanceof w.Date);assert.ok(keys[1] instanceof w.ArrayBuffer);assert.ok(keys[2] instanceof w.Array);for(const key of [NaN,null,true,{}])assert.throws(()=>w.indexedDB.cmp(1,key),e=>e.name==='DataError');db.close();});
++test('true rollback restores records and abort delivery is asynchronous',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w);let tx=db.transaction('s','readwrite'),completed=done(tx);tx.objectStore('s').put('before',1);await completed;tx=db.transaction('s','readwrite');const order=[],s=tx.objectStore('s'),a=s.put('after',1),b=s.put('new',2);a.onsuccess=()=>{order.push('put');tx.abort();order.push('returned')};b.onerror=e=>{e.preventDefault();order.push(b.error.name)};await new Promise(r=>tx.onabort=()=>{order.push('abort');r()});assert.deepEqual(order,['put','returned','AbortError','abort']);assert.deepEqual(plain(await result(db.transaction('s').objectStore('s').getAll())),['before']);db.close();});
++test('uncaught success-handler exceptions cause actual rollback even when Window error is canceled',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w),events=[];w.addEventListener('error',e=>{events.push(e.error.message);e.preventDefault()});const tx=db.transaction('s','readwrite');tx.objectStore('s').put('must-rollback','x').onsuccess=()=>{throw Error('owned-error')};await new Promise(r=>tx.onabort=r);assert.equal(tx.error.name,'AbortError');assert.deepEqual(events,['owned-error']);assert.equal(await result(db.transaction('s').objectStore('s').get('x')),undefined);db.close();});
++test('canceling a genuine request error permits subsequent real writes and commit',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w),tx=db.transaction('s','readwrite'),s=tx.objectStore('s'),completed=done(tx);s.add('first',1);const duplicate=s.add('bad',1);duplicate.onerror=e=>{assert.ok(e instanceof w.Event);assert.equal(e.isTrusted,true);assert.equal(e.bubbles,true);assert.equal(e.cancelable,true);e.preventDefault();s.put('after',2)};await completed;assert.deepEqual(plain(await result(db.transaction('s').objectStore('s').getAll())),['first','after']);db.close();});
++test('indexes/cursors operate on actual sorted records, updates and deletes',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w,'indexed',1,d=>{const s=d.createObjectStore('s',{keyPath:'id'});const index=s.createIndex('by_v','v');assert.strictEqual(s.index('by_v'),index);for(const[id,v]of[[1,'b'],[2,'a'],[3,'a'],[4,'c']])s.put({id,v})});const tx=db.transaction('s','readwrite'),s=tx.objectStore('s'),completed=done(tx),seen=[];const request=s.index('by_v').openCursor();await new Promise((resolve,reject)=>{request.onsuccess=()=>{const c=request.result;if(!c){resolve();return}assert.ok(c instanceof w.IDBCursorWithValue);assert.strictEqual(c.value,c.value);seen.push([c.key,c.primaryKey]);if(c.primaryKey===2)c.update({id:2,v:'a',updated:true});if(c.primaryKey===4)c.delete();c.continue()};request.onerror=()=>reject(request.error)});await completed;assert.deepEqual(seen,[['a',2],['a',3],['b',1],['c',4]]);const records=await result(db.transaction('s').objectStore('s').getAllRecords({direction:'prev'}));assert.ok(records instanceof w.Array);assert.ok(records[0] instanceof w.IDBRecord);assert.deepEqual(records.map(x=>x.key),new w.Array(3,2,1));assert.equal(records[1].value.updated,true);db.close();});
++test('real store/index names and handles follow rename and rollback',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w,'rename',1,(d,tx)=>{const s=d.createObjectStore('old'),i=s.createIndex('by_v','v');s.put({v:'value'},1);s.name='new';i.name='by_new';assert.strictEqual(tx.objectStore('new'),s);assert.strictEqual(s.index('by_new'),i)});const names=db.objectStoreNames;assert.ok(names instanceof w.DOMStringList);assert.notStrictEqual(names,db.objectStoreNames);assert.deepEqual(Reflect.ownKeys(names),[]);assert.equal(names[0],'new');assert.equal(names.contains('new'),true);assert.deepEqual([...names],['new']);db.close();const r=w.indexedDB.open('rename',2);let store,index;r.onupgradeneeded=()=>{store=r.transaction.objectStore('new');index=store.index('by_new');store.name='aborted';index.name='aborted-index';r.transaction.abort()};await assert.rejects(result(r),e=>e.name==='AbortError');assert.equal(store.name,'new');assert.equal(index.name,'by_new');});
++test('native-observed upgrades bypass connection blocking but retain old usable connections',{timeout:5000},async t=>{const{w}=await fixture(t),a=await open(w,'upgrade',1),b=await open(w,'upgrade',1),events=[];a.addEventListener('versionchange',()=>events.push('versionchange'));const r=w.indexedDB.open('upgrade',2);r.onblocked=()=>events.push('blocked');const c=await result(r);assert.notStrictEqual(a,b);assert.deepEqual(events,[]);assert.equal(a.version,1);assert.equal(c.version,2);assert.equal(await result(a.transaction('s').objectStore('s').get('none')),undefined);a.close();b.close();c.close();});
++test('delete really removes stores before its success callback can use retained connections',{timeout:5000},async t=>{const{w}=await fixture(t),db=await open(w,'delete',1),r=w.indexedDB.deleteDatabase('delete');await new Promise((resolve,reject)=>{r.onsuccess=()=>{assert.throws(()=>db.transaction('s'),e=>e.name==='NotFoundError');resolve()};r.onerror=()=>reject(r.error)});db.close();let upgraded=false;const next=await open(w,'delete',1,d=>{upgraded=true;d.createObjectStore('fresh')});assert.equal(upgraded,true);assert.deepEqual([...next.objectStoreNames],['fresh']);next.close();});
++test('context/origin persistence survives actual navigation and target recreation',{timeout:5000},async t=>{const{browser,page,w}=await fixture(t),db=await open(w,'persistent',1),tx=db.transaction('s','readwrite'),completed=done(tx);tx.objectStore('s').put('stored','key');await completed;db.close();await page.navigate(origin+'/next');let next=await open(page.dom.window,'persistent',1);assert.equal(await result(next.transaction('s').objectStore('s').get('key')),'stored');next.close();page.close();const peer=browser.createPage();await peer.navigate(origin);next=await open(peer.dom.window,'persistent',1);assert.equal(await result(next.transaction('s').objectStore('s').get('key')),'stored');next.close();const isolated=browser.createPage(browser.createContext());await isolated.navigate(origin);next=await open(isolated.dom.window,'persistent',1);assert.equal(await result(next.transaction('s').objectStore('s').get('key')),undefined);next.close();await peer.navigate(origin.replace('127.0.0.1','localhost'));next=await open(peer.dom.window,'persistent',1);assert.equal(await result(next.transaction('s').objectStore('s').get('key')),undefined);next.close();});
++test('actual CryptoKey material survives transactional graph copying and remains usable',{timeout:5000},async t=>{const{w}=await fixture(t),pair=await w.crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},false,['sign','verify']),db=await open(w,'keys',1),tx=db.transaction('s','readwrite'),completed=done(tx);tx.objectStore('s').put(pair,'key');await completed;const stored=await result(db.transaction('s').objectStore('s').get('key'));assert.ok(stored.privateKey instanceof w.CryptoKey);assert.equal(stored.privateKey.extractable,false);const data=new w.Uint8Array([1,2,3]),signature=await w.crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},stored.privateKey,data);assert.equal(await w.crypto.subtle.verify({name:'ECDSA',hash:'SHA-256'},pair.publicKey,signature,data),true);db.close();});
++test('opaque origins reject actual database access without opening a namespace',{timeout:5000},async t=>{const{page}=await fixture(t);await page.navigate('data:text/html,<body>opaque');assert.throws(()=>page.dom.window.indexedDB.open('opaque'),e=>e.name==='SecurityError'&&e.message==='The operation is insecure');});

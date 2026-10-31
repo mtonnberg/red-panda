@@ -1,0 +1,23 @@
+ function mix(samples,count,interpretation){const out=internal();for(let ch=0;ch<count;ch++)out.push(new F32(128));for(const source of samples){const channels=source.length;for(let ch=0;ch<count;ch++)for(let frame=0;frame<128;frame++){let value=0;if(interpretation==='discrete'){if(ch<channels)value=source[ch][frame];}else if(channels===1)value=source[0][frame];else if(count===1&&channels===2)value=(source[0][frame]+source[1][frame])*.5;else if(ch<channels)value=source[ch][frame];out[ch][frame]+=value;}}return out;}
+ function graphQuantum(context,state,sourceOutputs,start){
+  const cache=new Map(sourceOutputs),visiting=new Set(),stack=internal();stack.push(record({node:state.destination,done:false}));let allocated=0;
+  while(stack.length){const entry=stack.pop(),node=entry.node;if(cache.has(node))continue;const ns=nodes.get(node);
+   if(!entry.done){if(visiting.has(node))continue;visiting.add(node);stack.push(record({node,done:true}));for(const source of ns.incoming)if(!cache.has(source)&&!visiting.has(source))stack.push(record({node:source,done:false}));if(ns.gain)for(const source of params.get(ns.gain).incoming)if(!cache.has(source)&&!visiting.has(source))stack.push(record({node:source,done:false}));continue;}
+   const inputs=internal();let channels=1;for(const source of ns.incoming){const value=cache.get(source);if(value){inputs.push(value);channels=max(channels,value.length);}}
+   channels=ns.kind==='destination'?state.channels:ns.mode==='explicit'?ns.channelCount:ns.mode==='clamped-max'?min(ns.channelCount,channels):channels;
+   allocated+=channels*128;if(allocated>33554432)throw dom('NotSupportedError');
+   const data=mix(inputs,channels,ns.interpretation);
+   if(ns.kind==='gain'){const ps=params.get(ns.gain),modulations=internal();for(const source of ps.incoming){const value=cache.get(source);if(value)modulations.push(value);}const input=mix(modulations,1,'speakers');for(let frame=0;frame<128;frame++){const time=(ps.automation==='k-rate'?start:start+frame)/state.rate,gain=paramValue(ps,time)+input[0][frame];for(let ch=0;ch<channels;ch++)data[ch][frame]*=gain;}}
+   cache.set(node,data);visiting.delete(node);
+  }
+  return cache.get(state.destination);
+ }
+ function render(context,state){if(!bridge.active()||state.state!=='running')return;
+  if(!state.output)state.output=makeBuffer(state.length,state.channels,state.rate);const out=buffers.get(state.output),limit=ceil(state.length/128)*128,finished=internal();
+  try{while(state.frame<limit){const suspension=state.suspensions.get(state.frame);if(suspension){state.suspensions.delete(state.frame);state.state='suspended';schedule(()=>fire(context,'statechange'));suspension.resolve();return;}
+   const start=state.frame,sourceOutputs=new Map();for(const source of state.sources){const result=sourceFrames(source,state,128,start),sourceState=nodes.get(source);if(result.ended&&!sourceState.ended){sourceState.ended=true;finished.push(source);}if(result.samples)sourceOutputs.set(source,result.samples);}
+   const data=graphQuantum(context,state,sourceOutputs,start),count=min(128,state.length-start);if(data)for(let ch=0;ch<state.channels;ch++)for(let frame=0;frame<count;frame++)out.channels[ch][start+frame]=data[ch][frame];state.frame+=128;
+  }}catch(error){state.state='closed';state.reject(error);return;}
+  for(const source of finished)schedule(()=>fire(source,'ended'));
+  schedule(()=>{if(!bridge.active())return;state.state='closed';fire(context,'complete',state.output);state.resolve(state.output);schedule(()=>fire(context,'statechange'));});
+ }

@@ -1,4 +1,9 @@
+import {installSelectControls} from './select-controls.js';
+import {installMediaElements} from './media-elements.js';
+import {installPaymentRequest} from './payment-request.js';
+import {installImages} from './images.js';
 import { installWebCrypto } from './web-crypto.js';
+import { installIndexedDB } from './indexeddb.js';
 import {installCookieStore} from './cookie-store.js';
 import { installScheduler } from './scheduler.js';
 import {installDevicePermissions} from './device-permissions.js';
@@ -55,15 +60,18 @@ import { dumpDocument } from './dump.js';
 import { installShadowDOM } from './shadow.js';
 import { installSerialization } from './serialization.js';
 import { installFrames } from './frames.js';
+import {initializePopupPage,isPopupPage,preparePopupDocument,installWindowOpen,disposeBrowsingWindow,disposeOwnedPopups} from './popup-pages.js';
 import { installFetch } from './fetch.js';
 import { installAbortSignals } from './abort-signals.js';
 import { loadCollectionsBinding, installCollections } from './collections.js';
 import { installStyles } from './styles.js';
 import { installWebCodecsProcessors } from './webcodecs-processors.js';
+import { installAnimations } from './animations.js';
 import { installVideoFrame } from './video-frame.js';
 import { installAudioData } from './audio-data.js';
 import { installWebCodecsValues } from './webcodecs-values.js';
 import {installRangeGeometry} from './range-geometry.js';
+import {installSanitizer} from './sanitizer.js';
 import { installGeometry } from './geometry.js';
 import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
 import { renderDocument } from './render.js';
@@ -159,6 +167,11 @@ export class Browser extends EventEmitter {
     this.emit('targetCreated', page);
     return page;
   }
+  createPopupPage(contextId,config) {
+    const context=this.contexts.get(contextId);
+    if(!context)throw new Error('Unknown browser context');
+    return new Page(this,context,{popup:config});
+  }
   disposeContext(id) {
     if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');
     for (const page of [...this.pages.values()]) if (page.context.id === id) page.close();
@@ -168,7 +181,7 @@ export class Browser extends EventEmitter {
 }
 
 export class Page extends EventEmitter {
-  constructor(browser, context) {
+  constructor(browser, context, {popup}={}) {
     super();
     this.browser = browser;
     this.context = context;
@@ -200,12 +213,18 @@ export class Page extends EventEmitter {
     this.attachedFrames = new Set([this.frameId]);
     this.committedFrames = new Set([this.frameId]);
     this.createdFrameContexts = new Set();
+    initializePopupPage(this,popup);
     this.dom = this.createDOM('<!doctype html><html><head></head><body></body></html>');
   }
 
   createDOM(html, historyState = null) {
     const virtualConsole = new VirtualConsole();
-    virtualConsole.on('jsdomError', error => this.emit('pageError', error));
+    virtualConsole.on('jsdomError', error => {
+      // Fetch diagnostics are distinct from uncaught authored JavaScript.
+      // Preserve their backend signal without reporting Runtime.exceptionThrown.
+      if(error.type==='resource loading')this.emit('resourceError',error);
+      else this.emit('pageError',error.type==='unhandled exception'&&Object.hasOwn(error,'detail')?error.detail:error);
+    });
     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
       virtualConsole.on(type, (...args) => this.emit('console', { type, args }));
     }
@@ -221,6 +240,7 @@ export class Page extends EventEmitter {
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
+    preparePopupDocument(this,window);
     captureProtocolRealm(window);
     const invocation=createInvocationTrampoline(implForWrapper(window)._globalObject);
     this.documentAbort?.signal.addEventListener('abort',()=>invocation.dispose(),{once:true});
@@ -256,6 +276,7 @@ export class Page extends EventEmitter {
       installFetch(this, window);
       const creatorSnapshot=captureWorkerCreator(this,window);
       const secure=creatorSnapshot().secure;
+      installPaymentRequest(window,{secure});
       Object.defineProperty(window,'isSecureContext',{get:()=>creatorSnapshot().secure,configurable:true,enumerable:true});
       installCache(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,baseURL:()=>creatorSnapshot().baseURL});
 
@@ -270,12 +291,14 @@ export class Page extends EventEmitter {
       this.moduleScripts = installModuleScripts(this, window);
       installClassicScripts(this, window);
       installInputControls(this, window);
+      installSelectControls(this,window);
       const workers=installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
       installServiceWorkers(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,spawn:workers.createService});
       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
       installBroadcast(this, window);
       installImageData(window);
       installWebCrypto(window);
+      installIndexedDB(this, window);
       installURLPattern(window);
       installCanvas(window);
       installGeometry(window);
@@ -284,13 +307,17 @@ export class Page extends EventEmitter {
       installAudioData(window);
       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
       installWebCodecsProcessors(window);
+      installAnimations(this,window);
       installSVG(this, window);
       installDOMIDL(this, window);
       installDOMEvents(this, window);
       installDOMLifecycle(this, window);
+      installSanitizer(this,window);
       installSelection(this, window);
       installMedia(this, window);
       installTextTracks(this, window);
+      installMediaElements(this,window);
+      installImages(this, window);
       installAudioCore(this, window);
       installXHR(this, window);
       if (main) this.frames = installFrames(this, window, {
@@ -300,6 +327,7 @@ export class Page extends EventEmitter {
     prepareUtilityPlatform(window);
     installFrameActivity(this,window);
     installScheduler(this,window);
+    installWindowOpen(this,window);
     prepareHeapRealm(this,window);
     (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
     for (const { source,worldName } of this.newDocumentScripts.values()) {
@@ -646,7 +674,7 @@ export class Page extends EventEmitter {
       this.documentGeneration++;
       this.documentAbort.abort();
       this.documentAbort = new AbortController();
-      this.dom.window.close();
+      disposeBrowsingWindow(this.dom.window,{retain:isPopupPage(this)});
       this.responseHeaders = response ? [...response.headers].map(([name, value]) => ({ name, value })) : [];
       this.url = response?.finalUrl ?? target;
       this.mimeType = mimeType;
@@ -754,7 +782,8 @@ export class Page extends EventEmitter {
     this.navigationGeneration++;
     this.navigationAbort?.abort();
     this.documentAbort.abort();
-    this.dom.window.close();
+    disposeOwnedPopups(this);
+    disposeBrowsingWindow(this.dom.window);
     this.emit('close');
     this.removeAllListeners();
   }

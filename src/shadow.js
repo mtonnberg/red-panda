@@ -27,6 +27,7 @@ const DOCUMENTS = new WeakMap();
 const DISPOSED_DOCUMENTS = new WeakSet();
 const ROOTS = new WeakMap();
 const FORCED_FRAGMENTS = new WeakMap();
+const FORCED_DOCUMENTS = new WeakMap();
 const MANUAL_LISTS = new WeakMap();
 const MANUAL_OWNERS = new WeakMap();
 const HTML = 'http://www.w3.org/1999/xhtml';
@@ -187,13 +188,13 @@ function rootOptions(template) {
     clonable: template.hasAttributeNS(null, 'shadowrootclonable') };
 }
 
-function declarativeAdapter(adapter, record) {
+function declarativeAdapter(adapter, record, document = record?.documentImpl, inert = false) {
   const append = adapter.appendChild;
   adapter.appendChild = function (parent, child) {
     if (active(record) && child.nodeType === 1 && child.namespaceURI === HTML && child.localName === 'template') {
       const host = parent;
       const options = rootOptions(child);
-      if (options && host?.nodeType === 1 && host._ownerDocument === record.documentImpl && !host._shadowRoot) {
+      if (options && host?.nodeType === 1 && host._ownerDocument === document && !host._shadowRoot) {
         try {
           const root = attach(host, options, true);
           // parse5 now inserts template children directly into the real root.
@@ -206,7 +207,7 @@ function declarativeAdapter(adapter, record) {
       }
     }
     const result = append.call(this, parent, child);
-    if (active(record) && child.localName === 'script' && child._parserInserted && child.isConnected && isShadowRoot(child.getRootNode({}))) {
+    if (!inert && active(record) && child.localName === 'script' && child._parserInserted && child.isConnected && isShadowRoot(child.getRootNode({}))) {
       // The real document parser executes scripts in declarative shadow trees.
       // Mark this script attached for its existing parser-pop evaluation hook;
       // attaching every shadow descendant would also register private IDs and
@@ -253,11 +254,11 @@ function serialize(receiver, options, window) {
   return parse5.serialize(implForWrapper(receiver), { treeAdapter: adapter });
 }
 
-function setUnsafe(receiver, markup, options, window) {
+function setUnsafe(receiver, markup, options, window, filter) {
   if (options != null && options.sanitizer !== undefined) throw new window.DOMException('HTML sanitizer options are not implemented', 'NotSupportedError');
   markup = String(markup);
   const implementation = implForWrapper(receiver);
-  const record = recordFor(implementation._ownerDocument);
+  const record = recordFor(implementation._ownerDocument) ?? (filter !== undefined ? recordFor(implForWrapper(implementation._globalObject._document)) : null);
   if (!record) throw new window.DOMException('The document is not registered for shadow parsing', 'InvalidStateError');
   const context = ShadowRootInterface.is(receiver) ? implementation.host : implementation;
   const target = implementation.localName === 'template' && implementation.namespaceURI === HTML ? implementation._templateContents : implementation;
@@ -265,10 +266,11 @@ function setUnsafe(receiver, markup, options, window) {
   try {
     // Consume this permit at exactly one parser entry. Nested innerHTML calls
     // from custom-element constructors retain their ordinary inert semantics.
-    FORCED_FRAGMENTS.set(context, { record });
+    FORCED_FRAGMENTS.set(context, { record, document:implementation._ownerDocument });
     let fragment;
     try { fragment = htmlParser.parseFragment(markup, context); }
     finally { FORCED_FRAGMENTS.delete(context); }
+    if(filter)filter(fragment);
     target._replaceAll(fragment);
   } finally { ceReactionsPostSteps(window); }
 }
@@ -316,8 +318,9 @@ function patchHosts() {
   };
   const parseDocument = parse5.parse;
   parse5.parse = function (markup, options) {
-    const record = recordFor(options?.treeAdapter?._documentImpl);
-    if (record) declarativeAdapter(options.treeAdapter, record);
+    const document=options?.treeAdapter?._documentImpl,permit=FORCED_DOCUMENTS.get(document);if(permit)FORCED_DOCUMENTS.delete(document);
+    const record = permit?.record ?? recordFor(document);
+    if (record) declarativeAdapter(options.treeAdapter, record, document, Boolean(permit?.inert));
     return parseDocument.call(this, markup, options);
   };
   const parseFragment = parse5.parseFragment;
@@ -325,7 +328,7 @@ function patchHosts() {
     const permit = context && FORCED_FRAGMENTS.get(context);
     if (permit) {
       FORCED_FRAGMENTS.delete(context);
-      declarativeAdapter(options.treeAdapter, permit.record);
+      declarativeAdapter(options.treeAdapter, permit.record, permit.document ?? permit.record?.documentImpl);
       if (permit.executeScripts) {
         const pop = options.treeAdapter.onItemPop;
         options.treeAdapter.onItemPop = function (node, ...args) {
@@ -437,3 +440,10 @@ export function parseDocumentWriteFragment(document, markup) {
   try { return htmlParser.parseFragment(markup, context); }
   finally { FORCED_FRAGMENTS.delete(context); }
 }
+
+// Trusted sanitizer pipeline filters genuine parsed nodes before the one live replacement.
+export function replaceSanitizerHTML(node,markup,filter){const record=recordFor(node._ownerDocument)??recordFor(implForWrapper(node._globalObject._document));if(!record)throw new node._globalObject.DOMException("The document is not registered for shadow parsing","InvalidStateError");return setUnsafe(wrapperForImpl(node),markup,undefined,record.window,filter);}
+
+// One trusted inert-document parser entry may form real declarative roots using
+// its active allocating realm, without substituting the realm document itself.
+export function parseSanitizerDocument(document,markup,owner){patchHosts();const record=recordFor(owner);if(record)FORCED_DOCUMENTS.set(document,{record,inert:true});try{return htmlParser.parseIntoDocument(markup,document)}finally{FORCED_DOCUMENTS.delete(document)}}

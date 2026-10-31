@@ -1,9 +1,10 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const ObserverImpl = require('jsdom/lib/jsdom/living/mutation-observer/MutationObserver-impl.js').implementation;
 const ErrorEvent = require('jsdom/lib/jsdom/living/generated/ErrorEvent.js');
-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
 const windows = new WeakMap(), observers = new WeakMap(), agents = new WeakMap();
 let patched = false;
 

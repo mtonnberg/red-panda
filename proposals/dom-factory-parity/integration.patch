@@ -1,0 +1,260 @@
+--- /dev/null
++++ b/src/dom-factory-scope.js
+@@ -0,0 +1,48 @@
++// Host-only ownership for actual fresh DOM factory allocation. No Document
++// globals, backend ownership or existing canonical wrappers are changed.
++import 'jsdom';
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const {lookupCEDefinition}=require('jsdom/lib/jsdom/living/helpers/custom-elements.js');
++const {HTML_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
++const scopes=[],kinds=new Set(),globals=new WeakMap(),primaryScopes=new WeakMap();
++const nil=()=>Object.create(null);
++function context(value){return vm.isContext(value)?value:utils.implForWrapper(value)?._globalObject;}
++export function registerDOMAllocationKind(kind){kinds.add(kind);}
++export function domWrapperGlobal(value,fallback){return globals.get(value)??fallback;}
++export function recordDOMWrapperGlobal(value,globalObject){globals.set(value,globalObject);return value;}
++export function selectDOMWrapperAllocation(globalObject,prototype,kind){
++ const scope=scopes.at(-1);
++ if(!scope?.active||!kinds.has(kind)||context(globalObject)!==scope.source)return Object.assign(nil(),{globalObject,prototype});
++ const selected=scope.target,Constructor=selected[utils.ctorRegistrySymbol]?.[kind];
++ if(!Constructor)return Object.assign(nil(),{globalObject,prototype});
++ return Object.assign(nil(),{globalObject:selected,prototype:Constructor.prototype,scope});
++}
++export function noteDOMWrapperShell(value,selection){
++ globals.set(value,selection.globalObject);
++ if(selection.scope&&!selection.scope.primary){selection.scope.primary=value;primaryScopes.set(value,selection.scope);}
++ return value;
++}
++export function finishDOMWrapperSetup(value){
++ const scope=primaryScopes.get(value);
++ if(scope){scope.active=false;primaryScopes.delete(value);}
++}
++function customConstruction(implementation,name,args){
++ if(name!=='createElement'&&name!=='createElementNS')return false;
++ const namespace=name==='createElement'?(implementation._parsingMode==='html'?HTML_NS:null):args[0];
++ if(namespace!==HTML_NS)return false;
++ let localName=name==='createElement'?args[0]:args[1].split(':').at(-1);
++ if(name==='createElement'&&implementation._parsingMode==='html')localName=localName.replace(/[A-Z]/g,c=>c.toLowerCase());
++ const options=args[name==='createElement'?1:2],isValue=options&&typeof options==='object'?options.is:null;
++ return lookupCEDefinition(implementation,namespace,localName,isValue??null)!==null;
++}
++export function callDOMFactory(globalObject,implementation,name,args){
++ const source=context(implementation._globalObject),target=context(globalObject);
++ if(!source||!target)return name==='elements'?implementation[name]:Reflect.apply(implementation[name],implementation,args);
++ // Actual authored custom constructors retain their own construction realm.
++ const scope=Object.assign(nil(),{source,target,active:!customConstruction(implementation,name,args),primary:null});
++ scopes.push(scope);
++ try{return name==='elements'?implementation[name]:Reflect.apply(implementation[name],implementation,args);}
++ finally{if(scopes.pop()!==scope)throw new Error('DOM factory scope mismatch');}
++}
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {registerDOMAllocationKind,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
+ // Fresh Node/Event wrappers are allocated in their actual document VM. Generated
+ // setup/new retain their real implementation graph, brands and proxy traps.
+ import 'jsdom';
+@@ -25,10 +26,10 @@
+  }
+  return record;
+ }
+-export function createDOMWrapperShell(globalObject,prototype){
+- const record=realm(globalObject);
+- if(!record)return hostCreate(prototype);
+- return setPrototype(Reflect.construct(record.Object,[]),prototype);
++export function createDOMWrapperShell(globalObject,prototype,kind){
++ const selection=selectDOMWrapperAllocation(globalObject,prototype,kind),record=realm(selection.globalObject);
++ const value=record?setPrototype(Reflect.construct(record.Object,[]),selection.prototype):hostCreate(selection.prototype);
++ return noteDOMWrapperShell(value,selection);
+ }
+ export function observeDOMWrapperProxy(kind,callback){
+  if(typeof kind!=='string'||typeof callback!=='function')throw new TypeError('A generated kind and Host observer are required');
+@@ -37,9 +38,9 @@
+ }
+ export function createDOMWrapperProxy(target,handler,globalObject,kind){
+  for(const observe of observers.get(kind)??[])observe(target,handler,globalObject);
+- const Constructor=realm(globalObject)?.Proxy??HostProxy;
++ const selected=domWrapperGlobal(target,globalObject),Constructor=realm(selected)?.Proxy??HostProxy;
+  // This is the factory's original sole Proxy, with its same target and traps.
+- return Reflect.construct(Constructor,[target,handler]);
++ return recordDOMWrapperGlobal(Reflect.construct(Constructor,[target,handler]),selected);
+ }
+ export function installDOMWrapperRealms(){
+  if(installed)return;installed=true;
+@@ -55,23 +56,41 @@
+   }
+   if(!Implementation)continue;
+   const node=Implementation===NodeImpl||Implementation.prototype instanceof NodeImpl,event=Implementation===EventImpl||Implementation.prototype instanceof EventImpl;
+-  if(kind!=='HTMLOptionsCollection'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
++  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
++  if(node||kind==='HTMLFormControlsCollection')registerDOMAllocationKind(kind);
+   // Recompile the pinned independent generated source before any Window is
+   // installed. The same CommonJS exports object and Host implementations stay
+   // canonical. Only the three initial wrapper allocation expressions change.
+   const originalSource=readFileSync(full,'utf8');let source=originalSource;
+   const shell='return Object.create(proto);',proxy='return new Proxy(wrapper, proxyHandler);',constructor='exports.setup(Object.create(new.target.prototype),';
+   if(source.split(shell).length!==2)throw new Error('Unexpected generated Node allocation source: '+kind);
+-  source=source.replace(shell,'return createShell(globalObject, proto);');
++  source=source.replace(shell,`return createShell(globalObject, proto, ${JSON.stringify(kind)});`);
+   source=source.replaceAll(proxy,`return createProxy(wrapper, proxyHandler, globalObject, ${JSON.stringify(kind)});`);
+   source=source.replaceAll(constructor,'exports.setup(createShell(globalObject, new.target.prototype),');
++  if(kind==='Document'){
++   for(const method of ['createElement','createElementNS','createTextNode','createComment','createAttribute','createAttributeNS']){
++    const expression=`esValue[implSymbol].${method}(...args)`;
++    if(source.split(expression).length!==2)throw new Error('Unexpected generated Document factory call: '+method);
++    source=source.replace(expression,`callFactory(globalObject, esValue[implSymbol], ${JSON.stringify(method)}, args)`);
++   }
++   const expression='esValue[implSymbol].createDocumentFragment()';
++   if(source.split(expression).length!==2)throw new Error('Unexpected generated DocumentFragment factory call');
++   source=source.replace(expression,'callFactory(globalObject, esValue[implSymbol], "createDocumentFragment", [])');
++  }
++  if(kind==='HTMLFormElement'){
++   const expression='return utils.getSameObject(this, "elements", () => {\n        return utils.tryWrapperForImpl(esValue[implSymbol]["elements"]);\n      });';
++   if(source.split(expression).length!==2)throw new Error('Unexpected generated form.elements getter');
++   source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
++  }
+   candidates.push({factory,kind,full,originalSource,source});
+  }
+  const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
+- if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='5778ef2eeb41700ebaf12c621bc7009d1e15d38b611406e01693be050c8fe548')throw new Error('Pinned jsdom DOM allocation source changed');
++ if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='868d8b79e5309539b7018606ffa46ffd40b56f6295878521854592092211fc1c')throw new Error('Pinned jsdom DOM allocation source changed');
+  for(const {factory,kind,full,source} of candidates){
+   const module={exports:factory};
+-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy);
++  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory);
+   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
++  const setup=factory.setup;
++  factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};
+  }
+ }
+--- a/src/platform-factory-hooks.js
++++ b/src/platform-factory-hooks.js
+@@ -1,3 +1,4 @@
++import {domWrapperGlobal} from './dom-factory-scope.js';
+ import {installDOMWrapperRealms} from './dom-wrapper-realms.js';
+ import 'jsdom';
+ import { createRequire } from 'node:module';
+@@ -28,13 +29,13 @@
+     if (typeof setup === 'function') factory.setup = function (wrapper, globalObject, ...args) {
+       const value = setup.call(this, wrapper, globalObject, ...args);
+       const descriptor = Object.getOwnPropertyDescriptor(wrapper, utils.implSymbol);
+-      registerPlatformFactory(value, { kind, implementation:descriptor?.value, globalObject });
++      registerPlatformFactory(value, { kind, implementation:descriptor?.value, globalObject:domWrapperGlobal(value,globalObject) });
+       return value;
+     };
+     if (typeof allocate === 'function') factory.new = function (globalObject, ...args) {
+       const implementation = allocate.call(this, globalObject, ...args);
+       const descriptor = Object.getOwnPropertyDescriptor(implementation, utils.wrapperSymbol);
+-      if (descriptor?.value) registerPlatformFactory(descriptor.value, { kind, implementation, globalObject });
++      if (descriptor?.value) registerPlatformFactory(descriptor.value, { kind, implementation, globalObject:domWrapperGlobal(descriptor.value,globalObject) });
+       return implementation;
+     };
+   }
+--- a/src/document-xml.js
++++ b/src/document-xml.js
+@@ -1,3 +1,4 @@
++import {callDOMFactory} from './dom-factory-scope.js';
+ import {atomicFormMove} from './element-internals.js';
+ // Independent proposal. Existing jsdom DOM/parser/XPath components are reused;
+ // target implementation source is neither imported nor copied.
+@@ -13,6 +14,27 @@
+ const makeXPath=require('jsdom/lib/jsdom/level3/xpath.js');
+ const{decodeHTMLStrict}=require('entities');
+ const{parse:parseHost}=require('tldts');
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const UnknownElement=require('jsdom/lib/jsdom/living/generated/HTMLUnknownElement.js');
++const validateNames=require('jsdom/lib/jsdom/living/helpers/validate-names.js');
++const {HTML_NS,SVG_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
++let xmlFactoriesPatched=false;
++function patchXMLFactories(){
++ if(xmlFactoriesPatched)return;xmlFactoriesPatched=true;
++ const create=DocumentImpl.prototype.createElement,createNS=DocumentImpl.prototype.createElementNS;
++ const unknown=(document,namespace,prefix,localName)=>UnknownElement.createImpl(document._globalObject,[],{ownerDocument:document,localName,namespace,prefix,ceState:'uncustomized',ceDefinition:null,isValue:null});
++ DocumentImpl.prototype.createElement=function(localName,...args){
++  if(this._parsingMode!=='xml')return Reflect.apply(create,this,[localName,...args]);
++  validateNames.name(this._globalObject,localName);
++  const colon=localName.indexOf(':'),prefix=colon<0?null:localName.slice(0,colon);
++  return unknown(this,null,prefix,colon<0?localName:localName.slice(colon+1));
++ };
++ DocumentImpl.prototype.createElementNS=function(namespace,qualifiedName,...args){
++  if(this._parsingMode!=='xml'||namespace===HTML_NS||namespace===SVG_NS)return Reflect.apply(createNS,this,[namespace,qualifiedName,...args]);
++  const extracted=validateNames.validateAndExtract(this._globalObject,namespace,qualifiedName);
++  return unknown(this,extracted.namespace,extracted.prefix,extracted.localName);
++ };
++}
+ const installed=new WeakMap();
+ 
+ // XML5-style compatibility: known HTML entities are numeric-escaped into the
+@@ -106,12 +128,13 @@
+ }
+ 
+ export function installDocumentXML(page,window){
++ patchXMLFactories();
+  if(installed.has(window))return installed.get(window);
+  const document=window.document;
+  const docBrand=value=>DocumentInterface.is(value);
+  const metadata=window.eval(`(${realmMetadata.toString()})`)(window,{
+   normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,
+-  attribute(doc,name){const impl=implForWrapper(doc);if(impl._parsingMode==='html')name=name.replace(/[A-Z]/g,letter=>letter.toLowerCase());return wrapperForImpl(impl._createAttribute({localName:name}));},
++  attribute(doc,name){const impl=implForWrapper(doc);if(impl._parsingMode==='html')name=name.replace(/[A-Z]/g,letter=>letter.toLowerCase());return wrapperForImpl(callDOMFactory(window,impl,'_createAttribute',[{localName:name}]));},
+   html(doc){const impl=implForWrapper(doc);impl._parsingMode='html';impl.contentType='text/html';},
+   hostname(doc){const origin=implForWrapper(doc)._origin;try{return new URL(origin).hostname;}catch{}try{return window.location.hostname;}catch{return'';}},
+   validateDomain(current,value){
+--- a/src/custom-elements.js
++++ b/src/custom-elements.js
+@@ -1,3 +1,4 @@
++import {domWrapperGlobal} from './dom-factory-scope.js';
+ import {installElementInternals} from './element-internals.js';
+ import { createRequire } from 'node:module';
+ const require=createRequire(import.meta.url);
+@@ -70,7 +71,7 @@
+   const result=owner.call(this,document),record=recordFor(document);
+   if(record&&result._isInertTemplateDocument){
+    const wrapper=wrapperForImpl(result);
+-   Object.setPrototypeOf(wrapper,record.htmlDocumentPrototype);
++   Object.setPrototypeOf(wrapper,domWrapperGlobal(wrapper,record.window).HTMLDocument?.prototype??record.htmlDocumentPrototype);
+    // This separate inert Document is born complete, with no browsing context
+    // or active parser; no synthetic ready-state event is dispatched.
+    result._currentDocumentReadiness='complete';
+--- a/src/form-controls.js
++++ b/src/form-controls.js
+@@ -1,3 +1,5 @@
++import {domWrapperGlobal} from './dom-factory-scope.js';
++import {registerPlatformFactory} from './platform-factories.js';
+ import {createDOMWrapperShell,createDOMWrapperProxy} from './dom-wrapper-realms.js';
+ import {registerHeapFactoryValue} from './heap-registry.js';
+ import { createRequire } from 'node:module';
+@@ -56,7 +58,8 @@
+     ownKeys: target => Reflect.ownKeys(target),
+     preventExtensions: () => false,
+   }, globalObject, collection?'HTMLFormControlsCollection':'HTMLFormElement');
+-  registerHeapFactoryValue(wrapper,{implementation,globalObject,replace});
++  registerHeapFactoryValue(wrapper,{implementation,globalObject:domWrapperGlobal(wrapper,globalObject),replace});
++  registerPlatformFactory(wrapper,{kind:collection?'HTMLFormControlsCollection':'HTMLFormElement',implementation,globalObject:domWrapperGlobal(wrapper,globalObject)});
+   implementation[utils.wrapperSymbol] = wrapper;
+   return wrapper;
+ }
+--- /dev/null
++++ b/test/dom-factory-parity.test.js
+@@ -0,0 +1,19 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {createRequire} from 'node:module';
++import {Browser} from '../src/browser.js';
++import {getHeapBinding} from '../src/native-heap.js';
++import {platformFactoryRecord} from '../src/platform-factories.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),HTMLElementImpl=require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation,binding=getHeapBinding();
++async function fixture(t){const server=http.createServer((q,s)=>{s.setHeader('content-type','text/html');s.end('<!doctype html><body><iframe></iframe>')});server.listen(0,'127.0.0.1');await once(server,'listening');const browser=new Browser({timeout:1500,loadResources:['iframe']}),page=browser.createPage();t.after(async()=>{browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));});await page.navigate(`http://127.0.0.1:${server.address().port}`);const w=page.dom.window,c=w.document.querySelector('iframe').contentWindow;return{browser,page,w,c};}
++function actualRealm(value,anchor){const proto=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null);}}finally{Object.setPrototypeOf(value,proto);}}
++test('borrowed Element factories allocate actual method VM shells while backend and ownership stay original',async t=>{const{w,c}=await fixture(t),doc=utils.implForWrapper(w.document),anchor=c.eval('[]');for(const tag of ['div','input','form','select','template','unknown-owned']){const e=c.Document.prototype.createElement.call(w.document,tag),impl=utils.implForWrapper(e);actualRealm(e,anchor);assert.strictEqual(e.ownerDocument,w.document);assert.strictEqual(utils.wrapperForImpl(impl),e);assert.strictEqual(impl._ownerDocument,doc);assert.strictEqual(impl._globalObject,doc._globalObject);assert.equal(binding.sameRealm(impl,[]),true);assert.ok(e instanceof c.HTMLElement);assert.equal(e instanceof w.HTMLElement,false);assert.strictEqual(platformFactoryRecord(e).globalRef.deref(),utils.implForWrapper(c.document)._globalObject);w.document.body.append(e);assert.strictEqual(w.document.body.lastChild,e);}});
++test('seven Document factory paths retain owner Document and actual method VM without replacing existing nodes',async t=>{const{w,c}=await fixture(t),anchor=c.eval('[]');for(const[name,args,type]of[['createElement',['div'],'Element'],['createElementNS',['http://www.w3.org/2000/svg','svg'],'SVGElement'],['createTextNode',['actual'],'Text'],['createComment',['actual'],'Comment'],['createDocumentFragment',[],'DocumentFragment'],['createAttribute',['data-owned'],'Attr'],['createAttributeNS',[null,'data-owned'],'Attr']]){const e=c.Document.prototype[name].apply(w.document,args);actualRealm(e,anchor);assert.ok(e instanceof c[type]);assert.strictEqual(e.ownerDocument,w.document);}const e=w.document.createElement('span'),original=utils.implForWrapper(e);w.document.body.append(e);assert.strictEqual(c.Document.prototype.querySelector.call(w.document,'span'),e);assert.strictEqual(utils.implForWrapper(e),original);actualRealm(e,w.eval('[]'));const reverse=w.Document.prototype.createElement.call(c.document,'span');actualRealm(reverse,w.eval('[]'));assert.strictEqual(reverse.ownerDocument,c.document);});
++test('factory scopes begin after argument conversion and retire before authored custom constructor bodies',async t=>{const{w,c}=await fixture(t),inside=[],name={toString(){inside.push(w.document.createElement('div'));return 'div'}},options={get is(){inside.push(w.document.createElement('div'));return undefined}},e=c.Document.prototype.createElement.call(w.document,name,options);actualRealm(e,c.eval('[]'));assert.equal(inside.length,2);for(const value of inside)actualRealm(value,w.eval('[]'));w.eval('class Owned extends HTMLElement{constructor(){const before=document.createElement("span");super();this.before=before;this.after=document.createTextNode("after")}}customElements.define("owned-early",Owned)');const custom=c.Document.prototype.createElement.call(w.document,'owned-early');for(const value of [custom,custom.before,custom.after])actualRealm(value,w.eval('[]'));assert.equal(custom.localName,'owned-early');});
++test('failed borrowed calls leave subsequent real allocations in their proper realm',async t=>{const{w,c}=await fixture(t);for(const args of [[],['bad name']])assert.throws(()=>c.Document.prototype.createElement.apply(w.document,args));const e=w.document.createElement('div');actualRealm(e,w.eval('[]'));assert.strictEqual(e.ownerDocument,w.document);});
++test('borrowed templates construct real content Fragment and inert Document in the method VM',async t=>{const{w,c}=await fixture(t),t1=c.Document.prototype.createElement.call(w.document,'template'),anchor=c.eval('[]');for(const value of [t1,t1.content,t1.content.ownerDocument])actualRealm(value,anchor);assert.ok(t1.content instanceof c.DocumentFragment);assert.ok(t1.content.ownerDocument instanceof c.HTMLDocument);assert.equal(t1.content.ownerDocument instanceof w.HTMLDocument,false);assert.equal(t1.content.ownerDocument.defaultView,null);assert.notStrictEqual(t1.content.ownerDocument,w.document);const source=utils.implForWrapper(w.document)._globalObject;assert.strictEqual(utils.implForWrapper(t1.content)._globalObject,source);});
++test('form.elements returns independent genuine live collections with actual query state and getter VM',async t=>{const{w,c}=await fixture(t),form=w.document.createElement('form'),a=w.document.createElement('input');a.name='one';form.append(a);w.document.body.append(form);const first=form.elements,second=form.elements;assert.notStrictEqual(first,second);assert.notStrictEqual(utils.implForWrapper(first),utils.implForWrapper(second));assert.strictEqual(first.namedItem('one'),a);const b=w.document.createElement('input');b.name='two';form.append(b);assert.equal(first.length,2);assert.equal(second.length,2);a.remove();assert.strictEqual(first[0],b);assert.strictEqual(second[0],b);const getter=Object.getOwnPropertyDescriptor(c.HTMLFormElement.prototype,'elements').get,foreign=getter.call(form);actualRealm(foreign,c.eval('[]'));assert.ok(foreign instanceof c.HTMLFormControlsCollection);assert.strictEqual(foreign[0],b);assert.notStrictEqual(foreign,getter.call(form));assert.equal(platformFactoryRecord(foreign).kind,'HTMLFormControlsCollection');assert.strictEqual(platformFactoryRecord(foreign).implementation,utils.implForWrapper(foreign));});
++test('XML factories create genuine UnknownHTMLElement backends with actual case namespace prefix and owner',async t=>{const{w,c}=await fixture(t);for(const type of ['application/xml','text/xml','application/xhtml+xml','image/svg+xml']){const d=new w.DOMParser().parseFromString('<root/>',type);for(const name of ['div','DIV','r:child']){const e=d.createElement(name);assert.ok(e instanceof w.HTMLUnknownElement);assert.ok(utils.implForWrapper(e) instanceof HTMLElementImpl);assert.equal(e.namespaceURI,null);assert.equal(e.localName,name.includes(':')?'child':name);assert.equal(e.tagName,name);assert.strictEqual(e.ownerDocument,d);actualRealm(e,w.eval('[]'));e.setAttribute('data-owned','value');assert.equal(e.getAttribute('data-owned'),'value');}const foreign=c.Document.prototype.createElement.call(d,'div');actualRealm(foreign,c.eval('[]'));assert.ok(foreign instanceof c.HTMLElement);assert.strictEqual(foreign.ownerDocument,d);}});
++test('XML createElementNS constructs actual SVG/HTML/foreign namespace values without prototype branding',async t=>{const{w}=await fixture(t),d=new w.DOMParser().parseFromString('<root/>','application/xml');for(const ns of [null,'urn:owned','http://www.w3.org/1998/Math/MathML','http://www.w3.org/XML/1998/namespace']){const e=d.createElementNS(ns,'owned');assert.ok(e instanceof w.HTMLUnknownElement);assert.ok(utils.implForWrapper(e) instanceof HTMLElementImpl);assert.equal(e.namespaceURI,ns);assert.equal(e.localName,'owned');assert.strictEqual(e.ownerDocument,d);}const svg=d.createElementNS('http://www.w3.org/2000/svg','svg');assert.ok(svg instanceof w.SVGElement);assert.equal(svg instanceof w.HTMLElement,false);const prefixed=d.createElementNS('urn:owned','p:child');assert.equal(prefixed.prefix,'p');assert.equal(prefixed.localName,'child');assert.equal(prefixed.namespaceURI,'urn:owned');});

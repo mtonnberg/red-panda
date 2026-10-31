@@ -1,3 +1,4 @@
+import './dom-event-state.js';
 // Host-private provenance from successful allocation/factory callsites only.
 // No wrapper enumeration, authored marker reads or native heap dependency.
 const factories = new WeakMap();

@@ -1,0 +1,123 @@
+diff --git a/src/storage-event.js b/src/storage-event.js
+new file mode 100644
+--- /dev/null
++++ b/src/storage-event.js
+@@ -0,0 +1,45 @@
++import {createRequire} from 'node:module';
++import {registerPlatformFactory} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const require=createRequire(import.meta.url),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const events=new WeakMap(),installed=new WeakSet(),record=properties=>Object.assign(Object.create(null),properties);
++function factory(g,bridge){
++ const TypeError=g.TypeError,String=g.String,apply=Reflect.apply,define=Object.defineProperty,setPrototype=Object.setPrototypeOf;
++ const description=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,Event=g.Event,eventPrototype=Event.prototype;
++ const text=value=>bridge.normalize(typeof value==='symbol'?String(apply(description,value,[])):String(value));
++ const nullable=value=>value==null?null:text(value),object=value=>value!==null&&(typeof value==='object'||typeof value==='function');
++ const brand=value=>{if(!bridge.has(value))throw new TypeError('Illegal invocation')};
++ function StorageEvent(type){
++  if(new.target===undefined||arguments.length===0)throw new TypeError('invalid argument');
++  const name=text(type),input=arguments[1];if(input!=null&&!object(input))throw new TypeError('invalid argument');
++  const bubbles=input!=null&&'bubbles'in input?!!input.bubbles:false,cancelable=input!=null&&'cancelable'in input?!!input.cancelable:false,composed=input!=null&&'composed'in input?!!input.composed:false;
++  let key=null,newValue=null,oldValue=null,url='';
++  if(input!=null&&'key'in input)key=nullable(input.key);
++  if(input!=null&&'newValue'in input)newValue=nullable(input.newValue);
++  if(input!=null&&'oldValue'in input)oldValue=nullable(input.oldValue);
++  if(input!=null&&'url'in input){const value=input.url;if(value!==undefined)url=text(value)}
++  bridge.create(this,name,bubbles,cancelable,composed,key,oldValue,newValue,url);
++ }
++ const prototype=StorageEvent.prototype;setPrototype(prototype,eventPrototype);setPrototype(StorageEvent,Event);define(StorageEvent,'prototype',{writable:false});
++ for(const field of['key','oldValue','newValue','url','storageArea']){
++  const get=function(){brand(this);return bridge.read(this,field)};define(get,'name',{value:'get '+field,configurable:true});define(prototype,field,{get,enumerable:true,configurable:true});
++ }
++ function initStorageEvent(type){
++  brand(this);if(arguments.length===0)throw new TypeError('invalid argument');
++  const name=text(type),bubbles=!!arguments[1],cancelable=!!arguments[2],key=nullable(arguments[3]),oldValue=nullable(arguments[4]),newValue=nullable(arguments[5]),url=arguments[6]===undefined?'':text(arguments[6]);
++  bridge.init(this,name,bubbles,cancelable,key,oldValue,newValue,url);
++ }
++ define(prototype,'initStorageEvent',{value:initStorageEvent,writable:true,enumerable:true,configurable:true});const constructor=Object.getOwnPropertyDescriptor(prototype,'constructor');delete prototype.constructor;define(prototype,'constructor',constructor);define(prototype,Symbol.toStringTag,{value:'StorageEvent',configurable:true});
++ define(g,'StorageEvent',{value:StorageEvent,writable:true,configurable:true});
++}
++export function installStorageEvent(window){
++ if(installed.has(window))return;installed.add(window);registerPlatformFactoryKind('StorageEvent');
++ const bridge=Object.freeze(record({normalize:value=>String.prototype.toWellFormed.call(value),has:value=>events.has(value),
++  create(value,type,bubbles,cancelable,composed,key,oldValue,newValue,url){
++   EventIDL.setup(value,window,[type,{bubbles,cancelable,composed}],{isTrusted:false});
++   const implementation=implForWrapper(value),state=record({implementation,key,oldValue,newValue,url});events.set(value,state);registerPlatformFactory(value,{kind:'StorageEvent',implementation:state,globalObject:window});
++  },
++  read(value,field){return field==='storageArea'?null:events.get(value)[field]},
++  init(value,type,bubbles,cancelable,key,oldValue,newValue,url){const state=events.get(value),implementation=state.implementation;if(implementation._dispatchFlag)return;implementation.type=type;implementation.bubbles=bubbles;implementation.cancelable=cancelable;implementation.isTrusted=false;state.key=key;state.oldValue=oldValue;state.newValue=newValue;state.url=url},
++ }));window.eval(`(${factory.toString()})`)(window,bridge);
++}
+diff --git a/src/web-storage.js b/src/web-storage.js
+--- a/src/web-storage.js
++++ b/src/web-storage.js
+@@ -1,5 +1,6 @@
+ import {createRequire} from 'node:module';
+ import {StorageArea} from './storage-area.js';
++import {installStorageEvent} from './storage-event.js';
+ import {registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {captureDOMExceptionFactory} from './worker-dom-exception.js';
+@@ -43,6 +44,7 @@
+ function principal(window){const controller=installed.get(window),document=controller.document,origin=document._origin;if(origin!=='null')return origin;if(controller.parent&&document._URL.scheme==='about'&&['blank','srcdoc'].includes(document._URL.path))return principal(controller.parent);return document}
+ export function installWebStorage(page,window){
+  if(installed.has(window))return;
++ installStorageEvent(window);
+  const context=page.context,root=page.registry?.page??page,token=root.documentAbort;
+  let areas=contexts.get(context);if(!areas){areas=privateRecord({tuples:new Map(),opaque:new WeakMap()});contexts.set(context,areas)}
+  let tree=trees.get(token);if(!tree){tree=new Map();trees.set(token,tree)}
+diff --git a/src/platform-codec.js b/src/platform-codec.js
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -35,7 +35,7 @@
+   const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+-  if(['Animation','AnimationPlaybackEvent','Storage','PaymentRequest','PaymentResponse','PaymentRequestUpdateEvent','PaymentMethodChangeEvent','VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
++  if(['Animation','AnimationPlaybackEvent','Storage','StorageEvent','PaymentRequest','PaymentResponse','PaymentRequestUpdateEvent','PaymentMethodChangeEvent','VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+   const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
+   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+diff --git a/test/storage-event.test.js b/test/storage-event.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/storage-event.test.js
+@@ -0,0 +1,8 @@
++import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{createRequire}from'node:module';
++import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++const require=createRequire(import.meta.url),{implSymbol}=require('jsdom/lib/jsdom/living/generated/utils.js'),expected=JSON.parse(readFileSync(new URL('./fixtures/storage-event/native-expected.json',import.meta.url))),h=getHeapBinding();let server,origin;
++before(async()=>{server=http.createServer((q,s)=>{s.setHeader('content-type','text/html');s.end('<!doctype html><body>storage events')});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`});after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r))});
++async function fixture(t){const b=new Browser({loadResources:['iframe']});t.after(()=>b.close());const p=b.createPage();await p.navigate(origin);return{b,p,w:p.dom.window}}
++for(const[name,contract]of Object.entries(expected))test(`StorageEvent matches Native ${name} (${contract.rows} functional rows)`,async t=>{const{w}=await fixture(t),source=readFileSync(new URL(`./fixtures/storage-event/${name}.js`,import.meta.url),'utf8');assert.equal(createHash('sha256').update(source).digest('hex'),contract.sourceSHA256);assert.deepEqual(JSON.parse(await w.eval(`(async()=>JSON.stringify(await (${source})))()`)),contract.expected)});
++test('StorageEvent adapter public allocations and errors belong to their actual VM',async t=>{const{w}=await fixture(t),event=new w.StorageEvent('x');let error;try{w.StorageEvent.prototype.initStorageEvent.call({})}catch(value){error=value}const values=[event,w.StorageEvent,w.StorageEvent.prototype,w.StorageEvent.prototype.initStorageEvent,error,...['key','oldValue','newValue','url','storageArea'].map(name=>Object.getOwnPropertyDescriptor(w.StorageEvent.prototype,name).get)];for(const value of values){assert.equal(h.sameRealm(value,w.Object),true);assert.equal(h.sameRealm(value,{}),false);assert.strictEqual(h.creationGlobal(value),h.creationGlobal(w.Object));const prototype=Object.getPrototypeOf(value);Object.setPrototypeOf(value,null);assert.equal(h.sameRealm(value,w.Object),true);assert.equal(h.sameRealm(value,{}),false);Object.setPrototypeOf(value,prototype)}const state=platformFactoryRecord(event).implementation;assert.equal(Object.getPrototypeOf(state),null);assert.equal(h.sameRealm(state,w.Object),false)});
++test('StorageEvent owned fields and reinitialization use captured private state',async t=>{const{w}=await fixture(t),e=new w.StorageEvent('first',{key:'original'});let reads=0;Object.defineProperty(e,implSymbol,{configurable:true,get(){reads++;throw Error('authored impl read')}});assert.equal(e.key,'original');e.initStorageEvent('next',true,false,'changed','before','after','url');assert.equal(e.key,'changed');assert.equal(e.oldValue,'before');assert.equal(e.newValue,'after');assert.equal(e.url,'url');assert.equal(e.storageArea,null);assert.equal(reads,0)});
+diff --git a/test/fixtures/storage-event/storage-event-init.js b/test/fixtures/storage-event/storage-event-init.js
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/storage-event/storage-event-init.js
+@@ -0,0 +1 @@
++(()=>{const rows=[],safe=fn=>{try{return{value:fn()}}catch(e){return{error:e?.name,message:e?.message,type:typeof e,thrown:typeof e==='string'?e:undefined}}},snap=e=>({type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,key:e.key,oldValue:e.oldValue,newValue:e.newValue,url:e.url,storageArea:e.storageArea,isTrusted:e.isTrusted,defaultPrevented:e.defaultPrevented});for(const count of[0,1,3,7,8]){const e=new StorageEvent('initial',{bubbles:true,cancelable:true,composed:true,key:'k',oldValue:'old',newValue:'new',url:'url'});e.preventDefault();rows.push({label:'init:'+count,length:StorageEvent.prototype.initStorageEvent.length,result:safe(()=>{e.initStorageEvent(...['changed',false,false,'next',123,Symbol('val'),42,localStorage].slice(0,count));return snap(e)})})}const reads=[],item={toString(){reads.push('string');return'arg'}};let e=new StorageEvent('initial');rows.push({label:'coerce',result:safe(()=>{e.initStorageEvent(item,item,item,item,item,item,item,{get foo(){throw'ignored'}});return snap(e)}),reads});for(const[label,v]of[['object',{}],['proxy',new Proxy(e,{})],['inherited',Object.create(e)]]){rows.push({label:'brand:'+label,result:safe(()=>StorageEvent.prototype.initStorageEvent.call(v,'x',true,true,null,null,null,'',null))});rows.push({label:'getter:'+label,result:safe(()=>Object.getOwnPropertyDescriptor(StorageEvent.prototype,'key').get.call(v))})}rows.push({label:'ctor-call',result:safe(()=>StorageEvent('x'))});rows.push({label:'init-null',result:safe(()=>snap(new StorageEvent('x',null)))});return rows})()
+diff --git a/test/fixtures/storage-event/storage-event-ownership.js b/test/fixtures/storage-event/storage-event-ownership.js
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/storage-event/storage-event-ownership.js
+@@ -0,0 +1 @@
++(()=>{const e=new StorageEvent('first',{cancelable:true}),t=new EventTarget(),rows=[],reads=[];t.addEventListener('first',()=>e.preventDefault());t.dispatchEvent(e);e.initStorageEvent('second',true,false,'k','o','n','u');rows.push({label:'retained-dispatch',target:e.target===t,currentTarget:e.currentTarget,defaultPrevented:e.defaultPrevented,type:e.type,key:e.key});const x=new StorageEvent('x'),target=new EventTarget();target.addEventListener('x',()=>x.initStorageEvent({toString(){reads.push('type');return'y'}},false,false,{toString(){reads.push('key');return'k'}}));target.dispatchEvent(x);rows.push({label:'during-coerce',reads,type:x.type,key:x.key});for(const[label,value]of[['real',e],['prototype',Object.assign(Object.create(StorageEvent.prototype),{author:'own'})],['tag',{author:'own',[Symbol.toStringTag]:'StorageEvent'}]]){try{rows.push({label,clone:structuredClone(value)})}catch(error){rows.push({label,error:error.name,message:error.message})}}return rows})()
+diff --git a/test/fixtures/storage-event/native-expected.json b/test/fixtures/storage-event/native-expected.json
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/storage-event/native-expected.json
+@@ -0,0 +1 @@
++{"storage-event-values":{"sourceSHA256":"8e9d798934ae05bf35b24265c3923d2cecca6996e9a1a5c6a9c53f019e4f6be6","rows":13,"expected":[{"label":"surface","prototype":["key","oldValue","newValue","url","storageArea","initStorageEvent","constructor","Symbol(Symbol.toStringTag)"],"name":"StorageEvent","length":1,"initType":"function"},{"label":"missing","result":{"error":"TypeError","message":"invalid argument"}},{"label":"defaults","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"storage","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"values","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"x","bubbles":true,"cancelable":true,"composed":true,"key":"123","oldValue":null,"newValue":"new","url":"42","storageArea":null}}},{"label":"fake","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"number","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"null","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"order","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"x","bubbles":true,"cancelable":true,"composed":true,"key":"key","oldValue":"old","newValue":"new","url":"url","storageArea":null}},"reads":["has:bubbles","get:bubbles","has:cancelable","get:cancelable","has:composed","get:composed","has:key","get:key","has:newValue","get:newValue","has:oldValue","get:oldValue","has:url","get:url"]},{"label":"throw:key","result":{},"gets":["key"]},{"label":"throw:oldValue","result":{},"gets":["oldValue"]},{"label":"throw:newValue","result":{},"gets":["newValue"]},{"label":"throw:url","result":{},"gets":["url"]},{"label":"throw:storageArea","result":{"value":{"tag":"[object StorageEvent]","event":true,"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}},"gets":[]}]},"storage-event-init":{"sourceSHA256":"2e46dd24b60b7bf7c2384bf0ba994ba11e57358db1392b21dbd8e8fa0f915a25","rows":14,"expected":[{"label":"init:0","length":1,"result":{"error":"TypeError","message":"invalid argument","type":"object"}},{"label":"init:1","length":1,"result":{"value":{"type":"changed","bubbles":false,"cancelable":false,"composed":true,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null,"isTrusted":false,"defaultPrevented":true}}},{"label":"init:3","length":1,"result":{"value":{"type":"changed","bubbles":false,"cancelable":false,"composed":true,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null,"isTrusted":false,"defaultPrevented":true}}},{"label":"init:7","length":1,"result":{"value":{"type":"changed","bubbles":false,"cancelable":false,"composed":true,"key":"next","oldValue":"123","newValue":"val","url":"42","storageArea":null,"isTrusted":false,"defaultPrevented":true}}},{"label":"init:8","length":1,"result":{"value":{"type":"changed","bubbles":false,"cancelable":false,"composed":true,"key":"next","oldValue":"123","newValue":"val","url":"42","storageArea":null,"isTrusted":false,"defaultPrevented":true}}},{"label":"coerce","result":{"value":{"type":"arg","bubbles":true,"cancelable":true,"composed":false,"key":"arg","oldValue":"arg","newValue":"arg","url":"arg","storageArea":null,"isTrusted":false,"defaultPrevented":false}},"reads":["string","string","string","string","string"]},{"label":"brand:object","result":{"error":"TypeError","message":"Illegal invocation","type":"object"}},{"label":"getter:object","result":{"error":"TypeError","message":"Illegal invocation","type":"object"}},{"label":"brand:proxy","result":{"error":"TypeError","message":"Illegal invocation","type":"object"}},{"label":"getter:proxy","result":{"error":"TypeError","message":"Illegal invocation","type":"object"}},{"label":"brand:inherited","result":{"error":"TypeError","message":"Illegal invocation","type":"object"}},{"label":"getter:inherited","result":{"error":"TypeError","message":"Illegal invocation","type":"object"}},{"label":"ctor-call","result":{"error":"TypeError","message":"invalid argument","type":"object"}},{"label":"init-null","result":{"value":{"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null,"isTrusted":false,"defaultPrevented":false}}}]},"storage-event-conversion":{"sourceSHA256":"8b256f5ded11e488f1a34431b7cf0672d18591cac2ed56db29d3e2849cbf27ac","rows":12,"expected":[{"label":"undefined","result":{"value":{"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"number","result":{"error":"TypeError","message":"invalid argument"}},{"label":"string","result":{"error":"TypeError","message":"invalid argument"}},{"label":"boolean","result":{"error":"TypeError","message":"invalid argument"}},{"label":"symbol","result":{"error":"TypeError","message":"invalid argument"}},{"label":"function","result":{"value":{"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"all-undefined","result":{"value":{"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"all-null","result":{"value":{"type":"x","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"null","storageArea":null}}},{"label":"type:undefined","result":{"value":{"type":"undefined","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"type:null","result":{"value":{"type":"null","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"type:symbol","result":{"value":{"type":"s","bubbles":false,"cancelable":false,"composed":false,"key":null,"oldValue":null,"newValue":null,"url":"","storageArea":null}}},{"label":"during-dispatch","during":{"type":"initial","bubbles":false,"cancelable":true,"composed":true,"key":"old","oldValue":null,"newValue":null,"url":"","storageArea":null},"after":{"type":"initial","bubbles":false,"cancelable":true,"composed":true,"key":"old","oldValue":null,"newValue":null,"url":"","storageArea":null},"defaultPrevented":true}]},"storage-event-ownership":{"sourceSHA256":"a1a53b6ec12e091e99190ee095963758f7f1b0e9962db219e16a2b80f02ef328","rows":5,"expected":[{"label":"retained-dispatch","target":true,"currentTarget":null,"defaultPrevented":true,"type":"second","key":"k"},{"label":"during-coerce","reads":["type","key"],"type":"x","key":null},{"label":"real","error":"DataCloneError","message":"The object can not be cloned"},{"label":"prototype","clone":{"author":"own"}},{"label":"tag","clone":{"author":"own"}}]}}
+diff --git a/test/fixtures/storage-event/storage-event-values.js b/test/fixtures/storage-event/storage-event-values.js
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/storage-event/storage-event-values.js
+@@ -0,0 +1 @@
++(()=>{const rows=[],safe=fn=>{try{return{value:fn()}}catch(e){return{error:e.name,message:e.message}}},describe=e=>({tag:Object.prototype.toString.call(e),event:e instanceof Event,type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,key:e.key,oldValue:e.oldValue,newValue:e.newValue,url:e.url,storageArea:e.storageArea});rows.push({label:'surface',prototype:Reflect.ownKeys(StorageEvent.prototype).map(String),name:StorageEvent.name,length:StorageEvent.length,initType:typeof StorageEvent.prototype.initStorageEvent});for(const[label,args]of[['missing',[]],['defaults',['storage']],['values',['x',{bubbles:1,cancelable:1,composed:1,key:123,oldValue:null,newValue:Symbol('new'),url:42,storageArea:localStorage}]],['fake',['x',{storageArea:{fake:true}}]],['number',['x',{storageArea:123}]],['null',['x',{storageArea:null}]]])rows.push({label,result:safe(()=>describe(new StorageEvent(...args)))});const reads=[],init=new Proxy({bubbles:1,cancelable:1,composed:1,key:'key',oldValue:'old',newValue:'new',url:'url',storageArea:localStorage},{has(o,k){reads.push('has:'+k);return Reflect.has(o,k)},get(o,k){reads.push('get:'+String(k));return Reflect.get(o,k)}});rows.push({label:'order',result:safe(()=>describe(new StorageEvent('x',init))),reads});for(const key of['key','oldValue','newValue','url','storageArea']){const gets=[];rows.push({label:'throw:'+key,result:safe(()=>describe(new StorageEvent('x',{get[key](){gets.push(key);throw'authored'}}))),gets})}return rows})()
+diff --git a/test/fixtures/storage-event/storage-event-conversion.js b/test/fixtures/storage-event/storage-event-conversion.js
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/storage-event/storage-event-conversion.js
+@@ -0,0 +1 @@
++(()=>{const rows=[],safe=fn=>{try{return{value:fn()}}catch(e){return{error:e?.name,message:e?.message,thrown:typeof e==='string'?e:undefined}}},snap=e=>({type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,key:e.key,oldValue:e.oldValue,newValue:e.newValue,url:e.url,storageArea:e.storageArea});for(const[label,init]of[['undefined',undefined],['number',1],['string','x'],['boolean',true],['symbol',Symbol('x')],['function',()=>{}],['all-undefined',{key:undefined,oldValue:undefined,newValue:undefined,url:undefined}],['all-null',{key:null,oldValue:null,newValue:null,url:null}]])rows.push({label,result:safe(()=>snap(new StorageEvent('x',init)))});for(const[label,value]of[['undefined',undefined],['null',null],['symbol',Symbol('s')]])rows.push({label:'type:'+label,result:safe(()=>snap(new StorageEvent(value)))});const e=new StorageEvent('initial',{cancelable:true,composed:true,key:'old'}),target=new EventTarget();let during;target.addEventListener('initial',()=>{e.preventDefault();e.initStorageEvent('changed',true,false,'newkey','old','new','url',localStorage);during=snap(e)});target.dispatchEvent(e);rows.push({label:'during-dispatch',during,after:snap(e),defaultPrevented:e.defaultPrevented});return rows})()

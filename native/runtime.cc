@@ -80,10 +80,21 @@ void BoundedRegExp(const FunctionCallbackInfo<Value>& info) {
   if (expression->Exec(context, info[1].As<String>()).ToLocal(&result)) info.GetReturnValue().Set(result);
 }
 
+// Mark only an actual owned Promise handled without allocating a derived
+// Promise or invoking authored .then hooks. This public-V8 seam is privileged.
+void MarkPromiseHandled(const FunctionCallbackInfo<Value>& info) {
+  if (info.Length() != 1 || !info[0]->IsPromise()) {
+    info.GetIsolate()->ThrowException(Exception::TypeError(String::NewFromUtf8Literal(info.GetIsolate(), "An actual Promise is required")));
+    return;
+  }
+  info[0].As<Promise>()->MarkAsHandled();
+}
+
 NODE_MODULE_INIT() {
   Isolate* isolate = Isolate::GetCurrent();
   auto* state = new State();
   node::AddEnvironmentCleanupHook(isolate, [](void* pointer) { delete static_cast<State*>(pointer); }, state);
+  exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "markPromiseHandled"), Function::New(context, MarkPromiseHandled).ToLocalChecked()).Check();
   exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "checkpoint"), Function::New(context, Checkpoint, External::New(isolate, state)).ToLocalChecked()).Check();
   exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "createEntry"), Function::New(context, CreateEntry).ToLocalChecked()).Check();
   exports->CreateDataProperty(context, String::NewFromUtf8Literal(isolate, "boundedRegExp"), Function::New(context, BoundedRegExp).ToLocalChecked()).Check();

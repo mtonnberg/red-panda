@@ -1,3 +1,4 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { requestDialogClose } from './dialogs.js';
 import { createRequire } from 'node:module';
 import { installFocus, advanceFocus } from './focus.js';
@@ -6,7 +7,7 @@ import { installFocus, advanceFocus } from './focus.js';
 // page-created events untrusted; its pinned internal dispatch path preserves
 // the trusted flag for events created by this driver instead.
 const require = createRequire(import.meta.url);
-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
 const { isSubmitButton } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
 
 const METHODS = new Set(['Input.dispatchKeyEvent', 'Input.insertText', 'Input.dispatchMouseEvent']);

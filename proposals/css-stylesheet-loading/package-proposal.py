@@ -1,0 +1,25 @@
+from pathlib import Path
+import json,hashlib,difflib,shutil
+p=Path(__file__).parent;r=p.parent.parent;s=Path('/workspace/shared/css-stylesheet-loading-20261031');old=Path('/workspace/shared/css-position-stylesheets-20261031');sha=lambda f:hashlib.sha256(f.read_bytes()).hexdigest();digest=lambda b:hashlib.sha256(b).hexdigest();rebased=json.loads((p/'rebase-current.json').read_text());files=['src/stylesheet-decoder.js','src/classic-scripts.js','src/cssom.js','src/styles.js','src/browser.js','test/stylesheet-loading.test.js'];patch=[];records={}
+for rel in files:
+ after=(s/rel).read_text();exists=(old/rel).exists();before=(old/rel).read_text()if exists else ''
+ if rel=='src/browser.js':
+  correction="""    virtualConsole.on('jsdomError', error => {
+      // Fetch diagnostics are distinct from uncaught authored JavaScript.
+      // Preserve their backend signal without reporting Runtime.exceptionThrown.
+      if(error.type==='resource loading')this.emit('resourceError',error);
+      else this.emit('pageError',error.type==='unhandled exception'&&Object.hasOwn(error,'detail')?error.detail:error);
+    });"""
+  assert correction in after;before=after.replace(correction,"    virtualConsole.on('jsdomError', error => this.emit('pageError', error));");assert digest(before.encode())==rebased['browserBaseSHA256']
+ elif exists:assert digest(before.encode())==rebased['sharedBaseSHA256'].get(rel,digest(before.encode()))
+ leaf=p/'leaves'/rel;leaf.parent.mkdir(parents=True,exist_ok=True);leaf.write_text(after);patch.extend(difflib.unified_diff(before.splitlines(True),after.splitlines(True),fromfile='a/'+rel if exists else '/dev/null',tofile='b/'+rel));records[rel]={'baseSHA256':digest(before.encode())if exists else None,'finalSHA256':sha(leaf)}
+f=p/'integration-current.patch';f.write_text(''.join(patch))
+for index,leaf in [('043','stylesheet_charset'),('044','stylesheet_event_order'),('031','external_stylesheet')]:
+ for source,target in [('native455-canonical','native'),('candidate455-phase17','before')]:shutil.copy2(r/'proposals'/source/'reports'/f'{index}-css__{leaf}.html.json',p/f'{target}-source-{leaf}.json')
+frozen=json.loads((p/'source-freeze.json').read_text());assert all(sha(s/rel)==h for rel,h in frozen['files'].items())
+manifest={'patchSHA256':sha(f),'files':records,'noNativeOrDependencyPatch':True,'sourceFreezeSHA256':sha(p/'source-freeze.json'),'prerequisitePositionPatchSHA256':'f4b87f859fe8a90b5801a929393debae04f9347bfdc7817b5443d8515182618d','focused':{'new':7,'unchanged':50,'total':57,'passed':57,'command':['/workspace/shared/rea-tools/node_modules/node/bin/node','--experimental-vm-modules','--test','--test-concurrency=1','test/stylesheet-loading.test.js','test/classic-scripts.test.js','test/styles.test.js','test/cssom.test.js'],'log':'focused-rebased-final.log'},'sourceFreezeUnchangedAfterFinalExecution':True,'canonicalPortsReleased':True,'ownedJobsQuiesced':True,'comparisons':[],'historicalCanonicalEpoch':'Canonical three-fixture replay preceded the final authored-error detail mapping and untouched Root graph refresh. Exact final source has its own 57-test/raw/two-fixture ephemeral evidence; no final full external_stylesheet pass is claimed.'}
+a=json.loads((p/'native-v6.json').read_text());b=json.loads((p/'candidate-rebased-final.json').read_text());assert a['driverSHA256']==b['driverSHA256']==sha(p/'probe.mjs')
+for x,y in zip(a['observations'],b['observations']):manifest['comparisons'].append({'name':x['name'],'equal':x==y,'native':x if x!=y else None,'owned':y if x!=y else None,'rows':len(x['value'])if isinstance(x.get('value'),list)else 1})
+manifest['runtimeExceptionControls']={'nativeCount':len(a['runtimeExceptions']),'ownedCount':len(b['runtimeExceptions']),'nativeClass':a['runtimeExceptions'][0]['exception']['className'],'ownedClass':b['runtimeExceptions'][0]['exception']['className'],'nativeDescriptionFirstLine':a['runtimeExceptions'][0]['exception']['description'].splitlines()[0],'ownedDescriptionFirstLine':b['runtimeExceptions'][0]['exception']['description'].splitlines()[0],'note':'Only the deliberately authored TypeError remains; exact stack/locations/ids are not normalized or claimed equivalent. Actual authored value identity is verified by the focused real-timer test.'}
+manifest['externalInputs']={str(f):sha(f) for f in [Path('/workspace/shared/rea-tools/node_modules/node/bin/node'),Path('/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux'),r/'scripts/reference-server.mjs',r/'test/cdp-client.js',r/'scripts/conformance.mjs',r/'.cache/lightpanda-reference/browser-948d773786/src/browser/tests/testing.js',*[r/'.cache/lightpanda-reference/browser-948d773786/src/browser/tests/css'/f'{leaf}.html'for leaf in ['stylesheet_charset','stylesheet_event_order','external_stylesheet']]]}
+manifest['artifacts']={f.relative_to(p).as_posix():sha(f)for f in p.rglob('*')if f.is_file()and f.name!='manifest.json'};(p/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n');print(manifest['patchSHA256'])

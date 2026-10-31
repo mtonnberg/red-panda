@@ -1,0 +1,99 @@
+--- a/test/abort-signals.test.js
++++ b/test/abort-signals.test.js
+@@ -96,8 +96,9 @@
+  doc.open();doc.write('<!doctype html><title>reset</title><body>new document');doc.close();c.abort('retained');await delay(40);assert.deepEqual(seen,['abort','timeout']);assert.equal(page.dom.window,w);assert.equal(w.document,doc);assert.equal(signal,c.signal);assert.equal(signal.reason,'retained');
+ }));
+ 
+-test('raw Window close cancels pending timeout jobs and actual fetch resources',()=>fixture(async({page,window:w,requests,aborted})=>{
+- let n=0;w.AbortSignal.timeout(30).onabort=()=>n++;const pending=w.fetch('/slow');pending.catch(()=>{});while(!requests.includes('/slow'))await delay(2);w.close();await delay(60);assert.equal(n,0);assert.equal(page.closed,false);assert.equal(aborted.length,1);
++test('main Window.close retains timeout and fetch work while owned Page.close cancels both',()=>fixture(async({page,window:w,requests,aborted})=>{
++ const document=w.document;let n=0;w.AbortSignal.timeout(30).onabort=()=>n++;const pending=w.fetch('/slow');while(!requests.includes('/slow'))await delay(2);w.close();await delay(60);assert.equal(n,1);assert.equal(page.closed,false);assert.equal(w.document,document);assert.equal(w.closed,false);assert.equal(aborted.length,0);assert.equal(await (await pending).text(),'late');
++ const next=w.fetch('/slow');next.catch(()=>{});while(requests.filter(path=>path==='/slow').length<2)await delay(2);w.AbortSignal.timeout(30).onabort=()=>n++;page.close();await delay(60);assert.equal(n,1);assert.equal(page.closed,true);assert.equal(aborted.length,1);
+ }));
+ 
+ test('installer disposal is idempotent and removes timeout scheduling without changing public constructors',()=>fixture(async({page,window:w})=>{
+--- a/test/fetch.test.js
++++ b/test/fetch.test.js
+@@ -198,12 +198,12 @@
+   assert.equal((await (await child.fetch(foreignRequest)).json()).body, 'cross-realm request');
+ }));
+ 
+-test('document navigation, window close and page close suppress old-realm promise callbacks', async () => fixture(async ({ browser, page, window, base }) => {
++test('navigation and owned Page.close suppress old-realm callbacks while main Window.close retains fetch', async () => fixture(async ({ browser, page, window, base }) => {
+   let callbacks = 0;
+   window.fetch('/slow').then(() => callbacks++, () => callbacks++);
+   await page.navigate(`${base}/echo`); await delay(130); assert.equal(callbacks, 0);
+   let current = page.dom.window; installFetch(page, current);
+   current.fetch('/slow').then(() => callbacks++, () => callbacks++); page.close(); await delay(130); assert.equal(callbacks, 0);
+   const other = browser.createPage(); await other.navigate(base); current = other.dom.window; installFetch(other, current);
+-  current.fetch('/slow').then(() => callbacks++, () => callbacks++); current.close(); await delay(130); assert.equal(callbacks, 0);
+-}));
++  const document = current.document, pending = current.fetch('/slow').then(response => { callbacks++; return response.text(); }); current.close(); assert.equal(await pending, 'late body'); assert.equal(callbacks, 1); assert.equal(current.document, document); assert.equal(current.closed, false); assert.equal(other.closed, false);
++}));
+--- a/test/document-reset.test.js
++++ b/test/document-reset.test.js
+@@ -112,14 +112,14 @@
+   release(); await until(() => f.window.oldModuleFinished === true); assert.equal(f.page.documentAbort.signal.aborted, false); assert.deepEqual(f.errors, []);
+ });
+ 
+-test('raw Window.close aborts a real pending written external without stale parser continuation', async t => {
++test('owned Page.close aborts a real pending written external without stale parser continuation', async t => {
+   let received = false, disconnected = false;
+   const f = await fixture(t, undefined, { '/never.js': (request,response) => { received = true; response.on('close', () => { disconnected = true; }); } });
+   f.page.evaluate(`document.open();document.write('<script src="/never.js"><\/script><p id="tail">tail</p>');document.close();`);
+-  await until(() => received); f.window.close(); const afterClose = f.document.querySelectorAll('*').length;
++  await until(() => received); f.page.close(); const afterClose = f.document.querySelectorAll('*').length;
+   await until(() => disconnected); await tick(); await tick();
+   assert.equal(f.document.querySelectorAll('*').length, afterClose); assert.equal(f.document.getElementById('tail'), null);
+-  assert.equal(f.page.closed, false); assert.equal(f.page.documentAbort.signal.aborted, false);
++  assert.equal(f.page.closed, true); assert.equal(f.page.documentAbort.signal.aborted, true);
+ });
+ 
+ test('post-load iframe writes retain the actual child Window, Document and VM context', async t => {
+--- a/test/browser.test.js
++++ b/test/browser.test.js
+@@ -216,15 +216,17 @@
+   } finally { browser.close(); }
+ });
+ 
+-test('HTTP script failures report a page error while the document finishes loading', async () => {
+-  const browser = new Browser();
+-  try {
+-    const page = browser.createPage();
+-    const errors = []; page.on('pageError', error => errors.push(error));
++test('HTTP script failures retain resource diagnostics without reporting authored exceptions', async () => {
++  const browser = new Browser();
++  try {
++    const page = browser.createPage();
++    const errors = [], resources = []; page.on('pageError', error => errors.push(error)); page.on('resourceError', error => resources.push(error));
+     await page.navigate(`${fixture.url}resource-error-page`);
+     assert.equal(page.evaluate("document.querySelector('h1').textContent"), 'Document survived');
+-    assert.equal(errors.length, 1);
+-    assert.match(errors[0].message, /Could not load script/);
++    assert.deepEqual(errors, []);
++    assert.equal(resources.length, 1);
++    assert.match(resources[0].message, /Could not load script/);
++    assert.equal(page.evaluate('document.readyState'), 'complete');
+   } finally { browser.close(); }
+ });
+ 
+--- a/test/blob-urls.test.js
++++ b/test/blob-urls.test.js
+@@ -237,14 +237,15 @@
+   } finally { browser.close(); }
+ });
+ 
+-test('controller disposal and raw DOM window close revoke all and only creator-owned entries', async () => {
++test('controller and owned Page disposal revoke creator entries while main Window.close retains them', async () => {
+   const browser = new Browser();
+   try {
+     const a = await create(browser), b = await create(browser), first = a.window.URL.createObjectURL(new a.window.Blob(['a']));
+     const second = b.window.URL.createObjectURL(new b.window.Blob(['b']));
+     assert.equal(installBlobURLs(a.page, a.window), a.controller); a.controller.dispose(); a.controller.dispose();
+     denied(() => resolveBlobURL(b.page, first)); assert.equal(decoded(resolveBlobURL(b.page, second)), 'b');
+-    b.window.close(); denied(() => resolveBlobURL(b.page, second)); assert.equal(b.controller.size, 0);
++    const document = b.window.document; b.window.close(); assert.equal(decoded(resolveBlobURL(b.page, second)), 'b'); assert.equal(b.window.document, document); assert.equal(b.window.closed, false);
++    const peer = await create(browser); assert.equal(decoded(resolveBlobURL(peer.page, second)), 'b'); b.page.close(); denied(() => resolveBlobURL(peer.page, second)); assert.equal(b.controller.size, 0);
+   } finally { browser.close(); }
+ });
+ 

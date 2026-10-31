@@ -1,0 +1,11 @@
+file:///workspace/red-panda/proposals/indexeddb/fixture-probe.mjs:2
+const root=process.argv[2],output=process.argv[3],binary='/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux',upstream=resolve('.cache/lightpanda-reference/browser-948d773786/src/browser/tests');if(!output)throw Error('Root and output required');const names=['indexeddb.html','testing.js','window/support/popup_idb_self_close.html'];const files=new Map(await Promise.all(names.map(async name=>['/'+name,await readFile(resolve(upstream,name))])));const projected=process.env.IDB_PROBE_OMIT_POPUP==='1',served=new Map(files);let omitted;if(projected){const source=files.get('/indexeddb.html').toString(),match=source.match(/<script id=popup_self_close type=module>[\s\S]*?<\/script>/);if(!match)throw Error('Expected popup script not found');omitted=match[0];served.set('/indexeddb.html',Buffer.from(source.replace(omitted,'')));}const server=http.createServer((q,s)=>{const path=q.url.startsWith('/src/browser/tests/')?q.url.slice('/src/browser/tests'.length):q.url;const data=served.get(path);if(!data){s.writeHead(404);s.end();return;}s.setHeader('content-type',q.url.endsWith('.js')?'text/javascript':'text/html');s.end(data)});server.listen(0,'127.0.0.1');await once(server,'listening');const origin=`http://127.0.0.1:${server.address().port}`;let service,client,failure;const observations=[];
+                                                                                                                                                                                                                                ^
+
+Error: Root and output required
+    at file:///workspace/red-panda/proposals/indexeddb/fixture-probe.mjs:2:225
+    at ModuleJob.run (node:internal/modules/esm/module_job:561:25)
+    at async node:internal/modules/esm/loader:647:26
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+
+Node.js v24.22.1

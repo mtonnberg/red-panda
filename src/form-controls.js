@@ -1,3 +1,6 @@
+import {domWrapperGlobal} from './dom-factory-scope.js';
+import {registerPlatformFactory} from './platform-factories.js';
+import {createDOMWrapperShell,createDOMWrapperProxy} from './dom-wrapper-realms.js';
 import {registerHeapFactoryValue} from './heap-registry.js';
 import { createRequire } from 'node:module';
 
@@ -25,7 +28,7 @@ function wrap(raw, implementation, collection, globalObject, replace) {
     else if (key) result = collection ? implementation.namedItem(key) : implementation.elements.namedItem(key);
     return result == null ? absent : utils.tryWrapperForImpl(result);
   };
-  const wrapper = new Proxy(raw, {
+  const wrapper = createDOMWrapperProxy(raw, {
     get(target, key, receiver) {
       const item = value(key);
       return item === absent ? Reflect.get(target, key, receiver) : item;
@@ -54,8 +57,9 @@ function wrap(raw, implementation, collection, globalObject, replace) {
     deleteProperty: (target, key) => Reflect.deleteProperty(target, key),
     ownKeys: target => Reflect.ownKeys(target),
     preventExtensions: () => false,
-  });
-  registerHeapFactoryValue(wrapper,{implementation,globalObject,replace});
+  }, globalObject, collection?'HTMLFormControlsCollection':'HTMLFormElement');
+  registerHeapFactoryValue(wrapper,{implementation,globalObject:domWrapperGlobal(wrapper,globalObject),replace});
+  registerPlatformFactory(wrapper,{kind:collection?'HTMLFormControlsCollection':'HTMLFormElement',implementation,globalObject:domWrapperGlobal(wrapper,globalObject)});
   implementation[utils.wrapperSymbol] = wrapper;
   return wrapper;
 }
@@ -76,7 +80,7 @@ function patch() {
   FormIDL.new = function (globalObject, newTarget) {
     if (!active(utils.implForWrapper(globalObject.document))) return createForm.call(this, globalObject, newTarget);
     const prototype = newTarget?.prototype;
-    const raw = Object.create(utils.isObject(prototype) ? prototype : globalObject[utils.ctorRegistrySymbol].HTMLFormElement.prototype);
+    const raw = createDOMWrapperShell(globalObject, utils.isObject(prototype) ? prototype : globalObject[utils.ctorRegistrySymbol].HTMLFormElement.prototype);
     FormIDL._internalSetup(raw, globalObject);
     const implementation = Object.create(FormImpl.prototype);
     Object.defineProperty(raw, utils.implSymbol, { value: implementation, configurable: true });

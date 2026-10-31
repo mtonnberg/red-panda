@@ -92,6 +92,39 @@ network/SameSite/permissions and real media processing remain bounded gaps.
 Frozen proposals and negative-before/positive-after allocation controls preserve
 actual observed differences. Presence of a proposal is not production support.
 
+The current checkpoint adds real audio gain/oscillator/compressor rendering and
+WAV decoding; optional image HTTP/header processing and source selection;
+transactional IndexedDB; owned popup contexts; Sanitizer tree filtering;
+animation state/promises; Storage interceptors and hash ordering; select behavior;
+CSS position/encoding/loading corrections; genuine VM DOM/Event allocation;
+private Event backends, invocation recovery and inactive frame cleanup.
+
+All1,507 JavaScript tests,80 PureScript Puppeteer checks,13 Native differential
+groups, syntax checks and strict/pedantic PureScript builds pass.
+[Validation](reference/phase18-integration/validation.json) records9,060 unchanged
+declared inputs:1,752 indexed source/reference inputs,18 native build artifacts,
+6,579 Node dependency files,689 cached reference inputs, one controller and21
+unchanged preexisting reference files deliberately excluded from this commit.
+The final paired exact-profile22-fixture replay passes22/22 on both Native and
+Red Panda, under the original separate2000ms load and2000/8000ms assertion
+budgets, with9,051 inputs unchanged.
+
+Both failed full epochs remain recorded:1453/1501 with48 failures, then1504/1507
+with three duplicate standalone frame-cleanup failures. The genuine Host/VM
+Event and lifecycle corrections, native-controlled assertion fixes and audio
+algorithm optimization are linked to their negative/positive controls. The early
+audio source-load timeout is retained separately; no failed row is promoted.
+This remains partial browser coverage. The newly measured future-curve quantum
+and computed-value discrepancy, broader public interface realms, shared worker,
+network quota/SSE, history/Navigation and editing proposals are separate future
+work, not production support in this checkpoint.
+
+The separate complete frozen candidate matrix at ee39586 records338 verified
+passes,98 assertion failures,18 source-load timeouts and one image-option startup
+failure across455 paths/eight profiles. Its6654 source/helper/dependency/build
+inputs remain unchanged. [Raw reports and classification](../proposals/candidate455-phase17/README.md)
+remain tied to that commit; later feature replays do not rewrite its rows.
+
 The new test transport profile implements real HTTP/raw HTTP, compression,
 SSE, WebSocket, headers/sidecars, counters and downloads. Its source map covers
 455 unique registered paths in8 profiles (216 active literal calls,14 nondefault

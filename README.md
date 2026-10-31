@@ -6,7 +6,9 @@ and Chrome DevTools Protocol (CDP) behavior. Puppeteer automation, the example,
 and integration assertions are written in PureScript.
 
 The independent runtime uses Node's V8 and **jsdom** for HTML, DOM and page
-scripts, plus owned C++ bindings for HTMLDDA, runtime entry and public V8 heap queries.
+scripts, plus owned C++ bindings for HTMLDDA, Storage interceptors, runtime entry
+and public V8 heap queries. IndexedDB uses the pinned independent
+`fake-indexeddb` transactional backend.
 It does not import Lightpanda's production engine or launch Chromium.
 Full independent replication is the goal; the [compatibility ledger](docs/COMPATIBILITY.md)
 records substantial remaining gaps. No engine or performance parity is claimed.
@@ -268,11 +270,16 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 71 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 80 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
+
+The current checkpoint passes1,507 JavaScript tests,80 PureScript Puppeteer
+checks and13 Native differential groups, plus syntax and strict PureScript checks.
+[Source-bound validation](docs/reference/phase18-integration/validation.json)
+retains both failed full epochs and the final22/22 paired fixture replays.
 
 ## REA investigation and comparison
 

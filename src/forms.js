@@ -1,3 +1,4 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import {appendFormAssociatedValue} from './element-internals.js';
 import { submitDialogForm } from './dialogs.js';
 import { createRequire } from 'node:module';
@@ -10,7 +11,7 @@ const FormImpl = require('jsdom/lib/jsdom/living/nodes/HTMLFormElement-impl.js')
 const DataImpl = require('jsdom/lib/jsdom/living/xhr/FormData-impl.js').implementation;
 const HTMLElement = require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
 const FormDataIDL = require('jsdom/lib/jsdom/living/generated/FormData.js');
-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
 const { isDisabled, isSubmitButton } = require('jsdom/lib/jsdom/living/helpers/form-controls.js');
 const DOCUMENTS = new WeakMap();
 const DATA_WINDOWS = new WeakSet();

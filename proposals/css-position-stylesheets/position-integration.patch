@@ -1,0 +1,68 @@
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -85,6 +85,9 @@
+ 
+ export function normalizeCSSValue(property, value) {
+   if(typeof value !== 'string') return value;
++  // Position's public CSSOM token stream retains direct setter whitespace;
++  // stylesheet/cssText declaration parsing already trims its own boundaries.
++  if(property==='position')return value;
+   value=value.trim();
+   if(property === 'opacity') value=value.replace(/^([+-]?)\.(?=\d)/, (_, sign) => sign + '0.');
+   if(LENGTHS.test(property) && /^[+-]?0(?:\.0+)?$/.test(value))value='0px';
+@@ -215,7 +218,7 @@
+     return change(this,()=>{
+       const input=normalizeCSSValue(property,typeof value==='number'?String(value):value);
+       const before = MUTATIONS.get(this);
+-      if (property === 'opacity' && typeof input === 'string' && input !== '') this._setProperty(property, input);
++      if ((property === 'opacity'||property==='position') && typeof input === 'string' && input !== '') this._setProperty(property, input);
+       else descriptor.set.call(this,parserInput(input,property));
+       if(typeof input==='string' && LENGTHS.test(property) && /^anchor-size\(/i.test(input) && balancedEnd(input,input.indexOf('('))===input.length-1)this._setProperty(property,input);
+       if(typeof input==='string' && MUTATIONS.get(this)!==before)restoreUnquotedURLs(this,input,property);
+@@ -250,7 +253,7 @@
+       const before=MUTATIONS.get(this), previousPriority=this.getPropertyPriority(property);
+       if(AXES.has(property)){axisSet(this,property,normalized,priority.toLowerCase());return;}
+       if(property==='-webkit-border-radius'){if(normalized==='')this.removeProperty(property);else this._setProperty(property,normalized,priority.toLowerCase());return;}
+-      if (property.toLowerCase() === 'opacity' && normalized !== '') this._setProperty('opacity', normalized, priority.toLowerCase());
++      if (['opacity','position'].includes(property.toLowerCase()) && normalized !== '') this._setProperty(property.toLowerCase(), normalized, priority.toLowerCase());
+       else BASE.setProperty.call(this,property,normalized,priority.toLowerCase());
+       if(MUTATIONS.get(this)===before && normalized!=='') {
+         if(previousPriority)this._priorities.set(property,previousPriority);else this._priorities.delete(property);
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -413,6 +413,17 @@
+   return JSON.stringify(tokens);
+ }
+ 
++// Native's position accessor uses a typed keyword candidate from the actual
++// cascade, while CSSOM retains the authored declaration token stream. Unknown
++// keywords/variables and inherited/reset keywords other than initial do not
++// supply a position candidate; a genuine lower-ranked declaration can win.
++function positionValue(value) {
++  const keyword=value.trim().toLowerCase();
++  if(keyword==='initial')return 'static';
++  if(keyword==='-webkit-sticky')return 'sticky';
++  return ['static','relative','absolute','fixed','sticky'].includes(keyword)?keyword:null;
++}
++
+ function overflowAxes(value) {
+   const parts = value.trim().toLowerCase().split(/\s+/);
+   if (parts.length === 1 && ['inherit', 'initial', 'unset', 'revert', 'revert-layer'].includes(parts[0])) return [parts[0], parts[0]];
+@@ -475,6 +486,7 @@
+       const property = style[index];
+       let value = style.getPropertyValue(property);
+       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
++      if (property === 'position') { value = positionValue(value); if (value === null) continue; }
+       const important = style.getPropertyPriority(property) === 'important';
+       const entries=expandedEntries(property,value);if(!entries)continue;
+       // cssstyle's pinned parsed value map includes genuine shorthand
+--- /dev/null
++++ b/test/css-position.test.js
+@@ -0,0 +1,7 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';
++async function fixture(t,markup){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,'+encodeURIComponent('<!doctype html>'+markup));return{page,w:page.dom.window,d:page.dom.window.document}}
++test('actual lower stylesheet candidate survives invalid important position while raw CSSOM retains the declaration',async t=>{const{w,d}=await fixture(t,'<style>.parent{position:relative}.child{position:relative}.child{position:floating!important}</style><div class=parent><span class=child></span></div>');const e=d.querySelector('.child'),rules=d.styleSheets[0].cssRules;assert.equal(rules[2].style.position,'floating');assert.equal(rules[2].style.getPropertyPriority('position'),'important');assert.equal(w.getComputedStyle(e).position,'relative');assert.equal(e.offsetParent,e.parentElement);e.style.setProperty('position','relative fixed','important');assert.equal(e.style.position,'relative fixed');assert.equal(w.getComputedStyle(e).position,'relative');});
++test('same-block duplicate replacement preserves actual CSSOM state and exposes the initial position when no valid candidate remains',async t=>{const{w,d}=await fixture(t,'<style>.subject{position:relative;position:floating!important}</style><div class=subject></div>');const e=d.querySelector('.subject'),style=d.styleSheets[0].cssRules[0].style;assert.equal(style.position,'floating');assert.equal(style.cssText,'position: floating !important;');assert.equal(w.getComputedStyle(e).position,'static');assert.equal(e.offsetParent,d.body);});
++test('measured position initial reset and ignored inherited/variable keywords use the real cascade instead of CSSOM rewriting',async t=>{const{w,d}=await fixture(t,'<style>.parent{position:absolute}.subject{position:relative}</style><div class=parent><span class=subject></span></div>');const e=d.querySelector('.subject');for(const value of['inherit','unset','revert','revert-layer','var(--position, fixed)']){e.style.position=value;assert.equal(e.style.position,value);assert.equal(w.getComputedStyle(e).position,'relative');assert.equal(e.offsetParent,e.parentElement)}e.style.position='initial';assert.equal(e.style.position,'initial');assert.equal(w.getComputedStyle(e).position,'static');assert.equal(e.offsetParent,e.parentElement);});
++test('direct position token streams retain whitespace while actual declaration parsing owns its own boundaries',async t=>{const{w,d}=await fixture(t,'<div id=s></div>'),e=d.getElementById('s');e.style.position=' fixed ';assert.equal(e.style.position,' fixed ');assert.equal(e.style.getPropertyValue('position'),' fixed ');assert.equal(w.getComputedStyle(e).position,'fixed');assert.equal(e.offsetParent,null);e.style.setProperty('position',' relative ');assert.equal(e.style.position,' relative ');assert.equal(w.getComputedStyle(e).position,'relative');e.style.cssText='position: fixed ';assert.equal(e.style.position,'fixed');e.style.position=null;assert.equal(e.style.position,'');assert.equal(w.getComputedStyle(e).position,'static');});
++test('real positioned ancestor search and fixed ownership consume the same keyword candidates as public computed styles',async t=>{const{w,d}=await fixture(t,'<style>.outer{position:-webkit-sticky}.middle{position:floating}.fixed{position:FIXED}</style><div class=outer><div class=middle><span id=s></span><span class=fixed></span></div></div>'),e=d.getElementById('s'),outer=d.querySelector('.outer'),middle=d.querySelector('.middle'),fixed=d.querySelector('.fixed');assert.equal(w.getComputedStyle(outer).position,'sticky');assert.equal(w.getComputedStyle(middle).position,'static');assert.equal(e.offsetParent,outer);assert.equal(w.getComputedStyle(fixed).position,'fixed');assert.equal(fixed.offsetParent,null);assert.equal(w.CSS.supports('position','floating'),true);});

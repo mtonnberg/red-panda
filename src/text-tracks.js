@@ -1,3 +1,4 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import 'jsdom';
 import {createRequire} from 'node:module';
 import {types} from 'node:util';
@@ -5,7 +6,7 @@ import {registerPlatformFactory,platformFactoryRecord} from './platform-factorie
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import {parseWebVTT,renderVTTCue} from './vtt-parser.js';
 const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
-const {implForWrapper,wrapperForImpl}=utils;
+const {wrapperForImpl}=utils;
 const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
 const MediaImpl=require('jsdom/lib/jsdom/living/nodes/HTMLMediaElement-impl.js').implementation;
 const TrackImpl=require('jsdom/lib/jsdom/living/nodes/HTMLTrackElement-impl.js').implementation;

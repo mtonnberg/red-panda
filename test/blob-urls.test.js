@@ -237,14 +237,15 @@ test('navigation, page close and context disposal revoke document-owned URLs wit
   } finally { browser.close(); }
 });
 
-test('controller disposal and raw DOM window close revoke all and only creator-owned entries', async () => {
+test('controller and owned Page disposal revoke creator entries while main Window.close retains them', async () => {
   const browser = new Browser();
   try {
     const a = await create(browser), b = await create(browser), first = a.window.URL.createObjectURL(new a.window.Blob(['a']));
     const second = b.window.URL.createObjectURL(new b.window.Blob(['b']));
     assert.equal(installBlobURLs(a.page, a.window), a.controller); a.controller.dispose(); a.controller.dispose();
     denied(() => resolveBlobURL(b.page, first)); assert.equal(decoded(resolveBlobURL(b.page, second)), 'b');
-    b.window.close(); denied(() => resolveBlobURL(b.page, second)); assert.equal(b.controller.size, 0);
+    const document = b.window.document; b.window.close(); assert.equal(decoded(resolveBlobURL(b.page, second)), 'b'); assert.equal(b.window.document, document); assert.equal(b.window.closed, false);
+    const peer = await create(browser); assert.equal(decoded(resolveBlobURL(peer.page, second)), 'b'); b.page.close(); denied(() => resolveBlobURL(peer.page, second)); assert.equal(b.controller.size, 0);
   } finally { browser.close(); }
 });
 

@@ -1,3 +1,4 @@
+import {domWrapperGlobal} from './dom-factory-scope.js';
 import {installElementInternals} from './element-internals.js';
 import { createRequire } from 'node:module';
 const require=createRequire(import.meta.url);
@@ -70,7 +71,7 @@ function patch(){
   const result=owner.call(this,document),record=recordFor(document);
   if(record&&result._isInertTemplateDocument){
    const wrapper=wrapperForImpl(result);
-   Object.setPrototypeOf(wrapper,record.htmlDocumentPrototype);
+   Object.setPrototypeOf(wrapper,domWrapperGlobal(wrapper,record.window).HTMLDocument?.prototype??record.htmlDocumentPrototype);
    // This separate inert Document is born complete, with no browsing context
    // or active parser; no synthetic ready-state event is dispatched.
    result._currentDocumentReadiness='complete';

@@ -1,3 +1,4 @@
+import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 // Independent dialog and popover state, events, and default actions.
 import { createRequire } from 'node:module';
 // Bootstrap jsdom's interface registry before accessing pinned internal IDL.
@@ -7,7 +8,7 @@ const require = createRequire(import.meta.url);
 const Dialog = require('jsdom/lib/jsdom/living/generated/HTMLDialogElement.js');
 const HTMLElement = require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
 const HTMLElementImpl = require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
-const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
 const documents = new WeakMap(), states = new WeakMap(), installed = new WeakMap();
 let patched = false;
 

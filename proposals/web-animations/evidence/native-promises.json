@@ -1,0 +1,137 @@
+{
+  "scope": "Actual Native Web Animations observations; diagnostic task timing, no rendering/performance claim",
+  "name": "promises",
+  "source": "(async()=>{const out=[],wait=ms=>new Promise(r=>setTimeout(r,ms)),el=document.createElement('div'),unhandled=[];addEventListener('unhandledrejection',e=>{unhandled.push(e.reason?.name??e.reason);e.preventDefault()});\n{Promise.reject('positive-unhandled');await wait(20);out.push(['unhandled-positive',unhandled.splice(0)]);}\n{const a=el.animate();a.cancel();await wait(20);out.push(['unhandled-no-get',unhandled.splice(0)]);}\n{const a=el.animate();const p=a.finished;a.cancel();await wait(20);out.push(['unhandled-get',unhandled.splice(0)]);p.catch(()=>{});}\n{const a=el.animate(),events=[];a.finish();a.play();a.finished.then(()=>events.push('resolved'));await Promise.resolve();const micro=events.slice();await wait(25);out.push(['finish-play-lazy',{micro,events}]);a.finished.catch(()=>{});a.cancel();}\nconst frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow;\nfor(const key of['ready','finished'])for(const[name,make,get]of[['main-child-get',()=>el.animate(),Object.getOwnPropertyDescriptor(child.Animation.prototype,key).get],['child-main-get',()=>child.document.createElement('div').animate(),Object.getOwnPropertyDescriptor(Animation.prototype,key).get]]){const a=make(),p=get.call(a);out.push([key+':'+name,{main:p instanceof Promise,child:p instanceof child.Promise,same:p===a[key]}]);a.finished.catch(()=>{});a.cancel();}\nfor(const[name,make,cancel,get]of[['main-child-cancel-parent-get',()=>el.animate(),child.Animation.prototype.cancel,Object.getOwnPropertyDescriptor(Animation.prototype,'finished').get],['child-parent-cancel-child-get',()=>child.document.createElement('div').animate(),Animation.prototype.cancel,Object.getOwnPropertyDescriptor(child.Animation.prototype,'finished').get]]){const a=make(),first=a.finished;first.catch(()=>{});cancel.call(a);const p=get.call(a);out.push([name,{main:p instanceof Promise,child:p instanceof child.Promise,replaced:first!==p}]);}\n{const a=child.document.createElement('div').animate(),events=[];a.finished.then(()=>events.push('resolved'),()=>events.push('rejected'));a.onfinish=()=>events.push('finish');frame.remove();a.finish();await wait(25);out.push(['retired-explicit-finish',{state:a.playState,events}]);}\n{const a=el.animate(),events=[];a.startTime=88;a.effect={get currentTime(){throw Error('effect consulted')}};a.timeline={get currentTime(){throw Error('timeline consulted')}};a.onfinish=e=>events.push([e.currentTime,e.timelineTime]);a.finish();await wait(20);out.push(['event-times-ignore-slots',events]);}\nreturn out;})()\n",
+  "sourceSHA256": "72b2c0045c6aa945a99e154fcd78d8293faaf75bd3e97431b3dbdf5d1e42a05b",
+  "binary": {
+    "path": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+    "sha256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
+  },
+  "args": [
+    "--load-resources",
+    "iframe",
+    "--load-resources",
+    "worker"
+  ],
+  "version": {
+    "protocolVersion": "1.3",
+    "product": "Chrome/124.0.6367.29",
+    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jsVersion": "12.4.254.8"
+  },
+  "result": [
+    [
+      "unhandled-positive",
+      [
+        "positive-unhandled"
+      ]
+    ],
+    [
+      "unhandled-no-get",
+      []
+    ],
+    [
+      "unhandled-get",
+      []
+    ],
+    [
+      "finish-play-lazy",
+      {
+        "micro": [],
+        "events": [
+          "resolved"
+        ]
+      }
+    ],
+    [
+      "ready:main-child-get",
+      {
+        "main": false,
+        "child": true,
+        "same": true
+      }
+    ],
+    [
+      "ready:child-main-get",
+      {
+        "main": true,
+        "child": false,
+        "same": true
+      }
+    ],
+    [
+      "finished:main-child-get",
+      {
+        "main": false,
+        "child": true,
+        "same": true
+      }
+    ],
+    [
+      "finished:child-main-get",
+      {
+        "main": true,
+        "child": false,
+        "same": true
+      }
+    ],
+    [
+      "main-child-cancel-parent-get",
+      {
+        "main": true,
+        "child": false,
+        "replaced": true
+      }
+    ],
+    [
+      "child-parent-cancel-child-get",
+      {
+        "main": false,
+        "child": true,
+        "replaced": true
+      }
+    ],
+    [
+      "retired-explicit-finish",
+      {
+        "state": "finished",
+        "events": [
+          "resolved",
+          "finish"
+        ]
+      }
+    ],
+    [
+      "event-times-ignore-slots",
+      [
+        [
+          null,
+          null
+        ]
+      ]
+    ]
+  ],
+  "events": [],
+  "ownedBrowser": {
+    "pid": 143046,
+    "exitCode": 0,
+    "signal": null,
+    "stderr": "$time=1793436679789 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:40413 max_connections=16120 max_browser_connections=16\n",
+    "stderrTruncated": false
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 200,
+      "routeKnown": true
+    }
+  ]
+}
