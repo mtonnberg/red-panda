@@ -1,0 +1,92 @@
+--- a/src/messaging.js
++++ b/src/messaging.js
+@@ -27,7 +27,7 @@
+  * Blob/File preserve their immutable bytes and private metadata through graph
+  * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
+  */
+-export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {} } = {}) {
++export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false } = {}) {
+   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
+     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
+   const codec = createPlatformCodec(realm);
+@@ -124,9 +124,10 @@
+     if (list === null || typeof list?.[Symbol.iterator] !== 'function') throw typeError('Transfer list must be iterable');
+     return [...list];
+   }
+-  function prepare(data, options, sourcePort) {
++  function prepare(data, options, sourcePort, ignoreUnknownTransfers = false) {
+     const list = transferList(options), allowed = new Set(), transfer = [], moved = [], ports = [];
+     for (const value of list) {
++      if (ignoreUnknownTransfers && !PORTS.has(value) && !types.isArrayBuffer(value)) continue;
+       if (allowed.has(value)) throw cloneError('Transfer list contains duplicates');
+       allowed.add(value);
+       const state = PORTS.get(value);
+@@ -231,7 +232,7 @@
+     return {message, pending};
+   }
+   function clone(data, options) {
+-    const prepared = prepare(data, options);
++    const prepared = prepare(data, options, undefined, cloneUnknownTransfers);
+     if (codec.needsAsync(prepared.message)) throw cloneError('Synchronous clone cannot asynchronously read an embedded native Blob');
+     try {
+       const message = nativeClone(prepared.message, { transfer: prepared.transfer }); prepared.commit(); return receive(message).data;
+@@ -303,6 +304,7 @@
+   if (INSTALLED.has(window)) return INSTALLED.get(window);
+   const generation = page.documentGeneration, signal = page.documentAbort?.signal;
+   const bridge = createMessagingRealm(window, {
++    cloneUnknownTransfers: !page.parentFrameId,
+     active: () => !page.closed && !!window.document && page.documentGeneration === generation && !signal?.aborted,
+     dispatch: (target, type, data, ports) => fireAnEvent(type, implForWrapper(target), MessageEvent,
+       { data, ports, origin: '', source: null, lastEventId: '', bubbles: false, cancelable: false }),
+--- /dev/null
++++ b/test/window-clone-transfers.test.js
+@@ -0,0 +1,5 @@
++import test from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';import{installMessaging}from'../src/messaging.js';import{readFile}from'node:fs/promises';
++async function fixture(t){const b=new Browser({loadResources:['worker']});t.after(()=>b.close());const p=b.createPage();await p.navigate('data:text/html,<body>clone transfers</body>');return{p,w:p.dom.window,bridge:installMessaging(p,p.dom.window)}}
++test('Window structuredClone alone ignores Native-observed unknown transfer entries',async t=>{const{p}=await fixture(t),expression=await readFile(new URL('../oracle/webcodecs-media-transfer-list-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../oracle/webcodecs-media-native-transfer-list.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(JSON.parse(JSON.stringify(await p.evaluate(expression))),expected)});
++test('shared transport preparation remains strict and genuine buffer/port ownership remains atomic',async t=>{const{w,bridge}=await fixture(t);assert.throws(()=>bridge.prepare(1,{transfer:[{}]}),{name:'DataCloneError'});const channel=new w.MessageChannel();assert.throws(()=>channel.port1.postMessage(1,[{}]),{name:'DataCloneError'});const buffer=new w.ArrayBuffer(2);assert.throws(()=>w.structuredClone({bad(){}},{transfer:[{},buffer]}),{name:'DataCloneError'});assert.equal(buffer.detached,false);const moved=w.structuredClone({buffer},{transfer:[{},buffer]});assert.equal(buffer.detached,true);assert.equal(moved.buffer.byteLength,2);assert.throws(()=>w.structuredClone(1,{transfer:[channel.port1,channel.port1]}),{name:'DataCloneError'});channel.port1.close();channel.port2.close()});
++test('Worker-global structuredClone retains its existing strict transfer profile',async t=>{const{p}=await fixture(t);const value=await p.evaluate(`new Promise((resolve,reject)=>{const url=URL.createObjectURL(new Blob(['onmessage=()=>{try{structuredClone(1,{transfer:[{}]});postMessage("accepted")}catch(e){postMessage(e.name)}}'])),w=new Worker(url),timer=setTimeout(()=>{w.terminate();reject(Error('worker deadline'))},5000);w.onmessage=e=>{clearTimeout(timer);resolve(e.data);w.terminate();URL.revokeObjectURL(url)};w.onerror=e=>{clearTimeout(timer);w.terminate();reject(Error(e.message))};w.postMessage(1)})`);assert.equal(value,'DataCloneError')});
+--- /dev/null
++++ b/oracle/webcodecs-media-native-transfer-list.json
+@@ -0,0 +1,37 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "1bc9e61d1136fe269dcb5bd003cce341f526587ea4a85c8620cae3f687fe5140",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "tag": "[object Object]",
++          "result": 1
++        },
++        {
++          "tag": "[object Uint8Array]",
++          "result": 1
++        },
++        {
++          "tag": "[object Blob]",
++          "result": 1
++        },
++        {
++          "tag": "[object Function]",
++          "result": 1
++        },
++        {
++          "tag": "[object ImageData]",
++          "result": 1
++        },
++        {
++          "tag": "[object AudioData]",
++          "result": 1
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-transfer-list-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[];for(const value of[{},new Uint8Array(1),new Blob([]),()=>{},new ImageData(1,1),AudioData.prototype])try{rows.push({tag:Object.prototype.toString.call(value),result:structuredClone(1,{transfer:[value]})})}catch(e){rows.push({tag:Object.prototype.toString.call(value),error:e.name,message:e.message})}return rows})()

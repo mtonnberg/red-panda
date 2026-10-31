@@ -1,0 +1,200 @@
+--- a/src/custom-elements.js
++++ b/src/custom-elements.js
+@@ -1,3 +1,4 @@
++import {installElementInternals} from './element-internals.js';
+ import { createRequire } from 'node:module';
+ const require=createRequire(import.meta.url);
+ const utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+@@ -124,6 +125,7 @@
+ 
+ export function installCustomElements(page,window){
+  if(records.has(window))return records.get(window).controller;
++ installElementInternals(page,window);
+  patch();
+  const document=window.document,implementation=implForWrapper(document),registry=implForWrapper(implementation._globalObject._customElementRegistry);
+  const PromiseConstructor=window.Promise,resolve=PromiseConstructor.resolve,reject=PromiseConstructor.reject;
+--- a/src/forms.js
++++ b/src/forms.js
+@@ -1,3 +1,4 @@
++import {appendFormAssociatedValue} from './element-internals.js';
+ import { submitDialogForm } from './dialogs.js';
+ import { createRequire } from 'node:module';
+ import { randomBytes } from 'node:crypto';
+@@ -98,6 +99,7 @@
+   const { window } = record;
+   for (const implementation of formImpl._getSubmittableElementNodes()) {
+     const control = wrapperForImpl(implementation);
++    if (appendFormAssociatedValue(implementation, data)) continue;
+     if (isDisabled(implementation) || control.closest('datalist')) continue;
+     const tag = control.localName;
+     const type = control.type;
+--- a/src/document-xml.js
++++ b/src/document-xml.js
+@@ -1,3 +1,4 @@
++import {atomicFormMove} from './element-internals.js';
+ // Independent proposal. Existing jsdom DOM/parser/XPath components are reused;
+ // target implementation source is neither imported nor copied.
+ import{createRequire}from'node:module';
+@@ -141,7 +142,7 @@
+    try{
+     for(const key of['_detach','_attach']){descriptors.set(key,Object.getOwnPropertyDescriptor(n,key));Object.defineProperty(n,key,{configurable:true,writable:true,value(){}});}
+     for(const {element,definition,callback}of aware){definitions.set(element,definition);element._ceDefinition={...definition,lifecycleCallbacks:{...definition.lifecycleCallbacks,connectedCallback:null,disconnectedCallback:null,connectedMoveCallback:callback}};}
+-    p._preInsert(n,c);
++    atomicFormMove(()=>p._preInsert(n,c));
+     if(focused?.isConnected)owner._lastFocusedElement=focused;
+     for(const {element}of aware)enqueueCECallbackReaction(element,'connectedMoveCallback',[]);
+     // Keep lookup indexes ordered after a real topology change without detach/
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -1,3 +1,4 @@
++import {formAssociatedState} from './element-internals.js';
+ // Independent selector parsing and state adapter. No native engine is imported.
+ import 'jsdom';
+ import { createRequire } from 'node:module';
+@@ -134,6 +135,8 @@
+       if(name!=='is'&&name!=='where')fail(window,'Selector function cannot be empty');
+       compiled+=emitPredicate({kind:'never'});effective+=`:${name}()`;
+      }else{const nested=list(arg,name,name==='has');compiled+=`:${name}(${nested.compiled})`;effective+=`:${name}(${nested.effective})`;}
++    }else if(['valid','invalid','disabled','enabled'].includes(name)){
++     if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'form-state',name});effective+=value.slice(i,end);
+     }else if(name==='empty'){
+      if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'empty'});effective+=value.slice(i,end);
+     }else if(name==='modal'||name==='popover-open'||name==='popover'){
+@@ -164,6 +167,7 @@
+ export function supportsSelector(source){try{return parseSelector(source).groups.length===1;}catch{return false;}}
+ 
+ function predicate(record,element,item) {
++ if(item.kind==='form-state'){const value=formAssociatedState(element,item.name);return value===undefined?matcher(record).match(':'+item.name,element):value;}
+  if(item.kind==='never')return false;
+  if(item.kind==='empty'){for(const child of element.childNodes)if(child.nodeType===1||child.nodeType===3&&child.data.length)return false;return true;}
+  // Native parses :modal but its observed public predicate stays false.
+--- /dev/null
++++ b/src/element-internals.js
+@@ -0,0 +1,102 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {registerPlatformFactory,platformFactoryRecord,subscribePlatformFactories} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const require=createRequire(import.meta.url);
++const {implForWrapper,wrapperForImpl,ctorRegistrySymbol}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const HTMLElementImpl=require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
++const NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const FormImpl=require('jsdom/lib/jsdom/living/nodes/HTMLFormElement-impl.js').implementation;
++const RegistryImpl=require('jsdom/lib/jsdom/living/custom-elements/CustomElementRegistry-impl.js').implementation;
++const FunctionIDL=require('jsdom/lib/jsdom/living/generated/Function.js');
++const ValidityState=require('jsdom/lib/jsdom/living/generated/ValidityState.js');
++const {formOwner,isDisabled}=require('jsdom/lib/jsdom/living/helpers/form-controls.js');
++const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const {enqueueCECallbackReaction}=require('jsdom/lib/jsdom/living/helpers/custom-elements.js');
++const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
++const records=new WeakMap(),elements=new WeakMap(),internals=new WeakMap(),sets=new WeakMap(),iterators=new WeakMap();
++const flags=['badInput','customError','patternMismatch','rangeOverflow','rangeUnderflow','stepMismatch','tooLong','tooShort','typeMismatch','valueMissing'];
++const callbacks=['formAssociatedCallback','formDisabledCallback','formResetCallback','formStateRestoreCallback'];
++const trustedElements=new WeakMap(),elementRefs=new Set();
++subscribePlatformFactories((value,record)=>{if(record.implementation instanceof HTMLElementImpl){trustedElements.set(value,record.implementation);elementRefs.add(new WeakRef(record.implementation));}});
++function elementBrand(value){const known=trustedElements.get(value);if(known)return known;for(const ref of elementRefs){const e=ref.deref();if(!e){elementRefs.delete(ref);continue;}if(wrapperForImpl(e)===value){trustedElements.set(value,e);return e;}}return null;}
++const nil=()=>Object.create(null),apply=Reflect.apply,wellFormed=String.prototype.toWellFormed;
++let patched=false,atomic=0;const deferred=new Set();
++const supported=e=>e?._ceDefinition?.formAssociated===true&&e._ceDefinition.name===e._ceDefinition.localName&&(e._ceState==='custom'||e._ceState==='precustomized');
++function docRecord(e){return records.get(e?._ownerDocument??e);}
++function disabled(e){return e.hasAttributeNS(null,'disabled')||isDisabled(e);}
++function ancestor(e,name){for(let n=e.parentNode;n;n=n.parentNode)if(n._localName===name&&n._namespaceURI==='http://www.w3.org/1999/xhtml')return true;return false;}
++function willValidate(e){return !disabled(e)&&!e.hasAttributeNS(null,'readonly')&&!ancestor(e,'datalist');}
++function valid(state){return !flags.some(flag=>state.flags[flag]);}
++function control(e){let state=elements.get(e);if(!state){state=Object.assign(nil(),{element:e,form:null,disabled:false,flags:nil(),message:'',value:null,validity:null,states:null,docs:new WeakSet()});elements.set(e,state);e._customValidityErrorMessage='';e._internalContentAttributeMap??=new Map();}const record=docRecord(e);if(record&&!state.docs.has(record)){state.docs.add(record);record.controls.add(new WeakRef(e));}return state;}
++function notify(e,name,args){if(e._ceDefinition?.lifecycleCallbacks[name])enqueueCECallbackReaction(e,name,args);}
++function sync(record){if(!record||record.disposed)return;if(atomic){deferred.add(record);return;}for(const ref of record.controls){const e=ref.deref();if(!e){record.controls.delete(ref);continue;}if(e._ownerDocument!==record.document||!supported(e))continue;const state=control(e),form=formOwner(e),isDisabled=disabled(e);if(form!==state.form){state.form=form;notify(e,'formAssociatedCallback',[form]);}if(isDisabled!==state.disabled){state.disabled=isDisabled;notify(e,'formDisabledCallback',[isDisabled]);}}}
++function track(node){for(const e of domSymbolTree.treeIterator(node))if(supported(e))control(e);}
++export function atomicFormMove(callback){atomic++;try{return callback();}finally{if(!--atomic){const pending=[...deferred];deferred.clear();for(const record of pending)sync(record);}}}
++export function formAssociatedState(element,name){const e=implForWrapper(element);if(!docRecord(e))return undefined;if(supported(e)){if(name==='disabled')return disabled(e);if(name==='enabled')return !disabled(e);if(name==='valid'||name==='invalid')return willValidate(e)&&(name==='valid'?valid(control(e)):!valid(control(e)));}if(e?._localName==='form'&&(name==='valid'||name==='invalid')){const result=e._getElementNodes().every(c=>supported(c)?!willValidate(c)||valid(control(c)):typeof c._isCandidateForConstraintValidation!=='function'||!c._isCandidateForConstraintValidation()||c.validity.valid);return name==='valid'?result:!result;}return undefined;}
++export function appendFormAssociatedValue(element,data){if(!supported(element))return false;const state=control(element),value=state.value;if(value===null||disabled(element)||ancestor(element,'datalist'))return true;if(value.kind==='data'){for(const entry of value.entries)data.append(entry.name,typeof entry.value==='string'?entry.value:wrapperForImpl(entry.value));}else{const name=element.getAttributeNS(null,'name');if(name)data.append(name,value.kind==='file'?wrapperForImpl(value.value):value.value);}return true;}
++function patch(){if(patched)return;patched=true;
++ const define=RegistryImpl.prototype.define;
++ RegistryImpl.prototype.define=function(...args){const result=apply(define,this,args),record=records.get(implForWrapper(this._globalObject.document));if(!record)return result;const definition=this._customElementDefinitions.find(d=>d.name===args[0]);if(definition&&definition.name!==definition.localName)definition.formAssociated=false;if(!definition?.formAssociated)return result;for(const name of callbacks){const value=definition.objectReference.prototype[name];definition.lifecycleCallbacks[name]=value===undefined?null:FunctionIDL.convert(this._globalObject,value,{context:name});}const original=definition.constructor.construct;definition.constructor.construct=function(...values){const result=apply(original,this,values),e=implForWrapper(result);if(supported(e)){control(e);sync(docRecord(e));}return result;};return result;};
++ for(const name of ['_insert','_remove']){const original=NodeImpl.prototype[name];NodeImpl.prototype[name]=function(node,...args){const record=docRecord(this);if(!record)return apply(original,this,[node,...args]);const nodes=node.nodeType===11?domSymbolTree.childrenToArray(node):[node];for(const n of nodes)track(n);const result=apply(original,this,[node,...args]);for(const n of nodes)track(n);sync(record);return result;};}
++ const attr=ElementImpl.prototype._attrModified;ElementImpl.prototype._attrModified=function(name,...args){const record=docRecord(this);if(record&&supported(this))control(this);const result=apply(attr,this,[name,...args]);if(record&&['id','form','disabled'].includes(name))sync(record);return result;};
++ for(const name of ['_getElementNodes','_getSubmittableElementNodes']){const original=FormImpl.prototype[name];FormImpl.prototype[name]=function(){const existing=apply(original,this,[]);if(!docRecord(this))return existing;const known=new Set(existing);return domSymbolTree.treeToArray(this.getRootNode({}),{filter:e=>known.has(e)||supported(e)&&formOwner(e)===this});};}
++ const check=FormImpl.prototype.checkValidity;FormImpl.prototype.checkValidity=function(){const result=apply(check,this,[]);if(!docRecord(this))return result;let custom=true;for(const e of this._getElementNodes())if(supported(e)&&willValidate(e)&&!valid(control(e))){fireAnEvent('invalid',e,undefined,{cancelable:true});custom=false;}return result&&custom;};
++ const reset=HTMLElementImpl.prototype._formReset;HTMLElementImpl.prototype._formReset=function(){if(supported(this)&&docRecord(this))notify(this,'formResetCallback',[]);else if(reset)return apply(reset,this,[]);};
++}
++function factory(g,bridge){
++ const TypeError=g.TypeError,Exception=g.DOMException,String=g.String,apply=Reflect.apply,define=Object.defineProperty,getDescriptor=Object.getOwnPropertyDescriptor;
++ const description=getDescriptor(Symbol.prototype,'description').get,normalize=value=>bridge.normalize(typeof value==='symbol'?String(apply(description,value,[])):String(value));
++ const original=bridge.prototype,attach=g.HTMLElement.prototype.attachInternals;
++ function ElementInternals(){throw new TypeError('Illegal Constructor');}
++ define(ElementInternals,'prototype',{value:original,writable:false});define(original,'constructor',{value:ElementInternals,writable:true,configurable:true});bridge.constructor(ElementInternals);
++ const methods={
++  get shadowRoot(){return bridge.shadow(this);},get states(){return bridge.states(this);},
++  setFormValue(){bridge.validate(this);const value=arguments[0];bridge.setValue(this,value==null?null:bridge.binary(value)?value:normalize(value));},
++  get form(){return bridge.form(this);},get labels(){return bridge.labels(this);},
++  setValidity(){bridge.validate(this);const value=arguments[0];if(value!=null&&typeof value!=='object'&&typeof value!=='function')throw new TypeError('invalid argument');bridge.setValidity(this,value??{},arguments[1],arguments[2]);},
++  get willValidate(){return bridge.will(this);},get validity(){return bridge.validity(this);},get validationMessage(){return bridge.message(this);},checkValidity(){return bridge.check(this);},reportValidity(){return bridge.check(this);},
++ };
++ const existing=Object.fromEntries(Reflect.ownKeys(original).map(key=>[key,getDescriptor(original,key)]));for(const key of Reflect.ownKeys(original))delete original[key];
++ for(const key of Object.getOwnPropertyNames(methods))define(original,key,{...getDescriptor(methods,key),enumerable:true,configurable:true});
++ const braille={get ariaBrailleLabel(){return bridge.aria(this,'aria-braillelabel');},set ariaBrailleLabel(value){bridge.aria(this,'aria-braillelabel',value==null?null:normalize(value));},get ariaBrailleRoleDescription(){return bridge.aria(this,'aria-brailleroledescription');},set ariaBrailleRoleDescription(value){bridge.aria(this,'aria-brailleroledescription',value==null?null:normalize(value));}};for(const key of Object.getOwnPropertyNames(braille))existing[key]={...getDescriptor(braille,key),enumerable:true,configurable:true};
++ for(const key of ['role',...Object.getOwnPropertyNames(existing).filter(key=>key.startsWith('aria')).sort()])if(existing[key])define(original,key,existing[key]);
++ define(original,'constructor',{value:ElementInternals,writable:true,configurable:true});define(original,Symbol.toStringTag,{value:'ElementInternals',configurable:true});
++ define(g,'ElementInternals',{value:ElementInternals,writable:true,configurable:true});
++ define(g.HTMLElement.prototype,'attachInternals',{value:function attachInternals(){bridge.element(this);let value;try{value=apply(attach,this,[]);}catch(e){if(e?.name==='NotSupportedError')throw new Exception('The operation is not supported','NotSupportedError');throw e;}bridge.attached(value);return value;},writable:true,configurable:true,enumerable:true});
++ class CustomStateSet{constructor(){if(arguments[0]!==bridge.token)throw new TypeError('Illegal Constructor');bridge.created(this);}get size(){return bridge.size(this);}has(value){bridge.setBrand(this);return bridge.has(this,normalize(value));}add(value){bridge.setBrand(this);bridge.add(this,normalize(value));return this;}delete(value){bridge.setBrand(this);return bridge.delete(this,normalize(value));}clear(){bridge.clear(this);}keys(){return bridge.iterator(this,false);}values(){return bridge.iterator(this,false);}entries(){return bridge.iterator(this,true);}forEach(callback,thisArg){if(typeof callback!=='function')throw new TypeError('invalid argument');bridge.forEach(this,callback,thisArg);}}
++ const cp=CustomStateSet.prototype,constructor=getDescriptor(cp,'constructor');delete cp.constructor;for(const key of Object.getOwnPropertyNames(cp))define(cp,key,{...getDescriptor(cp,key),enumerable:true});define(cp,'constructor',constructor);define(cp,Symbol.iterator,{value:cp.values,writable:true,configurable:true});define(cp,Symbol.toStringTag,{value:'CustomStateSet',configurable:true});define(g,'CustomStateSet',{value:CustomStateSet,writable:true,configurable:true});
++ bridge.factories(CustomStateSet,function next(){const done=bridge.advance(this);if(done)return{done:true};const value=bridge.current(this);return{done:false,value:bridge.isEntries(this)?[value,value]:value};},function(){return this;});
++}
++export function installElementInternals(page,window){const document=implForWrapper(window.document);if(records.has(document))return;patch();registerPlatformFactoryKind('CustomStateSet');
++ const record=Object.assign(nil(),{page,window,document,controls:new Set(),TypeError:window.TypeError,Exception:window.DOMException,signal:page.documentAbort.signal,disposed:false,Array:window.Array,from:window.Array.from,String:window.String,description:Object.getOwnPropertyDescriptor(window.Symbol.prototype,'description').get,globalObject:implForWrapper(window)._globalObject,token:Symbol('custom-state-set')});records.set(document,record);
++ const fail=(name,message)=>{throw name==='TypeError'?new record.TypeError(message):new record.Exception(message??({NotSupportedError:'The operation is not supported',NotFoundError:'The object can not be found here'}[name]??''),name);};
++ const state=(value,form=false)=>{const s=internals.get(value);if(!s)fail('TypeError','Illegal invocation');if(form&&!supported(s.element))fail('NotSupportedError');return s;};
++ const set=value=>{const result=sets.get(value);if(!result)fail('TypeError','Illegal invocation');return result;};
++ const iterator=value=>{const result=iterators.get(value);if(!result)fail('TypeError','Illegal invocation');return result;};
++ const text=value=>apply(wellFormed,apply(record.String,undefined,[typeof value==='symbol'?apply(record.description,value,[]):value]),[]);
++ const capture=value=>{if(value==null)return null;const data=platformFactoryRecord(value);if(data?.kind==='FormData')return{kind:'data',entries:data.implementation._entries.map(e=>({name:e.name,value:e.value}))};if(data?.kind==='File')return{kind:'file',value:data.implementation};return{kind:'text',value};};
++ const bridge=Object.assign(nil(),{token:record.token,prototype:window.ElementInternals.prototype,normalize:value=>apply(wellFormed,value,[]),
++  constructor(C){window[ctorRegistrySymbol].ElementInternals=C;},
++  element(value){if(!elementBrand(value))fail('TypeError','Illegal invocation');},validate:value=>{state(value,true);},setBrand:value=>{set(value);},
++  attached(value){const data=platformFactoryRecord(value);if(data?.kind!=='ElementInternals')fail('TypeError','Illegal invocation');const s=control(data.implementation._targetElement);internals.set(value,s);sync(docRecord(s.element));},
++  aria(value,key,input){const map=state(value).element._internalContentAttributeMap;if(arguments.length<3)return map.get(key)??null;if(input===null)map.delete(key);else map.set(key,input);},
++  shadow:value=>{const e=state(value).element,s=e._shadowRoot;return s?._availableToElementInternals?wrapperForImpl(s):null;},
++  states(value){const s=state(value);if(!s.states)s.states=new record.SetConstructor(record.token);return s.states;},
++  form:value=>wrapperForImpl(formOwner(state(value,true).element)),
++  labels(value){const s=state(value,true),nodes=domSymbolTree.treeToArray(s.element.getRootNode({}),{filter:e=>e._localName==='label'&&e.control===s.element}).map(wrapperForImpl);return apply(record.from,record.Array,[nodes]);},
++  binary:value=>['File','FormData'].includes(platformFactoryRecord(value)?.kind),setValue(value,input){state(value,true).value=capture(input);},
++  setValidity(value,input,message,anchor){const s=state(value,true),next=nil();for(const flag of flags)next[flag]=!!input[flag];if(message!==undefined)message=text(message);if(flags.some(k=>next[k])&&!message)fail('TypeError','');if(anchor!==undefined&&anchor!==null){const actual=platformFactoryRecord(anchor)?.implementation;if(!actual||!s.element.contains(actual))fail('NotFoundError');}s.flags=next;s.message=flags.some(k=>next[k])?message:'';s.element._customValidityErrorMessage=next.customError?s.message:'';},
++  will:value=>willValidate(state(value,true).element),
++  validity(value){const s=state(value,true);if(!s.validity){const checks=nil();for(const flag of flags)checks[flag]=()=>s.flags[flag]===true;s.validity=wrapperForImpl(ValidityState.createImpl(record.globalObject,[],{element:s.element,state:checks}));}return s.validity;},
++  message:value=>{const s=state(value,true);return willValidate(s.element)&&!valid(s)?s.message:'';},check:value=>{const s=state(value,true);if(!willValidate(s.element)||valid(s))return true;fireAnEvent('invalid',s.element,undefined,{cancelable:true});return false;},
++  factories(C,next,self){record.SetConstructor=C;record.next=next;record.self=self;record.ObjectPrototype=window.Object.prototype;record.create=window.Object.create;},
++  created(value){sets.set(value,new Set());registerPlatformFactory(value,{kind:'CustomStateSet',globalObject:window});},size:value=>set(value).size,has:(value,key)=>set(value).has(key),add:(value,key)=>{set(value).add(key);},delete:(value,key)=>set(value).delete(key),clear:value=>{set(value).clear();},
++  forEach(value,callback,thisArg){for(const entry of set(value))apply(callback,thisArg,[entry,entry,value]);},
++  iterator(value,entries){const object=apply(record.create,window.Object,[record.ObjectPrototype]);iterators.set(object,Object.assign(nil(),{iterator:set(value).values(),entries,current:undefined}));Object.defineProperties(object,{next:{value:record.next,writable:true,configurable:true,enumerable:true},[Symbol.iterator]:{value:record.self,writable:true,configurable:true}});return object;},
++  advance(value){const s=iterator(value),next=s.iterator.next();s.current=next.value;return next.done;},current:value=>iterator(value).current,isEntries:value=>iterator(value).entries,
++ });
++ window.eval(`(${factory.toString()})`)(window,bridge);
++ const dispose=()=>{record.disposed=true;record.controls.clear();record.signal.removeEventListener('abort',dispose);};record.signal.addEventListener('abort',dispose,{once:true});
++}
+--- /dev/null
++++ b/test/element-internals.test.js
+@@ -0,0 +1,22 @@
++import{test,before,after}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{once}from'node:events';import{createRequire}from'node:module';import{Browser}from'../src/browser.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++const require=createRequire(import.meta.url),EI=require('jsdom/lib/jsdom/living/generated/ElementInternals.js'),Validity=require('jsdom/lib/jsdom/living/generated/ValidityState.js'),{implForWrapper,implSymbol}=require('jsdom/lib/jsdom/living/generated/utils.js');let server,origin,posts=[];
++before(async()=>{server=http.createServer(async(q,s)=>{const parts=[];for await(const p of q)parts.push(p);if(q.method==='POST')posts.push(Buffer.concat(parts).toString());s.setHeader('content-type','text/html');s.end('<!doctype html><body>Owned ElementInternals test');});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`;});after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));});
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t){const b=new Browser();t.after(()=>b.close());const p=b.createPage();await p.navigate(origin);const w=p.dom.window;w.eval(`class Control extends HTMLElement{static formAssociated=true;constructor(){super();this.i=this.attachInternals();this.events=[]}formAssociatedCallback(form){this.events.push(['form',form?.id??null])}formDisabledCallback(value){this.events.push(['disabled',value])}formResetCallback(){this.events.push(['reset',this.observe?.value??null])}}customElements.define('owned-control',Control);globalThis.Control=Control;globalThis.control=new Control()`);return{b,p,w,e:w.control,i:w.control.i};}
++test('internals retain actual generated identities, targets, labels and live validity',{timeout:5000},async t=>{const{w,e,i}=await fixture(t);assert.ok(EI.is(i));assert.strictEqual(implForWrapper(i)._targetElement,implForWrapper(e));assert.strictEqual(Object.getPrototypeOf(i),w.ElementInternals.prototype);assert.ok(i instanceof w.ElementInternals);assert.ok(Validity.is(i.validity));assert.strictEqual(i.validity,i.validity);assert.ok(w.Array.isArray(i.labels));assert.notStrictEqual(i.labels,i.labels);assert.ok(i.states instanceof w.CustomStateSet);assert.equal(platformFactoryRecord(i.states).kind,'CustomStateSet');assert.deepEqual(Object.keys(i),[]);for(const C of [w.ElementInternals,w.CustomStateSet])assert.throws(()=>new C,e=>e instanceof w.TypeError&&e.message==='Illegal Constructor');});
++test('attachment restrictions and private receiver brands preserve real elements and reject lookalikes',{timeout:5000},async t=>{const{w,e,i}=await fixture(t);assert.throws(()=>e.attachInternals(),x=>x.name==='NotSupportedError');for(const node of [w.document.createElement('div'),w.document.createElement('form'),w.document.createElement('owned-undefined')])assert.throws(()=>node.attachInternals(),x=>x.name==='NotSupportedError');const fake=Object.create(w.HTMLElement.prototype);Object.defineProperty(fake,implSymbol,{value:implForWrapper(e)});assert.throws(()=>w.HTMLElement.prototype.attachInternals.call(fake),x=>x instanceof w.TypeError);let reads=0;for(const receiver of [{},Object.create(i),new Proxy(i,{get(){reads++;throw 23}})])assert.throws(()=>w.ElementInternals.prototype.setFormValue.call(receiver,{toString(){reads++;throw 23}}),x=>x instanceof w.TypeError);assert.equal(reads,0);});
++test('non-form internals keep independent actual ARIA values and genuine shadow roots',{timeout:5000},async t=>{const{w}=await fixture(t);w.eval(`customElements.define('owned-plain',class extends HTMLElement{});globalThis.plain=document.createElement('owned-plain');globalThis.pi=plain.attachInternals()`);const i=w.pi;for(const key of ['form','labels','willValidate','validity','validationMessage'])assert.throws(()=>i[key],e=>e.name==='NotSupportedError'&&e.message==='The operation is not supported');assert.throws(()=>i.setFormValue({toString(){throw 23}}),e=>e.name==='NotSupportedError');i.role='checkbox';i.ariaLabel='actual';i.ariaBrailleLabel='dots';assert.equal(i.role,'checkbox');assert.equal(i.ariaLabel,'actual');assert.equal(i.ariaBrailleLabel,'dots');assert.equal(w.plain.role,null);assert.equal(w.plain.getAttribute('role'),null);i.ariaLabel=null;assert.equal(i.ariaLabel,null);const root=w.plain.attachShadow({mode:'closed'});assert.strictEqual(i.shadowRoot,root);});
++test('custom states preserve branded Set behavior and actual live iterator lifetime',{timeout:5000},async t=>{const{w,i}=await fixture(t),s=i.states;assert.ok(!(s instanceof w.Set));assert.strictEqual(s.add('a'),s);s.add('b');const iterator=s.values();assert.equal(Object.prototype.toString.call(iterator),'[object Object]');s.delete('a');assert.deepEqual(plain(iterator.next()),{done:false,value:'b'});s.add('c');assert.deepEqual([...iterator],['c']);s.clear();assert.deepEqual(plain(iterator.next()),{done:true});s.add('late');assert.deepEqual(plain(iterator.next()),{done:true});s.add(Symbol('state'));assert.deepEqual([...s],['late','state']);const pairs=[...s.entries()];assert.strictEqual(Object.getPrototypeOf(pairs[0]),w.Array.prototype);assert.deepEqual(plain(pairs),[['late','late'],['state','state']]);const seen=[];s.forEach(function(v,k,value){'use strict';assert.strictEqual(this,i);seen.push([v,k,value===s])},i);assert.deepEqual(seen,[['late','late',true],['state','state',true]]);assert.throws(()=>w.Set.prototype.add.call(s,'fake'),e=>e instanceof w.TypeError);});
++test('actual validity flags dispatch trusted invalid events and disabled/readonly barriers suppress validation',{timeout:5000},async t=>{const{w,e,i}=await fixture(t),v=i.validity,events=[];e.addEventListener('invalid',event=>events.push({trusted:event.isTrusted,cancelable:event.cancelable,bubbles:event.bubbles}));i.setValidity({valueMissing:true},'missing');assert.equal(v.valueMissing,true);assert.equal(v.customError,false);assert.equal(v.valid,false);assert.equal(i.validationMessage,'missing');assert.equal(e.matches(':invalid'),true);assert.equal(i.checkValidity(),false);assert.equal(i.reportValidity(),false);assert.deepEqual(events,[{trusted:true,cancelable:true,bubbles:false},{trusted:true,cancelable:true,bubbles:false}]);assert.throws(()=>i.setValidity({customError:true}),e=>e instanceof w.TypeError);assert.equal(v.valueMissing,true);assert.throws(()=>i.setValidity({customError:true},'x',w.document.body),e=>e.name==='NotFoundError');e.setAttribute('readonly','');assert.equal(i.willValidate,false);assert.equal(i.checkValidity(),true);assert.equal(i.validationMessage,'');assert.equal(e.matches(':valid'),false);assert.equal(e.matches(':invalid'),false);e.removeAttribute('readonly');i.setValidity({});assert.equal(v.valid,true);assert.equal(i.validationMessage,'');assert.equal(e.matches(':valid'),true);});
++test('real association callbacks follow tree changes, form IDs and atomic move boundaries',{timeout:5000},async t=>{const{w,e,i}=await fixture(t);w.document.body.innerHTML='<form id=a><div></div></form><form id=b></form>';const a=w.document.getElementById('a'),b=w.document.getElementById('b');a.append(e);b.append(e);assert.deepEqual(plain(e.events),[['form','a'],['form',null],['form','b']]);a.moveBefore(e,null);assert.deepEqual(plain(e.events).slice(-1),[['form','a']]);e.remove();w.document.body.append(e);e.setAttribute('form','later');const form=w.document.createElement('form');form.id='later';w.document.body.append(form);assert.strictEqual(i.form,form);assert.deepEqual(plain(e.events).slice(-2),[['form',null],['form','later']]);form.id='changed';assert.equal(i.form,null);assert.deepEqual(plain(e.events).at(-1),['form',null]);});
++test('fieldset/legend changes notify only actual disabled state transitions',{timeout:5000},async t=>{const{w,e,i}=await fixture(t);const fieldset=w.document.createElement('fieldset');fieldset.disabled=true;fieldset.innerHTML='<legend></legend><legend></legend>';const[first,second]=fieldset.children;second.append(e);assert.equal(i.willValidate,false);assert.deepEqual(plain(e.events),[['disabled',true]]);first.remove();assert.equal(i.willValidate,true);fieldset.prepend(first);assert.deepEqual(plain(e.events),[['disabled',true],['disabled',false],['disabled',true]]);e.setAttribute('disabled','');e.removeAttribute('disabled');assert.equal(e.events.length,3);assert.equal(e.matches(':disabled'),true);});
++test('fresh genuine label snapshots and live form collections follow actual IDs/topology',{timeout:5000},async t=>{const{w,e,i}=await fixture(t),labels=i.labels;w.document.body.innerHTML='<label for=custom>one</label><form id=f></form>';e.id='custom';w.document.getElementById('f').append(e);assert.notStrictEqual(i.labels,labels);assert.equal(labels.length,0);const snapshot=i.labels;assert.equal(snapshot.length,1);assert.strictEqual(snapshot[0].control,e);assert.strictEqual(i.form.elements[0],e);assert.strictEqual(i.form.elements.namedItem('custom'),e);const label=w.document.createElement('label');label.htmlFor='custom';w.document.body.append(label);assert.equal(snapshot.length,1);assert.equal(i.labels.length,2);e.id='other';assert.equal(snapshot.length,1);assert.equal(i.labels.length,0);});
++test('custom submission values use actual string/File/FormData data with snapshots and ordering',{timeout:5000},async t=>{const{w,e,i}=await fixture(t);w.document.body.innerHTML='<form><input name=before value=b><input name=after value=a></form>';const form=w.document.querySelector('form');form.insertBefore(e,form.lastChild);e.setAttribute('name','custom');i.setFormValue(Symbol('value'));assert.deepEqual([...new w.FormData(form)],[['before','b'],['custom','value'],['after','a']]);const data=new w.FormData();data.append('x','1');const file=new w.File(['actual'],'owned.txt');data.append('upload',file);e.removeAttribute('name');i.setFormValue(data);data.append('later','2');const result=new w.FormData(form);assert.deepEqual([...result.keys()],['before','x','upload','after']);assert.equal(await result.get('upload').text(),'actual');assert.equal(result.get('upload').name,'owned.txt');e.setAttribute('disabled','');assert.deepEqual([...new w.FormData(form)],[['before','b'],['after','a']]);});
++test('form reset callbacks run after built-ins reset and respect reset cancellation',{timeout:5000},async t=>{const{w,e}=await fixture(t);w.document.body.innerHTML='<form><input value=a></form>';const form=w.document.querySelector('form'),input=form.firstChild;form.prepend(e);e.observe=input;input.value='changed';form.reset();assert.deepEqual(plain(e.events).filter(x=>x[0]==='reset'),[['reset','a']]);form.addEventListener('reset',event=>event.preventDefault());input.value='again';form.reset();assert.equal(input.value,'again');assert.equal(e.events.filter(x=>x[0]==='reset').length,1);});
++test('invalid custom controls block actual network submission while valid values reach owned server',{timeout:5000},async t=>{const{w,e,i}=await fixture(t);posts=[];w.document.body.innerHTML='<form method=post action=/capture><input name=before value=b></form>';const form=w.document.querySelector('form');e.setAttribute('name','custom');form.append(e);i.setFormValue('actual');i.setValidity({customError:true},'blocked');form.requestSubmit();await new Promise(r=>setTimeout(r,30));assert.equal(posts.length,0);i.setValidity({});form.requestSubmit();for(let n=0;n<100&&!posts.length;n++)await new Promise(r=>setTimeout(r,10));assert.deepEqual(posts,['before=b&custom=actual']);});
++
++test('first-access states/validity and fresh labels use the actual invoked getter realm',{timeout:5000},async t=>{const{w}=await fixture(t),e=new w.Control(),f=w.document.createElement('iframe');const loaded=new Promise(r=>f.onload=r);f.src=origin+'/child';w.document.body.append(f);await loaded;const child=f.contentWindow;for(const[key,name]of [['states','CustomStateSet'],['validity','ValidityState']]){const value=Object.getOwnPropertyDescriptor(child.ElementInternals.prototype,key).get.call(e.i);assert.ok(value instanceof child[name]);assert.ok(!(value instanceof w[name]));assert.strictEqual(value,e.i[key]);}const labels=Object.getOwnPropertyDescriptor(child.ElementInternals.prototype,'labels').get.call(e.i);assert.strictEqual(Object.getPrototypeOf(labels),child.Array.prototype);assert.notStrictEqual(labels,e.i.labels);});
++
++test('observed value/state and validity coercion preserve actual conversion order',{timeout:5000},async t=>{const{i}=await fixture(t);let values=0,states=0;i.setFormValue({toString(){values++;return 'actual'}},{toString(){states++;throw 23}});assert.equal(values,1);assert.equal(states,0);const order=[],input={};for(const name of ['badInput','customError','patternMismatch','rangeOverflow','rangeUnderflow','stepMismatch','tooLong','tooShort','typeMismatch','valueMissing'])Object.defineProperty(input,name,{get(){order.push(name);return name==='customError'}});i.setValidity(input,{toString(){order.push('message');return 'bad'}});assert.deepEqual(order,['badInput','customError','patternMismatch','rangeOverflow','rangeUnderflow','stepMismatch','tooLong','tooShort','typeMismatch','valueMissing','message']);assert.equal(i.validationMessage,'bad');});
++
++test('customized built-ins keep actual built-in values and ignore autonomous form-associated flags',{timeout:5000},async t=>{const{w}=await fixture(t);w.eval(`class Input extends HTMLInputElement{static formAssociated=true;constructor(){super();this.events=[]}formAssociatedCallback(form){this.events.push(form)}}customElements.define('owned-input',Input,{extends:'input'})`);const form=w.document.createElement('form'),e=w.document.createElement('input',{is:'owned-input'});e.name='builtin';e.value='actual';w.document.body.append(form);form.append(e);assert.deepEqual(plain(e.events),[]);assert.deepEqual([...new w.FormData(form)],[['builtin','actual']]);assert.strictEqual(form.elements[0],e);assert.strictEqual(e.form,form);assert.throws(()=>e.attachInternals(),error=>error.name==='NotSupportedError');});

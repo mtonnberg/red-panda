@@ -1,4 +1,10 @@
-import { installCanvas } from './canvas.js';
+import { installWebCrypto } from './web-crypto.js';
+import {installScheduler} from './scheduler.js';
+import {installWorkerDOMException} from './worker-dom-exception.js';
+import {installWorkerEvents} from './worker-events.js';
+import {installWorkerAbort} from './worker-abort.js';
+import { installURLPattern } from './url-pattern.js';
+import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
 import { installImageData } from './image-data.js';
 import {workerSocketPolicy} from './worker-socket-policy.js';
 import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
@@ -12,6 +18,8 @@ import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'no
 import { createMessagingRealm, installMessaging } from './messaging.js';
 import { resolveBlobURL } from './blob-urls.js';
 import { installWebCodecsProcessors } from './webcodecs-processors.js';
+import { installVideoFrame } from './video-frame.js';
+import { installAudioData } from './audio-data.js';
 import { installWebCodecsValues } from './webcodecs-values.js';
 import { installGeometry } from './geometry.js';
 import { installNavigator } from './navigator.js';
@@ -178,7 +186,8 @@ export function installWorkers(page, window, { enabled = true } = {}) {
 
 async function runWorker() {
   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime;
+  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
+  let dispatchError = value => report(value);
   const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
@@ -233,11 +242,14 @@ async function runWorker() {
       }
     },
     async fetch(input, init = {}, resourceType) {
-      const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), init);
+      const supplied = init.signal;
+      const nativeSignal = supplied == null ? supplied : abortPlatform.hasSignal(supplied) ? abortPlatform.nativeSignal(supplied) : supplied;
+      const nativeInit = supplied == null ? init : {...init,signal:nativeSignal};
+      const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), nativeInit);
       const headers = [...new Headers(init.headers ?? original.headers)];
       const method = init.method ?? original.method;
       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal, resourceType);
+      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
       streams.adopt(response.body);
       Object.defineProperty(response, 'url', { value: result.url }); return response;
@@ -250,67 +262,70 @@ async function runWorker() {
     AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
     atob, btoa };
   context = vm.createContext(sandbox);
+  const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
+  installWorkerDOMException(realm,{evaluate});
+  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
+  lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
+  context.__eventPlatform=eventPlatform;
   vm.runInContext(`(function () {
-    const trustedEvents = new WeakSet();
-    class Event {
-      constructor(type, init = {}) { this.type = String(type); this.bubbles = Boolean(init.bubbles); this.cancelable = Boolean(init.cancelable); this.defaultPrevented = false; this.target = null; this.currentTarget = null; Object.defineProperty(this, 'isTrusted', { enumerable: true, get: () => trustedEvents.has(this) }); }
-      preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
-      stopPropagation() {} stopImmediatePropagation() { this.__stopped = true; }
-    }
-    class MessageEvent extends Event { constructor(type, init = {}) { super(type, init); this.data = init.data ?? null; this.ports = init.ports ?? []; this.origin = init.origin ?? ''; this.source = init.source ?? null; } }
-    class ErrorEvent extends Event { constructor(type, init = {}) { super(type, init); Object.assign(this, init); } }
-    class EventTarget {
-      constructor() { this.__listeners = new Map(); }
-      addEventListener(type, callback, options = {}) { if (!callback) return; type = String(type); const list = this.__listeners.get(type) ?? []; if (!list.some(item => item.callback === callback)) list.push({ callback, once: Boolean(options?.once), signal: options?.signal }); this.__listeners.set(type, list); }
-      removeEventListener(type, callback) { const list = this.__listeners.get(String(type)); if (list) this.__listeners.set(String(type), list.filter(item => item.callback !== callback)); }
-      dispatchEvent(event) { const receiver = this.__globalRoot ?? this; event.target = receiver; event.currentTarget = receiver; for (const item of [...this.__listeners.get(event.type) ?? []]) { if (item.signal?.aborted) continue; if (item.once) this.removeEventListener(event.type, item.callback); try { typeof item.callback === 'function' ? item.callback.call(receiver, event) : item.callback.handleEvent(event); } catch(error) { __dispatchError(error); } if (event.__stopped) break; } const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (typeof handler === 'function' && !event.__stopped) { try { if (handler.call(receiver, event) === true && event.type === 'error') event.preventDefault(); } catch(error) { __dispatchError(error); } } event.currentTarget = null; return !event.defaultPrevented; }
-    }
-    Object.assign(globalThis, { Event, MessageEvent, ErrorEvent, EventTarget });
+    const eventPlatform=__eventPlatform,bridge=__bridge;
+    delete globalThis.__bridge;
+    const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
     globalThis.self = globalThis; globalThis.name = __name;
-    Object.assign(globalThis, { onmessage: null, onmessageerror: null, onerror: null });
-    const target = new EventTarget(); target.__globalRoot = globalThis;
+    const target = new EventTarget(); eventPlatform.setReceiver(target,globalThis);
+    for(const key of ['onmessage','onmessageerror','onerror']) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
     for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = target[name].bind(target);
-    globalThis.dispatchEvent = event => { for (const key of ['onmessage', 'onmessageerror', 'onerror']) target[key] = globalThis[key]; return target.dispatchEvent(event); };
+    const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
+    globalThis.dispatchEvent = dispatchGlobal;
     let reportingError = false;
-    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); if (dispatchEvent(event)) __bridge.report(error); } finally { reportingError = false; } };
-    globalThis.postMessage = (data, transfer) => __bridge.postMessage(data, transfer);
-    globalThis.close = () => __bridge.close();
-    globalThis.importScripts = (...urls) => __bridge.importScripts(...urls);
-    globalThis.setTimeout = function(callback, delay = 0, ...args) { return __bridge.timer(callback, delay, args, false); };
-    globalThis.setInterval = function(callback, delay = 0, ...args) { return __bridge.timer(callback, delay, args, true); };
-    globalThis.clearTimeout = globalThis.clearInterval = id => __bridge.clear(id);
-    globalThis.queueMicrotask = callback => __bridge.microtask(callback);
-    globalThis.fetch = async (input, init) => __bridge.fetch(input, init);
-    globalThis.structuredClone = (value, options) => __bridge.structuredClone(value, options);
-    globalThis.console = Object.fromEntries(['log','info','warn','error','debug'].map(type => [type, (...args) => __bridge.console(type, args)]));
+    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); eventPlatform.trust(event); if (dispatchGlobal(event)) bridge.report(error); } finally { reportingError = false; } };
+    globalThis.postMessage = (data, transfer) => bridge.postMessage(data, transfer);
+    globalThis.close = () => bridge.close();
+    globalThis.importScripts = (...urls) => bridge.importScripts(...urls);
+    globalThis.setTimeout = function(callback, delay = 0, ...args) { return bridge.timer(callback, delay, args, false); };
+    globalThis.setInterval = function(callback, delay = 0, ...args) { return bridge.timer(callback, delay, args, true); };
+    globalThis.clearTimeout = globalThis.clearInterval = id => bridge.clear(id);
+    globalThis.queueMicrotask = callback => bridge.microtask(callback);
+    globalThis.fetch = async (input, init) => bridge.fetch(input, init);
+    globalThis.structuredClone = (value, options) => bridge.structuredClone(value, options);
+    globalThis.console = Object.fromEntries(['log','info','warn','error','debug'].map(type => [type, (...args) => bridge.console(type, args)]));
     class WorkerLocation { constructor(url) { for (const key of ['href','origin','protocol','host','hostname','port','pathname','search','hash']) Object.defineProperty(this, key, { value: url[key], enumerable: true }); } toString() { return this.href; } }
     Object.assign(globalThis, { WorkerLocation, location: new WorkerLocation(new URL(__url)) });
     class WorkerNavigator {} Object.assign(WorkerNavigator.prototype, { appName: 'Netscape', onLine: true });
     const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
     Object.assign(globalThis, { WorkerNavigator, navigator: nav });
     globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
-    globalThis.__trustWorkerEvent=event=>{trustedEvents.add(event);return event;};
-    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); trustedEvents.add(event); return event; };
+    globalThis.__trustWorkerEvent=event=>eventPlatform.trust(event);
+    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); eventPlatform.trust(event); return event; };
     globalThis.__createTrustedMessage = createTrustedMessage;
-    globalThis.__emitMessage = (data, ports) => dispatchEvent(createTrustedMessage('message', data, ports));
+    globalThis.__emitMessage = (data, ports) => dispatchGlobal(createTrustedMessage('message', data, ports));
   })();`, context);
+  delete context.__eventPlatform;
+  abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
+  installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
+  dispatchError=vm.runInContext('__dispatchError',context);
+  delete context.__dispatchError;
   emit = vm.runInContext('__emitMessage', context);
   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
   const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
   messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
     active: () => !closed,
-    dispatch: (target, type, data, ports) => target.dispatchEvent(createTrustedMessage(type, data, ports)),
+    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,createTrustedMessage(type, data, ports)),
     reportError: value => dispatchError(value),
   });
   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
-  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>target.dispatchEvent(createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
+  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>eventPlatform.dispatch(target,createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
   Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
   installImageData(vm.runInContext('globalThis', context));
+  installWebCrypto(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context)});
+  installURLPattern(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context)});
   installCanvas(vm.runInContext('globalThis', context));
   installGeometry(vm.runInContext('globalThis', context));
   installWebCodecsValues(vm.runInContext('globalThis', context));
+  installAudioData(vm.runInContext('globalThis', context));
+  installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
@@ -319,7 +334,6 @@ async function runWorker() {
   if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
     call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
-  const dispatchError = value => vm.runInContext('__dispatchError', context)(value);
   parentPort.on('message', message => {
     if (closed) return;
     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}

@@ -1,0 +1,168 @@
+diff --git a/src/selection.js b/src/selection.js
+new file mode 100644
+--- /dev/null
++++ b/src/selection.js
+@@ -0,0 +1,101 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {types} from 'node:util';
++import {platformFactoryRecord} from './platform-factories.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
++const NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const RangeImpl=require('jsdom/lib/jsdom/living/range/Range-impl.js').implementation;
++const SelectionImpl=require('jsdom/lib/jsdom/living/selection/Selection-impl.js').implementation;
++const {domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const {nodeRoot,nodeLength}=require('jsdom/lib/jsdom/living/helpers/node.js');
++const {compareBoundaryPointsPosition:compare}=require('jsdom/lib/jsdom/living/range/boundary-point.js');
++const INSTALLED=new WeakMap(),GLOBALS=new WeakMap(),UTILITY_INSTALLED=new WeakSet();let patched=false;
++function recordFor(selection){return GLOBALS.get(selection._globalObject)}
++function emit(selection){const record=recordFor(selection);if(!record||record.disposed)return;const event=Event.createImpl(record.global,['selectionchange',{bubbles:false,cancelable:false}]);record.document._dispatch(event);}
++function patch(){
++ if(patched)return;patched=true;const proto=SelectionImpl.prototype;
++ for(const key of['_anchor','_focus']){const descriptor=Object.getOwnPropertyDescriptor(proto,key);Object.defineProperty(proto,key,{...descriptor,get(){if(!recordFor(this))return descriptor.get.call(this);if(!this._range)return null;const backwards=this._direction===-1;return this._range[(key==='_anchor')!==backwards?'_start':'_end'];}})}
++ const associate=proto._associateRange;
++ proto._associateRange=function(range){if(!recordFor(this))return associate.call(this,range);this._range=range;this._direction=range===null?0:1;};
++ for(const name of['addRange','removeRange','removeAllRanges','collapse','collapseToStart','collapseToEnd','extend','setBaseAndExtent','selectAllChildren','deleteFromDocument']){
++  const original=proto[name];proto[name]=function(...args){
++   if(!recordFor(this))return original.apply(this,args);
++   // collapse(null) delegates to removeAllRanges, which owns that association.
++   if(name==='collapse'&&args[0]===null)return original.apply(this,args);
++   const before=this._range,result=original.apply(this,args),changed=before!==this._range;
++   if(changed){if(name==='addRange'||name==='collapse'||name==='collapseToStart'||name==='collapseToEnd')this._direction=0;else if((name==='extend'||name==='setBaseAndExtent')&&this._range?.collapsed)this._direction=0;}
++   if(changed||(name==='deleteFromDocument'&&before))emit(this);
++   return result;
++  };
++ }
++ const contains=proto.containsNode;
++ proto.containsNode=function(node,partial){
++  if(!recordFor(this)||!partial)return contains.call(this,node,partial);
++  if(!this._range||nodeRoot(node)!==nodeRoot(this._range._start.node))return false;
++  const parent=tree.parent(node);if(!parent)return true;
++  const index=tree.index(node),before={node:parent,offset:index},after={node:parent,offset:index+1};
++  return compare(this._range._start,after)<0&&compare(this._range._end,before)>0;
++ };
++}
++function nextText(node){for(let current=tree.following(node,{skipChildren:true});current;current=tree.following(current))if(current.nodeType===3)return current;return null;}
++function previousText(node){for(let current=tree.preceding(node);current;current=tree.preceding(current))if(current.nodeType===3)return current;return null;}
++function firstText(node){for(const current of tree.treeIterator(node))if(current.nodeType===3)return current;return null;}
++function lastText(node){for(const current of tree.treeIterator(node,{reverse:true}))if(current.nodeType===3)return current;return null;}
++const word=code=>code>=48&&code<=57||code>=65&&code<=90||code>=97&&code<=122||code===95;
++function wordOffset(text,offset,forward){
++ if(forward){while(offset<text.length&&!word(text.charCodeAt(offset)))offset++;while(offset<text.length&&word(text.charCodeAt(offset)))offset++;}
++ else{while(offset>0&&!word(text.charCodeAt(offset-1)))offset--;while(offset>0&&word(text.charCodeAt(offset-1)))offset--;}
++ return offset;
++}
++function move(selection,alteration,direction,granularity,document){
++ if((alteration!=='move'&&alteration!=='extend')||!['forward','backward','left','right'].includes(direction)||!['character','word'].includes(granularity)||!selection._range)return;
++ if(alteration==='extend'&&nodeRoot(selection._focus.node)!==document)return;
++ const forward=direction==='forward'||direction==='right',focus=selection._focus;let node=focus.node,offset=focus.offset;
++ if(node.nodeType===3){
++  if(forward?offset<nodeLength(node):offset>0)offset=granularity==='word'?wordOffset(node.data,offset,forward):offset+(forward?1:-1);
++  else{const adjacent=forward?nextText(node):previousText(node);if(adjacent){node=adjacent;offset=forward?0:nodeLength(node);if(granularity==='word')offset=wordOffset(node.data,offset,forward);}}
++ }else if(forward){
++  const child=tree.childrenToArray(node)[offset];let target=child?firstText(child):null;if(child&&!target)target=nextText(child);
++  if(target){node=target;offset=granularity==='word'?wordOffset(node.data,0,true):0;}
++  else{target=nextText(node);if(target){node=target;offset=granularity==='word'?wordOffset(node.data,0,true):Math.min(1,nodeLength(node));}}
++ }else{
++  const child=tree.childrenToArray(node)[offset-1],target=child?lastText(child):null;
++  if(target){node=target;offset=granularity==='word'?wordOffset(node.data,nodeLength(node),false):nodeLength(node);}
++ }
++ if(alteration==='move')selection.collapse(node,offset);else selection.extend(node,offset);
++}
++function factory(g,bridge){
++ const TypeError=g.TypeError,apply=g.Reflect.apply,define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,String=g.String;
++ const Number=g.Number,finite=Number.isFinite,trunc=g.Math.trunc,Exception=g.DOMException;
++ const description=own(g.Symbol.prototype,'description').get,primitive=g.Symbol.toPrimitive;
++ const isObject=value=>value!==null&&(typeof value==='object'||typeof value==='function');
++ function string(value){if(isObject(value)){const convert=value[primitive];if(convert!=null){if(typeof convert!=='function')throw new TypeError('invalid argument');value=apply(convert,value,['string']);if(isObject(value))throw new TypeError('invalid argument');}else{let done=false;for(const name of['toString','valueOf']){const fn=value[name];if(typeof fn==='function'){const next=apply(fn,value,[]);if(!isObject(next)){value=next;done=true;break}}}if(!done)throw new TypeError('invalid argument')}}return String(typeof value==='symbol'?apply(description,value,[]):value)}
++ const p=g.Selection.prototype,brand=value=>{if(!bridge.valid(value))throw new TypeError('Illegal invocation')};
++ function Selection(){throw new TypeError('Illegal Constructor')}
++ define(Selection,'prototype',{value:p,writable:false});define(p,'constructor',{value:Selection,writable:true,configurable:true});define(g,'Selection',{value:Selection,writable:true,configurable:true});
++ for(const[name,required,length]of[['addRange',1,1],['collapse',0,0],['collapseToEnd',0,0],['collapseToStart',0,0],['containsNode',2,2],['deleteFromDocument',0,0],['empty',0,0],['extend',1,1],['getRangeAt',1,1],['removeAllRanges',0,0],['removeRange',1,1],['selectAllChildren',1,1],['setBaseAndExtent',4,4],['setPosition',0,0],['toString',0,0]]){
++  const descriptor=own(p,name),original=descriptor.value;
++  const fn=({[name](...args){brand(this);if(args.length<required)throw new TypeError('invalid argument');if(name==='collapse'||name==='setPosition'){if(args[0]==null)args[0]=null;else if(!bridge.argument(args[0],'Node'))throw new TypeError('invalid argument')}else if(name==='addRange'||name==='removeRange'){if(!bridge.argument(args[0],'Range'))throw new TypeError('invalid argument')}else if(name==='extend'||name==='containsNode'||name==='selectAllChildren'){if(!bridge.argument(args[0],'Node'))throw new TypeError('invalid argument')}else if(name==='setBaseAndExtent'){if(!bridge.argument(args[0],'Node')||!bridge.argument(args[2],'Node'))throw new TypeError('invalid argument')}if((name==='collapse'||name==='setPosition'||name==='extend')&&args[0]!=null&&!bridge.inDocument(args[0])){if(typeof args[1]==='bigint')throw new TypeError('invalid argument');const n=Number(args[1]),offset=finite(n)?trunc(n)>>>0:0;if(offset>bridge.length(args[0]))throw new Exception('Index or size is negative or greater than the allowed amount','IndexSizeError');return}return apply(original,this,args)}})[name];define(fn,'length',{value:length,configurable:true});define(p,name,{...descriptor,value:fn});
++ }
++ for(const name of['anchorNode','anchorOffset','focusNode','focusOffset','isCollapsed','rangeCount','type']){
++  const descriptor=own(p,name),getter=({get [name](){brand(this);return apply(descriptor.get,this,[])}});define(p,name,{...descriptor,get:own(getter,name).get});
++ }
++ const extra={get direction(){brand(this);return bridge.direction(this)},modify(alteration,direction,granularity){brand(this);if(arguments.length<3)throw new TypeError('invalid argument');bridge.modify(this,string(alteration),string(direction),string(granularity))}};
++ for(const name of['direction','modify'])define(p,name,{...own(extra,name),enumerable:true,configurable:true});
++ if(typeof g.getSelection!=='function'){const document=g.document,get= document.getSelection;const getSelection=function getSelection(){return apply(get,document,[])};define(g,'getSelection',{value:getSelection,writable:true,enumerable:true,configurable:true});}
++}
++export function installSelection(page,window){
++ if(INSTALLED.has(window))return INSTALLED.get(window).controller;patch();
++ const record={document:utils.implForWrapper(window.document),global:utils.implForWrapper(window.document)._globalObject,disposed:false};GLOBALS.set(record.document._globalObject,record);
++ window.eval(`(${factory.toString()})`)(window,bridgeFor(record));
++ const dispose=()=>{record.disposed=true;page.documentAbort?.signal.removeEventListener('abort',dispose)};page.documentAbort?.signal.addEventListener('abort',dispose,{once:true});record.controller={dispose};INSTALLED.set(window,record);return record.controller;
++}
++
++function bridgeFor(record){
++ const implementation=value=>{if(types.isProxy(value))return null;const impl=platformFactoryRecord(value)?.implementation;return impl instanceof SelectionImpl?impl:null;};
++ return {valid:value=>!!implementation(value),argument:(value,kind)=>!types.isProxy(value)&&platformFactoryRecord(value)?.implementation instanceof (kind==='Node'?NodeImpl:RangeImpl),inDocument:value=>nodeRoot(platformFactoryRecord(value).implementation)===record.document,length:value=>nodeLength(platformFactoryRecord(value).implementation),direction:value=>{const selection=implementation(value);return selection._direction===1?'forward':selection._direction===-1?'backward':'none'},modify:(value,alteration,direction,granularity)=>move(implementation(value),alteration,direction,granularity,record.document)};
++}
++export function installUtilitySelection(controller,mainWindow){
++ if(UTILITY_INSTALLED.has(controller.global))return;const record=INSTALLED.get(mainWindow);if(!record)return;controller.evaluate(`(${factory.toString()})`)(controller.global,bridgeFor(record));UTILITY_INSTALLED.add(controller.global);
++}
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -19,6 +19,7 @@
+ import { installSVG } from './svg.js';
+ import { installDOMIDL } from './dom-idl.js';
+ import { installMedia } from './media.js';
++import {installSelection} from './selection.js';
+ import {installTextTracks} from './text-tracks.js';
+ import {installCache} from './cache.js';
+ import { installWindowMessaging, installBroadcast } from './window-messaging.js';
+@@ -278,6 +279,7 @@
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
+       installDOMLifecycle(this, window);
++      installSelection(this, window);
+       installMedia(this, window);
+       installTextTracks(this, window);
+       installAudioCore(this, window);
+diff --git a/src/world-sessions.js b/src/world-sessions.js
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,6 +1,7 @@
+ import { installURLPattern } from './url-pattern.js';
+ import { installCanvas } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
++import {installUtilitySelection} from './selection.js';
+ import { installImageData } from './image-data.js';
+ import {installFonts} from './fonts.js';
+ import {installUtilityLayout} from './utility-layout.js';
+@@ -33,7 +34,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installImageData(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installImageData(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+diff --git a/test/selection.test.js b/test/selection.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/selection.test.js
+@@ -0,0 +1,18 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{installUtilitySelection}from'../src/selection.js';
++async function fixture(t){const browser=new Browser({timeout:2000,loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><p id=p>one two</p><div id=root>one<span id=empty></span><b id=b>two</b> three</div>');const w=page.dom.window,d=w.document,s=w.getSelection();return{browser,page,w,d,s,text:d.getElementById('p').firstChild}}
++const pause=()=>new Promise(r=>setTimeout(r,15));
++test('Selection retains actual generated identity, live Range identity and private brands',async t=>{const{w,d,s,text}=await fixture(t),range=d.createRange();range.setStart(text,1);range.setEnd(text,3);s.addRange(range);assert.equal(s,d.getSelection());assert.equal(s,w.getSelection());assert.equal(s instanceof w.Selection,true);assert.equal(s.getRangeAt(0),range);assert.equal(s.direction,'none');assert.equal(s.anchorOffset,1);assert.equal(s.focusOffset,3);assert.throws(()=>new w.Selection(),e=>e instanceof w.TypeError&&e.message==='Illegal Constructor');for(const fake of[Object.create(w.Selection.prototype),new Proxy(s,{get(){throw Error('authored trap')}})])assert.throws(()=>w.Selection.prototype.modify.call(fake,'move','forward','character'),e=>e instanceof w.TypeError&&e.message==='Illegal invocation');});
++test('real direction follows anchors and focus; explicit collapse resets it while live Range edits retain it',async t=>{const{d,s,text}=await fixture(t);s.collapse(text,3);assert.equal(s.direction,'none');s.extend(text,6);assert.equal(s.direction,'forward');s.extend(text,1);assert.equal(s.direction,'backward');assert.deepEqual([s.anchorOffset,s.focusOffset],[3,1]);s.extend(text,3);assert.equal(s.direction,'none');s.selectAllChildren(d.getElementById('p'));const range=s.getRangeAt(0);range.collapse(true);assert.equal(s.direction,'forward');s.collapseToEnd();assert.equal(s.direction,'none');s.removeAllRanges();assert.equal(s.direction,'none');});
++test('successful associations dispatch synchronous real events after direction updates without queued duplicates',async t=>{const{w,d,s,text}=await fixture(t),events=[];d.addEventListener('selectionchange',e=>events.push([e,s.direction,s.anchorOffset,s.focusOffset]));s.removeAllRanges();assert.equal(events.length,0);s.collapse(text,1);assert.equal(events.length,1);s.collapse(text,1);assert.equal(events.length,2);s.extend(text,3);assert.equal(events.length,3);assert.deepEqual(events[2].slice(1),['forward',1,3]);const event=events[2][0];assert.equal(event instanceof w.Event,true);assert.equal(event.target,d);assert.equal(event.isTrusted,false);assert.equal(event.bubbles,false);assert.equal(event.cancelable,false);s.getRangeAt(0).setEnd(text,4);assert.equal(events.length,3);s.addRange(s.getRangeAt(0));assert.equal(events.length,3);s.modify('move','forward','line');assert.equal(events.length,3);await pause();assert.equal(events.length,3);});
++test('reentrant authored selection listeners observe actual state and preserve nested changes',async t=>{const{d,s,text}=await fixture(t),offsets=[];d.addEventListener('selectionchange',()=>{offsets.push(s.focusOffset);if(offsets.length===1)s.extend(text,5)});s.collapse(text,1);assert.deepEqual(offsets,[1,5]);assert.equal(s.direction,'forward');assert.deepEqual([s.anchorOffset,s.focusOffset],[1,5]);});
++test('character movement uses measured UTF-16 units and word movement scans actual ASCII word data',async t=>{const{s,text}=await fixture(t);text.data='A😀e\u0301 Z';s.collapse(text,0);const chars=[];for(let i=0;i<5;i++){s.modify('move','forward','character');chars.push(s.focusOffset)}assert.deepEqual(chars,[1,2,3,4,5]);s.collapse(text,0);const words=[];for(let i=0;i<3;i++){s.modify('move','forward','word');words.push(s.focusOffset)}assert.deepEqual(words,[1,4,7]);s.modify('move','backward','word');assert.equal(s.focusOffset,6);s.modify('extend','backward','character');assert.equal(s.direction,'backward');assert.deepEqual([s.anchorOffset,s.focusOffset],[6,5]);});
++test('actual DOM traversal honors text transitions, element offsets, empty nodes and comments',async t=>{const{d,s}=await fixture(t),root=d.getElementById('root'),a=root.firstChild,b=d.getElementById('b').firstChild,empty=d.getElementById('empty');s.collapse(a,3);s.modify('move','forward','character');assert.equal(s.anchorNode,b);assert.equal(s.anchorOffset,0);s.collapse(root,1);s.modify('move','forward','character');assert.equal(s.anchorNode,b);assert.equal(s.anchorOffset,0);s.collapse(empty,0);s.modify('move','forward','character');assert.equal(s.anchorNode,b);assert.equal(s.anchorOffset,1);s.collapse(empty,0);s.modify('move','backward','character');assert.equal(s.anchorNode,empty);s.collapse(root,root.childNodes.length);s.modify('move','backward','character');assert.equal(s.anchorNode,root.lastChild);assert.equal(s.anchorOffset,6);});
++test('move starts at actual focus while extend retains actual anchor and Range deletion changes real DOM',async t=>{const{d,s,text}=await fixture(t);s.setBaseAndExtent(text,6,text,1);s.modify('move','forward','character');assert.deepEqual([s.anchorOffset,s.focusOffset,s.direction],[2,2,'none']);s.setBaseAndExtent(text,1,text,4);const range=s.getRangeAt(0);s.deleteFromDocument();assert.equal(s.getRangeAt(0),range);assert.equal(text.data,'otwo');assert.equal(s.isCollapsed,true);assert.equal(s.direction,'forward');assert.equal(d.getElementById('p').textContent,'otwo');});
++test('partial containment uses actual boundary intersections and element selection preserves parent boundaries',async t=>{const{d,s}=await fixture(t),root=d.getElementById('root'),b=d.getElementById('b');s.selectAllChildren(root);assert.equal(s.anchorNode,root);assert.equal(s.focusOffset,root.childNodes.length);assert.equal(s.containsNode(root,false),false);assert.equal(s.containsNode(root,true),true);assert.equal(s.containsNode(b,true),true);assert.equal(s.containsNode(d.getElementById('p'),true),false);});
++test('modify conversions and genuine realm errors survive replaced public intrinsics',async t=>{const{w,s,text}=await fixture(t),TypeError=w.TypeError;s.collapse(text,0);const old={TypeError:w.TypeError,String:w.String,includes:w.Array.prototype.includes};try{w.TypeError=class Fake{};w.String=()=>{throw Error('authored')};w.Array.prototype.includes=()=>false;s.modify({[w.Symbol.toPrimitive](){return w.Symbol('move')}},w.Symbol('forward'),'character');assert.equal(s.anchorOffset,1);assert.throws(()=>s.modify(),e=>e instanceof TypeError&&e.message==='invalid argument');assert.throws(()=>w.Selection.prototype.modify.call({},'move','forward','character'),TypeError);}finally{w.TypeError=old.TypeError;w.String=old.String;w.Array.prototype.includes=old.includes;}});
++test('detached/shadow endpoints do not fabricate a selection, and actual frame values support borrowed methods',async t=>{const{w,d,s}=await fixture(t);s.collapse(d.createTextNode('detached'),1);s.modify('move','forward','character');assert.equal(s.rangeCount,0);const host=d.createElement('div');d.body.append(host);s.collapse(host.attachShadow({mode:'open'}).appendChild(d.createTextNode('shadow')),1);assert.equal(s.rangeCount,0);const frame=d.createElement('iframe');d.body.append(frame);const child=frame.contentWindow,node=child.document.body.appendChild(child.document.createTextNode('frame')),selection=child.getSelection();selection.collapse(node,1);w.Selection.prototype.collapse.call(selection,node,3);assert.equal(selection.focusOffset,1);w.Selection.prototype.modify.call(selection,'extend','forward','character');assert.equal(selection.focusOffset,1);selection.modify('extend','forward','character');assert.equal(selection instanceof child.Selection,true);assert.equal(selection instanceof w.Selection,false);assert.deepEqual([selection.anchorOffset,selection.focusOffset,selection.direction],[1,2,'forward']);assert.equal(Object.getOwnPropertyDescriptor(w.Selection.prototype,'direction').get.call(selection),'forward');});
++test('disposed document selections preserve actual teardown boundaries without dispatching late callbacks',async t=>{const{page,d,s,text}=await fixture(t);s.collapse(text,1);let events=0;d.addEventListener('selectionchange',()=>events++);page.close();const after={node:s.focusNode,offset:s.focusOffset};s.modify('move','forward','character');assert.equal(s.focusNode,after.node);assert.equal(s.focusOffset,after.offset);assert.equal(s.getRangeAt(0).startContainer.ownerDocument===d||s.getRangeAt(0).startContainer===d,true);assert.equal(events,0);await pause();assert.equal(events,0);});
++
++test('optional collapse endpoints and required containment arguments follow Native while DOM/Range brands reject copied internals',async t=>{const{w,d,s,text}=await fixture(t);s.collapse(text,1);s.collapse();assert.equal(s.rangeCount,0);s.setPosition();assert.equal(s.rangeCount,0);assert.throws(()=>s.containsNode(text),e=>e instanceof w.TypeError&&e.message==='invalid argument');for(const original of[text,d.createRange()]){const forged=Object.create(Object.getPrototypeOf(original),Object.getOwnPropertyDescriptors(original)),proxy=new Proxy(original,{get(){throw Error('authored trap')}});for(const value of[forged,proxy])assert.throws(()=>original===text?s.collapse(value,0):s.addRange(value),e=>e instanceof w.TypeError&&e.message==='invalid argument');}});
++
++test('utility Selection, Range and node returns are genuine world-local wrappers over the same physical selection',async t=>{const{page,w,s}=await fixture(t),world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());installUtilitySelection(world,w);const value=JSON.parse(world.evaluate(`JSON.stringify((()=>{const selection=getSelection(),node=document.getElementById('p').firstChild;selection.collapse(node,1);selection.modify('extend','forward','word');return {selection:selection instanceof Selection,range:selection.getRangeAt(0) instanceof Range,node:selection.anchorNode===node,same:selection===document.getSelection(),state:[selection.anchorOffset,selection.focusOffset,selection.direction,String(selection)]}})())`));assert.deepEqual(value,{selection:true,range:true,node:true,same:true,state:[1,3,'forward','ne']});assert.deepEqual([s.anchorOffset,s.focusOffset,s.direction],[1,3,'forward']);assert.notEqual(world.global.Selection,w.Selection);});

@@ -14,21 +14,12 @@ export function utilityLayoutFor(page,value) {
   return {node,document,layout:owner.layout};
 }
 function geometryFactory(g,bridge) {
-  const Rect=DOMRect,states=new WeakMap();
-  const element=value=>{if(!bridge.isElement(value))throw new TypeError('Illegal invocation');return value;};
-  const unsigned=value=>{value=+value;return Number.isFinite(value)?Math.trunc(value)>>>0:0;};
-  class DOMRectList {
-    constructor(){throw new TypeError('Illegal Constructor');}
-    get length(){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this).length;}
-    item(index){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this)[unsigned(index)]??null;}
-    *[Symbol.iterator](){if(!states.has(this))throw new TypeError('Illegal invocation');yield* states.get(this);}
-  }
-  Object.defineProperty(DOMRectList.prototype,Symbol.toStringTag,{value:'DOMRectList',configurable:true});
-  Object.defineProperty(g,'DOMRectList',{value:DOMRectList,writable:true,configurable:true});
-  const rect=value=>new Rect(value.x,value.y,value.width,value.height);
+  const TypeError=g.TypeError,Error=g.Error,ArrayConstructor=g.Array,set=g.Reflect.set;
+  const element=value=>{if (!bridge.isElement(value)) throw new TypeError('Illegal invocation');return value;};
+  const rect=value=>bridge.createRect(value);
   const methods={
     getBoundingClientRect(){return rect(bridge.rect(element(this)));},
-    getClientRects(){const result=Object.create(DOMRectList.prototype),values=Array.from(bridge.rects(element(this)),rect);states.set(result,values);for(let i=0;i<values.length;i++)Object.defineProperty(result,i,{value:values[i],enumerable:true,configurable:true});return result;},
+    getClientRects(){const values=bridge.rects(element(this)),result=new ArrayConstructor(values.length);try{for(let i=0;i<values.length;i++)set(result,i,rect(values[i]));}catch{throw new Error('FailedToCreateArray')}return result;},
     scrollIntoView(){bridge.scrollIntoView(element(this));},
     scrollIntoViewIfNeeded(){bridge.scrollIntoView(element(this));},
   };
@@ -39,6 +30,7 @@ function geometryFactory(g,bridge) {
 }
 export function installUtilityLayout(page,world,main=page.dom.window) {
   const bridge={
+    createRect:value=>world.createDOMRect(value),
     isElement:value=>nodeIdentity(canonicalUtilityValue(value))?.nodeType===1,
     rect:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rect(node);},
     rects:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rects(node);},

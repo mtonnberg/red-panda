@@ -1,0 +1,1 @@
+(()=>{const rows=[];for(const init of[{}, {pathname:'/:x'}, {protocol:'https',pathname:'/:x'},{protocol:'original-scheme',pathname:'/:x'},{protocol:'http{s}?',pathname:'/:x'}]){/(seed)/.exec('seed');new URLPattern(init);rows.push([init,[RegExp.$1,RegExp.lastMatch,RegExp.input]])}return JSON.stringify(rows)})()

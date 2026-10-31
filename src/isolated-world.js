@@ -33,7 +33,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  const utilityPrototypes=new Map();
  const mainPrototypes=new Map(),observerImpls=new Set(),listeners=[],timers=new Set();let disposed=false;
  const requireLive=()=>{if(disposed)throw new Error('Isolated world has been disposed');};
- const mainContext=hostUtils.implForWrapper(mainWindow.document)._globalObject;
+ const mainDocument=hostUtils.implForWrapper(mainWindow.document),mainContext=mainDocument._globalObject;
  const utilityApply=global.Reflect.apply;
  const realmFunction=bridge=>vm.compileFunction('return function(...args){return apply(bridge,this,args)}',['bridge','apply'],{parsingContext:context})(bridge,utilityApply);
  for(const[name,constructor]of Object.entries(mainWindow[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)mainPrototypes.set(constructor.prototype,name);
@@ -67,14 +67,14 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   // wrapper. Never replace an existing implementation's main wrapper to enter a world.
   const hostGenerated=require(join(generatedRoot,name+'.js'));
   if(typeof hostGenerated.new==='function'&&mainWindow[name]){
-   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);
+   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
   }
   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
  }
  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
   const source=readFileSync(filename,'utf8');const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
-  if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){return canonicalizeNew(name,original(...args));};
+  if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
    // Measured native producer quirk: MO arguments are real main-world values,
    // while the authored callback itself continues in its genuine utility realm.
    if(name==='MutationCallback')module.exports.convert=(ignored,value)=>{if(typeof value!=='function')throw new global.TypeError('Mutation callback is not a function');const invoke=function(records,observer){if(disposed)return;const array=vm.runInContext('[]',mainContext);for(let i=0;i<records.length;i++){const item=hostUtils.tryWrapperForImpl(records[i]);Object.defineProperty(array,String(i),{value:item,writable:true,enumerable:true,configurable:true});}const mainObserver=hostUtils.tryWrapperForImpl(observer);return Reflect.apply(value,hostUtils.tryWrapperForImpl(this),[array,mainObserver]);};invoke[hostUtils.wrapperSymbol]=value;invoke.objectReference=value;return invoke;};
@@ -102,5 +102,5 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
- return {context,global,realmFunction,evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
+ return {context,global,realmFunction,createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
 }

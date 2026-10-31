@@ -1,0 +1,5 @@
+(()=>{const rows=[],capture=(n,f)=>{try{rows.push([n,{value:f()}])}catch(e){rows.push([n,{error:e.name,message:e.message,realm:e instanceof TypeError}])}};for(const n of [10,12,14,16,18,20,22,24,26,30,40])capture('limit-'+n,()=>new URLPattern({pathname:'/((?:a+)+b|a+c)'}).test({pathname:'/'+'a'.repeat(n)+'c'}));
+for(const p of ['/:x?', '/:x+', '/:x*','/:x(.*)','/:x(a|b)','/{hello}?','/hello','/{:x}end'])for(const groups of [{},{x:'a'},{x:'a/b'},{x:''}])capture('gen-'+p+'-'+JSON.stringify(groups),()=>new URLPattern({pathname:p}).generate('pathname',groups));
+for(const [name,input]of [['numberObject',new Number(3)],['stringEmpty',new String('')],['boolean',true],['booleanObject',new Boolean(true)],['symbolEmpty',Symbol()],['coerceSymbol',{[Symbol.toPrimitive](){return Symbol('https://example.com/')}}]])capture('ctor-'+name,()=>new URLPattern(input).pathname);
+for(const second of [null,undefined,{},Symbol('x'),17])capture('dict-base-'+String(second),()=>new URLPattern().test({pathname:'/x'},second));
+return JSON.stringify(rows)})()

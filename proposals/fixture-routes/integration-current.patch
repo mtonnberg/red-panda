@@ -1,0 +1,620 @@
+--- a/scripts/conformance.mjs
++++ b/scripts/conformance.mjs
+@@ -12,7 +12,8 @@
+   [--tests-file /path/to/selection.json] [--isolate]
+   [--browser-arg=--load-resources --browser-arg=iframe]
+   [--timeout 5000] [--settle-ms 0] [--port 9582] [--report /new/report.json]
+-  [--fixture-profile static|xhr-subset | --fixture-origin http://127.0.0.1:9582]
++  [--registration-map /path/to/registration-map.json] [--websocket-port 9584]
++  [--fixture-profile static|xhr-subset|upstream | --fixture-origin http://127.0.0.1:9582]
+ 
+ Runs unchanged upstream fixture assertions through raw CDP. Both targets use
+ Lightpanda/1.0 solely within this runner so testing.js takes identical branches.
+@@ -23,7 +24,7 @@
+ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+ const inside = (root, path) => { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)); };
+ 
+-async function runFixture(client, server, selection, timeout, settleMs = 0) {
++async function runFixture(client, server, selection, timeout, settleMs = 0, injectScript = null) {
+   const started = Date.now();
+   const deadline = started + timeout;
+   const requestOffset = server.requests?.length ?? 0;
+@@ -51,6 +52,7 @@
+     await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
+     await send('Network.setUserAgentOverride', { userAgent:'Lightpanda/1.0' });
+     await send('Page.addScriptToEvaluateOnNewDocument', { source:'globalThis.__lp_external_runner = true;' });
++    if(injectScript!==null)await send('Page.addScriptToEvaluateOnNewDocument',{source:injectScript});
+     const url = `${server.origin}/src/browser/tests/${selection.path.split('/').map(encodeURIComponent).join('/')}`;
+     const navigation = await send('Page.navigate', { url });
+     if (navigation.errorText) throw new Error(navigation.errorText);
+@@ -111,8 +113,9 @@
+   const { values, positionals } = parseArgs({ allowPositionals:true, options:{
+     root:{type:'string'}, endpoint:{type:'string'}, binary:{type:'string'}, test:{type:'string',multiple:true},
+     'tests-file':{type:'string'}, isolate:{type:'boolean'}, 'browser-arg':{type:'string',multiple:true},
+-    timeout:{type:'string',default:'5000'}, 'settle-ms':{type:'string',default:'0'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
++    timeout:{type:'string'}, 'settle-ms':{type:'string',default:'0'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
+     'fixture-origin':{type:'string'}, 'fixture-profile':{type:'string'},
++    'registration-map':{type:'string'},'websocket-port':{type:'string'},
+   } });
+   if (values.help) { console.log(usage); return; }
+   if (!values.root || Boolean(values.endpoint) === Boolean(values.binary)) throw new Error(usage);
+@@ -120,7 +123,7 @@
+   if (values['browser-arg']?.length && !values.binary) throw new Error('--browser-arg requires --binary');
+   if (values['fixture-origin'] && (values['fixture-profile'] || values.port !== '9582')) throw new Error('--fixture-origin cannot be combined with --fixture-profile or a custom --port');
+   const profile = values['fixture-profile'] ?? 'static';
+-  if (!['static','xhr-subset'].includes(profile)) throw new Error('--fixture-profile must be static or xhr-subset');
++  if (!['static','xhr-subset','upstream'].includes(profile)) throw new Error('--fixture-profile must be static, xhr-subset or upstream');
+   let fromFile = [];
+   if (values['tests-file']) {
+     const text = await readFile(values['tests-file'],'utf8');
+@@ -129,7 +132,7 @@
+   }
+   const tests = [...(values.test ?? []), ...fromFile, ...positionals];
+   if (!tests.length) throw new Error('Zero selected fixtures: supply at least one explicit --test path');
+-  const timeout = Number(values.timeout), port = Number(values.port), settleMs=Number(values['settle-ms']);
++  const timeout = Number(values.timeout??5000), port = Number(values.port), settleMs=Number(values['settle-ms']);
+   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120000 || !Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid timeout or port');
+   if(!Number.isInteger(settleMs)||settleMs<0||settleMs>=timeout)throw new Error('--settle-ms must be a nonnegative integer below --timeout');
+   const root = await realpath(resolve(values.root));
+@@ -143,6 +146,12 @@
+     selections.push({ path:relative(root,canonical).split(sep).join('/'), sha256:createHash('sha256').update(bytes).digest('hex'), tagged:/<meta\s+name=["']?lp-mode["']?\s+content=["']?test["']?\s*\/?>/i.test(bytes.toString()) });
+   }
+   const browserArgs = values['browser-arg'] ?? [];
++  const registrationMap=values['registration-map']?JSON.parse(await readFile(values['registration-map'],'utf8')):null;
++  if(registrationMap&&(!values.isolate||browserArgs.length))throw new Error('--registration-map requires --isolate and supplies its own browser arguments');
++  const webSocketPort=values['websocket-port']===undefined?null:Number(values['websocket-port']);
++  if(webSocketPort!==null&&(!Number.isInteger(webSocketPort)||webSocketPort<0||webSocketPort>65535||values['fixture-origin']))throw new Error('Invalid owned --websocket-port');
++  for(const selection of selections){if(registrationMap){const row=registrationMap.fixtures.find(x=>x.path===selection.path);if(!row||row.sha256!==selection.sha256)throw new Error('Registration absent or hash mismatch: '+selection.path);selection.sourceProfile=registrationMap.profiles.find(x=>x.id===row.profile);if(!selection.sourceProfile)throw new Error('Missing registration profile');}}
++
+   let browser, server, client;
+   try {
+     if (values['fixture-origin']) {
+@@ -157,7 +166,7 @@
+         const response = await fetch(url,{signal:AbortSignal.timeout(timeout)});
+         if (!response.ok || createHash('sha256').update(Buffer.from(await response.arrayBuffer())).digest('hex') !== file.sha256) throw new Error(`External fixture bytes differ or are unavailable: ${file.path}`);
+       }
+-    } else server = await startFixtureServer(root,{port,profile});
++    } else server = await startFixtureServer(root,{port,profile,webSocketPort});
+     let endpoint = values.endpoint ?? null;
+     const binaryIdentity = values.binary ? {
+       path:resolve(values.binary), sha256:createHash('sha256').update(await readFile(resolve(values.binary))).digest('hex'),
+@@ -172,16 +181,22 @@
+     }
+     const results = [];
+     for (const selection of selections) {
++      const sourceProfile=selection.sourceProfile;
++      const effectiveTimeout=values.timeout===undefined&&sourceProfile?sourceProfile.sourceTimeoutMs:timeout;
++      if(settleMs>=effectiveTimeout)throw new Error('Settle delay exceeds selected source budget');
++      const effectiveArgs=sourceProfile?sourceProfile.nativeResourceAndFeatureArgs:browserArgs;
++      let stateReset=false;
++      if(server.owned&&profile==='upstream'){const reset=await fetch(server.origin+'/reset',{signal:AbortSignal.timeout(5000)});if(reset.status!==200)throw new Error('Fixture state reset failed');await reset.arrayBuffer();stateReset=true;}
+       let result;
+       if (values.isolate) {
+         let ownedBrowser, ownedClient;
+         const started = Date.now();
+         try {
+-          ownedBrowser = await startReference(resolve(values.binary),{args:browserArgs});
+-          ownedClient = await connect(ownedBrowser.endpoint,{timeout});
++          ownedBrowser = await startReference(resolve(values.binary),{args:effectiveArgs});
++          ownedClient = await connect(ownedBrowser.endpoint,{timeout:effectiveTimeout});
+           const target = await ownedClient.send('Browser.getVersion');
+           version ??= target;
+-          result = await runFixture(ownedClient,server,selection,timeout,settleMs);
++          result = await runFixture(ownedClient,server,selection,effectiveTimeout,settleMs,sourceProfile?.injectScript??null);
+           result.target = target;
+         } catch (cause) {
+           result = { ...selection,status:/timeout|timed out|deadline/i.test(cause.message)?'timeout':'failed',error:cause.message,
+@@ -190,9 +205,10 @@
+           await ownedClient?.close();
+           await ownedBrowser?.close();
+         }
+-        result.ownedBrowser = { pid:ownedBrowser?.process.pid ?? null,exitCode:ownedBrowser?.process.exitCode ?? null,signal:ownedBrowser?.process.signalCode ?? null };
++        result.ownedBrowser = { pid:ownedBrowser?.process.pid ?? null,exitCode:ownedBrowser?.process.exitCode ?? null,signal:ownedBrowser?.process.signalCode ?? null,stderr:ownedBrowser?.stderr??null,stderrTruncated:ownedBrowser?.stderrTruncated??null };
+         result.totalDurationMs = Date.now()-started;
+       } else result = await runFixture(client,server,selection,timeout,settleMs);
++      result.configuration={sourceProfile:sourceProfile??null,browserArgs:effectiveArgs,fixtureBudgetMs:effectiveTimeout,budgetKind:sourceProfile&&effectiveTimeout===sourceProfile.sourceTimeoutMs?'source-registration':'diagnostic-override',fixtureStateReset:stateReset};
+       results.push(result);
+       console.error(`${result.status.toUpperCase()} ${result.path}${result.error ? ': '+result.error : ''}`);
+     }
+@@ -204,11 +220,12 @@
+       configurationCoverage:{
+         sourceHtmlRunnerDefaults:['--load-resources','iframe','--load-resources','worker'],
+         sourceDefaultsNote:'src/testing.zig HtmlRunnerOpts enables iframe and worker; individual registrations may override resources, experimental features or injected scripts.',
+-        fixtureSpecificOptionsVerified:false,
+-        unrunConfigurationDimensions:['Per-fixture native registration overrides not audited','Full upstream test_routes server not implemented; see fixture server metadata or external server contract'],
++        fixtureSpecificOptionsVerified:!!registrationMap,
++        registrationMapSHA256:values['registration-map']?createHash('sha256').update(await readFile(values['registration-map'])).digest('hex'):null,
++        unrunConfigurationDimensions:[...(registrationMap?[]:['Per-fixture registration profiles not supplied']),...(profile==='upstream'?['All-registration runtime result matrix not implied by server support']:['Full pinned route transport not selected']),...(!server.webSocket?['WebSocket transport not owned by this runner']:[])],
+       },
+       fixtureOrigin:server.origin, fixtureServerOwnership:server.owned?'runner-owned':'caller-owned; caller must stop it',
+-      fixtureServerMetadata:server.metadata, staticRoutesOnly:server.owned ? profile==='static' : null,
++      fixtureServerMetadata:server.metadata, webSocketRequests:server.webSocket?.requests??null, staticRoutesOnly:server.owned ? profile==='static' : null,
+       sourceVerification:server.owned?'Local fixture files served directly':'External main fixture documents and testing.js hash-verified; transitive resource bytes not verified',
+       results, counts };
+     const json = `${JSON.stringify(report,null,2)}\n`;
+--- a/scripts/reference-server.mjs
++++ b/scripts/reference-server.mjs
+@@ -1,7 +1,8 @@
+ import http from 'node:http';
+ import { once } from 'node:events';
+ import { spawn } from 'node:child_process';
+-import { until } from '../src/browser.js';
++// Fixture process readiness does not import any candidate engine modules.
++const until=async(predicate,{timeout=10000}={})=>{const deadline=Date.now()+timeout;while(Date.now()<deadline){if(await predicate())return;await new Promise(resolve=>setTimeout(resolve,20));}throw new Error('Reference readiness timeout');};
+ 
+ export async function startReference(binary, { args = [], shutdownGrace = 1500 } = {}) {
+   const reservation = http.createServer();
+@@ -9,7 +10,8 @@
+   const port = reservation.address().port;
+   await new Promise(resolve => reservation.close(resolve));
+   const process = spawn(binary, ['serve', '--host', '127.0.0.1', '--port', String(port), ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+-  process.stderr.on('data', () => {});
++  let stderr='',stderrTruncated=false;
++  process.stderr.on('data', bytes => {const part=bytes.toString();if(stderr.length+part.length>65536)stderrTruncated=true;stderr=(stderr+part).slice(0,65536);});
+   let spawnError;
+   process.once('error', error => { spawnError = error; });
+   const close = async () => {
+@@ -28,6 +30,6 @@
+       if (process.exitCode !== null || process.signalCode !== null) throw new Error('Reference browser exited before readiness');
+       try { return (await fetch(`http://127.0.0.1:${port}/json/version`)).ok; } catch { return false; }
+     }, { timeout: 10000 });
+-    return { endpoint: `ws://127.0.0.1:${port}/`, close, process };
++    return { endpoint: `ws://127.0.0.1:${port}/`, close, process, get stderr(){return stderr;},get stderrTruncated(){return stderrTruncated;} };
+   } catch (error) { await close(); throw error; }
+ }
+--- /dev/null
++++ b/scripts/upstream-fixture-map.py
+@@ -0,0 +1,78 @@
++"""Read-only registration extraction. No Zig compilation/build-filter claim."""
++from pathlib import Path
++import hashlib,json,re,collections,argparse
++parser=argparse.ArgumentParser(description=__doc__)
++parser.add_argument('--source-root',type=Path,required=True)
++parser.add_argument('--output',type=Path,required=True)
++args=parser.parse_args()
++ROOT=args.source_root.resolve()
++OUT=args.output.resolve();OUT.mkdir(parents=True,exist_ok=True)
++sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
++def comments_out(s):
++ out=[];i=0;string=False;escape=False
++ while i<len(s):
++  c=s[i]
++  if string:
++   out.append(c)
++   if escape:escape=False
++   elif c=='\\':escape=True
++   elif c=='"':string=False
++   i+=1
++  elif c=='"':string=True;out.append(c);i+=1
++  elif s[i:i+2]=='//':
++   end=s.find('\n',i)
++   if end<0:end=len(s)
++   out.append(' '*(end-i));i=end
++  else:out.append(c);i+=1
++ return ''.join(out)
++registrations=[];fixture_profiles=collections.defaultdict(list);profiles={};inputs={}
++for file in sorted((ROOT/'src').rglob('*.zig')):
++ s=comments_out(file.read_text())
++ for match in re.finditer(r'\btesting\.htmlRunner\("([^"\n]+)"\s*,',s):
++  end=match.end();depth=1;string=False;escape=False
++  while end<len(s) and depth:
++   c=s[end]
++   if string:
++    if escape:escape=False
++    elif c=='\\':escape=True
++    elif c=='"':string=False
++   elif c=='"':string=True
++   elif c=='(':depth+=1
++   elif c==')':depth-=1
++   end+=1
++  options=s[match.end():end-1].strip();target=match.group(1);path=ROOT/'src/browser/tests'/target
++  assert path.exists(),target
++  fixtures=[path] if path.is_file() else sorted(x for x in path.iterdir() if x.is_file() and x.suffix=='.html')
++  load=re.search(r'\.load_resources\s*=\s*\.\{([^}]*)\}',options,re.S)
++  resources=sorted(re.findall(r'\.(\w+)\s*=\s*true',load[1])) if load else ['iframe','worker']
++  ex=re.search(r'\.experimental_features\s*=\s*\.\{([^}]*)\}',options,re.S)
++  experimental=dict((name,value=='true') for name,value in re.findall(r'\.(\w+)\s*=\s*(true|false)',ex[1])) if ex else {}
++  timeout=re.search(r'\.timeout_ms\s*=\s*(\d+)',options);timeout=int(timeout[1]) if timeout else 2000
++  inject=re.search(r'\.inject_script\s*=\s*("(?:\\.|[^"\\])*")',options);inject=json.loads(inject[1]) if inject else None
++  profile={'resources':resources,'experimentalFeatures':experimental,'injectScript':inject,'sourceTimeoutMs':timeout}
++  key=json.dumps(profile,sort_keys=True,separators=(',',':'));pid=hashlib.sha256(key.encode()).hexdigest()[:12]
++  args=[item for resource in resources for item in ['--load-resources',resource]] or ['--load-resources','none']
++  for feature,enabled in experimental.items():
++   if enabled:args+=['--experimental-features',feature]
++  profiles.setdefault(pid,{**profile,'id':pid,'nativeResourceAndFeatureArgs':args,'preloadViaCDP':inject,'fixtureCount':0})
++  rid=len(registrations);source=str(file.relative_to(ROOT));inputs[source]=sha(file)
++  registration={'id':rid,'source':source,'line':s.count('\n',0,match.start())+1,'sourceSHA256':inputs[source],'target':target,'targetKind':'file' if path.is_file() else 'directory-nonrecursive','profile':pid,'optionsRaw':options,'fixtureCount':len(fixtures)}
++  registrations.append(registration)
++  for fixture in fixtures:fixture_profiles[str(fixture.relative_to(ROOT/'src/browser/tests'))].append({'registration':rid,'profile':pid})
++fixtures=[]
++for path,rows in sorted(fixture_profiles.items()):
++ pids=set(r['profile'] for r in rows);assert len(pids)==1,(path,rows)
++ pid=next(iter(pids));profiles[pid]['fixtureCount']+=1
++ fixtures.append({'path':path,'sha256':sha(ROOT/'src/browser/tests'/path),'profile':pid,'registrations':[r['registration'] for r in rows]})
++for path in ['src/testing.zig','src/test_routes.zig','src/TestHTTPServer.zig','src/TestWSServer.zig','src/main_test_server.zig','src/Config.zig']:inputs[path]=sha(ROOT/path)
++support={str(p.relative_to(ROOT)):sha(p) for p in sorted((ROOT/'src/browser/tests').rglob('*')) if p.is_file()}
++data={'schemaVersion':1,'upstreamCommit':'948d773786380bae36f046639fc61e2ddddd212a','sourceRoot':str(ROOT),'counts':{'htmlRunnerCalls':len(registrations),'nondefaultCalls':sum(r['optionsRaw']!='.{}' for r in registrations),'registeredUniqueFixtures':len(fixtures),'profiles':len(profiles),'htmlFiles':sum(p.endswith('.html') for p in support)},'limits':['Literal active source syntax extraction, not a Zig compiled/import/build-filter inventory','Per-source 2000/8000ms budgets are preserved; any 15000ms diagnostic run must report a separate budget','Routes and support discovery do not establish successful or even observed runtime assertions','CORS experimental option is documented ignored upstream; it does not disable ordinary CORS'],'profiles':list(profiles.values()),'registrations':registrations,'fixtures':fixtures,'sourceSHA256':inputs,'fixtureAndSupportSHA256':support}
++(OUT/'registered-fixtures.json').write_text(json.dumps([row['path'] for row in fixtures],indent=2)+'\n')
++(OUT/'registration-map.json').write_text(json.dumps(data,indent=2)+'\n')
++# Every dynamic matching branch with source line, exact/prefix rule and return.
++s=(ROOT/'src/test_routes.zig').read_text();branches=[]
++for line,text in enumerate(s.splitlines(),1):
++ if 'path,' in text and any(x in text for x in ['std.mem.eql(', 'std.mem.startsWith(', 'std.mem.endsWith(']):
++  branches.append({'sourceLine':line,'condition':text.strip(),'literalRoutes':re.findall(r'"([^"\n]+)"',text)})
++(OUT/'route-source-map.json').write_text(json.dumps({'source':'src/test_routes.zig','sourceSHA256':sha(ROOT/'src/test_routes.zig'),'branches':branches,'staticHeaderSidecars':[p for p in support if p.endswith('.headers')],'rawResponses':['gzip','cacheable','revalidated','not_modified','large'],'webSocketSource':'src/TestWSServer.zig','webSocketSourceSHA256':sha(ROOT/'src/TestWSServer.zig'),'webSocketCommands':['force-close','get-cookie','get-origin','send-large:N','close:CODE:REASON','text echo- prefix','binary 0xEE prefix','close payload echo']},indent=2)+'\n')
++print(json.dumps({'counts':data['counts'],'profiles':data['profiles']},indent=2))
+--- /dev/null
++++ b/scripts/upstream-fixture-routes.mjs
+@@ -0,0 +1,113 @@
++// Independently written TEST transport for pinned upstream fixture contracts.
++// No browser engine source is imported. See the proposal's source hash ledger.
++import { readFile } from 'node:fs/promises';
++import { basename, extname, join } from 'node:path';
++export const extraRoutes = [
++ '/resource-timing/tao','/resource-timing/plain','/resource-timing/redirect','/redirect-no-fragment','/redirect-with-fragment',
++ '/redirect-cross-origin-x-hop','/redirect-cross-origin/*','/echo-x-hop','/redirect-target','/303-no-location','/300-with-location',
++ '/defer-marker.js','/serve-count/:name.js','/challenge/vercel','/stop_loading/streaming.html',
++ '/sse/simple','/sse/streaming','/sse/flag','/sse/reconnect','/sse/long_retry','/sse/404','/sse/badmime',
++ '/styles/important-cascade.css','/styles/visibility.css','/styles/visibility2.css','/styles/latin1-header.css',
++ '/styles/latin1-at-charset.css','/styles/truncated-utf8.css','/styles/404.css','/styles/large.css','/styles/oversize.css',
++ '/latin1_response','/scripts/bom-over-header.js','/scripts/latin1/*','/scripts/latin1-header/*',
++ '/images/ok.png*','/images/small.png*','/images/photo.jpg','/images/chunked.png','/images/404.png*','/images/500.png','/images/redirect.png',
++ '/echo_referer','/referer_link.html','/echo_method','/beacon/store/*','/beacon/read/*','/echo_body',
++ '/redirect_same_echo_referer','/redirect_cross_echo_referer','/redirect_to_echo','/download/report.csv','/download/missing.csv',
++ '/download_tool/no_content','/raw/:gzip|cacheable|revalidated|large','/favicon.ico',
++];
++export const rawResponses = Object.freeze({
++ gzip:{head:'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 29\r\n\r\n',body:Buffer.from('1f8b08000000000002ff4b4c1c05a360140c77000003da389ae8030000','hex')},
++ cacheable:{head:'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nContent-Length: 11\r\n\r\n',body:Buffer.from('hello world')},
++ revalidated:{head:'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-cache\r\nETag: "v1"\r\nContent-Length: 11\r\n\r\n',body:Buffer.from('hello world')},
++ not_modified:{head:'HTTP/1.1 304 Not Modified\r\nCache-Control: no-cache\r\nETag: "v1"\r\n\r\n',body:Buffer.alloc(0)},
++ large:{head:'HTTP/1.1 200 OK\r\nContent-Length: 262144\r\n\r\n',body:Buffer.alloc(256*1024,97)},
++});
++export function createRouteState(){return {flag:false,reconnectHits:0,counts:new Map(['defer','async','dynamic','prescan_blocking','prescan_defer','prescan_module'].map(x=>[x,0])),beacons:[]};}
++export function resetRouteState(state){state.flag=false;state.reconnectHits=0;state.beacons.length=0;for(const key of state.counts.keys())state.counts.set(key,0);}
++const html={'Content-Type':'text/html; charset=utf-8'},text={'Content-Type':'text/plain; charset=utf-8'},css={'Content-Type':'text/css'},sse={'Content-Type':'text/event-stream'};
++const latin=value=>Buffer.from(value,'latin1');
++async function readBody(request,limit){const chunks=[];let size=0;for await(const part of request){size+=part.length;if(size>limit){const error=new Error('Fixture body bound');error.status=413;throw error;}chunks.push(part);}return Buffer.concat(chunks);}
++function raw(request,response,entry,head,body){entry.status=Number(head.split(' ')[1]);entry.rawResponse=true;response.detachSocket(request.socket);request.socket.end(Buffer.concat([latin(head),body]));}
++export async function serveExtra({request,response,entry,send,wait,root,state,port}){
++ const path=request.url, redirect=location=>send(302,'',{Location:location}),sendText=body=>send(200,body,text);
++ // The pinned contracts intentionally keep canonical redirects on :9582. A
++ // port-0 server is useful for transport tests but is not a fixture URL rewrite.
++ const cross=suffix=>`http://localhost:9582/${suffix}`;
++ if(path==='/reset'){resetRouteState(state);send(200);return true;}
++ if(path==='/resource-timing/tao')send(200,'window.__rt_tao = true;',{'Content-Type':'text/javascript','Timing-Allow-Origin':'https://example.com, *'});
++ else if(path==='/resource-timing/plain')send(200,'window.__rt_plain = true;',{'Content-Type':'text/javascript'});
++ else if(path==='/resource-timing/redirect')redirect('/resource-timing/plain');
++ else if(path==='/redirect-no-fragment')redirect('/redirect-target');
++ else if(path==='/redirect-with-fragment')redirect('/redirect-target#target_fragment');
++ else if(path==='/redirect-cross-origin-x-hop')redirect(cross('echo-x-hop'));
++ else if(path.startsWith('/redirect-cross-origin/'))redirect(cross(path.slice('/redirect-cross-origin/'.length)));
++ else if(path==='/echo-x-hop')sendText(request.headers['x-hop']??'NONE');
++ else if(path==='/redirect-target')send(200,'<!DOCTYPE html><title>landed</title>',html);
++ else if(path==='/303-no-location')send(303,'<!DOCTYPE html><title>landed</title><p>see other body</p>',html);
++ else if(path==='/300-with-location')send(300,'<!DOCTYPE html><title>choices</title><p>multiple choices body</p>',{...html,Location:'http://127.0.0.1:9582/hi.html'});
++ else if(path==='/defer-marker.js')send(200,'window.__deferRan = true;',{'Content-Type':'application/javascript'});
++ else if(path.startsWith('/serve-count/')&&path.endsWith('.js')){
++  const name=path.slice('/serve-count/'.length,-3);if(!state.counts.has(name))send(404,'unknown counter');else {const n=state.counts.get(name)+1;state.counts.set(name,n);send(200,`window.__serve_count_${name} = ${n};`,{'Content-Type':'application/javascript','Cache-Control':'no-store'});}
++ }
++ else if(path==='/challenge/vercel')send(429,'<title>Vercel Security Checkpoint</title>',{...html,'x-vercel-mitigated':'challenge'});
++ else if(path==='/stop_loading/streaming.html'){
++  entry.status=200;response.writeHead(200,html);response.write('<html><body><p id=first>first</p>');if(await wait(1500,response))response.end('<p id=second>second</p></body></html>');
++ }
++ else if(path==='/sse/simple')send(200,'retry: 1000\ndata: first\n\n: comment\nid: 42\nevent: custom\ndata: a\ndata: b\n\n',sse);
++ else if(path==='/sse/streaming'){
++  state.flag=false;entry.status=200;response.writeHead(200,sse);response.write('data: first\n\n');
++  for(let elapsed=0;!state.flag&&elapsed<5000;elapsed+=10)if(!await wait(10,response))return true;
++  if(state.flag){response.write('data: sec');if(!await wait(20,response))return true;response.write('ond\n\n');}response.end();
++ }
++ else if(path==='/sse/flag'){state.flag=true;send(200);}
++ else if(path==='/sse/reconnect')send(200,state.reconnectHits++===0?'retry: 10\ndata: one\n\n':'data: two\n\n',sse);
++ else if(path==='/sse/long_retry')send(200,'retry: 60000\ndata: x\n\n',sse);
++ else if(path==='/sse/404')send(404,'data: x\n\n',sse);
++ else if(path==='/sse/badmime')send(200,'data: x\n\n',{'Content-Type':'text/plain'});
++ else if(path==='/styles/important-cascade.css')send(200,'.no-js-flex { display: none !important; }',css);
++ else if(path==='/styles/visibility.css')send(200,'.ext-hide { display: none; }',css);
++ else if(path==='/styles/visibility2.css')send(200,'.ext-hide-2 { display: none; }',css);
++ else if(path==='/styles/latin1-header.css')send(200,latin('/* caf\xe9 */ .by-header { display: none; --name: "caf\xe9"; }'),{'Content-Type':'text/css; charset=iso-8859-1'});
++ else if(path==='/styles/latin1-at-charset.css')send(200,latin('@charset "windows-1252"; /* caf\xe9 */ .by-at-charset { display: none; }'),css);
++ else if(path==='/styles/truncated-utf8.css')send(200,latin('.before-truncated { display: none; } \xe2'),css);
++ else if(path==='/latin1_response')raw(request,response,entry,'HTTP/1.1 200 Caf\xe9\r\nContent-Type: text/plain\r\nX-Latin1: La\xa0Paz\r\nX-Caf\xe9: 1\r\nContent-Length: 6\r\n\r\n',latin('latin1'));
++ else if(path==='/scripts/bom-over-header.js')send(200,Buffer.from("\ufeffwindow.byBom = 'café';"),{'Content-Type':'text/javascript; charset=iso-8859-1'});
++ else if(path.startsWith('/scripts/latin1/')||path.startsWith('/scripts/latin1-header/'))send(200,latin(`window['${basename(path,extname(path))}'] = 'caf\xe9';`),{'Content-Type':path.startsWith('/scripts/latin1-header/')?'text/javascript; charset=iso-8859-1':'text/javascript'});
++ else if(path==='/styles/404.css')send(404,'/* unused */',css);
++ else if(path==='/styles/large.css'||path==='/styles/oversize.css'){
++  const chunk='.pad { color: #abcdef; } ',large=path==='/styles/large.css',n=large?Math.floor(5*1024*1024/2/chunk.length):Math.floor(4*1024*1024/chunk.length)+1024;
++  send(200,chunk.repeat(n)+(large?'.large-hide { display: none; }':''),css);
++ }
++ else if(path.startsWith('/images/ok.png')){const image=await readFile(join(root,'fixtures/images/1000x750.png')),body=Buffer.alloc(16*1024+1,120);image.copy(body);send(200,body,{'Content-Type':'image/png'});}
++ else if(path.startsWith('/images/small.png'))send(200,await readFile(join(root,'fixtures/images/320x240.png')),{'Content-Type':'image/png'});
++ else if(path==='/images/photo.jpg')send(200,await readFile(join(root,'fixtures/images/1000x750.jpg')),{'Content-Type':'image/jpeg'});
++ else if(path==='/images/chunked.png'){entry.status=200;response.writeHead(200,{'Content-Type':'image/svg+xml'});response.write('<svg xmlns="http://www.w3.org/2000/svg"/>');response.end();}
++ else if(path.startsWith('/images/404.png'))send(404,'not here',{'Content-Type':'text/plain'});
++ else if(path==='/images/500.png')send(500,'boom',{'Content-Type':'text/plain'});
++ else if(path==='/images/redirect.png')redirect('/images/ok.png');
++ else if(path==='/echo_referer')send(200,`<html><body>referer=${request.headers.referer??'NONE'}</body></html>`,{...html,'Access-Control-Allow-Origin':request.headers.origin??'*'});
++ else if(path==='/referer_link.html')send(200,'<html><body><a id="link" href="/echo_referer">go</a></body></html>',html);
++ else if(path==='/echo_method')send(200,`<html><body>method=${request.method}</body></html>`,html);
++ else if(path.startsWith('/beacon/store/')){
++  const id=path.slice('/beacon/store/'.length),type=request.headers['content-type']??'(missing)',body=await readBody(request,128*1024);
++  if(Buffer.byteLength(id)<=32&&state.beacons.length<32){const line=Buffer.concat([Buffer.from(`${request.method}|${type}|${body.length}|`),body.subarray(0,64)]);state.beacons.push({id,record:line.length<=256?line:Buffer.alloc(0)});}send(200);
++ }
++ else if(path.startsWith('/beacon/read/'))send(200,state.beacons.find(x=>x.id===path.slice('/beacon/read/'.length))?.record??'(missing)',text);
++ else if(path==='/echo_body')send(200,await readBody(request,4096),text);
++ else if(path==='/redirect_same_echo_referer')redirect('/echo_referer');
++ else if(path==='/redirect_cross_echo_referer')redirect(cross('echo_referer'));
++ else if(path==='/redirect_to_echo')redirect('/echo_method');
++ else if(path==='/download/report.csv')send(200,'col1,col2\nhello,world\n42,1337\n',{'Content-Type':'text/csv','Content-Disposition':'attachment; filename="report.csv"'});
++ else if(path==='/download/missing.csv')send(404,'not found',{'Content-Type':'text/plain','Content-Disposition':'attachment; filename="missing.csv"'});
++ else if(path==='/download_tool/no_content')send(204);
++ else if(path.startsWith('/raw/')){
++  // Upstream's conditional detection is deliberately case-sensitive on rawhead.
++  const rawHead=`${request.method} ${request.url} HTTP/${request.httpVersion}\r\n`+request.rawHeaders.reduce((head,value,index)=>head+(index%2?value+'\r\n':value+': '),'');
++  const conditional=rawHead.includes('If-None-Match:');
++  const value=conditional?rawResponses.not_modified:rawResponses[path.slice('/raw/'.length)];
++  if(!value||path==='/raw/not_modified'&&!conditional)send(404,'unknown raw response');else raw(request,response,entry,value.head,value.body);
++ }
++ else if(path==='/favicon.ico')send(404);
++ else return false;
++ entry.routeKnown=true;return true;
++}
+--- a/scripts/upstream-fixture-server.mjs
++++ b/scripts/upstream-fixture-server.mjs
+@@ -3,6 +3,8 @@
+ // 948d773786380bae36f046639fc61e2ddddd212a. No engine implementation is imported.
+ // The original external source tree retains its AGPL-3.0-only license.
+ import http from 'node:http';
++import { createRouteState, serveExtra, extraRoutes } from './upstream-fixture-routes.mjs';
++import { startFixtureWebSocket } from './upstream-fixture-websocket.mjs';
+ import { readFile, realpath, stat } from 'node:fs/promises';
+ import { resolve, relative, isAbsolute, extname, sep } from 'node:path';
+ 
+@@ -17,19 +19,25 @@
+   '/redirect_same_echo_headers', '/redirect_cross_echo_headers', '/download_tool/redirect', '/echo_brotli',
+ ];
+ 
+-export async function startFixtureServer(rootPath,{port=9582,profile='xhr-subset'}={}) {
+-  if (!['static','xhr-subset'].includes(profile)) throw new Error('Unknown fixture profile');
++export async function startFixtureServer(rootPath,{port=9582,profile='xhr-subset',webSocketPort=null}={}) {
++  if (!['static','xhr-subset','upstream'].includes(profile)) throw new Error('Unknown fixture profile');
+   const root=await realpath(resolve(rootPath)), requests=[], activeTimers=new Set();
+   let origin;
++  const state=createRouteState();
++  let webSocket;
+   const wait=(ms,response)=>new Promise(resolve=>{
+     const finish=ok=>{clearTimeout(timer);activeTimers.delete(timer);response.off('close',closed);resolve(ok);};
+     const closed=()=>finish(false);
+     const timer=setTimeout(()=>finish(true),ms);activeTimers.add(timer);response.once('close',closed);
+   });
+   const metadata={profile,sourceCommit:'948d773786380bae36f046639fc61e2ddddd212a',sourceFile:'src/test_routes.zig',
+-    implementedDynamicRoutes:profile==='xhr-subset'?implementedRoutes:[],
++    implementedDynamicRoutes:profile==='upstream'?[...implementedRoutes,...extraRoutes]:profile==='xhr-subset'?implementedRoutes:[],
+     unsupportedRouteGroups:['CORS-specific endpoints','SSE','WebSocket :9584','raw HTTP responses','compression beyond /echo_brotli and deliberate bad-gzip','resource timing','serve-count counters','downloads beyond listed redirect'],
+-    completeUpstreamServer:false};
++    completeUpstreamServer:false,
++    routeContractCoverage:profile==='upstream'?'all branches in pinned test_routes.zig; separately validated wire transport':'partial',
++    staticHeaderSidecars:profile==='upstream', canonicalPort:9582, webSocketPort:null,
++    transportLimits:profile==='upstream'?['safe canonical static-root confinement','delay_ms capped at 120000ms','WebSocket send-large capped at 64MiB','ordinary Node HTTP framing differs from Zig except /raw/* and /latin1_response']:[]};
++  if(profile==='upstream')metadata.unsupportedRouteGroups=['WebSocket transport not enabled; pass webSocketPort explicitly'];
+   const server=http.createServer(async(request,response)=>{
+     const entry={method:request.method,path:request.url,status:0,routeKnown:false};
+     if(requests.length<10000)requests.push(entry);
+@@ -43,7 +51,8 @@
+     try {
+       const path=decodeURIComponent(new URL(request.url,'http://127.0.0.1').pathname);
+       if(path==='/__fixture_metadata'){entry.routeKnown=true;return send(200,JSON.stringify(metadata),{'Content-Type':'application/json'});}
+-      if(profile==='xhr-subset'){
++      if(profile==='upstream'&&await serveExtra({request,response,entry,send,wait,root,state,port}))return;
++      if(profile==='xhr-subset'||profile==='upstream'){
+         const exact=request.url;
+         if(implementedRoutes.includes(exact))entry.routeKnown=true;
+         if(exact==='/')return send(200,'<html><head></head><body></body></html>',{'Content-Type':'text/html; charset=utf-8'});
+@@ -56,7 +65,7 @@
+         }
+         if(exact==='/xhr/xml'||exact==='/xhr/xml_as_text')return send(200,xml,{'Content-Type':exact.endsWith('_as_text')?'text/plain':'application/xml'});
+         if(exact==='/xhr/json')return send(200,'{"over":"9000!!!","updated_at":1765867200000}',{'Content-Type':'application/json'});
+-        if(exact==='/xhr/redirect')return send(302,'',{Location:`${origin}/xhr`});
++        if(exact==='/xhr/redirect')return send(302,'',{Location:profile==='upstream'?'http://127.0.0.1:9582/xhr':`${origin}/xhr`});
+         if(exact==='/xhr/404')return send(404,'Not Found',{'Content-Type':'text/plain'});
+         if(exact==='/src/browser/tests/401')return send(401,'No',{'Content-Type':'text/plain'});
+         if(exact==='/404.js')return send(404,'window.__404_body_executed = true;',{'Content-Type':'application/javascript'});
+@@ -79,7 +88,7 @@
+         if(exact==='/set_cookie')return send(200,'',{'Set-Cookie':'lp_hidden=1; Path=/set_cookie_scope','X-Visible':'yes'});
+         if(exact==='/download_tool/redirect')return send(302,'',{'Set-Cookie':'lp_redirect=1; Path=/download_tool',Location:'/download_tool/echo_headers'});
+         if(exact==='/redirect_same_echo_headers')return send(302,'',{Location:'/echo_headers'});
+-        if(exact==='/redirect_cross_echo_headers')return send(302,'',{Location:`http://localhost:${server.address().port}/echo_headers`});
++        if(exact==='/redirect_cross_echo_headers')return send(302,'',{Location:profile==='upstream'?'http://localhost:9582/echo_headers':`http://localhost:${server.address().port}/echo_headers`});
+         if(exact==='/echo_headers'||exact==='/download_tool/echo_headers'){
+           const cors={'Access-Control-Allow-Origin':request.headers.origin??'*'};
+           if(request.method==='OPTIONS')return send(200,'',{...cors,'Access-Control-Allow-Methods':'GET','Access-Control-Allow-Headers':'x-hop'});
+@@ -89,7 +98,7 @@
+       }
+       if(!['GET','HEAD'].includes(request.method))return send(405,'Unsupported fixture request method',{'Content-Type':'text/plain'});
+       if(!path.startsWith(prefix)||path.includes('\\'))return send(404,'Unsupported fixture route',{'Content-Type':'text/plain'});
+-      const candidate=resolve(root,path.slice(prefix.length));
++      const candidate=resolve(root,path.slice(prefix.length).replace(/^\/+/,''));
+       if(!inside(root,candidate))return send(403,'Outside fixture root',{'Content-Type':'text/plain'});
+       const canonical=await realpath(candidate);
+       if(!inside(root,canonical))return send(403,'Symlink escapes fixture root',{'Content-Type':'text/plain'});
+@@ -97,12 +106,18 @@
+       const delay=new URL(request.url,'http://127.0.0.1').searchParams.get('delay_ms');
+       if(delay!==null){const ms=Number(delay);if(!Number.isInteger(ms)||ms<0||ms>120000)return send(400,'Unsupported fixture delay');if(!await wait(ms,response))return;}
+       entry.routeKnown=true;
+-      return send(200,await readFile(canonical),{'Content-Type':types[extname(canonical)]??'application/octet-stream','Cache-Control':'no-store'});
+-    }catch(error){send(error instanceof URIError?400:404,'Fixture unavailable',{'Content-Type':'text/plain'});}
++      const headers=profile==='upstream'?{'Content-Type':canonical.endsWith('.GB2312.html')?'text/html; charset=GB2312':({'.js':'text/javascript','.html':'text/html','.htm':'text/html','.txt':'text/plain','.xhtml':'application/xhtml+xml','.md':'text/markdown','.xml':'text/xml','.wasm':'application/wasm','.mjs':'text/javascript'}[extname(canonical)]??'text/html')}:{'Content-Type':types[extname(canonical)]??'application/octet-stream','Cache-Control':'no-store'};
++      if(profile==='upstream'){
++        try {const sidecarPath=await realpath(canonical+'.headers');if(!inside(root,sidecarPath))return send(403,'Header sidecar escapes fixture root');const sidecar=await readFile(sidecarPath);if(sidecar.length>1024)throw new Error('Header sidecar exceeds source bound');let count=0;for(const line of sidecar.toString().split(/[\r\n]+/).filter(Boolean)){const colon=line.indexOf(':');if(colon<0||++count>7)throw new Error('Invalid fixture header sidecar');const name=line.slice(0,colon).trim(),value=line.slice(colon+1).trim();const old=Object.keys(headers).find(x=>x.toLowerCase()===name.toLowerCase());if(old)delete headers[old];headers[name]=value;}}
++        catch(error){if(error.code!=='ENOENT')throw error;}
++      }
++      return send(200,await readFile(canonical),headers);
++    }catch(error){send(error.status??(error instanceof URIError?400:404),'Fixture unavailable',{'Content-Type':'text/plain'});}
+   });
+   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});
+   origin=`http://127.0.0.1:${server.address().port}`;
+-  return {origin,requests,metadata,owned:true,close:()=>new Promise(resolve=>{
++  if(webSocketPort!==null){try{webSocket=await startFixtureWebSocket({port:webSocketPort});metadata.webSocketPort=webSocket.port;if(profile==='upstream')metadata.unsupportedRouteGroups=[];}catch(error){await new Promise(resolve=>server.close(resolve));throw error;}}
++  return {origin,requests,metadata,webSocket,owned:true,close:async()=>{await webSocket?.close();await new Promise(resolve=>{
+     server.closeAllConnections();for(const timer of activeTimers)clearTimeout(timer);activeTimers.clear();server.close(resolve);
+-  })};
++  });}};
+ }
+--- /dev/null
++++ b/scripts/upstream-fixture-websocket.mjs
+@@ -0,0 +1,46 @@
++// Independently written fixture-only WebSocket wire server. No engine code.
++import http from 'node:http';
++import { createHash } from 'node:crypto';
++const LIMIT=128*1024; // The pinned receiver's message buffer is 128 KiB.
++function frame(opcode,bytes){let head;if(bytes.length<126)head=Buffer.from([0x80|opcode,bytes.length]);else if(bytes.length<=65535){head=Buffer.alloc(4);head[0]=0x80|opcode;head[1]=126;head.writeUInt16BE(bytes.length,2);}else{head=Buffer.alloc(10);head[0]=0x80|opcode;head[1]=127;head.writeBigUInt64BE(BigInt(bytes.length),2);}return Buffer.concat([head,bytes]);}
++export async function startFixtureWebSocket({port=9584}={}){
++ const sockets=new Set(),requests=[],server=http.createServer((request,response)=>{response.writeHead(400);response.end();});
++ server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});});
++ server.on('upgrade',(request,socket,initial)=>{
++  const entry={path:request.url,headers:request.rawHeaders.slice(),commands:[]};requests.push(entry);
++  const exact=name=>{const i=request.rawHeaders.indexOf(name);return i<0?'':request.rawHeaders[i+1];};
++  const key=exact('Sec-WebSocket-Key');if(!key){socket.destroy();return;}
++  const accept=createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
++  socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
++  let pending=Buffer.alloc(0);
++  const receive=part=>{
++   pending=Buffer.concat([pending,part]);
++   while(pending.length>=2){
++    const opcode=pending[0]&15,masked=!!(pending[1]&128);let size=pending[1]&127,offset=2;
++    if(size===126){if(pending.length<4)return;size=pending.readUInt16BE(2);offset=4;}
++    else if(size===127){if(pending.length<10)return;const big=pending.readBigUInt64BE(2);if(big>BigInt(LIMIT)){socket.destroy();return;}size=Number(big);offset=10;}
++    const full=offset+(masked?4:0)+size;if(full>LIMIT){socket.destroy();return;}if(pending.length<full)return;
++    const mask=masked?pending.subarray(offset,offset+4):null;offset+=masked?4:0;const bytes=Buffer.from(pending.subarray(offset,full));pending=pending.subarray(full);
++    if(mask)for(let i=0;i<bytes.length;i++)bytes[i]^=mask[i%4];
++    if(opcode===8){socket.end(frame(8,bytes));return;}
++    if(opcode===2){socket.write(frame(2,Buffer.concat([Buffer.from([238]),bytes])));continue;}
++    if(opcode!==1)continue;
++    const value=bytes.toString();if(entry.commands.length<1000)entry.commands.push({text:value.length<=160?value:null,length:bytes.length});
++    if(value==='force-close'){socket.destroy();return;}
++    if(value==='get-cookie')socket.write(frame(1,Buffer.from('cookie:'+exact('Cookie'))));
++    else if(value==='get-origin')socket.write(frame(1,Buffer.from('origin:'+exact('Origin'))));
++    else if(value.startsWith('send-large:')){
++     const digits=value.slice(11),n=Number(digits);if(!/^\d+$/.test(digits)||!Number.isSafeInteger(n)||n>64*1024*1024){socket.destroy();return;}
++     const bytes=Buffer.alloc(n);for(let i=0;i<n;i++)bytes[i]=65+i%26;socket.write(frame(1,bytes));
++    }
++    else if(value.startsWith('close:')){
++     const rest=value.slice(6),colon=rest.indexOf(':');if(colon<0)continue;let code=Number(rest.slice(0,colon));if(!/^\d+$/.test(rest.slice(0,colon))||code>65535)code=1000;
++     const reason=Buffer.from(rest.slice(colon+1)).subarray(0,123),bytes=Buffer.alloc(2+reason.length);bytes.writeUInt16BE(code);reason.copy(bytes,2);socket.write(frame(8,bytes));
++    }else socket.write(frame(1,Buffer.concat([Buffer.from('echo-'),bytes])));
++   }
++  };
++  socket.on('data',receive);if(initial.length)receive(initial);
++ });
++ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});
++ return {port:server.address().port,origin:`ws://127.0.0.1:${server.address().port}`,requests,owned:true,close:()=>new Promise(resolve=>{for(const socket of sockets)socket.destroy();server.close(resolve);})};
++}
+--- /dev/null
++++ b/test/upstream-fixture-server.test.mjs
+@@ -0,0 +1,106 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import net from 'node:net';
++import { once } from 'node:events';
++import { mkdtemp,readFile,writeFile,symlink,rm } from 'node:fs/promises';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import { gunzipSync,brotliCompressSync,brotliDecompressSync } from 'node:zlib';
++import { startFixtureServer } from '../scripts/upstream-fixture-server.mjs';
++const fixtureRoot=process.env.LP_FIXTURE_ROOT??'/workspace/red-panda/.cache/lightpanda-reference/browser-948d773786/src/browser/tests';
++function request(origin,path,{method='GET',headers={},body}={}){return new Promise((resolve,reject)=>{const req=http.request(origin+path,{method,headers},res=>{const chunks=[];res.on('data',x=>chunks.push(x));res.on('end',()=>resolve({status:res.statusCode,reason:res.statusMessage,headers:res.headers,rawHeaders:res.rawHeaders,body:Buffer.concat(chunks)}));});req.on('error',reject);req.end(body);});}
++async function raw(port,path,headers=''){const socket=net.connect(port,'127.0.0.1');await once(socket,'connect');const chunks=[];socket.on('data',x=>chunks.push(x));socket.write(`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\n${headers}\r\n`);await once(socket,'end');socket.destroy();return Buffer.concat(chunks);}
++let server;
++test.before(async()=>{server=await startFixtureServer(fixtureRoot,{port:0,profile:'upstream',webSocketPort:0});});
++test.after(async()=>{await server?.close();});
++test('route bytes, statuses, headers and canonical redirects',async()=>{
++ assert.deepEqual(server.metadata.unsupportedRouteGroups,[]);assert.equal(server.metadata.webSocketPort,server.webSocket.port);
++ const cases=[
++ ['/resource-timing/tao',200,'window.__rt_tao = true;','timing-allow-origin','https://example.com, *'],
++ ['/resource-timing/plain',200,'window.__rt_plain = true;'],
++ ['/resource-timing/redirect',302,'','location','/resource-timing/plain'],
++ ['/redirect-no-fragment',302,'','location','/redirect-target'],
++ ['/redirect-with-fragment',302,'','location','/redirect-target#target_fragment'],
++ ['/redirect-cross-origin/src/browser/tests/hi.html',302,'','location','http://localhost:9582/src/browser/tests/hi.html'],
++ ['/redirect-cross-origin-x-hop',302,'','location','http://localhost:9582/echo-x-hop'],
++ ['/redirect-target',200,'<!DOCTYPE html><title>landed</title>'],
++ ['/303-no-location',303,'<!DOCTYPE html><title>landed</title><p>see other body</p>'],
++ ['/300-with-location',300,'<!DOCTYPE html><title>choices</title><p>multiple choices body</p>','location','http://127.0.0.1:9582/hi.html'],
++ ['/xhr/redirect',302,'','location','http://127.0.0.1:9582/xhr'],
++ ['/defer-marker.js',200,'window.__deferRan = true;'],
++ ['/challenge/vercel',429,'<title>Vercel Security Checkpoint</title>','x-vercel-mitigated','challenge'],
++ ['/styles/important-cascade.css',200,'.no-js-flex { display: none !important; }'],
++ ['/styles/visibility.css',200,'.ext-hide { display: none; }'],
++ ['/styles/visibility2.css',200,'.ext-hide-2 { display: none; }'],
++ ['/styles/404.css',404,'/* unused */'],
++ ['/sse/simple',200,'retry: 1000\ndata: first\n\n: comment\nid: 42\nevent: custom\ndata: a\ndata: b\n\n'],
++ ['/sse/long_retry',200,'retry: 60000\ndata: x\n\n'],['/sse/404',404,'data: x\n\n'],['/sse/badmime',200,'data: x\n\n','content-type','text/plain'],
++ ['/download/report.csv',200,'col1,col2\nhello,world\n42,1337\n','content-disposition','attachment; filename="report.csv"'],
++ ['/download/missing.csv',404,'not found','content-disposition','attachment; filename="missing.csv"'],
++ ['/download_tool/no_content',204,''],['/favicon.ico',404,''],['/totally-unimplemented',404,'Unsupported fixture route'],
++ ['/redirect_same_echo_referer',302,'','location','/echo_referer'],['/redirect_cross_echo_referer',302,'','location','http://localhost:9582/echo_referer'],
++ ['/redirect_to_echo',302,'','location','/echo_method'],['/images/500.png',500,'boom'],['/images/404.png?unique',404,'not here'],['/images/redirect.png',302,'','location','/images/ok.png'],
++ ];
++ for(const[path,status,body,key,value]of cases){const r=await request(server.origin,path);assert.equal(r.status,status,path);assert.equal(r.body.toString(),body,path);if(key)assert.equal(r.headers[key],value,path);}
++ assert.equal((await request(server.origin,'/303-no-location')).headers.location,undefined);
++});
++test('raw response byte counts, gzip, cache and case-sensitive conditional headers',async()=>{
++ const port=Number(new URL(server.origin).port),r=await raw(port,'/raw/gzip');
++ const split=r.indexOf('\r\n\r\n')+4;assert.equal(split,89);assert.equal(r.length,118);assert.equal(gunzipSync(r.subarray(split)).toString(),'a'.repeat(1000));
++ const cache=await raw(port,'/raw/cacheable');assert.equal(cache.toString(),'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nContent-Length: 11\r\n\r\nhello world');
++ const conditional=await raw(port,'/raw/not-a-name','If-None-Match: "v1"\r\n');assert.equal(conditional.toString(),'HTTP/1.1 304 Not Modified\r\nCache-Control: no-cache\r\nETag: "v1"\r\n\r\n');
++ assert.match((await raw(port,'/raw/revalidated','if-none-match: "v1"\r\n')).toString(),/^HTTP\/1.1 200/);
++ const embedded=await raw(port,'/raw/cacheable','X-Probe: If-None-Match: anywhere\r\n');assert.match(embedded.toString(),/^HTTP\/1.1 304/);
++ const large=await raw(port,'/raw/large');assert.equal(large.subarray(large.indexOf('\r\n\r\n')+4).length,262144);
++ const latin=await raw(port,'/latin1_response');assert(latin.includes(Buffer.from('HTTP/1.1 200 Caf\xe9\r\n','latin1')));assert(latin.includes(Buffer.from('X-Caf\xe9: 1','latin1')));
++});
++test('real raw request body echo, brotli transport and CORS/header methods',async()=>{
++ const bytes=Buffer.from([0,255,10,128]);assert.deepEqual((await request(server.origin,'/echo_body',{method:'POST',body:bytes})).body,bytes);
++ const br=brotliCompressSync(Buffer.from('real brotli bytes'));const r=await request(server.origin,'/echo_brotli',{method:'POST',body:br});assert.equal(r.headers['content-encoding'],'br');assert.deepEqual(r.body,br);assert.equal(brotliDecompressSync(r.body).toString(),'real brotli bytes');
++ const cors=await request(server.origin,'/echo_headers',{method:'OPTIONS',headers:{Origin:'http://localhost:9582','Access-Control-Request-Method':'GET','Access-Control-Request-Headers':'x-hop'}});assert.equal(cors.headers['access-control-allow-origin'],'http://localhost:9582');assert.equal(cors.headers['access-control-allow-methods'],'GET');assert.equal(cors.headers['access-control-allow-headers'],'x-hop');
++ assert.match((await request(server.origin,'/echo_headers',{headers:{'X-Hop':'actual123'}})).body.toString(),/X-Hop: actual123\n/);
++ assert.equal((await request(server.origin,'/echo-x-hop',{headers:{'X-Hop':'alive'}})).body.toString(),'alive');
++ assert.equal((await request(server.origin,'/echo_referer',{headers:{Referer:'http://x.test/a'}})).body.toString(),'<html><body>referer=http://x.test/a</body></html>');
++ assert.equal((await request(server.origin,'/echo_method',{method:'POST',body:'abc'})).body.toString(),'<html><body>method=POST</body></html>');
++});
++test('counters and beacon records survive real requests and reset',async()=>{
++ await request(server.origin,'/reset');assert.equal((await request(server.origin,'/serve-count/defer.js')).body.toString(),'window.__serve_count_defer = 1;');assert.equal((await request(server.origin,'/serve-count/defer.js')).body.toString(),'window.__serve_count_defer = 2;');assert.equal((await request(server.origin,'/serve-count/unknown.js')).status,404);
++ assert.equal((await request(server.origin,'/beacon/read/id')).body.toString(),'(missing)');
++ await request(server.origin,'/beacon/store/id',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:Buffer.from([65,0,66])});assert.deepEqual((await request(server.origin,'/beacon/read/id')).body,Buffer.from('POST|application/octet-stream|3|A\0B'));
++ await request(server.origin,'/beacon/store/id',{method:'POST',body:'later'});assert.equal((await request(server.origin,'/beacon/read/id')).body.toString(),'POST|application/octet-stream|3|A\0B');
++ assert.equal((await request(server.origin,'/sse/reconnect')).body.toString(),'retry: 10\ndata: one\n\n');assert.equal((await request(server.origin,'/sse/reconnect')).body.toString(),'data: two\n\n');
++ await request(server.origin,'/reset');assert.equal((await request(server.origin,'/beacon/read/id')).body.toString(),'(missing)');assert.equal((await request(server.origin,'/serve-count/defer.js')).body.toString(),'window.__serve_count_defer = 1;');assert.equal((await request(server.origin,'/sse/reconnect')).body.toString(),'retry: 10\ndata: one\n\n');
++});
++test('SSE is progressive and second event requires a distinct flag request',async()=>{
++ await new Promise((resolve,reject)=>{http.get(server.origin+'/sse/streaming',res=>{const parts=[];let flagged=false;res.on('data',part=>{parts.push(part.toString());if(!flagged){flagged=true;assert.equal(parts.join(''),'data: first\n\n');request(server.origin,'/sse/flag').catch(reject);}});res.on('end',()=>{try{assert.deepEqual(parts,['data: first\n\n','data: sec','ond\n\n']);resolve();}catch(e){reject(e);}});}).on('error',reject);});
++});
++test('image bytes, actual dimensions inputs, streaming and encoding boundaries',async()=>{
++ const image=await readFile(join(fixtureRoot,'fixtures/images/1000x750.png')),padded=(await request(server.origin,'/images/ok.png?one')).body;assert.equal(padded.length,16385);assert.deepEqual(padded.subarray(0,image.length),image);assert(padded.subarray(image.length).every(x=>x===120));
++ assert.deepEqual((await request(server.origin,'/images/small.png?one')).body,await readFile(join(fixtureRoot,'fixtures/images/320x240.png')));
++ assert.deepEqual((await request(server.origin,'/images/photo.jpg')).body,await readFile(join(fixtureRoot,'fixtures/images/1000x750.jpg')));
++ const stream=await request(server.origin,'/images/chunked.png');assert.equal(stream.headers['content-length'],undefined);assert.equal(stream.headers['transfer-encoding'],'chunked');assert.equal(stream.body.toString(),'<svg xmlns="http://www.w3.org/2000/svg"/>');
++ assert((await request(server.origin,'/styles/latin1-header.css')).body.includes(233));assert.equal((await request(server.origin,'/styles/truncated-utf8.css')).body.at(-1),226);assert.deepEqual((await request(server.origin,'/scripts/bom-over-header.js')).body.subarray(0,3),Buffer.from([239,187,191]));
++ assert.equal((await request(server.origin,'/scripts/latin1/named.js')).body.toString('latin1'),"window['named'] = 'café';");
++ assert((await request(server.origin,'/styles/large.css')).body.length>2*1024*1024);assert((await request(server.origin,'/styles/oversize.css')).body.length>4*1024*1024);
++});
++test('static root confinement, slash normalization, exact bytes and sidecars',async()=>{
++ const temp=await mkdtemp(join(tmpdir(),'red-panda-fixture-'));let owned;
++ try{await writeFile(join(temp,'fixture.html'),Buffer.from([65,0,255]));await writeFile(join(temp,'fixture.html.headers'),'X-Custom: actual\nContent-Type: text/plain\n');await symlink('/etc/passwd',join(temp,'escape.html'));
++ owned=await startFixtureServer(temp,{port:0,profile:'upstream'});assert.deepEqual(owned.metadata.unsupportedRouteGroups,['WebSocket transport not enabled; pass webSocketPort explicitly']);
++ for(const path of ['/src/browser/tests/fixture.html','/src/browser/tests//fixture.html','/src/browser/tests///fixture.html']){const r=await request(owned.origin,path);assert.deepEqual(r.body,Buffer.from([65,0,255]));assert.equal(r.headers['x-custom'],'actual');assert.equal(r.headers['content-type'],'text/plain');assert.equal(r.headers['cache-control'],undefined);}
++ assert.equal((await request(owned.origin,'/src/browser/tests/escape.html')).status,403);assert.equal((await request(owned.origin,'/src/browser/tests/%2e%2e%2foutside')).status,403);assert.equal((await request(owned.origin,'/src/browser/tests/a%5cb')).status,404);
++ }finally{await owned?.close();await rm(temp,{recursive:true,force:true});}
++});
++function clientFrame(opcode,bytes){const n=bytes.length,head=n<126?Buffer.from([128|opcode,128|n]):Buffer.from([128|opcode,254,n>>8,n&255]);const mask=Buffer.from([1,2,3,4]),copy=Buffer.from(bytes);for(let i=0;i<n;i++)copy[i]^=mask[i%4];return Buffer.concat([head,mask,copy]);}
++async function wireWebSocket(port){const socket=net.connect(port,'127.0.0.1');await once(socket,'connect');let buffer=Buffer.alloc(0),ready=false;const frames=[],waiters=[];socket.on('data',part=>{buffer=Buffer.concat([buffer,part]);if(!ready){const i=buffer.indexOf('\r\n\r\n');if(i<0)return;assert.match(buffer.subarray(0,i).toString(),/Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK\+xOo=/);buffer=buffer.subarray(i+4);ready=true;}while(buffer.length>=2){let size=buffer[1]&127,off=2;if(size===126){if(buffer.length<4)return;size=buffer.readUInt16BE(2);off=4;}if(size===127){if(buffer.length<10)return;size=Number(buffer.readBigUInt64BE(2));off=10;}if(buffer.length<off+size)return;const f={opcode:buffer[0]&15,bytes:Buffer.from(buffer.subarray(off,off+size))};buffer=buffer.subarray(off+size);if(waiters.length)waiters.shift()(f);else frames.push(f);}});socket.write('GET /somepath HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: actual=123\r\nOrigin: http://127.0.0.1:9582\r\n\r\n');return {socket,next:()=>frames.length?Promise.resolve(frames.shift()):new Promise(resolve=>waiters.push(resolve)),send:(opcode,bytes)=>socket.write(clientFrame(opcode,Buffer.from(bytes)))};}
++test('WebSocket handshake, fragmented TCP/coalesced frames, binary, commands and close',async()=>{
++ const c=await wireWebSocket(server.webSocket.port);try{
++ const split=clientFrame(1,Buffer.from('hello'));c.socket.write(split.subarray(0,3));c.socket.write(split.subarray(3));assert.equal((await c.next()).bytes.toString(),'echo-hello');
++ c.socket.write(Buffer.concat([clientFrame(1,Buffer.from('get-cookie')),clientFrame(1,Buffer.from('get-origin'))]));assert.equal((await c.next()).bytes.toString(),'cookie:actual=123');assert.equal((await c.next()).bytes.toString(),'origin:http://127.0.0.1:9582');
++ c.send(2,[0,1,255]);assert.deepEqual((await c.next()).bytes,Buffer.from([238,0,1,255]));
++ c.send(1,'send-large:70000');const large=(await c.next()).bytes;assert.equal(large.length,70000);assert(large.every((x,i)=>x===65+i%26));
++ c.send(1,'close:1001:actual reason');const close=await c.next();assert.equal(close.opcode,8);assert.equal(close.bytes.readUInt16BE(0),1001);assert.equal(close.bytes.subarray(2).toString(),'actual reason');c.send(8,close.bytes);await once(c.socket,'end');
++ }finally{c.socket.destroy();}
++});
++test('close cancels pending SSE/timers and all owned transports',async()=>{const owned=await startFixtureServer(fixtureRoot,{port:0,profile:'upstream',webSocketPort:0});const req=http.get(owned.origin+'/sse/streaming');req.on('error',()=>{});await once(req,'response');await owned.close();assert(true);});

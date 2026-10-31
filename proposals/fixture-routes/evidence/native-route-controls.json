@@ -1,0 +1,271 @@
+{
+  "scope": "Actual Native route-specific authored controls; separate from unchanged fixture registrations",
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "sourceProfile": {
+    "resources": [
+      "iframe",
+      "worker"
+    ],
+    "experimentalFeatures": {}
+  },
+  "controls": [
+    {
+      "name": "cors-preflight-real-reflected-origin",
+      "source": "(async()=>{const r=await fetch('http://localhost:9582/echo_headers',{headers:{'X-Hop':'route-positive'}});return {status:r.status,type:r.type,bodyHasHeader:(await r.text()).toLowerCase().includes('x-hop: route-positive')};})()",
+      "expected": {
+        "status": 200,
+        "type": "cors",
+        "bodyHasHeader": true
+      },
+      "result": {
+        "status": 200,
+        "type": "cors",
+        "bodyHasHeader": true
+      },
+      "passed": true
+    },
+    {
+      "name": "cors-denied-real-missing-acao",
+      "source": "(async()=>{try{await fetch('http://localhost:9582/xhr');return 'unexpected success';}catch(e){return e.name;}})()",
+      "expected": "TypeError",
+      "result": "TypeError",
+      "passed": true
+    },
+    {
+      "name": "brotli-real-compressed-request-native-decoder",
+      "source": "(async()=>{const bytes=new TextEncoder().encode('actual native brotli transport');const stream=new Blob([bytes]).stream().pipeThrough(new CompressionStream('brotli'));const compressed=await new Response(stream).arrayBuffer();const r=await fetch('/echo_brotli',{method:'POST',body:compressed});return [r.status,await r.text()];})()",
+      "expected": [
+        200,
+        "actual native brotli transport"
+      ],
+      "result": [
+        200,
+        "actual native brotli transport"
+      ],
+      "passed": true
+    },
+    {
+      "name": "gzip-exact-raw-bytes-native-decoder",
+      "source": "(async()=>{const r=await fetch('/raw/gzip');return [r.status,r.headers.get('content-encoding'),(await r.text()).length];})()",
+      "expected": [
+        200,
+        "gzip",
+        1000
+      ],
+      "result": [
+        200,
+        "gzip",
+        1000
+      ],
+      "passed": true
+    },
+    {
+      "name": "websocket-single-text-binary-origin-close",
+      "source": "new Promise(resolve=>{const seen=[],ws=new WebSocket('ws://127.0.0.1:9584/');const timer=setTimeout(()=>{ws.close();resolve({timeout:true,seen});},3000);ws.binaryType='arraybuffer';ws.onopen=()=>{seen.push('open');ws.send('actual');};ws.onmessage=e=>{if(typeof e.data==='string'){seen.push(e.data);if(e.data==='echo-actual')ws.send(new Uint8Array([1,2]));else ws.close(1000,'done');}else{seen.push(Array.from(new Uint8Array(e.data)));ws.send('get-origin');}};ws.onclose=e=>{clearTimeout(timer);seen.push([e.code,e.reason,e.wasClean]);resolve(seen);};ws.onerror=()=>seen.push('error');})",
+      "expected": [
+        "open",
+        "echo-actual",
+        [
+          238,
+          1,
+          2
+        ],
+        "origin:http://127.0.0.1:9582",
+        [
+          1000,
+          "done",
+          true
+        ]
+      ],
+      "result": [
+        "open",
+        "echo-actual",
+        [
+          238,
+          1,
+          2
+        ],
+        "origin:http://127.0.0.1:9582",
+        [
+          1000,
+          "done",
+          true
+        ]
+      ],
+      "passed": true
+    },
+    {
+      "name": "attachment-real-file-and-events",
+      "navigate": {
+        "frameId": "FID-0000000001",
+        "loaderId": "LID-0000000002"
+      },
+      "bytes": "col1,col2\nhello,world\n42,1337\n",
+      "expectedBytes": "col1,col2\nhello,world\n42,1337\n",
+      "files": [
+        "report.csv"
+      ],
+      "events": [
+        {
+          "method": "Browser.downloadWillBegin",
+          "params": {
+            "frameId": "FID-0000000001",
+            "guid": "be3fe06f-e6c2-4051-b351-20ae2605eb11",
+            "url": "http://127.0.0.1:9582/download/report.csv",
+            "suggestedFilename": "report.csv",
+            "contentType": "text/csv"
+          }
+        },
+        {
+          "method": "Browser.downloadProgress",
+          "params": {
+            "guid": "be3fe06f-e6c2-4051-b351-20ae2605eb11",
+            "totalBytes": 30,
+            "receivedBytes": 0,
+            "state": "inProgress"
+          }
+        },
+        {
+          "method": "Browser.downloadProgress",
+          "params": {
+            "guid": "be3fe06f-e6c2-4051-b351-20ae2605eb11",
+            "totalBytes": 30,
+            "receivedBytes": 30,
+            "state": "completed"
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "attachment-404-no-file",
+      "navigate": {
+        "frameId": "FID-0000000001",
+        "loaderId": "LID-0000000003"
+      },
+      "files": [
+        "report.csv"
+      ],
+      "events": [],
+      "passed": true
+    }
+  ],
+  "version": {
+    "protocolVersion": "1.3",
+    "product": "Chrome/124.0.6367.29",
+    "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "jsVersion": "12.4.254.8"
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "OPTIONS",
+      "path": "/echo_headers",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "GET",
+      "path": "/echo_headers",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "GET",
+      "path": "/xhr",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "POST",
+      "path": "/echo_brotli",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "GET",
+      "path": "/raw/gzip",
+      "status": 200,
+      "routeKnown": true,
+      "rawResponse": true
+    },
+    {
+      "method": "GET",
+      "path": "/download/report.csv",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "GET",
+      "path": "/download/report.csv",
+      "status": 200,
+      "routeKnown": true
+    },
+    {
+      "method": "GET",
+      "path": "/download/missing.csv",
+      "status": 404,
+      "routeKnown": true
+    }
+  ],
+  "webSocketRequests": [
+    {
+      "path": "/",
+      "headers": [
+        "Host",
+        "127.0.0.1:9584",
+        "Accept",
+        "*/*",
+        "Accept-Encoding",
+        "deflate, gzip, br, zstd",
+        "Upgrade",
+        "websocket",
+        "Sec-WebSocket-Version",
+        "13",
+        "Sec-WebSocket-Key",
+        "fTb3/Nf3zH5BOX970nyiDQ==",
+        "User-Agent",
+        "Lightpanda/1.0",
+        "Sec-Ch-Ua",
+        "\"Lightpanda\";v=\"1\"",
+        "Sec-Ch-Ua-Full-Version-List",
+        "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "Accept-Language",
+        "en-US,en;q=0.9",
+        "Origin",
+        "http://127.0.0.1:9582",
+        "Connection",
+        "Upgrade"
+      ],
+      "commands": [
+        {
+          "text": "actual",
+          "length": 6
+        },
+        {
+          "text": "get-origin",
+          "length": 10
+        }
+      ]
+    }
+  ],
+  "ownedBrowser": {
+    "pid": 103520,
+    "exitCode": 0,
+    "signal": null,
+    "stderr": "$time=1793434601573 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:46663 max_connections=16120 max_browser_connections=16\n",
+    "stderrTruncated": false
+  },
+  "counts": {
+    "selected": 7,
+    "passed": 7,
+    "failed": 0
+  },
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f"
+}

@@ -1,3 +1,4 @@
+import {retireDeviceRequests} from './device-permissions.js';
 // A retired browsing context retains its actual VM and DOM. The original
 // main-world tasks present at retirement are canceled; later calls remain valid.
 import 'jsdom';
@@ -6,7 +7,8 @@ import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
 import { createInvocationTrampoline } from './invocation.js';
 import { retireFetchRequests } from './fetch.js';
-const activities=new WeakMap(),apply=Reflect.apply;
+const activities=new WeakMap(),retirementHooks=new WeakMap(),apply=Reflect.apply;
+export function onFrameRetirement(window,callback){let hooks=retirementHooks.get(window);if(!hooks){hooks=new Set();retirementHooks.set(window,hooks)}hooks.add(callback);return()=>hooks.delete(callback)}
 function activityFactory(g,bridge){
   const finite=Number.isFinite,trunc=Math.trunc;
   const long=value=>{value=+value;return finite(value)?trunc(value)|0:0;};
@@ -34,8 +36,8 @@ export function installFrameActivity(page,window){
     closed:()=>Boolean(page.retired||page.closed),
   };
   vm.compileFunction(`(${activityFactory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:context})(bridge);
-  const cancel=()=>{for(const id of timers)apply(source.clear,window,[id]);timers.clear();for(const id of frames)apply(source.cancel,window,[id]);frames.clear();retireFetchRequests(window);};
+  const cancel=()=>{for(const id of timers)apply(source.clear,window,[id]);timers.clear();for(const id of frames)apply(source.cancel,window,[id]);frames.clear();retireFetchRequests(window);retireDeviceRequests(window);};
   const dispose=()=>{if(disposed)return;cancel();disposed=true;signal.removeEventListener('abort',dispose);};
   signal.addEventListener('abort',dispose,{once:true});activities.set(window,{cancel,dispose});
 }
-export function retireFrameActivity(window){activities.get(window)?.cancel();}
+export function retireFrameActivity(window){activities.get(window)?.cancel();for(const callback of retirementHooks.get(window)??[])callback();}

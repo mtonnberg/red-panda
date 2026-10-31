@@ -1,0 +1,23 @@
+This is a bounded independent implementation of media text-track values, actual indexed list state, cue HTML, and loading real WebVTT resources. It does not implement audio/video decoding or a media playback clock.
+
+`integration-current.patch` applies to current Root source. It adds `src/text-tracks.js`, `src/vtt-parser.js`, `test/text-tracks.test.js`, one browser import/install, and the separately approved ordinary indexed-object allocator in `native/collections.cc`. The current HTMLDDA allocator and its flags are unchanged. Rebuild the collections binding for every selected Node SDK before running the combined tree or restarting an owned service. Only prepared Node 24.22.1 was rebuilt in this isolated scratch.
+
+Final bounded evidence:
+
+- 13 focused tests pass, including actual ordinary/nonproxy indexed lists, readonly live membership, real cue movement/sorting, strong brands, captured conversions, EventTarget handler replacement order, inert cue text, real Blob parsing/load events, cancellation of an actual pending HTTP resource on page teardown, and actual frame-local prototypes/fragments/errors.
+- All 13 raw CDP Native value/shape/conversion/list observations equal candidate observations structurally (`native-values.json`, `candidate-values-final.json`).
+- All six corrected async observations equal Native (`native-async-v2.json`, `candidate-async-final.json`). These measure no automatic mutation events, actual Blob loading, disabled/no-parent behavior, default selection, and removal before the queued load. Earlier `native-async.json` used an incorrectly escaped driver and is preserved as invalid probe setup, not negative Native behavior.
+- All four unchanged upstream fixtures (`mediaerror`, `texttrack`, `vttcue`, `vttregion`) pass on Native and candidate, preserving source/harness hashes and enforcing real harness observations. These use the documented 15-second diagnostic deadline, 100ms settling delay, isolated child per fixture, ephemeral fixture origin, and native iframe/worker flags. No throughput, 2-second parity, or full-browser parity claim follows.
+
+The fixture-server helper is the already corrected duplicate-slash route helper from the coverage-recovery scratch; the fixture and `testing.js` bytes remain unchanged. This helper correction is recorded in `source-freeze.json` and is not included in this production patch. Raw drivers import the Root CDP/reference helper; their hashes are recorded in `verification.json`.
+
+Actual values are allocated in the main/frame Window realm, backed by private identity state and genuine EventTarget/DOM implementations. Collections use real ordinary V8 indexed interceptors, not Proxy/Array/HTMLDDA stand-ins. Cue text produces real fresh DocumentFragments through the private DOM producer. Resource success requires fetched bytes passing the implemented WebVTT parser; failures produce genuine trusted error events. Teardown aborts owned transports and cancels owned queued tasks.
+
+Remaining gaps are explicit:
+
+- Utility-world constructors and per-world typed return wrapping are not installed. Native utility-world behavior is positively observed in `native-realms-v2.json`; this is a deferred compatibility gap. The cross-frame transfer portion of that probe failed its setup and is unobserved, not evidence of success or failure. The focused frame test establishes actual local allocation only.
+- There is no playback/decoding engine or active-cue clock. `activeCues` represents the actual empty initial state; no timed cue transitions or media playback outputs are synthesized. MediaError constants/accessors/illegal construction/brands are present, but no new media-error producer is implemented; existing `HTMLMediaElement.error` yields undefined.
+- The parser covers genuine cue bytes, IDs, timing, settings, regions, cue markup, CRLF/BOM, notes, and inert unknown tags. The full WebVTT grammar, malformed-file matrix, CORS/media-specific policy, reload/default-selection edge cases, adoption and retained-world lifetime, and all cross-realm typed-return semantics have not been exhaustively calibrated.
+- Combined Root CSS/source graph regression, other native SDK rebuilds, broad suites and owned-service restart are pending Root integration. The tested scratch predates Root's independent CSS additions; packaging rebases only the narrow browser import/install onto current Root and records both source graphs.
+
+`source-freeze.json`, `integration-manifest.json`, and `verification.json` pin the tested scratch graph, integration leaves, exact fixture/report/probe/native-binary identities, and bounded outcomes. No Root production files were edited by this worker.

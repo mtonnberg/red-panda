@@ -1,0 +1,1825 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import { installScheduler } from './scheduler.js';
+ import {installDevicePermissions} from './device-permissions.js';
+ import { installURLPattern } from './url-pattern.js';
+ import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
+@@ -292,6 +293,7 @@
+     });
+     prepareUtilityPlatform(window);
+     installFrameActivity(this,window);
++    installScheduler(this,window);
+     prepareHeapRealm(this,window);
+     (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
+     for (const { source,worldName } of this.newDocumentScripts.values()) {
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import { installScheduler } from './scheduler.js';
+ import { installURLPattern } from './url-pattern.js';
+ import { installCanvas } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
+@@ -34,7 +35,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installImageData(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/frame-activity.js
++++ b/src/frame-activity.js
+@@ -7,7 +7,8 @@
+ const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ import { createInvocationTrampoline } from './invocation.js';
+ import { retireFetchRequests } from './fetch.js';
+-const activities=new WeakMap(),apply=Reflect.apply;
++const activities=new WeakMap(),retirementHooks=new WeakMap(),apply=Reflect.apply;
++export function onFrameRetirement(window,callback){let hooks=retirementHooks.get(window);if(!hooks){hooks=new Set();retirementHooks.set(window,hooks)}hooks.add(callback);return()=>hooks.delete(callback)}
+ function activityFactory(g,bridge){
+   const finite=Number.isFinite,trunc=Math.trunc;
+   const long=value=>{value=+value;return finite(value)?trunc(value)|0:0;};
+@@ -39,4 +40,4 @@
+   const dispose=()=>{if(disposed)return;cancel();disposed=true;signal.removeEventListener('abort',dispose);};
+   signal.addEventListener('abort',dispose,{once:true});activities.set(window,{cancel,dispose});
+ }
+-export function retireFrameActivity(window){activities.get(window)?.cancel();}
++export function retireFrameActivity(window){activities.get(window)?.cancel();for(const callback of retirementHooks.get(window)??[])callback();}
+--- /dev/null
++++ b/docs/reference/scheduler-context-native-expression.js
+@@ -0,0 +1,2 @@
++(async()=>{const rows=[];const first=[];const p=scheduler.yield().then(()=>first.push('yield'));Promise.resolve().then(()=>first.push('microtask'));await p;rows.push({name:'freshYield',order:first});const c=new TaskController();await scheduler.postTask(()=>1,{signal:c.signal});c.abort('after-settled');let after;try{await scheduler.yield();after='resolved'}catch(e){after=e}rows.push({name:'afterSettled',result:after});await scheduler.postTask(()=>1);let clear;try{await scheduler.yield();clear='resolved'}catch(e){clear=e}rows.push({name:'afterUnsignaled',result:clear});
++const a=new TaskController(),trace=[];const ta=scheduler.postTask(async()=>{await new Promise(r=>setTimeout(r,15));a.abort('A');try{await scheduler.yield();trace.push('yield-resolved')}catch(e){trace.push(e)}},{signal:a.signal});ta.catch(()=>{});const tb=scheduler.postTask(()=>trace.push('B'));await Promise.all([ta,tb]);rows.push({name:'interleavedAsyncYield',trace});return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-context-native.json
+@@ -0,0 +1,30 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "ccee821fd99c4cfb4ab747fd30a33c0e3fc4bdc296b90da27eff64e00407e446",
++  "observations": [
++    {
++      "name": "freshYield",
++      "order": [
++        "microtask",
++        "yield"
++      ]
++    },
++    {
++      "name": "afterSettled",
++      "result": "after-settled"
++    },
++    {
++      "name": "afterUnsignaled",
++      "result": "resolved"
++    },
++    {
++      "name": "interleavedAsyncYield",
++      "trace": [
++        "B",
++        "yield-resolved"
++      ]
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-extra-native-expression.js
+@@ -0,0 +1,9 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const d of[4294967296,4294967297,-4294967296])await run('delay-'+d,async()=>{const c=new AbortController(),p=scheduler.postTask(()=>7,{signal:c.signal,delay:d});const v=await Promise.race([p.then(value=>({value}),e=>({error:e.name})),new Promise(r=>setTimeout(()=>r({pending:true}),20))]);c.abort();return v});
++await run('yieldOutsideOrder',async()=>{const order=[];const p=scheduler.yield().then(()=>order.push('yield'));Promise.resolve().then(()=>order.push('microtask'));await p;return order});
++await run('priorityInvalidGetterOrder',async()=>{const trace=[];try{await scheduler.postTask(()=>1,{get priority(){trace.push('priority');return'bad'},get signal(){trace.push('signal');return null}})}catch(e){return{trace,error:e.message}}});
++await run('controllerPriorityNull',()=>new TaskController({priority:null}).signal.priority);
++await run('eventInitPrimitive',()=>new TaskPriorityChangeEvent('x',3));
++await run('signalAbortBrand',()=>{const c=new TaskController();let fake;try{Object.getOwnPropertyDescriptor(TaskSignal.prototype,'priority').get.call(new AbortController().signal)}catch(e){fake={name:e.name,message:e.message}}return{fake,signalCtor:Object.getOwnPropertyDescriptor(TaskSignal.prototype,'priority').get.name}});
++await run('worker',()=>new Promise(resolve=>{const w=new Worker(URL.createObjectURL(new Blob(["postMessage({scheduler:typeof scheduler,controller:typeof TaskController,signal:typeof TaskSignal,event:typeof TaskPriorityChangeEvent})"],{type:'text/javascript'})));w.onmessage=e=>{resolve(e.data);w.terminate()}}));
++return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-extra-native.json
+@@ -0,0 +1,75 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "5f607ac436809cdceccc2a87394a0a92195a70ac75ea9e6dbb0eec88affc049e",
++  "observations": [
++    {
++      "name": "delay-4294967296",
++      "value": {
++        "value": 7
++      }
++    },
++    {
++      "name": "delay-4294967297",
++      "value": {
++        "value": 7
++      }
++    },
++    {
++      "name": "delay--4294967296",
++      "value": {
++        "value": 7
++      }
++    },
++    {
++      "name": "yieldOutsideOrder",
++      "error": {
++        "name": "AbortError",
++        "message": "signal is aborted without reason"
++      }
++    },
++    {
++      "name": "priorityInvalidGetterOrder",
++      "value": {
++        "trace": [
++          "priority"
++        ],
++        "error": "invalid postTask options"
++      }
++    },
++    {
++      "name": "controllerPriorityNull",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "eventInitPrimitive",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "signalAbortBrand",
++      "value": {
++        "fake": {
++          "name": "TypeError",
++          "message": "Illegal invocation"
++        },
++        "signalCtor": "get priority"
++      }
++    },
++    {
++      "name": "worker",
++      "value": {
++        "scheduler": "object",
++        "controller": "function",
++        "signal": "function",
++        "event": "function"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-lifetime-native-expression.js
+@@ -0,0 +1,10 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const [name,fn]of[['callbackMissing',()=>scheduler.postTask()],['callbackBad',()=>scheduler.postTask(3)],['fakePost',()=>Scheduler.prototype.postTask.call({},()=>1)],['fakeYield',()=>Scheduler.prototype.yield.call({})]])await run(name,async()=>{let p;try{p=fn()}catch(e){return{sync:true,name:e.name,message:e.message}}try{return{sync:false,value:await p}}catch(e){return{sync:false,name:e.name,message:e.message}}});
++await run('callbackOptionOrder',async()=>{const trace=[];let p;try{p=scheduler.postTask(3,{get delay(){trace.push('delay');return 0},get priority(){trace.push('priority');return'bad'},get signal(){trace.push('signal');return null}})}catch(e){return{trace,sync:e.name}}try{await p}catch(e){return{trace,error:e.message}}});
++await run('optionGetterThrow',()=>{try{const p=scheduler.postTask(()=>1,{get signal(){throw Error('getter')}});p.catch(()=>{});return{sync:false}}catch(e){return{sync:true,message:e.message}}});
++await run('abortModes',async()=>{const out=[];for(const mode of['pre','queued','running','promise']){const c=new TaskController(),reason={mode},trace=[];if(mode==='pre')c.abort(reason);const p=scheduler.postTask(()=>{trace.push('ran');if(mode==='running')c.abort(reason);if(mode==='promise')return new Promise(resolve=>setTimeout(()=>{trace.push('inner');resolve(9)},20));return 9},{signal:c.signal,delay:mode==='queued'?20:0});if(mode==='queued')c.abort(reason);if(mode==='promise')setTimeout(()=>c.abort(reason),5);let result;try{result={value:await p}}catch(e){result={same:e===reason}}await new Promise(r=>setTimeout(r,25));out.push({mode,result,trace})}return out});
++await run('yield',async()=>{const order=[];await Promise.all([scheduler.postTask(async()=>{order.push('a');await scheduler.yield();order.push('c')}),scheduler.postTask(()=>order.push('b'))]);return order});
++await run('yieldAsyncSignal',async()=>{const c=new TaskController();let report;const p=scheduler.postTask(async()=>{await Promise.resolve();c.abort('later');try{await scheduler.yield();report='resolved'}catch(e){report=e}},{signal:c.signal});p.catch(()=>{});await new Promise(r=>setTimeout(r,30));return report});
++await run('handlerOrder',()=>{const c=new TaskController(),out=[];c.signal.addEventListener('prioritychange',()=>out.push('a'));c.signal.onprioritychange=()=>out.push('b');c.signal.addEventListener('prioritychange',()=>out.push('c'));c.signal.onprioritychange=()=>out.push('d');c.setPriority('background');c.signal.onprioritychange=null;c.signal.onprioritychange=()=>out.push('e');c.setPriority('user-blocking');return out});
++await run('retire',async()=>{const f=document.createElement('iframe');document.body.append(f);const w=f.contentWindow;let ran=0,settled='pending';w.scheduler.postTask(()=>{ran++;return1},{delay:40}).then(()=>settled='resolved',()=>settled='rejected');f.remove();await new Promise(r=>setTimeout(r,60));const before={ran,settled,closed:w.closed};let after;try{after=await w.scheduler.postTask(()=>23)}catch(e){after=e.name}return{before,after}});
++await run('worker',()=>new Promise(resolve=>{const w=new Worker(URL.createObjectURL(new Blob(["postMessage({scheduler:typeof scheduler,controller:typeof TaskController,signal:typeof TaskSignal,event:typeof TaskPriorityChangeEvent})"],{type:'text/javascript'})));w.onmessage=e=>{resolve(e.data);w.terminate()}}));return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-lifetime-native.json
+@@ -0,0 +1,135 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "d4b6c1f1492293743b20793bb5d9ac2f483810564dff09e927eeb88a91c03045",
++  "observations": [
++    {
++      "name": "callbackMissing",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "callbackBad",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "fakePost",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "fakeYield",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "callbackOptionOrder",
++      "value": {
++        "trace": [],
++        "error": "invalid argument"
++      }
++    },
++    {
++      "name": "optionGetterThrow",
++      "value": {
++        "sync": true,
++        "message": "getter"
++      }
++    },
++    {
++      "name": "abortModes",
++      "value": [
++        {
++          "mode": "pre",
++          "result": {
++            "same": true
++          },
++          "trace": []
++        },
++        {
++          "mode": "queued",
++          "result": {
++            "same": true
++          },
++          "trace": []
++        },
++        {
++          "mode": "running",
++          "result": {
++            "same": true
++          },
++          "trace": [
++            "ran"
++          ]
++        },
++        {
++          "mode": "promise",
++          "result": {
++            "value": 9
++          },
++          "trace": [
++            "ran",
++            "inner"
++          ]
++        }
++      ]
++    },
++    {
++      "name": "yield",
++      "value": [
++        "a",
++        "c",
++        "b"
++      ]
++    },
++    {
++      "name": "yieldAsyncSignal",
++      "value": "later"
++    },
++    {
++      "name": "handlerOrder",
++      "value": [
++        "a",
++        "d",
++        "c",
++        "a",
++        "c",
++        "e"
++      ]
++    },
++    {
++      "name": "retire",
++      "value": {
++        "before": {
++          "ran": 0,
++          "settled": "pending",
++          "closed": true
++        },
++        "after": 23
++      }
++    },
++    {
++      "name": "worker",
++      "value": {
++        "scheduler": "object",
++        "controller": "function",
++        "signal": "function",
++        "event": "function"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-lifetime-v2-native-expression.js
+@@ -0,0 +1,10 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const [name,fn]of[['callbackMissing',()=>scheduler.postTask()],['callbackBad',()=>scheduler.postTask(3)],['fakePost',()=>Scheduler.prototype.postTask.call({},()=>1)],['fakeYield',()=>Scheduler.prototype.yield.call({})]])await run(name,async()=>{let p;try{p=fn()}catch(e){return{sync:true,name:e.name,message:e.message}}try{return{sync:false,value:await p}}catch(e){return{sync:false,name:e.name,message:e.message}}});
++await run('callbackOptionOrder',async()=>{const trace=[];let p;try{p=scheduler.postTask(3,{get delay(){trace.push('delay');return 0},get priority(){trace.push('priority');return'bad'},get signal(){trace.push('signal');return null}})}catch(e){return{trace,sync:e.name}}try{await p}catch(e){return{trace,error:e.message}}});
++await run('optionGetterThrow',()=>{try{const p=scheduler.postTask(()=>1,{get signal(){throw Error('getter')}});p.catch(()=>{});return{sync:false}}catch(e){return{sync:true,message:e.message}}});
++await run('abortModes',async()=>{const out=[];for(const mode of['pre','queued','running','promise']){const c=new TaskController(),reason={mode},trace=[];if(mode==='pre')c.abort(reason);const p=scheduler.postTask(()=>{trace.push('ran');if(mode==='running')c.abort(reason);if(mode==='promise')return new Promise(resolve=>setTimeout(()=>{trace.push('inner');resolve(9)},20));return 9},{signal:c.signal,delay:mode==='queued'?20:0});if(mode==='queued')c.abort(reason);if(mode==='promise')setTimeout(()=>c.abort(reason),5);let result;try{result={value:await p}}catch(e){result={same:e===reason}}await new Promise(r=>setTimeout(r,25));out.push({mode,result,trace})}return out});
++await run('yield',async()=>{const order=[];await Promise.all([scheduler.postTask(async()=>{order.push('a');await scheduler.yield();order.push('c')}),scheduler.postTask(()=>order.push('b'))]);return order});
++await run('yieldAsyncSignal',async()=>{const c=new TaskController();let report;const p=scheduler.postTask(async()=>{await Promise.resolve();c.abort('later');try{await scheduler.yield();report='resolved'}catch(e){report=e}},{signal:c.signal});p.catch(()=>{});await new Promise(r=>setTimeout(r,30));return report});
++await run('handlerOrder',()=>{const c=new TaskController(),out=[];c.signal.addEventListener('prioritychange',()=>out.push('a'));c.signal.onprioritychange=()=>out.push('b');c.signal.addEventListener('prioritychange',()=>out.push('c'));c.signal.onprioritychange=()=>out.push('d');c.setPriority('background');c.signal.onprioritychange=null;c.signal.onprioritychange=()=>out.push('e');c.setPriority('user-blocking');return out});
++await run('retire',async()=>{const f=document.createElement('iframe');document.body.append(f);const w=f.contentWindow;let ran=0,settled='pending';w.scheduler.postTask(()=>{ran++;return 1},{delay:40}).then(()=>settled='resolved',()=>settled='rejected');f.remove();await new Promise(r=>setTimeout(r,60));const before={ran,settled,closed:w.closed};let after;try{after=await w.scheduler.postTask(()=>23)}catch(e){after=e.name}return{before,after}});
++await run('worker',()=>new Promise(resolve=>{const w=new Worker(URL.createObjectURL(new Blob(["postMessage({scheduler:typeof scheduler,controller:typeof TaskController,signal:typeof TaskSignal,event:typeof TaskPriorityChangeEvent})"],{type:'text/javascript'})));w.onmessage=e=>{resolve(e.data);w.terminate()}}));return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-lifetime-v2-native.json
+@@ -0,0 +1,135 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "017535d4f1a931147fb8c98dbcf19a4c21c92f5f4c544f98c2ace575bbd9ec18",
++  "observations": [
++    {
++      "name": "callbackMissing",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "callbackBad",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "fakePost",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "fakeYield",
++      "value": {
++        "sync": false,
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "callbackOptionOrder",
++      "value": {
++        "trace": [],
++        "error": "invalid argument"
++      }
++    },
++    {
++      "name": "optionGetterThrow",
++      "value": {
++        "sync": true,
++        "message": "getter"
++      }
++    },
++    {
++      "name": "abortModes",
++      "value": [
++        {
++          "mode": "pre",
++          "result": {
++            "same": true
++          },
++          "trace": []
++        },
++        {
++          "mode": "queued",
++          "result": {
++            "same": true
++          },
++          "trace": []
++        },
++        {
++          "mode": "running",
++          "result": {
++            "same": true
++          },
++          "trace": [
++            "ran"
++          ]
++        },
++        {
++          "mode": "promise",
++          "result": {
++            "value": 9
++          },
++          "trace": [
++            "ran",
++            "inner"
++          ]
++        }
++      ]
++    },
++    {
++      "name": "yield",
++      "value": [
++        "a",
++        "c",
++        "b"
++      ]
++    },
++    {
++      "name": "yieldAsyncSignal",
++      "value": "later"
++    },
++    {
++      "name": "handlerOrder",
++      "value": [
++        "a",
++        "d",
++        "c",
++        "a",
++        "c",
++        "e"
++      ]
++    },
++    {
++      "name": "retire",
++      "value": {
++        "before": {
++          "ran": 0,
++          "settled": "pending",
++          "closed": true
++        },
++        "after": 23
++      }
++    },
++    {
++      "name": "worker",
++      "value": {
++        "scheduler": "object",
++        "controller": "function",
++        "signal": "function",
++        "event": "function"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-order-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{const out=[];await scheduler.postTask(()=>1);const order=[],p=scheduler.yield().then(()=>order.push('yield'));Promise.resolve().then(()=>order.push('microtask'));await p;out.push({name:'afterUnsignaledYield',order});const c=new TaskController(),err={tag:'throw'},reason={tag:'abort'};try{await scheduler.postTask(()=>{c.abort(reason);throw err},{signal:c.signal})}catch(e){out.push({name:'throwAndAbort',throw:e===err,abort:e===reason})}const f=document.createElement('iframe');document.body.append(f);const w=f.contentWindow;let missing;try{Object.getOwnPropertyDescriptor(window,'scheduler').get.call({})}catch(e){missing={name:e.name,message:e.message}}out.push({name:'namespaceFake',missing});f.remove();return out})()
+--- /dev/null
++++ b/docs/reference/scheduler-order-native.json
+@@ -0,0 +1,27 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "ed63268b75863ac87df663219c960a7abb3e60b9676b3c36ebedd01bf039589f",
++  "observations": [
++    {
++      "name": "afterUnsignaledYield",
++      "order": [
++        "microtask",
++        "yield"
++      ]
++    },
++    {
++      "name": "throwAndAbort",
++      "throw": false,
++      "abort": true
++    },
++    {
++      "name": "namespaceFake",
++      "missing": {
++        "name": "TypeError",
++        "message": "Illegal invocation"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-surface-native-expression.js
+@@ -0,0 +1,14 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++await run('surface',()=>({scheduler:scheduler instanceof Scheduler,tag:Object.prototype.toString.call(scheduler),classes:Object.fromEntries([Scheduler,TaskController,TaskSignal,TaskPriorityChangeEvent].map(C=>[C.name,{length:C.length,parent:Object.getPrototypeOf(C.prototype).constructor.name,keys:Reflect.ownKeys(C.prototype).map(String)}]))}));
++await run('schedulerConstruct',()=>new Scheduler());await run('signalConstruct',()=>new TaskSignal());
++for(const[name,init]of[['default',undefined],['null',null],['bg',{priority:'background'}],['bad',{priority:'bad'}],['symbol',{priority:Symbol('background')}],['primitive',3]])await run('controller-'+name,()=>{const c=new TaskController(init);return{signal:c.signal instanceof TaskSignal,abort:c.signal instanceof AbortSignal,controller:c instanceof AbortController,priority:c.signal.priority,aborted:c.signal.aborted,tag:Object.prototype.toString.call(c.signal)}});
++await run('priorityEvent',()=>{const c=new TaskController({priority:'background'}),events=[];c.signal.addEventListener('prioritychange',e=>events.push({old:e.previousPriority,now:c.signal.priority,trusted:e.isTrusted,sub:e instanceof TaskPriorityChangeEvent,base:e instanceof Event,target:e.target===c.signal,bubbles:e.bubbles,cancelable:e.cancelable}));c.setPriority('user-blocking');c.setPriority('user-blocking');c.setPriority('user-visible');return events});
++await run('eventCtor',()=>{const e=new TaskPriorityChangeEvent('prioritychange',{previousPriority:'background',bubbles:true,cancelable:true});return{old:e.previousPriority,trusted:e.isTrusted,bubbles:e.bubbles,cancelable:e.cancelable,tag:Object.prototype.toString.call(e)}});
++for(const[name,args]of[['missing',[]],['one',['prioritychange']],['empty',['prioritychange',{}]],['null',['prioritychange',null]],['bad',['prioritychange',{previousPriority:'bad'}]],['symbol',[Symbol('event'),{previousPriority:Symbol('background')}]]])await run('event-'+name,()=>{const e=new TaskPriorityChangeEvent(...args);return{type:e.type,old:e.previousPriority}});
++await run('priorityReentrant',()=>{const c=new TaskController(),trace=[];c.signal.onprioritychange=e=>{trace.push([e.previousPriority,c.signal.priority]);if(c.signal.priority==='background'){try{c.setPriority('user-blocking')}catch(e){trace.push(e.name)}}};c.setPriority('background');return trace});
++await run('abortDefault',()=>{const c=new TaskController();c.abort();return{aborted:c.signal.aborted,name:c.signal.reason.name,message:c.signal.reason.message,dom:c.signal.reason instanceof DOMException}});
++await run('basicTask',async()=>{const a=[],p=scheduler.postTask(function(){'use strict';a.push(this===window?'window':this===undefined?'undefined':this===null?'null':'other');return17},{priority:'background'});a.push('sync');Promise.resolve().then(()=>a.push('microtask'));return{realm:p instanceof Promise,value:await p,order:a}});
++await run('priorities',async()=>{const order=[];await Promise.all([scheduler.postTask(()=>order.push('background'),{priority:'background'}),scheduler.postTask(()=>order.push('visible'),{priority:'user-visible'}),scheduler.postTask(()=>order.push('blocking'),{priority:'user-blocking'})]);return order});
++await run('reprioritize',async()=>{const order=[],c=new TaskController({priority:'background'}),a=scheduler.postTask(()=>order.push('controller'),{signal:c.signal}),b=scheduler.postTask(()=>order.push('fixed'),{priority:'user-visible'});c.setPriority('user-blocking');await Promise.all([a,b]);return order});
++await run('asyncAdoption',async()=>{const o=[];const p=scheduler.postTask(async()=>{o.push('start');await new Promise(r=>setTimeout(r,5));o.push('finish');return{data:3}}),q=scheduler.postTask(()=>o.push('other'));const value=await p;await q;return{value,order:o}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-surface-native.json
+@@ -0,0 +1,254 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "bea0fbdc115c9c69ba31eda569f7e74a2834b9374e5d4dadcf13c3e5191ddbb0",
++  "observations": [
++    {
++      "name": "surface",
++      "value": {
++        "scheduler": true,
++        "tag": "[object Scheduler]",
++        "classes": {
++          "Scheduler": {
++            "length": 0,
++            "parent": "Object",
++            "keys": [
++              "postTask",
++              "yield",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          },
++          "TaskController": {
++            "length": 0,
++            "parent": "AbortController",
++            "keys": [
++              "setPriority",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          },
++          "TaskSignal": {
++            "length": 0,
++            "parent": "AbortSignal",
++            "keys": [
++              "priority",
++              "onprioritychange",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          },
++          "TaskPriorityChangeEvent": {
++            "length": 1,
++            "parent": "Event",
++            "keys": [
++              "previousPriority",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          }
++        }
++      }
++    },
++    {
++      "name": "schedulerConstruct",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    },
++    {
++      "name": "signalConstruct",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    },
++    {
++      "name": "controller-default",
++      "value": {
++        "signal": true,
++        "abort": true,
++        "controller": true,
++        "priority": "user-visible",
++        "aborted": false,
++        "tag": "[object TaskSignal]"
++      }
++    },
++    {
++      "name": "controller-null",
++      "value": {
++        "signal": true,
++        "abort": true,
++        "controller": true,
++        "priority": "user-visible",
++        "aborted": false,
++        "tag": "[object TaskSignal]"
++      }
++    },
++    {
++      "name": "controller-bg",
++      "value": {
++        "signal": true,
++        "abort": true,
++        "controller": true,
++        "priority": "background",
++        "aborted": false,
++        "tag": "[object TaskSignal]"
++      }
++    },
++    {
++      "name": "controller-bad",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "controller-symbol",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "controller-primitive",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "priorityEvent",
++      "value": [
++        {
++          "old": "background",
++          "now": "user-blocking",
++          "trusted": true,
++          "sub": true,
++          "base": true,
++          "target": true,
++          "bubbles": false,
++          "cancelable": false
++        },
++        {
++          "old": "user-blocking",
++          "now": "user-visible",
++          "trusted": true,
++          "sub": true,
++          "base": true,
++          "target": true,
++          "bubbles": false,
++          "cancelable": false
++        }
++      ]
++    },
++    {
++      "name": "eventCtor",
++      "value": {
++        "old": "background",
++        "trusted": false,
++        "bubbles": true,
++        "cancelable": true,
++        "tag": "[object TaskPriorityChangeEvent]"
++      }
++    },
++    {
++      "name": "event-missing",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "event-one",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "event-empty",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "event-null",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "event-bad",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "event-symbol",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "priorityReentrant",
++      "value": [
++        [
++          "user-visible",
++          "background"
++        ],
++        "Error"
++      ]
++    },
++    {
++      "name": "abortDefault",
++      "value": {
++        "aborted": true,
++        "name": "AbortError",
++        "message": "signal is aborted without reason",
++        "dom": true
++      }
++    },
++    {
++      "name": "basicTask",
++      "error": {
++        "name": "ReferenceError",
++        "message": "return17 is not defined"
++      }
++    },
++    {
++      "name": "priorities",
++      "value": [
++        "background",
++        "visible",
++        "blocking"
++      ]
++    },
++    {
++      "name": "reprioritize",
++      "value": [
++        "controller",
++        "fixed"
++      ]
++    },
++    {
++      "name": "asyncAdoption",
++      "value": {
++        "value": {
++          "data": 3
++        },
++        "order": [
++          "start",
++          "other",
++          "finish"
++        ]
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-surface-v2-native-expression.js
+@@ -0,0 +1,14 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++await run('surface',()=>({scheduler:scheduler instanceof Scheduler,tag:Object.prototype.toString.call(scheduler),classes:Object.fromEntries([Scheduler,TaskController,TaskSignal,TaskPriorityChangeEvent].map(C=>[C.name,{length:C.length,parent:Object.getPrototypeOf(C.prototype).constructor.name,keys:Reflect.ownKeys(C.prototype).map(String)}]))}));
++await run('schedulerConstruct',()=>new Scheduler());await run('signalConstruct',()=>new TaskSignal());
++for(const[name,init]of[['default',undefined],['null',null],['bg',{priority:'background'}],['bad',{priority:'bad'}],['symbol',{priority:Symbol('background')}],['primitive',3]])await run('controller-'+name,()=>{const c=new TaskController(init);return{signal:c.signal instanceof TaskSignal,abort:c.signal instanceof AbortSignal,controller:c instanceof AbortController,priority:c.signal.priority,aborted:c.signal.aborted,tag:Object.prototype.toString.call(c.signal)}});
++await run('priorityEvent',()=>{const c=new TaskController({priority:'background'}),events=[];c.signal.addEventListener('prioritychange',e=>events.push({old:e.previousPriority,now:c.signal.priority,trusted:e.isTrusted,sub:e instanceof TaskPriorityChangeEvent,base:e instanceof Event,target:e.target===c.signal,bubbles:e.bubbles,cancelable:e.cancelable}));c.setPriority('user-blocking');c.setPriority('user-blocking');c.setPriority('user-visible');return events});
++await run('eventCtor',()=>{const e=new TaskPriorityChangeEvent('prioritychange',{previousPriority:'background',bubbles:true,cancelable:true});return{old:e.previousPriority,trusted:e.isTrusted,bubbles:e.bubbles,cancelable:e.cancelable,tag:Object.prototype.toString.call(e)}});
++for(const[name,args]of[['missing',[]],['one',['prioritychange']],['empty',['prioritychange',{}]],['null',['prioritychange',null]],['bad',['prioritychange',{previousPriority:'bad'}]],['symbol',[Symbol('event'),{previousPriority:Symbol('background')}]]])await run('event-'+name,()=>{const e=new TaskPriorityChangeEvent(...args);return{type:e.type,old:e.previousPriority}});
++await run('priorityReentrant',()=>{const c=new TaskController(),trace=[];c.signal.onprioritychange=e=>{trace.push([e.previousPriority,c.signal.priority]);if(c.signal.priority==='background'){try{c.setPriority('user-blocking')}catch(e){trace.push(e.name)}}};c.setPriority('background');return trace});
++await run('abortDefault',()=>{const c=new TaskController();c.abort();return{aborted:c.signal.aborted,name:c.signal.reason.name,message:c.signal.reason.message,dom:c.signal.reason instanceof DOMException}});
++await run('basicTask',async()=>{const a=[],p=scheduler.postTask(function(){'use strict';a.push(this===window?'window':this===undefined?'undefined':this===null?'null':'other');return 17},{priority:'background'});a.push('sync');Promise.resolve().then(()=>a.push('microtask'));return{realm:p instanceof Promise,value:await p,order:a}});
++await run('priorities',async()=>{const order=[];await Promise.all([scheduler.postTask(()=>order.push('background'),{priority:'background'}),scheduler.postTask(()=>order.push('visible'),{priority:'user-visible'}),scheduler.postTask(()=>order.push('blocking'),{priority:'user-blocking'})]);return order});
++await run('reprioritize',async()=>{const order=[],c=new TaskController({priority:'background'}),a=scheduler.postTask(()=>order.push('controller'),{signal:c.signal}),b=scheduler.postTask(()=>order.push('fixed'),{priority:'user-visible'});c.setPriority('user-blocking');await Promise.all([a,b]);return order});
++await run('asyncAdoption',async()=>{const o=[];const p=scheduler.postTask(async()=>{o.push('start');await new Promise(r=>setTimeout(r,5));o.push('finish');return{data:3}}),q=scheduler.postTask(()=>o.push('other'));const value=await p;await q;return{value,order:o}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-surface-v2-native.json
+@@ -0,0 +1,259 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "a3878c1c946253847f7d77116e953643598b1c41b9e161223d2466f4fc3dadf4",
++  "observations": [
++    {
++      "name": "surface",
++      "value": {
++        "scheduler": true,
++        "tag": "[object Scheduler]",
++        "classes": {
++          "Scheduler": {
++            "length": 0,
++            "parent": "Object",
++            "keys": [
++              "postTask",
++              "yield",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          },
++          "TaskController": {
++            "length": 0,
++            "parent": "AbortController",
++            "keys": [
++              "setPriority",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          },
++          "TaskSignal": {
++            "length": 0,
++            "parent": "AbortSignal",
++            "keys": [
++              "priority",
++              "onprioritychange",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          },
++          "TaskPriorityChangeEvent": {
++            "length": 1,
++            "parent": "Event",
++            "keys": [
++              "previousPriority",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ]
++          }
++        }
++      }
++    },
++    {
++      "name": "schedulerConstruct",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    },
++    {
++      "name": "signalConstruct",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    },
++    {
++      "name": "controller-default",
++      "value": {
++        "signal": true,
++        "abort": true,
++        "controller": true,
++        "priority": "user-visible",
++        "aborted": false,
++        "tag": "[object TaskSignal]"
++      }
++    },
++    {
++      "name": "controller-null",
++      "value": {
++        "signal": true,
++        "abort": true,
++        "controller": true,
++        "priority": "user-visible",
++        "aborted": false,
++        "tag": "[object TaskSignal]"
++      }
++    },
++    {
++      "name": "controller-bg",
++      "value": {
++        "signal": true,
++        "abort": true,
++        "controller": true,
++        "priority": "background",
++        "aborted": false,
++        "tag": "[object TaskSignal]"
++      }
++    },
++    {
++      "name": "controller-bad",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "controller-symbol",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "controller-primitive",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "priorityEvent",
++      "value": [
++        {
++          "old": "background",
++          "now": "user-blocking",
++          "trusted": true,
++          "sub": true,
++          "base": true,
++          "target": true,
++          "bubbles": false,
++          "cancelable": false
++        },
++        {
++          "old": "user-blocking",
++          "now": "user-visible",
++          "trusted": true,
++          "sub": true,
++          "base": true,
++          "target": true,
++          "bubbles": false,
++          "cancelable": false
++        }
++      ]
++    },
++    {
++      "name": "eventCtor",
++      "value": {
++        "old": "background",
++        "trusted": false,
++        "bubbles": true,
++        "cancelable": true,
++        "tag": "[object TaskPriorityChangeEvent]"
++      }
++    },
++    {
++      "name": "event-missing",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "event-one",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "event-empty",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "event-null",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "event-bad",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "event-symbol",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "priorityReentrant",
++      "value": [
++        [
++          "user-visible",
++          "background"
++        ],
++        "Error"
++      ]
++    },
++    {
++      "name": "abortDefault",
++      "value": {
++        "aborted": true,
++        "name": "AbortError",
++        "message": "signal is aborted without reason",
++        "dom": true
++      }
++    },
++    {
++      "name": "basicTask",
++      "value": {
++        "realm": true,
++        "value": 17,
++        "order": [
++          "sync",
++          "microtask",
++          "window"
++        ]
++      }
++    },
++    {
++      "name": "priorities",
++      "value": [
++        "background",
++        "visible",
++        "blocking"
++      ]
++    },
++    {
++      "name": "reprioritize",
++      "value": [
++        "controller",
++        "fixed"
++      ]
++    },
++    {
++      "name": "asyncAdoption",
++      "value": {
++        "value": {
++          "data": 3
++        },
++        "order": [
++          "start",
++          "other",
++          "finish"
++        ]
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-utility-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{let inherited;try{await scheduler.yield();inherited='resolved'}catch(e){inherited=e}const c=new TaskController(),events=[];c.signal.addEventListener('prioritychange',e=>events.push({sub:e instanceof TaskPriorityChangeEvent,event:e instanceof Event,signal:c.signal instanceof TaskSignal,abort:c.signal instanceof AbortSignal,target:e.target===c.signal,trusted:e.isTrusted,old:e.previousPriority}));c.setPriority('background');const p=scheduler.postTask(()=>43);return{inherited,events,promise:p instanceof Promise,value:await p,classes:TaskController instanceof Function&&Scheduler instanceof Function,namespace:scheduler instanceof Scheduler}})()
+--- /dev/null
++++ b/docs/reference/scheduler-utility-native.json
+@@ -0,0 +1,24 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "e4327b50b5bb67f36c0f61552094c867aa4495c8fed23412a0743791be83d623",
++  "expressionSHA256": "1ba3b521f4b1cd327a6ca6f1fe574d61f32af8ec4dc2b6935240abf5a9ef13b5",
++  "observations": {
++    "inherited": "resolved",
++    "events": [
++      {
++        "sub": true,
++        "event": true,
++        "signal": true,
++        "abort": true,
++        "target": true,
++        "trusted": true,
++        "old": "user-visible"
++      }
++    ],
++    "promise": true,
++    "value": 43,
++    "classes": true,
++    "namespace": true
++  }
++}
+--- /dev/null
++++ b/docs/reference/scheduler-utility-retire-native.json
+@@ -0,0 +1,15 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "9f5cb4ac7454776289c83384389b6e1f37e2cd83f597779b52f49c11f29ddac7",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": {
++        "ran": 1,
++        "settled": "resolved",
++        "closed": true
++      }
++    }
++  }
++}
+--- /dev/null
++++ b/docs/reference/scheduler-validation-native-expression.js
+@@ -0,0 +1,12 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const[name,options]of[['null',null],['primitive',3],['delayNegative',{delay:-1}],['delayFraction',{delay:.5}],['delayNaN',{delay:NaN}],['delayInfinity',{delay:Infinity}],['delayBigint',{delay:1n}],['delaySymbol',{delay:Symbol()}],['priorityBad',{priority:'bad'}],['priorityNull',{priority:null}],['priorityObject',{priority:{toString(){return'background'}}}],['signalNull',{signal:null}],['signalFake',{signal:Object.create(AbortSignal.prototype)}]])await run(name,async()=>{let p;try{p=scheduler.postTask(()=>7,options)}catch(e){return{sync:true,name:e.name,message:e.message}}return{sync:false,promise:p instanceof Promise,result:await Promise.race([p.then(value=>({value}),e=>({name:e.name,message:e.message})),new Promise(r=>setTimeout(()=>r({pending:true}),30))])}});
++for(const[name,args]of[['noCallback',[]],['badCallback',[3]],['missingThis',[()=>1]],['fakeYield',[]]])await run(name,()=>{let p;try{p=name==='missingThis'?Scheduler.prototype.postTask.call({},...args):name==='fakeYield'?Scheduler.prototype.yield.call({}):scheduler.postTask(...args)}catch(e){return{sync:true,name:e.name,message:e.message}}return{sync:false,promise:p instanceof Promise}});
++await run('optionOrder',async()=>{const trace=[],o={get delay(){trace.push('delay');return{valueOf(){trace.push('number');return 0}}},get priority(){trace.push('priority');return'user-visible'},get signal(){trace.push('signal');return null}};const p=scheduler.postTask(()=>3,o);return{value:await p,trace}});
++await run('controllerEnumObject',()=>new TaskController({priority:{toString(){return'background'}}}).signal.priority);
++await run('reentrantMessage',()=>{const c=new TaskController(),rows=[];c.signal.addEventListener('prioritychange',()=>{for(const p of['background','user-blocking'])try{c.setPriority(p)}catch(e){rows.push({name:e.name,message:e.message})}});c.setPriority('background');return rows});
++await run('setAfterAbort',()=>{const c=new TaskController(),trace=[];c.signal.addEventListener('prioritychange',e=>trace.push([e.previousPriority,c.signal.priority,e.isTrusted]));c.abort('old');c.setPriority('background');return{trace,reason:c.signal.reason}});
++await run('priorityOrder',()=>{const trace=[],c=new TaskController({get priority(){trace.push('priority');return'user-visible'}});let error;try{c.setPriority({toString(){trace.push('string');return'background'}})}catch(e){error=e.name}return{trace,error}});
++await run('eventOrder',()=>{const trace=[];new TaskPriorityChangeEvent({toString(){trace.push('type');return't'}},{get bubbles(){trace.push('bubbles');return false},get cancelable(){trace.push('cancelable');return false},get composed(){trace.push('composed');return false},get previousPriority(){trace.push('previous');return'background'}});return trace});
++await run('eventGetter',()=>{const d=Object.getOwnPropertyDescriptor(TaskPriorityChangeEvent.prototype,'previousPriority');let fake;try{d.get.call({})}catch(e){fake={name:e.name,message:e.message}}return{get:d.get.name,enumerable:d.enumerable,configurable:d.configurable,fake}});
++await run('namespace',()=>{let owner=window,d;while(owner&&!d){d=Object.getOwnPropertyDescriptor(owner,'scheduler');if(!d)owner=Object.getPrototypeOf(owner)}return{value:typeof d.value,get:typeof d.get,set:typeof d.set,writable:d.writable,enumerable:d.enumerable,configurable:d.configurable,same:scheduler===scheduler}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-validation-native.json
+@@ -0,0 +1,255 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "29458f81e87e27472eb63a41cfda5c5dc70e4a76418d37bd1586c4a2bd3ca712",
++  "observations": [
++    {
++      "name": "null",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "primitive",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "delayNegative",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "pending": true
++        }
++      }
++    },
++    {
++      "name": "delayFraction",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delayNaN",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delayInfinity",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delayBigint",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delaySymbol",
++      "value": {
++        "sync": true,
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    },
++    {
++      "name": "priorityBad",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "priorityNull",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "priorityObject",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "signalNull",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "signalFake",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "noCallback",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "badCallback",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "missingThis",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "fakeYield",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "optionOrder",
++      "value": {
++        "value": 3,
++        "trace": [
++          "delay",
++          "number",
++          "priority",
++          "signal"
++        ]
++      }
++    },
++    {
++      "name": "controllerEnumObject",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "reentrantMessage",
++      "value": [
++        {
++          "name": "Error",
++          "message": "NotSupportedError"
++        },
++        {
++          "name": "Error",
++          "message": "NotSupportedError"
++        }
++      ]
++    },
++    {
++      "name": "setAfterAbort",
++      "value": {
++        "trace": [
++          [
++            "user-visible",
++            "background",
++            true
++          ]
++        ],
++        "reason": "old"
++      }
++    },
++    {
++      "name": "priorityOrder",
++      "value": {
++        "trace": [
++          "priority"
++        ],
++        "error": "TypeError"
++      }
++    },
++    {
++      "name": "eventOrder",
++      "value": [
++        "type",
++        "bubbles",
++        "cancelable",
++        "composed",
++        "previous"
++      ]
++    },
++    {
++      "name": "eventGetter",
++      "value": {
++        "get": "get previousPriority",
++        "enumerable": true,
++        "configurable": true,
++        "fake": {
++          "name": "TypeError",
++          "message": "Illegal invocation"
++        }
++      }
++    },
++    {
++      "name": "namespace",
++      "value": {
++        "value": "undefined",
++        "get": "function",
++        "set": "undefined",
++        "enumerable": true,
++        "configurable": true,
++        "same": true
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/scheduler-validation-v2-native-expression.js
+@@ -0,0 +1,12 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const[name,options]of[['null',null],['primitive',3],['delayNegative',{delay:-1}],['delayFraction',{delay:.5}],['delayNaN',{delay:NaN}],['delayInfinity',{delay:Infinity}],['delayBigint',{delay:1n}],['delaySymbol',{delay:Symbol()}],['priorityBad',{priority:'bad'}],['priorityNull',{priority:null}],['priorityObject',{priority:{toString(){return'background'}}}],['signalNull',{signal:null}],['signalFake',{signal:Object.create(AbortSignal.prototype)}]])await run(name,async()=>{let p;try{p=scheduler.postTask(()=>7,options)}catch(e){return{sync:true,name:e.name,message:e.message}}return{sync:false,promise:p instanceof Promise,result:await Promise.race([p.then(value=>({value}),e=>({name:e.name,message:e.message})),new Promise(r=>setTimeout(()=>r({pending:true}),30))])}});
++for(const[name,args]of[['noCallback',[]],['badCallback',[3]],['missingThis',[()=>1]],['fakeYield',[]]])await run(name,()=>{let p;try{p=name==='missingThis'?Scheduler.prototype.postTask.call({},...args):name==='fakeYield'?Scheduler.prototype.yield.call({}):scheduler.postTask(...args)}catch(e){return{sync:true,name:e.name,message:e.message}}p.catch(()=>{});return{sync:false,promise:p instanceof Promise}});
++await run('optionOrder',async()=>{const trace=[],o={get delay(){trace.push('delay');return{valueOf(){trace.push('number');return 0}}},get priority(){trace.push('priority');return'user-visible'},get signal(){trace.push('signal');return null}};const p=scheduler.postTask(()=>3,o);return{value:await p,trace}});
++await run('controllerEnumObject',()=>new TaskController({priority:{toString(){return'background'}}}).signal.priority);
++await run('reentrantMessage',()=>{const c=new TaskController(),rows=[];c.signal.addEventListener('prioritychange',()=>{for(const p of['background','user-blocking'])try{c.setPriority(p)}catch(e){rows.push({name:e.name,message:e.message})}});c.setPriority('background');return rows});
++await run('setAfterAbort',()=>{const c=new TaskController(),trace=[];c.signal.addEventListener('prioritychange',e=>trace.push([e.previousPriority,c.signal.priority,e.isTrusted]));c.abort('old');c.setPriority('background');return{trace,reason:c.signal.reason}});
++await run('priorityOrder',()=>{const trace=[],c=new TaskController({get priority(){trace.push('priority');return'user-visible'}});let error;try{c.setPriority({toString(){trace.push('string');return'background'}})}catch(e){error=e.name}return{trace,error}});
++await run('eventOrder',()=>{const trace=[];new TaskPriorityChangeEvent({toString(){trace.push('type');return't'}},{get bubbles(){trace.push('bubbles');return false},get cancelable(){trace.push('cancelable');return false},get composed(){trace.push('composed');return false},get previousPriority(){trace.push('previous');return'background'}});return trace});
++await run('eventGetter',()=>{const d=Object.getOwnPropertyDescriptor(TaskPriorityChangeEvent.prototype,'previousPriority');let fake;try{d.get.call({})}catch(e){fake={name:e.name,message:e.message}}return{get:d.get.name,enumerable:d.enumerable,configurable:d.configurable,fake}});
++await run('namespace',()=>{let owner=window,d;while(owner&&!d){d=Object.getOwnPropertyDescriptor(owner,'scheduler');if(!d)owner=Object.getPrototypeOf(owner)}return{value:typeof d.value,get:typeof d.get,set:typeof d.set,writable:d.writable,enumerable:d.enumerable,configurable:d.configurable,same:scheduler===scheduler}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/scheduler-validation-v2-native.json
+@@ -0,0 +1,255 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "41a4cc8d735f2f63fc9a293b637f90c6c49d6a265ea8a4dc3133b4accab755b6",
++  "observations": [
++    {
++      "name": "null",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "primitive",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "delayNegative",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "pending": true
++        }
++      }
++    },
++    {
++      "name": "delayFraction",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delayNaN",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delayInfinity",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delayBigint",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "delaySymbol",
++      "value": {
++        "sync": true,
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    },
++    {
++      "name": "priorityBad",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "priorityNull",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "priorityObject",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "signalNull",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "value": 7
++        }
++      }
++    },
++    {
++      "name": "signalFake",
++      "value": {
++        "sync": false,
++        "promise": true,
++        "result": {
++          "name": "TypeError",
++          "message": "invalid postTask options"
++        }
++      }
++    },
++    {
++      "name": "noCallback",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "badCallback",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "missingThis",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "fakeYield",
++      "value": {
++        "sync": false,
++        "promise": true
++      }
++    },
++    {
++      "name": "optionOrder",
++      "value": {
++        "value": 3,
++        "trace": [
++          "delay",
++          "number",
++          "priority",
++          "signal"
++        ]
++      }
++    },
++    {
++      "name": "controllerEnumObject",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "reentrantMessage",
++      "value": [
++        {
++          "name": "Error",
++          "message": "NotSupportedError"
++        },
++        {
++          "name": "Error",
++          "message": "NotSupportedError"
++        }
++      ]
++    },
++    {
++      "name": "setAfterAbort",
++      "value": {
++        "trace": [
++          [
++            "user-visible",
++            "background",
++            true
++          ]
++        ],
++        "reason": "old"
++      }
++    },
++    {
++      "name": "priorityOrder",
++      "value": {
++        "trace": [
++          "priority"
++        ],
++        "error": "TypeError"
++      }
++    },
++    {
++      "name": "eventOrder",
++      "value": [
++        "type",
++        "bubbles",
++        "cancelable",
++        "composed",
++        "previous"
++      ]
++    },
++    {
++      "name": "eventGetter",
++      "value": {
++        "get": "get previousPriority",
++        "enumerable": true,
++        "configurable": true,
++        "fake": {
++          "name": "TypeError",
++          "message": "Illegal invocation"
++        }
++      }
++    },
++    {
++      "name": "namespace",
++      "value": {
++        "value": "undefined",
++        "get": "function",
++        "set": "undefined",
++        "enumerable": true,
++        "configurable": true,
++        "same": true
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/src/scheduler.js
+@@ -0,0 +1,125 @@
++// Independent timer-backed task execution calibrated against the pinned Native.
++// Priority metadata/events are real; that target currently runs priority hints
++// FIFO. Callback returns/errors settle actual receiving-realm Promises.
++import {createRequire} from 'node:module';
++import {createInvocationTrampoline} from './invocation.js';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++import {onFrameRetirement} from './frame-activity.js';
++const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const installed=new WeakMap(),controllers=new WeakMap(),signals=new WeakMap(),events=new WeakMap(),schedulers=new WeakMap();
++const apply=Reflect.apply,microtask=queueMicrotask;
++const slot=fields=>Object.assign(Object.create(null),fields);
++function signalSource(value){const state=signals.get(value);if(state)return state.source;const p=platformFactoryRecord(value);return p?.kind==='AbortSignal'&&p.implementation? p.implementation:null}
++function factory(g,b){
++ const TypeError=g.TypeError,Error=g.Error,BaseController=g.AbortController,BaseSignal=g.AbortSignal,BaseEvent=g.Event,Promise=g.Promise,Number=g.Number;
++ const define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,setPrototype=g.Object.setPrototypeOf,apply=g.Reflect.apply;
++ const controllerSignal=own(BaseController.prototype,'signal').get,symbolDescription=own(g.Symbol.prototype,'description').get,String=g.String;
++ const domString=value=>typeof value==='symbol'?apply(symbolDescription,value,[])??'':String(value);
++ const allowed=value=>typeof value==='string'&&(value==='user-visible'||value==='user-blocking'||value==='background');
++ const invalid=()=>new TypeError('invalid argument'),illegal=()=>new TypeError('Illegal invocation');
++ function dictionary(value){if(value==null)return{};if(typeof value!=='object'&&typeof value!=='function')throw invalid();return value}
++ class TaskPriorityChangeEvent extends BaseEvent{
++  constructor(type,init=undefined){
++   if(!arguments.length)throw invalid();
++   type=domString(type);
++   if(init!=null&&typeof init!=='object'&&typeof init!=='function')throw invalid();
++   super(type,init);
++   if(init==null)throw new TypeError('');
++   if(typeof init!=='object'&&typeof init!=='function')throw invalid();
++   const previous=init.previousPriority;if(!allowed(previous))throw invalid();b.event(this,previous);
++  }
++  get previousPriority(){if(!b.hasEvent(this))throw illegal();return b.previous(this)}
++ }
++ class TaskSignal extends BaseSignal{
++  constructor(){throw new TypeError('Illegal Constructor')}
++  get priority(){if(!b.hasSignal(this))throw illegal();return b.priority(this)}
++  get onprioritychange(){if(!b.hasSignal(this))throw illegal();return b.handler(this)}
++  set onprioritychange(value){if(!b.hasSignal(this))throw illegal();b.handlerSet(this,typeof value==='function'?value:null)}
++ }
++ class TaskController extends BaseController{
++  constructor(options=undefined){
++   const input=dictionary(options),value=input.priority,priority=value===undefined?'user-visible':value;
++   if(!allowed(priority))throw invalid();
++   super();const signal=apply(controllerSignal,this,[]);setPrototype(signal,TaskSignal.prototype);b.controller(this,signal,priority);
++  }
++  setPriority(priority){if(!b.hasController(this))throw illegal();if(!allowed(priority))throw invalid();if(b.changing(this))throw new Error('NotSupportedError');b.change(this,priority)}
++ }
++ class Scheduler{
++  constructor(){throw new TypeError('Illegal Constructor')}
++  postTask(callback,options=undefined){
++   if(!b.hasScheduler(this)||typeof callback!=='function')return Promise.reject(invalid());
++   if(options!=null&&typeof options!=='object'&&typeof options!=='function')return Promise.reject(new TypeError('invalid postTask options'));
++   const input=options??{},delayValue=input.delay,delay=delayValue==null?0:Number(delayValue)>>>0,priority=input.priority;
++   if(priority!=null&&!allowed(priority))return Promise.reject(new TypeError('invalid postTask options'));
++   const signal=input.signal;if(signal!=null&&!b.validSignal(signal))return Promise.reject(new TypeError('invalid postTask options'));
++   return new Promise((resolve,reject)=>b.enqueue(callback,delay,signal??null,resolve,reject));
++  }
++  yield(){
++   if(!b.hasScheduler(this))return Promise.reject(invalid());
++   const current=b.currentSignal();if(current&&b.aborted(current))return Promise.reject(b.reason(current));
++   return new Promise((resolve,reject)=>b.yieldTask(resolve,reject,current));
++  }
++ }
++ for(const C of[Scheduler,TaskController,TaskSignal,TaskPriorityChangeEvent]){
++  const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);define(p,key,{...d,enumerable:true})}
++  delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true});
++ }
++ define(g,'scheduler',{get(){return b.namespace(this)},enumerable:true,configurable:true});
++ return{Scheduler,TaskController,TaskSignal,TaskPriorityChangeEvent};
++}
++export function installScheduler(page,realm,{context,mainWindow=realm}={}){
++ if(installed.has(realm))return installed.get(realm);
++ if(!realm.AbortSignal||!realm.Event||!realm.document)throw new TypeError('Scheduler currently requires a genuine document AbortSignal/EventTarget realm');
++ for(const kind of['Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'])registerPlatformFactoryKind(kind);
++ const state=slot({current:null,tasks:new Set(),ready:[],front:[],pump:undefined,disposed:false});
++ const timer=realm.setTimeout,clear=realm.clearTimeout,create=realm.Object.create,ObjectCtor=realm.Object,ErrorCtor=realm.TypeError;
++ const aliases=new Set([realm,realm._globalObject,realm._globalProxy].filter(v=>v!==null&&(typeof v==='object'||typeof v==='function')));
++ const add=realm.EventTarget.prototype.addEventListener,remove=realm.EventTarget.prototype.removeEventListener;
++ const invocation=createInvocationTrampoline(context??implForWrapper(realm.document)._globalObject);
++ let classes,instance,capturingNamespace=false;
++ const record=(value,kind,implementation)=>registerPlatformFactory(value,{kind,implementation,globalObject:realm});
++ function cleanTask(task){task.active=false;if(task.timer!==undefined)apply(clear,realm,[task.timer]);task.timer=undefined;if(task.source&&task.abort)task.source._removeAlgorithm(task.abort);task.abort=null;state.tasks.delete(task)}
++ function cancelPending(){if(state.pump!==undefined)apply(clear,realm,[state.pump]);state.pump=undefined;for(const task of state.tasks)cleanTask(task);state.tasks.clear();state.ready.length=state.front.length=0}
++ const unretire=realm===mainWindow?onFrameRetirement(mainWindow,cancelPending):()=>{};
++ const dispose=()=>{if(state.disposed)return;state.disposed=true;cancelPending();unretire();page?.documentAbort?.signal.removeEventListener('abort',dispose)};
++ page?.documentAbort?.signal.addEventListener('abort',dispose,{once:true});
++ function pump(){
++  state.pump=undefined;if(state.disposed)return;
++  let task;while(!task||!task.active){task=state.front.shift()??state.ready.shift();if(!task)return}
++  cleanTask(task);
++  if(task.source?.aborted)task.reject(task.source.reason);
++  else if(task.yielded)task.resolve();
++  else{state.current=task.signal;let value,error,threw=false;try{value=invocation.invoke(task.callback,realm,[],{timeout:Math.min(page?.timeout??2000,2000),displayErrors:false})}catch(cause){error=cause;threw=true}
++   if(task.source?.aborted)task.reject(task.source.reason);else if(threw)task.reject(error);else task.resolve(value);
++  }
++  requestPump();
++ }
++ function requestPump(){if(!state.disposed&&state.pump===undefined&&(state.front.length||state.ready.length))state.pump=apply(timer,realm,[pump,0])}
++ function schedule(callback,delay,signal,resolve,reject,yielded=false){
++  if(state.disposed)return;
++  const source=signal?signalSource(signal):null;if(source?.aborted){reject(source.reason);return}
++  const task=slot({callback,source,signal,resolve,reject,yielded,remaining:delay,timer:undefined,abort:null,active:true});state.tasks.add(task);
++  task.abort=()=>{cleanTask(task);reject(source.reason)};if(source)source._addAlgorithm(task.abort);
++  const ready=()=>{(yielded?state.front:state.ready).push(task);requestPump()};
++  if(!delay){ready();return}
++  const fire=()=>{task.timer=undefined;task.remaining-=Math.min(task.remaining,2147483647);if(task.remaining>0)task.timer=apply(timer,realm,[fire,Math.min(task.remaining,2147483647)]);else ready()};
++  task.timer=apply(timer,realm,[fire,Math.min(delay,2147483647)]);
++ }
++ const b={
++  hasController:v=>controllers.has(v),hasSignal:v=>signals.has(v),priority:v=>signals.get(v).priority,changing:v=>signals.get(controllers.get(v)).changing,
++  hasEvent:v=>events.has(v),previous:v=>events.get(v).previous,
++  event(value,previous){const data=Object.freeze(slot({previous}));events.set(value,data);record(value,'TaskPriorityChangeEvent',data)},
++  controller(value,signal,priority){const provenance=platformFactoryRecord(signal),source=provenance?.implementation;if(!source)throw new ErrorCtor('A genuine document AbortSignal is required');const data=slot({source,priority,changing:false,handler:null,relay:null});signals.set(signal,data);controllers.set(value,signal);record(signal,'TaskSignal',source);record(value,'TaskController',platformFactoryRecord(value)?.implementation)},
++  change(value,priority){const signal=controllers.get(value),data=signals.get(signal);if(data.priority===priority)return;const previous=data.priority;data.priority=priority;data.changing=true;microtask(()=>{data.changing=false});try{const event=new classes.TaskPriorityChangeEvent('prioritychange',{previousPriority:previous}),eventImpl=implForWrapper(event);eventImpl.isTrusted=true;data.source._dispatch(eventImpl)}finally{data.changing=false}},
++  handler:v=>signals.get(v).handler,
++  handlerSet(value,callback){const data=signals.get(value);data.handler=callback;if(!callback&&data.relay){apply(remove,value,['prioritychange',data.relay]);data.relay=null}else if(callback&&!data.relay){data.relay=event=>{if(data.handler)apply(data.handler,value,[event])};apply(add,value,['prioritychange',data.relay])}},
++  hasScheduler:v=>schedulers.has(v),namespace(value){if(capturingNamespace)aliases.add(value);if(!aliases.has(value))throw new ErrorCtor('Illegal invocation');return instance},
++  validSignal:value=>!!signalSource(value),aborted:value=>signalSource(value).aborted,reason:value=>signalSource(value).reason,currentSignal:()=>state.current,
++  yieldTask:(resolve,reject,signal)=>schedule(null,0,signal,resolve,reject,true),
++  enqueue:schedule,
++ };
++ const created=realm.eval(`(${factory.toString()})`)(realm,b);classes=Object.freeze(Object.assign(Object.create(null),created));instance=apply(create,ObjectCtor,[classes.Scheduler.prototype]);schedulers.set(instance,state);record(instance,'Scheduler',state);
++ capturingNamespace=true;try{realm.eval('scheduler')}finally{capturingNamespace=false}
++ const api={dispose};installed.set(realm,api);return api;
++}
+--- /dev/null
++++ b/test/scheduler.test.js
+@@ -0,0 +1,33 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++async function fixture(t){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body></body>');return{browser,page,window:page.dom.window}}
++const plain=v=>JSON.parse(JSON.stringify(v));
++for(const file of ['scheduler-surface-v2-native','scheduler-validation-v2-native','scheduler-lifetime-v2-native','scheduler-context-native','scheduler-order-native','scheduler-extra-native'])test(`genuine Scheduler Native controls: ${file}`,async t=>{
++ const{page}=await fixture(t),expression=await readFile(new URL(`../docs/reference/${file}-expression.js`,import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL(`../docs/reference/${file}.json`,import.meta.url),'utf8')).observations;
++ const actual=plain(await page.evaluate(expression));
++ // Existing Worker AbortSignal/EventTarget integration is a separately observed
++ // limitation. These tables retain Native worker availability, without claiming
++ // that this document-realm implementation provides the Worker API yet.
++ const skip=new Set(['worker']);assert.deepEqual(actual.filter(v=>!skip.has(v.name)),expected.filter(v=>!skip.has(v.name)));
++});
++
++test('unchanged pinned scheduler fixture executes actual callbacks and nonzero native-branch assertions',async t=>{
++ const{upstreamTestRoot}=await import('./upstream-reference.js'),{startFixtureServer}=await import('../scripts/upstream-fixture-server.mjs'),{createHash}=await import('node:crypto');const root=await upstreamTestRoot(),path='scheduler/scheduler.html',source=await readFile(`${root}/${path}`);assert.equal(createHash('sha256').update(source).digest('hex'),'88deb42b19c69fbd0b12bbe01982b51698a114febc49c6942f9930fdfe8d383b');const server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());const browser=new Browser({userAgent:'Lightpanda/1.0'});t.after(()=>browser.close());const page=browser.createPage(),errors=[];page.on('console',e=>{if(e.type==='error')errors.push(e.args.map(String).join(' '))});page.newDocumentScripts.set('external',{source:'globalThis.__lp_external_runner=true;'});await page.navigate(`${server.origin}/src/browser/tests/${path}`);let passed=false;for(let i=0;i<200;i++){passed=page.evaluate('testing.assertOk()')===true;if(passed)break;await new Promise(r=>setTimeout(r,20))}assert.equal(page.evaluate('testing.IS_TEST_RUNNER'),true);assert.equal(passed,true,JSON.stringify(errors));assert.deepEqual(errors,[]);
++});
++
++test('private queued cancellation ignores forged implementation symbols and authored signal getters',async t=>{
++ const{page}=await fixture(t);const result=await page.evaluate(`(async()=>{const c=new TaskController(),signal=c.signal,reason={actual:3};let hits=0;for(const key of['aborted','reason','priority'])Object.defineProperty(signal,key,{get(){hits++;throw Error('author')}});const p=scheduler.postTask(()=>9,{signal,delay:20});c.abort(reason);let same;try{await p}catch(e){same=e===reason}const real=new AbortController().signal,symbol=Object.getOwnPropertySymbols(real).find(s=>s.description==='impl'),fake=Object.create(AbortSignal.prototype);Object.defineProperty(fake,symbol,{get(){hits++;throw Error('forged')}});let error;try{await scheduler.postTask(()=>7,{signal:fake})}catch(e){error=e.name}return{same,hits,error}})()`);assert.deepEqual(plain(result),{same:true,hits:0,error:'TypeError'});
++});
++
++test('actual task completion forwards original thrown/rejected identities and cancellation leaves unrelated work live',async t=>{
++ const{page}=await fixture(t);const result=await page.evaluate(`(async()=>{const error={tag:1},reason={tag:2},c=new TaskController(),trace=[];const canceled=scheduler.postTask(()=>trace.push('bad'),{signal:c.signal,delay:10});c.abort(reason);const normal=scheduler.postTask(()=>{trace.push('actual');return{value:4}}),thrown=scheduler.postTask(()=>{throw error}),rejected=scheduler.postTask(()=>Promise.reject(error));const checks=await Promise.all([canceled.catch(e=>e===reason),thrown.catch(e=>e===error),rejected.catch(e=>e===error)]);return{checks,normal:(await normal).value,trace}})()`);assert.deepEqual(plain(result),{checks:[true,true,true],normal:4,trace:['actual']});
++});
++
++test('actual utility Scheduler has independent active signal scope, genuine events and retained task execution',async t=>{
++ const{serve}=await import('../src/cdp.js'),{connect}=await import('./cdp-client.js');const service=await serve({host:'127.0.0.1',port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(m,p)=>client.send(m,p,sessionId),evaluate=(expression,contextId)=>send('Runtime.evaluate',{expression,contextId,returnByValue:true,awaitPromise:true});
++ await evaluate("(async()=>{globalThis.mainController=new TaskController();await scheduler.postTask(()=>1,{signal:mainController.signal});mainController.abort('main-context')})()");const{frameTree}=await send('Page.getFrameTree',{}),{executionContextId}=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'scheduler-utility'});
++ const expression=await readFile(new URL('../docs/reference/scheduler-utility-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/scheduler-utility-native.json',import.meta.url),'utf8')).observations,result=await evaluate(expression,executionContextId);assert.equal(result.exceptionDetails,undefined,JSON.stringify(result));assert.deepEqual(result.result.value,expected);
++ await evaluate("globalThis.f=document.createElement('iframe');document.body.append(f);true");const tree=(await send('Page.getFrameTree',{})).frameTree,{executionContextId:child}=await send('Page.createIsolatedWorld',{frameId:tree.childFrames[0].frame.id,worldName:'scheduler-retire'});await evaluate("globalThis.ran=0;globalThis.settled='pending';scheduler.postTask(()=>{ran++;return 1},{delay:40}).then(()=>settled='resolved',()=>settled='rejected');true",child);await evaluate('f.remove();true');await new Promise(r=>setTimeout(r,80));const retained=await evaluate('({ran,settled,closed:window.closed})',child),control=JSON.parse(await readFile(new URL('../docs/reference/scheduler-utility-retire-native.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(retained.result.value,control);
++});

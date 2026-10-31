@@ -5,9 +5,10 @@ import {createHorizontalLayout} from './horizontal-layout.js';
 import {refreshMediaQueries} from './media.js';
 // Independent surrogate geometry for a headless DOM. This intentionally models
 // the reference's measured simple boxes; it is not a CSS layout renderer.
-import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision } from './styles.js';
+import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision, getSpecifiedStyle } from './styles.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
+const RectFactory=require('jsdom/lib/jsdom/living/generated/DOMRect.js');
 const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
 const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
@@ -52,6 +53,7 @@ export function createLayout(window, options = {}) {
     const documentImpl=implForWrapper(document),shadowRoots=[],tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
     const appendTree=root=>{
       for(const implementation of domSymbolTree.treeIterator(root)){
+        if(implementation.nodeType===11)continue;
         const node=wrapperForImpl(implementation);
         order.set(node,nodes.length);nodes.push(node);
         if(tokens){
@@ -82,7 +84,7 @@ export function createLayout(window, options = {}) {
       const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
       hidden.set(node, result); return result;
     }
-    const textHeight=node=>nativeTextHeight(children(node).filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(style(node).width),Number.parseFloat(style(node).fontSize)||16,style(node).whiteSpace==='nowrap'||style(node).textWrap==='nowrap'||style(node).textWrapMode==='nowrap');
+    const textHeight=node=>{const declaration=style(node),fontSize=Number.parseFloat(declaration.fontSize),collapse=getSpecifiedStyle(node,'white-space-collapse');return nativeTextHeight(children(node).filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(declaration.width),Number.isFinite(fontSize)?fontSize:16,declaration.textWrap==='nowrap'||declaration.textWrapMode==='nowrap',{whiteSpace:declaration.whiteSpace,collapse:typeof collapse==='object'?collapse.value:collapse});};
     const horizontal=createHorizontalLayout(window,{style,hidden:isHidden,viewportWidth:width,styleRevision});
     function size(node) {
       if (sizes.has(node)) return sizes.get(node);
@@ -118,7 +120,6 @@ export function createLayout(window, options = {}) {
         const sibling=wrapperForImpl(implementation);siblingAdvances.set(sibling,sum);
         if(isHidden(sibling))continue;
         if(sibling.nodeType===1)sum+=horizontal.advance(sibling);
-        else if(sibling.nodeType===3&&/\S/.test(sibling.data))sum+=5;
       }
       return siblingAdvances.get(node)??0;
     }
@@ -130,7 +131,7 @@ export function createLayout(window, options = {}) {
       let x = parentX;
       x+=siblingAdvance(node);
       if(node.nodeType===1)x+=horizontal.translation(node);
-      const value = rectValue(x, order.get(node) * 5, size(node).width, size(node).height);
+      const value = rectValue(x, (order.get(node)??order.get(node.host)??0) * 5, size(node).width, size(node).height);
       positions.set(node, value); return value;
     }
 
@@ -240,12 +241,7 @@ export function createLayout(window, options = {}) {
   };
 }
 
-function clientRectList(window, values) {
-  const list = { length: values.length, item: index => values[index] ?? null, [Symbol.iterator]: function* () { yield* values; } };
-  values.forEach((value, index) => { list[index] = value; });
-  Object.defineProperty(list, Symbol.toStringTag, { value: 'DOMRectList' });
-  return list;
-}
+function clientRectList(ArrayConstructor,set,ErrorConstructor,values){const list=new ArrayConstructor(values.length);try{for(let index=0;index<values.length;index++)set(list,index,values[index]);}catch{throw new ErrorConstructor('FailedToCreateArray')}return list;}
 
 export function installLayout(page, window, options = {}) {
   const layout = createLayout(window, options);
@@ -253,11 +249,11 @@ export function installLayout(page, window, options = {}) {
   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
   installElementScroll(window,ownedLayout);
-  const Rect=window.DOMRect;
-  const domRect=value=>new Rect(value.x,value.y,value.width,value.height);
+  const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
+  const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
   const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
   define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
-  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(window, ownedLayout(this).rects(this).map(domRect)); } });
+  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(ArrayConstructor,set,ErrorConstructor,ownedLayout(this).rects(this).map(domRect)); } });
   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
     define(window.HTMLElement.prototype, name, { get() { return ownedLayout(this).dimension(this,dimension); } });
   }
@@ -306,3 +302,6 @@ export function installLayout(page, window, options = {}) {
   page.layout = layout;
   return layout;
 }
+
+// Private geometry consumers address the actual document implementation.
+export function layoutForDocument(document){return LAYOUTS.get(document);}

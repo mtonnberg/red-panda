@@ -60,13 +60,53 @@ Path2D, gradient/pattern and text metric values with shared utility backing stat
 Its measured target profile has ineffective drawing, transparent reads and a1x1
 transparent PNG regardless of nonzero canvas dimensions. An independent encoder
 builds that PNG from actual RGBA samples and verifies CRC/DEFLATE/Adler data;
-general rasterization is not claimed. The current combined checkpoint passes **1,140 JavaScript tests, 60 PureScript
+general rasterization is not claimed. The preceding combined checkpoint passes **1,140 JavaScript tests, 60 PureScript
 checks and 13 existing native differential groups**, syntax and strict/pedantic
 builds. [Validation](reference/phase16-integration/validation.json) binds490
 committed source/reference inputs,18 native build artifacts and eight unused
 pre-existing reference files unchanged across the run. All six unchanged affected
 source fixtures pass in a paired native/candidate replay. Diagnostic budgets and
 scoped controls do not establish a full registration/WPT or performance pass rate.
+
+The current integration adds real AudioData/VideoFrame plane bytes,
+URLPattern parsing/bounded V8 matching/generation, typed DOMException and
+CryptoKey cloning, genuine selected-VM Worker Event/Abort/Scheduler wrappers,
+Window device denied defaults, Cookie Store changes from the actual context jar,
+Selection operations and measured Range fragments, Web Locks callback lifetime,
+form-associated custom element state/validation/submission, and task scheduling.
+Private state/factories use Host allocations and strong successful-wrapper brands.
+Public result materialization preserves measured setters and actual realms.
+
+The current checkpoint passes **1,323 JavaScript tests, 71 PureScript Puppeteer
+checks and 13 native differential groups**, plus syntax and strict/pedantic builds.
+[Validation](reference/phase17-integration/validation.json) binds1,409 committed
+source/reference inputs,18 exact native artifacts and21 unused pre-existing
+reference files unchanged across the run. The initial run's three failures are
+retained separately: a loopback proxy mismatch, an old layout assertion corrected
+by an exact Native control, and a genuine Worker codec dispatch integration bug.
+The corrected Worker/Window/layout checks pass27/27 before the complete retry.
+Broader geometry/Unicode/layout,
+Window symbol exposure and exact heap counts, worker Request.signal coverage,
+additional IDL/conversion/error wording, exotic custom-definition rollback,
+network/SameSite/permissions and real media processing remain bounded gaps.
+Frozen proposals and negative-before/positive-after allocation controls preserve
+actual observed differences. Presence of a proposal is not production support.
+
+The new test transport profile implements real HTTP/raw HTTP, compression,
+SSE, WebSocket, headers/sidecars, counters and downloads. Its source map covers
+455 unique registered paths in8 profiles (216 active literal calls,14 nondefault
+calls;15 paths have nondefault options). The external source load contract waits
+up to2000ms for actual complete/load before starting a separate2000/8000ms
+assertion budget. Earlier immediate-poll/single-budget epochs are explicitly
+load-contract mismatches, including their apparent passes.
+
+The frozen Native-only canonical matrix is451 passes, one full-WebSocket
+assertion failure, one XHR header setup mismatch, one blob-frame load timeout
+and one owned-driver deadline without a final report. The header correction and
+successful XHR/compare-position replays are separate evidence; they do not turn
+that epoch into a full455 pass. This matrix is neither a current Red Panda
+comparison nor a compiled Zig/WPT or performance result. See
+[the baseline](../proposals/native455-canonical/README.md) and exact manifests.
 
 ## Target and evidence boundaries
 

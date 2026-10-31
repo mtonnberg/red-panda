@@ -1,0 +1,996 @@
+--- /dev/null
++++ b/src/worker-events.js
+@@ -0,0 +1,83 @@
++import {addAbortListener} from 'node:events';
++// Genuine selected-VM Event/EventTarget frontends over private real Node state.
++// No Node prototype is grafted onto a public VM constructor or wrapper.
++import {registerPlatformFactory} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const NativeEvent=globalThis.Event,NativeTarget=globalThis.EventTarget,apply=Reflect.apply;
++const signalAborted=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'aborted').get,disposeSymbol=Symbol.dispose;
++const props=['type','bubbles','cancelable','composed','target','currentTarget','eventPhase','defaultPrevented','timeStamp','cancelBubble','returnValue','isTrusted'];
++const readers=Object.fromEntries(props.map(k=>[k,Object.getOwnPropertyDescriptor(NativeEvent.prototype,k)?.get]));
++const methods=Object.fromEntries(['preventDefault','stopPropagation','stopImmediatePropagation','composedPath'].map(k=>[k,NativeEvent.prototype[k]]));
++const add=NativeTarget.prototype.addEventListener,remove=NativeTarget.prototype.removeEventListener,dispatch=NativeTarget.prototype.dispatchEvent;
++const installed=new WeakMap(),eventStates=new WeakMap(),targetStates=new WeakMap();
++const slot=fields=>Object.assign(Object.create(null),fields);
++function factory(g,b){
++ const create=g.Object.create,TypeError=g.TypeError,String=g.String,define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,Array=g.Array,freeze=g.Object.freeze;
++ const description=own(g.Symbol.prototype,'description').get,text=v=>typeof v==='symbol'?apply(description,v,[])??'':String(v);
++ const invalid=()=>new TypeError('invalid argument'),illegal=()=>new TypeError('Illegal invocation');
++ const validEvent=v=>{if(!b.event(v))throw illegal()},validTarget=v=>{if(!b.target(v))throw illegal()};
++ const dict=v=>{if(v==null)return{};if(typeof v!=='object'&&typeof v!=='function')throw invalid();return v};
++ const immutableArray=list=>{const out=new Array(list.length);for(let i=0;i<list.length;i++)define(out,i,{value:list[i],writable:true,enumerable:true,configurable:true});return out};
++ function Event(type,init=undefined){if(!new.target||!arguments.length)throw invalid();type=text(type);const o=dict(init),bubbles=!!o.bubbles,cancelable=!!o.cancelable,composed=!!o.composed;b.eventStore(this,type,bubbles,cancelable,composed)}
++ const ep=Event.prototype;delete ep.constructor;define(Event,'prototype',{writable:false});
++ for(const key of['type','bubbles','cancelable','composed','target','srcElement','currentTarget','eventPhase','defaultPrevented','timeStamp'])define(ep,key,{get(){validEvent(this);return b.eventRead(this,key)},enumerable:true,configurable:true});
++ const em={preventDefault(){validEvent(this);b.eventCall(this,'preventDefault')},stopPropagation(){validEvent(this);b.eventCall(this,'stopPropagation')},stopImmediatePropagation(){validEvent(this);b.eventCall(this,'stopImmediatePropagation')},composedPath(){validEvent(this);return immutableArray(b.path(this))},initEvent(type,bubbles=false,cancelable=false){validEvent(this);if(!arguments.length)throw invalid();b.init(this,text(type),!!bubbles,!!cancelable)}};
++ for(const[name,value]of Object.entries(em))define(ep,name,{value,writable:true,enumerable:true,configurable:true});
++ define(ep,'returnValue',{get(){validEvent(this);return!b.eventRead(this,'defaultPrevented')},set(value){validEvent(this);if(!value)b.eventCall(this,'preventDefault')},enumerable:true,configurable:true});
++ define(ep,'cancelBubble',{get(){validEvent(this);return b.eventRead(this,'cancelBubble')},set(value){validEvent(this);if(value)b.eventCall(this,'stopPropagation')},enumerable:true,configurable:true});
++ for(const[name,value]of Object.entries({NONE:0,CAPTURING_PHASE:1,AT_TARGET:2,BUBBLING_PHASE:3})){define(ep,name,{value,enumerable:true});define(Event,name,{value,enumerable:true})}
++ class MessageEvent extends Event{
++  constructor(type,init=undefined){if(!arguments.length)throw invalid();super(type,init);const o=dict(init),data=o.data??null,lastEventId=o.lastEventId===undefined?'':text(o.lastEventId),origin=o.origin===undefined?'':text(o.origin),raw=o.ports,source=o.source??null;const ports=[];if(raw!==undefined){if(raw==null||typeof raw[g.Symbol.iterator]!=='function')throw invalid();for(const value of raw)define(ports,ports.length,{value,writable:true,enumerable:true,configurable:true})}b.message(this,data,origin,lastEventId,source,freeze(ports))}
++  get data(){validEvent(this);return b.extra(this,'data')}get origin(){validEvent(this);return b.extra(this,'origin')}get lastEventId(){validEvent(this);return b.extra(this,'lastEventId')}get source(){validEvent(this);return b.extra(this,'source')}get ports(){validEvent(this);return b.extra(this,'ports')}
++ }
++ class ErrorEvent extends Event{
++  constructor(type,init=undefined){if(!arguments.length)throw invalid();super(type,init);const o=dict(init),colno=o.colno===undefined?0:(+o.colno)>>>0,error=o.error??null,filename=o.filename===undefined?'':text(o.filename),lineno=o.lineno===undefined?0:(+o.lineno)>>>0,message=o.message===undefined?'':text(o.message);b.error(this,message,filename,lineno,colno,error)}
++  get message(){validEvent(this);return b.extra(this,'message')}get filename(){validEvent(this);return b.extra(this,'filename')}get lineno(){validEvent(this);return b.extra(this,'lineno')}get colno(){validEvent(this);return b.extra(this,'colno')}get error(){validEvent(this);return b.extra(this,'error')}
++ }
++ function options(v){if(v==null||typeof v!=='object'&&typeof v!=='function')return{capture:!!v,once:false,passive:false,signal:null};const capture=!!v.capture,once=!!v.once,passive=!!v.passive,signal=v.signal??null;if(signal!==null&&!b.signal(signal))throw invalid();return{capture,once,passive,signal}}
++ function EventTarget(){if(!new.target)throw invalid();b.targetStore(this)}
++ const tp=EventTarget.prototype;delete tp.constructor;define(EventTarget,'prototype',{writable:false});
++ const tm={dispatchEvent(event){validTarget(this);if(!arguments.length||!b.event(event))throw invalid();return b.dispatch(this,event)},addEventListener(type,callback){validTarget(this);if(arguments.length<2)throw invalid();type=text(type);if(callback==null)return;if(typeof callback!=='function'&&typeof callback!=='object')throw invalid();b.add(this,type,callback,options(arguments[2]))},removeEventListener(type,callback){validTarget(this);if(arguments.length<2)throw invalid();type=text(type);const o=arguments[2],capture=typeof o==='object'&&o!==null?!!o.capture:!!o;b.remove(this,type,callback,capture)}};
++ for(const[name,value]of Object.entries(tm))define(tp,name,{value,writable:true,enumerable:true,configurable:true});
++ for(const C of[Event,EventTarget,MessageEvent,ErrorEvent]){const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});if(d.configurable)define(p,key,{...d,enumerable:typeof key==='string'})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true})}
++ return{Event,EventTarget,MessageEvent,ErrorEvent,allocate(prototype){return create(prototype)}};
++}
++export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true}={}){
++ if(installed.has(realm))return installed.get(realm);
++ for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget'])registerPlatformFactoryKind(kind);
++ const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,define=Object.defineProperty;let signalAdapter=value=>null,classes;
++ const receiver=state=>state.receiver??state.publicValue;
++ function eventState(value){const state=eventStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
++ function targetState(value){const state=targetStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
++ function trustOwn(value){const accessors=evaluate('(function(bridge,value){return{get isTrusted(){return bridge(value)}}})')(v=>{const s=eventStates.get(v);return s.trusted===null?apply(readers.isTrusted,s.backend,[]):s.trusted},value);define(value,'isTrusted',{get:Object.getOwnPropertyDescriptor(accessors,'isTrusted').get,enumerable:true})}
++ function registerEvent(value,backend){const data=slot({backend,trusted:null,pendingTrust:false,inDispatch:0,passive:0,allowed:null,timeStamp:apply(readers.timeStamp,backend,[]),extra:slot({})});eventStates.set(value,data);nativeEvents.set(backend,value);trustOwn(value);registerPlatformFactory(value,{kind:'Event',implementation:data,globalObject:realm});return value}
++ function adopt(backend){let value=nativeEvents.get(backend);if(!value){value=classes.allocate(classes.Event.prototype);registerEvent(value,backend)}return value}
++ function removeEntry(state,entry){apply(remove,state.backend,[entry.type,entry.native,{capture:entry.capture}]);if(entry.abort)entry.abort[disposeSymbol]();state.listeners.delete(entry)}
++ function addEntry(value,type,callback,options){const state=targetState(value),capture=options.capture;for(const e of state.listeners)if(e.type===type&&e.callback===callback&&e.capture===capture)return;const signal=options.signal?signalAdapter(options.signal):null;if(signal&&apply(signalAborted,signal,[]))return;
++  const entry=slot({type,callback,capture,once:options.once,signal,passive:options.passive,abort:null,native:null});entry.native=backend=>{if(!active()||signal&&apply(signalAborted,signal,[]))return;const event=adopt(backend),es=eventState(event);if(!es.allowed)es.allowed=new Set(state.listeners);if(!es.allowed.has(entry))return;es.inDispatch++;if(entry.passive)es.passive++;if(entry.once)removeEntry(state,entry);try{if(typeof callback==='function')apply(callback,receiver(state),[event]);else{const fn=callback.handleEvent;if(typeof fn==='function')apply(fn,callback,[event]);else throw new TypeError('invalid argument')}}catch(error){reportError(error)}finally{if(entry.passive)es.passive--;es.inDispatch--}};
++  state.listeners.add(entry);apply(add,state.backend,[type,entry.native,{capture,passive:options.passive,...(signal?{signal}:{})}]);if(signal)entry.abort=addAbortListener(signal,()=>removeEntry(state,entry))
++ }
++ function dispatchEvent(value,event){const ts=targetState(value),es=eventState(event);if(es.inDispatch)throw new Exception('The object is in an invalid state','InvalidStateError');es.trusted=es.pendingTrust?true:false;es.pendingTrust=false;es.allowed=new Set(ts.listeners);es.inDispatch++;try{return apply(dispatch,ts.backend,[es.backend])}finally{es.inDispatch--;es.allowed=null}}
++ const bridge={
++  event:v=>eventStates.has(v),target:v=>targetStates.has(v),
++  eventStore(value,type,bubbles,cancelable,composed){registerEvent(value,new NativeEvent(type,{bubbles,cancelable,composed}))},
++  eventRead(value,key){const s=eventState(value);if(key==='timeStamp')return s.timeStamp;if(key==='currentTarget'&&!s.inDispatch)return null;if(key==='eventPhase'&&!s.inDispatch)return 0;if(key==='srcElement')key='target';if(key==='target'||key==='currentTarget'){const target=apply(readers[key],s.backend,[]),state=nativeTargets.get(target);return state?receiver(state):null}return apply(readers[key],s.backend,[])},
++  trusted:v=>{const s=eventState(v);return s.trusted===null?apply(readers.isTrusted,s.backend,[]):s.trusted},
++  eventCall(value,name){const s=eventState(value);if(name==='preventDefault'&&s.passive)return;apply(methods[name],s.backend,[])},path(value){eventState(value);return[]},
++  init(value,type,bubbles,cancelable){const s=eventState(value);if(s.inDispatch)return;s.backend=new NativeEvent(type,{bubbles,cancelable,composed:apply(readers.composed,s.backend,[])});s.trusted=false;s.pendingTrust=false;nativeEvents.set(s.backend,value)},
++  message(value,data,origin,lastEventId,source,ports){const s=eventState(value);s.extra=slot({data,origin,lastEventId,source,ports});registerPlatformFactory(value,{kind:'MessageEvent',implementation:s,globalObject:realm})},
++  error(value,message,filename,lineno,colno,error){const s=eventState(value);s.extra=slot({message,filename,lineno,colno,error});registerPlatformFactory(value,{kind:'ErrorEvent',implementation:s,globalObject:realm})},extra(v,k){const extra=eventState(v).extra;if(!Object.hasOwn(extra,k))throw new TypeError('Illegal invocation');return extra[k]},
++  targetStore(value){api.registerTarget(value,new NativeTarget())},signal:value=>!!signalAdapter(value),dispatch:dispatchEvent,add:addEntry,remove(value,type,callback,capture){const s=targetState(value);for(const entry of s.listeners)if(entry.type===type&&entry.callback===callback&&entry.capture===capture)removeEntry(s,entry)},
++ };
++ const api={
++  registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map()});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
++  configureSignals(callback){signalAdapter=callback},nativeTarget:value=>targetState(value).backend,
++  trust(value){const s=eventState(value);s.trusted=true;s.pendingTrust=true;return value},
++  setReceiver(value,receiverValue){targetState(value).receiver=receiverValue},
++  getHandler(value,type){return targetState(value).handlers.get(type)?.callback??null},
++  setHandler(value,type,callback){const s=targetState(value),existing=s.handlers.get(type);callback=typeof callback==='function'?callback:null;if(existing){if(callback){existing.callback=callback;return}removeEntry(s,existing.entry);s.handlers.delete(type);return}if(!callback)return;const h=slot({callback,entry:null}),relay=event=>{const result=apply(h.callback,receiver(s),[event]);if(type==='error'&&result===true)apply(methods.preventDefault,eventState(event).backend,[])};addEntry(value,type,relay,{capture:false,once:false,passive:false,signal:null});h.entry=[...s.listeners].find(e=>e.callback===relay);s.handlers.set(type,h)},
++  dispatch:dispatchEvent,
++  dispose(){for(const ref of live){const value=ref.deref();if(!value)continue;const s=targetStates.get(value);for(const e of s.listeners)removeEntry(s,e);s.handlers.clear()}live.clear()},
++ };
++ const made=evaluate(`(${factory.toString()})`)(realm,bridge);classes=Object.freeze(Object.assign(Object.create(null),made));installed.set(realm,api);return api;
++}
+--- /dev/null
++++ b/src/worker-abort.js
+@@ -0,0 +1,50 @@
++// Real selected-VM Abort frontends with strong private wrapper brands and real
++// private Node cancellation state. Public methods never inspect authored slots.
++import{registerPlatformFactory}from'./platform-factories.js';
++import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';
++const NativeController=globalThis.AbortController,NativeSignal=globalThis.AbortSignal,apply=Reflect.apply;
++const nativeAny=NativeSignal.any;
++const abort=NativeController.prototype.abort,signalGetter=Object.getOwnPropertyDescriptor(NativeController.prototype,'signal').get;
++const aborted=Object.getOwnPropertyDescriptor(NativeSignal.prototype,'aborted').get,reason=Object.getOwnPropertyDescriptor(NativeSignal.prototype,'reason').get;
++const installed=new WeakMap(),controllers=new WeakMap(),signals=new WeakMap();
++const slot=fields=>Object.assign(Object.create(null),fields);
++function factory(g,b){
++ const create=g.Object.create,finite=g.Number.isFinite,trunc=g.Math.trunc,TypeError=g.TypeError,Exception=g.DOMException,Target=g.EventTarget,define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,Array=g.Array,iterator=g.Symbol.iterator;
++ const invalid=()=>new TypeError('invalid argument'),illegal=()=>new TypeError('Illegal invocation'),defaultReason=()=>new Exception('signal is aborted without reason','AbortError');
++ function AbortController(){if(!new.target)throw invalid();b.controller(this)}
++ const cp=AbortController.prototype;delete cp.constructor;define(AbortController,'prototype',{writable:false});
++ define(cp,'signal',{get(){if(!b.hasController(this))throw illegal();return b.signal(this)},enumerable:true,configurable:true});
++ const cm={abort(){if(!b.hasController(this))throw illegal();b.abort(this,arguments[0]===undefined?defaultReason():arguments[0])}};define(cp,'abort',{value:cm.abort,writable:true,enumerable:true,configurable:true});
++ class AbortSignal extends Target{
++  constructor(){throw new TypeError('Illegal Constructor')}
++  get aborted(){if(!b.hasSignal(this))throw illegal();return b.aborted(this)}
++  get reason(){if(!b.hasSignal(this))throw illegal();return b.reason(this)}
++  get onabort(){if(!b.hasSignal(this))throw illegal();return b.handler(this)}
++  set onabort(value){if(!b.hasSignal(this))throw illegal();b.handlerSet(this,typeof value==='function'?value:null)}
++  throwIfAborted(){if(!b.hasSignal(this))throw illegal();if(b.aborted(this))throw b.reason(this)}
++  static abort(){return b.staticAbort(arguments[0]===undefined?defaultReason():arguments[0])}
++  static timeout(milliseconds){if(!arguments.length)throw invalid();const n=+milliseconds;if(!finite(n)||n<0||n>9007199254740991)throw new TypeError('');return b.timeout(trunc(n))}
++  static any(values){if(!arguments.length||values===null||(typeof values!=='object'&&typeof values!=='function')||typeof values[iterator]!=='function')throw invalid();const list=[];for(const value of values){if(!b.hasSignal(value))throw invalid();define(list,list.length,{value,writable:true,enumerable:true,configurable:true})}return b.any(list)}
++ }
++ for(const C of[AbortController,AbortSignal]){const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});define(p,key,{...d,enumerable:true})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true})}
++ return{AbortController,AbortSignal,allocate(prototype){return create(prototype)}};
++}
++export function installWorkerAbort(realm,{events,evaluate=source=>realm.eval(source),signal:lifetime,active=()=>!lifetime?.aborted}={}){
++ if(installed.has(realm))return installed.get(realm);if(!events)throw new TypeError('Actual Worker event backend is required');
++ for(const kind of['AbortController','AbortSignal'])registerPlatformFactoryKind(kind);
++ const TimeoutException=realm.DOMException,timer=realm.setTimeout,clear=realm.clearTimeout,timers=new Set(),ErrorCtor=realm.TypeError;let classes,disposed=false;
++ function makeSignal(native){const value=classes.allocate(classes.AbortSignal.prototype),state=Object.freeze(slot({native}));signals.set(value,state);events.registerTarget(value,native,'AbortSignal');registerPlatformFactory(value,{kind:'AbortSignal',implementation:state,globalObject:realm});return value}
++ function node(value){const state=signals.get(value);if(!state)throw new ErrorCtor('Illegal invocation');return state.native}
++ const bridge={
++  hasController:v=>controllers.has(v),hasSignal:v=>signals.has(v),
++  controller(value){const native=new NativeController(),state=slot({native,signal:makeSignal(apply(signalGetter,native,[]))});controllers.set(value,state);registerPlatformFactory(value,{kind:'AbortController',implementation:state,globalObject:realm})},
++  signal:value=>controllers.get(value).signal,aborted:value=>apply(aborted,node(value),[]),reason:value=>apply(reason,node(value),[]),abort:(value,why)=>apply(abort,controllers.get(value).native,[why]),
++  handler:v=>events.getHandler(v,'abort'),handlerSet:(v,fn)=>events.setHandler(v,'abort',fn),
++  staticAbort(why){const native=new NativeController();apply(abort,native,[why]);return makeSignal(apply(signalGetter,native,[]))},
++  timeout(milliseconds){const native=new NativeController(),value=makeSignal(apply(signalGetter,native,[]));let remaining=milliseconds;const schedule=()=>{if(disposed||!active())return;const chunk=Math.min(remaining,2147483647);let handle;handle=apply(timer,realm,[()=>{timers.delete(handle);remaining-=chunk;if(remaining>0)schedule();else apply(abort,native,[new TimeoutException('signal timed out','TimeoutError')])},chunk]);timers.add(handle)};schedule();return value},
++  any(list){const sources=[];for(let i=0;i<list.length;i++)sources.push(node(list[i]));return makeSignal(apply(nativeAny,NativeSignal,[sources]))},
++ };
++ classes=Object.freeze(Object.assign(Object.create(null),evaluate(`(${factory.toString()})`)(realm,bridge)));events.configureSignals(value=>signals.get(value)?.native??null);
++ const dispose=()=>{if(disposed)return;disposed=true;for(const t of timers)apply(clear,realm,[t]);timers.clear();lifetime?.removeEventListener('abort',dispose)};lifetime?.addEventListener('abort',dispose,{once:true});
++ const api={nativeSignal:node,hasSignal:v=>signals.has(v),dispose};installed.set(realm,api);return api;
++}
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,6 @@
++import {installWorkerDOMException} from './worker-dom-exception.js';
++import {installWorkerEvents} from './worker-events.js';
++import {installWorkerAbort} from './worker-abort.js';
+ import { installURLPattern } from './url-pattern.js';
+ import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
+ import { installImageData } from './image-data.js';
+@@ -181,7 +184,8 @@
+ 
+ async function runWorker() {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime;
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
++  let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+   const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
+@@ -236,11 +240,14 @@
+       }
+     },
+     async fetch(input, init = {}, resourceType) {
+-      const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), init);
++      const supplied = init.signal;
++      const nativeSignal = supplied == null ? supplied : abortPlatform.hasSignal(supplied) ? abortPlatform.nativeSignal(supplied) : supplied;
++      const nativeInit = supplied == null ? init : {...init,signal:nativeSignal};
++      const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), nativeInit);
+       const headers = [...new Headers(init.headers ?? original.headers)];
+       const method = init.method ?? original.method;
+       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
+-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, init.signal ?? original.signal, resourceType);
++      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
+       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+       streams.adopt(response.body);
+       Object.defineProperty(response, 'url', { value: result.url }); return response;
+@@ -253,60 +260,58 @@
+     AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
+     atob, btoa };
+   context = vm.createContext(sandbox);
++  const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
++  installWorkerDOMException(realm,{evaluate});
++  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
++  lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
++  context.__eventPlatform=eventPlatform;
+   vm.runInContext(`(function () {
+-    const trustedEvents = new WeakSet();
+-    class Event {
+-      constructor(type, init = {}) { this.type = String(type); this.bubbles = Boolean(init.bubbles); this.cancelable = Boolean(init.cancelable); this.defaultPrevented = false; this.target = null; this.currentTarget = null; Object.defineProperty(this, 'isTrusted', { enumerable: true, get: () => trustedEvents.has(this) }); }
+-      preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+-      stopPropagation() {} stopImmediatePropagation() { this.__stopped = true; }
+-    }
+-    class MessageEvent extends Event { constructor(type, init = {}) { super(type, init); this.data = init.data ?? null; this.ports = init.ports ?? []; this.origin = init.origin ?? ''; this.source = init.source ?? null; } }
+-    class ErrorEvent extends Event { constructor(type, init = {}) { super(type, init); Object.assign(this, init); } }
+-    class EventTarget {
+-      constructor() { this.__listeners = new Map(); }
+-      addEventListener(type, callback, options = {}) { if (!callback) return; type = String(type); const list = this.__listeners.get(type) ?? []; if (!list.some(item => item.callback === callback)) list.push({ callback, once: Boolean(options?.once), signal: options?.signal }); this.__listeners.set(type, list); }
+-      removeEventListener(type, callback) { const list = this.__listeners.get(String(type)); if (list) this.__listeners.set(String(type), list.filter(item => item.callback !== callback)); }
+-      dispatchEvent(event) { const receiver = this.__globalRoot ?? this; event.target = receiver; event.currentTarget = receiver; for (const item of [...this.__listeners.get(event.type) ?? []]) { if (item.signal?.aborted) continue; if (item.once) this.removeEventListener(event.type, item.callback); try { typeof item.callback === 'function' ? item.callback.call(receiver, event) : item.callback.handleEvent(event); } catch(error) { __dispatchError(error); } if (event.__stopped) break; } const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (typeof handler === 'function' && !event.__stopped) { try { if (handler.call(receiver, event) === true && event.type === 'error') event.preventDefault(); } catch(error) { __dispatchError(error); } } event.currentTarget = null; return !event.defaultPrevented; }
+-    }
+-    Object.assign(globalThis, { Event, MessageEvent, ErrorEvent, EventTarget });
++    const eventPlatform=__eventPlatform,bridge=__bridge;
++    delete globalThis.__bridge;
++    const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
+     globalThis.self = globalThis; globalThis.name = __name;
+-    Object.assign(globalThis, { onmessage: null, onmessageerror: null, onerror: null });
+-    const target = new EventTarget(); target.__globalRoot = globalThis;
++    const target = new EventTarget(); eventPlatform.setReceiver(target,globalThis);
++    for(const key of ['onmessage','onmessageerror','onerror']) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
+     for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = target[name].bind(target);
+-    globalThis.dispatchEvent = event => { for (const key of ['onmessage', 'onmessageerror', 'onerror']) target[key] = globalThis[key]; return target.dispatchEvent(event); };
++    const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
++    globalThis.dispatchEvent = dispatchGlobal;
+     let reportingError = false;
+-    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); if (dispatchEvent(event)) __bridge.report(error); } finally { reportingError = false; } };
+-    globalThis.postMessage = (data, transfer) => __bridge.postMessage(data, transfer);
+-    globalThis.close = () => __bridge.close();
+-    globalThis.importScripts = (...urls) => __bridge.importScripts(...urls);
+-    globalThis.setTimeout = function(callback, delay = 0, ...args) { return __bridge.timer(callback, delay, args, false); };
+-    globalThis.setInterval = function(callback, delay = 0, ...args) { return __bridge.timer(callback, delay, args, true); };
+-    globalThis.clearTimeout = globalThis.clearInterval = id => __bridge.clear(id);
+-    globalThis.queueMicrotask = callback => __bridge.microtask(callback);
+-    globalThis.fetch = async (input, init) => __bridge.fetch(input, init);
+-    globalThis.structuredClone = (value, options) => __bridge.structuredClone(value, options);
+-    globalThis.console = Object.fromEntries(['log','info','warn','error','debug'].map(type => [type, (...args) => __bridge.console(type, args)]));
++    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); eventPlatform.trust(event); if (dispatchGlobal(event)) bridge.report(error); } finally { reportingError = false; } };
++    globalThis.postMessage = (data, transfer) => bridge.postMessage(data, transfer);
++    globalThis.close = () => bridge.close();
++    globalThis.importScripts = (...urls) => bridge.importScripts(...urls);
++    globalThis.setTimeout = function(callback, delay = 0, ...args) { return bridge.timer(callback, delay, args, false); };
++    globalThis.setInterval = function(callback, delay = 0, ...args) { return bridge.timer(callback, delay, args, true); };
++    globalThis.clearTimeout = globalThis.clearInterval = id => bridge.clear(id);
++    globalThis.queueMicrotask = callback => bridge.microtask(callback);
++    globalThis.fetch = async (input, init) => bridge.fetch(input, init);
++    globalThis.structuredClone = (value, options) => bridge.structuredClone(value, options);
++    globalThis.console = Object.fromEntries(['log','info','warn','error','debug'].map(type => [type, (...args) => bridge.console(type, args)]));
+     class WorkerLocation { constructor(url) { for (const key of ['href','origin','protocol','host','hostname','port','pathname','search','hash']) Object.defineProperty(this, key, { value: url[key], enumerable: true }); } toString() { return this.href; } }
+     Object.assign(globalThis, { WorkerLocation, location: new WorkerLocation(new URL(__url)) });
+     class WorkerNavigator {} Object.assign(WorkerNavigator.prototype, { appName: 'Netscape', onLine: true });
+     const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
+     Object.assign(globalThis, { WorkerNavigator, navigator: nav });
+     globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
+-    globalThis.__trustWorkerEvent=event=>{trustedEvents.add(event);return event;};
+-    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); trustedEvents.add(event); return event; };
++    globalThis.__trustWorkerEvent=event=>eventPlatform.trust(event);
++    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); eventPlatform.trust(event); return event; };
+     globalThis.__createTrustedMessage = createTrustedMessage;
+-    globalThis.__emitMessage = (data, ports) => dispatchEvent(createTrustedMessage('message', data, ports));
++    globalThis.__emitMessage = (data, ports) => dispatchGlobal(createTrustedMessage('message', data, ports));
+   })();`, context);
++  delete context.__eventPlatform;
++  abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
++  dispatchError=vm.runInContext('__dispatchError',context);
++  delete context.__dispatchError;
+   emit = vm.runInContext('__emitMessage', context);
+   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
+   const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
+   messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
+     active: () => !closed,
+-    dispatch: (target, type, data, ports) => target.dispatchEvent(createTrustedMessage(type, data, ports)),
++    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,createTrustedMessage(type, data, ports)),
+     reportError: value => dispatchError(value),
+   });
+   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
+-  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>target.dispatchEvent(createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
++  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>eventPlatform.dispatch(target,createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
+   Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+@@ -325,7 +330,6 @@
+   if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
+     call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
+   vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
+-  const dispatchError = value => vm.runInContext('__dispatchError', context)(value);
+   parentPort.on('message', message => {
+     if (closed) return;
+     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -30,8 +30,8 @@
+   const provenance=platformFactoryRecord(value);
+   const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+-  if(provenance?.kind==='VideoColorSpace'||provenance?.kind==='URLPattern')throw failure('The object can not be cloned');
++  if(['VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal'].includes(provenance?.kind))throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+   const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
+   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+--- /dev/null
++++ b/test/worker-abort.test.js
+@@ -0,0 +1,69 @@
++import {readFileSync} from 'node:fs';
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { EventEmitter } from 'node:events';
++import { execFile } from 'node:child_process';
++import { promisify } from 'node:util';
++import { JSDOM } from 'jsdom';
++import { installWorkers } from '../src/workers.js';
++
++const tick = () => new Promise(resolve => setImmediate(resolve));
++const deadline = (promise, milliseconds = 8000) => new Promise((resolve, reject) => {
++  const timer = setTimeout(() => reject(new Error('Worker fixture timed out')), milliseconds);
++  Promise.resolve(promise).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
++});
++function fixture(t, sources = {}) {
++  const page = new EventEmitter(); page.documentAbort = new AbortController();
++  const errors = [], requests = [];
++  page.on('pageError', error => errors.push(error));
++  page.referrerFor = (url, source) => source;
++  page.fetch = async (url, init, type) => {
++    requests.push({ url, init, type });
++    let entry = sources[url]; if (typeof entry === 'function') entry = await entry(init);
++    if (init.signal.aborted) throw new DOMException('Aborted', 'AbortError');
++    if (typeof entry === 'string') entry = { source: entry };
++    const response = new Response(entry?.source ?? '', { status: entry?.status ?? (entry ? 200 : 404),
++      headers: { 'content-type': entry?.mime ?? 'text/javascript', ...(entry?.headers ?? {}) } });
++    Object.defineProperty(response, 'url', { value: entry?.url ?? url }); return response;
++  };
++  const dom = new JSDOM('<body></body>', { url: 'https://example.test/app/page.html', runScripts: 'outside-only' });
++  const workers = installWorkers(page, dom.window);
++  t.after(() => { page.closed = true; page.documentAbort.abort(); workers.dispose(); dom.window.close(); });
++  return { page, window: dom.window, workers, errors, requests };
++}
++function message(worker) { return deadline(new Promise((resolve, reject) => {
++  worker.addEventListener('message', event => resolve(event.data), { once: true });
++  worker.addEventListener('error', event => reject(event.error ?? new Error(event.message)), { once: true });
++})); }
++function portMessage(port) { return deadline(new Promise(resolve => {
++  port.addEventListener('message', resolve, { once: true }); port.start();
++})); }
++
++test('Worker Event/Abort actual Native controls',async t=>{
++ const code=readFileSync(new URL('../docs/reference/worker-abort/worker-abort-native-code.js',import.meta.url),'utf8');
++ const f=fixture(t,{'https://example.test/app/abort.js':code}),worker=new f.window.Worker('./abort.js');
++ const result=JSON.parse(JSON.stringify(await message(worker)));
++ const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-abort/worker-abort-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
++});
++test('Worker Event/Abort Native dispatch/private brand controls',async t=>{
++ const code=readFileSync(new URL('../docs/reference/worker-abort/worker-events-extra-code.js',import.meta.url),'utf8');
++ const f=fixture(t,{'https://example.test/app/abort.js':code}),worker=new f.window.Worker('./abort.js');
++ const result=JSON.parse(JSON.stringify(await message(worker)));
++ const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-abort/worker-events-extra-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
++});
++
++test('Worker public values and methods have actual selected VM creation contexts',async()=>{
++ const {stdout}=await promisify(execFile)(process.execPath,[new URL('./worker-abort-realm.mjs',import.meta.url).pathname]);
++ const proof=JSON.parse(stdout);assert.equal(proof.thread,true);assert.equal(proof.backend,'public-v8-query-objects');
++ assert.equal(proof.rows.length,11);for(const row of proof.rows){assert.equal(row.VM,true,row.name);assert.equal(row.Host,false,row.name);assert.equal(row.creationGlobal,true,row.name);assert.equal(row.VMNullPrototype,true,row.name);assert.equal(row.HostNullPrototype,false,row.name)}
++});
++
++test('Worker Abort algorithms survive authored stopImmediatePropagation',async t=>{
++ const code=readFileSync(new URL('../docs/reference/worker-abort/worker-abort-algorithms-code.js',import.meta.url),'utf8');
++ const f=fixture(t,{'https://example.test/app/abort.js':code}),worker=new f.window.Worker('./abort.js');
++ const result=JSON.parse(JSON.stringify(await message(worker)));
++ const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-abort/worker-abort-algorithms-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
++});
+--- /dev/null
++++ b/test/worker-abort-realm.mjs
+@@ -0,0 +1,14 @@
++import vm from 'node:vm';
++import {Worker,isMainThread,parentPort} from 'node:worker_threads';
++import {installWorkerDOMException} from '../src/worker-dom-exception.js';
++import {installWorkerEvents} from '../src/worker-events.js';
++import {installWorkerAbort} from '../src/worker-abort.js';
++import {getHeapBinding} from '../src/native-heap.js';
++if(isMainThread){const worker=new Worker(new URL(import.meta.url));worker.on('message',value=>console.log(JSON.stringify(value,null,2)));worker.on('error',error=>{console.error(error);process.exitCode=1})}
++else{
++ const context=vm.createContext({setTimeout,clearTimeout}),evaluate=source=>vm.runInContext(source,context),realm=evaluate('globalThis');
++ installWorkerDOMException(realm,{evaluate});const events=installWorkerEvents(realm,{evaluate});const abort=installWorkerAbort(realm,{evaluate,events});
++ const heap=getHeapBinding(),anchor=evaluate('({})'),host={};const values=evaluate(`(()=>{const c=new AbortController();return{controller:c,signal:c.signal,event:new Event('x'),target:new EventTarget(),message:new MessageEvent('x'),exception:new DOMException('x'),controllerFunction:AbortController,signalFunction:AbortSignal,eventFunction:Event,targetFunction:EventTarget,signalGetter:Object.getOwnPropertyDescriptor(AbortSignal.prototype,'reason').get}})()`),rows=[];
++ for(const[name,value]of Object.entries(values)){const row={name,VM:heap.sameRealm(value,anchor),Host:heap.sameRealm(value,host),creationGlobal:heap.creationGlobal(value)===realm};Object.setPrototypeOf(value,null);row.VMNullPrototype=heap.sameRealm(value,anchor);row.HostNullPrototype=heap.sameRealm(value,host);rows.push(row)}
++ abort.dispose();events.dispose();parentPort.postMessage({node:process.version,thread:true,backend:heap.backend,rows});
++}
+--- /dev/null
++++ b/docs/reference/worker-abort/README.md
+@@ -0,0 +1,33 @@
++Worker cancellation and event foundation
++
++These three raw oracle tables were obtained from the pinned Native executable
++SHA256 9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f,
++using actual dedicated Blob workers with worker resources enabled. They contain
++48 independently executed controls. The JavaScript inputs are retained beside
++the tables. The proposal retains the CDP expressions, probe hash and raw logs.
++
++The independent adapter creates Event/EventTarget/MessageEvent/ErrorEvent and
++AbortController/AbortSignal public values in the selected VM. Host WeakMaps own
++real private Node event/controller/signal backends. Node prototypes and symbol
++markers confer no public brands. Real Node AbortSignal.any dependencies set
++reasons before source callbacks and dispatch dependent events afterward; actual
++abort cleanup resists authored stopImmediatePropagation. Callback arguments,
++listener identity/order/capture/once/passive/handler state, and cancellation
++flow through the actual backend. Native's empty composedPath for these worker
++targets and preserved composed flag through initEvent are measured here.
++
++Worker fetch unwraps only a genuinely registered signal to its actual backend.
++Request/Response/Headers/Blob and other existing Node-backed Worker values are
++outside this frontend change; in particular Request.signal is not claimed as a
++selected-VM wrapper. No nested workers, new scheduler support, or additional
++worker event interfaces are introduced. Worker termination still destroys the
++owned thread; close cancels the adapter's timeout jobs and removes listeners.
++
++The focused test also runs direct public V8 sameRealm/creationGlobal checks in
++a real Node thread for eleven public objects/functions/getters, repeats the
++checks after nulling prototypes, and rejects Host creation contexts. It uses
++the existing source-and-binary-verified native heap binding without a heap scan.
++
++The DOMException dependency is owned by the separate Worker DOMException
++proposal; exact module SHA256 is
++02dff903451159c4dee70ac10cae2163ca6d5b5dea4e48069cb36bc761b655a3.
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-abort-algorithms-code.js
+@@ -0,0 +1,6 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('anyStopImmediate',()=>{const c=new AbortController(),out=[];c.signal.addEventListener('abort',e=>{out.push(['source',s.aborted]);e.stopImmediatePropagation()});const s=AbortSignal.any([c.signal]);s.onabort=()=>out.push('any');c.abort('reason');return{out,aborted:s.aborted,reason:s.reason}});
++await run('listenerSignalStopImmediate',()=>{const c=new AbortController(),t=new EventTarget(),out=[];c.signal.onabort=e=>e.stopImmediatePropagation();t.addEventListener('x',()=>out.push('removed'),{signal:c.signal});c.abort();t.dispatchEvent(new Event('x'));return out});
++await run('anyReasonDuringSourceEvent',()=>{const c=new AbortController();let state;const s=AbortSignal.any([c.signal]);c.signal.addEventListener('abort',()=>state=[s.aborted,s.reason]);c.abort('done');return state});
++await run('anyEventOrder',()=>{const c=new AbortController(),s=AbortSignal.any([c.signal]),out=[];s.addEventListener('abort',()=>out.push('any'));c.signal.addEventListener('abort',()=>out.push('source'));c.abort();return out});
++return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-abort-algorithms-native.json
+@@ -0,0 +1,43 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "9f8efd4209771615b61b61645478d96627c64c188ceac089b7ead5b9e982de69",
++  "observations": {
++    "ok": true,
++    "value": [
++      {
++        "name": "anyStopImmediate",
++        "value": {
++          "out": [
++            [
++              "source",
++              true
++            ],
++            "any"
++          ],
++          "aborted": true,
++          "reason": "reason"
++        }
++      },
++      {
++        "name": "listenerSignalStopImmediate",
++        "value": []
++      },
++      {
++        "name": "anyReasonDuringSourceEvent",
++        "value": [
++          true,
++          "done"
++        ]
++      },
++      {
++        "name": "anyEventOrder",
++        "value": [
++          "source",
++          "any"
++        ]
++      }
++    ]
++  }
++}
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-abort-native-code.js
+@@ -0,0 +1,17 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('shape',()=>({controller:AbortController.length,signal:AbortSignal.length,ctlKeys:Reflect.ownKeys(AbortController.prototype).map(String),sigKeys:Reflect.ownKeys(AbortSignal.prototype).map(String),signalTarget:Object.getPrototypeOf(AbortSignal.prototype)===EventTarget.prototype,eventKeys:Reflect.ownKeys(Event.prototype).map(String),targetKeys:Reflect.ownKeys(EventTarget.prototype).map(String)}));
++await run('basic',()=>{const c=new AbortController(),s=c.signal;return{same:c.signal===s,controller:c instanceof AbortController,signal:s instanceof AbortSignal,target:s instanceof EventTarget,aborted:s.aborted,reason:s.reason===undefined,tag:Object.prototype.toString.call(s),keys:Object.keys(s),eventKeys:Object.keys(new Event('x'))}});
++await run('defaultAbort',()=>{const c=new AbortController();let e;c.signal.onabort=value=>e=value;c.abort();return{aborted:c.signal.aborted,name:c.signal.reason.name,message:c.signal.reason.message,code:c.signal.reason.code,dom:c.signal.reason instanceof DOMException,error:c.signal.reason instanceof Error,event:e instanceof Event,trusted:e.isTrusted,target:e.target===c.signal,current:e.currentTarget===null,bubbles:e.bubbles,cancelable:e.cancelable,keys:Object.keys(e)}});
++await run('listenerOrder',()=>{const c=new AbortController(),order=[],s=c.signal;s.addEventListener('abort',function(e){order.push(['a',this===s,e.currentTarget===s,e.eventPhase])});s.onabort=()=>order.push('handler');s.addEventListener('abort',()=>order.push('b'));s.addEventListener('abort',{handleEvent(e){order.push(['object',e.target===s])}});s.onabort=()=>order.push('replacement');c.abort(3);c.abort(4);return{order,reason:s.reason}});
++await run('stopImmediate',()=>{const s=new AbortController(),out=[];s.signal.addEventListener('abort',e=>{out.push('a');e.stopImmediatePropagation()});s.signal.onabort=()=>out.push('h');s.signal.addEventListener('abort',()=>out.push('b'));s.abort();return out});
++await run('borrowedMethods',()=>{const c=new AbortController(),out=[];EventTarget.prototype.addEventListener.call(c.signal,'x',e=>out.push([e.type,e.target===c.signal,e instanceof Event]));const e=new Event('x',{cancelable:true});const result=EventTarget.prototype.dispatchEvent.call(c.signal,e);return{out,result,trusted:e.isTrusted}});
++await run('reasonIdentity',()=>{const c=new AbortController(),reason={a:3};c.abort(reason);let same;try{c.signal.throwIfAborted()}catch(e){same=e===reason}const d=AbortSignal.abort(reason);return{same,identity:c.signal.reason===reason,static:d.reason===reason,signal:d instanceof AbortSignal,target:d instanceof EventTarget}});
++await run('onceCaptureRemoval',()=>{const t=new EventTarget(),out=[],fn=()=>out.push('f');t.addEventListener('x',fn,true);t.addEventListener('x',fn,false);t.removeEventListener('x',fn,true);t.addEventListener('x',()=>out.push('once'),{once:true});t.dispatchEvent(new Event('x'));t.dispatchEvent(new Event('x'));return out});
++await run('eventCancel',()=>{const t=new EventTarget(),e=new Event('x',{cancelable:true});t.addEventListener('x',event=>event.preventDefault());return{result:t.dispatchEvent(e),prevented:e.defaultPrevented,current:e.currentTarget,phase:e.eventPhase,trusted:e.isTrusted}});
++await run('eventSignalOption',()=>{const t=new EventTarget(),c=new AbortController(),out=[];t.addEventListener('x',()=>out.push(1),{signal:c.signal});c.abort();t.dispatchEvent(new Event('x'));return out});
++await run('any',()=>{const a=new AbortController(),b=new AbortController(),reason={a:2},s=AbortSignal.any([a.signal,b.signal]);b.abort(reason);return{aborted:s.aborted,same:s.reason===reason,target:s instanceof EventTarget}});
++await run('timeout',async()=>{const s=AbortSignal.timeout(2);await new Promise(r=>s.addEventListener('abort',r));return{name:s.reason.name,message:s.reason.message,dom:s.reason instanceof DOMException,error:s.reason instanceof Error}});
++for(const[name,fn]of[['signalConstruct',()=>new AbortSignal()],['controllerCall',()=>AbortController()],['getterFake',()=>Object.getOwnPropertyDescriptor(AbortSignal.prototype,'aborted').get.call(Object.create(AbortSignal.prototype))],['abortFake',()=>AbortController.prototype.abort.call({})],['anyFake',()=>AbortSignal.any([Object.create(AbortSignal.prototype)])],['dispatchFake',()=>new EventTarget().dispatchEvent(Object.create(Event.prototype))]])await run(name,fn);
++for(const[name,fn]of[['negative',()=>AbortSignal.timeout(-1)],['nan',()=>AbortSignal.timeout(NaN)],['infinity',()=>AbortSignal.timeout(Infinity)],['fraction',()=>{const s=AbortSignal.timeout(1.9);return{signal:s instanceof AbortSignal}}],['bigint',()=>{const s=AbortSignal.timeout(1n);return{signal:s instanceof AbortSignal}}],['symbol',()=>AbortSignal.timeout(Symbol())],['anyString',()=>AbortSignal.any('')],['anyEmpty',()=>AbortSignal.any([]).aborted]])await run('static-'+name,fn);
++await run('signalClone',()=>structuredClone(new AbortController().signal));await run('eventClone',()=>structuredClone(new Event('x')));
++return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-abort-native.json
+@@ -0,0 +1,312 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "a568a448415256d12e81b8ef4432510cfecf5f6b8f8d9ab218f20afd0eb78629",
++  "observations": {
++    "ok": true,
++    "value": [
++      {
++        "name": "shape",
++        "value": {
++          "controller": 0,
++          "signal": 0,
++          "ctlKeys": [
++            "signal",
++            "abort",
++            "constructor",
++            "Symbol(Symbol.toStringTag)"
++          ],
++          "sigKeys": [
++            "aborted",
++            "reason",
++            "onabort",
++            "throwIfAborted",
++            "constructor",
++            "Symbol(Symbol.toStringTag)"
++          ],
++          "signalTarget": true,
++          "eventKeys": [
++            "type",
++            "bubbles",
++            "cancelable",
++            "composed",
++            "target",
++            "srcElement",
++            "currentTarget",
++            "eventPhase",
++            "defaultPrevented",
++            "timeStamp",
++            "preventDefault",
++            "stopPropagation",
++            "stopImmediatePropagation",
++            "composedPath",
++            "initEvent",
++            "returnValue",
++            "cancelBubble",
++            "NONE",
++            "CAPTURING_PHASE",
++            "AT_TARGET",
++            "BUBBLING_PHASE",
++            "constructor",
++            "Symbol(Symbol.toStringTag)"
++          ],
++          "targetKeys": [
++            "dispatchEvent",
++            "addEventListener",
++            "removeEventListener",
++            "constructor",
++            "Symbol(Symbol.toStringTag)"
++          ]
++        }
++      },
++      {
++        "name": "basic",
++        "value": {
++          "same": true,
++          "controller": true,
++          "signal": true,
++          "target": true,
++          "aborted": false,
++          "reason": true,
++          "tag": "[object AbortSignal]",
++          "keys": [],
++          "eventKeys": [
++            "isTrusted"
++          ]
++        }
++      },
++      {
++        "name": "defaultAbort",
++        "value": {
++          "aborted": true,
++          "name": "AbortError",
++          "message": "signal is aborted without reason",
++          "code": 20,
++          "dom": true,
++          "error": true,
++          "event": true,
++          "trusted": true,
++          "target": true,
++          "current": true,
++          "bubbles": false,
++          "cancelable": false,
++          "keys": [
++            "isTrusted"
++          ]
++        }
++      },
++      {
++        "name": "listenerOrder",
++        "value": {
++          "order": [
++            [
++              "a",
++              true,
++              true,
++              2
++            ],
++            "replacement",
++            "b",
++            [
++              "object",
++              true
++            ]
++          ],
++          "reason": 3
++        }
++      },
++      {
++        "name": "stopImmediate",
++        "value": [
++          "a"
++        ]
++      },
++      {
++        "name": "borrowedMethods",
++        "value": {
++          "out": [
++            [
++              "x",
++              true,
++              true
++            ]
++          ],
++          "result": true,
++          "trusted": false
++        }
++      },
++      {
++        "name": "reasonIdentity",
++        "value": {
++          "same": true,
++          "identity": true,
++          "static": true,
++          "signal": true,
++          "target": true
++        }
++      },
++      {
++        "name": "onceCaptureRemoval",
++        "value": [
++          "f",
++          "once",
++          "f"
++        ]
++      },
++      {
++        "name": "eventCancel",
++        "value": {
++          "result": false,
++          "prevented": true,
++          "current": null,
++          "phase": 0,
++          "trusted": false
++        }
++      },
++      {
++        "name": "eventSignalOption",
++        "value": []
++      },
++      {
++        "name": "any",
++        "value": {
++          "aborted": true,
++          "same": true,
++          "target": true
++        }
++      },
++      {
++        "name": "timeout",
++        "value": {
++          "name": "TimeoutError",
++          "message": "signal timed out",
++          "dom": true,
++          "error": true
++        }
++      },
++      {
++        "name": "signalConstruct",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal Constructor",
++          "realm": true
++        }
++      },
++      {
++        "name": "controllerCall",
++        "error": {
++          "name": "TypeError",
++          "message": "invalid argument",
++          "realm": true
++        }
++      },
++      {
++        "name": "getterFake",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal invocation",
++          "realm": true
++        }
++      },
++      {
++        "name": "abortFake",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal invocation",
++          "realm": true
++        }
++      },
++      {
++        "name": "anyFake",
++        "error": {
++          "name": "TypeError",
++          "message": "invalid argument",
++          "realm": true
++        }
++      },
++      {
++        "name": "dispatchFake",
++        "error": {
++          "name": "TypeError",
++          "message": "invalid argument",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-negative",
++        "error": {
++          "name": "TypeError",
++          "message": "",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-nan",
++        "error": {
++          "name": "TypeError",
++          "message": "",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-infinity",
++        "error": {
++          "name": "TypeError",
++          "message": "",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-fraction",
++        "value": {
++          "signal": true
++        }
++      },
++      {
++        "name": "static-bigint",
++        "error": {
++          "name": "TypeError",
++          "message": "Cannot convert a BigInt value to a number",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-symbol",
++        "error": {
++          "name": "TypeError",
++          "message": "Cannot convert a Symbol value to a number",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-anyString",
++        "error": {
++          "name": "TypeError",
++          "message": "invalid argument",
++          "realm": true
++        }
++      },
++      {
++        "name": "static-anyEmpty",
++        "value": false
++      },
++      {
++        "name": "signalClone",
++        "error": {
++          "name": "DataCloneError",
++          "message": "The object can not be cloned",
++          "realm": false
++        }
++      },
++      {
++        "name": "eventClone",
++        "error": {
++          "name": "DataCloneError",
++          "message": "The object can not be cloned",
++          "realm": false
++        }
++      }
++    ]
++  }
++}
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-events-extra-code.js
+@@ -0,0 +1,18 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('addDuringDispatch',()=>{const t=new EventTarget(),out=[];t.addEventListener('x',()=>{out.push('a');t.addEventListener('x',()=>out.push('later'))},{once:true});t.addEventListener('x',()=>out.push('b'));t.dispatchEvent(new Event('x'));out.push('|');t.dispatchEvent(new Event('x'));return out});
++await run('removeDuringDispatch',()=>{const t=new EventTarget(),out=[],b=()=>out.push('b');t.addEventListener('x',()=>{out.push('a');t.removeEventListener('x',b)});t.addEventListener('x',b);t.dispatchEvent(new Event('x'));return out});
++await run('eventRedispatch',()=>{const c=new AbortController(),out=[];let event;c.signal.onabort=e=>{event=e;out.push(e.isTrusted)};c.abort();const t=new EventTarget();t.addEventListener('abort',e=>out.push([e.isTrusted,e.target===t,e.currentTarget===t]));t.dispatchEvent(event);return{out,trusted:event.isTrusted,target:event.target===t}});
++await run('eventInit',()=>{const t=new EventTarget(),e=new Event('x',{bubbles:true,cancelable:true,composed:true}),stamp=e.timeStamp;e.preventDefault();e.initEvent('y',false,true);return{type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,prevented:e.defaultPrevented,stamp:e.timeStamp===stamp,target:e.target,trusted:e.isTrusted}});
++await run('recursiveDispatch',()=>{const t=new EventTarget(),e=new Event('x');let result;t.addEventListener('x',()=>{try{t.dispatchEvent(e)}catch(x){result=[x.name,x.message,x instanceof DOMException,x instanceof Error]}});t.dispatchEvent(e);return result});
++await run('stopPropagation',()=>{const t=new EventTarget(),out=[];t.addEventListener('x',e=>{e.stopPropagation();out.push(e.cancelBubble)});t.addEventListener('x',()=>out.push('b'));t.dispatchEvent(new Event('x'));return out});
++await run('passive',()=>{const t=new EventTarget(),e=new Event('x',{cancelable:true});t.addEventListener('x',e=>e.preventDefault(),{passive:true});return{result:t.dispatchEvent(e),prevented:e.defaultPrevented}});
++await run('path',()=>{const t=new EventTarget(),e=new Event('x');let during;t.addEventListener('x',e=>{const p=e.composedPath();during=[p.length,p[0]===t,p instanceof Array]});t.dispatchEvent(e);return{during,after:e.composedPath().length}});
++await run('messageBrand',()=>Object.getOwnPropertyDescriptor(MessageEvent.prototype,'data').get.call(new Event('x')));
++await run('errorBrand',()=>Object.getOwnPropertyDescriptor(ErrorEvent.prototype,'error').get.call(new Event('x')));
++await run('proxyBrands',()=>{const c=new AbortController(),e=new Event('x'),out=[];for(const fn of[()=>Object.getOwnPropertyDescriptor(AbortController.prototype,'signal').get.call(new Proxy(c,{})),()=>Object.getOwnPropertyDescriptor(AbortSignal.prototype,'reason').get.call(new Proxy(c.signal,{})),()=>Event.prototype.preventDefault.call(new Proxy(e,{})),()=>EventTarget.prototype.addEventListener.call(new Proxy(c.signal,{}),'x',()=>{})])try{fn();out.push('accepted')}catch(e){out.push([e.name,e.message,e instanceof TypeError])}return out});
++await run('cancelledListener',()=>{const t=new EventTarget(),c=new AbortController(),out=[];t.addEventListener('x',()=>{out.push('a');c.abort()});t.addEventListener('x',()=>out.push('b'),{signal:c.signal});t.dispatchEvent(new Event('x'));return out});
++await run('alreadyAny',()=>{const a=AbortSignal.abort('a'),b=AbortSignal.abort('b');return AbortSignal.any([b,a]).reason});
++await run('onabortClearPosition',()=>{const c=new AbortController(),out=[];c.signal.onabort=()=>out.push('a');c.signal.addEventListener('abort',()=>out.push('b'));c.signal.onabort=null;c.signal.onabort=()=>out.push('c');c.abort();return out});
++await run('timeoutOrdering',async()=>{const s=AbortSignal.timeout(0),out=[s.aborted];queueMicrotask(()=>out.push(['micro',s.aborted]));s.addEventListener('abort',e=>out.push(['abort',e.isTrusted]));await new Promise(r=>setTimeout(r,5));return out});
++await run('capturedAbort',()=>{const C=AbortController,S=AbortSignal,old=globalThis.DOMException;globalThis.DOMException=function(){throw Error('authored')};try{const c=new C();c.abort();return{old:c.signal.reason instanceof old,name:c.signal.reason.name,static:S.abort().reason instanceof old}}finally{globalThis.DOMException=old}});
++return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-events-extra-native.json
+@@ -0,0 +1,169 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "e81f535060cd8d384be8384bd7375320cf9fb5721b7823c9f69f569f3da780b5",
++  "observations": {
++    "ok": true,
++    "value": [
++      {
++        "name": "addDuringDispatch",
++        "value": [
++          "a",
++          "b",
++          "|",
++          "b",
++          "later"
++        ]
++      },
++      {
++        "name": "removeDuringDispatch",
++        "value": [
++          "a"
++        ]
++      },
++      {
++        "name": "eventRedispatch",
++        "value": {
++          "out": [
++            true,
++            [
++              false,
++              true,
++              true
++            ]
++          ],
++          "trusted": false,
++          "target": true
++        }
++      },
++      {
++        "name": "eventInit",
++        "value": {
++          "type": "y",
++          "bubbles": false,
++          "cancelable": true,
++          "composed": true,
++          "prevented": false,
++          "stamp": true,
++          "target": null,
++          "trusted": false
++        }
++      },
++      {
++        "name": "recursiveDispatch",
++        "value": [
++          "InvalidStateError",
++          "The object is in an invalid state",
++          true,
++          true
++        ]
++      },
++      {
++        "name": "stopPropagation",
++        "value": [
++          true,
++          "b"
++        ]
++      },
++      {
++        "name": "passive",
++        "value": {
++          "result": true,
++          "prevented": false
++        }
++      },
++      {
++        "name": "path",
++        "value": {
++          "during": [
++            0,
++            false,
++            true
++          ],
++          "after": 0
++        }
++      },
++      {
++        "name": "messageBrand",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal invocation",
++          "realm": true
++        }
++      },
++      {
++        "name": "errorBrand",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal invocation",
++          "realm": true
++        }
++      },
++      {
++        "name": "proxyBrands",
++        "value": [
++          [
++            "TypeError",
++            "Illegal invocation",
++            true
++          ],
++          [
++            "TypeError",
++            "Illegal invocation",
++            true
++          ],
++          [
++            "TypeError",
++            "Illegal invocation",
++            true
++          ],
++          [
++            "TypeError",
++            "Illegal invocation",
++            true
++          ]
++        ]
++      },
++      {
++        "name": "cancelledListener",
++        "value": [
++          "a"
++        ]
++      },
++      {
++        "name": "alreadyAny",
++        "value": "b"
++      },
++      {
++        "name": "onabortClearPosition",
++        "value": [
++          "b",
++          "c"
++        ]
++      },
++      {
++        "name": "timeoutOrdering",
++        "value": [
++          false,
++          [
++            "micro",
++            false
++          ],
++          [
++            "abort",
++            true
++          ]
++        ]
++      },
++      {
++        "name": "capturedAbort",
++        "value": {
++          "old": true,
++          "name": "AbortError",
++          "static": true
++        }
++      }
++    ]
++  }
++}

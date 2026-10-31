@@ -6,6 +6,7 @@ import { registerPlatformFactory, platformFactoryRecord } from './platform-facto
 
 const require=createRequire(import.meta.url);
 const {fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
+const JsdomEventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const installed=new WeakMap(),states=new WeakMap(),eventTargets=new WeakMap();
 const typed=Object.getPrototypeOf(Uint8Array.prototype),get=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
 const tb=get(typed,'buffer'),tl=get(typed,'byteLength'),to=get(typed,'byteOffset'),db=get(DataView.prototype,'buffer'),dl=get(DataView.prototype,'byteLength'),dof=get(DataView.prototype,'byteOffset');
@@ -117,6 +118,7 @@ function factory(g,bridge){
   const operation=decoder?'decode':'encode';define(C.prototype,operation,{enumerable:true,configurable:true,writable:true,value:{[operation](input){
    receiver(this,name);const data=decoder?bridge.chunk(input):bridge.media(input,name==='AudioEncoder'?'AudioData':'VideoFrame');
    if(!data||decoder&&data.interface!==(name==='AudioDecoder'?'EncodedAudioChunk':'EncodedVideoChunk'))throw typeError('invalid argument');
+   if(!decoder&&data.closed)throw typeError('');
    if(bridge.read(this,'state')!=='configured')throw invalidState();
    if(decoder&&bridge.read(this,'keyRequired')&&data.type!=='key')throw new Exception('Data provided to an operation does not meet requirements','DataError');
    bridge.enqueue(this,data);
@@ -157,9 +159,9 @@ export function installWebCodecsProcessors(realm,{trustEvent}={}){
   brand:(value,name)=>states.get(value)?.interface===name,
   read:(value,key)=>['state','queueSize','keyRequired','handler'].includes(key)?states.get(value)[key]:undefined,
   bytes:snapshotBytes,chunk:encodedChunkData,
-  media(value,kind){const provenance=platformFactoryRecord(value);if(provenance?.kind!==kind||typeof provenance.read!=='function')return null;const record=provenance.read();return record?.closed?null:record},
+  media(value,kind){const provenance=platformFactoryRecord(value);if(provenance?.kind!==kind||typeof provenance.read!=='function')return null;const record=provenance.read();return record},
   create(value,kind,error,output){
-   const implementation=platformFactoryRecord(value)?.implementation;if(implementation)eventTargets.set(value,implementation);
+   const implementation=platformFactoryRecord(value)?.implementation;if(implementation instanceof JsdomEventTargetImpl)eventTargets.set(value,implementation);
    const state=hidden({value,runtime,interface:kind,state:'unconfigured',queueSize:0,keyRequired:true,error,output,handler:null,listener:null,configurationTask:null,dequeueTask:null,flushes:[],work:[]});
    states.set(value,state);registerPlatformFactory(value,{kind,globalObject:realm,implementation:state});
   },

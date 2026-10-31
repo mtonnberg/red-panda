@@ -1,0 +1,1 @@
+(()=>{const rows=[];for(const method of['test','exec']){const p=new URLPattern({pathname:'/:x'});/(seed)/.exec('seed');const before=[RegExp.$1,RegExp.lastMatch,RegExp.input];p[method]({pathname:'/a'});const after=[RegExp.$1,RegExp.lastMatch,RegExp.input];rows.push([method,{before,after}])}return JSON.stringify(rows)})()

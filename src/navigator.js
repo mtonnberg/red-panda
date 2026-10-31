@@ -23,12 +23,14 @@ export const navigatorProfile = Object.freeze({
 export function createNavigatorRealm(realm, {
   worker = false, get = () => undefined, profile = {}, estimate, active = () => true,
 } = {}) {
-  const Object = realm.Object, Array = realm.Array, Promise = realm.Promise;
+  const Object = realm.Object, Array = realm.Array, Promise = realm.Promise, TypeErrorConstructor = realm.TypeError;
+  const symbolDescription = Object.getOwnPropertyDescriptor(realm.Symbol.prototype, 'description').get;
+  const addListener = realm.EventTarget.prototype.addEventListener, removeListener = realm.EventTarget.prototype.removeEventListener;
   const secret = {}, navigatorObjects = new WeakSet(), permissionsObjects = new WeakSet(),
     storageObjects = new WeakSet(), uaObjects = new WeakSet(), statuses = new WeakMap(), estimates = new WeakMap();
   let disposed = false;
   const live = () => !disposed && active();
-  const fail = (message = 'Illegal invocation') => { throw new realm.TypeError(message); };
+  const fail = (message = 'Illegal invocation') => { throw new TypeErrorConstructor(message); };
   const text = value => typeof value === 'symbol' ? fail('Cannot convert a Symbol to a string') : String(value);
   const object = entries => Object.assign(new Object(), entries);
   const list = values => Array.from(values);
@@ -64,21 +66,28 @@ export function createNavigatorRealm(realm, {
     get onchange() { const value = statuses.get(this); if (!value) fail(); return value.onchange; }
     set onchange(value) {
       const state = statuses.get(this); if (!state) fail();
-      if (state.onchange) this.removeEventListener('change', state.onchange);
+      if (state.onchange) Reflect.apply(removeListener, this, ['change', state.onchange]);
       state.onchange = typeof value === 'function' ? value : null;
-      if (state.onchange) this.addEventListener('change', state.onchange);
+      if (state.onchange) Reflect.apply(addListener, this, ['change', state.onchange]);
     }
     get [Symbol.toStringTag]() { return 'PermissionStatus'; }
   }
   class Permissions {
     constructor(token) { if (token !== secret) fail('Illegal constructor'); permissionsObjects.add(this); }
     query(descriptor) {
-      return promise(() => {
+      let name, failure, failed = false;
+      // Native argument conversion runs before returning the realm Promise.
+      // Actual settlement still belongs to this document's private lifetime.
+      try {
         check(permissionsObjects, this);
-        if (descriptor === null || descriptor === undefined) fail('Permission descriptor requires a name');
-        const name = descriptor.name;
-        if (name === undefined) fail('Permission descriptor requires a name');
-        return new PermissionStatus(secret, text(name));
+        if (descriptor === null || descriptor === undefined) fail('invalid argument');
+        const input = descriptor.name;
+        if (input === undefined) fail('invalid argument');
+        name = typeof input === 'symbol' ? String(Reflect.apply(symbolDescription, input, [])) : text(input);
+      } catch (error) { failed = true; failure = error; }
+      return promise(() => {
+        if (failed) throw failure;
+        return new PermissionStatus(secret, name);
       });
     }
     get [Symbol.toStringTag]() { return 'Permissions'; }

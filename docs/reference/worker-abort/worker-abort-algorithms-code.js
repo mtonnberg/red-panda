@@ -1,0 +1,6 @@
+(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
+await run('anyStopImmediate',()=>{const c=new AbortController(),out=[];c.signal.addEventListener('abort',e=>{out.push(['source',s.aborted]);e.stopImmediatePropagation()});const s=AbortSignal.any([c.signal]);s.onabort=()=>out.push('any');c.abort('reason');return{out,aborted:s.aborted,reason:s.reason}});
+await run('listenerSignalStopImmediate',()=>{const c=new AbortController(),t=new EventTarget(),out=[];c.signal.onabort=e=>e.stopImmediatePropagation();t.addEventListener('x',()=>out.push('removed'),{signal:c.signal});c.abort();t.dispatchEvent(new Event('x'));return out});
+await run('anyReasonDuringSourceEvent',()=>{const c=new AbortController();let state;const s=AbortSignal.any([c.signal]);c.signal.addEventListener('abort',()=>state=[s.aborted,s.reason]);c.abort('done');return state});
+await run('anyEventOrder',()=>{const c=new AbortController(),s=AbortSignal.any([c.signal]),out=[];s.addEventListener('abort',()=>out.push('any'));c.signal.addEventListener('abort',()=>out.push('source'));c.abort();return out});
+return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))

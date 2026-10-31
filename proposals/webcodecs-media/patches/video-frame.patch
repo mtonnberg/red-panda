@@ -1,0 +1,4989 @@
+--- /dev/null
++++ b/src/video-frame.js
+@@ -0,0 +1,109 @@
++import {types} from 'node:util';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const states=new WeakMap(),installed=new WeakMap(),tokens=new WeakMap(),nativeClone=globalThis.structuredClone,MAX_BYTES=64*1024*1024;
++const typed=Object.getPrototypeOf(Uint8Array.prototype),get=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
++const tb=get(typed,'buffer'),tl=get(typed,'byteLength'),to=get(typed,'byteOffset'),db=get(DataView.prototype,'buffer'),dl=get(DataView.prototype,'byteLength'),dof=get(DataView.prototype,'byteOffset');
++const FORMATS=Object.create(null);
++for(const [name,sx,sy]of[['I420',2,2],['I422',2,1],['I444',1,1]])for(const alpha of[false,true])for(const depth of[8,10,12]){
++ const format=name+(alpha?'A':'')+(depth===8?'':'P'+depth),bps=depth===8?1:2;
++ FORMATS[format]=Object.freeze({rgb:false,alpha,planes:Object.freeze([{x:1,y:1,unit:bps},{x:sx,y:sy,unit:bps},{x:sx,y:sy,unit:bps},...(alpha?[{x:1,y:1,unit:bps}]:[])].map(Object.freeze))});
++}
++FORMATS.NV12=Object.freeze({rgb:false,alpha:false,planes:Object.freeze([{x:1,y:1,unit:1},{x:2,y:2,unit:2}].map(Object.freeze))});
++for(const format of['RGBA','RGBX','BGRA','BGRX'])FORMATS[format]=Object.freeze({rgb:true,alpha:format.endsWith('A'),planes:Object.freeze([Object.freeze({x:1,y:1,unit:4})])});
++Object.freeze(FORMATS);
++const isData=value=>types.isArrayBuffer(value)||ArrayBuffer.isView(value),slot=values=>Object.assign(Object.create(null),values),failure=(name='TypeError',message='')=>({ok:false,name,message});
++function byteView(value){if(types.isArrayBuffer(value)){try{return new Uint8Array(value)}catch{return new Uint8Array()}}const dataView=types.isDataView(value),buffer=(dataView?db:tb).call(value);try{return new Uint8Array(buffer,(dataView?dof:to).call(value),(dataView?dl:tl).call(value))}catch{return new Uint8Array()}}
++function layout(format,width,height,custom){
++ const type=FORMATS[format];if(!type)return failure();if(custom&&custom.length!==type.planes.length)return failure();let next=0;const planes=[];
++ for(let i=0;i<type.planes.length;i++){const p=type.planes[i],rows=Math.ceil(height/p.y),row=Math.ceil(width/p.x)*p.unit,c=custom?.[i],offset=c?c.offset:next,stride=c?c.stride:row,end=offset+stride*rows;
++  if(!Number.isInteger(offset)||offset<0||offset>4294967295||!Number.isInteger(stride)||stride<row||stride>4294967295||!Number.isSafeInteger(end))return failure();
++  for(const old of planes)if(offset<old.end&&old.offset<end)return failure();
++  planes.push(slot({offset,stride,row,rows,end,x:p.x,y:p.y,unit:p.unit}));next=Math.max(next,end);
++ }
++ return{ok:true,planes,size:next};
++}
++function rectangle(value,width,height,format){const rect=value??{x:0,y:0,width,height},copy=slot({});for(const k of['x','y','width','height']){const n=rect[k];if(!Number.isFinite(n)||n<0||n>4294967295)return failure();copy[k]=Math.trunc(n)}
++ if(!copy.width||!copy.height||copy.x+copy.width>width||copy.y+copy.height>height)return failure();for(const p of FORMATS[format].planes)if(copy.x%p.x||copy.y%p.y)return failure();return{ok:true,...copy};}
++function pack(source,sourceLayout,format,rect,targetFormat=format){
++ const out=layout(targetFormat,rect.width,rect.height);if(!out.ok)return out;if(out.size>MAX_BYTES)return failure('RangeError','VideoFrame exceeds the independent backend byte limit');const bytes=new Uint8Array(out.size);
++ for(let i=0;i<out.planes.length;i++){const a=sourceLayout.planes[i],b=out.planes[i];if(!a)return failure();for(let row=0;row<b.rows;row++){const offset=a.offset+(Math.floor(rect.y/a.y)+row)*a.stride+Math.floor(rect.x/a.x)*a.unit;bytes.set(source.subarray(offset,offset+b.row),b.offset+row*b.stride)}}
++ return{ok:true,bytes};
++}
++const defaultColor=format=>slot({primaries:'bt709',transfer:FORMATS[format].rgb?'iec61966-2-1':'bt709',matrix:FORMATS[format].rgb?'rgb':'bt709',fullRange:FORMATS[format].rgb});
++const COLOR={primaries:['bt709','bt470bg','smpte170m','bt2020','smpte432'],transfer:['bt709','smpte170m','iec61966-2-1','linear','pq','hlg'],matrix:['rgb','bt709','bt470bg','smpte170m','bt2020-ncl']};
++function color(value,format){if(value===undefined)return{ok:true,value:defaultColor(format)};const c=slot({primaries:value.primaries??null,transfer:value.transfer??null,matrix:value.matrix??null,fullRange:value.fullRange??null});for(const key of['primaries','transfer','matrix'])if(c[key]!==null&&!COLOR[key].includes(c[key]))return failure();return{ok:true,value:c}}
++function factory(g,b){
++ const TypeError=g.TypeError,RangeError=g.RangeError,Exception=g.DOMException,Promise=g.Promise,Rect=g.DOMRectReadOnly,ColorSpace=g.VideoColorSpace;
++ const create=g.Object.create,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,String=g.String,Array=g.Array,from=Array.from,iterator=g.Symbol.iterator,symbolDescription=descriptor(g.Symbol.prototype,'description').get;
++ const finite=g.Number.isFinite,trunc=g.Math.trunc,abs=g.Math.abs;
++ const err=()=>new TypeError(''),argument=()=>new TypeError('invalid argument'),text=v=>typeof v==='symbol'?apply(symbolDescription,v,[])??'':String(v);
++ const dictionary=v=>{if(v==null)return{};if(typeof v!=='object'&&typeof v!=='function')throw err();return v},member=(o,k)=>k in o?o[k]:undefined;
++ const uint=v=>{const n=+v;if(!finite(n)||n<0||n>4294967295)throw err();return trunc(n)},integer=(v,unsigned=false)=>{const n=+v;if(!finite(n)||abs(trunc(n))>9007199254740991||unsigned&&n<0)throw err();return trunc(n)||0};
++ const assert=value=>{if(!b.brand(value))throw new TypeError('Illegal invocation')};
++ function check(r){if(r.ok)return r;if(r.name==='RangeError')throw new RangeError(r.message);if(r.name==='TypeError')throw new TypeError(r.message);throw new Exception(r.message,r.name)}
++ function rect(value){if(value==null)return undefined;const o=dictionary(value),height=member(o,'height'),width=member(o,'width'),x=member(o,'x'),y=member(o,'y');return{x:x===undefined?0:+x,y:y===undefined?0:+y,width:width===undefined?0:+width,height:height===undefined?0:+height}}
++ function sequence(value){if(value===undefined||value===null)return undefined;if(typeof value[iterator]!=='function')throw err();return apply(from,Array,[value])}
++ function layouts(value){const list=sequence(value);if(list===undefined)return undefined;const result=[];for(let i=0;i<list.length;i++){const o=dictionary(list[i]),offset=member(o,'offset'),stride=member(o,'stride');define(result,i,{value:{offset:uint(offset),stride:uint(stride)},enumerable:true,writable:true,configurable:true})}return result}
++ function color(value){if(value==null)return undefined;const o=dictionary(value),f=member(o,'fullRange'),m=member(o,'matrix'),p=member(o,'primaries'),t=member(o,'transfer');return{fullRange:f==null?null:!!f,matrix:m==null?null:text(m),primaries:p==null?null:text(p),transfer:t==null?null:text(t)}}
++ function parse(init,raw){
++  const o=dictionary(init),out=create(null);
++  const fields=raw?['codedHeight','codedWidth','colorSpace','displayHeight','displayWidth','duration','flip','format','layout','rotation','timestamp','transfer','visibleRect']:['alpha','displayHeight','displayWidth','duration','flip','rotation','timestamp','visibleRect'];
++  for(let i=0;i<fields.length;i++){const key=fields[i],value=member(o,key);if(value===undefined)continue;let converted;
++   if(key==='colorSpace')converted=color(value);else if(key==='visibleRect')converted=rect(value);else if(key==='layout')converted=layouts(value);else if(key==='transfer'){converted=sequence(value);if(converted)for(let j=0;j<converted.length;j++)if(!b.transferable(converted[j]))throw err();}
++   else if(key==='flip')converted=!!value;else if(key==='codedHeight'||key==='codedWidth')converted=value===null?0:uint(value);else if(key==='displayHeight'||key==='displayWidth')converted=value===null?undefined:uint(value);else if(key==='timestamp')converted=integer(value);else if(key==='duration')converted=value==null?undefined:integer(value,true);else if(key==='rotation')converted=+value;else converted=text(value);
++   define(out,key,{value:converted,enumerable:true,writable:true,configurable:true});
++  }
++  return out;
++ }
++ function copyOptions(value){const o=dictionary(value),c=member(o,'colorSpace'),format=member(o,'format'),l=member(o,'layout'),r=member(o,'rect');return{colorSpace:c==null?undefined:text(c),format:format==null?undefined:text(format),layout:layouts(l),rect:rect(r)}}
++ function VideoFrame(source){if(new.target===undefined||!arguments.length)throw argument();const kind=b.source(source),options=parse(arguments[1],kind==='buffer');check(b.create(this,source,kind,options))}
++ define(VideoFrame,'prototype',{writable:false});const p=VideoFrame.prototype;delete p.constructor;
++ const getters={get format(){assert(this);return b.read(this,'format')},get codedWidth(){assert(this);return b.read(this,'codedWidth')},get codedHeight(){assert(this);return b.read(this,'codedHeight')},get codedRect(){assert(this);return b.read(this,'closed')?null:new Rect(0,0,b.read(this,'codedWidth'),b.read(this,'codedHeight'))},get visibleRect(){assert(this);return b.read(this,'closed')?null:new Rect(0,0,b.read(this,'storageWidth'),b.read(this,'storageHeight'))},get rotation(){assert(this);return b.read(this,'rotation')},get flip(){assert(this);return b.read(this,'flip')},get displayWidth(){assert(this);return b.read(this,'displayWidth')},get displayHeight(){assert(this);return b.read(this,'displayHeight')},get duration(){assert(this);return b.read(this,'duration')},get timestamp(){assert(this);return b.read(this,'timestamp')},get colorSpace(){assert(this);return new ColorSpace(b.color(this))}};
++ for(const key of['format','codedWidth','codedHeight','codedRect','visibleRect','rotation','flip','displayWidth','displayHeight','duration','timestamp','colorSpace'])define(p,key,{...descriptor(getters,key),enumerable:true,configurable:true});
++ const methods={metadata(){assert(this);check(b.open(this));return{}},allocationSize(){assert(this);return check(b.allocation(this,copyOptions(arguments[0]))).size},copyTo(destination){return new Promise((resolve,reject)=>{try{if(!b.brand(this)||!b.isData(destination))throw argument();const r=check(b.copy(this,destination,copyOptions(arguments[1]))),result=[];for(let i=0;i<r.layout.length;i++)define(result,i,{value:{offset:r.layout[i].offset,stride:r.layout[i].stride},enumerable:true,writable:true,configurable:true});resolve(result)}catch(error){reject(error)}})},clone(){assert(this);return check(b.clone(this)).value},close(){assert(this);b.close(this)}};
++ for(const key of['metadata','allocationSize','copyTo','clone','close'])define(p,key,{value:methods[key],enumerable:true,writable:true,configurable:true});
++ define(p,'constructor',{value:VideoFrame,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:'VideoFrame',configurable:true});define(g,'VideoFrame',{value:VideoFrame,writable:true,configurable:true});
++ return{construct(token){const value=create(VideoFrame.prototype);check(b.hydrate(value,token));return value}};
++}
++export function installVideoFrame(realm,{canvasSnapshot,canvasDimensions}={}){
++ if(installed.has(realm))return installed.get(realm);registerPlatformFactoryKind('VideoFrame');let api;
++ const selected=(value,options)=>{const s=states.get(value);if(s.closed)return failure('InvalidStateError','The object is in an invalid state');const format=options.format??s.format,type=FORMATS[format];if(!type)return failure();const r=rectangle(options.rect,s.storageWidth,s.storageHeight,s.format);if(!r.ok)return r;const l=layout(format,r.width,r.height,options.layout);if(!l.ok)return l;return{ok:true,state:s,format,rect:r,output:l,size:l.size}};
++ const source=value=>isData(value)?'buffer':states.has(value)?'frame':['HTMLCanvasElement','OffscreenCanvas'].includes(platformFactoryRecord(value)?.kind)?'canvas':['HTMLImageElement','SVGImageElement','HTMLVideoElement'].includes(platformFactoryRecord(value)?.kind)?'image':'unknown';
++ api=realm.eval(`(${factory.toString()})`)(realm,{
++  brand:value=>states.has(value),source,isData,transferable:types.isArrayBuffer,
++  create(value,input,kind,o){
++   let format,width,height,bytes,sourceLayout,original,raw=kind==='buffer';
++   if(raw){format=o.format;width=o.codedWidth;height=o.codedHeight;bytes=byteView(input);if(!FORMATS[format]||!width||!height)return failure();sourceLayout=layout(format,width,height,o.layout);if(!sourceLayout.ok||sourceLayout.size>bytes.length)return failure();}
++   else if(kind==='frame'){original=states.get(input);if(original.closed)return failure('InvalidStateError','The object is in an invalid state');format=original.format;width=original.storageWidth;height=original.storageHeight;bytes=original.bytes;sourceLayout=layout(format,width,height);}
++   else if(kind==='canvas'){if(!canvasSnapshot)return failure('InvalidStateError','The object is in an invalid state');const size=canvasDimensions?.(input);if(size&&(!size.width||!size.height||size.width>32767||size.height>32767))return failure('InvalidStateError','The object is in an invalid state');let snapshot;try{snapshot=canvasSnapshot(input)}catch(error){if(error instanceof RangeError)return failure('InvalidStateError','The object is in an invalid state');throw error}if(!snapshot||!snapshot.width||!snapshot.height)return failure('InvalidStateError','The object is in an invalid state');format='RGBA';width=snapshot.width;height=snapshot.height;bytes=snapshot.bytes;sourceLayout=layout(format,width,height);}
++   else if(kind==='image')return failure('InvalidStateError','The object is in an invalid state');else return failure();
++   const timestamp=o.timestamp===undefined?original?.timestamp:o.timestamp,duration=o.duration??original?.duration??null,angle=o.rotation??0;
++   if(timestamp===undefined||!Number.isFinite(angle))return failure();
++   const r=rectangle(o.visibleRect,width,height,format);if(!r.ok)return r;
++   if((o.displayWidth===undefined)!==(o.displayHeight===undefined)||o.displayWidth===0||o.displayHeight===0)return failure();
++   if(o.alpha!==undefined&&!['keep','discard'].includes(o.alpha))return failure();
++   let targetFormat=format;if(o.alpha==='discard'){if(format==='RGBA')targetFormat='RGBX';else if(format==='BGRA')targetFormat='BGRX';else if(FORMATS[format].alpha)targetFormat=format.replace('A','');}
++   const copied=pack(bytes,sourceLayout,format,r,targetFormat);if(!copied.ok)return copied;
++   const chosenColor=raw?color(o.colorSpace,format):{ok:true,value:original?.colorSpace??slot({primaries:null,transfer:null,matrix:null,fullRange:null})};if(!chosenColor.ok)return chosenColor;
++   const buffers=[],seen=new Set();for(let i=0;i<(o.transfer?.length??0);i++){const buffer=o.transfer[i];if(seen.has(buffer))return failure('DataCloneError','The object can not be cloned');seen.add(buffer);try{new Uint8Array(buffer)}catch{return failure('DataCloneError','The object can not be cloned')}buffers.push(buffer)}try{nativeClone(null,{transfer:buffers})}catch{return failure('DataCloneError','The object can not be cloned')}
++   const relative=((Math.round((angle%360)/90)*90)%360+360)%360,rotation=(((original?.rotation??0)+(original?.flip?-relative:relative))%360+360)%360,flip=Boolean(original?.flip)!==Boolean(o.flip),baseDisplayWidth=o.displayWidth!==undefined?(rotation%180?o.displayHeight:o.displayWidth):(original&&!o.visibleRect?(original.rotation%180?original.baseDisplayHeight:original.baseDisplayWidth):r.width),baseDisplayHeight=o.displayHeight!==undefined?(rotation%180?o.displayWidth:o.displayHeight):(original&&!o.visibleRect?(original.rotation%180?original.baseDisplayWidth:original.baseDisplayHeight):r.height);
++   const state=slot({format:targetFormat,codedWidth:original?.codedWidth??r.width,codedHeight:original?.codedHeight??r.height,storageWidth:r.width,storageHeight:r.height,baseDisplayWidth,baseDisplayHeight,timestamp,duration,rotation,flip,colorSpace:Object.freeze(slot(chosenColor.value)),bytes:copied.bytes,closed:false});states.set(value,state);registerPlatformFactory(value,{kind:'VideoFrame',implementation:state,globalObject:realm,read:()=>videoFrameRecord(value)});return{ok:true};
++  },
++  read(value,key){const s=states.get(value);if(key==='closed')return s.closed;if(s.closed)return key==='timestamp'||key==='duration'?s[key]:key==='format'?null:key==='flip'?false:0;if(key==='displayWidth')return s.rotation%180?s.baseDisplayHeight:s.baseDisplayWidth;if(key==='displayHeight')return s.rotation%180?s.baseDisplayWidth:s.baseDisplayHeight;return['format','codedWidth','codedHeight','storageWidth','storageHeight','timestamp','duration','rotation','flip'].includes(key)?s[key]:undefined},
++  color(value){const s=states.get(value);return s.closed?slot({primaries:null,transfer:null,matrix:null,fullRange:null}):slot(s.colorSpace)},
++  open:value=>states.get(value).closed?failure('InvalidStateError','The object is in an invalid state'):{ok:true},
++  allocation(value,options){const r=selected(value,options);return r.ok?{ok:true,size:r.size}:r},
++  copy(value,destination,options){const r=selected(value,options);if(!r.ok)return r;const s=r.state,from=FORMATS[s.format],to=FORMATS[r.format];if(s.format!==r.format&&!(from.rgb&&to.rgb))return failure('NotSupportedError','The operation is not supported');const dest=byteView(destination);if(dest.length<r.size)return failure();const input=layout(s.format,s.storageWidth,s.storageHeight);
++   if(s.format===r.format){for(let i=0;i<r.output.planes.length;i++){const a=input.planes[i],b=r.output.planes[i];for(let row=0;row<b.rows;row++){const start=a.offset+(Math.floor(r.rect.y/a.y)+row)*a.stride+Math.floor(r.rect.x/a.x)*a.unit;dest.set(s.bytes.subarray(start,start+b.row),b.offset+row*b.stride)}}}
++   else{const a=input.planes[0],b=r.output.planes[0],swap=s.format[0]!==r.format[0],opaque=!from.alpha||!to.alpha;for(let y=0;y<r.rect.height;y++)for(let x=0;x<r.rect.width;x++){const src=a.offset+(r.rect.y+y)*a.stride+(r.rect.x+x)*4,target=b.offset+y*b.stride+x*4;dest[target]=s.bytes[src+(swap?2:0)];dest[target+1]=s.bytes[src+1];dest[target+2]=s.bytes[src+(swap?0:2)];dest[target+3]=opaque?255:s.bytes[src+3]}}
++   return{ok:true,layout:r.output.planes.map(p=>({offset:p.offset,stride:p.stride}))};
++  },
++  clone(value){const s=states.get(value);if(s.closed)return failure('InvalidStateError','The object is in an invalid state');const token=Object.create(null);tokens.set(token,{realm,record:videoFrameRecord(value)});return{ok:true,value:api.construct(token)}},
++  hydrate(value,token){const entry=tokens.get(token);if(!entry||entry.realm!==realm)return failure();tokens.delete(token);const r=entry.record;if(!validVideoFrameRecord(r))return failure();const state=slot({...r,colorSpace:Object.freeze(slot(r.colorSpace)),bytes:r.bytes.slice(),closed:false});states.set(value,state);registerPlatformFactory(value,{kind:'VideoFrame',implementation:state,globalObject:realm,read:()=>videoFrameRecord(value)});return{ok:true}},
++  close(value){const s=states.get(value);s.closed=true;s.bytes=null},
++ });installed.set(realm,api);return api;
++}
++export function videoFrameRecord(value){const s=states.get(value);if(!s)return null;if(s.closed)return{kind:'VideoFrame',closed:true,timestamp:s.timestamp,duration:s.duration};return{kind:'VideoFrame',closed:false,format:s.format,codedWidth:s.codedWidth,codedHeight:s.codedHeight,storageWidth:s.storageWidth,storageHeight:s.storageHeight,baseDisplayWidth:s.baseDisplayWidth,baseDisplayHeight:s.baseDisplayHeight,timestamp:s.timestamp,duration:s.duration,rotation:s.rotation,flip:s.flip,colorSpace:slot(s.colorSpace),bytes:s.bytes.slice()}}
++export function validVideoFrameRecord(r){if(r?.kind!=='VideoFrame'||r.closed||!FORMATS[r.format]||!Number.isInteger(r.codedWidth)||r.codedWidth<=0||!Number.isInteger(r.codedHeight)||r.codedHeight<=0||!Number.isSafeInteger(r.timestamp)||r.duration!==null&&(!Number.isSafeInteger(r.duration)||r.duration<0)||!types.isUint8Array(r.bytes)||r.bytes.length>MAX_BYTES)return false;if(!Number.isInteger(r.storageWidth)||r.storageWidth<=0||r.storageWidth>r.codedWidth||!Number.isInteger(r.storageHeight)||r.storageHeight<=0||r.storageHeight>r.codedHeight)return false;if(!Number.isInteger(r.baseDisplayWidth)||r.baseDisplayWidth<=0||r.baseDisplayWidth>4294967295||!Number.isInteger(r.baseDisplayHeight)||r.baseDisplayHeight<=0||r.baseDisplayHeight>4294967295||![0,90,180,270].includes(r.rotation)||typeof r.flip!=='boolean'||!r.colorSpace)return false;const c=color(r.colorSpace,r.format);if(!c.ok)return false;const l=layout(r.format,r.storageWidth,r.storageHeight);return l.ok&&l.size===r.bytes.length}
++export function deserializeVideoFrame(realm,r){const api=installed.get(realm);if(!api||!validVideoFrameRecord(r))throw new TypeError('Invalid VideoFrame receiver');const token=Object.create(null);tokens.set(token,{realm,record:r});return api.construct(token)}
+--- /dev/null
++++ b/test/video-frame.test.js
+@@ -0,0 +1,9 @@
++import test from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{Browser}from'../src/browser.js';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t){const browser=new Browser({loadResources:['worker','iframe']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body>VideoFrame bytes</body>');return{page,w:page.dom.window}}
++for(const group of['video','video-layout','video-extra','video-transform'])test('actual Native '+group+' frame-byte controls match',async t=>{const{page}=await fixture(t),expression=await readFile(new URL('../oracle/webcodecs-media-'+group+'-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../oracle/webcodecs-media-native-'+group+'.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(plain(await page.evaluate(expression)),expected)});
++test('VideoFrame snapshots actual views, crop rows and raw transfer before later source mutation',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`(async()=>{const bytes=new Uint8Array([1,2,3,4,5,6,7,8]),frame=new VideoFrame(bytes,{format:'RGBA',codedWidth:2,codedHeight:1,timestamp:1,transfer:[bytes.buffer]});const clone=frame.clone(),dest=new Uint8Array(4);await clone.copyTo(dest,{rect:{x:1,y:0,width:1,height:1}});frame.close();return{detached:bytes.byteLength,bytes:[...dest],closed:frame.format,clone:clone.format,timestamp:clone.timestamp}})()`);assert.deepEqual(plain(value),{detached:0,bytes:[5,6,7,8],closed:null,clone:'RGBA',timestamp:1})});
++test('clone and actual serialization bypass authored metadata getters and prototype option hooks',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`(async()=>{const f=new VideoFrame(new Uint8Array([1,2,3,4]),{format:'RGBA',codedWidth:1,codedHeight:1,timestamp:2}),a=new AudioData({data:new Uint8Array([7]),format:'u8',numberOfFrames:1,numberOfChannels:1,sampleRate:8000,timestamp:3});for(const key of['format','codedWidth','timestamp'])Object.defineProperty(f,key,{get(){throw Error('authored field')}});Object.defineProperty(Object.prototype,'transfer',{configurable:true,get(){throw Error('prototype transfer read')}});let copy,clone,aClone;try{copy=structuredClone({f,a});clone=f.clone();aClone=a.clone()}finally{delete Object.prototype.transfer}const pixels=new Uint8Array(4),audio=new Uint8Array(1);await copy.f.copyTo(pixels);aClone.copyTo(audio,{planeIndex:0});return{pixels:[...pixels],clone:clone.format,audio:[...audio],timestamp:copy.f.timestamp}})()`);assert.deepEqual(plain(value),{pixels:[1,2,3,4],clone:'RGBA',audio:[7],timestamp:2})});
++test('authored plane-shaped clone records never acquire private VideoFrame brands',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`(()=>{const fake=Object.create(VideoFrame.prototype);for(const[key,value]of Object.entries({kind:'VideoFrame',format:'RGBA',codedWidth:1,codedHeight:1,bytes:new Uint8Array([1,2,3,4])}))Object.defineProperty(fake,key,{value,enumerable:true,configurable:true});const copy=structuredClone(fake);let error;try{VideoFrame.prototype.clone.call(copy)}catch(e){error=e.name}return{plain:Object.getPrototypeOf(copy)===Object.prototype,brand:copy instanceof VideoFrame,error,kind:copy.kind}})()`);assert.deepEqual(plain(value),{plain:true,brand:false,error:'TypeError',kind:'VideoFrame'})});
++test('actual Worker transport preserves immutable multi-plane pixels after sender closes',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`new Promise((resolve,reject)=>{const source='onmessage=async e=>{const f=e.data,bytes=new Uint8Array(f.allocationSize()),layout=await f.copyTo(bytes);postMessage({brand:f instanceof VideoFrame,layout,bytes,copy:f.clone()})}',url=URL.createObjectURL(new Blob([source])),worker=new Worker(url),timer=setTimeout(()=>{worker.terminate();reject(Error('worker deadline'))},5000);worker.onerror=e=>{clearTimeout(timer);worker.terminate();reject(Error(e.message))};worker.onmessage=async e=>{clearTimeout(timer);const bytes=new Uint8Array(e.data.copy.allocationSize());await e.data.copy.copyTo(bytes);resolve({brand:e.data.brand,copy:e.data.copy instanceof VideoFrame,bytes:[...bytes],layout:e.data.layout});worker.terminate();URL.revokeObjectURL(url)};const f=new VideoFrame(new Uint8Array([1,2,3,4,5,6]),{format:'I420',codedWidth:2,codedHeight:2,timestamp:4});worker.postMessage(f);f.close()})`);assert.deepEqual(plain(value),{brand:true,copy:true,bytes:[1,2,3,4,5,6],layout:[{offset:0,stride:2},{offset:4,stride:1},{offset:5,stride:1}]})});
++test('genuine VideoFrames enter actual encoder queues and closed frames reject before queueing',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`(async()=>{const events=[],encoder=new VideoEncoder({output(){events.push('unexpected output')},error:e=>events.push(e.name)}),frame=new VideoFrame(new Uint8Array([1,2,3,4]),{format:'RGBA',codedWidth:1,codedHeight:1,timestamp:0});encoder.configure({codec:'vp8',width:1,height:1});encoder.encode(frame);const queued=encoder.encodeQueueSize;await encoder.flush().catch(e=>events.push('flush:'+e.name));frame.close();const second=new VideoEncoder({output(){},error(){}});let closed;try{second.encode(frame)}catch(e){closed=[e.name,e.message]}second.close();return{queued,events,closed}})()`);assert.deepEqual(plain(value),{queued:1,events:['NotSupportedError','flush:NotSupportedError'],closed:['TypeError','']})});
+--- /dev/null
++++ b/oracle/webcodecs-media-native-video.json
+@@ -0,0 +1,3009 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "361954228db0669a9d0e48ba407b0ec754e414cc08174ec9cf4e2606bc363c83",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "name": "shape",
++          "value": {
++            "length": 1,
++            "keys": [
++              "format",
++              "codedWidth",
++              "codedHeight",
++              "codedRect",
++              "visibleRect",
++              "rotation",
++              "flip",
++              "displayWidth",
++              "displayHeight",
++              "duration",
++              "timestamp",
++              "colorSpace",
++              "metadata",
++              "allocationSize",
++              "copyTo",
++              "clone",
++              "close",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ],
++            "methods": {
++              "allocationSize": 0,
++              "copyTo": 1,
++              "clone": 0,
++              "close": 0,
++              "metadata": 0
++            }
++          }
++        },
++        {
++          "name": "metadata",
++          "value": {
++            "meta": {
++              "format": "RGBA",
++              "codedWidth": 2,
++              "codedHeight": 2,
++              "displayWidth": 2,
++              "displayHeight": 2,
++              "timestamp": 7,
++              "duration": 3,
++              "rotation": 0,
++              "flip": false,
++              "visible": {
++                "x": 0,
++                "y": 0,
++                "width": 2,
++                "height": 2,
++                "top": 0,
++                "right": 2,
++                "bottom": 2,
++                "left": 0
++              },
++              "coded": {
++                "x": 0,
++                "y": 0,
++                "width": 2,
++                "height": 2,
++                "top": 0,
++                "right": 2,
++                "bottom": 2,
++                "left": 0
++              },
++              "color": {
++                "primaries": "bt709",
++                "transfer": "iec61966-2-1",
++                "matrix": "rgb",
++                "fullRange": true
++              }
++            },
++            "own": [],
++            "metadata": {},
++            "sameRect": false,
++            "sameColor": false
++          }
++        },
++        {
++          "name": "input-order",
++          "value": [
++            "has:codedHeight",
++            "get:codedHeight",
++            "has:codedWidth",
++            "get:codedWidth",
++            "has:colorSpace",
++            "has:displayHeight",
++            "has:displayWidth",
++            "has:duration",
++            "get:duration",
++            "has:flip",
++            "has:format",
++            "get:format",
++            "has:layout",
++            "has:rotation",
++            "has:timestamp",
++            "get:timestamp",
++            "has:transfer",
++            "has:visibleRect"
++          ]
++        },
++        {
++          "name": "format:I420",
++          "value": {
++            "size": 17,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 2
++              },
++              {
++                "offset": 13,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I420P10",
++          "value": {
++            "size": 34,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 26,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I420P12",
++          "value": {
++            "size": 34,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 26,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I420A",
++          "value": {
++            "size": 26,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 2
++              },
++              {
++                "offset": 13,
++                "stride": 2
++              },
++              {
++                "offset": 17,
++                "stride": 3
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I420AP10",
++          "value": {
++            "size": 52,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 26,
++                "stride": 4
++              },
++              {
++                "offset": 34,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I420AP12",
++          "value": {
++            "size": 52,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 26,
++                "stride": 4
++              },
++              {
++                "offset": 34,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I422",
++          "value": {
++            "size": 21,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 2
++              },
++              {
++                "offset": 15,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I422P10",
++          "value": {
++            "size": 42,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 30,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I422P12",
++          "value": {
++            "size": 42,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 30,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I422A",
++          "value": {
++            "size": 30,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 2
++              },
++              {
++                "offset": 15,
++                "stride": 2
++              },
++              {
++                "offset": 21,
++                "stride": 3
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I422AP10",
++          "value": {
++            "size": 60,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 30,
++                "stride": 4
++              },
++              {
++                "offset": 42,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51,
++              52,
++              53,
++              54,
++              55,
++              56,
++              57,
++              58,
++              59
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I422AP12",
++          "value": {
++            "size": 60,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 4
++              },
++              {
++                "offset": 30,
++                "stride": 4
++              },
++              {
++                "offset": 42,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51,
++              52,
++              53,
++              54,
++              55,
++              56,
++              57,
++              58,
++              59
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I444",
++          "value": {
++            "size": 27,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 3
++              },
++              {
++                "offset": 18,
++                "stride": 3
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I444P10",
++          "value": {
++            "size": 54,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 6
++              },
++              {
++                "offset": 36,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51,
++              52,
++              53
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I444P12",
++          "value": {
++            "size": 54,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 6
++              },
++              {
++                "offset": 36,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51,
++              52,
++              53
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I444A",
++          "value": {
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 3
++              },
++              {
++                "offset": 18,
++                "stride": 3
++              },
++              {
++                "offset": 27,
++                "stride": 3
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I444AP10",
++          "value": {
++            "size": 72,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 6
++              },
++              {
++                "offset": 36,
++                "stride": 6
++              },
++              {
++                "offset": 54,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51,
++              52,
++              53,
++              54,
++              55,
++              56,
++              57,
++              58,
++              59,
++              60,
++              61,
++              62,
++              63,
++              64,
++              65,
++              66,
++              67,
++              68,
++              69,
++              70,
++              71
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:I444AP12",
++          "value": {
++            "size": 72,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 6
++              },
++              {
++                "offset": 18,
++                "stride": 6
++              },
++              {
++                "offset": 36,
++                "stride": 6
++              },
++              {
++                "offset": 54,
++                "stride": 6
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              48,
++              49,
++              50,
++              51,
++              52,
++              53,
++              54,
++              55,
++              56,
++              57,
++              58,
++              59,
++              60,
++              61,
++              62,
++              63,
++              64,
++              65,
++              66,
++              67,
++              68,
++              69,
++              70,
++              71
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:NV12",
++          "value": {
++            "size": 17,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "bt709",
++              "matrix": "bt709",
++              "fullRange": false
++            }
++          }
++        },
++        {
++          "name": "format:RGBA",
++          "value": {
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 12
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "format:RGBX",
++          "value": {
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 12
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "format:BGRA",
++          "value": {
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 12
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "format:BGRX",
++          "value": {
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 12
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              28,
++              29,
++              30,
++              31,
++              32,
++              33,
++              34,
++              35
++            ],
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "format:RGBAF16",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "format:nope",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "rotation:0",
++          "value": [
++            0,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:44",
++          "value": [
++            0,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:45",
++          "value": [
++            90,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:46",
++          "value": [
++            90,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:89",
++          "value": [
++            90,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:91",
++          "value": [
++            90,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:135",
++          "value": [
++            180,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:179",
++          "value": [
++            180,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:180",
++          "value": [
++            180,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:225",
++          "value": [
++            270,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:270",
++          "value": [
++            270,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:315",
++          "value": [
++            0,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:360",
++          "value": [
++            0,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:-45",
++          "value": [
++            0,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:-46",
++          "value": [
++            270,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "rotation:-179",
++          "value": [
++            180,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:1e+300",
++          "value": [
++            0,
++            4,
++            1
++          ]
++        },
++        {
++          "name": "rotation:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "rotation:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:undefined",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:null",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:-1",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:1.5",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 1,
++            "codedHeight": 2,
++            "displayWidth": 1,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 1,
++              "height": 2,
++              "top": 0,
++              "right": 1,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 1,
++              "height": 2,
++              "top": 0,
++              "right": 1,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:codedWidth:4294967296",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedWidth:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:undefined",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:null",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:-1",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:1.5",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 1,
++            "displayWidth": 2,
++            "displayHeight": 1,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 1,
++              "top": 0,
++              "right": 2,
++              "bottom": 1,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 1,
++              "top": 0,
++              "right": 2,
++              "bottom": 1,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:codedHeight:4294967296",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:codedHeight:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:timestamp:undefined",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:timestamp:null",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 0,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:timestamp:0",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 0,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:timestamp:-1",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": -1,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:timestamp:1.5",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 1,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:timestamp:4294967296",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 4294967296,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:timestamp:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:timestamp:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:duration:undefined",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": null,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:duration:null",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": null,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:duration:0",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 0,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:duration:-1",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:duration:1.5",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 1,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:duration:4294967296",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 4294967296,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:duration:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:duration:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayWidth:undefined",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:displayWidth:null",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:displayWidth:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayWidth:-1",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayWidth:1.5",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayWidth:4294967296",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayWidth:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayWidth:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayHeight:undefined",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:displayHeight:null",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "field:displayHeight:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayHeight:-1",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayHeight:1.5",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayHeight:4294967296",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayHeight:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "field:displayHeight:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:undefined",
++          "value": {
++            "primaries": "bt709",
++            "transfer": "iec61966-2-1",
++            "matrix": "rgb",
++            "fullRange": true
++          }
++        },
++        {
++          "name": "color:{}",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": null,
++            "fullRange": null
++          }
++        },
++        {
++          "name": "color:null",
++          "value": {
++            "primaries": "bt709",
++            "transfer": "iec61966-2-1",
++            "matrix": "rgb",
++            "fullRange": true
++          }
++        },
++        {
++          "name": "color:{\"matrix\":\"bt709\"}",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": "bt709",
++            "fullRange": null
++          }
++        },
++        {
++          "name": "color:{\"fullRange\":false,\"primaries\":\"bt2020\",\"transfer\":\"linear\",\"matrix\":\"rgb\"}",
++          "value": {
++            "primaries": "bt2020",
++            "transfer": "linear",
++            "matrix": "rgb",
++            "fullRange": false
++          }
++        },
++        {
++          "name": "clone-close",
++          "value": {
++            "closed": {
++              "format": null,
++              "codedWidth": 0,
++              "codedHeight": 0,
++              "displayWidth": 0,
++              "displayHeight": 0,
++              "timestamp": 7,
++              "duration": 3,
++              "rotation": 0,
++              "flip": false,
++              "color": {
++                "primaries": null,
++                "transfer": null,
++                "matrix": null,
++                "fullRange": null
++              }
++            },
++            "oldColor": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "clone": {
++              "format": "RGBA",
++              "codedWidth": 2,
++              "codedHeight": 2,
++              "displayWidth": 2,
++              "displayHeight": 2,
++              "timestamp": 7,
++              "duration": 3,
++              "rotation": 0,
++              "flip": false,
++              "visible": {
++                "x": 0,
++                "y": 0,
++                "width": 2,
++                "height": 2,
++                "top": 0,
++                "right": 2,
++                "bottom": 2,
++                "left": 0
++              },
++              "coded": {
++                "x": 0,
++                "y": 0,
++                "width": 2,
++                "height": 2,
++                "top": 0,
++                "right": 2,
++                "bottom": 2,
++                "left": 0
++              },
++              "color": {
++                "primaries": "bt709",
++                "transfer": "iec61966-2-1",
++                "matrix": "rgb",
++                "fullRange": true
++              }
++            },
++            "serialized": {
++              "format": "RGBA",
++              "codedWidth": 2,
++              "codedHeight": 2,
++              "displayWidth": 2,
++              "displayHeight": 2,
++              "timestamp": 7,
++              "duration": 3,
++              "rotation": 0,
++              "flip": false,
++              "visible": {
++                "x": 0,
++                "y": 0,
++                "width": 2,
++                "height": 2,
++                "top": 0,
++                "right": 2,
++                "bottom": 2,
++                "left": 0
++              },
++              "coded": {
++                "x": 0,
++                "y": 0,
++                "width": 2,
++                "height": 2,
++                "top": 0,
++                "right": 2,
++                "bottom": 2,
++                "left": 0
++              },
++              "color": {
++                "primaries": "bt709",
++                "transfer": "iec61966-2-1",
++                "matrix": "rgb",
++                "fullRange": true
++              }
++            }
++          }
++        },
++        {
++          "name": "closed:clone",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "closed:metadata",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "closed:allocationSize",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "closed:copyTo",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "clone-transfer",
++          "value": {
++            "source": "RGBA",
++            "copy": "RGBA",
++            "alias": true
++          }
++        },
++        {
++          "name": "source:plain",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "source:image",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "source:image-data",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "source:shared",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "source:shared-view",
++          "value": {
++            "format": "RGBA",
++            "codedWidth": 2,
++            "codedHeight": 2,
++            "displayWidth": 2,
++            "displayHeight": 2,
++            "timestamp": 7,
++            "duration": 3,
++            "rotation": 0,
++            "flip": false,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "coded": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            }
++          }
++        },
++        {
++          "name": "copy-sync-write",
++          "value": {
++            "promise": true,
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              12,
++              13,
++              14,
++              15,
++              16
++            ]
++          }
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-video-expression.js
+@@ -0,0 +1,15 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++const pixels=()=>new Uint8Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);const init=()=>({format:'RGBA',codedWidth:2,codedHeight:2,timestamp:7,duration:3});const meta=f=>({format:f.format,codedWidth:f.codedWidth,codedHeight:f.codedHeight,displayWidth:f.displayWidth,displayHeight:f.displayHeight,timestamp:f.timestamp,duration:f.duration,rotation:f.rotation,flip:f.flip,visible:f.visibleRect?.toJSON(),coded:f.codedRect?.toJSON(),color:f.colorSpace.toJSON()});
++await run('shape',()=>({length:VideoFrame.length,keys:Reflect.ownKeys(VideoFrame.prototype).map(String),methods:Object.fromEntries(['allocationSize','copyTo','clone','close','metadata'].map(k=>[k,VideoFrame.prototype[k].length]))}));
++await run('metadata',()=>{const f=new VideoFrame(pixels(),init());return{meta:meta(f),own:Object.keys(f),metadata:f.metadata(),sameRect:f.visibleRect===f.visibleRect,sameColor:f.colorSpace===f.colorSpace}});
++await run('input-order',()=>{const order=[],f=new VideoFrame(pixels(),new Proxy(init(),{has(o,k){order.push('has:'+String(k));return k in o},get(o,k){order.push('get:'+String(k));return o[k]}}));f.close();return order});
++for(const format of['I420','I420P10','I420P12','I420A','I420AP10','I420AP12','I422','I422P10','I422P12','I422A','I422AP10','I422AP12','I444','I444P10','I444P12','I444A','I444AP10','I444AP12','NV12','RGBA','RGBX','BGRA','BGRX','RGBAF16','nope'])await run('format:'+format,async()=>{const source=new Uint8Array(256);for(let i=0;i<source.length;i++)source[i]=i;const f=new VideoFrame(source,{format,codedWidth:3,codedHeight:3,timestamp:0}),size=f.allocationSize(),dest=new Uint8Array(size),layout=await f.copyTo(dest);return{size,layout,bytes:[...dest],color:f.colorSpace.toJSON()}});
++for(const rotation of[0,44,45,46,89,91,135,179,180,225,270,315,360,-45,-46,-179,1e300,NaN,Infinity])await run('rotation:'+String(rotation),()=>{const f=new VideoFrame(pixels(),{...init(),codedWidth:4,codedHeight:1,rotation});return[f.rotation,f.displayWidth,f.displayHeight]});
++for(const key of['codedWidth','codedHeight','timestamp','duration','displayWidth','displayHeight'])for(const value of[undefined,null,0,-1,1.5,2**32,2**53,Infinity])await run('field:'+key+':'+String(value),()=>{const f=new VideoFrame(pixels(),{...init(),[key]:value});return meta(f)});
++for(const colorSpace of[undefined,{},null,{matrix:'bt709'},{fullRange:false,primaries:'bt2020',transfer:'linear',matrix:'rgb'}])await run('color:'+JSON.stringify(colorSpace),()=>new VideoFrame(pixels(),{...init(),colorSpace}).colorSpace.toJSON());
++await run('clone-close',()=>{const f=new VideoFrame(pixels(),init()),color=f.colorSpace,clone=f.clone(),serialized=structuredClone(f);f.close();f.close();return{closed:meta(f),oldColor:color.toJSON(),clone:meta(clone),serialized:meta(serialized)}});
++for(const op of['clone','metadata','allocationSize','copyTo'])await run('closed:'+op,async()=>{const f=new VideoFrame(pixels(),init());f.close();return op==='copyTo'?await f.copyTo(new Uint8Array(16)):f[op]()});
++await run('clone-transfer',()=>{const f=new VideoFrame(pixels(),init()),copy=structuredClone({f,again:f},{transfer:[f,f]});return{source:f.format,copy:copy.f.format,alias:copy.f===copy.again}});
++for(const [label,source]of[['plain',{}],['image',document.createElement('img')],['image-data',new ImageData(1,1)],['shared',new SharedArrayBuffer(16)],['shared-view',new Uint8Array(new SharedArrayBuffer(16))]])await run('source:'+label,()=>meta(new VideoFrame(source,init())));
++await run('copy-sync-write',()=>{const f=new VideoFrame(pixels(),init()),dest=new Uint8Array(16),p=f.copyTo(dest);return{promise:p instanceof Promise,bytes:[...dest]}});
++return rows})()
+--- /dev/null
++++ b/oracle/webcodecs-media-native-video-layout.json
+@@ -0,0 +1,1156 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "c8f9b661622c16a5bc31267b3a6ee4117952489e2a00a491927f66e2eb7a3355",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "name": "swizzle:RGBA:RGBA",
++          "value": [
++            1,
++            2,
++            3,
++            4
++          ]
++        },
++        {
++          "name": "swizzle:RGBA:RGBX",
++          "value": [
++            1,
++            2,
++            3,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:RGBA:BGRA",
++          "value": [
++            3,
++            2,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "swizzle:RGBA:BGRX",
++          "value": [
++            3,
++            2,
++            1,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:RGBX:RGBA",
++          "value": [
++            1,
++            2,
++            3,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:RGBX:RGBX",
++          "value": [
++            1,
++            2,
++            3,
++            4
++          ]
++        },
++        {
++          "name": "swizzle:RGBX:BGRA",
++          "value": [
++            3,
++            2,
++            1,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:RGBX:BGRX",
++          "value": [
++            3,
++            2,
++            1,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:BGRA:RGBA",
++          "value": [
++            3,
++            2,
++            1,
++            4
++          ]
++        },
++        {
++          "name": "swizzle:BGRA:RGBX",
++          "value": [
++            3,
++            2,
++            1,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:BGRA:BGRA",
++          "value": [
++            1,
++            2,
++            3,
++            4
++          ]
++        },
++        {
++          "name": "swizzle:BGRA:BGRX",
++          "value": [
++            1,
++            2,
++            3,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:BGRX:RGBA",
++          "value": [
++            3,
++            2,
++            1,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:BGRX:RGBX",
++          "value": [
++            3,
++            2,
++            1,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:BGRX:BGRA",
++          "value": [
++            1,
++            2,
++            3,
++            255
++          ]
++        },
++        {
++          "name": "swizzle:BGRX:BGRX",
++          "value": [
++            1,
++            2,
++            3,
++            4
++          ]
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":1,\"y\":1,\"width\":1,\"height\":1}",
++          "value": {
++            "width": 1,
++            "height": 1,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 1,
++              "height": 1,
++              "top": 0,
++              "right": 1,
++              "bottom": 1,
++              "left": 0
++            },
++            "size": 4,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              20,
++              21,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":1,\"y\":1,\"width\":1,\"height\":1}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 4,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              20,
++              21,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":0,\"y\":0,\"width\":3,\"height\":3}",
++          "value": {
++            "width": 3,
++            "height": 3,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 3,
++              "height": 3,
++              "top": 0,
++              "right": 3,
++              "bottom": 3,
++              "left": 0
++            },
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 12
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43
++            ]
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":0,\"y\":0,\"width\":3,\"height\":3}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 36,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 12
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23,
++              24,
++              25,
++              26,
++              27,
++              32,
++              33,
++              34,
++              35,
++              36,
++              37,
++              38,
++              39,
++              40,
++              41,
++              42,
++              43
++            ]
++          }
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":2,\"y\":2,\"width\":2,\"height\":2}",
++          "value": {
++            "width": 2,
++            "height": 2,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "size": 16,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 8
++              }
++            ],
++            "bytes": [
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              56,
++              57,
++              58,
++              59,
++              60,
++              61,
++              62,
++              63
++            ]
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":2,\"y\":2,\"width\":2,\"height\":2}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 16,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 8
++              }
++            ],
++            "bytes": [
++              40,
++              41,
++              42,
++              43,
++              44,
++              45,
++              46,
++              47,
++              56,
++              57,
++              58,
++              59,
++              60,
++              61,
++              62,
++              63
++            ]
++          }
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":-1,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":-1,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":1.5,\"y\":0,\"width\":1,\"height\":1}",
++          "value": {
++            "width": 1,
++            "height": 1,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 1,
++              "height": 1,
++              "top": 0,
++              "right": 1,
++              "bottom": 1,
++              "left": 0
++            },
++            "size": 4,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              4,
++              5,
++              6,
++              7
++            ]
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":1.5,\"y\":0,\"width\":1,\"height\":1}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 4,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              4,
++              5,
++              6,
++              7
++            ]
++          }
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":0,\"y\":0,\"width\":0,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":0,\"y\":0,\"width\":0,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "RGBA:constructor:{\"x\":0,\"y\":0,\"width\":18446744073709552000,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "RGBA:copy:{\"x\":0,\"y\":0,\"width\":18446744073709552000,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":1,\"y\":1,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":1,\"y\":1,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":0,\"y\":0,\"width\":3,\"height\":3}",
++          "value": {
++            "width": 3,
++            "height": 3,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 3,
++              "height": 3,
++              "top": 0,
++              "right": 3,
++              "bottom": 3,
++              "left": 0
++            },
++            "size": 17,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 2
++              },
++              {
++                "offset": 13,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              4,
++              5,
++              6,
++              8,
++              9,
++              10,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":0,\"y\":0,\"width\":3,\"height\":3}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 17,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 2
++              },
++              {
++                "offset": 13,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              4,
++              5,
++              6,
++              8,
++              9,
++              10,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":2,\"y\":2,\"width\":2,\"height\":2}",
++          "value": {
++            "width": 2,
++            "height": 2,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "size": 6,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 2
++              },
++              {
++                "offset": 4,
++                "stride": 1
++              },
++              {
++                "offset": 5,
++                "stride": 1
++              }
++            ],
++            "bytes": [
++              10,
++              11,
++              14,
++              15,
++              19,
++              23
++            ]
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":2,\"y\":2,\"width\":2,\"height\":2}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 6,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 2
++              },
++              {
++                "offset": 4,
++                "stride": 1
++              },
++              {
++                "offset": 5,
++                "stride": 1
++              }
++            ],
++            "bytes": [
++              10,
++              11,
++              14,
++              15,
++              19,
++              23
++            ]
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":-1,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":-1,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":1.5,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":1.5,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":0,\"y\":0,\"width\":0,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":0,\"y\":0,\"width\":0,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:constructor:{\"x\":0,\"y\":0,\"width\":18446744073709552000,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "I420:copy:{\"x\":0,\"y\":0,\"width\":18446744073709552000,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":1,\"y\":1,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":1,\"y\":1,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":0,\"y\":0,\"width\":3,\"height\":3}",
++          "value": {
++            "width": 3,
++            "height": 3,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 3,
++              "height": 3,
++              "top": 0,
++              "right": 3,
++              "bottom": 3,
++              "left": 0
++            },
++            "size": 17,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              4,
++              5,
++              6,
++              8,
++              9,
++              10,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":0,\"y\":0,\"width\":3,\"height\":3}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 17,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 3
++              },
++              {
++                "offset": 9,
++                "stride": 4
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              4,
++              5,
++              6,
++              8,
++              9,
++              10,
++              16,
++              17,
++              18,
++              19,
++              20,
++              21,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":2,\"y\":2,\"width\":2,\"height\":2}",
++          "value": {
++            "width": 2,
++            "height": 2,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 2,
++              "height": 2,
++              "top": 0,
++              "right": 2,
++              "bottom": 2,
++              "left": 0
++            },
++            "size": 6,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 2
++              },
++              {
++                "offset": 4,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              10,
++              11,
++              14,
++              15,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":2,\"y\":2,\"width\":2,\"height\":2}",
++          "value": {
++            "width": 4,
++            "height": 4,
++            "visible": {
++              "x": 0,
++              "y": 0,
++              "width": 4,
++              "height": 4,
++              "top": 0,
++              "right": 4,
++              "bottom": 4,
++              "left": 0
++            },
++            "size": 6,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 2
++              },
++              {
++                "offset": 4,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              10,
++              11,
++              14,
++              15,
++              22,
++              23
++            ]
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":-1,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":-1,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":1.5,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":1.5,\"y\":0,\"width\":1,\"height\":1}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":0,\"y\":0,\"width\":0,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":0,\"y\":0,\"width\":0,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:constructor:{\"x\":0,\"y\":0,\"width\":18446744073709552000,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "NV12:copy:{\"x\":0,\"y\":0,\"width\":18446744073709552000,\"height\":2}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "layout:[{\"offset\":0,\"stride\":4},{\"offset\":8,\"stride\":2},{\"offset\":10,\"stride\":2}]",
++          "value": {
++            "size": 12,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 4
++              },
++              {
++                "offset": 8,
++                "stride": 2
++              },
++              {
++                "offset": 10,
++                "stride": 2
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8,
++              9,
++              10,
++              11,
++              255,
++              255,
++              255,
++              255,
++              255,
++              255,
++              255,
++              255
++            ]
++          }
++        },
++        {
++          "name": "layout:[{\"offset\":0,\"stride\":5},{\"offset\":12,\"stride\":2},{\"offset\":16,\"stride\":3}]",
++          "value": {
++            "size": 19,
++            "layout": [
++              {
++                "offset": 0,
++                "stride": 5
++              },
++              {
++                "offset": 12,
++                "stride": 2
++              },
++              {
++                "offset": 16,
++                "stride": 3
++              }
++            ],
++            "bytes": [
++              0,
++              1,
++              2,
++              3,
++              255,
++              4,
++              5,
++              6,
++              7,
++              255,
++              255,
++              255,
++              8,
++              9,
++              255,
++              255,
++              10,
++              11,
++              255,
++              255
++            ]
++          }
++        },
++        {
++          "name": "layout:[{\"offset\":0,\"stride\":3},{\"offset\":8,\"stride\":2},{\"offset\":10,\"stride\":2}]",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "layout:[{\"offset\":0,\"stride\":4},{\"offset\":0,\"stride\":2},{\"offset\":10,\"stride\":2}]",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "layout:[]",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "layout:[{\"offset\":0,\"stride\":4}]",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "options-order",
++          "value": [
++            "has:colorSpace",
++            "has:format",
++            "has:layout",
++            "has:rect"
++          ]
++        },
++        {
++          "name": "copy-cross-family",
++          "error": {
++            "name": "NotSupportedError",
++            "message": "The operation is not supported"
++          }
++        },
++        {
++          "name": "from-frame-options-order",
++          "value": [
++            "has:alpha",
++            "has:displayHeight",
++            "has:displayWidth",
++            "has:duration",
++            "has:flip",
++            "has:rotation",
++            "has:timestamp",
++            "has:visibleRect"
++          ]
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-video-layout-expression.js
+@@ -0,0 +1,11 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++const source=new Uint8Array(64);for(let i=0;i<64;i++)source[i]=i;
++for(const from of['RGBA','RGBX','BGRA','BGRX'])for(const to of['RGBA','RGBX','BGRA','BGRX'])await run('swizzle:'+from+':'+to,async()=>{const f=new VideoFrame(new Uint8Array([1,2,3,4]),{format:from,codedWidth:1,codedHeight:1,timestamp:0}),dest=new Uint8Array(4);await f.copyTo(dest,{format:to});return [...dest]});
++const rects=[{x:1,y:1,width:1,height:1},{x:0,y:0,width:3,height:3},{x:2,y:2,width:2,height:2},{x:-1,y:0,width:1,height:1},{x:1.5,y:0,width:1,height:1},{x:0,y:0,width:0,height:2},{x:0,y:0,width:2**64,height:2}];
++for(const format of['RGBA','I420','NV12'])for(const rect of rects)for(const mode of['constructor','copy'])await run(format+':'+mode+':'+JSON.stringify(rect),async()=>{const init={format,codedWidth:4,codedHeight:4,timestamp:0},f=new VideoFrame(source,{...init,...(mode==='constructor'?{visibleRect:rect}:{})}),options=mode==='copy'?{rect}:{},size=f.allocationSize(options),dest=new Uint8Array(size),layout=await f.copyTo(dest,options);return{width:f.codedWidth,height:f.codedHeight,visible:f.visibleRect.toJSON(),size,layout,bytes:[...dest]}});
++const layouts=[[{offset:0,stride:4},{offset:8,stride:2},{offset:10,stride:2}],[{offset:0,stride:5},{offset:12,stride:2},{offset:16,stride:3}],[{offset:0,stride:3},{offset:8,stride:2},{offset:10,stride:2}],[{offset:0,stride:4},{offset:0,stride:2},{offset:10,stride:2}],[],[{offset:0,stride:4}]];
++for(const layout of layouts)await run('layout:'+JSON.stringify(layout),async()=>{const f=new VideoFrame(source,{format:'I420',codedWidth:4,codedHeight:2,timestamp:0}),size=f.allocationSize({layout}),dest=new Uint8Array(Math.max(20,size)).fill(255),actual=await f.copyTo(dest,{layout});return{size,layout:actual,bytes:[...dest]}});
++await run('options-order',()=>{const log=[],f=new VideoFrame(source,{format:'RGBA',codedWidth:4,codedHeight:4,timestamp:0});f.allocationSize(new Proxy({},{has(o,k){log.push('has:'+String(k));return k in o},get(o,k){log.push('get:'+String(k));return o[k]}}));return log});
++await run('copy-cross-family',async()=>{const f=new VideoFrame(source,{format:'I420',codedWidth:4,codedHeight:4,timestamp:0});return await f.copyTo(new Uint8Array(64),{format:'RGBA'})});
++await run('from-frame-options-order',()=>{const order=[],f=new VideoFrame(source,{format:'RGBA',codedWidth:4,codedHeight:4,timestamp:0});new VideoFrame(f,new Proxy({},{has(o,k){order.push('has:'+String(k));return k in o},get(o,k){order.push('get:'+String(k));return o[k]}}));return order});
++return rows})()
+--- /dev/null
++++ b/oracle/webcodecs-media-native-video-extra.json
+@@ -0,0 +1,488 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "abe61ae2b0b275a208f3c6a3871ecf62853286ff950ed30710948c5f4bfbbd4b",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "name": "canvas:offscreen:3:2",
++          "value": {
++            "format": "RGBA",
++            "width": 3,
++            "height": 2,
++            "bytes": [
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0
++            ],
++            "length": 24,
++            "color": {
++              "primaries": null,
++              "transfer": null,
++              "matrix": null,
++              "fullRange": null
++            }
++          }
++        },
++        {
++          "name": "canvas:offscreen:0:2",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:offscreen:100000:100000",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:offscreen:32767:32767",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:offscreen:32767:1",
++          "value": {
++            "format": "RGBA",
++            "width": 32767,
++            "height": 1,
++            "bytes": [
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0
++            ],
++            "length": 131068,
++            "color": {
++              "primaries": null,
++              "transfer": null,
++              "matrix": null,
++              "fullRange": null
++            }
++          }
++        },
++        {
++          "name": "canvas:offscreen:32768:1",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:offscreen:1:32768",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:offscreen:100000:1",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:html:3:2",
++          "value": {
++            "format": "RGBA",
++            "width": 3,
++            "height": 2,
++            "bytes": [
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0
++            ],
++            "length": 24,
++            "color": {
++              "primaries": null,
++              "transfer": null,
++              "matrix": null,
++              "fullRange": null
++            }
++          }
++        },
++        {
++          "name": "canvas:html:0:2",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:html:100000:100000",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:html:32767:32767",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:html:32767:1",
++          "value": {
++            "format": "RGBA",
++            "width": 32767,
++            "height": 1,
++            "bytes": [
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0,
++              0
++            ],
++            "length": 131068,
++            "color": {
++              "primaries": null,
++              "transfer": null,
++              "matrix": null,
++              "fullRange": null
++            }
++          }
++        },
++        {
++          "name": "canvas:html:32768:1",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:html:1:32768",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "canvas:html:100000:1",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "from:{}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 90,
++            "flip": true,
++            "width": 2,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"alpha\":\"discard\"}",
++          "value": {
++            "format": "RGBX",
++            "rotation": 90,
++            "flip": true,
++            "width": 2,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"rotation\":45}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 0,
++            "flip": true,
++            "width": 1,
++            "height": 2,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"rotation\":-179}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 270,
++            "flip": true,
++            "width": 2,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"flip\":true}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 90,
++            "flip": false,
++            "width": 2,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"duration\":null}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 90,
++            "flip": true,
++            "width": 2,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"displayWidth\":5,\"displayHeight\":6}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 90,
++            "flip": true,
++            "width": 5,
++            "height": 6,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"visibleRect\":{\"x\":1,\"y\":0,\"width\":1,\"height\":1}}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 90,
++            "flip": true,
++            "width": 1,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "from:{\"colorSpace\":{\"matrix\":\"bt709\"}}",
++          "value": {
++            "format": "RGBA",
++            "rotation": 90,
++            "flip": true,
++            "width": 2,
++            "height": 1,
++            "codedWidth": 2,
++            "duration": 2,
++            "color": {
++              "primaries": "bt709",
++              "transfer": "iec61966-2-1",
++              "matrix": "rgb",
++              "fullRange": true
++            },
++            "bytes": [
++              1,
++              2,
++              3,
++              4,
++              5,
++              6,
++              7,
++              8
++            ]
++          }
++        },
++        {
++          "name": "close-transform",
++          "value": {
++            "rotation": 0,
++            "flip": false,
++            "timestamp": 4,
++            "duration": 2
++          }
++        },
++        {
++          "name": "yuv-conversion:allocationSize",
++          "value": 16
++        },
++        {
++          "name": "yuv-conversion:copyTo",
++          "error": {
++            "name": "NotSupportedError",
++            "message": "The operation is not supported"
++          }
++        },
++        {
++          "name": "encoder-closed",
++          "value": [
++            "TypeError",
++            ""
++          ]
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-video-extra-expression.js
+@@ -0,0 +1,8 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const kind of['offscreen','html'])for(const [width,height]of[[3,2],[0,2],[100000,100000],[32767,32767],[32767,1],[32768,1],[1,32768],[100000,1]])await run('canvas:'+kind+':'+width+':'+height,async()=>{const canvas=kind==='offscreen'?new OffscreenCanvas(width,height):document.createElement('canvas');if(kind==='html'){canvas.width=width;canvas.height=height}const c=canvas.getContext('2d');if(c){c.fillStyle='red';c.fillRect(0,0,1,1)}const f=new VideoFrame(canvas,{timestamp:1}),dest=new Uint8Array(f.allocationSize());await f.copyTo(dest);return{format:f.format,width:f.codedWidth,height:f.codedHeight,bytes:[...dest.slice(0,12)],length:dest.length,color:f.colorSpace.toJSON()}});
++const raw=()=>new VideoFrame(new Uint8Array([1,2,3,4,5,6,7,8]),{format:'RGBA',codedWidth:2,codedHeight:1,timestamp:4,duration:2,rotation:90,flip:true});
++for(const options of[{}, {alpha:'discard'}, {rotation:45}, {rotation:-179}, {flip:true}, {duration:null},{displayWidth:5,displayHeight:6},{visibleRect:{x:1,y:0,width:1,height:1}},{colorSpace:{matrix:'bt709'}}])await run('from:'+JSON.stringify(options),async()=>{const f=new VideoFrame(raw(),options),dest=new Uint8Array(f.allocationSize());await f.copyTo(dest);return{format:f.format,rotation:f.rotation,flip:f.flip,width:f.displayWidth,height:f.displayHeight,codedWidth:f.codedWidth,duration:f.duration,color:f.colorSpace.toJSON(),bytes:[...dest]}});
++await run('close-transform',()=>{const f=raw();f.close();return{rotation:f.rotation,flip:f.flip,timestamp:f.timestamp,duration:f.duration}});
++for(const method of['allocationSize','copyTo'])await run('yuv-conversion:'+method,async()=>{const f=new VideoFrame(new Uint8Array(6),{format:'I420',codedWidth:2,codedHeight:2,timestamp:0});return method==='allocationSize'?f.allocationSize({format:'RGBA'}):await f.copyTo(new Uint8Array(16),{format:'RGBA'})});
++await run('encoder-closed',()=>{const f=raw();f.close();const c=new VideoEncoder({output(){},error(){}});c.configure({codec:'vp8',width:2,height:1});try{c.encode(f)}catch(e){c.reset();c.close();return[e.name,e.message]}});
++return rows})()
+--- /dev/null
++++ b/oracle/webcodecs-media-native-video-transform.json
+@@ -0,0 +1,71 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "d8aab688133f8d9623a6ffc96c06a4816a0ea05e705c4fa7471221ef12b8907b",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "raw": true,
++          "options": {
++            "rotation": 90,
++            "displayWidth": 5,
++            "displayHeight": 6
++          },
++          "rotation": 90,
++          "flip": false,
++          "display": [
++            5,
++            6
++          ]
++        },
++        {
++          "raw": true,
++          "options": {
++            "rotation": 90,
++            "flip": true,
++            "displayWidth": 5,
++            "displayHeight": 6
++          },
++          "rotation": 90,
++          "flip": true,
++          "display": [
++            5,
++            6
++          ]
++        },
++        {
++          "raw": false,
++          "options": {
++            "rotation": 90,
++            "displayWidth": 5,
++            "displayHeight": 6
++          },
++          "rotation": 90,
++          "flip": false,
++          "display": [
++            5,
++            6
++          ]
++        },
++        {
++          "raw": false,
++          "options": {
++            "rotation": 90,
++            "flip": true,
++            "displayWidth": 5,
++            "displayHeight": 6
++          },
++          "rotation": 90,
++          "flip": true,
++          "display": [
++            5,
++            6
++          ]
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-video-transform-expression.js
+@@ -0,0 +1 @@
++(()=>{const rows=[];for(const raw of[true,false])for(const options of[{rotation:90,displayWidth:5,displayHeight:6},{rotation:90,flip:true,displayWidth:5,displayHeight:6}]){const init={format:'RGBA',codedWidth:2,codedHeight:1,timestamp:0,...options},base=new VideoFrame(new Uint8Array(8),{format:'RGBA',codedWidth:2,codedHeight:1,timestamp:0});const f=raw?new VideoFrame(new Uint8Array(8),init):new VideoFrame(base,options);rows.push({raw,options,rotation:f.rotation,flip:f.flip,display:[f.displayWidth,f.displayHeight]})}return rows})()
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,4 +1,4 @@
+-import { installCanvas } from './canvas.js';
++import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
+ import {installAudioCore} from './audio-core.js';
+ import {installConsole} from './console.js';
+@@ -52,6 +52,7 @@
+ import { loadCollectionsBinding, installCollections } from './collections.js';
+ import { installStyles } from './styles.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
++import { installVideoFrame } from './video-frame.js';
+ import { installAudioData } from './audio-data.js';
+ import { installWebCodecsValues } from './webcodecs-values.js';
+ import { installGeometry } from './geometry.js';
+@@ -266,6 +267,7 @@
+       installGeometry(window);
+       installWebCodecsValues(window);
+       installAudioData(window);
++      installVideoFrame(window,{canvasSnapshot,canvasDimensions});
+       installWebCodecsProcessors(window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,4 +1,4 @@
+-import { installCanvas } from './canvas.js';
++import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
+ import { installImageData } from './image-data.js';
+ import {workerSocketPolicy} from './worker-socket-policy.js';
+ import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
+@@ -12,6 +12,7 @@
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+ import { resolveBlobURL } from './blob-urls.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
++import { installVideoFrame } from './video-frame.js';
+ import { installAudioData } from './audio-data.js';
+ import { installWebCodecsValues } from './webcodecs-values.js';
+ import { installGeometry } from './geometry.js';
+@@ -313,6 +314,7 @@
+   installGeometry(vm.runInContext('globalThis', context));
+   installWebCodecsValues(vm.runInContext('globalThis', context));
+   installAudioData(vm.runInContext('globalThis', context));
++  installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import { videoFrameRecord, validVideoFrameRecord, deserializeVideoFrame } from './video-frame.js';
+ import { audioDataRecord, validAudioDataRecord, deserializeAudioData } from './audio-data.js';
+ import { isCanvasCloneRejected } from './canvas.js';
+ import { imageDataRecord, validImageDataRecord, deserializeImageData } from './image-data.js';
+@@ -31,6 +32,7 @@
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+   if(provenance?.kind==='VideoColorSpace')throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
++  const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
+   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+   const image=imageDataRecord(value);if(image){if(!validImageDataRecord(image))throw failure('Invalid ImageData clone');return image;}
+   const geometry=geometryFactoryData(value);
+@@ -50,8 +52,9 @@
+   if(message.platforms===undefined)return null;
+   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
+   for(const[placeholder,record]of message.platforms){
+-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData','AudioData'].includes(record.kind))throw failure('Malformed platform node');
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData','AudioData','VideoFrame'].includes(record.kind))throw failure('Malformed platform node');
+    if(record.kind==='EncodedChunk'){if(!validEncodedChunk(record))throw failure('Malformed encoded chunk');continue;}
++   if(record.kind==='VideoFrame'){if(!validVideoFrameRecord(record))throw failure('Malformed VideoFrame node');continue;}
+    if(record.kind==='AudioData'){if(!validAudioDataRecord(record))throw failure('Malformed AudioData node');continue;}
+    if(record.kind==='ImageData'){if(!validImageDataRecord(record))throw failure('Malformed ImageData node');continue;}
+    if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
+@@ -77,6 +80,7 @@
+   return stripNativeHandles(message);
+  }
+  function deserialize(record){
++  if(record.kind==='VideoFrame'){try{return deserializeVideoFrame(realm,record)}catch{throw failure('Invalid VideoFrame receiver')}}
+   if(record.kind==='AudioData'){try{return deserializeAudioData(realm,record)}catch{throw failure('Invalid AudioData receiver')}}
+   if(record.kind==='ImageData'){try{return deserializeImageData(realm,record)}catch{throw failure('Invalid ImageData receiver')}}
+   if(record.kind==='EncodedChunk'){try{return deserializeEncodedChunk(realm,record)}catch{throw failure('Invalid encoded chunk receiver')}}

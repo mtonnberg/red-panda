@@ -57,13 +57,14 @@ test('Permissions queries return fresh realm EventTargets with prompt metadata a
   assert.equal((await navigator.permissions.query({ name: 'unknown-permission-name' })).state, 'prompt');
   assert.equal((await navigator.permissions.query({ name: 42 })).name, '42');
   assert.equal((await navigator.permissions.query({ name: null })).name, 'null');
+  assert.equal((await navigator.permissions.query({ name: Symbol('actual') })).name, 'actual');
   assert.equal((await navigator.permissions.query({ name: 'midi', sysex: true })).state, 'prompt');
   assert.equal(navigator.permissions.request, undefined); assert.equal(navigator.permissions.revoke, undefined);
 });
 
 test('permission and UA descriptor failures reject realm promises and interface constructors reject direct creation', async t => {
   const { window, navigator } = fixture(t);
-  for (const input of [undefined, null, {}, { name: undefined }, { name: Symbol('invalid') }]) {
+  for (const input of [undefined, null, {}, { name: undefined }]) {
     const result = navigator.permissions.query(input); assert.ok(result instanceof window.Promise); await assert.rejects(result, window.TypeError);
   }
   await assert.rejects(window.Permissions.prototype.query.call({}, { name: 'camera' }), window.TypeError);

@@ -1,0 +1,101 @@
+--- a/src/worker-events.js
++++ b/src/worker-events.js
+@@ -50,21 +50,21 @@
+  function eventState(value){const state=eventStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
+  function targetState(value){const state=targetStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
+  function trustOwn(value){const accessors=evaluate('(function(bridge,value){return{get isTrusted(){return bridge(value)}}})')(v=>{const s=eventStates.get(v);return s.trusted===null?apply(readers.isTrusted,s.backend,[]):s.trusted},value);define(value,'isTrusted',{get:Object.getOwnPropertyDescriptor(accessors,'isTrusted').get,enumerable:true})}
+- function registerEvent(value,backend){const data=slot({backend,trusted:null,pendingTrust:false,inDispatch:0,passive:0,allowed:null,timeStamp:apply(readers.timeStamp,backend,[]),extra:slot({})});eventStates.set(value,data);nativeEvents.set(backend,value);trustOwn(value);registerPlatformFactory(value,{kind:'Event',implementation:data,globalObject:realm});return value}
++ function registerEvent(value,backend){const data=slot({backend,trusted:null,pendingTrust:false,inDispatch:0,passive:0,allowed:null,completed:false,timeStamp:apply(readers.timeStamp,backend,[]),extra:slot({})});eventStates.set(value,data);nativeEvents.set(backend,value);trustOwn(value);registerPlatformFactory(value,{kind:'Event',implementation:data,globalObject:realm});return value}
+  function adopt(backend){let value=nativeEvents.get(backend);if(!value){value=classes.allocate(classes.Event.prototype);registerEvent(value,backend)}return value}
+  function removeEntry(state,entry){apply(remove,state.backend,[entry.type,entry.native,{capture:entry.capture}]);if(entry.abort)entry.abort[disposeSymbol]();state.listeners.delete(entry)}
+  function addEntry(value,type,callback,options){const state=targetState(value),capture=options.capture;for(const e of state.listeners)if(e.type===type&&e.callback===callback&&e.capture===capture)return;const signal=options.signal?signalAdapter(options.signal):null;if(signal&&apply(signalAborted,signal,[]))return;
+-  const entry=slot({type,callback,capture,once:options.once,signal,passive:options.passive,abort:null,native:null});entry.native=backend=>{if(!active()||signal&&apply(signalAborted,signal,[]))return;const event=adopt(backend),es=eventState(event);if(!es.allowed)es.allowed=new Set(state.listeners);if(!es.allowed.has(entry))return;es.inDispatch++;if(entry.passive)es.passive++;if(entry.once)removeEntry(state,entry);try{if(typeof callback==='function')apply(callback,receiver(state),[event]);else{const fn=callback.handleEvent;if(typeof fn==='function')apply(fn,callback,[event]);else throw new TypeError('invalid argument')}}catch(error){reportError(error)}finally{if(entry.passive)es.passive--;es.inDispatch--}};
++  const entry=slot({type,callback,capture,once:options.once,signal,passive:options.passive,abort:null,native:null});entry.native=backend=>{if(!active()||signal&&apply(signalAborted,signal,[]))return;const event=adopt(backend),es=eventState(event);if(!es.allowed)es.allowed=new Set(state.listeners);if(!es.allowed.has(entry))return;es.inDispatch++;if(entry.passive)es.passive++;if(entry.once)removeEntry(state,entry);try{if(typeof callback==='function')apply(callback,receiver(state),[event]);else{const fn=callback.handleEvent;if(typeof fn==='function')apply(fn,callback,[event]);else throw new TypeError('invalid argument')}}catch(error){reportError(error)}finally{if(entry.passive)es.passive--;es.inDispatch--;if(!es.inDispatch)es.completed=true}};
+   state.listeners.add(entry);apply(add,state.backend,[type,entry.native,{capture,passive:options.passive,...(signal?{signal}:{})}]);if(signal)entry.abort=addAbortListener(signal,()=>removeEntry(state,entry))
+  }
+- function dispatchEvent(value,event){const ts=targetState(value),es=eventState(event);if(es.inDispatch)throw new Exception('The object is in an invalid state','InvalidStateError');es.trusted=es.pendingTrust?true:false;es.pendingTrust=false;es.allowed=new Set(ts.listeners);es.inDispatch++;try{return apply(dispatch,ts.backend,[es.backend])}finally{es.inDispatch--;es.allowed=null}}
++ function dispatchEvent(value,event){const ts=targetState(value),es=eventState(event);if(es.inDispatch)throw new Exception('The object is in an invalid state','InvalidStateError');const previous=es.backend;es.backend=new NativeEvent(apply(readers.type,previous,[]),{bubbles:apply(readers.bubbles,previous,[]),cancelable:apply(readers.cancelable,previous,[]),composed:apply(readers.composed,previous,[])});if(apply(readers.defaultPrevented,previous,[]))apply(methods.preventDefault,es.backend,[]);nativeEvents.set(es.backend,event);es.completed=false;es.trusted=es.pendingTrust?true:false;es.pendingTrust=false;es.allowed=new Set(ts.listeners);es.inDispatch++;try{return apply(dispatch,ts.backend,[es.backend])}finally{es.inDispatch--;es.allowed=null;es.completed=true}}
+  const bridge={
+   event:v=>eventStates.has(v),target:v=>targetStates.has(v),
+   eventStore(value,type,bubbles,cancelable,composed){registerEvent(value,new NativeEvent(type,{bubbles,cancelable,composed}))},
+-  eventRead(value,key){const s=eventState(value);if(key==='timeStamp')return s.timeStamp;if(key==='currentTarget'&&!s.inDispatch)return null;if(key==='eventPhase'&&!s.inDispatch)return 0;if(key==='srcElement')key='target';if(key==='target'||key==='currentTarget'){const target=apply(readers[key],s.backend,[]),state=nativeTargets.get(target);return state?receiver(state):null}return apply(readers[key],s.backend,[])},
++  eventRead(value,key){const s=eventState(value);if(key==='timeStamp')return s.timeStamp;if(key==='cancelBubble'&&s.completed&&!s.inDispatch)return false;if(key==='currentTarget'&&!s.inDispatch)return null;if(key==='eventPhase'&&!s.inDispatch)return 0;if(key==='srcElement')key='target';if(key==='target'||key==='currentTarget'){const target=apply(readers[key],s.backend,[]),state=nativeTargets.get(target);return state?receiver(state):null}return apply(readers[key],s.backend,[])},
+   trusted:v=>{const s=eventState(v);return s.trusted===null?apply(readers.isTrusted,s.backend,[]):s.trusted},
+-  eventCall(value,name){const s=eventState(value);if(name==='preventDefault'&&s.passive)return;apply(methods[name],s.backend,[])},path(value){eventState(value);return[]},
+-  init(value,type,bubbles,cancelable){const s=eventState(value);if(s.inDispatch)return;s.backend=new NativeEvent(type,{bubbles,cancelable,composed:apply(readers.composed,s.backend,[])});s.trusted=false;s.pendingTrust=false;nativeEvents.set(s.backend,value)},
++  eventCall(value,name){const s=eventState(value);if(name==='preventDefault'&&s.passive)return;if((name==='stopPropagation'||name==='stopImmediatePropagation')&&!s.inDispatch)s.completed=false;apply(methods[name],s.backend,[])},path(value){eventState(value);return[]},
++  init(value,type,bubbles,cancelable){const s=eventState(value);if(s.inDispatch)return;s.backend=new NativeEvent(type,{bubbles,cancelable,composed:apply(readers.composed,s.backend,[])});s.trusted=false;s.pendingTrust=false;s.completed=false;nativeEvents.set(s.backend,value)},
+   message(value,data,origin,lastEventId,source,ports){const s=eventState(value);s.extra=slot({data,origin,lastEventId,source,ports});registerPlatformFactory(value,{kind:'MessageEvent',implementation:s,globalObject:realm})},
+   error(value,message,filename,lineno,colno,error){const s=eventState(value);s.extra=slot({message,filename,lineno,colno,error});registerPlatformFactory(value,{kind:'ErrorEvent',implementation:s,globalObject:realm})},extra(v,k){const extra=eventState(v).extra;if(!Object.hasOwn(extra,k))throw new TypeError('Illegal invocation');return extra[k]},
+   targetStore(value){api.registerTarget(value,new NativeTarget())},signal:value=>!!signalAdapter(value),dispatch:dispatchEvent,add:addEntry,remove(value,type,callback,capture){const s=targetState(value);for(const entry of s.listeners)if(entry.type===type&&entry.callback===callback&&entry.capture===capture)removeEntry(s,entry)},
+--- a/test/worker-abort.test.js
++++ b/test/worker-abort.test.js
+@@ -67,3 +67,11 @@
+  const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-abort/worker-abort-algorithms-native.json',import.meta.url),'utf8')).observations;
+  assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
+ });
++
++test('Worker Event redispatch resets stop flags while preserving default prevention',async t=>{
++ const code=readFileSync(new URL('../docs/reference/worker-abort/worker-events-reuse-code.js',import.meta.url),'utf8');
++ const f=fixture(t,{'https://example.test/app/abort.js':code}),worker=new f.window.Worker('./abort.js');
++ const result=JSON.parse(JSON.stringify(await message(worker)));
++ const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-abort/worker-events-reuse-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
++});
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-events-reuse-code.js
+@@ -0,0 +1,5 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('reuseImmediate',()=>{const t=new EventTarget(),e=new Event('x'),out=[];let first=true;t.addEventListener('x',e=>{out.push('a');if(first){first=false;e.stopImmediatePropagation()}});t.addEventListener('x',()=>out.push('b'));t.dispatchEvent(e);const bubble=e.cancelBubble;t.dispatchEvent(e);return{out,bubble,after:e.cancelBubble}});
++await run('stopBeforeFirst',()=>{const t=new EventTarget(),e=new Event('x'),out=[];t.addEventListener('x',()=>out.push('a'));e.stopImmediatePropagation();const before=e.cancelBubble;t.dispatchEvent(e);t.dispatchEvent(e);return{out,before,after:e.cancelBubble}});
++await run('defaultPreventedReuse',()=>{const t=new EventTarget(),e=new Event('x',{cancelable:true}),out=[];t.addEventListener('x',e=>{out.push(e.defaultPrevented);e.preventDefault()});const a=t.dispatchEvent(e),b=t.dispatchEvent(e);return{out,a,b,prevented:e.defaultPrevented}});
++return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))
+--- /dev/null
++++ b/docs/reference/worker-abort/worker-events-reuse-native.json
+@@ -0,0 +1,46 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "5f051172ba330777b55b069050bc5955890fee0a6bde6a3110388fb31e7eb7ea",
++  "observations": {
++    "ok": true,
++    "value": [
++      {
++        "name": "reuseImmediate",
++        "value": {
++          "out": [
++            "a",
++            "a",
++            "b"
++          ],
++          "bubble": false,
++          "after": false
++        }
++      },
++      {
++        "name": "stopBeforeFirst",
++        "value": {
++          "out": [
++            "a",
++            "a"
++          ],
++          "before": true,
++          "after": false
++        }
++      },
++      {
++        "name": "defaultPreventedReuse",
++        "value": {
++          "out": [
++            false,
++            true
++          ],
++          "a": false,
++          "b": false,
++          "prevented": true
++        }
++      }
++    ]
++  }
++}

@@ -1,0 +1,514 @@
+--- a/src/scheduler.js
++++ b/src/scheduler.js
+@@ -1,3 +1,4 @@
++import {addAbortListener} from 'node:events';
+ // Independent timer-backed task execution calibrated against the pinned Native.
+ // Priority metadata/events are real; that target currently runs priority hints
+ // FIFO. Callback returns/errors settle actual receiving-realm Promises.
+@@ -9,6 +10,7 @@
+ const require=createRequire(import.meta.url),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const installed=new WeakMap(),controllers=new WeakMap(),signals=new WeakMap(),events=new WeakMap(),schedulers=new WeakMap();
+ const apply=Reflect.apply,microtask=queueMicrotask;
++const nodeAborted=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'aborted').get,nodeReason=Object.getOwnPropertyDescriptor(globalThis.AbortSignal.prototype,'reason').get,disposeSymbol=Symbol.dispose;
+ const slot=fields=>Object.assign(Object.create(null),fields);
+ function signalSource(value){const state=signals.get(value);if(state)return state.source;const p=platformFactoryRecord(value);return p?.kind==='AbortSignal'&&p.implementation? p.implementation:null}
+ function factory(g,b){
+@@ -68,20 +70,34 @@
+  define(g,'scheduler',{get(){return b.namespace(this)},enumerable:true,configurable:true});
+  return{Scheduler,TaskController,TaskSignal,TaskPriorityChangeEvent};
+ }
+-export function installScheduler(page,realm,{context,mainWindow=realm}={}){
++export function installScheduler(page,realm,{context,mainWindow=realm,workerAbort,workerEvents,evaluate=source=>realm.eval(source)}={}){
+  if(installed.has(realm))return installed.get(realm);
+- if(!realm.AbortSignal||!realm.Event||!realm.document)throw new TypeError('Scheduler currently requires a genuine document AbortSignal/EventTarget realm');
++ const worker=!!workerAbort&&!!workerEvents;
++ if(!realm.AbortSignal||!realm.Event||(!realm.document&&!worker))throw new TypeError('Scheduler requires a genuine document or Worker AbortSignal/EventTarget realm');
+  for(const kind of['Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'])registerPlatformFactoryKind(kind);
+  const state=slot({current:null,tasks:new Set(),ready:[],front:[],pump:undefined,disposed:false});
+  const timer=realm.setTimeout,clear=realm.clearTimeout,create=realm.Object.create,ObjectCtor=realm.Object,ErrorCtor=realm.TypeError;
+  const aliases=new Set([realm,realm._globalObject,realm._globalProxy].filter(v=>v!==null&&(typeof v==='object'||typeof v==='function')));
+  const add=realm.EventTarget.prototype.addEventListener,remove=realm.EventTarget.prototype.removeEventListener;
+  const invocation=createInvocationTrampoline(context??implForWrapper(realm.document)._globalObject);
++ const workerSources=new WeakMap();
++ function sourceFor(value){
++  if(!worker)return signalSource(value);
++  const task=signals.get(value);if(task)return task.source;
++  if(!workerAbort.hasSignal(value))return null;
++  let source=workerSources.get(value);if(source)return source;
++  const native=workerAbort.nativeSignal(value),algorithms=new Map();
++  source=slot({});
++  Object.defineProperties(source,{aborted:{get:()=>apply(nodeAborted,native,[])},reason:{get:()=>apply(nodeReason,native,[])}});
++  source._addAlgorithm=callback=>{if(!algorithms.has(callback))algorithms.set(callback,addAbortListener(native,callback))};
++  source._removeAlgorithm=callback=>{const subscription=algorithms.get(callback);if(subscription){subscription[disposeSymbol]();algorithms.delete(callback)}};
++  workerSources.set(value,source);return source;
++ }
+  let classes,instance,capturingNamespace=false;
+  const record=(value,kind,implementation)=>registerPlatformFactory(value,{kind,implementation,globalObject:realm});
+  function cleanTask(task){task.active=false;if(task.timer!==undefined)apply(clear,realm,[task.timer]);task.timer=undefined;if(task.source&&task.abort)task.source._removeAlgorithm(task.abort);task.abort=null;state.tasks.delete(task)}
+  function cancelPending(){if(state.pump!==undefined)apply(clear,realm,[state.pump]);state.pump=undefined;for(const task of state.tasks)cleanTask(task);state.tasks.clear();state.ready.length=state.front.length=0}
+- const unretire=realm===mainWindow?onFrameRetirement(mainWindow,cancelPending):()=>{};
++ const unretire=!worker&&realm===mainWindow?onFrameRetirement(mainWindow,cancelPending):()=>{};
+  const dispose=()=>{if(state.disposed)return;state.disposed=true;cancelPending();unretire();page?.documentAbort?.signal.removeEventListener('abort',dispose)};
+  page?.documentAbort?.signal.addEventListener('abort',dispose,{once:true});
+  function pump(){
+@@ -98,7 +114,7 @@
+  function requestPump(){if(!state.disposed&&state.pump===undefined&&(state.front.length||state.ready.length))state.pump=apply(timer,realm,[pump,0])}
+  function schedule(callback,delay,signal,resolve,reject,yielded=false){
+   if(state.disposed)return;
+-  const source=signal?signalSource(signal):null;if(source?.aborted){reject(source.reason);return}
++  const source=signal?sourceFor(signal):null;if(source?.aborted){reject(source.reason);return}
+   const task=slot({callback,source,signal,resolve,reject,yielded,remaining:delay,timer:undefined,abort:null,active:true});state.tasks.add(task);
+   task.abort=()=>{cleanTask(task);reject(source.reason)};if(source)source._addAlgorithm(task.abort);
+   const ready=()=>{(yielded?state.front:state.ready).push(task);requestPump()};
+@@ -110,16 +126,16 @@
+   hasController:v=>controllers.has(v),hasSignal:v=>signals.has(v),priority:v=>signals.get(v).priority,changing:v=>signals.get(controllers.get(v)).changing,
+   hasEvent:v=>events.has(v),previous:v=>events.get(v).previous,
+   event(value,previous){const data=Object.freeze(slot({previous}));events.set(value,data);record(value,'TaskPriorityChangeEvent',data)},
+-  controller(value,signal,priority){const provenance=platformFactoryRecord(signal),source=provenance?.implementation;if(!source)throw new ErrorCtor('A genuine document AbortSignal is required');const data=slot({source,priority,changing:false,handler:null,relay:null});signals.set(signal,data);controllers.set(value,signal);record(signal,'TaskSignal',source);record(value,'TaskController',platformFactoryRecord(value)?.implementation)},
+-  change(value,priority){const signal=controllers.get(value),data=signals.get(signal);if(data.priority===priority)return;const previous=data.priority;data.priority=priority;data.changing=true;microtask(()=>{data.changing=false});try{const event=new classes.TaskPriorityChangeEvent('prioritychange',{previousPriority:previous}),eventImpl=implForWrapper(event);eventImpl.isTrusted=true;data.source._dispatch(eventImpl)}finally{data.changing=false}},
++  controller(value,signal,priority){const source=sourceFor(signal);if(!source)throw new ErrorCtor('A genuine AbortSignal is required');const data=slot({source,priority,changing:false,handler:null,relay:null});signals.set(signal,data);controllers.set(value,signal);record(signal,'TaskSignal',source);record(value,'TaskController',platformFactoryRecord(value)?.implementation)},
++  change(value,priority){const signal=controllers.get(value),data=signals.get(signal);if(data.priority===priority)return;const previous=data.priority;data.priority=priority;data.changing=true;microtask(()=>{data.changing=false});try{const event=new classes.TaskPriorityChangeEvent('prioritychange',{previousPriority:previous}),eventImpl=worker?null:implForWrapper(event);if(worker){workerEvents.trust(event);workerEvents.dispatch(signal,event)}else{eventImpl.isTrusted=true;data.source._dispatch(eventImpl)}}finally{data.changing=false}},
+   handler:v=>signals.get(v).handler,
+   handlerSet(value,callback){const data=signals.get(value);data.handler=callback;if(!callback&&data.relay){apply(remove,value,['prioritychange',data.relay]);data.relay=null}else if(callback&&!data.relay){data.relay=event=>{if(data.handler)apply(data.handler,value,[event])};apply(add,value,['prioritychange',data.relay])}},
+   hasScheduler:v=>schedulers.has(v),namespace(value){if(capturingNamespace)aliases.add(value);if(!aliases.has(value))throw new ErrorCtor('Illegal invocation');return instance},
+-  validSignal:value=>!!signalSource(value),aborted:value=>signalSource(value).aborted,reason:value=>signalSource(value).reason,currentSignal:()=>state.current,
++  validSignal:value=>!!sourceFor(value),aborted:value=>sourceFor(value).aborted,reason:value=>sourceFor(value).reason,currentSignal:()=>state.current,
+   yieldTask:(resolve,reject,signal)=>schedule(null,0,signal,resolve,reject,true),
+   enqueue:schedule,
+  };
+- const created=realm.eval(`(${factory.toString()})`)(realm,b);classes=Object.freeze(Object.assign(Object.create(null),created));instance=apply(create,ObjectCtor,[classes.Scheduler.prototype]);schedulers.set(instance,state);record(instance,'Scheduler',state);
+- capturingNamespace=true;try{realm.eval('scheduler')}finally{capturingNamespace=false}
++ const created=evaluate(`(${factory.toString()})`)(realm,b);classes=Object.freeze(Object.assign(Object.create(null),created));instance=apply(create,ObjectCtor,[classes.Scheduler.prototype]);schedulers.set(instance,state);record(instance,'Scheduler',state);
++ capturingNamespace=true;try{evaluate('scheduler')}finally{capturingNamespace=false}
+  const api={dispose};installed.set(realm,api);return api;
+ }
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,4 @@
++import {installScheduler} from './scheduler.js';
+ import {installWorkerDOMException} from './worker-dom-exception.js';
+ import {installWorkerEvents} from './worker-events.js';
+ import {installWorkerAbort} from './worker-abort.js';
+@@ -300,6 +301,7 @@
+   })();`, context);
+   delete context.__eventPlatform;
+   abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
++  installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
+   dispatchError=vm.runInContext('__dispatchError',context);
+   delete context.__dispatchError;
+   emit = vm.runInContext('__emitMessage', context);
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -30,8 +30,8 @@
+   const provenance=platformFactoryRecord(value);
+   const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+-  if(['VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal'].includes(provenance?.kind))throw failure('The object can not be cloned');
++  if(['VideoColorSpace','URLPattern','Event','MessageEvent','ErrorEvent','EventTarget','AbortController','AbortSignal','Scheduler','TaskController','TaskSignal','TaskPriorityChangeEvent'].includes(provenance?.kind))throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+   const video=videoFrameRecord(value);if(video){if(!validVideoFrameRecord(video))throw failure('The object can not be cloned');return video;}
+   const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+--- a/test/scheduler.test.js
++++ b/test/scheduler.test.js
+@@ -7,10 +7,7 @@
+ for(const file of ['scheduler-surface-v2-native','scheduler-validation-v2-native','scheduler-lifetime-v2-native','scheduler-context-native','scheduler-order-native','scheduler-extra-native'])test(`genuine Scheduler Native controls: ${file}`,async t=>{
+  const{page}=await fixture(t),expression=await readFile(new URL(`../docs/reference/${file}-expression.js`,import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL(`../docs/reference/${file}.json`,import.meta.url),'utf8')).observations;
+  const actual=plain(await page.evaluate(expression));
+- // Existing Worker AbortSignal/EventTarget integration is a separately observed
+- // limitation. These tables retain Native worker availability, without claiming
+- // that this document-realm implementation provides the Worker API yet.
+- const skip=new Set(['worker']);assert.deepEqual(actual.filter(v=>!skip.has(v.name)),expected.filter(v=>!skip.has(v.name)));
++ assert.deepEqual(actual,expected);
+ });
+ 
+ test('unchanged pinned scheduler fixture executes actual callbacks and nonzero native-branch assertions',async t=>{
+--- /dev/null
++++ b/test/worker-scheduler.test.js
+@@ -0,0 +1,66 @@
++import {readFileSync} from 'node:fs';
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { EventEmitter } from 'node:events';
++import { execFile } from 'node:child_process';
++import { promisify } from 'node:util';
++import { JSDOM } from 'jsdom';
++import { installWorkers } from '../src/workers.js';
++
++const tick = () => new Promise(resolve => setImmediate(resolve));
++const deadline = (promise, milliseconds = 8000) => new Promise((resolve, reject) => {
++  const timer = setTimeout(() => reject(new Error('Worker fixture timed out')), milliseconds);
++  Promise.resolve(promise).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
++});
++function fixture(t, sources = {}) {
++  const page = new EventEmitter(); page.documentAbort = new AbortController();
++  const errors = [], requests = [];
++  page.on('pageError', error => errors.push(error));
++  page.referrerFor = (url, source) => source;
++  page.fetch = async (url, init, type) => {
++    requests.push({ url, init, type });
++    let entry = sources[url]; if (typeof entry === 'function') entry = await entry(init);
++    if (init.signal.aborted) throw new DOMException('Aborted', 'AbortError');
++    if (typeof entry === 'string') entry = { source: entry };
++    const response = new Response(entry?.source ?? '', { status: entry?.status ?? (entry ? 200 : 404),
++      headers: { 'content-type': entry?.mime ?? 'text/javascript', ...(entry?.headers ?? {}) } });
++    Object.defineProperty(response, 'url', { value: entry?.url ?? url }); return response;
++  };
++  const dom = new JSDOM('<body></body>', { url: 'https://example.test/app/page.html', runScripts: 'outside-only' });
++  const workers = installWorkers(page, dom.window);
++  t.after(() => { page.closed = true; page.documentAbort.abort(); workers.dispose(); dom.window.close(); });
++  return { page, window: dom.window, workers, errors, requests };
++}
++function message(worker) { return deadline(new Promise((resolve, reject) => {
++  worker.addEventListener('message', event => resolve(event.data), { once: true });
++  worker.addEventListener('error', event => reject(event.error ?? new Error(event.message)), { once: true });
++})); }
++function portMessage(port) { return deadline(new Promise(resolve => {
++  port.addEventListener('message', resolve, { once: true }); port.start();
++})); }
++
++test('Worker Scheduler executes actual callbacks and cancellation with genuine Worker values',async t=>{
++ const code=readFileSync(new URL('../docs/reference/worker-scheduler/worker-scheduler-code.js',import.meta.url),'utf8');
++ const f=fixture(t,{'https://example.test/app/scheduler.js':code}),worker=new f.window.Worker('./scheduler.js');
++ const result=JSON.parse(JSON.stringify(await message(worker)));
++ const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-scheduler/worker-scheduler-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
++});
++test('Worker Scheduler Native clones/handlers and copied marker controls',async t=>{
++ const code=readFileSync(new URL('../docs/reference/worker-scheduler/worker-scheduler-extra-code.js',import.meta.url),'utf8');
++ const f=fixture(t,{'https://example.test/app/scheduler.js':code}),worker=new f.window.Worker('./scheduler.js');
++ const result=JSON.parse(JSON.stringify(await message(worker)));
++ const expected=JSON.parse(readFileSync(new URL('../docs/reference/worker-scheduler/worker-scheduler-extra-native.json',import.meta.url),'utf8')).observations;
++ assert.deepEqual(result,expected);assert.deepEqual(f.errors,[]);worker.terminate();
++});
++test('Worker Scheduler public values/methods are actually created in selected VM',async()=>{
++ const {stdout}=await promisify(execFile)(process.execPath,[new URL('./worker-scheduler-realm.mjs',import.meta.url).pathname]);
++ const proof=JSON.parse(stdout);assert.equal(proof.thread,true);assert.equal(proof.backend,'public-v8-query-objects');
++ assert.equal(proof.rows.length,11);for(const row of proof.rows){assert.equal(row.VM,true,row.name);assert.equal(row.Host,false,row.name);assert.equal(row.creationGlobal,true,row.name);assert.equal(row.VMNullPrototype,true,row.name);assert.equal(row.HostNullPrototype,false,row.name)}
++});
++test('Worker close tears down pending actual Scheduler jobs',async t=>{
++ const f=fixture(t,{'https://example.test/app/scheduler.js':`scheduler.postTask(()=>postMessage('late'),{delay:20}).then(()=>postMessage('settled'));postMessage('before');close();`});
++ const worker=new f.window.Worker('./scheduler.js'),messages=[];worker.onmessage=e=>messages.push(e.data);
++ await deadline((async()=>{while(!messages.length||f.workers.size)await tick()})());
++ assert.deepEqual(messages,['before']);assert.deepEqual(f.errors,[]);
++});
+--- /dev/null
++++ b/test/worker-scheduler-realm.mjs
+@@ -0,0 +1,16 @@
++import {installScheduler} from '../src/scheduler.js';
++import vm from 'node:vm';
++import {Worker,isMainThread,parentPort} from 'node:worker_threads';
++import {installWorkerDOMException} from '../src/worker-dom-exception.js';
++import {installWorkerEvents} from '../src/worker-events.js';
++import {installWorkerAbort} from '../src/worker-abort.js';
++import {getHeapBinding} from '../src/native-heap.js';
++if(isMainThread){const worker=new Worker(new URL(import.meta.url));worker.on('message',value=>console.log(JSON.stringify(value,null,2)));worker.on('error',error=>{console.error(error);process.exitCode=1})}
++else{
++ const context=vm.createContext({setTimeout,clearTimeout}),evaluate=source=>vm.runInContext(source,context),realm=evaluate('globalThis');
++ installWorkerDOMException(realm,{evaluate});const events=installWorkerEvents(realm,{evaluate});const abort=installWorkerAbort(realm,{evaluate,events});
++ const scheduler=installScheduler(null,realm,{context,evaluate,workerAbort:abort,workerEvents:events});
++ const heap=getHeapBinding(),anchor=evaluate('({})'),host={};const values=evaluate(`(()=>{const c=new TaskController();return{namespace:scheduler,controller:c,signal:c.signal,event:new TaskPriorityChangeEvent('x',{previousPriority:'background'}),schedulerFunction:Scheduler,controllerFunction:TaskController,signalFunction:TaskSignal,eventFunction:TaskPriorityChangeEvent,postTask:Scheduler.prototype.postTask,priorityGetter:Object.getOwnPropertyDescriptor(TaskSignal.prototype,'priority').get,previousGetter:Object.getOwnPropertyDescriptor(TaskPriorityChangeEvent.prototype,'previousPriority').get}})()`),rows=[];
++ for(const[name,value]of Object.entries(values)){const row={name,VM:heap.sameRealm(value,anchor),Host:heap.sameRealm(value,host),creationGlobal:heap.creationGlobal(value)===realm};Object.setPrototypeOf(value,null);row.VMNullPrototype=heap.sameRealm(value,anchor);row.HostNullPrototype=heap.sameRealm(value,host);rows.push(row)}
++ scheduler.dispose();abort.dispose();events.dispose();parentPort.postMessage({node:process.version,thread:true,backend:heap.backend,rows});
++}
+--- /dev/null
++++ b/docs/reference/worker-scheduler/README.md
+@@ -0,0 +1,31 @@
++Worker Scheduler followup
++
++The two oracle tables contain 26 controls run in actual dedicated Native
++workers, using executable SHA256
++9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f.
++Inputs and raw observations are retained without substitutions.
++
++This separate followup installs the existing independent task queue in genuine
++Worker Abort/Event realms. Actual timer jobs invoke actual VM callbacks through
++the existing invocation trampoline. Callback values/errors and adopted Promise
++results retain identity. Abort subscriptions use real private Node signal state
++and resistant cancellation listeners; authored getters, copied symbols and
++proxy prototypes never supply signal authority. Trusted priority events are
++actual selected-VM events dispatched through the private real event backend.
++Worker close cancels pending timers and abort subscriptions.
++
++Public V8 creation-context checks in an actual Node thread cover eleven public
++Scheduler/Task values, constructors, method and getters, including after nulling
++prototypes. They use the existing verified addon with direct sameRealm and
++creationGlobal calls; they perform no heap enumeration.
++
++The previously skipped Worker availability rows in the document Scheduler tests
++are now asserted. All ten document/utility/unchanged-source tests passed with
++the pinned source root supplied. The first combined run retained one setup
++failure caused by missing scratch reference files, before fixture execution;
++the other seventeen tests passed. A final focused Worker run passed all nine
++tests including the separate Event redispatch correction.
++
++Existing Worker Request.signal and other Node-backed API frontends remain
++outside this followup. The calibrated priority-hint FIFO and sticky active-signal
++semantics remain unchanged. No broad/full/other-runtime/PureScript suite ran.
+--- /dev/null
++++ b/docs/reference/worker-scheduler/worker-scheduler-code.js
+@@ -0,0 +1,20 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++await run('workerShape',()=>({scheduler:typeof scheduler,controller:typeof TaskController,signal:typeof TaskSignal,event:typeof TaskPriorityChangeEvent,keys:Reflect.ownKeys(Scheduler.prototype).map(String),prototype:Object.getPrototypeOf(TaskSignal.prototype)===AbortSignal.prototype,controllerPrototype:Object.getPrototypeOf(TaskController.prototype)===AbortController.prototype}));
++await run('taskActual',async()=>{const promise=scheduler.postTask(function(){return{value:42,thisGlobal:this===globalThis}});return{promise:promise instanceof Promise,result:await promise}});
++await run('priorityEvent',()=>{const c=new TaskController(),s=c.signal,out=[];s.addEventListener('prioritychange',e=>out.push({prev:e.previousPriority,current:s.priority,event:e instanceof Event,priorityEvent:e instanceof TaskPriorityChangeEvent,target:e.target===s,trusted:e.isTrusted}));c.setPriority('background');return{out,signal:s instanceof TaskSignal,abort:s instanceof AbortSignal,target:s instanceof EventTarget,priority:s.priority}});
++await run('abortEvent',()=>{const c=new TaskController();let event;c.signal.onabort=e=>event=e;c.abort();return{target:c.signal instanceof EventTarget,signal:c.signal instanceof AbortSignal,aborted:c.signal.aborted,reason:c.signal.reason instanceof DOMException,error:c.signal.reason instanceof Error,event:event instanceof Event,trusted:event.isTrusted}});
++await run('fifo',async()=>{const out=[];await Promise.all([scheduler.postTask(()=>out.push('background'),{priority:'background'}),scheduler.postTask(()=>out.push('blocking'),{priority:'user-blocking'}),scheduler.postTask(()=>out.push('normal'))]);return out});
++await run('delay',async()=>{const out=[];await Promise.all([scheduler.postTask(()=>out.push('later'),{delay:8}),scheduler.postTask(()=>out.push('first'))]);return out});
++await run('yield',async()=>{const out=[];await Promise.all([scheduler.postTask(async()=>{out.push('a');await scheduler.yield();out.push('c')}),scheduler.postTask(()=>out.push('b'))]);return out});
++await run('reasonIdentity',async()=>{const c=new AbortController(),reason={a:2};c.abort(reason);try{await scheduler.postTask(()=>42,{signal:c.signal})}catch(e){return e===reason}});
++await run('pendingAbort',async()=>{const c=new TaskController(),reason={b:3},promise=scheduler.postTask(()=>42,{signal:c.signal,delay:20});c.abort(reason);try{await promise}catch(e){return e===reason}});
++await run('throwIdentity',async()=>{const reason={x:3};try{await scheduler.postTask(()=>{throw reason})}catch(e){return e===reason}});
++await run('returnedPromise',async()=>{const c=new TaskController();return scheduler.postTask(()=>{const promise=Promise.resolve(7);queueMicrotask(()=>c.abort('later'));return promise},{signal:c.signal})});
++await run('abortDuringCallback',async()=>{const c=new TaskController();try{await scheduler.postTask(()=>{c.abort('during');throw Error('ignored')},{signal:c.signal})}catch(e){return e}});
++await run('cancelWithStopImmediate',async()=>{const c=new TaskController();let called=false;c.signal.onabort=e=>e.stopImmediatePropagation();const promise=scheduler.postTask(()=>{called=true},{signal:c.signal,delay:20});c.abort('cancelled');try{await promise}catch(e){return{reason:e,called}}});
++await run('stickySignal',async()=>{const c=new TaskController();await scheduler.postTask(()=>1,{signal:c.signal});c.abort('sticky');try{await scheduler.yield()}catch(e){return e}});
++await run('nextTaskClearsSignal',async()=>{await scheduler.postTask(()=>1);await scheduler.yield();return true});
++await run('forgedSignal',()=>scheduler.postTask(()=>1,{signal:Object.create(TaskSignal.prototype)}));
++await run('forgedController',()=>TaskController.prototype.setPriority.call(Object.create(TaskController.prototype),'background'));
++await run('forgedEvent',()=>Object.getOwnPropertyDescriptor(TaskPriorityChangeEvent.prototype,'previousPriority').get.call(new Event('x')));
++return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))
+--- /dev/null
++++ b/docs/reference/worker-scheduler/worker-scheduler-extra-code.js
+@@ -0,0 +1,7 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message,realm:e instanceof TypeError}})}};
++for(const[name,value]of[['namespace',scheduler],['controller',new TaskController()],['signal',new TaskController().signal],['event',new TaskPriorityChangeEvent('x',{previousPriority:'background'})]])await run('clone-'+name,()=>structuredClone(value));
++await run('handlerOrder',()=>{const c=new TaskController(),out=[];c.signal.onprioritychange=()=>out.push('h');c.signal.addEventListener('prioritychange',()=>out.push('a'));c.signal.onprioritychange=()=>out.push('r');c.setPriority('background');return out});
++await run('priorityStillWorksAfterAbort',()=>{const c=new TaskController(),out=[];c.signal.onprioritychange=e=>out.push([e.previousPriority,c.signal.priority,e.isTrusted]);c.abort('done');c.setPriority('background');return{out,aborted:c.signal.aborted,reason:c.signal.reason}});
++await run('prioritySignalOption',()=>{const c=new TaskController(),s=new AbortController(),out=[];s.signal.onabort=e=>e.stopImmediatePropagation();c.signal.addEventListener('prioritychange',()=>out.push('called'),{signal:s.signal});s.abort();c.setPriority('background');return out});
++await run('copiedMarkers',async()=>{const c=new TaskController(),fake=Object.create(TaskSignal.prototype);for(const symbol of Object.getOwnPropertySymbols(c.signal))Object.defineProperty(fake,symbol,Object.getOwnPropertyDescriptor(c.signal,symbol));let calls=0;Object.defineProperty(fake,'aborted',{get(){calls++;throw Error('authored')}});try{await scheduler.postTask(()=>3,{signal:fake})}catch(e){return{calls,name:e.name,message:e.message,realm:e instanceof TypeError}}});
++return rows})().then(value=>postMessage({ok:true,value}),e=>postMessage({failure:{name:e.name,message:e.message}}))
+--- /dev/null
++++ b/docs/reference/worker-scheduler/worker-scheduler-extra-native.json
+@@ -0,0 +1,77 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "5a2f485922dae6880ee146e080561f6af72d9ea9a865cab3def9a04aa3620a39",
++  "observations": {
++    "ok": true,
++    "value": [
++      {
++        "name": "clone-namespace",
++        "error": {
++          "name": "DataCloneError",
++          "message": "The object can not be cloned",
++          "realm": false
++        }
++      },
++      {
++        "name": "clone-controller",
++        "error": {
++          "name": "DataCloneError",
++          "message": "The object can not be cloned",
++          "realm": false
++        }
++      },
++      {
++        "name": "clone-signal",
++        "error": {
++          "name": "DataCloneError",
++          "message": "The object can not be cloned",
++          "realm": false
++        }
++      },
++      {
++        "name": "clone-event",
++        "error": {
++          "name": "DataCloneError",
++          "message": "The object can not be cloned",
++          "realm": false
++        }
++      },
++      {
++        "name": "handlerOrder",
++        "value": [
++          "r",
++          "a"
++        ]
++      },
++      {
++        "name": "priorityStillWorksAfterAbort",
++        "value": {
++          "out": [
++            [
++              "user-visible",
++              "background",
++              true
++            ]
++          ],
++          "aborted": true,
++          "reason": "done"
++        }
++      },
++      {
++        "name": "prioritySignalOption",
++        "value": []
++      },
++      {
++        "name": "copiedMarkers",
++        "value": {
++          "calls": 0,
++          "name": "TypeError",
++          "message": "invalid postTask options",
++          "realm": true
++        }
++      }
++    ]
++  }
++}
+--- /dev/null
++++ b/docs/reference/worker-scheduler/worker-scheduler-native.json
+@@ -0,0 +1,151 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "f04b2a881a1a8e4772cd4d28e004d34e8c2f68d0f69b41ca472bf522fb08eaf8",
++  "observations": {
++    "ok": true,
++    "value": [
++      {
++        "name": "workerShape",
++        "value": {
++          "scheduler": "object",
++          "controller": "function",
++          "signal": "function",
++          "event": "function",
++          "keys": [
++            "postTask",
++            "yield",
++            "constructor",
++            "Symbol(Symbol.toStringTag)"
++          ],
++          "prototype": true,
++          "controllerPrototype": true
++        }
++      },
++      {
++        "name": "taskActual",
++        "value": {
++          "promise": true,
++          "result": {
++            "value": 42,
++            "thisGlobal": true
++          }
++        }
++      },
++      {
++        "name": "priorityEvent",
++        "value": {
++          "out": [
++            {
++              "prev": "user-visible",
++              "current": "background",
++              "event": true,
++              "priorityEvent": true,
++              "target": true,
++              "trusted": true
++            }
++          ],
++          "signal": true,
++          "abort": true,
++          "target": true,
++          "priority": "background"
++        }
++      },
++      {
++        "name": "abortEvent",
++        "value": {
++          "target": true,
++          "signal": true,
++          "aborted": true,
++          "reason": true,
++          "error": true,
++          "event": true,
++          "trusted": true
++        }
++      },
++      {
++        "name": "fifo",
++        "value": [
++          "background",
++          "blocking",
++          "normal"
++        ]
++      },
++      {
++        "name": "delay",
++        "value": [
++          "first",
++          "later"
++        ]
++      },
++      {
++        "name": "yield",
++        "value": [
++          "a",
++          "c",
++          "b"
++        ]
++      },
++      {
++        "name": "reasonIdentity",
++        "value": true
++      },
++      {
++        "name": "pendingAbort",
++        "value": true
++      },
++      {
++        "name": "throwIdentity",
++        "value": true
++      },
++      {
++        "name": "returnedPromise",
++        "value": 7
++      },
++      {
++        "name": "abortDuringCallback",
++        "value": "during"
++      },
++      {
++        "name": "cancelWithStopImmediate",
++        "value": {
++          "reason": "cancelled",
++          "called": false
++        }
++      },
++      {
++        "name": "stickySignal",
++        "value": "sticky"
++      },
++      {
++        "name": "nextTaskClearsSignal",
++        "value": true
++      },
++      {
++        "name": "forgedSignal",
++        "error": {
++          "name": "TypeError",
++          "message": "invalid postTask options",
++          "realm": true
++        }
++      },
++      {
++        "name": "forgedController",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal invocation",
++          "realm": true
++        }
++      },
++      {
++        "name": "forgedEvent",
++        "error": {
++          "name": "TypeError",
++          "message": "Illegal invocation",
++          "realm": true
++        }
++      }
++    ]
++  }
++}

@@ -1,0 +1,1209 @@
+--- /dev/null
++++ b/src/audio-data.js
+@@ -0,0 +1,95 @@
++import {types} from 'node:util';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++
++const states=new WeakMap(),installed=new WeakMap(),tokens=new WeakMap(),nativeClone=globalThis.structuredClone;
++const typed=Object.getPrototypeOf(Uint8Array.prototype),get=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
++const tb=get(typed,'buffer'),tl=get(typed,'byteLength'),to=get(typed,'byteOffset'),db=get(DataView.prototype,'buffer'),dl=get(DataView.prototype,'byteLength'),dof=get(DataView.prototype,'byteOffset');
++const MAX_BYTES=64*1024*1024,FORMATS=Object.create(null);
++for(const [base,bps]of[['u8',1],['s16',2],['s32',4],['f32',4]])for(const planar of[false,true])FORMATS[base+(planar?'-planar':'')]=Object.freeze({base,bps,planar});
++Object.freeze(FORMATS);
++const isData=value=>types.isArrayBuffer(value)||ArrayBuffer.isView(value);
++function view(value){
++ if(types.isArrayBuffer(value)){try{return new Uint8Array(value)}catch{return new Uint8Array()}}
++ const dataView=types.isDataView(value),buffer=(dataView?db:tb).call(value);try{return new Uint8Array(buffer,(dataView?dof:to).call(value),(dataView?dl:tl).call(value))}catch{return new Uint8Array()}
++}
++const failure=(name,message='')=>({ok:false,name,message});
++function selection(state,options){
++ if(state.closed)return failure('InvalidStateError','The object is in an invalid state');
++ const format=options.format??state.format,target=FORMATS[format];if(!target)return failure('TypeError');
++ const offset=options.frameOffset,count=options.frameCount??state.numberOfFrames-offset,planes=target.planar?state.numberOfChannels:1;
++ if(options.planeIndex>=planes||offset>=state.numberOfFrames||count>state.numberOfFrames-offset)return failure('RangeError');
++ return{ok:true,format,target,offset,count,plane:options.planeIndex,size:count*(target.planar?1:state.numberOfChannels)*target.bps};
++}
++function readSample(data,format,index){const offset=index*format.bps;if(format.base==='u8')return data.getUint8(offset)-128;if(format.base==='s16')return data.getInt16(offset,true);if(format.base==='s32')return data.getInt32(offset,true);return data.getFloat32(offset,true)}
++function convertSample(value,source,target){
++ if(source==='f32'){
++  if(target==='f32')return value;
++  if(Number.isNaN(value))value=0;value=Math.max(-1,Math.min(1,value));
++  const bits=target==='u8'?8:target==='s16'?16:32,converted=Math.trunc(value*(value<0?2**(bits-1):2**(bits-1)-1));return target==='u8'?converted+128:converted;
++ }
++ const bits=source==='u8'?8:source==='s16'?16:32;
++ if(target==='f32')return value/(value<0?2**(bits-1):2**(bits-1)-1);
++ const targetBits=target==='u8'?8:target==='s16'?16:32,converted=targetBits>=bits?value*2**(targetBits-bits):Math.floor(value/2**(bits-targetBits));return target==='u8'?converted+128:converted;
++}
++function copySamples(state,destination,selected){
++ const src=FORMATS[state.format],dst=selected.target,source=new DataView(state.bytes.buffer,state.bytes.byteOffset,state.bytes.byteLength),target=new DataView(destination.buffer,destination.byteOffset,destination.byteLength),channels=state.numberOfChannels;
++ for(let frame=0;frame<selected.count;frame++)for(let channel=0;channel<(dst.planar?1:channels);channel++){
++  const c=dst.planar?selected.plane:channel,sourceIndex=src.planar?c*state.numberOfFrames+selected.offset+frame:(selected.offset+frame)*channels+c,targetIndex=dst.planar?frame:frame*channels+channel,offset=targetIndex*dst.bps;
++  if(src.base===dst.base){const start=sourceIndex*src.bps;destination.set(state.bytes.subarray(start,start+src.bps),offset);continue;}
++  const value=convertSample(readSample(source,src,sourceIndex),src.base,dst.base);
++  if(dst.base==='u8')target.setUint8(offset,value);else if(dst.base==='s16')target.setInt16(offset,value,true);else if(dst.base==='s32')target.setInt32(offset,value,true);else target.setFloat32(offset,value,true);
++ }
++}
++function factory(g,bridge){
++ const TypeError=g.TypeError,RangeError=g.RangeError,Exception=g.DOMException,String=g.String,Number=g.Number;
++ const create=g.Object.create,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,Array=g.Array,from=Array.from,iterator=g.Symbol.iterator,description=descriptor(g.Symbol.prototype,'description').get;
++ const trunc=g.Math.trunc,abs=g.Math.abs,fround=g.Math.fround,finite=Number.isFinite;
++ const error=()=>new TypeError('invalid argument');
++ const text=value=>typeof value==='symbol'?apply(description,value,[])??'':String(value);
++ const dictionary=value=>{if(value==null)return{};if(typeof value!=='object'&&typeof value!=='function')throw error();return value};
++ const member=(object,name,required=false)=>{const value=name in object?object[name]:undefined;if(required&&value===undefined)throw error();return value};
++ const uint=value=>{const number=+value;if(!finite(number)||number<0||number>4294967295)throw error();return trunc(number)};
++ const integer=value=>{const number=+value;if(!finite(number)||abs(trunc(number))>9007199254740991)throw error();return trunc(number)||0};
++ const assert=value=>{if(!bridge.brand(value))throw new TypeError('Illegal invocation')};
++ function check(result){if(result.ok)return result;if(result.name==='RangeError')throw new RangeError(result.message);if(result.name==='TypeError')throw new TypeError(result.message);throw new Exception(result.message,result.name)}
++ function transfer(value){if(value===undefined)return[];if(value===null||typeof value[iterator]!=='function')throw error();const list=apply(from,Array,[value]);for(let i=0;i<list.length;i++)if(!bridge.isTransfer(list[i]))throw new TypeError('');return list}
++ function options(value){const source=dictionary(value),f=member(source,'format'),format=f==null?undefined:text(f),n=member(source,'frameCount'),frameCount=n==null?undefined:uint(n),o=member(source,'frameOffset'),frameOffset=o===undefined?0:uint(o),planeIndex=uint(member(source,'planeIndex',true));if(format!==undefined&&!bridge.format(format))throw new TypeError('');return{format,frameCount,frameOffset,planeIndex}}
++ function AudioData(init){
++  if(new.target===undefined)throw error();const source=dictionary(init),data=member(source,'data',true);if(!bridge.isData(data))throw error();
++  const format=text(member(source,'format',true)),channels=uint(member(source,'numberOfChannels',true)),frames=uint(member(source,'numberOfFrames',true)),sampleRate=fround(+member(source,'sampleRate',true)),timestamp=integer(member(source,'timestamp',true)),list=transfer(member(source,'transfer'));
++  check(bridge.create(this,data,format,channels,frames,sampleRate,timestamp,list));
++ }
++ define(AudioData,'prototype',{writable:false});const p=AudioData.prototype;delete p.constructor;
++ const accessors={get format(){assert(this);return bridge.read(this,'format')},get sampleRate(){assert(this);return bridge.read(this,'sampleRate')},get numberOfFrames(){assert(this);return bridge.read(this,'numberOfFrames')},get numberOfChannels(){assert(this);return bridge.read(this,'numberOfChannels')},get duration(){assert(this);return bridge.read(this,'duration')},get timestamp(){assert(this);return bridge.read(this,'timestamp')}};
++ for(const name of['format','sampleRate','numberOfFrames','numberOfChannels','duration','timestamp'])define(p,name,{...descriptor(accessors,name),enumerable:true,configurable:true});
++ const methods={allocationSize(value){assert(this);return check(bridge.allocation(this,options(value))).size},copyTo(destination,value){assert(this);if(!bridge.isData(destination))throw error();check(bridge.copy(this,destination,options(value)))},clone(){assert(this);return check(bridge.clone(this)).value},close(){assert(this);bridge.close(this)}};
++ for(const name of['allocationSize','copyTo','clone','close'])define(p,name,{value:methods[name],writable:true,configurable:true,enumerable:true});
++ define(p,'constructor',{value:AudioData,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:'AudioData',configurable:true});define(g,'AudioData',{value:AudioData,writable:true,configurable:true});
++ return{construct(token){const value=create(AudioData.prototype);check(bridge.hydrate(value,token));return value}};
++}
++export function installAudioData(realm){
++ if(installed.has(realm))return installed.get(realm);registerPlatformFactoryKind('AudioData');let api;
++ api=realm.eval(`(${factory.toString()})`)(realm,{
++  brand:value=>states.has(value),format:value=>Object.hasOwn(FORMATS,value),isData,isTransfer:types.isArrayBuffer,
++  create(value,data,format,numberOfChannels,numberOfFrames,sampleRate,timestamp,transfer){
++   const type=FORMATS[format],bytes=view(data),size=type?numberOfChannels*numberOfFrames*type.bps:0;
++   if(!type||!numberOfChannels||!numberOfFrames||!(sampleRate>0)||!Number.isFinite(sampleRate)||!Number.isSafeInteger(size)||size>bytes.length)return failure('TypeError');
++   if(size>MAX_BYTES)return failure('RangeError','AudioData exceeds the independent backend byte limit');
++   const seen=new Set(),buffers=[];for(let i=0;i<transfer.length;i++){const buffer=transfer[i];if(seen.has(buffer))return failure('DataCloneError','The object can not be cloned');seen.add(buffer);try{new Uint8Array(buffer)}catch{return failure('DataCloneError','The object can not be cloned')}buffers.push(buffer)}
++   const copied=bytes.slice(0,size);try{nativeClone(null,{transfer:buffers})}catch{return failure('DataCloneError','The object can not be cloned')}
++   const duration=Math.min(2**64-1,Math.trunc(numberOfFrames*1e6/sampleRate)),state=Object.assign(Object.create(null),{format,numberOfChannels,numberOfFrames,sampleRate,timestamp,duration,bytes:copied,closed:false});states.set(value,state);
++   registerPlatformFactory(value,{kind:'AudioData',implementation:state,globalObject:realm,read:()=>audioDataRecord(value)});return{ok:true};
++  },
++  read(value,key){const s=states.get(value);if(!['format','sampleRate','numberOfFrames','numberOfChannels','duration','timestamp'].includes(key))return undefined;if(s.closed)return key==='timestamp'?s.timestamp:key==='format'?null:0;return s[key]},
++  allocation(value,options){return selection(states.get(value),options)},
++  copy(value,destination,options){const state=states.get(value),selected=selection(state,options);if(!selected.ok)return selected;const target=view(destination);if(target.length<selected.size)return failure('RangeError');copySamples(state,target,selected);return{ok:true}},
++  clone(value){const s=states.get(value);if(s.closed)return failure('InvalidStateError','The object is in an invalid state');const token=Object.create(null);tokens.set(token,{realm,record:audioDataRecord(value)});return{ok:true,value:api.construct(token)}},
++  hydrate(value,token){const entry=tokens.get(token);if(!entry||entry.realm!==realm)return failure('TypeError');tokens.delete(token);const r=entry.record;if(!validAudioDataRecord(r))return failure('TypeError');const state=Object.assign(Object.create(null),{format:r.format,numberOfChannels:r.numberOfChannels,numberOfFrames:r.numberOfFrames,sampleRate:r.sampleRate,timestamp:r.timestamp,duration:Math.min(2**64-1,Math.trunc(r.numberOfFrames*1e6/r.sampleRate)),bytes:r.bytes.slice(),closed:false});states.set(value,state);registerPlatformFactory(value,{kind:'AudioData',implementation:state,globalObject:realm,read:()=>audioDataRecord(value)});return{ok:true}},
++  close(value){const s=states.get(value);s.closed=true;s.bytes=null},
++ });installed.set(realm,api);return api;
++}
++export function audioDataRecord(value){const s=states.get(value);if(!s)return null;if(s.closed)return{kind:'AudioData',closed:true,timestamp:s.timestamp};return{kind:'AudioData',closed:false,format:s.format,numberOfChannels:s.numberOfChannels,numberOfFrames:s.numberOfFrames,sampleRate:s.sampleRate,timestamp:s.timestamp,bytes:s.bytes.slice()}}
++export function isAudioData(value){return states.has(value)}
++export function validAudioDataRecord(r){const format=r&&FORMATS[r.format];return r?.kind==='AudioData'&&!r.closed&&!!format&&Number.isInteger(r.numberOfChannels)&&r.numberOfChannels>0&&r.numberOfChannels<=4294967295&&Number.isInteger(r.numberOfFrames)&&r.numberOfFrames>0&&r.numberOfFrames<=4294967295&&Number.isFinite(r.sampleRate)&&r.sampleRate>0&&Number.isSafeInteger(r.timestamp)&&types.isUint8Array(r.bytes)&&r.bytes.length<=MAX_BYTES&&r.bytes.length===r.numberOfChannels*r.numberOfFrames*format.bps}
++export function deserializeAudioData(realm,r){const api=installed.get(realm);if(!api||!validAudioDataRecord(r))throw new TypeError('Invalid AudioData receiver');const token=Object.create(null);tokens.set(token,{realm,record:r});return api.construct(token)}
+--- /dev/null
++++ b/test/audio-data.test.js
+@@ -0,0 +1,9 @@
++import test from 'node:test';import assert from 'node:assert/strict';import{readFile}from'node:fs/promises';import{Browser}from'../src/browser.js';import{queryHeapObjects}from'../src/heap-query.js';
++const plain=x=>JSON.parse(JSON.stringify(x));
++async function fixture(t){const browser=new Browser({loadResources:['worker','iframe']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body>AudioData</body>');return{page,w:page.dom.window,context:page.dom.getInternalVMContext()}}
++for(const group of['audio','audio-conversion','audio-extra'])test('actual Native '+group+' byte-value controls match',async t=>{const{page}=await fixture(t);const expression=await readFile(new URL('../oracle/webcodecs-media-'+group+'-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../oracle/webcodecs-media-native-'+group+'.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(plain(await page.evaluate(expression)),expected)});
++test('AudioData snapshots real view bytes and ignores authored BufferSource/metadata properties',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`(()=>{const raw=new Uint8Array([9,1,2,3,4,9]),view=raw.subarray(1,5);for(const key of['buffer','byteOffset','byteLength'])Object.defineProperty(view,key,{get(){throw Error('authored')}});const a=new AudioData({data:view,format:'u8-planar',numberOfChannels:2,numberOfFrames:2,sampleRate:8000,timestamp:2});raw.fill(0);for(const key of['format','sampleRate','numberOfFrames','numberOfChannels'])Object.defineProperty(a,key,{get(){throw Error('authored')}});const copy=structuredClone(a),bytes=new Uint8Array(4);copy.copyTo(bytes,{planeIndex:0,format:'u8'});return{bytes:[...bytes],rate:copy.sampleRate,channels:copy.numberOfChannels}})()`);assert.deepEqual(plain(value),{bytes:[1,3,2,4],rate:8000,channels:2})});
++test('same-base planar conversion preserves actual Float32 NaN payload bits and signed zero',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`(()=>{const source=new Uint32Array([0x7fc01234,0x80000000,0x3f800000,0x40000000]),a=new AudioData({data:source,format:'f32-planar',numberOfFrames:2,numberOfChannels:2,sampleRate:8000,timestamp:0}),dest=new Uint32Array(4);a.copyTo(dest,{planeIndex:0,format:'f32'});return[...dest]})()`);assert.deepEqual(plain(value),[0x7fc01234,0x3f800000,0x80000000,0x40000000])});
++test('actual MessagePorts clone immutable AudioData aliases without detaching its source',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`new Promise(resolve=>{const c=new MessageChannel(),a=new AudioData({format:'u8',sampleRate:8000,numberOfFrames:2,numberOfChannels:1,timestamp:3,data:new Uint8Array([7,8])});c.port2.onmessage=e=>{const bytes=new Uint8Array(2);e.data.a.copyTo(bytes,{planeIndex:0});resolve({brand:e.data.a instanceof AudioData,alias:e.data.a===e.data.again,bytes:[...bytes],source:a.format});c.port1.close();c.port2.close()};c.port1.postMessage({a,again:a})})`);assert.deepEqual(plain(value),{brand:true,alias:true,bytes:[7,8],source:'u8'})});
++test('actual worker threads create and return AudioData through real platform serialization',async t=>{const{page}=await fixture(t);const value=await page.evaluate(`new Promise((resolve,reject)=>{const source='onmessage=e=>{const input=e.data,data=new Float32Array(input.numberOfFrames);input.copyTo(data,{planeIndex:0,format:"f32-planar"});postMessage({brand:input instanceof AudioData,value:new AudioData({data,format:"f32",sampleRate:input.sampleRate,numberOfFrames:input.numberOfFrames,numberOfChannels:1,timestamp:input.timestamp})})}',url=URL.createObjectURL(new Blob([source])),worker=new Worker(url),timer=setTimeout(()=>{worker.terminate();reject(Error('worker deadline'))},5000);worker.onerror=e=>{clearTimeout(timer);worker.terminate();reject(Error(e.message))};worker.onmessage=e=>{clearTimeout(timer);const dest=new Float32Array(3);e.data.value.copyTo(dest,{planeIndex:0});resolve({input:e.data.brand,brand:e.data.value instanceof AudioData,samples:[...dest]});worker.terminate();URL.revokeObjectURL(url)};worker.postMessage(new AudioData({data:new Uint8Array([0,128,255]),format:'u8',sampleRate:8000,numberOfChannels:1,numberOfFrames:3,timestamp:2}))})`);assert.deepEqual(plain(value),{input:true,brand:true,samples:[-1,0,1]})});
++test('heap queries preserve authored AudioData lookalikes without private slots or byte storage',async t=>{const{page,w,context}=await fixture(t);await page.evaluate(`globalThis.a=new AudioData({data:new Uint8Array([1,2]),format:'u8',numberOfChannels:1,numberOfFrames:2,sampleRate:8000,timestamp:31337});globalThis.authored={format:'u8',numberOfFrames:2,timestamp:31337,bytes:new Uint8Array([1,2])};true`);const objects=queryHeapObjects(w.Object.prototype,context).objects,own=(o,k)=>Object.getOwnPropertyDescriptor(o,k)?.value;assert.ok(objects.includes(w.authored));assert.ok(queryHeapObjects(w.AudioData.prototype,context).objects.includes(w.a));assert.deepEqual([...objects.filter(o=>own(o,'format')==='u8'&&own(o,'timestamp')===31337&&own(o,'bytes'))],[w.authored])});
+--- /dev/null
++++ b/oracle/webcodecs-media-native-audio.json
+@@ -0,0 +1,557 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "60c9b3b0916ad4755ea7ff4b270c1d018c4bf2af82e25c3761b93ac5974a021f",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "name": "shape",
++          "value": {
++            "length": 1,
++            "keys": [
++              "format",
++              "sampleRate",
++              "numberOfFrames",
++              "numberOfChannels",
++              "duration",
++              "timestamp",
++              "allocationSize",
++              "copyTo",
++              "clone",
++              "close",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ],
++            "methods": {
++              "allocationSize": 1,
++              "copyTo": 2,
++              "clone": 0,
++              "close": 0
++            }
++          }
++        },
++        {
++          "name": "metadata",
++          "value": {
++            "format": "u8",
++            "frames": 3,
++            "channels": 2,
++            "sampleRate": 8000,
++            "timestamp": 10,
++            "duration": 375,
++            "keys": [],
++            "tag": "[object AudioData]"
++          }
++        },
++        {
++          "name": "property-order",
++          "value": [
++            "has:data",
++            "get:data",
++            "has:format",
++            "get:format",
++            "has:numberOfChannels",
++            "get:numberOfChannels",
++            "has:numberOfFrames",
++            "get:numberOfFrames",
++            "has:sampleRate",
++            "get:sampleRate",
++            "has:timestamp",
++            "get:timestamp",
++            "has:transfer"
++          ]
++        },
++        {
++          "name": "init:format:nope",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:format:null",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:format:Symbol(u8)",
++          "value": [
++            "u8",
++            2,
++            3,
++            8000,
++            10,
++            375
++          ]
++        },
++        {
++          "name": "init:numberOfChannels:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:numberOfChannels:-1",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:numberOfChannels:1.5",
++          "value": [
++            "u8",
++            1,
++            3,
++            8000,
++            10,
++            375
++          ]
++        },
++        {
++          "name": "init:numberOfChannels:4294967295",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:numberOfChannels:4294967296",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:numberOfChannels:1",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a BigInt value to a number"
++          }
++        },
++        {
++          "name": "init:numberOfFrames:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:numberOfFrames:-1",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:numberOfFrames:1.5",
++          "value": [
++            "u8",
++            2,
++            1,
++            8000,
++            10,
++            125
++          ]
++        },
++        {
++          "name": "init:numberOfFrames:4294967296",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:sampleRate:0",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:sampleRate:-1",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:sampleRate:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:sampleRate:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "init:sampleRate:0.1",
++          "value": [
++            "u8",
++            2,
++            3,
++            0.10000000149011612,
++            10,
++            29999999
++          ]
++        },
++        {
++          "name": "init:sampleRate:1e-30",
++          "value": [
++            "u8",
++            2,
++            3,
++            1.0000000031710769e-30,
++            10,
++            18446744073709552000
++          ]
++        },
++        {
++          "name": "init:sampleRate:48000.125",
++          "value": [
++            "u8",
++            2,
++            3,
++            48000.125,
++            10,
++            62
++          ]
++        },
++        {
++          "name": "init:timestamp:undefined",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:timestamp:null",
++          "value": [
++            "u8",
++            2,
++            3,
++            8000,
++            0,
++            375
++          ]
++        },
++        {
++          "name": "init:timestamp:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:timestamp:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:timestamp:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "init:timestamp:1",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a BigInt value to a number"
++          }
++        },
++        {
++          "name": "data:buffer",
++          "value": 6
++        },
++        {
++          "name": "data:view",
++          "value": 6
++        },
++        {
++          "name": "data:shared",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "data:shared-view",
++          "value": 6
++        },
++        {
++          "name": "data:string",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "close",
++          "value": [
++            null,
++            0,
++            0,
++            0,
++            10,
++            0
++          ]
++        },
++        {
++          "name": "closed:clone",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "closed:allocationSize",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "closed:copyTo",
++          "error": {
++            "name": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "allocation:undefined",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "allocation:null",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "allocation:{}",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "allocation:0",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0}",
++          "value": 6
++        },
++        {
++          "name": "allocation:{\"planeIndex\":1}",
++          "error": {
++            "name": "RangeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "allocation:{\"planeIndex\":2}",
++          "error": {
++            "name": "RangeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "allocation:{\"planeIndex\":-1}",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"frameOffset\":3}",
++          "error": {
++            "name": "RangeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"frameOffset\":2}",
++          "value": 2
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"frameCount\":0}",
++          "value": 0
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"frameCount\":4}",
++          "error": {
++            "name": "RangeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"format\":\"u8-planar\"}",
++          "value": 3
++        },
++        {
++          "name": "allocation:{\"planeIndex\":1,\"format\":\"u8-planar\"}",
++          "value": 3
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"format\":\"s16\"}",
++          "value": 12
++        },
++        {
++          "name": "allocation:{\"planeIndex\":0,\"format\":\"nope\"}",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "options-order",
++          "value": [
++            "has:format",
++            "has:frameCount",
++            "has:frameOffset",
++            "has:planeIndex",
++            "get:planeIndex"
++          ]
++        },
++        {
++          "name": "copy-short",
++          "error": {
++            "name": "RangeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "copy-invalid-first",
++          "value": {
++            "error": "TypeError",
++            "message": "invalid argument",
++            "touched": false
++          }
++        },
++        {
++          "name": "copy-shared",
++          "value": [
++            0,
++            128,
++            255,
++            64,
++            192,
++            1
++          ]
++        },
++        {
++          "name": "copy-detach",
++          "value": {
++            "error": "RangeError",
++            "message": "",
++            "bytes": 0
++          }
++        },
++        {
++          "name": "clone-transfer",
++          "value": {
++            "closed": "u8",
++            "clone": "u8",
++            "alias": true,
++            "brand": true,
++            "bytes": [
++              0,
++              128,
++              255,
++              64,
++              192,
++              1
++            ]
++          }
++        },
++        {
++          "name": "transfer-unrelated",
++          "value": "u8"
++        },
++        {
++          "name": "transfer-atomic",
++          "value": {
++            "error": "DataCloneError",
++            "format": "u8",
++            "detached": false
++          }
++        },
++        {
++          "name": "init-transfer:buffer",
++          "value": {
++            "size": 6,
++            "dataDetached": true,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "init-transfer:duplicate",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "init-transfer:detached",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "dataDetached": false,
++            "otherDetached": true
++          }
++        },
++        {
++          "name": "init-transfer:foreign",
++          "value": {
++            "size": 6,
++            "dataDetached": false,
++            "otherDetached": true
++          }
++        },
++        {
++          "name": "encoder-input",
++          "value": {
++            "queued": 1,
++            "events": [
++              "NotSupportedError",
++              "flush:NotSupportedError"
++            ],
++            "stillOpen": "u8"
++          }
++        },
++        {
++          "name": "encoder-closed-input",
++          "value": [
++            "TypeError",
++            ""
++          ]
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-audio-expression.js
+@@ -0,0 +1,22 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++const init=()=>({data:new Uint8Array([0,128,255,64,192,1]),format:'u8',numberOfChannels:2,numberOfFrames:3,sampleRate:8000,timestamp:10});
++await run('shape',()=>({length:AudioData.length,keys:Reflect.ownKeys(AudioData.prototype).map(String),methods:Object.fromEntries(['allocationSize','copyTo','clone','close'].map(k=>[k,AudioData.prototype[k].length]))}));
++await run('metadata',()=>{const a=new AudioData(init());return{format:a.format,frames:a.numberOfFrames,channels:a.numberOfChannels,sampleRate:a.sampleRate,timestamp:a.timestamp,duration:a.duration,keys:Object.keys(a),tag:Object.prototype.toString.call(a)}});
++await run('property-order',()=>{const log=[],source=new Proxy(init(),{has(o,k){log.push('has:'+String(k));return k in o},get(o,k){log.push('get:'+String(k));return o[k]}});new AudioData(source);return log});
++for(const [field,values]of Object.entries({format:['nope',null,Symbol('u8')],numberOfChannels:[0,-1,1.5,4294967295,4294967296,1n],numberOfFrames:[0,-1,1.5,4294967296],sampleRate:[0,-1,Infinity,NaN,0.1,1e-30,48000.125],timestamp:[undefined,null,NaN,Infinity,2**53,1n]}))for(const value of values)await run('init:'+field+':'+String(value),()=>{const a=new AudioData({...init(),[field]:value});return[a.format,a.numberOfChannels,a.numberOfFrames,a.sampleRate,a.timestamp,a.duration]});
++for(const [label,data]of[['buffer',new ArrayBuffer(6)],['view',new DataView(new ArrayBuffer(6))],['shared',new SharedArrayBuffer(6)],['shared-view',new Uint8Array(new SharedArrayBuffer(6))],['string','bad']])await run('data:'+label,()=>{const a=new AudioData({...init(),data});return a.allocationSize({planeIndex:0})});
++await run('close',()=>{const a=new AudioData(init());a.close();a.close();return[a.format,a.numberOfChannels,a.numberOfFrames,a.sampleRate,a.timestamp,a.duration]});
++for(const op of['clone','allocationSize','copyTo'])await run('closed:'+op,()=>{const a=new AudioData(init());a.close();return op==='clone'?a.clone():op==='allocationSize'?a.allocationSize({planeIndex:0}):a.copyTo(new Uint8Array(6),{planeIndex:0})});
++for(const options of[undefined,null,{},0,{planeIndex:0},{planeIndex:1},{planeIndex:2},{planeIndex:-1},{planeIndex:0,frameOffset:3},{planeIndex:0,frameOffset:2},{planeIndex:0,frameCount:0},{planeIndex:0,frameCount:4},{planeIndex:0,format:'u8-planar'},{planeIndex:1,format:'u8-planar'},{planeIndex:0,format:'s16'},{planeIndex:0,format:'nope'}])await run('allocation:'+String(JSON.stringify(options)),()=>new AudioData(init()).allocationSize(options));
++await run('options-order',()=>{const log=[],a=new AudioData(init());const opts=new Proxy({planeIndex:0},{has(o,k){log.push('has:'+String(k));return k in o},get(o,k){log.push('get:'+String(k));return o[k]}});a.allocationSize(opts);return log});
++await run('copy-short',()=>new AudioData(init()).copyTo(new Uint8Array(1),{planeIndex:0}));
++await run('copy-invalid-first',()=>{let touched=false;try{new AudioData(init()).copyTo(1,{get planeIndex(){touched=true;return 0}})}catch(e){return{error:e.name,message:e.message,touched}}});
++await run('copy-shared',()=>{const dest=new Uint8Array(new SharedArrayBuffer(6));new AudioData(init()).copyTo(dest,{planeIndex:0});return[...dest]});
++await run('copy-detach',()=>{const dest=new Uint8Array(6);try{new AudioData(init()).copyTo(dest,{planeIndex:0,get frameOffset(){dest.buffer.transfer(0);return 0}})}catch(e){return{error:e.name,message:e.message,bytes:dest.byteLength}}});
++await run('clone-transfer',()=>{const a=new AudioData(init()),b=a.clone(),copy=structuredClone({a,again:a},{transfer:[a]});const bytes=new Uint8Array(6);copy.a.copyTo(bytes,{planeIndex:0});return{closed:a.format,clone:b.format,alias:copy.a===copy.again,brand:copy.a instanceof AudioData,bytes:[...bytes]}});
++await run('transfer-unrelated',()=>{const a=new AudioData(init());structuredClone(1,{transfer:[a]});return a.format});
++await run('transfer-atomic',()=>{const a=new AudioData(init()),b=new ArrayBuffer(1);try{structuredClone({a,fn(){}},{transfer:[a,b]})}catch(e){return{error:e.name,format:a.format,detached:b.detached}}});
++for(const transfer of['buffer','duplicate','detached','foreign'])await run('init-transfer:'+transfer,()=>{const data=new ArrayBuffer(6),other=new ArrayBuffer(1),a=init();let list;if(transfer==='buffer')list=[data];if(transfer==='duplicate')list=[data,data];if(transfer==='detached'){other.transfer(0);list=[other]}if(transfer==='foreign')list=[other];try{const x=new AudioData({...a,data,transfer:list});return{size:x.allocationSize({planeIndex:0}),dataDetached:data.detached,otherDetached:other.detached}}catch(e){return{error:e.name,message:e.message,dataDetached:data.detached,otherDetached:other.detached}}});
++await run('encoder-input',async()=>{const a=new AudioData(init()),events=[],c=new AudioEncoder({output(){events.push('output')},error:e=>events.push(e.name)});c.configure({codec:'opus',sampleRate:48000,numberOfChannels:2});let queued;try{c.encode(a);queued=c.encodeQueueSize}catch(e){queued=e.name}await c.flush().catch(e=>events.push('flush:'+e.name));return{queued,events,stillOpen:a.format}});
++await run('encoder-closed-input',()=>{const a=new AudioData(init());a.close();const c=new AudioEncoder({output(){},error(){}});c.configure({codec:'opus',sampleRate:48000,numberOfChannels:2});try{c.encode(a)}catch(e){c.reset();c.close();return[e.name,e.message]}});
++return rows})()
+--- /dev/null
++++ b/oracle/webcodecs-media-native-audio-conversion.json
+@@ -0,0 +1,295 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "69632a89c71dc330ae5dea749200e0629a5fc511b0db784463a9393187196bb6",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "source": "u8",
++          "target": "u8",
++          "values": [
++            0,
++            1,
++            64,
++            127,
++            128,
++            192,
++            254,
++            255
++          ]
++        },
++        {
++          "source": "u8",
++          "target": "s16",
++          "values": [
++            -32768,
++            -32512,
++            -16384,
++            -256,
++            0,
++            16384,
++            32256,
++            32512
++          ]
++        },
++        {
++          "source": "u8",
++          "target": "s32",
++          "values": [
++            -2147483648,
++            -2130706432,
++            -1073741824,
++            -16777216,
++            0,
++            1073741824,
++            2113929216,
++            2130706432
++          ]
++        },
++        {
++          "source": "u8",
++          "target": "f32",
++          "values": [
++            -1,
++            -0.9921875,
++            -0.5,
++            -0.0078125,
++            0,
++            0.5039370059967041,
++            0.9921259880065918,
++            1
++          ]
++        },
++        {
++          "source": "s16",
++          "target": "u8",
++          "values": [
++            0,
++            0,
++            64,
++            127,
++            128,
++            192,
++            255,
++            255
++          ]
++        },
++        {
++          "source": "s16",
++          "target": "s16",
++          "values": [
++            -32768,
++            -32767,
++            -16384,
++            -1,
++            0,
++            16384,
++            32766,
++            32767
++          ]
++        },
++        {
++          "source": "s16",
++          "target": "s32",
++          "values": [
++            -2147483648,
++            -2147418112,
++            -1073741824,
++            -65536,
++            0,
++            1073741824,
++            2147352576,
++            2147418112
++          ]
++        },
++        {
++          "source": "s16",
++          "target": "f32",
++          "values": [
++            -1,
++            -0.999969482421875,
++            -0.5,
++            -0.000030517578125,
++            0,
++            0.5000152587890625,
++            0.999969482421875,
++            1
++          ]
++        },
++        {
++          "source": "s32",
++          "target": "u8",
++          "values": [
++            0,
++            0,
++            64,
++            127,
++            128,
++            192,
++            255,
++            255
++          ]
++        },
++        {
++          "source": "s32",
++          "target": "s16",
++          "values": [
++            -32768,
++            -32768,
++            -16384,
++            -1,
++            0,
++            16384,
++            32767,
++            32767
++          ]
++        },
++        {
++          "source": "s32",
++          "target": "s32",
++          "values": [
++            -2147483648,
++            -2147483647,
++            -1073741824,
++            -1,
++            0,
++            1073741824,
++            2147483646,
++            2147483647
++          ]
++        },
++        {
++          "source": "s32",
++          "target": "f32",
++          "values": [
++            -1,
++            -1,
++            -0.5,
++            -4.656612873077393e-10,
++            0,
++            0.5,
++            1,
++            1
++          ]
++        },
++        {
++          "source": "f32",
++          "target": "u8",
++          "values": [
++            0,
++            0,
++            64,
++            128,
++            191,
++            255,
++            255,
++            128
++          ]
++        },
++        {
++          "source": "f32",
++          "target": "s16",
++          "values": [
++            -32768,
++            -32768,
++            -16384,
++            0,
++            16383,
++            32767,
++            32767,
++            0
++          ]
++        },
++        {
++          "source": "f32",
++          "target": "s32",
++          "values": [
++            -2147483648,
++            -2147483648,
++            -1073741824,
++            0,
++            1073741823,
++            2147483647,
++            2147483647,
++            0
++          ]
++        },
++        {
++          "source": "f32",
++          "target": "f32",
++          "values": [
++            -2,
++            -1,
++            -0.5,
++            0,
++            0.5,
++            1,
++            2,
++            "NaN"
++          ]
++        },
++        {
++          "planar": false,
++          "destPlanar": false,
++          "planeIndex": 0,
++          "values": [
++            3,
++            4,
++            5,
++            6
++          ]
++        },
++        {
++          "planar": false,
++          "destPlanar": true,
++          "planeIndex": 0,
++          "values": [
++            3,
++            5
++          ]
++        },
++        {
++          "planar": false,
++          "destPlanar": true,
++          "planeIndex": 1,
++          "values": [
++            4,
++            6
++          ]
++        },
++        {
++          "planar": true,
++          "destPlanar": false,
++          "planeIndex": 0,
++          "values": [
++            2,
++            5,
++            3,
++            6
++          ]
++        },
++        {
++          "planar": true,
++          "destPlanar": true,
++          "planeIndex": 0,
++          "values": [
++            2,
++            3
++          ]
++        },
++        {
++          "planar": true,
++          "destPlanar": true,
++          "planeIndex": 1,
++          "values": [
++            5,
++            6
++          ]
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-audio-conversion-expression.js
+@@ -0,0 +1,4 @@
++(()=>{const rows=[];const formats={u8:[Uint8Array,[0,1,64,127,128,192,254,255]],s16:[Int16Array,[-32768,-32767,-16384,-1,0,16384,32766,32767]],s32:[Int32Array,[-2147483648,-2147483647,-1073741824,-1,0,1073741824,2147483646,2147483647]],f32:[Float32Array,[-2,-1,-0.5,0,0.5,1,2,NaN]]};
++for(const[source,[ArrayType,values]]of Object.entries(formats))for(const[target,[Dest]]of Object.entries(formats)){const a=new AudioData({data:new ArrayType(values),format:source,numberOfChannels:1,numberOfFrames:values.length,sampleRate:8000,timestamp:0}),dest=new Dest(values.length);a.copyTo(dest,{planeIndex:0,format:target});rows.push({source,target,values:[...dest].map(x=>Number.isNaN(x)?'NaN':Object.is(x,-0)?'-0':x)});}
++for(const planar of[false,true])for(const destPlanar of[false,true]){const data=new Int16Array([1,2,3,4,5,6]),a=new AudioData({data,format:'s16'+(planar?'-planar':''),numberOfChannels:2,numberOfFrames:3,sampleRate:8000,timestamp:0});for(let planeIndex=0;planeIndex<(destPlanar?2:1);planeIndex++){const dest=new Int16Array(destPlanar?2:4);a.copyTo(dest,{planeIndex,format:'s16'+(destPlanar?'-planar':''),frameOffset:1,frameCount:2});rows.push({planar,destPlanar,planeIndex,values:[...dest]});}}
++return rows})()
+--- /dev/null
++++ b/oracle/webcodecs-media-native-audio-extra.json
+@@ -0,0 +1,107 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "expressionSHA256": "4a17aee122110614c28619394b1b36eb137b56f83a5d900d0dbdc001ac9b57a6",
++  "probeSHA256": "afa9a2dec982b3e13879903508245b599693e9a11fee2baeb63f20327ebdf7af",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "name": "without-new",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "transfer:open:payload",
++          "value": {
++            "source": "u8",
++            "result": "u8"
++          }
++        },
++        {
++          "name": "transfer:open:unrelated",
++          "value": {
++            "source": "u8",
++            "result": 1
++          }
++        },
++        {
++          "name": "transfer:open:duplicate",
++          "value": {
++            "source": "u8",
++            "result": "u8"
++          }
++        },
++        {
++          "name": "transfer:closed:payload",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "source": null
++          }
++        },
++        {
++          "name": "transfer:closed:unrelated",
++          "value": {
++            "source": null,
++            "result": 1
++          }
++        },
++        {
++          "name": "transfer:closed:duplicate",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "source": null
++          }
++        },
++        {
++          "name": "encoder-unconfigured:false",
++          "value": [
++            "InvalidStateError",
++            "The object is in an invalid state"
++          ]
++        },
++        {
++          "name": "encoder-unconfigured:true",
++          "value": [
++            "TypeError",
++            ""
++          ]
++        },
++        {
++          "name": "closed-options-order",
++          "value": {
++            "calls": [
++              "offset",
++              "plane"
++            ],
++            "error": "InvalidStateError",
++            "message": "The object is in an invalid state"
++          }
++        },
++        {
++          "name": "closed-copy-invalid-destination",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "clone-identity",
++          "value": {
++            "brand": true,
++            "bytes": [
++              1,
++              2
++            ],
++            "timestamp": 3
++          }
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-media-audio-extra-expression.js
+@@ -0,0 +1,7 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{rows.push({name,value:await fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};const init=()=>({data:new Uint8Array([1,2]),format:'u8',numberOfChannels:1,numberOfFrames:2,sampleRate:8000,timestamp:3});
++await run('without-new',()=>AudioData(init()));for(const state of['open','closed'])for(const mode of['payload','unrelated','duplicate'])await run('transfer:'+state+':'+mode,()=>{const a=new AudioData(init());if(state==='closed')a.close();try{const b=structuredClone(mode==='unrelated'?1:a,{transfer:mode==='duplicate'?[a,a]:[a]});return{source:a.format,result:typeof b==='number'?b:b.format}}catch(e){return{error:e.name,message:e.message,source:a.format}}});
++for(const closed of[false,true])await run('encoder-unconfigured:'+closed,()=>{const data=new AudioData(init());if(closed)data.close();const codec=new AudioEncoder({output(){},error(){}});try{codec.encode(data);return'ok'}catch(e){return[e.name,e.message]}finally{codec.close()}});
++await run('closed-options-order',()=>{const a=new AudioData(init());a.close();const calls=[];try{a.allocationSize({get planeIndex(){calls.push('plane');return 0},get frameOffset(){calls.push('offset');return 0}})}catch(e){return{calls,error:e.name,message:e.message}}});
++await run('closed-copy-invalid-destination',()=>{const a=new AudioData(init());a.close();return a.copyTo(1,{planeIndex:0})});
++await run('clone-identity',()=>{const a=new AudioData(init());Object.defineProperty(a,'format',{get(){throw Error('authored')}});const b=a.clone();a.close();const data=new Uint8Array(2);b.copyTo(data,{planeIndex:0});return{brand:b instanceof AudioData,bytes:[...data],timestamp:b.timestamp}});
++return rows})()
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -52,6 +52,7 @@
+ import { loadCollectionsBinding, installCollections } from './collections.js';
+ import { installStyles } from './styles.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
++import { installAudioData } from './audio-data.js';
+ import { installWebCodecsValues } from './webcodecs-values.js';
+ import { installGeometry } from './geometry.js';
+ import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
+@@ -264,6 +265,7 @@
+       installCanvas(window);
+       installGeometry(window);
+       installWebCodecsValues(window);
++      installAudioData(window);
+       installWebCodecsProcessors(window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -12,6 +12,7 @@
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+ import { resolveBlobURL } from './blob-urls.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
++import { installAudioData } from './audio-data.js';
+ import { installWebCodecsValues } from './webcodecs-values.js';
+ import { installGeometry } from './geometry.js';
+ import { installNavigator } from './navigator.js';
+@@ -311,6 +312,7 @@
+   installCanvas(vm.runInContext('globalThis', context));
+   installGeometry(vm.runInContext('globalThis', context));
+   installWebCodecsValues(vm.runInContext('globalThis', context));
++  installAudioData(vm.runInContext('globalThis', context));
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import { audioDataRecord, validAudioDataRecord, deserializeAudioData } from './audio-data.js';
+ import { isCanvasCloneRejected } from './canvas.js';
+ import { imageDataRecord, validImageDataRecord, deserializeImageData } from './image-data.js';
+ import { encodedChunkData, validEncodedChunk, deserializeEncodedChunk } from './webcodecs-values.js';
+@@ -30,6 +31,7 @@
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+   if(provenance?.kind==='VideoColorSpace'||provenance?.kind==='URLPattern')throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
++  const audio=audioDataRecord(value);if(audio){if(!validAudioDataRecord(audio))throw failure('The object can not be cloned');return audio;}
+   const image=imageDataRecord(value);if(image){if(!validImageDataRecord(image))throw failure('Invalid ImageData clone');return image;}
+   const geometry=geometryFactoryData(value);
+   if(geometry){if(!validGeometryRecord(geometry))throw failure('The object can not be cloned');return geometry;}
+@@ -48,8 +50,9 @@
+   if(message.platforms===undefined)return null;
+   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
+   for(const[placeholder,record]of message.platforms){
+-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData'].includes(record.kind))throw failure('Malformed platform node');
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData','AudioData'].includes(record.kind))throw failure('Malformed platform node');
+    if(record.kind==='EncodedChunk'){if(!validEncodedChunk(record))throw failure('Malformed encoded chunk');continue;}
++   if(record.kind==='AudioData'){if(!validAudioDataRecord(record))throw failure('Malformed AudioData node');continue;}
+    if(record.kind==='ImageData'){if(!validImageDataRecord(record))throw failure('Malformed ImageData node');continue;}
+    if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
+    if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
+@@ -74,6 +77,7 @@
+   return stripNativeHandles(message);
+  }
+  function deserialize(record){
++  if(record.kind==='AudioData'){try{return deserializeAudioData(realm,record)}catch{throw failure('Invalid AudioData receiver')}}
+   if(record.kind==='ImageData'){try{return deserializeImageData(realm,record)}catch{throw failure('Invalid ImageData receiver')}}
+   if(record.kind==='EncodedChunk'){try{return deserializeEncodedChunk(realm,record)}catch{throw failure('Invalid encoded chunk receiver')}}
+   if(record.kind==='Geometry'){try{return deserializeGeometry(realm,record)}catch{throw failure('Invalid geometry receiver')}}
+--- a/src/webcodecs-processors.js
++++ b/src/webcodecs-processors.js
+@@ -117,6 +117,7 @@
+   const operation=decoder?'decode':'encode';define(C.prototype,operation,{enumerable:true,configurable:true,writable:true,value:{[operation](input){
+    receiver(this,name);const data=decoder?bridge.chunk(input):bridge.media(input,name==='AudioEncoder'?'AudioData':'VideoFrame');
+    if(!data||decoder&&data.interface!==(name==='AudioDecoder'?'EncodedAudioChunk':'EncodedVideoChunk'))throw typeError('invalid argument');
++   if(!decoder&&data.closed)throw typeError('');
+    if(bridge.read(this,'state')!=='configured')throw invalidState();
+    if(decoder&&bridge.read(this,'keyRequired')&&data.type!=='key')throw new Exception('Data provided to an operation does not meet requirements','DataError');
+    bridge.enqueue(this,data);
+@@ -157,7 +158,7 @@
+   brand:(value,name)=>states.get(value)?.interface===name,
+   read:(value,key)=>['state','queueSize','keyRequired','handler'].includes(key)?states.get(value)[key]:undefined,
+   bytes:snapshotBytes,chunk:encodedChunkData,
+-  media(value,kind){const provenance=platformFactoryRecord(value);if(provenance?.kind!==kind||typeof provenance.read!=='function')return null;const record=provenance.read();return record?.closed?null:record},
++  media(value,kind){const provenance=platformFactoryRecord(value);if(provenance?.kind!==kind||typeof provenance.read!=='function')return null;const record=provenance.read();return record},
+   create(value,kind,error,output){
+    const implementation=platformFactoryRecord(value)?.implementation;if(implementation)eventTargets.set(value,implementation);
+    const state=hidden({value,runtime,interface:kind,state:'unconfigured',queueSize:0,keyRequired:true,error,output,handler:null,listener:null,configurationTask:null,dequeueTask:null,flushes:[],work:[]});

@@ -244,7 +244,7 @@ function stateFor(root, record, fresh = false) {
   let state = ADOPTED.get(root);
   if (state?.document !== ownerDocument(root)) state = null;
   if (state && !fresh) return state;
-  const target = new record.window.Array();
+  const target = new record.Array();
   state = { document: ownerDocument(root), target, list: null };
   const validate = sheet => {
     const metadata = SHEETS.get(sheet);
@@ -256,8 +256,8 @@ function stateFor(root, record, fresh = false) {
   state.list = new Proxy(target, {
     get(array, property, receiver) {
       if (['push', 'pop', 'shift', 'unshift', 'splice', 'reverse', 'sort', 'fill', 'copyWithin'].includes(property)) return (...args) => {
-        const draft = record.window.Array.prototype.slice.call(array);
-        const result = record.window.Array.prototype[property].apply(draft, args);
+        const draft = record.Array.prototype.slice.call(array);
+        const result = record.Array.prototype[property].apply(draft, args);
         draft.forEach(validate); array.length = 0; array.length = draft.length;
         for (const key of Object.keys(draft)) array[key] = draft[key];
         return result === draft ? state.list : result;
@@ -707,7 +707,7 @@ export function installStyles(page, window) {
   const originalStyleDescriptor = Object.getOwnPropertyDescriptor(window.HTMLStyleElement.prototype, 'sheet');
   const originalLinkDescriptor = Object.getOwnPropertyDescriptor(window.HTMLLinkElement.prototype, 'sheet');
   const originalDocumentSheets = Object.getOwnPropertyDescriptor(window.Document.prototype, 'styleSheets');
-  const record = { page, window, document, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
+  const record = { page, window, document, Array:window.Array, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }

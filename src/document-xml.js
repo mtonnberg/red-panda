@@ -1,3 +1,4 @@
+import {atomicFormMove} from './element-internals.js';
 // Independent proposal. Existing jsdom DOM/parser/XPath components are reused;
 // target implementation source is neither imported nor copied.
 import{createRequire}from'node:module';
@@ -141,7 +142,7 @@ export function installDocumentXML(page,window){
    try{
     for(const key of['_detach','_attach']){descriptors.set(key,Object.getOwnPropertyDescriptor(n,key));Object.defineProperty(n,key,{configurable:true,writable:true,value(){}});}
     for(const {element,definition,callback}of aware){definitions.set(element,definition);element._ceDefinition={...definition,lifecycleCallbacks:{...definition.lifecycleCallbacks,connectedCallback:null,disconnectedCallback:null,connectedMoveCallback:callback}};}
-    p._preInsert(n,c);
+    atomicFormMove(()=>p._preInsert(n,c));
     if(focused?.isConnected)owner._lastFocusedElement=focused;
     for(const {element}of aware)enqueueCECallbackReaction(element,'connectedMoveCallback',[]);
     // Keep lookup indexes ordered after a real topology change without detach/

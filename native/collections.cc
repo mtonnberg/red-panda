@@ -93,8 +93,28 @@ void Create(const FunctionCallbackInfo<Value>& info) {
   info.GetReturnValue().Set(collection);
 }
 
+// Ordinary live indexed WebIDL objects share the real property interceptors,
+// but have neither HTMLDDA undetectability nor callable behavior.
+void CreateIndexed(const FunctionCallbackInfo<Value>& info) {
+  auto isolate = info.GetIsolate();
+  if (info.Length() != 2 || !info[0]->IsObject() || !info[1]->IsObject()) {
+    isolate->ThrowException(Exception::TypeError(String::NewFromUtf8Literal(isolate, "Collection bridge and prototype are required")));
+    return;
+  }
+  Local<Context> realm;
+  if (!info[1].As<Object>()->GetCreationContext().ToLocal(&realm)) return;
+  Context::Scope scope(realm);
+  auto object = ObjectTemplate::New(isolate);
+  object->SetHandler(IndexedPropertyHandlerConfiguration(IndexGet, nullptr, IndexQuery, nullptr, IndexKeys, info[0]));
+  Local<Object> collection;
+  if (!object->NewInstance(realm).ToLocal(&collection)) return;
+  if (!collection->SetPrototypeV2(realm, info[1]).FromMaybe(false)) return;
+  info.GetReturnValue().Set(collection);
+}
+
 NODE_MODULE_INIT() {
   NODE_SET_METHOD(exports, "create", Create);
+  NODE_SET_METHOD(exports, "createIndexed", CreateIndexed);
   auto isolate = Isolate::GetCurrent();
   exports->Set(context, String::NewFromUtf8Literal(isolate, "headersVersion"), String::NewFromUtf8Literal(isolate, NODE_VERSION)).Check();
   exports->Set(context, String::NewFromUtf8Literal(isolate, "abiVersion"), Integer::New(isolate, NODE_MODULE_VERSION)).Check();

@@ -1,0 +1,124 @@
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import { domExceptionRecord, validDOMExceptionRecord, deserializeDOMException, captureDOMExceptionFactory } from './worker-dom-exception.js';
+ import { videoFrameRecord, validVideoFrameRecord, deserializeVideoFrame } from './video-frame.js';
+ import { audioDataRecord, validAudioDataRecord, deserializeAudioData } from './audio-data.js';
+ import { isCanvasCloneRejected } from './canvas.js';
+@@ -19,6 +20,7 @@
+  * payload aliases. NativeBlob carries immutable bytes across actual threads.
+  */
+ export function createPlatformCodec(realm){
++ captureDOMExceptionFactory(realm);
+  installNativePlatformFactories(realm);
+  const Blob=realm.Blob,File=realm.File;
+  const probe=typeof Blob==='function'?new Blob([]):null;
+@@ -28,6 +30,7 @@
+  const failure=message=>new Exception(message,'DataCloneError');
+  function serialize(value){
+   const provenance=platformFactoryRecord(value);
++  const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+   if(provenance?.kind==='VideoColorSpace'||provenance?.kind==='URLPattern')throw failure('The object can not be cloned');
+@@ -52,7 +55,8 @@
+   if(message.platforms===undefined)return null;
+   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
+   for(const[placeholder,record]of message.platforms){
+-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData','AudioData','VideoFrame'].includes(record.kind))throw failure('Malformed platform node');
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData','AudioData','VideoFrame','DOMException'].includes(record.kind))throw failure('Malformed platform node');
++   if(record.kind==='DOMException'){if(!validDOMExceptionRecord(record))throw failure('Malformed DOMException');continue;}
+    if(record.kind==='EncodedChunk'){if(!validEncodedChunk(record))throw failure('Malformed encoded chunk');continue;}
+    if(record.kind==='VideoFrame'){if(!validVideoFrameRecord(record))throw failure('Malformed VideoFrame node');continue;}
+    if(record.kind==='AudioData'){if(!validAudioDataRecord(record))throw failure('Malformed AudioData node');continue;}
+@@ -80,6 +84,7 @@
+   return stripNativeHandles(message);
+  }
+  function deserialize(record){
++  if(record.kind==='DOMException'){try{return deserializeDOMException(realm,record)}catch{throw failure('Invalid DOMException receiver')}}
+   if(record.kind==='VideoFrame'){try{return deserializeVideoFrame(realm,record)}catch{throw failure('Invalid VideoFrame receiver')}}
+   if(record.kind==='AudioData'){try{return deserializeAudioData(realm,record)}catch{throw failure('Invalid AudioData receiver')}}
+   if(record.kind==='ImageData'){try{return deserializeImageData(realm,record)}catch{throw failure('Invalid ImageData receiver')}}
+--- /dev/null
++++ b/src/worker-dom-exception.js
+@@ -0,0 +1,63 @@
++// Real selected-VM Error allocation and Host-private actual Node DOMException
++// slots. Node's constructor returns its own Host Error and ignores newTarget's
++// creation realm, so it is deliberately used only as the private backend.
++import { registerPlatformFactoryKind } from './platform-factory-hooks.js';
++import { registerPlatformFactory, platformFactoryRecord } from './platform-factories.js';
++import { createRequire } from 'node:module';
++const require=createRequire(import.meta.url),generated=require('jsdom/lib/jsdom/living/generated/DOMException.js'),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const NativeException=globalThis.DOMException,apply=Reflect.apply;
++const readers=Object.fromEntries(['name','message','code'].map(name=>[name,Object.getOwnPropertyDescriptor(NativeException.prototype,name).get]));
++const constants=Object.getOwnPropertyNames(NativeException).filter(name=>/^[A-Z][A-Z0-9_]*$/.test(name)&&typeof Object.getOwnPropertyDescriptor(NativeException,name).value==='number').map(name=>[name,NativeException[name]]);
++const installed=new WeakMap(),states=new WeakMap(),producers=new WeakMap();
++function factory(g,bridge){
++ 'use strict';
++ const define=g.Object.defineProperty,setPrototype=g.Object.setPrototypeOf,TypeError=g.TypeError,String=g.String,apply=g.Reflect.apply,construct=g.Reflect.construct,Error=g.Error;
++ const description=g.Object.getOwnPropertyDescriptor(g.Symbol.prototype,'description').get;
++ const text=value=>typeof value==='symbol'?apply(description,value,[])??'':String(value);
++ function DOMException(){if(new.target===undefined)throw new TypeError('invalid argument');const message=arguments[0]===undefined?'':text(arguments[0]),name=arguments[1]===undefined?'Error':text(arguments[1]),value=construct(Error,[],new.target);delete value.stack;bridge.store(value,message,name);return value}
++ const prototype=DOMException.prototype;delete prototype.constructor;define(DOMException,'prototype',{writable:false});setPrototype(prototype,g.Error.prototype);
++ for(const name of['code','name','message']){const accessors={[`get ${name}`](){const result=bridge.read(this,name);if(!result.ok)throw new TypeError('Illegal invocation');return result.value}};define(prototype,name,{get:accessors[`get ${name}`],enumerable:true,configurable:true})}
++ const methods={toString(){const name=bridge.read(this,'name'),message=bridge.read(this,'message');if(!name.ok||!message.ok)throw new TypeError('Illegal invocation');return name.value+': '+message.value}};define(prototype,'toString',{value:methods.toString,writable:true,enumerable:true,configurable:true});
++ for(const[name,value]of bridge.constants){define(prototype,name,{value,enumerable:true});define(DOMException,name,{value,enumerable:true})}
++ define(prototype,'constructor',{value:DOMException,writable:true,configurable:true});
++ define(prototype,g.Symbol.toStringTag,{value:'DOMException',configurable:true});
++ define(g,'DOMException',{value:DOMException,writable:true,configurable:true});return DOMException;
++}
++export function installWorkerDOMException(realm,{evaluate=source=>realm.eval(source)}={}){
++ if(installed.has(realm))return installed.get(realm);
++ registerPlatformFactoryKind('DOMException');
++ const Exception=evaluate(`(${factory.toString()})`)(realm,{
++  constants,
++  store(value,message,name){const backend=new NativeException(message,name),state=Object.freeze(Object.assign(Object.create(null),{backend}));states.set(value,state);registerPlatformFactory(value,{kind:'DOMException',implementation:state,globalObject:realm})},
++  read(value,name){const state=states.get(value);return state?{ok:true,value:apply(readers[name],state.backend,[])}:{ok:false}},
++ });installed.set(realm,Exception);return Exception;
++}
++export function captureDOMExceptionFactory(realm){
++ if(producers.has(realm))return producers.get(realm);
++ const Exception=installed.get(realm)??realm.DOMException,registry=Object.getOwnPropertyDescriptor(realm,utils.ctorRegistrySymbol)?.value;
++ // Already-converted scalar messages bypass generated DOMString conversion,
++ // which otherwise consults an authored replacement of Window.String.
++ let allocate;
++ if(registry?.DOMException===Exception){
++  const Error=realm.Error,construct=realm.Reflect.construct,define=realm.Object.defineProperty,remove=realm.Reflect.deleteProperty;
++  const target=realm.eval('(function DOMException(){})');define(target,'prototype',{value:Exception.prototype,writable:false});
++  allocate=(message,name)=>{
++   const value=construct(Error,[],target);
++   // The trusted generated init captures a stack via wrapper.constructor.
++   // Initialization uses a captured constructor, then removes that temporary
++   // own field before the public value can be observed.
++   define(value,'constructor',{value:Exception,configurable:true});
++   try{return generated.setup(value,realm,[message,name])}finally{remove(value,'constructor')}
++  };
++ }else allocate=(message,name)=>new Exception(message,name);
++ const producer=(message,name)=>{const value=allocate(message,name);delete value.stack;return value};producers.set(realm,producer);return producer;
++}
++export function domExceptionRecord(value){
++ const state=states.get(value);if(state)return{kind:'DOMException',name:apply(readers.name,state.backend,[]),message:apply(readers.message,state.backend,[])};
++ // The pinned generated Window factory owns its real implementation slots.
++ // No authored getter, implementation symbol, or tag is read for provenance.
++ const factory=platformFactoryRecord(value),implementation=factory?.kind==='DOMException'?factory.implementation:null;
++ return implementation&&typeof implementation.name==='string'&&typeof implementation.message==='string'?{kind:'DOMException',name:implementation.name,message:implementation.message}:null;
++}
++export function validDOMExceptionRecord(record){return record?.kind==='DOMException'&&typeof record.name==='string'&&typeof record.message==='string'}
++export function deserializeDOMException(realm,record){if(!validDOMExceptionRecord(record))throw new TypeError('Invalid DOMException receiver');return captureDOMExceptionFactory(realm)(record.message,record.name)}
+--- /dev/null
++++ b/test/worker-dom-exception.test.js
+@@ -0,0 +1,7 @@
++import{test}from'node:test';import assert from'node:assert/strict';import vm from'node:vm';import{readFile,writeFile}from'node:fs/promises';import{Worker}from'node:worker_threads';import{types}from'node:util';import{installWorkerDOMException,domExceptionRecord}from'../src/worker-dom-exception.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++const root=new URL('../proposals/web-crypto/',import.meta.url);
++function realm(){const context=vm.createContext({}),g=vm.runInContext('globalThis',context);installWorkerDOMException(g,{evaluate:source=>vm.runInContext(source,context)});return{context,g}}
++for(const[expression,report]of[['dom-exception.js','native-dom-exception.json'],['dom-stringifier-v2.js','native-dom-stringifier-v2.json']])test(`selected-VM DOMException actual Native controls: ${report}`,async()=>{const{context}=realm(),source=await readFile(new URL(expression,root),'utf8'),evidence=JSON.parse(await readFile(new URL(report,root),'utf8'));const actual=JSON.parse(vm.runInContext(source,context,{timeout:15000}));assert.deepEqual(actual,JSON.parse(evidence.result.result.value))});
++test('DOMException has genuine selected-VM Error slots and authentic private backend; descriptors, proxies and Error lookalikes grant no brand',()=>{const{context,g}=realm(),e=vm.runInContext("new DOMException('private','SyntaxError')",context),state=platformFactoryRecord(e).implementation;assert.equal(types.isNativeError(e),true);assert.equal(e instanceof g.Error,true);assert.equal(Object.getPrototypeOf(state),null);assert.equal(Object.getOwnPropertyDescriptor(DOMException.prototype,'message').get.call(state.backend),'private');assert.throws(()=>Object.getOwnPropertyDescriptor(DOMException.prototype,'message').get.call(e),TypeError);assert.deepEqual(Reflect.ownKeys(e),[]);for(const fake of[{},Object.create(g.DOMException.prototype),Object.create(g.DOMException.prototype,Object.getOwnPropertyDescriptors(e)),Object.setPrototypeOf(new g.Error(),g.DOMException.prototype),new Proxy(e,{})]){assert.equal(domExceptionRecord(fake),null);assert.equal(platformFactoryRecord(fake),undefined);assert.throws(()=>Object.getOwnPropertyDescriptor(g.DOMException.prototype,'name').get.call(fake),error=>error instanceof g.TypeError&&error.message==='Illegal invocation')}assert.deepEqual(domExceptionRecord(e),{kind:'DOMException',name:'SyntaxError',message:'private'})});
++test('DOMException foreign borrowed getters preserve actual private values and use the selected method error realm',()=>{const a=realm(),b=realm(),value=new a.g.DOMException('foreign','DataError'),getter=Object.getOwnPropertyDescriptor(b.g.DOMException.prototype,'message').get;assert.equal(getter.call(value),'foreign');assert.throws(()=>getter.call({}),error=>error instanceof b.g.TypeError&&!(error instanceof a.g.TypeError));const target=vm.runInContext('(function Alternate(){})',b.context),e=Reflect.construct(a.g.DOMException,['alternate','SyntaxError'],target);assert.equal(Object.getPrototypeOf(e),target.prototype);assert.equal(getter.call(e),'alternate');assert.equal(types.isNativeError(e),true)});
++test('DOMException genuine worker heap identity and actual Error creation realm survive removing the public prototype',async()=>{const value=await new Promise((resolve,reject)=>{const worker=new Worker(new URL('./fixtures/worker-dom-exception-heap.mjs',import.meta.url),{execArgv:[]});worker.once('message',resolve);worker.once('error',reject);worker.once('exit',code=>{if(code)reject(Error('Worker exited '+code))})});assert.equal(value.nativeError,true);assert.equal(value.before,true);assert.equal(value.after,true);assert.equal(value.host,false);assert.equal(value.heapContains,true);assert.equal(value.backendNativeBrand,'worker realm');assert.equal(value.privateStatePrototype,true);assert.deepEqual(value.own,[]);assert.deepEqual(value.directNodeConstruction,{before:false,after:false,host:true});if(process.env.RED_PANDA_CRYPTO_EVIDENCE_DIR)await writeFile(process.env.RED_PANDA_CRYPTO_EVIDENCE_DIR+'/helper-heap-'+process.versions.node+'.json',JSON.stringify(value,null,2)+'\n')});
+--- /dev/null
++++ b/test/fixtures/worker-dom-exception-heap.mjs
+@@ -0,0 +1,4 @@
++import vm from'node:vm';import{parentPort}from'node:worker_threads';import{types}from'node:util';import{installWorkerDOMException,domExceptionRecord}from'../../src/worker-dom-exception.js';import{getHeapBinding}from'../../src/native-heap.js';import{platformFactoryRecord}from'../../src/platform-factories.js';
++const context=vm.createContext({}),g=vm.runInContext('globalThis',context);installWorkerDOMException(g,{evaluate:source=>vm.runInContext(source,context)});const value=vm.runInContext("globalThis.heldException=new DOMException('worker realm','DataError')",context),anchor=vm.runInContext('[]',context),binding=getHeapBinding(),state=platformFactoryRecord(value).implementation;
++const failed=Reflect.construct(DOMException,['Host counterexample','DataError'],g.DOMException),failedBefore=binding.sameRealm(failed,anchor);Object.setPrototypeOf(failed,null);const failedAfter=binding.sameRealm(failed,anchor);
++const raw=binding.queryObjects(g.DOMException.prototype,anchor,1000,100000,1000,10000);const before=binding.sameRealm(value,anchor);Object.setPrototypeOf(value,null);const after=binding.sameRealm(value,anchor);parentPort.postMessage({directNodeConstruction:{before:failedBefore,after:failedAfter,host:binding.sameRealm(failed,Array.prototype)},node:process.version,v8:process.versions.v8,nativeError:types.isNativeError(value),before,after,host:binding.sameRealm(value,Array.prototype),heapContains:raw.objects.includes(value),backendNativeBrand:Object.getOwnPropertyDescriptor(DOMException.prototype,'message').get.call(state.backend),privateStatePrototype:Object.getPrototypeOf(state)===null,record:domExceptionRecord(value),own:Reflect.ownKeys(value).map(String)});

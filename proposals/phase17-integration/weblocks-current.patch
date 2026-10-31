@@ -1,0 +1,241 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -4,6 +4,7 @@
+ import {installAudioCore} from './audio-core.js';
+ import {installConsole} from './console.js';
+ import {installWebStorage} from './web-storage.js';
++import {installWebLocks} from './web-locks.js';
+ import { installImageData } from './image-data.js';
+ import { SyncHTTP } from './sync-http.js';
+ import {installFrameActivity} from './frame-activity.js';
+@@ -241,7 +242,8 @@
+       window.TextDecoder = TextDecoder;
+       window.structuredClone = structuredClone;
+       installNavigator(this, window);
++      installWebLocks(this, window);
+       installDevicePermissions(this,window);
+       installFonts(window);
+       installFetch(this, window);
+       const creatorSnapshot=captureWorkerCreator(this,window);
+--- /dev/null
++++ b/src/web-locks.js
+@@ -0,0 +1,145 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {createInvocationTrampoline} from './invocation.js';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++
++// The observed target keeps separate document LockManagers, including for
++// same-origin frames. Queues below therefore belong to the genuine manager's
++// document, not a synthetic origin-wide service. See proposals/weblocks.
++const require=createRequire(import.meta.url);
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const SignalImpl=require('jsdom/lib/jsdom/living/aborting/AbortSignal-impl.js').implementation;
++const addAbort=SignalImpl.prototype._addAlgorithm,removeAbort=SignalImpl.prototype._removeAlgorithm;
++const installed=new WeakMap(),managers=new WeakMap(),locks=new WeakMap(),navigators=new WeakMap(),clients=new WeakMap();
++const hostSchedule=setTimeout,hostCancel=clearTimeout,apply=Reflect.apply,normalize=String.prototype.toWellFormed;
++
++function lockRealm(g,bridge){
++ const TypeError=g.TypeError,Exception=g.DOMException,Promise=g.Promise,Array=g.Array,String=g.String;
++ const apply=Reflect.apply,define=Object.defineProperty,getDescriptor=Object.getOwnPropertyDescriptor,create=Object.create;
++ const resolvePromise=Promise.resolve,thenPromise=Promise.prototype.then;
++ const symbolDescription=getDescriptor(Symbol.prototype,'description').get;
++ const text=value=>bridge.normalize(typeof value==='symbol'?String(apply(symbolDescription,value,[])):String(value));
++ const error=()=>new TypeError('invalid argument');
++ const owner=value=>{const state=bridge.managerState(value);if(!state)throw error();return state;};
++ const state=value=>{const record=bridge.lockState(value);if(!record)throw new TypeError('Illegal invocation');return record;};
++ const dom=name=>new Exception(name==='AbortError'?'The operation was aborted':'The operation is not supported',name);
++ let realm;
++ class Lock{
++  constructor(){throw new TypeError('Illegal Constructor');}
++  get mode(){return state(this).mode;}
++  get name(){return state(this).name;}
++ }
++ class LockManager{
++  constructor(){throw new TypeError('Illegal Constructor');}
++  request(name,options){
++   const receiver=this,args=arguments;
++   return new Promise((resolve,reject)=>{
++    try{
++     const target=owner(receiver);if(args.length<2)throw error();name=text(name);
++     let callback,mode='exclusive',ifAvailable=false,steal=false,signal;
++     if(typeof options==='function')callback=options;
++     else{
++      if(options===null||typeof options!=='object')throw error();
++      ifAvailable=!!options.ifAvailable;
++      const suppliedMode=options.mode;if(suppliedMode!==undefined){if(suppliedMode!=='exclusive'&&suppliedMode!=='shared')throw error();mode=suppliedMode;}
++      const suppliedSignal=options.signal;if(suppliedSignal!=null)signal=bridge.signal(suppliedSignal);
++      steal=!!options.steal;
++      callback=args[2];if(typeof callback!=='function')throw new TypeError('callback must be a function');
++     }
++     if(name.startsWith('-')||(steal&&(ifAvailable||mode==='shared'))||(signal&&(steal||ifAvailable)))throw dom('NotSupportedError');
++     bridge.request(target,name,mode,ifAvailable,steal,signal,callback,resolve,reject,realm);
++    }catch(e){reject(e);}
++   });
++  }
++  query(){const receiver=this;return new Promise((resolve,reject)=>{try{const snapshot=bridge.snapshot(owner(receiver));const entries=values=>Array.from(values,value=>({name:value.name,mode:value.mode,clientId:value.clientId}));resolve({held:entries(snapshot.held),pending:entries(snapshot.pending)});}catch(e){reject(e);}});}
++ }
++ for(const [name,C]of [['Lock',Lock],['LockManager',LockManager]]){
++  const prototype=C.prototype,constructor=getDescriptor(prototype,'constructor');delete prototype.constructor;
++  for(const key of Object.getOwnPropertyNames(prototype))define(prototype,key,{...getDescriptor(prototype,key),enumerable:true});
++  define(prototype,'constructor',constructor);define(prototype,Symbol.toStringTag,{value:name,configurable:true});
++  define(g,name,{value:C,writable:true,configurable:true,enumerable:false});
++ }
++ realm={global:g,
++  makeManager(target){const value=create(LockManager.prototype);bridge.publishManager(value,target);return value;},
++  makeLock(name,mode){const value=create(Lock.prototype);bridge.publishLock(value,name,mode);return value;},
++  abort:()=>dom('AbortError'),
++  deliver(callback,receiver,lock,fulfill,reject){let value;try{value=apply(callback,receiver,[lock]);}catch(e){reject(e);return;}apply(thenPromise,apply(resolvePromise,Promise,[value]),[fulfill,reject]);},
++ };
++ const getters={get locks(){return bridge.manager(this);}};
++ define(g.Navigator.prototype,'locks',{...getDescriptor(getters,'locks'),enumerable:true,configurable:true});
++ return realm;
++}
++function removeAlgorithm(request){
++ if(request.signal&&request.abort){apply(removeAbort,request.signal,[request.abort]);request.abort=null;}
++}
++function cancelTimer(request){if(request.timer!==undefined){hostCancel(request.timer);request.owner.timers.delete(request.timer);request.timer=undefined;}}
++function removeRequest(request){
++ cancelTimer(request);removeAlgorithm(request);
++ const {owner,group}=request;owner.requests.delete(request);
++ if(group){group.held.delete(request);const at=group.pending.indexOf(request);if(at!==-1)group.pending.splice(at,1);}
++ request.phase='settled';
++}
++function promote(owner,group){
++ if(owner.disposed)return;
++ while(group.pending.length){
++  const request=group.pending[0];
++  if(group.held.size&&(request.mode==='exclusive'||[...group.held].some(value=>value.mode==='exclusive')))break;
++  group.pending.shift();group.held.add(request);schedule(request,true);
++  if(request.mode==='exclusive')break;
++ }
++}
++function settle(request,rejected,value){
++ if(request.phase==='settled'||request.owner.disposed)return;
++ const group=request.group;removeRequest(request);if(group){promote(request.owner,group);if(!group.held.size&&!group.pending.length)request.owner.groups.delete(request.name);}
++ (rejected?request.reject:request.resolve)(value);
++}
++function schedule(request,available){
++ request.phase='scheduled';
++ request.timer=hostSchedule(()=>{
++  request.owner.timers.delete(request.timer);request.timer=undefined;
++  if(request.phase!=='scheduled'||request.owner.disposed)return;
++  request.phase='running';removeAlgorithm(request);
++  const lock=available?request.realm.makeLock(request.name,request.mode):null;
++  try{request.realm.invoke(request.realm.deliver,request.realm.global,[request.callback,request.realm.global,lock,value=>settle(request,false,value),error=>settle(request,true,error)]);}
++  catch(error){settle(request,true,error);}
++ },0);
++ request.owner.timers.add(request.timer);
++}
++function request(owner,name,mode,ifAvailable,steal,signal,callback,resolve,reject,realm){
++ if(owner.disposed)return;
++ if(signal?.aborted){reject(signal.reason);return;}
++ let group=owner.groups.get(name);if(!group){group={held:new Set(),pending:[]};owner.groups.set(name,group);}
++ const entry={owner,name,mode,signal,callback,resolve,reject,realm,group,phase:'pending'};
++ owner.requests.add(entry);
++ if(signal){entry.abort=()=>settle(entry,true,signal.reason);apply(addAbort,signal,[entry.abort]);}
++ if(steal){
++  for(const held of [...group.held]){removeRequest(held);held.reject(realm.abort());}
++  group.pending.unshift(entry);promote(owner,group);return;
++ }
++ if(ifAvailable&&(group.pending.length||(group.held.size&&(mode==='exclusive'||[...group.held].some(value=>value.mode==='exclusive'))))){entry.group=null;schedule(entry,false);return;}
++ group.pending.push(entry);promote(owner,group);
++}
++export function installWebLocks(page,window){
++ if(installed.has(window))return installed.get(window);
++ for(const kind of ['Lock','LockManager'])registerPlatformFactoryKind(kind);
++ let registry=clients.get(page.browser);if(!registry){registry={ids:new Map(),next:1};clients.set(page.browser,registry);}
++ let clientId=registry.ids.get(page.frameId);if(!clientId){clientId=String(registry.next++);registry.ids.set(page.frameId,clientId);}
++ const ErrorType=window.TypeError;
++ const signal=page.documentAbort.signal,document=implForWrapper(window.document),invoke=createInvocationTrampoline(implForWrapper(window)._globalObject);
++ const owner={window,document,context:page.context,clientId,groups:new Map(),requests:new Set(),timers:new Set(),disposed:false,manager:null};
++ let realm;
++ const bridge={normalize:value=>apply(normalize,value,[]),managerState:value=>managers.get(value),lockState:value=>locks.get(value),
++  manager(value){const state=navigators.get(value);if(!state)throw new ErrorType('Illegal invocation');if(!state.manager)state.manager=state.realm.makeManager(state);return state.manager;},
++  publishManager(value,state){managers.set(value,state);registerPlatformFactory(value,{kind:'LockManager',globalObject:window});},
++  publishLock(value,name,mode){locks.set(value,{name,mode});registerPlatformFactory(value,{kind:'Lock',globalObject:window});},
++  signal(value){const record=platformFactoryRecord(value);if(record?.kind!=='AbortSignal'||!record.implementation)throw new ErrorType('invalid argument');return record.implementation;},
++  request,
++  snapshot(state){const held=[],pending=[];for(const entry of state.requests){if(!entry.group)continue;const values=entry.phase==='pending'?pending:held;values.push({name:entry.name,mode:entry.mode,clientId:state.clientId});}return{held,pending};},
++ };
++ realm=window.eval(`(${lockRealm.toString()})`)(window,bridge);
++ realm.invoke=(fn,receiver,args)=>invoke.invoke(fn,receiver,args,{timeout:Math.min(page.timeout??2000,2000),displayErrors:false});owner.realm=realm;navigators.set(window.navigator,owner);
++ const dispose=()=>{if(owner.disposed)return;owner.disposed=true;for(const pending of [...owner.requests])removeRequest(pending);owner.groups.clear();signal.removeEventListener('abort',dispose);};
++ signal.addEventListener('abort',dispose,{once:true});
++ const controller={dispose};installed.set(window,controller);return controller;
++}
+--- /dev/null
++++ b/test/web-locks.test.js
+@@ -0,0 +1,71 @@
++import {test,before,after} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {Browser} from '../src/browser.js';
++import {platformFactoryRecord} from '../src/platform-factories.js';
++let server,origin;
++before(async()=>{server=http.createServer((q,s)=>{s.setHeader('content-type','text/html');s.end('<!doctype html><body>Owned Web Locks test');});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`;});
++after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));});
++const tick=()=>new Promise(r=>setTimeout(r,0));
++async function fixture(t){const browser=new Browser({loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate(origin);return{browser,page,w:page.dom.window};}
++async function child(w){const frame=w.document.createElement('iframe');frame.src=origin+'/child';const loaded=new Promise(r=>frame.onload=r);w.document.body.append(frame);await loaded;return{frame,w:frame.contentWindow};}
++const plain=value=>JSON.parse(JSON.stringify(value));
++
++test('actual LockManager/Lock allocations have realm prototypes and private factory provenance',{timeout:5000},async t=>{
++ const{w}=await fixture(t),manager=w.navigator.locks;assert.strictEqual(manager,w.navigator.locks);assert.ok(manager instanceof w.LockManager);assert.equal(platformFactoryRecord(manager).kind,'LockManager');assert.strictEqual(platformFactoryRecord(manager).globalRef.deref(),w);assert.deepEqual(Reflect.ownKeys(manager),[]);assert.equal(Object.prototype.toString.call(manager),'[object LockManager]');
++ let value;await manager.request('actual',lock=>{value=lock;assert.ok(lock instanceof w.Lock);assert.strictEqual(Object.getPrototypeOf(lock),w.Lock.prototype);assert.equal(platformFactoryRecord(lock).kind,'Lock');assert.equal(lock.name,'actual');assert.equal(lock.mode,'exclusive');});assert.equal(value.name,'actual');assert.equal(value.mode,'exclusive');assert.deepEqual(Reflect.ownKeys(value),[]);
++ assert.deepEqual(Reflect.ownKeys(w.Lock.prototype).map(String),['mode','name','constructor','Symbol(Symbol.toStringTag)']);assert.deepEqual(Reflect.ownKeys(w.LockManager.prototype).map(String),['request','query','constructor','Symbol(Symbol.toStringTag)']);for(const C of [w.Lock,w.LockManager])assert.throws(()=>new C(),e=>e instanceof w.TypeError&&e.message==='Illegal Constructor');
++ for(const key of ['name','mode'])assert.throws(()=>Object.getOwnPropertyDescriptor(w.Lock.prototype,key).get.call(Object.create(w.Lock.prototype)),e=>e instanceof w.TypeError&&e.message==='Illegal invocation');
++});
++test('request callbacks use a separate task, invoked realm receiver and real adopted values',{timeout:5000},async t=>{
++ const{w}=await fixture(t);const result=await w.eval(`(async()=>{const order=[],actual={actual:true};const p=navigator.locks.request('task',function(){'use strict';order.push('callback');if(this!==window)throw Error('receiver');return actual});order.push('returned');Promise.resolve().then(()=>order.push('microtask'));setTimeout(()=>order.push('timer'),0);const value=await p;order.push('settled');await new Promise(r=>setTimeout(r,10));return{order,same:value===actual}})()`);assert.deepEqual(plain(result),{order:['returned','microtask','callback','settled','timer'],same:true});
++ const token={own:true};assert.strictEqual(await w.navigator.locks.request('thenable',()=>({then(resolve){resolve(token)}})),token);await assert.rejects(w.navigator.locks.request('throw',()=>{throw 23}),e=>e===23);const reason=Symbol();await assert.rejects(w.navigator.locks.request('reject',()=>w.Promise.reject(reason)),e=>e===reason);
++});
++test('exclusive reservations serialize through callback Promise settlement and release before resolution',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks,order=[];let release;const first=m.request('same',()=>new Promise(r=>{order.push('first');release=r}));const second=m.request('same',()=>{order.push('second');return 2});const initial=await m.query();assert.equal(initial.held[0].name,'same');assert.equal(initial.pending[0].name,'same');assert.deepEqual(order,[]);await tick();assert.deepEqual(order,['first']);release(1);assert.deepEqual(await Promise.all([first,second]),[1,2]);assert.deepEqual(order,['first','second']);assert.equal(await m.request('same',{ifAvailable:true},l=>!!l),true);assert.deepEqual(plain(await m.query()),{held:[],pending:[]});
++});
++test('shared reservations coexist and earlier exclusive waiters prevent shared overtaking',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks,order=[],releases={};const hold=(name,mode)=>m.request('fair',{mode},()=>new Promise(r=>{order.push(name);releases[name]=r}));const a=hold('s1','shared'),b=hold('s2','shared');await tick();const exclusive=hold('exclusive','exclusive'),last=hold('s3','shared');await tick();assert.deepEqual(order,['s1','s2']);releases.s1();await a;await tick();assert.deepEqual(order,['s1','s2']);releases.s2();await b;await tick();assert.deepEqual(order,['s1','s2','exclusive']);releases.exclusive();await exclusive;await tick();assert.deepEqual(order,['s1','s2','exclusive','s3']);releases.s3();await last;
++});
++test('ifAvailable invokes an asynchronous null callback without adding a pending lock',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks;let release;const held=m.request('available',{mode:'shared'},()=>new Promise(r=>release=r));await tick();assert.equal(await m.request('available',{mode:'shared',ifAvailable:true},l=>!!l),true);const pending=m.request('available',()=>2);let invoked=false;const unavailable=m.request('available',{mode:'shared',ifAvailable:true},l=>{invoked=true;assert.strictEqual(l,null);return 'none'});assert.equal(invoked,false);assert.equal((await m.query()).pending.length,1);assert.equal(await unavailable,'none');release();await Promise.all([held,pending]);
++});
++test('steal rejects the actual holder Promise and preserves queued waiter progress',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks,order=[];let release;const held=m.request('steal',()=>new Promise(r=>{order.push('holder');release=r}));const rejected=assert.rejects(held,e=>e instanceof w.DOMException&&e.name==='AbortError'&&e.message==='The operation was aborted');await tick();const waiter=m.request('steal',()=>{order.push('waiter');return 'waiter'});await tick();const stealer=m.request('steal',{steal:true},()=>{order.push('stealer');return 'stealer'});await rejected;assert.equal(await stealer,'stealer');assert.equal(await waiter,'waiter');assert.deepEqual(order,['holder','stealer','waiter']);release('late');await tick();assert.deepEqual(plain(await m.query()),{held:[],pending:[]});
++});
++test('stealing inside a running callback never drains rejection microtasks inline',{timeout:5000},async t=>{
++ const{w}=await fixture(t);assert.deepEqual(plain(await w.eval(`(async()=>{const order=[];navigator.locks.request('sync',()=>{order.push('A');navigator.locks.request('sync',{steal:true},()=>{});order.push('B');return new Promise(()=>{})}).catch(()=>order.push('C'));await new Promise(r=>setTimeout(r,20));return order})()`)),['A','B','C']);
++});
++test('AbortSignal cancels reservations/pending requests but not a running callback',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks;let ran=false;const pre=new w.AbortController();pre.abort('pre');await assert.rejects(m.request('pre',{signal:pre.signal},()=>ran=true),e=>e==='pre');const early=new w.AbortController();const p=m.request('early',{signal:early.signal},()=>ran=true);early.abort('early');await assert.rejects(p,e=>e==='early');assert.equal(ran,false);let release;const held=m.request('abort',()=>new Promise(r=>release=r));await tick();const controller=new w.AbortController(),reason={actual:true};const queued=m.request('abort',{signal:controller.signal},()=>ran=true),next=m.request('abort',()=>3);controller.abort(reason);await assert.rejects(queued,e=>e===reason);assert.equal((await m.query()).pending.length,1);release();assert.equal(await next,3);await held;
++ const after=new w.AbortController();let done,acquired;const started=new Promise(r=>acquired=r);const running=m.request('after',{signal:after.signal},()=>{acquired();return new Promise(r=>done=r)});await started;after.abort('ignored');done(4);assert.equal(await running,4);assert.equal(ran,false);
++});
++test('aborted timeout requests leave query before their rejection handler runs',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks;let release;const held=m.request('timeout',()=>new Promise(r=>release=r));await tick();const pending=m.request('timeout',{signal:w.AbortSignal.timeout(5)},()=>1);let snapshot;const observed=pending.catch(async error=>{snapshot=await m.query();throw error;});await assert.rejects(observed,e=>e.name==='TimeoutError');assert.equal(snapshot.pending.length,0);release();await held;
++});
++test('validation rejects real realm Promises with observed conversion and option precedence',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks;for(const args of [[],['x'],['x',null],['x',23],['x',undefined,()=>1],['x',{mode:'bad'},()=>1],['x',{signal:{}},()=>1]]){const p=Reflect.apply(w.LockManager.prototype.request,m,args);assert.ok(p instanceof w.Promise);await assert.rejects(p,e=>e instanceof w.TypeError&&e.message==='invalid argument');}
++ for(const options of [{steal:true,ifAvailable:true},{steal:true,mode:'shared'},{steal:true,signal:new w.AbortController().signal},{ifAvailable:true,signal:new w.AbortController().signal}])await assert.rejects(m.request('x',options,()=>1),e=>e instanceof w.DOMException&&e.name==='NotSupportedError');await assert.rejects(m.request('-reserved',()=>1),e=>e.name==='NotSupportedError');await assert.rejects(m.request('x',{},null),e=>e.message==='callback must be a function');
++ const order=[],options={};for(const key of ['ifAvailable','mode','signal','steal'])Object.defineProperty(options,key,{get(){order.push(key);return undefined}});const p=m.request({toString(){order.push('name');return 'order'}},options,()=>1);order.push('returned');await p;assert.deepEqual(order,['name','ifAvailable','mode','signal','steal','returned']);assert.equal(await m.request('overload',()=>11,()=>22),11);assert.equal(await m.request(Symbol('symbol'),l=>l.name),'symbol');assert.equal(await m.request(Symbol(),l=>l.name),'undefined');assert.equal(await m.request('\ud800',l=>l.name),'�');
++ for(const method of ['request','query'])for(const receiver of [{},new Proxy(m,{}),Object.create(m)])await assert.rejects(Reflect.apply(w.LockManager.prototype[method],receiver,['brand',()=>1]),e=>e instanceof w.TypeError);let hits=0;await assert.rejects(m.request('fake',{signal:new Proxy(new w.AbortController().signal,{get(){hits++;throw 23}})},()=>1),e=>e instanceof w.TypeError);assert.equal(hits,0);
++});
++test('same-origin frames have genuine independent managers/pools, with method-realm borrowed values',{timeout:5000},async t=>{
++ const{w}=await fixture(t),c=await child(w),other=c.w,m=w.navigator.locks;assert.notStrictEqual(m,other.navigator.locks);assert.ok(other.navigator.locks instanceof other.LockManager);assert.ok(!(other.navigator.locks instanceof w.LockManager));let release;const held=m.request('same-name',()=>new Promise(r=>release=r));await tick();assert.equal((await other.navigator.locks.query()).held.length,0);assert.equal(await other.navigator.locks.request('same-name',{ifAvailable:true},l=>!!l),true);
++ const p=other.LockManager.prototype.query.call(m);assert.ok(p instanceof other.Promise);assert.ok(!(p instanceof w.Promise));const snapshot=await p;assert.strictEqual(Object.getPrototypeOf(snapshot),other.Object.prototype);assert.strictEqual(Object.getPrototypeOf(snapshot.held),other.Array.prototype);assert.strictEqual(Object.getPrototypeOf(snapshot.held[0]),other.Object.prototype);
++ const borrowed=other.LockManager.prototype.request.call(m,'borrowed',function(lock){'use strict';assert.strictEqual(this,other);assert.ok(lock instanceof other.Lock);assert.ok(!(lock instanceof w.Lock));return 'actual'});assert.ok(borrowed instanceof other.Promise);assert.equal(await borrowed,'actual');release();await held;
++});
++test('retired frames preserve held Promise lifetime until real callback settlement',{timeout:5000},async t=>{
++ const{w}=await fixture(t),c=await child(w);let release,outcome='pending';const p=c.w.navigator.locks.request('retirement',()=>new Promise(r=>release=r));p.then(()=>outcome='resolved');await tick();c.frame.remove();await tick();assert.equal(outcome,'pending');release();await p;assert.equal(outcome,'resolved');
++});
++test('client identities belong to real browsing contexts across navigation, targets and BrowserContexts',{timeout:5000},async t=>{
++ const{browser,page,w}=await fixture(t),snapshot=async manager=>manager.request('identity',()=>manager.query());assert.equal((await snapshot(w.navigator.locks)).held[0].clientId,'1');const c=await child(w);assert.equal((await snapshot(c.w.navigator.locks)).held[0].clientId,'2');w.navigator.locks[Symbol.for('marker')]=true;await page.navigate(origin+'/next');assert.equal((await snapshot(page.dom.window.navigator.locks)).held[0].clientId,'1');assert.equal(page.dom.window.navigator.locks[Symbol.for('marker')],undefined);page.close();const next=browser.createPage();await next.navigate(origin);assert.equal((await snapshot(next.dom.window.navigator.locks)).held[0].clientId,'3');const fresh=browser.createPage(browser.createContext());await fresh.navigate(origin);assert.equal((await snapshot(fresh.dom.window.navigator.locks)).held[0].clientId,'4');
++});
++test('opaque data documents allow actual requests and navigation teardown cancels unrun grants',{timeout:5000},async t=>{
++ const{page}=await fixture(t);await page.navigate('data:text/html,<body>Opaque locks');const old=page.dom.window;assert.equal(await old.navigator.locks.request('opaque',l=>l.name),'opaque');let ran=false;old.navigator.locks.request('pending-close',()=>ran=true);page.close();await tick();assert.equal(ran,false);
++});
++
++test('query preserves actual request registration order across names and later promotions',{timeout:5000},async t=>{
++ const{w}=await fixture(t),m=w.navigator.locks,release=[];const active=[];for(const[name,mode]of [['z','shared'],['a','exclusive'],['z','shared'],['b','exclusive']])active.push(m.request(name,{mode},()=>new Promise(r=>release.push(r))));await tick();assert.deepEqual(plain((await m.query()).held).map(x=>x.name),['z','a','z','b']);for(const r of release)r();await Promise.all(active);
++ const done={};const a=m.request('promote-a',()=>new Promise(r=>done.a=r)),queued=m.request('promote-a',()=>new Promise(r=>done.queued=r)),b=m.request('promote-b',()=>new Promise(r=>done.b=r));await tick();done.a();await a;await tick();assert.deepEqual(plain((await m.query()).held).map(x=>x.name),['promote-a','promote-b']);done.queued();done.b();await Promise.all([queued,b]);
++});

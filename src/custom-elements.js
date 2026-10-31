@@ -1,3 +1,4 @@
+import {installElementInternals} from './element-internals.js';
 import { createRequire } from 'node:module';
 const require=createRequire(import.meta.url);
 const utils=require('jsdom/lib/jsdom/living/generated/utils.js');
@@ -124,6 +125,7 @@ function factory(g,bridge){
 
 export function installCustomElements(page,window){
  if(records.has(window))return records.get(window).controller;
+ installElementInternals(page,window);
  patch();
  const document=window.document,implementation=implForWrapper(document),registry=implForWrapper(implementation._globalObject._customElementRegistry);
  const PromiseConstructor=window.Promise,resolve=PromiseConstructor.resolve,reject=PromiseConstructor.reject;

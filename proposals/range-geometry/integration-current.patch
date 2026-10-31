@@ -1,0 +1,427 @@
+diff --git a/src/range-geometry.js b/src/range-geometry.js
+new file mode 100644
+--- /dev/null
++++ b/src/range-geometry.js
+@@ -0,0 +1,82 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {types} from 'node:util';
++import {platformFactoryRecord} from './platform-factories.js';
++import {getLayoutStyle,getSpecifiedStyle} from './styles.js';
++import {layoutForDocument} from './layout.js';
++import {resolveFlowLength} from './flow-metrics.js';
++import {selectedText,measureSelectedText} from './range-text.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const RangeImpl=require('jsdom/lib/jsdom/living/range/Range-impl.js').implementation;
++const Rect=require('jsdom/lib/jsdom/living/generated/DOMRect.js');
++const {domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const {nodeLength,nodeRoot}=require('jsdom/lib/jsdom/living/helpers/node.js');
++const {compareBoundaryPointsPosition:compare}=require('jsdom/lib/jsdom/living/range/boundary-point.js');
++const INSTALLED=new WeakSet(),ZERO=Object.freeze({x:0,y:0,width:0,height:0});
++const hiddenTags=new Set(['head','style','script','template','meta','link','title','base']);
++const wrapper=utils.wrapperForImpl;
++function parent(node){return node._assignedSlot??tree.parent(node)??node.host??null;}
++function elementParent(node){for(let value=parent(node);value;value=parent(value))if(value.nodeType===1)return value;return null;}
++function style(node){return getLayoutStyle(wrapper(node))??{display:'inline',position:'static',float:'none',fontSize:'16px',whiteSpace:'normal'};}
++function hidden(node){for(let p=node;p;p=parent(p)){if(p.nodeType===1&&(hiddenTags.has(p.localName)||style(p).display==='none'))return true;const ordinary=tree.parent(p);if(ordinary?.nodeType===1&&!p._assignedSlot&&(ordinary._shadowRoot||ordinary.localName==='slot'&&ordinary._assignedNodes?.length))return true;}return false;}
++function documentFor(node){return node.nodeType===9?node:node._ownerDocument;}
++function modelFor(node){return layoutForDocument(documentFor(node));}
++function elementBox(node){const model=modelFor(node);return model?model.rect(wrapper(node)):ZERO;}
++function textGeometry(context,text){
++ if(hidden(context))return null;
++ const element=context.nodeType===1?context:elementParent(context),declaration=element?style(element):{fontSize:'16px',whiteSpace:'normal'};
++ let anchor=element;while(anchor&&style(anchor).display==='contents')anchor=elementParent(anchor);
++ const box=anchor?elementBox(anchor):ZERO;
++ let container=element;
++ for(;container;container=elementParent(container)){
++  const own=style(container),p=elementParent(container),item=p&&['flex','inline-flex','grid','inline-grid'].includes(style(p).display);
++  if(own.display!=='contents'&&(own.display!=='inline'||own.float&&own.float!=='none'||['absolute','fixed'].includes(own.position)||item))break;
++ }
++ const model=modelFor(context),viewport=model?.viewport??{width:1920,height:1080},own=container?style(container):null;
++ const resolved=own?resolveFlowLength(own.width,viewport,container?elementBox(container).width:undefined):undefined;
++ const width=resolved??(container?elementBox(container).width:Infinity);
++ const fontSize=Number.parseFloat(declaration.fontSize);const collapse=element?getSpecifiedStyle(wrapper(element),'white-space-collapse'):undefined;
++ const measured=measureSelectedText(text,{fontSize:Number.isFinite(fontSize)?fontSize:16,width:whiteSpaceWidth(width),whiteSpace:declaration.whiteSpace,collapse:typeof collapse==='object'?collapse.value:collapse,nowrap:declaration.textWrap==='nowrap'||declaration.textWrapMode==='nowrap'});
++ return measured?{x:box.x,y:box.y,...measured}:null;
++}
++function whiteSpaceWidth(width){return Number.isFinite(width)&&width>0?width:Infinity;}
++function textSlice(range,node){
++ const start=node===range._start.node?range._start.offset:0,end=node===range._end.node?range._end.offset:nodeLength(node);
++ return selectedText(node.data,start,end);
++}
++function intersects(range,node){return compare(range._start,{node,offset:nodeLength(node)})<0&&compare(range._end,{node,offset:0})>0;}
++function selected(range,node){const p=tree.parent(node);if(!p)return false;const index=tree.index(node);return compare(range._start,{node:p,offset:index})<=0&&compare(range._end,{node:p,offset:index+1})>=0;}
++function clientFragments(range){
++ if(range.collapsed)return[];const root=range.commonAncestorContainer,values=[];
++ for(const node of tree.treeIterator(root)){
++  if(hidden(node))continue;
++  if(node.nodeType===1&&selected(range,node)&&!selected(range,tree.parent(node))){values.push(elementBox(node));}
++  else if(node.nodeType===3&&intersects(range,node)){const rect=textGeometry(node,textSlice(range,node));if(rect)values.push(rect);}
++ }
++ return values;
++}
++function bounding(range){
++ if(range.collapsed)return ZERO;
++ const common=range.commonAncestorContainer;
++ if(common.nodeType===3)return textGeometry(common,textSlice(range,common))??ZERO;
++ let content=false;for(const node of tree.treeIterator(common))if(node.nodeType===1&&selected(range,node)||node.nodeType===3&&intersects(range,node)&&textSlice(range,node)){content=true;break;}if(!content)return ZERO;
++ const children=Array.from(tree.childrenIterator(common));
++ if(!children.some(node=>node.nodeType===1)){
++  let text='';for(const node of children)if(node.nodeType===3&&intersects(range,node))text+=textSlice(range,node);
++  return textGeometry(common,text)??ZERO;
++ }
++ // Native's measured non-text branch is the actual current common-ancestor
++ // box. It intentionally differs from the separately computed client fragments.
++ let box=common;if(box.nodeType===11)box=box.host;if(box?.nodeType===9)box=box.documentElement;
++ return box?.nodeType===1?elementBox(box):ZERO;
++}
++function factory(g,bridge){
++ const TypeError=g.TypeError,Error=g.Error,ArrayConstructor=g.Array,set=g.Reflect.set,define=g.Object.defineProperty,brand=value=>{if(!bridge.valid(value))throw new TypeError('Illegal invocation')};
++ for(const name of['setStart','setEnd','setStartBefore','setStartAfter','setEndBefore','setEndAfter','selectNode','selectNodeContents','insertNode','surroundContents','isPointInRange','comparePoint','intersectsNode']){const original=g.Range.prototype[name];if(typeof original!=='function')continue;const method=({[name](...args){brand(this);if(!args.length||!bridge.node(args[0]))throw new TypeError('invalid argument');return bridge.apply(original,this,args)}})[name];define(method,'length',{value:original.length,configurable:true});define(g.Range.prototype,name,{value:method,writable:true,enumerable:true,configurable:true});}
++ const methods={getBoundingClientRect(){brand(this);return bridge.rect(bridge.bounding(this))},getClientRects(){brand(this);const values=bridge.fragments(this),result=new ArrayConstructor(values.length);try{for(let i=0;i<values.length;i++)set(result,i,bridge.rect(values[i]));}catch{throw new Error('FailedToCreateArray')}return result;}};
++ for(const[name,value]of g.Object.entries(methods))define(g.Range.prototype,name,{value,writable:true,enumerable:true,configurable:true});
++}
++function bridge(global,createRect=value=>Rect.create(global,[value.x,value.y,value.width,value.height])){const implementation=value=>{if(types.isProxy(value))return null;const state=platformFactoryRecord(value)?.implementation;return state instanceof RangeImpl?state:null;};return{apply:Reflect.apply,node:value=>!types.isProxy(value)&&platformFactoryRecord(value)?.implementation instanceof NodeImpl,valid:value=>!!implementation(value),bounding:value=>bounding(implementation(value)),fragments:value=>clientFragments(implementation(value)),rect:createRect};}
++export function installRangeGeometry(page,window){if(INSTALLED.has(window))return;window.eval(`(${factory.toString()})`)(window,bridge(utils.implForWrapper(window.document)._globalObject));INSTALLED.add(window);}
++export function installUtilityRangeGeometry(controller){if(INSTALLED.has(controller.global))return;controller.evaluate(`(${factory.toString()})`)(controller.global,bridge(controller.global,value=>controller.createDOMRect(value)));INSTALLED.add(controller.global);}
+diff --git a/src/range-text.js b/src/range-text.js
+new file mode 100644
+--- /dev/null
++++ b/src/range-text.js
+@@ -0,0 +1,36 @@
++// Independent text geometry for the measured headless profile. These are real
++// selected Unicode scalars and CSS whitespace/wrapping decisions, not element
++// bounding-box dimensions or a font renderer.
++const asciiSpace=/[\t\n\f\r ]/;
++const mark=/\p{Mark}/u;
++function wide(code){return code>=0x1100&&(code<=0x115f||code===0x2329||code===0x232a||code>=0x2e80&&code<=0xa4cf&&code!==0x303f||code>=0xac00&&code<=0xd7a3||code>=0xf900&&code<=0xfaff||code>=0xfe10&&code<=0xfe19||code>=0xfe30&&code<=0xfe6f||code>=0xff00&&code<=0xff60||code>=0xffe0&&code<=0xffe6||code>=0x1f300&&code<=0x1faff||code>=0x20000&&code<=0x3fffd)}
++export function selectedText(data,start,end){
++ const boundary=offset=>offset>0&&offset<data.length&&data.charCodeAt(offset)>=0xdc00&&data.charCodeAt(offset)<=0xdfff&&data.charCodeAt(offset-1)>=0xd800&&data.charCodeAt(offset-1)<=0xdbff?offset-1:offset;
++ return data.slice(boundary(start),boundary(end));
++}
++export function glyphAdvance(character,fontSize){
++ const code=character.codePointAt(0);if(mark.test(character)||code===0x200c||code===0x200d)return 0;
++ if(character===' ')return fontSize*.33;if(character==='\t')return fontSize*.33*4;if(character==='\f')return fontSize*.33;
++ return fontSize*(wide(code)?1:.6);
++}
++export function measureSelectedText(text,{fontSize=16,width=Infinity,whiteSpace='normal',collapse,nowrap=false}={}){
++ const preserve=/^(?:pre|pre-wrap|break-spaces)$/.test(whiteSpace)||/(?:^|\s)preserve(?:\s|$)/.test(whiteSpace)||collapse==='preserve';
++ const newlines=preserve||whiteSpace==='pre-line';nowrap=nowrap||whiteSpace==='pre'||whiteSpace==='nowrap'||/(?:^|\s)nowrap(?:\s|$)/.test(whiteSpace);
++ text=text.replace(/\r\n?/g,'\n');
++ if(!preserve){if(newlines)text=text.split('\n').map(line=>line.replace(/[\t\f ]+/g,' ').replace(/^ | $/g,'')).join('\n');else text=text.replace(/[\t\n\f\r ]+/g,' ').replace(/^ | $/g,'');}
++ if(!text)return null;
++ const advance=text=>{let result=0;for(const character of text)result+=glyphAdvance(character,fontSize);return result;};
++ let maximum=0,line=0,lines=0;const chunks=newlines?text.split('\n'):[text];if(newlines&&chunks.at(-1)==='')chunks.pop();
++ for(const chunk of chunks){
++  let pending='';line=0;
++  for(const token of chunk.match(/[\t\f ]+|[^\t\f ]+/g)??[]){
++   if(asciiSpace.test(token[0])){pending+=token;continue;}
++   const spacing=advance(pending),word=advance(token);
++   if(!nowrap&&line>0&&line+spacing+word>width){maximum=Math.max(maximum,line);lines++;line=word;}
++   else line+=spacing+word;
++   pending='';
++  }
++  line+=advance(pending);maximum=Math.max(maximum,line);lines++;
++ }
++ return{width:maximum,height:Math.max(1,lines)*fontSize*1.2};
++}
+diff --git a/src/layout.js b/src/layout.js
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -5,9 +5,10 @@
+ import {refreshMediaQueries} from './media.js';
+ // Independent surrogate geometry for a headless DOM. This intentionally models
+ // the reference's measured simple boxes; it is not a CSS layout renderer.
+-import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision } from './styles.js';
++import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision, getSpecifiedStyle } from './styles.js';
+ import { createRequire } from 'node:module';
+ const require = createRequire(import.meta.url);
++const RectFactory=require('jsdom/lib/jsdom/living/generated/DOMRect.js');
+ const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
+ const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
+ const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
+@@ -52,6 +53,7 @@
+     const documentImpl=implForWrapper(document),shadowRoots=[],tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
+     const appendTree=root=>{
+       for(const implementation of domSymbolTree.treeIterator(root)){
++        if(implementation.nodeType===11)continue;
+         const node=wrapperForImpl(implementation);
+         order.set(node,nodes.length);nodes.push(node);
+         if(tokens){
+@@ -82,7 +84,7 @@
+       const result = Boolean(ancestorHidden || ownHidden || outsideFlatTree);
+       hidden.set(node, result); return result;
+     }
+-    const textHeight=node=>nativeTextHeight(children(node).filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(style(node).width),Number.parseFloat(style(node).fontSize)||16,style(node).whiteSpace==='nowrap'||style(node).textWrap==='nowrap'||style(node).textWrapMode==='nowrap');
++    const textHeight=node=>{const declaration=style(node),fontSize=Number.parseFloat(declaration.fontSize),collapse=getSpecifiedStyle(node,'white-space-collapse');return nativeTextHeight(children(node).filter(child=>child.nodeType===3).map(child=>child.data).join(''),dimension(declaration.width),Number.isFinite(fontSize)?fontSize:16,declaration.textWrap==='nowrap'||declaration.textWrapMode==='nowrap',{whiteSpace:declaration.whiteSpace,collapse:typeof collapse==='object'?collapse.value:collapse});};
+     const horizontal=createHorizontalLayout(window,{style,hidden:isHidden,viewportWidth:width,styleRevision});
+     function size(node) {
+       if (sizes.has(node)) return sizes.get(node);
+@@ -118,7 +120,6 @@
+         const sibling=wrapperForImpl(implementation);siblingAdvances.set(sibling,sum);
+         if(isHidden(sibling))continue;
+         if(sibling.nodeType===1)sum+=horizontal.advance(sibling);
+-        else if(sibling.nodeType===3&&/\S/.test(sibling.data))sum+=5;
+       }
+       return siblingAdvances.get(node)??0;
+     }
+@@ -130,7 +131,7 @@
+       let x = parentX;
+       x+=siblingAdvance(node);
+       if(node.nodeType===1)x+=horizontal.translation(node);
+-      const value = rectValue(x, order.get(node) * 5, size(node).width, size(node).height);
++      const value = rectValue(x, (order.get(node)??order.get(node.host)??0) * 5, size(node).width, size(node).height);
+       positions.set(node, value); return value;
+     }
+ 
+@@ -240,12 +241,7 @@
+   };
+ }
+ 
+-function clientRectList(window, values) {
+-  const list = { length: values.length, item: index => values[index] ?? null, [Symbol.iterator]: function* () { yield* values; } };
+-  values.forEach((value, index) => { list[index] = value; });
+-  Object.defineProperty(list, Symbol.toStringTag, { value: 'DOMRectList' });
+-  return list;
+-}
++function clientRectList(ArrayConstructor,set,ErrorConstructor,values){const list=new ArrayConstructor(values.length);try{for(let index=0;index<values.length;index++)set(list,index,values[index]);}catch{throw new ErrorConstructor('FailedToCreateArray')}return list;}
+ 
+ export function installLayout(page, window, options = {}) {
+   const layout = createLayout(window, options);
+@@ -253,11 +249,11 @@
+   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
+   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
+   installElementScroll(window,ownedLayout);
+-  const Rect=window.DOMRect;
+-  const domRect=value=>new Rect(value.x,value.y,value.width,value.height);
++  const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
++  const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
+   const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
+   define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
+-  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(window, ownedLayout(this).rects(this).map(domRect)); } });
++  define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(ArrayConstructor,set,ErrorConstructor,ownedLayout(this).rects(this).map(domRect)); } });
+   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
+     define(window.HTMLElement.prototype, name, { get() { return ownedLayout(this).dimension(this,dimension); } });
+   }
+@@ -306,3 +302,6 @@
+   page.layout = layout;
+   return layout;
+ }
++
++// Private geometry consumers address the actual document implementation.
++export function layoutForDocument(document){return LAYOUTS.get(document);}
+diff --git a/src/flow-metrics.js b/src/flow-metrics.js
+--- a/src/flow-metrics.js
++++ b/src/flow-metrics.js
+@@ -1,5 +1,6 @@
+-// Measured native surrogate length and text-height arithmetic. Text contributes
+-// a measured line height only when the element has a resolvable explicit width;
+-// words are indivisible and line-height declarations are not used by this model.
++import {measureSelectedText} from './range-text.js';
++// Measured native length arithmetic and text-height projection. Element text
++// contributes height only with a resolvable explicit width. Actual selected-text
++// glyph advances, whitespace and word wrapping share the independent producer.
+ export function resolveFlowLength(value,viewport={},basis){const m=/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(px|%|pt|pc|in|cm|mm|q|vw|vh)?$/i.exec(value?.trim()??'');if(!m)return undefined;const unit=(m[2]??'px').toLowerCase(),factors={px:1,pt:96/72,pc:16,in:96,cm:96/2.54,mm:96/25.4,q:96/101.6,vw:viewport.width/100,vh:viewport.height/100,'%':basis===undefined?undefined:basis/100};const factor=factors[unit];return factor===undefined?undefined:Math.fround(Number(m[1])*factor);}
+-export function nativeTextHeight(text,width,fontSize,nowrap=false){const words=String(text).trim().split(/\s+/).filter(Boolean);if(!words.length||width===undefined||width<=0)return 0;let lines=1,line=0;const unit=fontSize*0.6;for(const word of words){const advance=word.length*unit;if(!nowrap&&line&&line+unit+advance>width){lines++;line=advance;}else line+=line?unit+advance:advance;}return Math.ceil(lines*fontSize*1.2);}
++export function nativeTextHeight(text,width,fontSize,nowrap=false,options={}){if(width===undefined||width<=0)return 0;const measured=measureSelectedText(String(text),{fontSize,width,nowrap,...options});return Math.ceil(measured?.height??0);}
+diff --git a/src/utility-layout.js b/src/utility-layout.js
+--- a/src/utility-layout.js
++++ b/src/utility-layout.js
+@@ -14,21 +14,12 @@
+   return {node,document,layout:owner.layout};
+ }
+ function geometryFactory(g,bridge) {
+-  const Rect=DOMRect,states=new WeakMap();
+-  const element=value=>{if(!bridge.isElement(value))throw new TypeError('Illegal invocation');return value;};
+-  const unsigned=value=>{value=+value;return Number.isFinite(value)?Math.trunc(value)>>>0:0;};
+-  class DOMRectList {
+-    constructor(){throw new TypeError('Illegal Constructor');}
+-    get length(){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this).length;}
+-    item(index){if(!states.has(this))throw new TypeError('Illegal invocation');return states.get(this)[unsigned(index)]??null;}
+-    *[Symbol.iterator](){if(!states.has(this))throw new TypeError('Illegal invocation');yield* states.get(this);}
+-  }
+-  Object.defineProperty(DOMRectList.prototype,Symbol.toStringTag,{value:'DOMRectList',configurable:true});
+-  Object.defineProperty(g,'DOMRectList',{value:DOMRectList,writable:true,configurable:true});
+-  const rect=value=>new Rect(value.x,value.y,value.width,value.height);
++  const TypeError=g.TypeError,Error=g.Error,ArrayConstructor=g.Array,set=g.Reflect.set;
++  const element=value=>{if (!bridge.isElement(value)) throw new TypeError('Illegal invocation');return value;};
++  const rect=value=>bridge.createRect(value);
+   const methods={
+     getBoundingClientRect(){return rect(bridge.rect(element(this)));},
+-    getClientRects(){const result=Object.create(DOMRectList.prototype),values=Array.from(bridge.rects(element(this)),rect);states.set(result,values);for(let i=0;i<values.length;i++)Object.defineProperty(result,i,{value:values[i],enumerable:true,configurable:true});return result;},
++    getClientRects(){const values=bridge.rects(element(this)),result=new ArrayConstructor(values.length);try{for(let i=0;i<values.length;i++)set(result,i,rect(values[i]));}catch{throw new Error('FailedToCreateArray')}return result;},
+     scrollIntoView(){bridge.scrollIntoView(element(this));},
+     scrollIntoViewIfNeeded(){bridge.scrollIntoView(element(this));},
+   };
+@@ -39,6 +30,7 @@
+ }
+ export function installUtilityLayout(page,world,main=page.dom.window) {
+   const bridge={
++    createRect:value=>world.createDOMRect(value),
+     isElement:value=>nodeIdentity(canonicalUtilityValue(value))?.nodeType===1,
+     rect:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rect(node);},
+     rects:value=>{const{node,layout}=utilityLayoutFor(page,value);return layout.rects(node);},
+diff --git a/src/isolated-world.js b/src/isolated-world.js
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -33,7 +33,7 @@
+  const utilityPrototypes=new Map();
+  const mainPrototypes=new Map(),observerImpls=new Set(),listeners=[],timers=new Set();let disposed=false;
+  const requireLive=()=>{if(disposed)throw new Error('Isolated world has been disposed');};
+- const mainContext=hostUtils.implForWrapper(mainWindow.document)._globalObject;
++ const mainDocument=hostUtils.implForWrapper(mainWindow.document),mainContext=mainDocument._globalObject;
+  const utilityApply=global.Reflect.apply;
+  const realmFunction=bridge=>vm.compileFunction('return function(...args){return apply(bridge,this,args)}',['bridge','apply'],{parsingContext:context})(bridge,utilityApply);
+  for(const[name,constructor]of Object.entries(mainWindow[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)mainPrototypes.set(constructor.prototype,name);
+@@ -67,14 +67,14 @@
+   // wrapper. Never replace an existing implementation's main wrapper to enter a world.
+   const hostGenerated=require(join(generatedRoot,name+'.js'));
+   if(typeof hostGenerated.new==='function'&&mainWindow[name]){
+-   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);
++   const transient=hostGenerated.new(mainWindow),canonical=transient[hostUtils.wrapperSymbol];Object.defineProperty(canonical,hostUtils.implSymbol,{value:impl,configurable:true});impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);registerPlatformFactory(canonical,{kind:name,implementation:impl,globalObject:mainWindow});
+   }
+   register(wrapper,impl,name);if(name==='MutationObserver')observerImpls.add(new WeakRef(impl));return wrapper;
+  }
+  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
+   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
+   const source=readFileSync(filename,'utf8');const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
+-  if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){return canonicalizeNew(name,original(...args));};
++  if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
+    // Measured native producer quirk: MO arguments are real main-world values,
+    // while the authored callback itself continues in its genuine utility realm.
+    if(name==='MutationCallback')module.exports.convert=(ignored,value)=>{if(typeof value!=='function')throw new global.TypeError('Mutation callback is not a function');const invoke=function(records,observer){if(disposed)return;const array=vm.runInContext('[]',mainContext);for(let i=0;i<records.length;i++){const item=hostUtils.tryWrapperForImpl(records[i]);Object.defineProperty(array,String(i),{value:item,writable:true,enumerable:true,configurable:true});}const mainObserver=hostUtils.tryWrapperForImpl(observer);return Reflect.apply(value,hostUtils.tryWrapperForImpl(this),[array,mainObserver]);};invoke[hostUtils.wrapperSymbol]=value;invoke.objectReference=value;return invoke;};
+@@ -102,5 +102,5 @@
+  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
+  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
+  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
+- return {context,global,realmFunction,evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
++ return {context,global,realmFunction,createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
+ }
+diff --git a/src/styles.js b/src/styles.js
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -244,7 +244,7 @@
+   let state = ADOPTED.get(root);
+   if (state?.document !== ownerDocument(root)) state = null;
+   if (state && !fresh) return state;
+-  const target = new record.window.Array();
++  const target = new record.Array();
+   state = { document: ownerDocument(root), target, list: null };
+   const validate = sheet => {
+     const metadata = SHEETS.get(sheet);
+@@ -256,8 +256,8 @@
+   state.list = new Proxy(target, {
+     get(array, property, receiver) {
+       if (['push', 'pop', 'shift', 'unshift', 'splice', 'reverse', 'sort', 'fill', 'copyWithin'].includes(property)) return (...args) => {
+-        const draft = record.window.Array.prototype.slice.call(array);
+-        const result = record.window.Array.prototype[property].apply(draft, args);
++        const draft = record.Array.prototype.slice.call(array);
++        const result = record.Array.prototype[property].apply(draft, args);
+         draft.forEach(validate); array.length = 0; array.length = draft.length;
+         for (const key of Object.keys(draft)) array[key] = draft[key];
+         return result === draft ? state.list : result;
+@@ -707,7 +707,7 @@
+   const originalStyleDescriptor = Object.getOwnPropertyDescriptor(window.HTMLStyleElement.prototype, 'sheet');
+   const originalLinkDescriptor = Object.getOwnPropertyDescriptor(window.HTMLLinkElement.prototype, 'sheet');
+   const originalDocumentSheets = Object.getOwnPropertyDescriptor(window.Document.prototype, 'styleSheets');
+-  const record = { page, window, document, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
++  const record = { page, window, document, Array:window.Array, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
+     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
+   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
+   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -62,6 +62,7 @@
+ import { installVideoFrame } from './video-frame.js';
+ import { installAudioData } from './audio-data.js';
+ import { installWebCodecsValues } from './webcodecs-values.js';
++import {installRangeGeometry} from './range-geometry.js';
+ import { installGeometry } from './geometry.js';
+ import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
+ import { renderDocument } from './render.js';
+@@ -276,6 +277,7 @@
+       installURLPattern(window);
+       installCanvas(window);
+       installGeometry(window);
++      installRangeGeometry(this,window);
+       installWebCodecsValues(window);
+       installAudioData(window);
+       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
+diff --git a/src/world-sessions.js b/src/world-sessions.js
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,5 +1,6 @@
+ import { installScheduler } from './scheduler.js';
+ import { installURLPattern } from './url-pattern.js';
++import {installUtilityRangeGeometry} from './range-geometry.js';
+ import { installCanvas } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
+ import {installUtilitySelection} from './selection.js';
+@@ -35,7 +36,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+diff --git a/test/range-geometry.test.js b/test/range-geometry.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/range-geometry.test.js
+@@ -0,0 +1,22 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{types}from'node:util';import{Browser}from'../src/browser.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{installUtilityLayout}from'../src/utility-layout.js';import{installUtilityRangeGeometry}from'../src/range-geometry.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++async function fixture(t){const browser=new Browser({timeout:2500,loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><div id=host></div>');const w=page.dom.window,d=w.document,host=d.getElementById('host');return{browser,page,w,d,host}}
++const fields=r=>[r.x,r.y,r.width,r.height];
++function contents(w,node){const range=new w.Range();range.selectNodeContents(node);return range}
++function part(w,text,start,end){const range=new w.Range();range.setStart(text,start);range.setEnd(text,end);return range}
++test('selected text yields genuine fresh realm Arrays and DOMRects independent of element box dimensions',async t=>{const{w,d,host}=await fixture(t);host.style.cssText='width:500px;height:200px';host.textContent='abcdef';const range=part(w,host.firstChild,1,4),list=range.getClientRects(),rect=range.getBoundingClientRect();assert.equal(list instanceof w.Array,true);assert.equal(types.isProxy(list),false);assert.equal(w.DOMRectList,undefined);assert.equal(list.item,undefined);assert.equal(list.length,1);assert.equal(list[0] instanceof w.DOMRect,true);assert.equal(rect instanceof w.DOMRectReadOnly,true);assert.deepEqual(fields(rect),[host.getBoundingClientRect().x,host.getBoundingClientRect().y,28.799999999999997,19.2]);assert.notEqual(rect.width,500);assert.notEqual(rect.height,200);assert.notEqual(list,range.getClientRects());assert.notEqual(list[0],range.getClientRects()[0]);assert.deepEqual(Object.getOwnPropertyDescriptor(list,'0'),{value:list[0],writable:true,enumerable:true,configurable:true});list[0]='authored';assert.equal(range.getClientRects()[0] instanceof w.DOMRect,true);assert.equal(d.createRange() instanceof w.Range,true);});
++test('collapsed, collapsed-whitespace, hidden and font-zero states follow separately measured actual geometry',async t=>{const{w,host}=await fixture(t),empty=new w.Range();assert.deepEqual(fields(empty.getBoundingClientRect()),[0,0,0,0]);assert.equal(empty.getClientRects().length,0);host.textContent='   ';assert.equal(contents(w,host).getClientRects().length,0);host.style.whiteSpace='pre';assert.deepEqual(fields(contents(w,host).getBoundingClientRect()).slice(2),[15.84,19.2]);host.style.cssText='font-size:0';host.textContent='real';const range=contents(w,host),box=host.getBoundingClientRect();assert.deepEqual(fields(range.getBoundingClientRect()),[box.x,box.y,0,0]);assert.equal(range.getClientRects().length,1);host.style.display='none';assert.deepEqual(fields(range.getBoundingClientRect()),[0,0,0,0]);assert.equal(range.getClientRects().length,0);});
++test('UTF-16 boundaries map actual selected scalars, including surrogate halves, combining marks, CJK and emoji',async t=>{const{w,host}=await fixture(t);host.textContent='A😀e\u0301 Z';const text=host.firstChild;assert.equal(part(w,text,1,2).getClientRects().length,0);assert.equal(part(w,text,2,3).getBoundingClientRect().width,16);assert.equal(part(w,text,3,4).getBoundingClientRect().width,9.6);assert.deepEqual(fields(part(w,text,4,5).getBoundingClientRect()).slice(2),[0,19.2]);assert.equal(part(w,text,0,7).getBoundingClientRect().width,50.08);text.data='中👩‍💻';assert.equal(contents(w,host).getBoundingClientRect().width,48);});
++test('wrapping and partial measurements come from selected actual text and nearest containing block',async t=>{const{w,host}=await fixture(t);host.innerHTML='<div style="width:30px">abc ab cd</div>';const text=host.firstChild.firstChild,whole=contents(w,host.firstChild);assert.equal(whole.getClientRects().length,1);assert.deepEqual(fields(whole.getBoundingClientRect()).slice(2),[28.799999999999997,57.599999999999994]);assert.deepEqual(fields(part(w,text,4,6).getBoundingClientRect()).slice(2),[19.2,19.2]);for(const html of['<span style="display:inline-block;width:2px">abc ab</span>','<span style="float:left;width:2px">abc ab</span>','<span style="position:absolute;width:2px">abc ab</span>','<div style="display:flex"><span style="width:2px">abc ab</span></div>','<div style="width:2px"><span>abc ab</span></div>']){host.innerHTML=html;assert.deepEqual(fields(contents(w,host.querySelector('span')).getBoundingClientRect()).slice(2),[28.799999999999997,38.4]);}});
++test('preserved whitespace, newlines, tabs and nowrap share actual range and explicit-width element metrics',async t=>{const{w,host}=await fixture(t);host.style.cssText='width:54px';host.textContent='abc ab';assert.equal(host.offsetHeight,20);assert.equal(contents(w,host).getBoundingClientRect().height,19.2);host.style.whiteSpace='pre-wrap';host.textContent='a\nb';assert.equal(host.offsetHeight,39);assert.deepEqual(fields(contents(w,host).getBoundingClientRect()).slice(2),[9.6,38.4]);host.style.whiteSpace='pre';host.textContent='\t';assert.equal(contents(w,host).getBoundingClientRect().width,21.12);host.textContent='\u00a0';host.style.whiteSpace='normal';assert.equal(host.offsetHeight,20);assert.equal(contents(w,host).getBoundingClientRect().width,9.6);host.style.whiteSpace='nowrap';host.style.width='2px';host.textContent='abc ab';assert.equal(host.offsetHeight,20);assert.equal(contents(w,host).getBoundingClientRect().width,53.28);});
++test('client fragments follow real selected element/text tree order and partial ancestor boundaries',async t=>{const{w,host}=await fixture(t);host.innerHTML='<p><span>ab</span><i>cd</i>ef<!--x--></p>';const p=host.firstChild,span=p.firstChild,i=span.nextSibling,range=contents(w,p);assert.deepEqual(Array.from(range.getClientRects(),r=>r.width),[5,19.2,5,19.2,19.2]);range.selectNode(p);assert.deepEqual(Array.from(range.getClientRects(),r=>r.width),[1920,19.2,19.2,19.2]);range.setStart(span.firstChild,1);range.setEnd(i.firstChild,1);assert.deepEqual(Array.from(range.getClientRects(),r=>r.width),[9.6,9.6]);range.selectNode(p.lastChild);assert.equal(range.getClientRects().length,0);assert.deepEqual(fields(range.getBoundingClientRect()),[0,0,0,0]);});
++test('Native non-text bounding branch uses the actual common ancestor box independently from client fragments',async t=>{const{w,host}=await fixture(t);host.innerHTML='<p><span>ab</span><i>cd</i></p>';const p=host.firstChild,range=part(w,p.firstChild.firstChild,1,2);range.setEnd(p.lastChild.firstChild,1);assert.deepEqual(fields(range.getBoundingClientRect()),fields(p.getBoundingClientRect()));assert.equal(range.getClientRects().length,2);assert.notEqual(range.getClientRects()[0].width,range.getBoundingClientRect().width);p.lastChild.style.display='none';range.selectNode(p.lastChild);assert.equal(range.getClientRects().length,0);assert.deepEqual(fields(range.getBoundingClientRect()),fields(p.getBoundingClientRect()));});
++test('display:contents and genuine shadow text use actual host anchors, without phantom fragment advances',async t=>{const{w,d,host}=await fixture(t);host.innerHTML='<div style="display:contents">Role</div>';let rect=contents(w,host.firstChild).getBoundingClientRect();assert.deepEqual(fields(rect).slice(0,2),fields(host.getBoundingClientRect()).slice(0,2));assert.equal(rect.width,38.4);host.innerHTML='<div></div>';const target=host.firstChild,shadow=target.attachShadow({mode:'open'});shadow.innerHTML='shadow<span>text</span>';const list=contents(w,shadow).getClientRects(),base=target.getBoundingClientRect();assert.deepEqual(fields(list[0]),[base.x,base.y,57.6,19.2]);assert.equal(list[1].x,base.x);assert.equal(list[1].y,base.y+10);const detached=d.createElement('div');detached.textContent='off';assert.deepEqual(fields(contents(w,detached).getBoundingClientRect()),[0,0,28.799999999999997,19.2]);});
++test('real Range boundaries follow splitText and deletion, while CSS mutations invalidate actual metrics',async t=>{const{w,host}=await fixture(t);host.textContent='abcdef';const range=part(w,host.firstChild,1,5);host.firstChild.splitText(3);assert.equal(range.startContainer,host.firstChild);assert.equal(range.endContainer,host.lastChild);assert.deepEqual(Array.from(range.getClientRects(),r=>r.width),[19.2,19.2]);assert.equal(range.getBoundingClientRect().width,38.4);host.style.fontSize='20px';assert.equal(range.getBoundingClientRect().width,48);range.deleteContents();assert.equal(host.textContent,'af');assert.equal(range.collapsed,true);assert.equal(range.getClientRects().length,0);});
++test('genuine Range and Node brands reject proxies and copied private symbols without invoking traps',async t=>{const{w,host}=await fixture(t);host.textContent='abc';const range=contents(w,host);for(const fake of[Object.create(w.Range.prototype,Object.getOwnPropertyDescriptors(range)),new Proxy(range,{get(){throw Error('authored trap')}})])assert.throws(()=>w.Range.prototype.getClientRects.call(fake),e=>e instanceof w.TypeError&&e.message==='Illegal invocation');for(const node of[Object.create(Object.getPrototypeOf(host.firstChild),Object.getOwnPropertyDescriptors(host.firstChild)),new Proxy(host.firstChild,{get(){throw Error('authored trap')}})])assert.throws(()=>range.setStart(node,0),e=>e instanceof w.TypeError&&e.message==='invalid argument');});
++test('geometry captures intrinsic constructors while real array population invokes authored setters and maps failure',async t=>{const{w,host}=await fixture(t);host.textContent='abc';const range=contents(w,host),Original={Array:w.Array,DOMRect:w.DOMRect,Number:w.Number,TypeError:w.TypeError,Error:w.Error,ElementRect:w.Element.prototype.getBoundingClientRect};let setters=0;try{w.Array=class Fake{};w.DOMRect=class Fake{};w.Number=()=>{throw Error('authored Number')};w.TypeError=class Fake{};w.Element.prototype.getBoundingClientRect=()=>{throw Error('authored box')};Object.defineProperty(Original.Array.prototype,'0',{configurable:true,set(){setters++;throw Error('authored Array index')}});assert.throws(()=>range.getClientRects(),e=>e instanceof Original.Error&&e.message==='FailedToCreateArray');assert.equal(setters,1);delete Original.Array.prototype[0];const list=range.getClientRects();assert.equal(list instanceof Original.Array,true);assert.equal(list[0] instanceof Original.DOMRect,true);assert.equal(list[0].width,28.799999999999997);assert.equal(setters,1);assert.throws(()=>w.Range.prototype.getBoundingClientRect.call({}),Original.TypeError);}finally{delete Original.Array.prototype[0];w.Array=Original.Array;w.DOMRect=Original.DOMRect;w.Number=Original.Number;w.TypeError=Original.TypeError;w.Element.prototype.getBoundingClientRect=Original.ElementRect;}});
++test('borrowed frame geometry measures the receiving document while Arrays and rectangles use the method realm',async t=>{const{w,d}=await fixture(t),frame=d.createElement('iframe');d.body.append(frame);const child=frame.contentWindow,text=child.document.body.appendChild(child.document.createTextNode('child text')),range=part(child,text,1,4),own=range.getClientRects(),borrowed=w.Range.prototype.getClientRects.call(range);assert.equal(own instanceof child.Array,true);assert.equal(own[0] instanceof child.DOMRect,true);assert.equal(own instanceof w.Array,false);assert.equal(borrowed instanceof w.Array,true);assert.equal(borrowed[0] instanceof w.DOMRect,true);assert.deepEqual(fields(own[0]),fields(borrowed[0]));assert.equal(borrowed[0].width,28.799999999999997);});
++test('utility Range constructor has genuine document boundaries and final canonical provenance; rectangles remain world-local',async t=>{const{page,w,host}=await fixture(t);host.textContent='abcdef';const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());installUtilityLayout(page,world,w);installUtilityRangeGeometry(world);const value=JSON.parse(world.evaluate(`JSON.stringify((()=>{globalThis.range=new Range();const initial=range.startContainer===document&&range.endContainer===document&&range.collapsed;const text=document.getElementById('host').firstChild;range.setStart(text,1);range.setEnd(text,3);const rects=range.getClientRects(),elements=document.getElementById('host').getClientRects();return{initial,range:range instanceof Range,array:rects instanceof Array,rect:rects[0] instanceof DOMRect,width:rects[0].width,elementArray:elements instanceof Array,list:typeof DOMRectList,item:typeof elements.item}})())`));assert.deepEqual(value,{initial:true,range:true,array:true,rect:true,width:19.2,elementArray:true,list:'undefined',item:'undefined'});const range=world.evaluate('range'),canonical=canonicalUtilityValue(range);assert.notEqual(range,canonical);assert.equal(platformFactoryRecord(range).implementation,platformFactoryRecord(canonical).implementation);assert.equal(w.Range.prototype.getBoundingClientRect.call(canonical).width,19.2);assert.equal(range.getClientRects()[0] instanceof world.global.DOMRect,true);});
++
++test('successful numeric setters receive genuine snapshots and leave the actual pre-sized materialization array holes',async t=>{const{w,host}=await fixture(t);host.textContent='abc';const range=contents(w,host);let calls=0,value;try{Object.defineProperty(w.Array.prototype,'0',{configurable:true,set(next){calls++;value=next}});const list=range.getClientRects();assert.equal(calls,1);assert.equal(list.length,1);assert.equal(Object.hasOwn(list,'0'),false);assert.equal(value instanceof w.DOMRect,true);assert.equal(value.width,28.799999999999997);}finally{delete w.Array.prototype[0]}});
++
++test('a failed ordinary indexed set on inherited readonly data leaves the real array hole and inherited value',async t=>{const{w,host}=await fixture(t);host.textContent='abc';const range=contents(w,host);try{Object.defineProperty(w.Array.prototype,'0',{configurable:true,value:'authored',writable:false});const list=range.getClientRects();assert.equal(list.length,1);assert.equal(Object.hasOwn(list,'0'),false);assert.equal(list[0],'authored');}finally{delete w.Array.prototype[0]}});
+diff --git a/test/layout.test.js b/test/layout.test.js
+--- a/test/layout.test.js
++++ b/test/layout.test.js
+@@ -128,8 +128,10 @@
+ 
+ test('hidden and detached elements have no client rectangles and zero bounds', t => {
+   const f = setup(t), hidden = f.element('hidden');
+-  assert.equal(Object.prototype.toString.call(hidden.getClientRects()), '[object DOMRectList]');
+-  assert.equal(hidden.getClientRects().item(0), null);
++  assert.equal(hidden.getClientRects() instanceof f.window.Array, true);
++  assert.equal(Object.prototype.toString.call(hidden.getClientRects()), '[object Array]');
++  assert.equal(hidden.getClientRects().item, undefined);
++  assert.equal(hidden.getClientRects().length,0);
+   assert.equal(hidden.getBoundingClientRect() instanceof f.window.DOMRect, true);
+   const detached = f.document.createElement('div');
+   assert.deepEqual(basic(f.layout.rect(detached)), { x: 0, y: 0, width: 0, height: 0 });
+diff --git a/test/utility-platform.test.js b/test/utility-platform.test.js
+--- a/test/utility-platform.test.js
++++ b/test/utility-platform.test.js
+@@ -18,8 +18,8 @@
+ test('rectangles and live layout dimensions come from canonical nodes while result identities stay utility-local',async t=>{
+  const{page,main,world}=await fixture(t),node=main.document.getElementById('a');node.mainExpando=42;
+  const expected=plain(node.getBoundingClientRect().toJSON());
+- const actual=plain(world.evaluate('globalThis.target=document.getElementById("a");globalThis.rect=target.getBoundingClientRect();globalThis.rects=target.getClientRects();({value:rect.toJSON(),rect:rect instanceof DOMRect,base:rect instanceof DOMRectReadOnly,list:rects instanceof DOMRectList,item:rects.item(0)===rects[0],array:[...rects] instanceof Array,method:target.getBoundingClientRect instanceof Function,width:document.documentElement.clientWidth,height:document.documentElement.clientHeight,mainExpando:target.mainExpando})'));
+- assert.deepEqual(actual,{value:expected,rect:true,base:true,list:true,item:true,array:true,method:true,width:page.layout.viewport.width,height:page.layout.viewport.height});
++ const actual=plain(world.evaluate('globalThis.target=document.getElementById("a");globalThis.rect=target.getBoundingClientRect();globalThis.rects=target.getClientRects();({value:rect.toJSON(),rect:rect instanceof DOMRect,base:rect instanceof DOMRectReadOnly,list:rects instanceof Array,item:typeof rects.item,constructor:typeof DOMRectList,array:[...rects] instanceof Array,method:target.getBoundingClientRect instanceof Function,width:document.documentElement.clientWidth,height:document.documentElement.clientHeight,mainExpando:target.mainExpando})'));
++ assert.deepEqual(actual,{value:expected,rect:true,base:true,list:true,item:'undefined',constructor:'undefined',array:true,method:true,width:page.layout.viewport.width,height:page.layout.viewport.height});
+  assert.notEqual(world.evaluate('rect'),node.getBoundingClientRect());assert.equal(canonicalUtilityValue(world.evaluate('target')),node);
+  node.style.width='40px';assert.equal(world.evaluate('target.getBoundingClientRect().width'),40);assert.equal(world.evaluate('rect.width'),20);
+  assert.deepEqual(plain(world.evaluate('(()=>{const result=[];for(const fn of [()=>Element.prototype.getBoundingClientRect.call({}),()=>Object.getOwnPropertyDescriptor(Element.prototype,"clientWidth").get.call({})]){try{fn()}catch(error){result.push([error instanceof TypeError,error.message])}}return result})()')),[[true,'Illegal invocation'],[true,'Illegal invocation']]);

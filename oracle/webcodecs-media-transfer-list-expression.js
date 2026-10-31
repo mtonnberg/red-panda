@@ -1,0 +1,1 @@
+(()=>{const rows=[];for(const value of[{},new Uint8Array(1),new Blob([]),()=>{},new ImageData(1,1),AudioData.prototype])try{rows.push({tag:Object.prototype.toString.call(value),result:structuredClone(1,{transfer:[value]})})}catch(e){rows.push({tag:Object.prototype.toString.call(value),error:e.name,message:e.message})}return rows})()

@@ -1,0 +1,20 @@
+import http from 'node:http';
+import {once} from 'node:events';
+import {readFile,writeFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import {pathToFileURL} from 'node:url';
+import {resolve} from 'node:path';
+import {startReference} from '../../scripts/reference-server.mjs';
+import {connect} from '../../test/cdp-client.js';
+const binary='/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux',output=process.argv[2];if(!output)throw Error('Output path required');
+const server=http.createServer((q,s)=>{s.setHeader('content-type','text/html');s.end('<!doctype html><body>Owned Web Locks oracle');});server.listen(0,'127.0.0.1');await once(server,'listening');const origin=`http://127.0.0.1:${server.address().port}`;
+let service,client,failure;const observations=[];
+try{
+ if(process.env.WEB_LOCKS_CANDIDATE_ROOT){const{serve}=await import(pathToFileURL(resolve(process.env.WEB_LOCKS_CANDIDATE_ROOT,'src/cdp.js')));service=await serve({port:0,loadResources:['iframe']});service.endpoint=`ws://127.0.0.1:${service.port}/`;}else service=await startReference(binary,{args:['--load-resources','iframe']});
+ client=await connect(service.endpoint);const{browserContextId}=await client.send('Target.createBrowserContext');const{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(m,p={})=>client.send(m,p,sessionId);await send('Page.enable');await send('Runtime.enable');await send('Page.navigate',{url:origin+'/main'});
+ const run=async(name,expression)=>{const result=await send('Runtime.evaluate',{expression:`(async()=>JSON.stringify(await Promise.race([(async()=>(${expression}))(),new Promise(resolve=>setTimeout(()=>resolve({__probeDeadline:true}),1500))])))()`,awaitPromise:true,returnByValue:true});observations.push({name,result});};
+ await run('borrowed-callback-receiver',`(async()=>{const frame=document.createElement('iframe');frame.src=${JSON.stringify(origin+'/borrowed')};const loaded=new Promise(r=>frame.onload=r);document.body.append(frame);await loaded;const child=frame.contentWindow;return {parentOwner:await child.LockManager.prototype.request.call(navigator.locks,'borrowed',function(){'use strict';return {parent:this===window,child:this===child,undefined:this===undefined}}),childOwner:await LockManager.prototype.request.call(child.navigator.locks,'borrowed',function(){'use strict';return {parent:this===window,child:this===child,undefined:this===undefined}})}})()`);
+ await run('option-exception-precedence',`(async()=>{const rows=[];for(const [label,mode,signal]of [['bad-mode','bad',null],['bad-signal',undefined,{}],['throw-signal',undefined,'throw']]){const order=[],o={};for(const key of ['ifAvailable','mode','signal','steal'])Object.defineProperty(o,key,{get(){order.push(key);if(key==='mode')return mode;if(key==='signal'){if(signal==='throw')throw 23;return signal}}});try{await navigator.locks.request({toString(){order.push('name');return 'opts'}},o,()=>1)}catch(e){rows.push({label,order,error:e===23?23:e.message})}}return rows})()`);
+ await run('query-settles-before-task',`(async()=>{const order=[];navigator.locks.query().then(()=>order.push('query'));Promise.resolve().then(()=>order.push('microtask'));order.push('returned');await new Promise(r=>setTimeout(r,0));return order})()`);
+ await client.send('Target.disposeBrowserContext',{browserContextId});
+}catch(e){failure={name:e.name,message:e.message,stack:e.stack};}finally{await client?.close();await service?.close();server.closeAllConnections();await new Promise(r=>server.close(r));const sha=bytes=>createHash('sha256').update(bytes).digest('hex');await writeFile(output,JSON.stringify({candidateRoot:process.env.WEB_LOCKS_CANDIDATE_ROOT,binarySHA256:sha(await readFile(binary)),helperSHA256:sha(await readFile(new URL(import.meta.url))),origin,observations,failure},null,2)+'\n',{flag:'wx'});console.log(JSON.stringify({observations:observations.length,failure}));}

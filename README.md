@@ -61,8 +61,9 @@ If the default npm cache is unwritable in your cloud environment, set
 XDG cache/config/data locations to the ignored `.cache/` directory.
 
 When using a managed HTTP proxy, preserve its configuration and include
-`0.0.0.0,127.0.0.1,localhost` in `NO_PROXY` and `no_proxy` for the owned local
-test servers. Some cross-origin and insecure-context fixtures use `0.0.0.0`.
+`0.0.0.0,127.0.0.1,127.0.0.2,127.255.1.2,localhost,::1,[::1]` in both
+`NO_PROXY` and `no_proxy` for the owned local test servers. Cross-origin,
+cross-site and insecure-context fixtures use the additional loopback addresses.
 
 Fetch a trusted document:
 
@@ -115,10 +116,10 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket and FileReaderSync |
-| Web APIs | Real HTMLDDA collections, CSS.escape/supports namespaces, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
+| Web APIs | Real HTMLDDA collections, CSS.escape/supports namespaces, Selection and Range geometry, actual Web Crypto keys/bytes, Cookie Store, Web Locks, Scheduler, form-associated custom elements, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Canvas | Genuine context/Path2D state, measured transparent pixel reads and independently encoded PNG output; the target profile has no Canvas rasterizer |
 | Storage | UTF-8 value-byte quota, context/origin backing state and genuine shared frame wrappers; key order and legacy reflection remain incomplete |
-| Media values | Genuine ImageData pixels/clones, encoded audio/video chunk bytes and VideoColorSpace; codec state/queue/reset/flush/error behavior with unsupported media processing reported explicitly |
+| Media values | Genuine ImageData, AudioData and VideoFrame bytes/planes/clones, encoded chunks and VideoColorSpace; codec task/error behavior without fabricated processing output |
 | Offline audio | Real AudioBuffer channel data and scheduled buffer-source rendering, resampling, loops, playback rate/detune and completion events; wider audio nodes remain incomplete |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
@@ -267,7 +268,7 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 60 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 71 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.

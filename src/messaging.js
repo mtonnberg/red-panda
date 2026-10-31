@@ -27,7 +27,7 @@ const VIEW_NAMES = ['DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 
  * Blob/File preserve their immutable bytes and private metadata through graph
  * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
  */
-export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {} } = {}) {
+export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false } = {}) {
   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
   const codec = createPlatformCodec(realm);
@@ -124,9 +124,10 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     if (list === null || typeof list?.[Symbol.iterator] !== 'function') throw typeError('Transfer list must be iterable');
     return [...list];
   }
-  function prepare(data, options, sourcePort) {
+  function prepare(data, options, sourcePort, ignoreUnknownTransfers = false) {
     const list = transferList(options), allowed = new Set(), transfer = [], moved = [], ports = [];
     for (const value of list) {
+      if (ignoreUnknownTransfers && !PORTS.has(value) && !types.isArrayBuffer(value)) continue;
       if (allowed.has(value)) throw cloneError('Transfer list contains duplicates');
       allowed.add(value);
       const state = PORTS.get(value);
@@ -231,7 +232,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     return {message, pending};
   }
   function clone(data, options) {
-    const prepared = prepare(data, options);
+    const prepared = prepare(data, options, undefined, cloneUnknownTransfers);
     if (codec.needsAsync(prepared.message)) throw cloneError('Synchronous clone cannot asynchronously read an embedded native Blob');
     try {
       const message = nativeClone(prepared.message, { transfer: prepared.transfer }); prepared.commit(); return receive(message).data;
@@ -303,6 +304,7 @@ export function installMessaging(page, window) {
   if (INSTALLED.has(window)) return INSTALLED.get(window);
   const generation = page.documentGeneration, signal = page.documentAbort?.signal;
   const bridge = createMessagingRealm(window, {
+    cloneUnknownTransfers: !page.parentFrameId,
     active: () => !page.closed && !!window.document && page.documentGeneration === generation && !signal?.aborted,
     dispatch: (target, type, data, ports) => fireAnEvent(type, implForWrapper(target), MessageEvent,
       { data, ports, origin: '', source: null, lastEventId: '', bubbles: false, cancelable: false }),

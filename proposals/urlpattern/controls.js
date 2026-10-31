@@ -1,0 +1,8 @@
+(()=>{const rows=[],cap=(n,f)=>{try{rows.push([n,{value:f()}])}catch(e){rows.push([n,{error:e.name,message:e.message,realm:e instanceof TypeError}])}};const norm=v=>v===undefined?'__undefined__':v;
+for(const component of['protocol','username','password','hostname','port','pathname','search','hash'])for(const protocol of ['https','original-scheme'])for(const v of ['','a b','a/b','a.b','a?b','a#b','a:b','a\\b','a*b','🍅','a\nb','a\0b','%2f'])cap('generate-'+component+'-'+protocol+'-'+JSON.stringify(v),()=>new URLPattern({protocol,[component]:':x'}).generate(component,{x:v}));
+for(const value of [undefined,null,17,true,'hi',Symbol('x'),{},Object.create({x:'inherited'}),{x:null},{x:17},{x:Symbol('str')}])cap('groups-'+String(value),()=>new URLPattern({pathname:'/:x'}).generate('pathname',value));
+cap('group-order',()=>{let log=[];const groups=new Proxy({z:'z',a:'a'}, {get(t,k){log.push(String(k));return t[k]},ownKeys(){throw Error('ownKeys')}});const value=new URLPattern({pathname:'/:z/:a/:z2?'}).generate('pathname',groups);return{log,value}});
+for(const component of[undefined,null,Symbol('pathname'),'invalid'])cap('component-'+String(component),()=>new URLPattern({pathname:'/:x'}).generate(component,{x:'a'}));
+for(const second of[17,true,null,undefined,Symbol('https://example.com'),new String('https://example.com')])cap('ctor-second-'+String(second),()=>new URLPattern('/a',second).pathname);
+cap('statics',()=>({compareLength:URLPattern.compareComponent.length,descriptor:Object.getOwnPropertyDescriptor(URLPattern,'compareComponent'),prototype:Object.getOwnPropertyDescriptor(URLPattern,'prototype'),global:Object.getOwnPropertyDescriptor(globalThis,'URLPattern')}));
+return JSON.stringify(rows)})()

@@ -128,8 +128,10 @@ test('viewport changes, stylesheet updates and replacement nodes invalidate geom
 
 test('hidden and detached elements have no client rectangles and zero bounds', t => {
   const f = setup(t), hidden = f.element('hidden');
-  assert.equal(Object.prototype.toString.call(hidden.getClientRects()), '[object DOMRectList]');
-  assert.equal(hidden.getClientRects().item(0), null);
+  assert.equal(hidden.getClientRects() instanceof f.window.Array, true);
+  assert.equal(Object.prototype.toString.call(hidden.getClientRects()), '[object Array]');
+  assert.equal(hidden.getClientRects().item, undefined);
+  assert.equal(hidden.getClientRects().length,0);
   assert.equal(hidden.getBoundingClientRect() instanceof f.window.DOMRect, true);
   const detached = f.document.createElement('div');
   assert.deepEqual(basic(f.layout.rect(detached)), { x: 0, y: 0, width: 0, height: 0 });

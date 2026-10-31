@@ -1,3 +1,4 @@
+import {appendFormAssociatedValue} from './element-internals.js';
 import { submitDialogForm } from './dialogs.js';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
@@ -98,6 +99,7 @@ function entryList(record, formImpl, submitterImpl, data = new record.window.For
   const { window } = record;
   for (const implementation of formImpl._getSubmittableElementNodes()) {
     const control = wrapperForImpl(implementation);
+    if (appendFormAssociatedValue(implementation, data)) continue;
     if (isDisabled(implementation) || control.closest('datalist')) continue;
     const tag = control.localName;
     const type = control.type;

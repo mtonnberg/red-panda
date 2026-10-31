@@ -12,7 +12,8 @@ const usage = `Usage: node scripts/conformance.mjs --root /path/to/upstream/src/
   [--tests-file /path/to/selection.json] [--isolate]
   [--browser-arg=--load-resources --browser-arg=iframe]
   [--timeout 5000] [--settle-ms 0] [--port 9582] [--report /new/report.json]
-  [--fixture-profile static|xhr-subset | --fixture-origin http://127.0.0.1:9582]
+  [--registration-map /path/to/registration-map.json] [--source-load-contract] [--websocket-port 9584]
+  [--fixture-profile static|xhr-subset|upstream | --fixture-origin http://127.0.0.1:9582]
 
 Runs unchanged upstream fixture assertions through raw CDP. Both targets use
 Lightpanda/1.0 solely within this runner so testing.js takes identical branches.
@@ -23,9 +24,11 @@ The native harness requires origin http://127.0.0.1:9582 for its dynamic routes.
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const inside = (root, path) => { const rel = relative(root, path); return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel)); };
 
-async function runFixture(client, server, selection, timeout, settleMs = 0) {
+async function runFixture(client, server, selection, timeout, settleMs = 0, injectScript = null, sourceLoadContract = false) {
   const started = Date.now();
-  const deadline = started + timeout;
+  let deadline = started + (sourceLoadContract?10000:timeout);
+  let executionPhase=sourceLoadContract?'automation-setup':'navigation-and-assertions';
+  let loadBarrier=null,loadStarted=null,assertionStarted=null,assertionFinished=null;
   const requestOffset = server.requests?.length ?? 0;
   let context;
   let session;
@@ -51,9 +54,28 @@ async function runFixture(client, server, selection, timeout, settleMs = 0) {
     await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
     await send('Network.setUserAgentOverride', { userAgent:'Lightpanda/1.0' });
     await send('Page.addScriptToEvaluateOnNewDocument', { source:'globalThis.__lp_external_runner = true;' });
+    if(injectScript!==null)await send('Page.addScriptToEvaluateOnNewDocument',{source:injectScript});
     const url = `${server.origin}/src/browser/tests/${selection.path.split('/').map(encodeURIComponent).join('/')}`;
+    if(sourceLoadContract)await send('Page.setLifecycleEventsEnabled',{enabled:true});
+    const loadEventOffset=client.events.length;
+    if(sourceLoadContract){executionPhase='source-load';loadStarted=Date.now();deadline=loadStarted+2000;}
     const navigation = await send('Page.navigate', { url });
     if (navigation.errorText) throw new Error(navigation.errorText);
+    if(sourceLoadContract){
+      if(!navigation.frameId)throw new Error('Source load contract requires navigation root frame identity');
+      while(Date.now()<deadline){
+        const event=client.events.slice(loadEventOffset).find(event=>event.sessionId===session&&event.method==='Page.lifecycleEvent'&&event.params.name==='load'&&event.params.frameId===navigation.frameId);
+        if(event){
+          const documentState=JSON.parse(await evaluate('JSON.stringify({readyState:document.readyState,url:document.URL})'));
+          if(documentState.readyState==='complete'){
+            loadBarrier={observed:true,rootFrameId:navigation.frameId,loaderId:navigation.loaderId??null,event:event.params,document:documentState,durationMs:Date.now()-loadStarted};break;
+          }
+        }
+        await sleep(Math.min(20,remaining()));
+      }
+      if(!loadBarrier)throw new Error('Source load-state-complete 2000ms deadline exceeded before assertOk');
+      executionPhase='source-assertions';assertionStarted=Date.now();deadline=assertionStarted+timeout;
+    }
     if (settleMs) {
       while (Date.now() < deadline && await evaluate('document.readyState') !== 'complete') await sleep(Math.min(20,remaining()));
       if (Date.now() >= deadline) throw new Error('Fixture document-complete deadline exceeded');
@@ -86,6 +108,7 @@ async function runFixture(client, server, selection, timeout, settleMs = 0) {
   } catch (cause) {
     status = /timeout|timed out|deadline/i.test(cause.message) ? 'timeout' : 'failed'; error = cause.message;
   } finally {
+    if(assertionStarted!==null)assertionFinished=Date.now();
     if (status === 'timeout' && harnessObserved) await send('Runtime.evaluate', {
       expression:"typeof testing !== 'undefined' && typeof testing.printTimeoutState === 'function' ? (testing.printTimeoutState(),true) : false",
       returnByValue:true,
@@ -99,7 +122,8 @@ async function runFixture(client, server, selection, timeout, settleMs = 0) {
     status = 'unobserved'; error = 'Upstream harness recorded no test observations';
   }
   return { ...selection, status, error, durationMs:Date.now()-started, harnessObserved, nativeHarnessBranch, observedUserAgent,
-    deadlineMs:timeout, deadlineIncludesNavigation:true, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
+    deadlineMs:timeout, deadlineIncludesNavigation:!sourceLoadContract,
+    executionPhase,sourceLoadContract:sourceLoadContract?{sourceReferences:['src/testing.zig:454','src/testing.zig:456','src/browser/Runner.zig:303'],loadBudgetMs:2000,assertionBudgetMs:timeout,automationSetupBudgetMs:10000,loadBarrier,assertionStartedAfterLoad:assertionStarted!==null,assertionDurationMs:assertionStarted===null?null:assertionFinished-assertionStarted}:null, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
     assertOkPolls:polls, nonzeroObservationsEnforced:status==='passed',
     observationCount:null, observationCountNote:'Private upstream harness state; passing assertOk enforces nonzero observations and no pending async blocks.',
     diagnostics:logs, runtimeExceptions:events.filter(event => event.method === 'Runtime.exceptionThrown').map(event => event.params.exceptionDetails?.text),
@@ -111,8 +135,9 @@ async function main() {
   const { values, positionals } = parseArgs({ allowPositionals:true, options:{
     root:{type:'string'}, endpoint:{type:'string'}, binary:{type:'string'}, test:{type:'string',multiple:true},
     'tests-file':{type:'string'}, isolate:{type:'boolean'}, 'browser-arg':{type:'string',multiple:true},
-    timeout:{type:'string',default:'5000'}, 'settle-ms':{type:'string',default:'0'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
+    timeout:{type:'string'}, 'settle-ms':{type:'string',default:'0'}, port:{type:'string',default:'9582'}, report:{type:'string'}, help:{type:'boolean'},
     'fixture-origin':{type:'string'}, 'fixture-profile':{type:'string'},
+    'registration-map':{type:'string'},'websocket-port':{type:'string'},'source-load-contract':{type:'boolean'},
   } });
   if (values.help) { console.log(usage); return; }
   if (!values.root || Boolean(values.endpoint) === Boolean(values.binary)) throw new Error(usage);
@@ -120,7 +145,7 @@ async function main() {
   if (values['browser-arg']?.length && !values.binary) throw new Error('--browser-arg requires --binary');
   if (values['fixture-origin'] && (values['fixture-profile'] || values.port !== '9582')) throw new Error('--fixture-origin cannot be combined with --fixture-profile or a custom --port');
   const profile = values['fixture-profile'] ?? 'static';
-  if (!['static','xhr-subset'].includes(profile)) throw new Error('--fixture-profile must be static or xhr-subset');
+  if (!['static','xhr-subset','upstream'].includes(profile)) throw new Error('--fixture-profile must be static, xhr-subset or upstream');
   let fromFile = [];
   if (values['tests-file']) {
     const text = await readFile(values['tests-file'],'utf8');
@@ -129,9 +154,10 @@ async function main() {
   }
   const tests = [...(values.test ?? []), ...fromFile, ...positionals];
   if (!tests.length) throw new Error('Zero selected fixtures: supply at least one explicit --test path');
-  const timeout = Number(values.timeout), port = Number(values.port), settleMs=Number(values['settle-ms']);
+  const timeout = Number(values.timeout??5000), port = Number(values.port), settleMs=Number(values['settle-ms']);
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120000 || !Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid timeout or port');
   if(!Number.isInteger(settleMs)||settleMs<0||settleMs>=timeout)throw new Error('--settle-ms must be a nonnegative integer below --timeout');
+  if(values['source-load-contract']&&settleMs!==0)throw new Error('--source-load-contract requires no fixed settling delay');
   const root = await realpath(resolve(values.root));
   const harness = await readFile(join(root,'testing.js'));
   const selections = [];
@@ -143,6 +169,12 @@ async function main() {
     selections.push({ path:relative(root,canonical).split(sep).join('/'), sha256:createHash('sha256').update(bytes).digest('hex'), tagged:/<meta\s+name=["']?lp-mode["']?\s+content=["']?test["']?\s*\/?>/i.test(bytes.toString()) });
   }
   const browserArgs = values['browser-arg'] ?? [];
+  const registrationMap=values['registration-map']?JSON.parse(await readFile(values['registration-map'],'utf8')):null;
+  if(registrationMap&&(!values.isolate||browserArgs.length))throw new Error('--registration-map requires --isolate and supplies its own browser arguments');
+  const webSocketPort=values['websocket-port']===undefined?null:Number(values['websocket-port']);
+  if(webSocketPort!==null&&(!Number.isInteger(webSocketPort)||webSocketPort<0||webSocketPort>65535||values['fixture-origin']))throw new Error('Invalid owned --websocket-port');
+  for(const selection of selections){if(registrationMap){const row=registrationMap.fixtures.find(x=>x.path===selection.path);if(!row||row.sha256!==selection.sha256)throw new Error('Registration absent or hash mismatch: '+selection.path);selection.sourceProfile=registrationMap.profiles.find(x=>x.id===row.profile);if(!selection.sourceProfile)throw new Error('Missing registration profile');}}
+
   let browser, server, client;
   try {
     if (values['fixture-origin']) {
@@ -157,7 +189,7 @@ async function main() {
         const response = await fetch(url,{signal:AbortSignal.timeout(timeout)});
         if (!response.ok || createHash('sha256').update(Buffer.from(await response.arrayBuffer())).digest('hex') !== file.sha256) throw new Error(`External fixture bytes differ or are unavailable: ${file.path}`);
       }
-    } else server = await startFixtureServer(root,{port,profile});
+    } else server = await startFixtureServer(root,{port,profile,webSocketPort});
     let endpoint = values.endpoint ?? null;
     const binaryIdentity = values.binary ? {
       path:resolve(values.binary), sha256:createHash('sha256').update(await readFile(resolve(values.binary))).digest('hex'),
@@ -172,16 +204,22 @@ async function main() {
     }
     const results = [];
     for (const selection of selections) {
+      const sourceProfile=selection.sourceProfile;
+      const effectiveTimeout=values.timeout===undefined&&sourceProfile?sourceProfile.sourceTimeoutMs:timeout;
+      if(settleMs>=effectiveTimeout)throw new Error('Settle delay exceeds selected source budget');
+      const effectiveArgs=sourceProfile?sourceProfile.nativeResourceAndFeatureArgs:browserArgs;
+      let stateReset=false;
+      if(server.owned&&profile==='upstream'){const reset=await fetch(server.origin+'/reset',{signal:AbortSignal.timeout(5000)});if(reset.status!==200)throw new Error('Fixture state reset failed');await reset.arrayBuffer();stateReset=true;}
       let result;
       if (values.isolate) {
         let ownedBrowser, ownedClient;
         const started = Date.now();
         try {
-          ownedBrowser = await startReference(resolve(values.binary),{args:browserArgs});
-          ownedClient = await connect(ownedBrowser.endpoint,{timeout});
+          ownedBrowser = await startReference(resolve(values.binary),{args:effectiveArgs});
+          ownedClient = await connect(ownedBrowser.endpoint,{timeout:effectiveTimeout});
           const target = await ownedClient.send('Browser.getVersion');
           version ??= target;
-          result = await runFixture(ownedClient,server,selection,timeout,settleMs);
+          result = await runFixture(ownedClient,server,selection,effectiveTimeout,settleMs,sourceProfile?.injectScript??null,!!values['source-load-contract']);
           result.target = target;
         } catch (cause) {
           result = { ...selection,status:/timeout|timed out|deadline/i.test(cause.message)?'timeout':'failed',error:cause.message,
@@ -190,9 +228,10 @@ async function main() {
           await ownedClient?.close();
           await ownedBrowser?.close();
         }
-        result.ownedBrowser = { pid:ownedBrowser?.process.pid ?? null,exitCode:ownedBrowser?.process.exitCode ?? null,signal:ownedBrowser?.process.signalCode ?? null };
+        result.ownedBrowser = { pid:ownedBrowser?.process.pid ?? null,exitCode:ownedBrowser?.process.exitCode ?? null,signal:ownedBrowser?.process.signalCode ?? null,stderr:ownedBrowser?.stderr??null,stderrTruncated:ownedBrowser?.stderrTruncated??null };
         result.totalDurationMs = Date.now()-started;
-      } else result = await runFixture(client,server,selection,timeout,settleMs);
+      } else result = await runFixture(client,server,selection,timeout,settleMs,null,!!values['source-load-contract']);
+      result.configuration={sourceProfile:sourceProfile??null,browserArgs:effectiveArgs,fixtureBudgetMs:effectiveTimeout,budgetKind:sourceProfile&&effectiveTimeout===sourceProfile.sourceTimeoutMs?(values['source-load-contract']?'source-registration-load-then-assert':'source-registration'):'diagnostic-override',fixtureStateReset:stateReset};
       results.push(result);
       console.error(`${result.status.toUpperCase()} ${result.path}${result.error ? ': '+result.error : ''}`);
     }
@@ -202,13 +241,15 @@ async function main() {
       harnessSourceUnchanged:true, testUserAgent:'Lightpanda/1.0', externalRunnerFlag:true,
       isolatedBrowserPerFixture:!!values.isolate, browserArgs, settleDelayMs:settleMs, waitForDocumentCompleteBeforeSettle:!!settleMs,
       configurationCoverage:{
+        sourceLoadContract:!!values['source-load-contract'],sourceLoadBudgetMs:values['source-load-contract']?2000:null,
         sourceHtmlRunnerDefaults:['--load-resources','iframe','--load-resources','worker'],
         sourceDefaultsNote:'src/testing.zig HtmlRunnerOpts enables iframe and worker; individual registrations may override resources, experimental features or injected scripts.',
-        fixtureSpecificOptionsVerified:false,
-        unrunConfigurationDimensions:['Per-fixture native registration overrides not audited','Full upstream test_routes server not implemented; see fixture server metadata or external server contract'],
+        fixtureSpecificOptionsVerified:!!registrationMap,
+        registrationMapSHA256:values['registration-map']?createHash('sha256').update(await readFile(values['registration-map'])).digest('hex'):null,
+        unrunConfigurationDimensions:[...(registrationMap?[]:['Per-fixture registration profiles not supplied']),...(profile==='upstream'?['All-registration runtime result matrix not implied by server support']:['Full pinned route transport not selected']),...(!server.webSocket?['WebSocket transport not owned by this runner']:[])],
       },
       fixtureOrigin:server.origin, fixtureServerOwnership:server.owned?'runner-owned':'caller-owned; caller must stop it',
-      fixtureServerMetadata:server.metadata, staticRoutesOnly:server.owned ? profile==='static' : null,
+      fixtureServerMetadata:server.metadata, webSocketRequests:server.webSocket?.requests??null, staticRoutesOnly:server.owned ? profile==='static' : null,
       sourceVerification:server.owned?'Local fixture files served directly':'External main fixture documents and testing.js hash-verified; transitive resource bytes not verified',
       results, counts };
     const json = `${JSON.stringify(report,null,2)}\n`;

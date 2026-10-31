@@ -1,3 +1,4 @@
+import {formAssociatedState} from './element-internals.js';
 // Independent selector parsing and state adapter. No native engine is imported.
 import 'jsdom';
 import { createRequire } from 'node:module';
@@ -134,6 +135,8 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
       if(name!=='is'&&name!=='where')fail(window,'Selector function cannot be empty');
       compiled+=emitPredicate({kind:'never'});effective+=`:${name}()`;
      }else{const nested=list(arg,name,name==='has');compiled+=`:${name}(${nested.compiled})`;effective+=`:${name}(${nested.effective})`;}
+    }else if(['valid','invalid','disabled','enabled'].includes(name)){
+     if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'form-state',name});effective+=value.slice(i,end);
     }else if(name==='empty'){
      if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'empty'});effective+=value.slice(i,end);
     }else if(name==='modal'||name==='popover-open'||name==='popover'){
@@ -164,6 +167,7 @@ export function selectorForSpecificity(source) { try{return parseSelector(source
 export function supportsSelector(source){try{return parseSelector(source).groups.length===1;}catch{return false;}}
 
 function predicate(record,element,item) {
+ if(item.kind==='form-state'){const value=formAssociatedState(element,item.name);return value===undefined?matcher(record).match(':'+item.name,element):value;}
  if(item.kind==='never')return false;
  if(item.kind==='empty'){for(const child of element.childNodes)if(child.nodeType===1||child.nodeType===3&&child.data.length)return false;return true;}
  // Native parses :modal but its observed public predicate stays false.
