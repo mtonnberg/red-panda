@@ -20,6 +20,11 @@ import { primitiveRemoteValue, describeRemoteValue, needsRemoteHandle, ownerDocu
 
 const timestamp = () => performance.now() / 1000;
 const protocolErrors = new WeakSet();
+// DOM lifecycle is owned by supportsDOM/runDOM above Session's generic branch.
+// Keep existing known Root extensions explicit; arbitrary suffixes never brand
+// a wire method as a supported domain command.
+const SESSION_ENABLE_METHODS = new Set(['Page.enable','Runtime.enable','Network.enable','Log.enable','Performance.enable','Audits.enable']);
+const SESSION_DISABLE_METHODS = new Set(['Page.disable','Runtime.disable','Network.disable','Log.disable','Performance.disable','Audits.disable']);
 class ProtocolError extends Error {
   constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
 }
@@ -263,7 +268,7 @@ class Session {
     if (supportsDOM(method)) return runDOM(this, method, params);
     if (supportsInput(method)) return runInput(this, method, params);
     if (supportsRuntime(method)) return runRuntime(this, method, params);
-    if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
+    if (SESSION_ENABLE_METHODS.has(method)) {
       if(method==='Runtime.enable'&&this.domains.has('Runtime'))return {};
       this.domains.add(method.split('.')[0]);
       if (method === 'Runtime.enable') {
@@ -273,7 +278,7 @@ class Session {
       }
       return {};
     }
-    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { if(method==='Runtime.disable')this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
+    if (SESSION_DISABLE_METHODS.has(method)) { if(method==='Runtime.disable'&&this.domains.has('Runtime'))this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
     switch (method) {
       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
       case 'Page.getLayoutMetrics': {

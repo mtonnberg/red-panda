@@ -4,7 +4,7 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The latest integrated checkpoint passes **1,906 JavaScript tests, 100 PureScript
+The latest full-suite checkpoint passes **1,906 JavaScript tests, 100 PureScript
 Puppeteer checks and 13 native differential groups**, syntax and strict/pedantic
 PureScript builds. [Validation](reference/phase23-integration/validation.json)
 records 13,487 unchanged monitored inputs. Its first1902-case full run had1899
@@ -38,8 +38,15 @@ focused epochs describe their exact prior graphs, not a fabricated final39 run.
 
 Red Panda branding is explicit user policy. The source fixture's literal
 Lightpanda-name expectation is intentionally different; its remaining unexecuted
-assertions are not automatically verified. Functional work still includes exact
-CDP dispatch, complete cookie delete/clear/attached-write scope, Page/dialog and
+assertions are not automatically verified. Exact known CDP enable/disable commands
+now reject malformed nested names without changing domain state; known disables
+are idempotent, and Runtime cleanup retains its enabled-only guard. Native real
+HTTP controls match disabled/enabled/disabled Network event delivery. All25
+focused checks pass on each prepared SDK, with100 compiled PureScript checks;
+a fresh main-checkout25-case replay kept8339 inputs unchanged. This scoped fix
+does not replace the full-suite epoch above. See the [dispatch evidence](../proposals/phase24-domain-dispatch/evidence-packet/README.md).
+
+Functional work still includes complete cookie delete/clear/attached-write scope, Page/dialog and
 permission controls, binary response/post-data capture and real limits, cache,
 Fetch/downloads, trusted input/semantic tools, broader media and genuine Window/
 module boundaries. Source63/private104 and historical full455 results stay

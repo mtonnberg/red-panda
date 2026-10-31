@@ -1,0 +1,3 @@
+# Post-push environment validation
+
+Pushed78dbea872990db066747a3f17431de49a5fb4135: ownedservice66717/PID595200/startTicks6876978, exactoldPIDverification+SIGTERM beforestart. Health andactualPureScript examplePASS6832stable/trackedruntimeclean. Fullworkspace discovery93Gitroots/1572links,1project+89dependency/cache/empty+3verifiedunborn no-remote copies;0unknown/errors/outside. Draft31savedandreadbackexactpushedref/start11296chars; installer1150chars/network/secrets unchanged. UserexplicitRedPanda branding preserved. Savingdoesnotapply/publish; freshrestorationunverified. Post-pushreceiptscanjoinnextcheckpoint.

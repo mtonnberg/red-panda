@@ -1,0 +1,104 @@
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -20,6 +20,11 @@
+ 
+ const timestamp = () => performance.now() / 1000;
+ const protocolErrors = new WeakSet();
++// DOM lifecycle is owned by supportsDOM/runDOM above Session's generic branch.
++// Keep existing known Root extensions explicit; arbitrary suffixes never brand
++// a wire method as a supported domain command.
++const SESSION_ENABLE_METHODS = new Set(['Page.enable','Runtime.enable','Network.enable','Log.enable','Performance.enable','Audits.enable']);
++const SESSION_DISABLE_METHODS = new Set(['Page.disable','Runtime.disable','Network.disable','Log.disable','Performance.disable','Audits.disable']);
+ class ProtocolError extends Error {
+   constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
+ }
+@@ -263,7 +268,7 @@
+     if (supportsDOM(method)) return runDOM(this, method, params);
+     if (supportsInput(method)) return runInput(this, method, params);
+     if (supportsRuntime(method)) return runRuntime(this, method, params);
+-    if (method.endsWith('.enable') && ['Page', 'Runtime', 'Network', 'DOM', 'Log', 'Performance', 'Audits'].includes(method.split('.')[0])) {
++    if (SESSION_ENABLE_METHODS.has(method)) {
+       if(method==='Runtime.enable'&&this.domains.has('Runtime'))return {};
+       this.domains.add(method.split('.')[0]);
+       if (method === 'Runtime.enable') {
+@@ -273,7 +278,7 @@
+       }
+       return {};
+     }
+-    if (method.endsWith('.disable') && this.domains.has(method.split('.')[0])) { if(method==='Runtime.disable')this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
++    if (SESSION_DISABLE_METHODS.has(method)) { if(method==='Runtime.disable'&&this.domains.has('Runtime'))this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
+     switch (method) {
+       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
+       case 'Page.getLayoutMetrics': {
+--- /dev/null
++++ b/test/cdp-domain-dispatch.test.js
+@@ -0,0 +1,69 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++
++async function setup(t){
++ const service=await serve({port:0}),client=await connect(`ws://127.0.0.1:${service.port}`);
++ t.after(async()=>{await client.close();await service.close()});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
++ return{client,sessionId,send:(method,params={})=>client.send(method,params,sessionId)};
++}
++
++test('only exact known lifecycle methods route and genuine disabled domains can disable idempotently',async t=>{
++ const{send}=await setup(t);
++ for(const domain of['NotAnActualDomain','DOM']){
++  await assert.rejects(send(domain+'.nested.enable'),error=>error.code===-32601);
++  await assert.rejects(send(domain+'.nested.disable'),error=>error.code===-32601);
++ }
++ for(const domain of['Network','Runtime','Log','Performance','Audits','Page']){
++  assert.deepEqual(await send(domain+'.disable'),{});
++  await assert.rejects(send(domain+'.notARealMethod.enable'),error=>error.code===-32601);
++  assert.deepEqual(await send(domain+'.enable'),{});
++  await assert.rejects(send(domain+'.notARealMethod.disable'),error=>error.code===-32601);
++  assert.deepEqual(await send(domain+'.disable'),{});assert.deepEqual(await send(domain+'.disable'),{});
++ }
++ // DOM keeps its substantive reset/observer owner, rather than entering the
++ // generic acknowledgement branch. Page.disable remains an explicit Root
++ // extension; it is not advertised as a Native Page action.
++ assert.deepEqual(await send('DOM.enable'),{});assert.ok((await send('DOM.getDocument')).root);assert.deepEqual(await send('DOM.disable'),{});
++});
++
++test('unknown enable/disable suffixes never change real Network event delivery',async t=>{
++ const{client,sessionId,send}=await setup(t),requests=[];
++ const fixture=http.createServer((req,res)=>{requests.push(req.url);res.setHeader('content-type','text/html');res.end('<!doctype html><title>actual dispatch control</title>')});
++ fixture.listen(0,'127.0.0.1');await once(fixture,'listening');t.after(async()=>{fixture.closeAllConnections();await new Promise(resolve=>fixture.close(resolve))});
++ const origin=`http://127.0.0.1:${fixture.address().port}`;
++ await send('Page.enable');await send('Runtime.enable');
++ const navigate=async path=>{await send('Page.navigate',{url:origin+path});const deadline=Date.now()+2000;while(Date.now()<deadline){const value=await send('Runtime.evaluate',{expression:'document.readyState',returnByValue:true});if(value.result.value==='complete')return;await new Promise(resolve=>setTimeout(resolve,5))}throw Error('actual load completion not observed within2s')};
++ const observed=path=>client.events.filter(event=>event.sessionId===sessionId&&event.method==='Network.requestWillBeSent'&&event.params.request.url===origin+path).length;
++ await send('Network.disable');await assert.rejects(send('Network.notARealMethod.enable'),error=>error.code===-32601);await navigate('/disabled');assert.equal(observed('/disabled'),0);
++ await send('Network.enable');await assert.rejects(send('Network.notARealMethod.disable'),error=>error.code===-32601);await navigate('/enabled');assert.equal(observed('/enabled'),1);
++ await send('Network.disable');await navigate('/disabled-again');assert.equal(observed('/disabled-again'),0);
++ assert.deepEqual(requests,['/disabled','/enabled','/disabled-again']);
++});
++
++test('Runtime disable preserves real utility context, handle and binding authority across duplicate disable and re-enable',async t=>{
++ const{client,sessionId,send}=await setup(t);
++ await send('Runtime.disable');await send('Runtime.enable');
++ const{frameTree}=await send('Page.getFrameTree');
++ const{executionContextId:contextId}=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'retained-dispatch-world'});
++ const retained=(await send('Runtime.evaluate',{contextId,expression:'({value:41})'})).result;
++ await send('Runtime.addBinding',{name:'dispatchReport',executionContextId:contextId});
++ const start=client.events.length;
++ await send('Runtime.disable');await send('Runtime.disable');
++ const call=()=>send('Runtime.callFunctionOn',{objectId:retained.objectId,functionDeclaration:'function(){return this.value+1}',returnByValue:true});
++ assert.equal((await call()).result.value,42);
++ await send('Runtime.evaluate',{contextId,expression:'dispatchReport("disabled");true',returnByValue:true});
++ assert.equal(client.events.slice(start).filter(event=>event.method==='Runtime.bindingCalled').length,0);
++ assert.equal((await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'retained-dispatch-world'})).executionContextId,contextId);
++ await send('Runtime.enable');await send('Runtime.enable');
++ assert.equal(client.events.slice(start).filter(event=>event.sessionId===sessionId&&event.method==='Runtime.executionContextCreated'&&event.params.context.id===contextId).length,1);
++ assert.equal(client.events.slice(start).filter(event=>event.method==='Runtime.executionContextDestroyed'&&event.params.executionContextId===contextId).length,0);
++ assert.equal((await call()).result.value,42);
++ await send('Runtime.evaluate',{contextId,expression:'dispatchReport("enabled");true',returnByValue:true});
++ const reports=client.events.slice(start).filter(event=>event.method==='Runtime.bindingCalled');
++ assert.equal(reports.length,1);assert.equal(reports[0].params.payload,'enabled');assert.equal(reports[0].params.executionContextId,contextId);
++});
