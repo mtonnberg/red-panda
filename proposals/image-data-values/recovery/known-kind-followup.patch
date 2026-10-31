@@ -1,0 +1,29 @@
+--- a/src/image-data.js
++++ b/src/image-data.js
+@@ -2,6 +2,7 @@
+ // Successful factory identities, not authored prototype/tag/symbol fields,
+ // provide private state and clone provenance.
+ import { types } from 'node:util';
++import { registerPlatformFactoryKind } from './platform-factory-hooks.js';
+ import { registerPlatformFactory, platformFactoryRecord } from './platform-factories.js';
+ const states=new WeakMap(),installed=new WeakMap();
+ const typed=Object.getPrototypeOf(Uint8Array.prototype),length=Object.getOwnPropertyDescriptor(typed,'length').get;
+@@ -58,6 +59,7 @@
+  return{construct(record){const data=new Clamped(record.bytes.length);for(let i=0;i<record.bytes.length;i++)data[i]=record.bytes[i];return new ImageData(data,record.width,record.height)}};
+ }
+ export function installImageData(realm){
++ registerPlatformFactoryKind('ImageData');
+  if(installed.has(realm))return installed.get(realm);
+  const ErrorCtor=realm.TypeError;
+  const api=realm.eval(`(${factory.toString()})`)(realm,{
+--- a/src/clone-object-kind.js
++++ b/src/clone-object-kind.js
+@@ -4,7 +4,7 @@
+ import { platformFactoryRecord } from './platform-factories.js';
+ import { knownPlatformFactoryKind } from './platform-factory-hooks.js';
+ const descriptor = Object.getOwnPropertyDescriptor, prototype = Object.getPrototypeOf;
+-const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad','ImageData','EncodedAudioChunk','EncodedVideoChunk','VideoColorSpace']);
++const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad','EncodedAudioChunk','EncodedVideoChunk','VideoColorSpace']);
+ export function cloneObjectKind(value) {
+   if (Array.isArray(value)) return 'Array';
+   for (const [kind, test] of [['Map',types.isMap],['Set',types.isSet],['Error',types.isNativeError],['ArrayBuffer',types.isAnyArrayBuffer],['View',ArrayBuffer.isView],['Date',types.isDate],['RegExp',types.isRegExp]]) if (test(value)) return kind;

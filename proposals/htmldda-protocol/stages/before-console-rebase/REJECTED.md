@@ -1,0 +1,1 @@
+Rejected before application: this draft compared current Root with an older candidate and unintentionally removed newer Console import/event normalization lines. Do not apply this stage. The top-level integration.patch preserves those fields and supersedes it.

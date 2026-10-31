@@ -1,0 +1,527 @@
+{
+  "binarySHA256": "520fdea78bf9253149db3612874a9b0101121fda2a50711607487e828515dee6",
+  "driverSHA256": "449ad02d94f62a35229f786dd4bf4a99682f125bfa7bd1b4fb0681ec95b62512",
+  "observations": [
+    {
+      "label": "plain",
+      "expression": "({a:1,b:\"two\"})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "b": "two"
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "own-toJSON",
+      "expression": "({a:1,toJSON(){hits.push(\"own-toJSON\");return {changed:2}}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "nonenumerable-toJSON",
+      "expression": "Object.defineProperty({a:1},\"toJSON\",{value(){hits.push(\"hidden-toJSON\");return 9}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "inherited-toJSON",
+      "expression": "Object.assign(Object.create({toJSON(){hits.push(\"inherited-toJSON\");return 8}}),{a:1})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "toJSON-getter",
+      "expression": "Object.defineProperty({a:1},\"toJSON\",{enumerable:true,get(){hits.push(\"toJSON-getter\");return ()=>9}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      },
+      "hits": [
+        "toJSON-getter"
+      ]
+    },
+    {
+      "label": "hidden-getter",
+      "expression": "Object.defineProperty({a:1},\"hidden\",{get(){hits.push(\"hidden\");return 7}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "own-getter",
+      "expression": "Object.defineProperty({a:1},\"visible\",{enumerable:true,get(){hits.push(\"visible\");return 7}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "visible": 7
+          }
+        }
+      },
+      "hits": [
+        "visible"
+      ]
+    },
+    {
+      "label": "inherited-getter",
+      "expression": "Object.assign(Object.create({get inherited(){hits.push(\"inherited\");return 8}}),{a:1})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "throwing-getter",
+      "expression": "Object.defineProperty({},\"visible\",{enumerable:true,get(){hits.push(\"throw\");throw Error(\"getter-failure\")}})",
+      "error": {
+        "code": -32603,
+        "message": "Internal error"
+      },
+      "hits": [
+        "throw"
+      ]
+    },
+    {
+      "label": "symbol-key",
+      "expression": "({a:1,[Symbol(\"secret\")]:2})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "nested-values",
+      "expression": "({u:undefined,f(){},s:Symbol(\"s\"),n:null,a:[undefined,function(){},Symbol(\"s\"),null]})",
+      "error": {
+        "code": -32000,
+        "message": "Object couldn't be returned by value"
+      },
+      "hits": []
+    },
+    {
+      "label": "nonfinite",
+      "expression": "({nan:NaN,infinity:Infinity,negative:-Infinity,zero:-0})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "nan": null,
+            "infinity": null,
+            "negative": null,
+            "zero": 0
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "bigint-property",
+      "expression": "({a:1,b:2n})",
+      "error": {
+        "code": -32000,
+        "message": "Object couldn't be returned by value"
+      },
+      "hits": []
+    },
+    {
+      "label": "bigint-array",
+      "expression": "[1,2n]",
+      "error": {
+        "code": -32000,
+        "message": "Object couldn't be returned by value"
+      },
+      "hits": []
+    },
+    {
+      "label": "sparse-array",
+      "expression": "Object.assign(Array(3),{1:\"one\",extra:42})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            null,
+            "one",
+            null
+          ]
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "array-accessor",
+      "expression": "Object.defineProperty([1,2],\"1\",{get(){hits.push(\"array-index\");return 7}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            1,
+            7
+          ]
+        }
+      },
+      "hits": [
+        "array-index"
+      ]
+    },
+    {
+      "label": "array-toJSON",
+      "expression": "Object.assign([1,2],{toJSON(){hits.push(\"array-toJSON\");return 8}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            1,
+            2
+          ]
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "boxed-number",
+      "expression": "new Number(17)",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "boxed-string",
+      "expression": "new String(\"abc\")",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "0": "a",
+            "1": "b",
+            "2": "c"
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "boxed-boolean",
+      "expression": "new Boolean(false)",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "date",
+      "expression": "new Date(\"2020-01-02T03:04:05Z\")",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "regexp",
+      "expression": "/ab/gi",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "map",
+      "expression": "new Map([[\"a\",1]])",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "set",
+      "expression": "new Set([1])",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "typed-array",
+      "expression": "new Uint8Array([7,8])",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "0": 7,
+            "1": 8
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "data-view",
+      "expression": "new DataView(new ArrayBuffer(3))",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "array-buffer",
+      "expression": "new ArrayBuffer(3)",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "error",
+      "expression": "new TypeError(\"bad\")",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "error-extra",
+      "expression": "Object.assign(new Error(\"bad\"),{extra:17})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "extra": 17
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "dom-exception",
+      "expression": "new DOMException(\"bad\",\"AbortError\")",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "url",
+      "expression": "new URL(\"https://example.test/a?x=1\")",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "point",
+      "expression": "typeof DOMPoint===\"function\"?new DOMPoint(1,2,3,4):{unavailable:\"DOMPoint\"}",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "rect",
+      "expression": "typeof DOMRect===\"function\"?new DOMRect(1,2,3,4):{unavailable:\"DOMRect\"}",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "video-color",
+      "expression": "typeof VideoColorSpace===\"function\"?new VideoColorSpace({matrix:\"rgb\"}):{unavailable:\"VideoColorSpace\"}",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "null-prototype",
+      "expression": "Object.assign(Object.create(null),{a:1})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "proto-key",
+      "expression": "Object.defineProperty({},\"__proto__\",{value:{pollution:true},enumerable:true})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "__proto__": {
+              "pollution": true
+            }
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "enumeration-mutation",
+      "expression": "Object.defineProperty({a:1},\"b\",{enumerable:true,get(){hits.push(\"mutate\");this.c=3;delete this.a;return 2}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "b": 2
+          }
+        }
+      },
+      "hits": [
+        "mutate"
+      ]
+    },
+    {
+      "label": "proxy",
+      "expression": "new Proxy({a:1},{ownKeys(t){hits.push(\"ownKeys\");return Reflect.ownKeys(t)},getOwnPropertyDescriptor(t,k){hits.push(\"descriptor:\"+String(k));return Reflect.getOwnPropertyDescriptor(t,k)},get(t,k,r){hits.push(\"get:\"+String(k));return Reflect.get(t,k,r)}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      },
+      "hits": [
+        "ownKeys",
+        "descriptor:a"
+      ]
+    },
+    {
+      "label": "revoked-proxy",
+      "expression": "(()=>{const p=Proxy.revocable({},{});p.revoke();return p.proxy})()",
+      "error": {
+        "code": -32603,
+        "message": "Internal error"
+      },
+      "hits": []
+    },
+    {
+      "label": "nested-toJSON",
+      "expression": "({nested:{a:1,toJSON(){hits.push(\"nested-toJSON\");return 8}}})",
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "nested": {
+              "a": 1,
+              "toJSON": {}
+            }
+          }
+        }
+      },
+      "hits": []
+    },
+    {
+      "label": "array-cycle",
+      "expression": "(()=>{const a=[];a.push(a);return a})()",
+      "error": {
+        "code": -32000,
+        "message": "Object reference chain is too long"
+      },
+      "hits": []
+    },
+    {
+      "label": "object-cycle",
+      "expression": "(()=>{const a={};a.self=a;return a})()",
+      "error": {
+        "code": -32000,
+        "message": "Object reference chain is too long"
+      },
+      "hits": []
+    }
+  ]
+}

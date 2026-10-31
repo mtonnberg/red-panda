@@ -43,7 +43,7 @@ function details(session, error, contextId) {
   return { ...session.exception(error, contextId), executionContextId: contextId };
 }
 
-class RealmInspector {
+export class RealmInspector {
   constructor(page) {
     this.page = page; this.inspector = new InspectorSession(); this.inspector.connect();
     this.contexts = new Map(); this.enabled = false; this.selected = undefined; this.closed = false;
@@ -64,6 +64,23 @@ class RealmInspector {
       });
     });
   }
+  postSync(method,params={}) {
+    if(this.closed)throw new RuntimeError('Execution context was destroyed',-32000);
+    let completed=false,result,failure;
+    this.inspector.post(method,params,(error,value)=>{completed=true;failure=error;result=value;});
+    if(!completed)throw new RuntimeError('Synchronous protocol serialization unavailable',-32603);
+    if(failure){const match=/^Inspector error (-?\d+): ([\s\S]*)$/.exec(failure.message);throw new RuntimeError(match?match[2]:'Internal error',match?Number(match[1]):-32603);}
+    return result;
+  }
+  realmSync() {
+    const name=nameForVMContext(this.page.dom.getInternalVMContext());
+    if(!name||!isOwnedVMContextName(name))throw new RuntimeError('Selected page VM context has no registered name',-32000);
+    if(this.selected!==undefined&&this.contexts.get(this.selected)===name)return this.selected;
+    if(!this.enabled){this.postSync('Runtime.enable');this.enabled=true;}
+    const matches=[...this.contexts].filter(([,candidate])=>candidate===name).map(([id])=>id);
+    if(matches.length!==1)throw new RuntimeError('Could not identify one named page execution context',-32000);
+    this.selected=matches[0];return this.selected;
+  }
   async realm() {
     const name = nameForVMContext(this.page.dom.getInternalVMContext());
     if (!name) throw new RuntimeError('Selected page VM context has no registered name', -32000);
@@ -76,7 +93,7 @@ class RealmInspector {
   async lexicalNames() { return this.post('Runtime.globalLexicalScopeNames', { executionContextId: await this.realm() }); }
   close() {
     if (this.closed) return;
-    this.closed = true; this.inspector.disconnect(); this.contexts.clear();
+    this.inspector.disconnect(); this.closed = true; this.contexts.clear();
   }
 }
 
@@ -187,33 +204,34 @@ export async function runRuntime(session, method, params = {}) {
       const script = state.scripts.get(params.scriptId);
       if (!script) throw new RuntimeError('No script with given id', -32000);
       state.scripts.delete(params.scriptId); // V8 persisted scripts are single-use.
+      let value;
       try {
-        let value;
         try { value = script.runInContext(page.dom.getInternalVMContext(), { timeout: Math.min(page.timeout, 2000), displayErrors: false }); }
         finally { page.reconcileURL?.(); }
         if (params.awaitPromise) value = await awaitInState(state, value);
         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
-        return { result: session.remote(value, params.returnByValue, params.objectGroup, contextId) };
       } catch (error) {
         if (error instanceof RuntimeError) throw error;
         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
         return { result: { type: 'undefined' }, exceptionDetails: details(session, error, contextId) };
       }
+      return { result: session.remote(value, params.returnByValue, params.objectGroup, contextId) };
     }
     case 'Runtime.awaitPromise': {
       string(params.promiseObjectId, 'promiseObjectId'); boolean(params.returnByValue, 'returnByValue');
       const promise = session.object(params.promiseObjectId);
       if (!types.isPromise(promise)) throw new RuntimeError('Object is not a Promise');
       const group = session.objects?.get(params.promiseObjectId)?.group;
+      let value;
       try {
-        const value = await awaitInState(state, promise);
+        value = await awaitInState(state, promise);
         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
-        return { result: session.remote(value, params.returnByValue, group, contextId) };
       } catch (error) {
         if (error instanceof RuntimeError) throw error;
         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
         return { result: session.remote(error, params.returnByValue, group, contextId), exceptionDetails: details(session, error, contextId) };
       }
+      return { result: session.remote(value, params.returnByValue, group, contextId) };
     }
     case 'Runtime.globalLexicalScopeNames': {
       const result=await inspector().lexicalNames(),owned=invocationBindingFor(page.dom.getInternalVMContext());

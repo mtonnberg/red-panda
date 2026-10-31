@@ -7,6 +7,11 @@ const require = createRequire(import.meta.url);
 let installed = false;
 const knownKinds = new Set();
 export function knownPlatformFactoryKind(kind) { return knownKinds.has(kind); }
+// Known names only affect ordinary lookalike classification, never branding.
+export function registerPlatformFactoryKind(kind) {
+  if (typeof kind !== 'string' || !kind) throw new TypeError('Platform factory kind is required');
+  knownKinds.add(kind);
+}
 // Only successful trusted generated setup/new returns register an identity.
 // Candidate classification never discovers brands from implementation symbols.
 export function installPlatformFactoryHooks() {

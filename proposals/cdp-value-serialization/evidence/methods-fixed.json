@@ -1,0 +1,332 @@
+{
+  "binarySHA256": "41f60878144bff4d24b5f6b3b18e162ff930b09b3a980d252099aa34a2d18683",
+  "driverSHA256": "899cd250fb8ae590485822e8a2cedbc2e14cb39aa6b9b0364132715feb464a59",
+  "observations": [
+    {
+      "label": "init",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.hits=[];true",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "call-own-toJSON",
+      "method": "Runtime.callFunctionOn",
+      "params": {
+        "functionDeclaration": "function(){return {a:1,toJSON(){hits.push(\"toJSON\");return 9}}}",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "call-bigint",
+      "method": "Runtime.callFunctionOn",
+      "params": {
+        "functionDeclaration": "function(){return {a:1n}}",
+        "returnByValue": true
+      },
+      "error": {
+        "code": -32000,
+        "message": "Object couldn't be returned by value"
+      }
+    },
+    {
+      "label": "run-own-toJSON",
+      "method": "Runtime.runScript",
+      "params": {
+        "scriptId": "8e4cc3a6-8c56-44cb-b5f3-3aae705d9a4b",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "run-cycle",
+      "method": "Runtime.runScript",
+      "params": {
+        "scriptId": "4c2f2ddf-940a-49f4-b57e-fb4d372d35f7",
+        "returnByValue": true
+      },
+      "error": {
+        "code": -32000,
+        "message": "Object reference chain is too long"
+      }
+    },
+    {
+      "label": "await-own-toJSON",
+      "method": "Runtime.awaitPromise",
+      "params": {
+        "promiseObjectId": "51082eba-0423-48d6-beb9-c903d7533991",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "await-cycle",
+      "method": "Runtime.awaitPromise",
+      "params": {
+        "promiseObjectId": "6406a36d-e2ea-4132-8b1b-f264d8583bd0",
+        "returnByValue": true
+      },
+      "error": {
+        "code": -32000,
+        "message": "Object reference chain is too long"
+      }
+    },
+    {
+      "label": "own-undefined",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({u:undefined,f(){}})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "f": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "array-undefined",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "[undefined,function(){}]",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            null,
+            {}
+          ]
+        }
+      }
+    },
+    {
+      "label": "function-own-property",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "Object.assign(function(){},{marker:17})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "function",
+          "value": {
+            "marker": 17
+          }
+        }
+      }
+    },
+    {
+      "label": "array-proxy",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "new Proxy([1,2],{get(t,k,r){hits.push(\"get:\"+String(k));return Reflect.get(t,k,r)}})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "0": 1,
+            "1": 2
+          }
+        }
+      }
+    },
+    {
+      "label": "getter-microtask",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({get value(){hits.push(\"get\");queueMicrotask(()=>hits.push(\"microtask\"));return 1}})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "value": 1
+          }
+        }
+      }
+    },
+    {
+      "label": "side-effects",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "hits",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            "get:0",
+            "get:1",
+            "get",
+            "microtask"
+          ]
+        }
+      }
+    },
+    {
+      "label": "utility-listen",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 2,
+        "expression": "globalThis.foreign=null;document.addEventListener(\"actual-value\",event=>{globalThis.foreign=event.detail});true",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "main-transfer",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.foreign={marker:17,toJSON(){hits.push(\"foreign-toJSON\");return 9}};document.dispatchEvent(new CustomEvent(\"actual-value\",{detail:foreign}));true",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "utility-foreign",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 2,
+        "expression": "foreign",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "marker": 17,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "utility-foreign-call",
+      "method": "Runtime.callFunctionOn",
+      "params": {
+        "executionContextId": 2,
+        "functionDeclaration": "function(){return {foreign,nested:{toJSON(){return 9},marker:23}}}",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "foreign": {
+              "marker": 17,
+              "toJSON": {}
+            },
+            "nested": {
+              "toJSON": {},
+              "marker": 23
+            }
+          }
+        }
+      }
+    },
+    {
+      "label": "utility-public-intrinsics",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 2,
+        "expression": "globalThis.saved=Object.create({toJSON(){throw Error(\"called\")}});saved.marker=29;JSON.parse=JSON.stringify=()=>{throw Error(\"JSON\")};Function.prototype.apply=Reflect.apply=()=>{throw Error(\"apply\")};saved",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "marker": 29
+          }
+        }
+      }
+    },
+    {
+      "label": "main-public-intrinsics",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "JSON.parse=JSON.stringify=()=>{throw Error(\"JSON\")};Function.prototype.apply=Reflect.apply=()=>{throw Error(\"apply\")};foreign",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "marker": 17,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "main-toJSON-hits",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "hits",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            "get:0",
+            "get:1",
+            "get",
+            "microtask"
+          ]
+        }
+      }
+    }
+  ]
+}

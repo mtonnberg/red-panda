@@ -1,0 +1,336 @@
+{
+  "binarySHA256": "41f60878144bff4d24b5f6b3b18e162ff930b09b3a980d252099aa34a2d18683",
+  "driverSHA256": "fdf304be2af9d21f9c559ca9f3910ee9515a53f73bd720d91b238e2f757b1373",
+  "observations": [
+    {
+      "label": "init",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.hits=[];true",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "call-own-toJSON",
+      "method": "Runtime.callFunctionOn",
+      "params": {
+        "executionContextId": 1,
+        "functionDeclaration": "function(){return {a:1,toJSON(){hits.push(\"toJSON\");return 9}}}",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "call-bigint",
+      "method": "Runtime.callFunctionOn",
+      "params": {
+        "executionContextId": 1,
+        "functionDeclaration": "function(){return {a:1n}}",
+        "returnByValue": true
+      },
+      "error": {
+        "code": -32000,
+        "message": "Object couldn't be returned by value"
+      }
+    },
+    {
+      "label": "run-own-toJSON",
+      "method": "Runtime.runScript",
+      "params": {
+        "scriptId": "56ae7de5-1905-498d-aab4-5d3da3ce99c1",
+        "executionContextId": 1,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "run-cycle",
+      "method": "Runtime.runScript",
+      "params": {
+        "scriptId": "33af9bbd-c90c-4768-bf64-5bfb1f53579e",
+        "executionContextId": 1,
+        "returnByValue": true
+      },
+      "error": {
+        "code": -32000,
+        "message": "Object reference chain is too long"
+      }
+    },
+    {
+      "label": "await-own-toJSON",
+      "method": "Runtime.awaitPromise",
+      "params": {
+        "promiseObjectId": "8908b49c-fead-4a1f-8f2e-6888cacf8792",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "a": 1,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "await-cycle",
+      "method": "Runtime.awaitPromise",
+      "params": {
+        "promiseObjectId": "d73944fc-de01-44b7-938b-ffe250d21021",
+        "returnByValue": true
+      },
+      "error": {
+        "code": -32000,
+        "message": "Object reference chain is too long"
+      }
+    },
+    {
+      "label": "own-undefined",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({u:undefined,f(){}})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "f": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "array-undefined",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "[undefined,function(){}]",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            null,
+            {}
+          ]
+        }
+      }
+    },
+    {
+      "label": "function-own-property",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "Object.assign(function(){},{marker:17})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "function",
+          "value": {
+            "marker": 17
+          }
+        }
+      }
+    },
+    {
+      "label": "array-proxy",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "new Proxy([1,2],{get(t,k,r){hits.push(\"get:\"+String(k));return Reflect.get(t,k,r)}})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "0": 1,
+            "1": 2
+          }
+        }
+      }
+    },
+    {
+      "label": "getter-microtask",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({get value(){hits.push(\"get\");queueMicrotask(()=>hits.push(\"microtask\"));return 1}})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "value": 1
+          }
+        }
+      }
+    },
+    {
+      "label": "side-effects",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "hits",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            "get:0",
+            "get:1",
+            "get",
+            "microtask"
+          ]
+        }
+      }
+    },
+    {
+      "label": "utility-listen",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 2,
+        "expression": "globalThis.foreign=null;document.addEventListener(\"actual-value\",event=>{globalThis.foreign=event.detail});true",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "main-transfer",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.foreign={marker:17,toJSON(){hits.push(\"foreign-toJSON\");return 9}};document.dispatchEvent(new CustomEvent(\"actual-value\",{detail:foreign}));true",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "utility-foreign",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 2,
+        "expression": "foreign",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "marker": 17,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "utility-foreign-call",
+      "method": "Runtime.callFunctionOn",
+      "params": {
+        "executionContextId": 2,
+        "functionDeclaration": "function(){return {foreign,nested:{toJSON(){return 9},marker:23}}}",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "foreign": {
+              "marker": 17,
+              "toJSON": {}
+            },
+            "nested": {
+              "toJSON": {},
+              "marker": 23
+            }
+          }
+        }
+      }
+    },
+    {
+      "label": "utility-public-intrinsics",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 2,
+        "expression": "globalThis.saved=Object.create({toJSON(){throw Error(\"called\")}});saved.marker=29;JSON.parse=JSON.stringify=()=>{throw Error(\"JSON\")};Function.prototype.apply=Reflect.apply=()=>{throw Error(\"apply\")};saved",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "marker": 29
+          }
+        }
+      }
+    },
+    {
+      "label": "main-public-intrinsics",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "JSON.parse=JSON.stringify=()=>{throw Error(\"JSON\")};Function.prototype.apply=Reflect.apply=()=>{throw Error(\"apply\")};foreign",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "marker": 17,
+            "toJSON": {}
+          }
+        }
+      }
+    },
+    {
+      "label": "main-toJSON-hits",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "hits",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": [
+            "get:0",
+            "get:1",
+            "get",
+            "microtask"
+          ]
+        }
+      }
+    }
+  ]
+}

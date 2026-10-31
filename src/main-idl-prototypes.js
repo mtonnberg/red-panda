@@ -3,6 +3,8 @@
 // unchanged except the explicitly realm-compiled sequence method below.
 import 'jsdom';
 import vm from 'node:vm';
+import {restoreWindowGlobalInheritance} from './window-global.js';
+import {originalGlobalPrototypeFor} from './context-names.js';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
 const interfaces=require('jsdom/lib/jsdom/living/interfaces.js');
@@ -23,6 +25,7 @@ export function alignMainIDLPrototypes(window){
  for(const fn of functions)if(prototypeOf(fn)===hostFunction)setPrototype(fn,functionPrototype);
  const property=descriptor(window.Element.prototype,'getAttributeNames');
  const context=utils.implForWrapper(window.document)._globalObject;
+ if(originalGlobalPrototypeFor(context))restoreWindowGlobalInheritance(window,context);
  const wrapper=vm.compileFunction('return ({getAttributeNames(...args){const values=apply(original,this,args);return apply(from,ArrayConstructor,[values]);}}).getAttributeNames;',['original','apply','from','ArrayConstructor'],{parsingContext:context})(property.value,window.Reflect.apply,window.Array.from,window.Array);
  for(const key of ['name','length'])Object.defineProperty(wrapper,key,descriptor(property.value,key));
  Object.defineProperty(window.Element.prototype,'getAttributeNames',{...property,value:wrapper});

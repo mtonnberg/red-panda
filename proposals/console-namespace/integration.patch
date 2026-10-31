@@ -1,0 +1,312 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installConsole} from './console.js';
+ import { SyncHTTP } from './sync-http.js';
+ import {installFrameActivity} from './frame-activity.js';
+ import {installHeapFactories,prepareHeapRealm} from './heap-registry.js';
+@@ -241,6 +242,7 @@
+       installDialogs(this, window);
+       installForms(this, window);
+       installDocumentXML(this, window);
++      installConsole(window,{emit:(type,args)=>this.emit('console',{type,args})});
+       installCustomElements(this, window);
+       this.moduleScripts = installModuleScripts(this, window);
+       installClassicScripts(this, window);
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,4 @@
++import {installConsole,consoleProtocolType} from './console.js';
+ import {registerPlatformFactory} from './platform-factories.js';
+ // Independent genuine VM/IDL-world prototype. Generated wrapper source comes
+ // from the pinned existing jsdom dependency; no target engine source is used.
+@@ -96,7 +97,7 @@
+  const clearTimer=id=>{const handle=timerHandles.get(id);if(handle!==undefined){clearTimeout(handle);clearInterval(handle);}timerHandles.delete(id);timers.delete(id);};
+  global.setTimeout=realmFunction((...args)=>timerBridge(false,...args));global.setInterval=realmFunction((...args)=>timerBridge(true,...args));const cancellations=vm.compileFunction("return {clearTimeout(id=0){const n=+id;clear(Number.isFinite(n)?Math.trunc(n)|0:0)},clearInterval(id=0){const n=+id;clear(Number.isFinite(n)?Math.trunc(n)|0:0)}}",["clear"],{parsingContext:context})(clearTimer);global.clearTimeout=cancellations.clearTimeout;global.clearInterval=cancellations.clearInterval;
+  global.queueMicrotask=realmFunction(callback=>{if(typeof callback!=='function')throw new global.TypeError('Callback must be a function');queueMicrotask(()=>{if(!disposed)Reflect.apply(callback,undefined,[]);});});
+- global.console=vm.runInContext('({})',context);for(const method of ['log','warn','error','info','debug'])global.console[method]=realmFunction((...args)=>onConsole?onConsole(method,args):mainWindow.console[method](...args));
++ installConsole(global,{evaluate:source=>vm.runInContext(source,context),emit:(type,args)=>onConsole?onConsole(consoleProtocolType(type),args):Reflect.apply(mainWindow.console[type],mainWindow.console,args)});
+  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
+  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
+  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import {consoleProtocolType} from './console.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+ import {canonicalUtilityValue} from './isolated-world.js';
+@@ -119,7 +120,7 @@
+       timestamp: Date.now(), exceptionDetails: this.exception(error, executionContextId),
+     }));
+     listen('frameConsole', ({ type, args, executionContextId }) => this.event('Runtime.consoleAPICalled', {
+-      type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
++      type:consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
+     }));
+     listen('domContentLoaded', () => {
+       this.event('Page.domContentEventFired', { timestamp: timestamp() });
+@@ -163,7 +164,7 @@
+       requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
+     }));
+     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
+-      type: type === 'log' ? 'log' : type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
++      type:consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+       executionContextId, timestamp: Date.now(),
+     }));
+     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
+--- /dev/null
++++ b/src/console.js
+@@ -0,0 +1,53 @@
++// Independent Console namespace: genuine realm methods and host-private state.
++const records=new WeakMap(),apply=Reflect.apply;
++const own=Object.getOwnPropertyDescriptor,define=Object.defineProperty;
++export const consoleProtocolType=type=>type==='warn'?'warning':type;
++function factory(g,bridge){
++ const {defineProperty,create,setPrototypeOf,getOwnPropertyDescriptor}=Object;
++ const apply=Reflect.apply,StringConstructor=String,TypeErrorConstructor=TypeError,ErrorConstructor=Error;
++ const primitiveSymbol=Symbol.toPrimitive,description=getOwnPropertyDescriptor(Symbol.prototype,'description').get;
++ function label(value){
++  if(value===undefined)return 'default';
++  const object=v=>v!==null&&(typeof v==='object'||typeof v==='function');
++  if(object(value)){
++   const exotic=value[primitiveSymbol];
++   if(exotic!==null&&exotic!==undefined){if(typeof exotic!=='function')throw new TypeErrorConstructor('invalid argument');value=apply(exotic,value,['string']);if(object(value))throw new TypeErrorConstructor('invalid argument');}
++   else{let done=false;for(let index=0;index<2;index++){const key=index===0?'toString':'valueOf';const method=value[key];if(typeof method!=='function')continue;const result=apply(method,value,[]);if(!object(result)){value=result;done=true;break;}}if(!done)throw new TypeErrorConstructor('invalid argument');}
++  }
++  return StringConstructor(typeof value==='symbol'?apply(description,value,[]):value);
++ }
++ class Console{constructor(){throw new TypeErrorConstructor('Illegal constructor');}}
++ class ConsoleTask{constructor(){const task={run(callback=undefined){if(typeof callback!=='function')throw new ErrorConstructor('First argument must be a function.');return apply(callback,undefined,[]);}};setPrototypeOf(task,ConsoleTask.prototype);return task;}}
++ const namespace={
++  trace(...args){bridge.emit('trace',args);},debug(...args){bridge.emit('debug',args);},info(...args){bridge.emit('info',args);},log(...args){bridge.emit('log',args);},warn(...args){bridge.emit('warn',args);},
++  clear(){},assert(condition=undefined,...args){if(!condition)bridge.emit('warn',args);},error(...args){bridge.emit('error',args);},exception(...args){bridge.emit('error',args);},
++  table(){},dir(...args){bridge.emit('dir',args);},dirxml(...args){bridge.emit('dirxml',args);},
++  count(value=undefined){bridge.count(label(value));},countReset(value=undefined){bridge.countReset(label(value));},
++  time(value=undefined){bridge.time(label(value));},timeLog(value=undefined,...args){bridge.timeLog(label(value),args);},timeEnd(value=undefined){bridge.timeEnd(label(value));},
++  group(...args){bridge.group();},groupCollapsed(...args){bridge.group();},groupEnd(){bridge.groupEnd();},
++  createTask(name=undefined){if(typeof name!=='string'||name.length===0)throw new ErrorConstructor('First argument must be a non-empty string.');return new ConsoleTask();},
++ };
++ setPrototypeOf(namespace,Console.prototype);defineProperty(namespace,Symbol.toStringTag,{value:'console',configurable:true});
++ const accessor={get console(){const value=bridge.get(this);if(value===undefined)throw new TypeErrorConstructor('Illegal invocation');return value;},set console(value){defineProperty(this,'console',{value,writable:true,configurable:true,enumerable:true});}};
++ const prototype=g.Window?.prototype??g.WorkerGlobalScope?.prototype;
++ if(prototype){delete g.console;defineProperty(prototype,'console',getOwnPropertyDescriptor(accessor,'console'));}
++ else defineProperty(g,'console',{value:namespace,configurable:true,writable:true,enumerable:true});
++ return namespace;
++}
++export function installConsole(realm,{evaluate=source=>realm.eval(source),emit}={}){
++ if(records.has(realm))return records.get(realm).namespace;
++ if(typeof emit!=='function')throw new TypeError('Console output bridge is required');
++ const counters=new Map(),timers=new Map();let depth=0;
++ const bridge={
++  get:receiver=>records.get(receiver)?.namespace,
++  emit(type,args){const values=[];for(let i=0;i<args.length;i++)define(values,String(i),{value:own(args,String(i)).value,enumerable:true,writable:true,configurable:true});emit(type,values);},
++  count:key=>counters.set(key,(counters.get(key)??0)+1),countReset:key=>counters.delete(key),
++  time:key=>{if(!timers.has(key))timers.set(key,performance.now());},timeLog:key=>{if(timers.has(key))return performance.now()-timers.get(key);},timeEnd:key=>timers.delete(key),
++  group:()=>depth++,groupEnd:()=>{if(depth)depth--;},
++ };
++ const namespace=evaluate(`(${factory.toString()})`)(realm,bridge);
++ const record=Object.freeze(Object.assign(Object.create(null),{namespace}));
++ records.set(realm,record);records.set(evaluate('globalThis'),record);
++ for(const key of ['_globalObject','_globalProxy']){const descriptor=own(realm,key);if(descriptor&&'value'in descriptor&&descriptor.value&&typeof descriptor.value==='object')records.set(descriptor.value,record);}
++ return namespace;
++}
+--- /dev/null
++++ b/test/console.test.js
+@@ -0,0 +1,35 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++const native=JSON.parse(await readFile(new URL('../docs/reference/console-native.json',import.meta.url),'utf8'));
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>console');return {browser,page,w:page.dom.window};}
++test('Console namespace is a real realm object with the measured nonconstructable method shapes',async t=>{
++ const{page,w}=await fixture(t),expected=JSON.parse(native.observations.find(x=>x.name==='shape').result.result.value);
++ const actual=page.evaluate(`(()=>{const c=console,p=Object.getPrototypeOf(c),shape={tag:Object.prototype.toString.call(c),ownNames:Object.getOwnPropertyNames(c),symbols:Object.getOwnPropertySymbols(c).map(s=>[String(s),Object.getOwnPropertyDescriptor(c,s)]),prototypeIsObject:p===Object.prototype,prototypeNames:Object.getOwnPropertyNames(p),prototypeParentIsObject:Object.getPrototypeOf(p)===Object.prototype,globalDescriptor:Object.getOwnPropertyDescriptor(window,'console')??null,methods:{}};for(const name of shape.ownNames){const d=Object.getOwnPropertyDescriptor(c,name);if(typeof d.value!=='function')continue;let constructor;try{new d.value();constructor='allowed'}catch(e){constructor=[e.name,e instanceof TypeError]}shape.methods[name]={length:d.value.length,name:d.value.name,realm:Object.getPrototypeOf(d.value)===Function.prototype,ownPrototype:Object.hasOwn(d.value,'prototype'),descriptor:{writable:d.writable,enumerable:d.enumerable,configurable:d.configurable},constructor}}return JSON.stringify(shape)})()`);
++ assert.deepEqual(JSON.parse(actual),expected);assert.equal(w.Console,undefined);
++});
++test('namespace callbacks ignore receiver and deliver actual argument identities without fabricated groups or timers',async t=>{
++ const{page,w}=await fixture(t),events=[];page.on('console',x=>events.push(x));
++ page.evaluate(`globalThis.payload={actual:17};console.log.apply({},[payload]);const warn=console.warn;warn('warn');console.assert(false,payload);console.assert(true,'hidden');console.dir(payload);console.dirxml(payload,'extra');console.trace(payload);console.count();console.countReset();console.time();console.timeLog();console.timeEnd();console.group('outer');console.groupEnd();console.table(payload);console.clear();`);
++ assert.deepEqual(events.map(x=>x.type),['log','warn','warn','dir','dirxml','trace']);for(const index of [0,2,3,4,5])assert.equal(events[index].args[0],w.payload);assert.equal(events[4].args[1],'extra');
++});
++test('replaceable global and actual Window getter branding preserve independent frame namespaces',async t=>{
++ const{page,w}=await fixture(t),events=[];page.on('frameConsole',x=>events.push(x));
++ const actual=page.evaluate(`(()=>{const frame=document.createElement('iframe');document.body.append(frame);const child=frame.contentWindow,a=console,b=child.console,get=Object.getOwnPropertyDescriptor(Window.prototype,'console').get;let bad;try{get.call({})}catch(e){bad=e instanceof TypeError};child.console.log('child');'use strict';window.console={marker:29};const replaced=console.marker;window.console=a;return JSON.stringify({distinct:a!==b,foreign:get.call(child)===b,bad,replaced,restored:console===a,realm:Object.getPrototypeOf(b.log)===child.Function.prototype})})()`);
++ assert.deepEqual(JSON.parse(actual),{distinct:true,foreign:true,bad:true,replaced:29,restored:true,realm:true});assert.equal(events.length,1);assert.equal(events[0].args[0],'child');assert.notEqual(events[0].executionContextId,page.executionContextId);
++});
++test('real named tasks execute actual callbacks and retain measured errors and callback exceptions',async t=>{
++ const{page}=await fixture(t);const actual=page.evaluate(`(()=>{const rows=[];for(const value of [undefined,'',42,Symbol('x')])try{console.createTask(value)}catch(e){rows.push([e.name,e.message])};const task=console.createTask('actual');for(const callback of [undefined,17])try{task.run(callback)}catch(e){rows.push([e.name,e.message])};let thrown;try{task.run(()=>{throw 37})}catch(e){thrown=e};return JSON.stringify({rows,tag:Object.prototype.toString.call(task),names:Object.getOwnPropertyNames(task),length:task.run.length,value:task.run(function(){return [this===globalThis,arguments.length,41]}),thrown})})()`);
++ const x=JSON.parse(actual);assert.equal(x.rows.length,6);for(const row of x.rows)assert.equal(row[0],'Error');assert.equal(x.rows[0][1],'First argument must be a non-empty string.');assert.equal(x.rows.at(-1)[1],'First argument must be a function.');assert.deepEqual(x.value,[true,0,41]);assert.equal(x.thrown,37);assert.deepEqual(x.names,['run']);assert.equal(x.length,0);
++});
++test('captured intrinsics and host argument arrays survive authored global/prototype changes',async t=>{
++ const{page,w}=await fixture(t),events=[];page.on('console',x=>events.push(x));
++ const actual=page.evaluate(`(()=>{const original={Object,Error,TypeError,apply:Reflect.apply,iterator:Array.prototype[Symbol.iterator]},saved=console;let hits=0;Object.defineProperty(Array.prototype,'0',{set(){hits++;throw 'setter'},configurable:true});Array.prototype[Symbol.iterator]=()=>{throw 'iterator'};Reflect.apply=()=>{throw 'apply'};globalThis.Object=function(){throw 'Object'};globalThis.Error=function(){throw 'Error'};try{saved.count({toString(){return 'actual'}});saved.log(17,29);let conversion;try{saved.time({toString(){throw 43}})}catch(e){conversion=e};let error;try{saved.createTask('')}catch(e){error=e instanceof original.Error};return JSON.stringify({hits,conversion,error,value:saved.createTask('real').run(()=>47)})}finally{globalThis.Object=original.Object;globalThis.Error=original.Error;Reflect.apply=original.apply;delete Array.prototype['0'];Array.prototype[Symbol.iterator]=original.iterator}})()`);
++ assert.deepEqual(JSON.parse(actual),{hits:0,conversion:43,error:true,value:47});assert.deepEqual(events[0].args,[17,29]);assert.equal(w.console.log.length,0);
++});
++test('CDP console types and actual utility/frame context ownership follow the measured protocol',async t=>{
++ const service=await serve({port:0,loadResources:['iframe']}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Runtime.enable');await send('Page.enable');const page=service.browser.pages.get(targetId);const{executionContextId}=await send('Page.createIsolatedWorld',{frameId:page.frameId,worldName:'console-world'});await send('Runtime.evaluate',{expression:"console.warn('main');console.dirxml(document.body)",returnByValue:true});await send('Runtime.evaluate',{expression:"console.assert(false,'utility');console.trace('utility trace');globalThis.shape=Object.prototype.toString.call(console)",contextId:executionContextId});const types=client.events.filter(x=>x.method==='Runtime.consoleAPICalled').map(x=>({type:x.params.type,contextId:x.params.executionContextId}));assert.deepEqual(types,[{type:'warning',contextId:page.executionContextId},{type:'dirxml',contextId:page.executionContextId},{type:'warning',contextId:executionContextId},{type:'trace',contextId:executionContextId}]);assert.equal((await send('Runtime.evaluate',{expression:'shape',contextId:executionContextId,returnByValue:true})).result.value,'[object console]');
++});
+--- /dev/null
++++ b/docs/reference/console-native.json
+@@ -0,0 +1,159 @@
++{
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "74e9804f10ccf42c9589c6be5caee5f2cce15ed9c5c8ea1692cb85406531d59b",
++  "observations": [
++    {
++      "name": "shape",
++      "result": {
++        "result": {
++          "type": "string",
++          "value": "{\"tag\":\"[object console]\",\"ownNames\":[\"trace\",\"debug\",\"info\",\"log\",\"warn\",\"clear\",\"assert\",\"error\",\"exception\",\"table\",\"dir\",\"dirxml\",\"count\",\"countReset\",\"time\",\"timeLog\",\"timeEnd\",\"group\",\"groupCollapsed\",\"groupEnd\",\"createTask\"],\"symbols\":[[\"Symbol(Symbol.toStringTag)\",{\"value\":\"console\",\"writable\":false,\"enumerable\":false,\"configurable\":true}]],\"prototypeIsObject\":false,\"prototypeNames\":[\"constructor\"],\"prototypeParentIsObject\":true,\"globalDescriptor\":null,\"methods\":{\"trace\":{\"length\":0,\"name\":\"trace\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"debug\":{\"length\":0,\"name\":\"debug\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"info\":{\"length\":0,\"name\":\"info\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"log\":{\"length\":0,\"name\":\"log\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"warn\":{\"length\":0,\"name\":\"warn\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"clear\":{\"length\":0,\"name\":\"clear\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"assert\":{\"length\":0,\"name\":\"assert\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"error\":{\"length\":0,\"name\":\"error\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"exception\":{\"length\":0,\"name\":\"exception\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"table\":{\"length\":0,\"name\":\"table\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"dir\":{\"length\":0,\"name\":\"dir\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"dirxml\":{\"length\":0,\"name\":\"dirxml\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"count\":{\"length\":0,\"name\":\"count\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"countReset\":{\"length\":0,\"name\":\"countReset\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"time\":{\"length\":0,\"name\":\"time\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"timeLog\":{\"length\":0,\"name\":\"timeLog\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"timeEnd\":{\"length\":0,\"name\":\"timeEnd\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"group\":{\"length\":0,\"name\":\"group\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"groupCollapsed\":{\"length\":0,\"name\":\"groupCollapsed\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"groupEnd\":{\"length\":0,\"name\":\"groupEnd\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]},\"createTask\":{\"length\":0,\"name\":\"createTask\",\"realm\":true,\"ownPrototype\":false,\"descriptor\":{\"writable\":true,\"enumerable\":true,\"configurable\":true},\"constructor\":[\"TypeError\",true]}}}"
++        }
++      }
++    },
++    {
++      "name": "operations",
++      "result": {
++        "result": {
++          "type": "string",
++          "value": "[[\"log\",\"undefined\"],[\"assert\",\"undefined\"],[\"assert\",\"undefined\"],[\"assert\",\"undefined\"],[\"dir\",\"undefined\"],[\"dirxml\",\"undefined\"],[\"count\",\"undefined\"],[\"count\",\"undefined\"],[\"countReset\",\"undefined\"],[\"count\",\"undefined\"],[\"countReset\",\"undefined\"],[\"time\",\"undefined\"],[\"timeLog\",\"undefined\"],[\"timeEnd\",\"undefined\"],[\"timeEnd\",\"undefined\"],[\"group\",\"undefined\"],[\"groupCollapsed\",\"undefined\"],[\"groupEnd\",\"undefined\"],[\"groupEnd\",\"undefined\"],[\"clear\",\"undefined\"],[\"table\",\"undefined\"],[\"trace\",\"undefined\"]]"
++        }
++      }
++    },
++    {
++      "name": "prototype-task",
++      "result": {
++        "result": {
++          "type": "string",
++          "value": "{\"constructorType\":\"function\",\"constructorName\":\"Console\",\"constructorLength\":0,\"constructorIsObject\":false,\"descriptor\":{\"writable\":true,\"enumerable\":false,\"configurable\":true},\"prototypeParent\":true,\"task\":[{\"error\":\"Error\"},{\"shape\":{\"tag\":\"[object Object]\",\"names\":[\"run\"],\"prototypeNames\":[\"constructor\"],\"runType\":\"function\",\"runLength\":0},\"result\":[true,0,17]},{\"error\":\"Error\"},{\"error\":\"Error\"}]}"
++        }
++      }
++    },
++    {
++      "name": "accessor-and-task",
++      "result": {
++        "result": {
++          "type": "string",
++          "value": "[{\"depth\":2,\"enumerable\":true,\"configurable\":true,\"getName\":\"get console\",\"setName\":\"set console\",\"getRealm\":true,\"bad\":\"TypeError\"},{\"name\":\"\",\"error\":\"Error\",\"message\":\"First argument must be a non-empty string.\"},{\"name\":\" \",\"created\":true},{\"run\":\"undefined\",\"error\":\"Error\",\"message\":\"First argument must be a function.\"},{\"run\":\"number\",\"error\":\"Error\",\"message\":\"First argument must be a function.\"},{\"run\":\"function\",\"result\":29},{\"name\":\"42\",\"error\":\"Error\",\"message\":\"First argument must be a non-empty string.\"},{\"name\":\"x\",\"error\":\"Error\",\"message\":\"First argument must be a non-empty string.\"}]"
++        }
++      }
++    },
++    {
++      "name": "conversion",
++      "result": {
++        "result": {
++          "type": "string",
++          "value": "[[\"count\",\"symbol\",\"undefined\"],[\"count\",\"object\",\"undefined\"],[\"count\",\"object\",17],[\"countReset\",\"symbol\",\"undefined\"],[\"countReset\",\"object\",\"undefined\"],[\"countReset\",\"object\",17],[\"time\",\"symbol\",\"undefined\"],[\"time\",\"object\",\"undefined\"],[\"time\",\"object\",17],[\"timeLog\",\"symbol\",\"undefined\"],[\"timeLog\",\"object\",\"undefined\"],[\"timeLog\",\"object\",17],[\"timeEnd\",\"symbol\",\"undefined\"],[\"timeEnd\",\"object\",\"undefined\"],[\"timeEnd\",\"object\",17]]"
++        }
++      }
++    }
++  ],
++  "events": [
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "log",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": [
++          {
++            "type": "string",
++            "value": "text"
++          },
++          {
++            "type": "number",
++            "description": "17",
++            "value": 17
++          }
++        ]
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "warning",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": []
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "warning",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": [
++          {
++            "type": "string",
++            "value": "actual"
++          }
++        ]
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "dir",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": []
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "dirxml",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": [
++          {
++            "type": "object",
++            "subtype": "node",
++            "className": "HTMLBodyElement",
++            "objectId": "2.2.1"
++          },
++          {
++            "type": "string",
++            "value": "extra"
++          }
++        ]
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "trace",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": [
++          {
++            "type": "string",
++            "value": "trace"
++          }
++        ]
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.consoleAPICalled",
++      "params": {
++        "type": "error",
++        "executionContextId": 2,
++        "timestamp": 26542,
++        "args": [
++          {
++            "type": "string",
++            "value": "error-alias"
++          }
++        ]
++      },
++      "sessionId": "SID-1"
++    }
++  ]
++}

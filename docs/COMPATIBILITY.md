@@ -16,6 +16,32 @@ policy; complete runtime worlds/heap enumeration; and complete asynchronous exec
 deadlines remain unfinished. See the source proposals and retained observations
 in `proposals/`; isolated proposals are not automatically production features.
 
+The following integration also includes actual V8 by-value serialization with
+getter deadlines/recovery, real Window global prototype layers, Console
+namespaces, ImageData/encoded chunk values, unsupported codec task state machines
+and genuine offline audio buffer rendering. Private value/audio records use
+Host allocations while public objects retain their actual realms. Native
+HTMLDDA descriptors, enumeration, borrowed methods and retained handles now come
+from the actual independent native binding, including by-value serialization
+through the ordinary V8 serializer. Broad Window IDL, media processing, wider
+audio/Canvas APIs and protocol/resource behavior remain incomplete.
+
+In the selected additional48 source cohort, the earlier candidate had9 passes.
+The current graph has17 per-case passes and31 application failures after the
+separately replayed ImageData case. Its first attempt failed during browser setup
+with a WebSocket HTTP200 response and no harness observations; that raw outcome
+is preserved. Native positive controls for these48 span the previously retained
+44, two corrected fixture-route cases and two canonical cases. These scoped,
+separate runs do not establish a full registration/WPT pass rate or speed parity.
+
+The validated checkpoint passes **1106 JavaScript tests,57 PureScript checks
+and13 existing native differential groups**, plus syntax and strict/pedantic
+builds. [Evidence](reference/phase15-integration/validation.json) binds263 inputs
+unchanged across the full run and records exact collection builds on three Node
+versions. The new PureScript flows verify actual image/chunk bytes and scheduled
+offline audio samples through Puppeteer. Earlier checkpoint reports below remain
+historical; they are not cumulative current-source pass rates.
+
 ## Target and evidence boundaries
 
 - Binary: official Linux x86_64 Lightpanda

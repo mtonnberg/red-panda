@@ -1,3 +1,6 @@
+import {installAudioCore} from './audio-core.js';
+import {installConsole} from './console.js';
+import { installImageData } from './image-data.js';
 import { SyncHTTP } from './sync-http.js';
 import {installFrameActivity} from './frame-activity.js';
 import {installHeapFactories,prepareHeapRealm} from './heap-registry.js';
@@ -45,6 +48,8 @@ import { installFetch } from './fetch.js';
 import { installAbortSignals } from './abort-signals.js';
 import { loadCollectionsBinding, installCollections } from './collections.js';
 import { installStyles } from './styles.js';
+import { installWebCodecsProcessors } from './webcodecs-processors.js';
+import { installWebCodecsValues } from './webcodecs-values.js';
 import { installGeometry } from './geometry.js';
 import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
 import { renderDocument } from './render.js';
@@ -241,6 +246,7 @@ export class Page extends EventEmitter {
       installDialogs(this, window);
       installForms(this, window);
       installDocumentXML(this, window);
+      installConsole(window,{emit:(type,args)=>this.emit('console',{type,args})});
       installCustomElements(this, window);
       this.moduleScripts = installModuleScripts(this, window);
       installClassicScripts(this, window);
@@ -249,12 +255,16 @@ export class Page extends EventEmitter {
       installServiceWorkers(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,spawn:workers.createService});
       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
       installBroadcast(this, window);
+      installImageData(window);
       installGeometry(window);
+      installWebCodecsValues(window);
+      installWebCodecsProcessors(window);
       installSVG(this, window);
       installDOMIDL(this, window);
       installDOMEvents(this, window);
       installDOMLifecycle(this, window);
       installMedia(this, window);
+      installAudioCore(this, window);
       installXHR(this, window);
       if (main) this.frames = installFrames(this, window, {
         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),

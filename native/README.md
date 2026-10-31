@@ -3,7 +3,7 @@
 `collections.cc` supplies a small V8 binding for the real `[[IsHTMLDDA]]`
 behavior of `document.all`. A JavaScript Proxy cannot supply this engine bit.
 The binding marks an object undetectable, makes it callable, and delegates live
-property lookup/enumeration to `src/collections.js`. It contains no upstream
+property lookup to `src/collections.js`. It contains no upstream
 Lightpanda implementation code, native DOM, JavaScript parser, or browser engine.
 V8 owns the bridge references and collection objects; the binding uses no
 process-global persistent V8 handles or external object pointers.
@@ -13,9 +13,19 @@ The resulting object simultaneously supports:
 - `typeof document.all === 'undefined'`, falsiness and equality with `null` or
   `undefined`, while strict equality with `undefined` remains false;
 - live element indexing, iteration, callable lookup, `item` and `namedItem`;
-- IDs, eligible HTML `name` attributes, duplicate-match live HTMLCollections;
-- enumerable indexed properties and unenumerable named properties;
-- the `HTMLAllCollection` prototype and receiver checks.
+- IDs and eligible HTML `name` attributes, with the native first-ID/name result;
+- indexed/named presence and descriptors, with no virtual keys in own-key enumeration;
+- the `HTMLAllCollection` prototype and genuine borrowed-realm receiver checks.
+
+Native controls confirm that virtual indices/names remain accessible but are not
+returned by `Object.keys`, `getOwnPropertyNames` or `Reflect.ownKeys`. Real authored
+own properties still enumerate. The binding therefore supplies no interceptor
+enumerators; actual V8 protocol serialization observes this behavior directly.
+Indexed descriptors are read-only, `item` uses signed32 numeric conversion, and
+`namedItem`/callable name lookup prioritizes the first matching ID. The measured
+native engine returns a fresh collection on each `document.all` access.
+See [the protocol evidence](../proposals/htmldda-protocol/README.md) for by-reference
+identity, by-value serialization, genuine prototype metadata and clone controls.
 
 The JS adapter also fixes two related jsdom26 RadioNodeList issues: a derived
 list must refresh its lazy form-controls parent, and its value setter must

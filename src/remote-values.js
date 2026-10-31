@@ -1,3 +1,4 @@
+import { protocolPrototypeClass } from './protocol-classes.js';
 import {utilityNodeIdentity} from './isolated-world.js';
 // CDP value metadata without evaluating page getters or coercion hooks. This
 // module deliberately does not allocate handles or select execution contexts.
@@ -157,6 +158,8 @@ export function describeRemoteValue(value) {
   if (primitive) return primitive;
   if (typeof value==='symbol') return { type:'symbol',description:apply(symbolText,value,[]) };
   if (htmlDDA(value)) return { type:'function',className:'HTMLAllCollection',description:'function () { [native code] }' };
+  const prototypeClass = protocolPrototypeClass(value);
+  if (prototypeClass !== undefined) return { type:'object',className:prototypeClass,description:prototypeClass };
   const type=typeof value;
   // JS cannot unwrap or distinguish revocation of a Proxy without extra native
   // support. A generic Proxy description is truthful and never invokes traps.

@@ -1,0 +1,111 @@
+--- a/src/webcodecs-values.js
++++ b/src/webcodecs-values.js
+@@ -24,7 +24,7 @@
+  const includes=Array.prototype.includes;
+  const error=message=>new TypeError(message),cloneError=()=>new Exception('The object can not be cloned','DataCloneError');
+  const dictionary=value=>{if(value==null)return{};if(typeof value!=='object'&&typeof value!=='function')throw error('invalid argument');return value};
+- const getColor=value=>{const state=bridge.color(value);if(!state)throw error('Illegal invocation');return state};
++ const getColor=(value,key)=>{if(!bridge.hasColor(value))throw error('Illegal invocation');return bridge.color(value,key)};
+  const enumeration=(value,allowed)=>{const string=typeof value==='symbol'?apply(description,value,[])??'':String(value);if(!apply(includes,allowed,[string]))throw error('');return string};
+  const integer=value=>{const number=+value;if(!finite(number)||abs(trunc(number))>9007199254740991)throw error('invalid argument');return trunc(number)||0};
+  const primaries=['bt709','bt470bg','smpte170m','bt2020','smpte432'];
+@@ -33,19 +33,19 @@
+  class VideoColorSpace {
+   constructor(init={}){
+    const input=dictionary(init),fullRange=input.fullRange,matrix=input.matrix,primariesValue=input.primaries,transfer=input.transfer;
+-   const state={primaries:primariesValue==null?null:enumeration(primariesValue,primaries),transfer:transfer==null?null:enumeration(transfer,transfers),matrix:matrix==null?null:enumeration(matrix,matrices),fullRange:fullRange==null?null:!!fullRange};
+-   bridge.setColor(this,state);bridge.register(this,{kind:'VideoColorSpace',read:()=>({kind:'NonCloneableWebCodec'})});
++   bridge.setColor(this,primariesValue==null?null:enumeration(primariesValue,primaries),transfer==null?null:enumeration(transfer,transfers),matrix==null?null:enumeration(matrix,matrices),fullRange==null?null:!!fullRange);
+   }
+-  get primaries(){return getColor(this).primaries}
+-  get transfer(){return getColor(this).transfer}
+-  get matrix(){return getColor(this).matrix}
+-  get fullRange(){return getColor(this).fullRange}
+-  toJSON(){const s=getColor(this);return{primaries:s.primaries,transfer:s.transfer,matrix:s.matrix,fullRange:s.fullRange}}
++  get primaries(){return getColor(this,'primaries')}
++  get transfer(){return getColor(this,'transfer')}
++  get matrix(){return getColor(this,'matrix')}
++  get fullRange(){return getColor(this,'fullRange')}
++  toJSON(){return{primaries:getColor(this,'primaries'),transfer:getColor(this,'transfer'),matrix:getColor(this,'matrix'),fullRange:getColor(this,'fullRange')}}
+  }
+  const shape=C=>{const p=C.prototype;for(const key of keys(p)){if(key==='constructor')continue;const d=g.Object.getOwnPropertyDescriptor(p,key);define(p,key,{...d,enumerable:true})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});};
+  shape(VideoColorSpace);
+  function makeChunk(name){
+-  const stateFor=value=>{const state=bridge.chunk(value);if(!state)throw error('Illegal invocation');if(state.interface!==name)throw error('Illegal invocation');return state};
++  const assertState=value=>{if(!bridge.hasChunk(value,name))throw error('Illegal invocation')};
++  const read=(value,key)=>{assertState(value);return bridge.chunk(value,key)};
+   const C=class {
+    constructor(init){
+     const input=dictionary(init),data=input.data;
+@@ -64,14 +64,13 @@
+     for(let index=0;index<transfer.length;index++)if(!bridge.isTransfer(transfer[index]))throw error('');
+     const preparation=bridge.snapshot(data,transfer);
+     if(!preparation.ok)throw cloneError();
+-    const state={interface:name,type,timestamp,duration,bytes:preparation.bytes};bridge.setChunk(this,state);
+-    bridge.register(this,{kind:name,read:()=>({kind:'EncodedChunk',interface:name,type,timestamp,duration,bytes:bridge.copy(state.bytes)})});
++    bridge.setChunk(this,name,type,timestamp,duration,preparation);
+    }
+-   get type(){return stateFor(this).type}
+-   get timestamp(){return stateFor(this).timestamp}
+-   get duration(){return stateFor(this).duration}
+-   get byteLength(){return stateFor(this).bytes.length}
+-   copyTo(destination){const state=stateFor(this);if(!bridge.isData(destination))throw error('invalid argument');if(!bridge.write(destination,state.bytes))throw error('')}
++   get type(){return read(this,'type')}
++   get timestamp(){return read(this,'timestamp')}
++   get duration(){return read(this,'duration')}
++   get byteLength(){return read(this,'byteLength')}
++   copyTo(destination){assertState(this);if(!bridge.isData(destination))throw error('invalid argument');if(!bridge.writeChunk(this,destination))throw error('')}
+   };
+   define(C,'name',{value:name,configurable:true});shape(C);return C;
+  }
+@@ -83,18 +82,19 @@
+ export function installWebCodecsValues(realm){
+  if(installed.has(realm))return installed.get(realm);
+  const api=realm.eval(`(${factory.toString()})`)(realm,{
+-  color:value=>colorStates.get(value),setColor:(value,state)=>colorStates.set(value,state),
+-  chunk:value=>chunkStates.get(value),setChunk:(value,state)=>chunkStates.set(value,state),
+-  register(value,record){registerPlatformFactory(value,{...record,globalObject:realm})},
++  hasColor:value=>colorStates.has(value),color:(value,key)=>['primaries','transfer','matrix','fullRange'].includes(key)?colorStates.get(value)?.[key]:undefined,
++  setColor(value,primaries,transfer,matrix,fullRange){const state=Object.freeze(Object.assign(Object.create(null),{primaries,transfer,matrix,fullRange}));colorStates.set(value,state);registerPlatformFactory(value,{kind:'VideoColorSpace',globalObject:realm,implementation:state,read:()=>({kind:'NonCloneableWebCodec'})})},
++  hasChunk:(value,name)=>chunkStates.get(value)?.interface===name,
++  chunk(value,key){const state=chunkStates.get(value);return key==='byteLength'?state.bytes.length:['type','timestamp','duration'].includes(key)?state[key]:undefined},
++  setChunk(value,name,type,timestamp,duration,preparation){const state=Object.freeze(Object.assign(Object.create(null),{interface:name,type,timestamp,duration,bytes:preparation.bytes}));chunkStates.set(value,state);registerPlatformFactory(value,{kind:name,globalObject:realm,implementation:state,read:()=>({kind:'EncodedChunk',interface:name,type,timestamp,duration,bytes:state.bytes.slice()})})},
+   isData:allowedData,
+   isTransfer:value=>types.isArrayBuffer(value),
+-  copy:bytes=>bytes.slice(),
+   snapshot(data,transfer){
+    const seen=new Set(),buffers=[];for(let index=0;index<transfer.length;index++){const buffer=transfer[index];if(seen.has(buffer))return{ok:false};seen.add(buffer);try{new Uint8Array(buffer)}catch{return{ok:false}}buffers.push(buffer)}
+    const bytes=byteView(data).slice();
+    try{nativeClone(null,{transfer:buffers});return{ok:true,bytes}}catch{return{ok:false}}
+   },
+-  write(destination,bytes){try{const view=byteView(destination);if(view.length<bytes.length)return false;view.set(bytes);return true}catch{return false}},
++  writeChunk(value,destination){const bytes=chunkStates.get(value).bytes;try{const view=byteView(destination);if(view.length<bytes.length)return false;view.set(bytes);return true}catch{return false}},
+  });
+  installed.set(realm,api);return api;
+ }
+--- /dev/null
++++ b/test/webcodecs-privacy.test.js
+@@ -0,0 +1,23 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {Browser} from '../src/browser.js';
++import {queryHeapObjects} from '../src/heap-query.js';
++
++async function fixture(t){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body>private codec values</body>');await page.evaluate(`globalThis.ownedChunk=new EncodedVideoChunk({type:'delta',timestamp:31337,duration:19,data:new Uint8Array([2,3])});globalThis.ownedColor=new VideoColorSpace({primaries:'bt709'});globalThis.authoredSlot={interface:'EncodedVideoChunk',type:'delta',timestamp:31337,duration:19,bytes:new Uint8Array([2,3])};globalThis.authoredColor={primaries:'bt709',transfer:null,matrix:null,fullRange:null};globalThis.authorFunction=function authorFunction(){return ownedChunk};true`);return {page,w:page.dom.window,context:page.dom.getInternalVMContext()}}
++const own=(value,key)=>Object.getOwnPropertyDescriptor(value,key)?.value;
++
++test('real heap queries retain authored metadata and never expose private WebCodecs slots',async t=>{
++ const {w,context}=await fixture(t),objects=queryHeapObjects(w.Object.prototype,context).objects;
++ assert.ok(objects.includes(w.authoredSlot));assert.ok(objects.includes(w.authoredColor));
++ const chunks=objects.filter(value=>own(value,'interface')==='EncodedVideoChunk'&&own(value,'timestamp')===31337&&own(value,'duration')===19&&own(value,'bytes'));
++ const colors=objects.filter(value=>own(value,'primaries')==='bt709'&&own(value,'transfer')===null&&own(value,'matrix')===null&&own(value,'fullRange')===null);
++ assert.deepEqual([...chunks],[w.authoredSlot]);assert.deepEqual([...colors],[w.authoredColor]);
++});
++
++test('heap-discovered implementation helpers cannot return private slots or byte storage',async t=>{
++ const {w,context}=await fixture(t),functions=queryHeapObjects(w.Function.prototype,context).objects;
++ assert.ok(functions.includes(w.authorFunction));
++ const source=value=>{try{return Function.prototype.toString.call(value)}catch{return ''}};
++ for(const fn of functions){const text=source(fn);if(text.includes('bridge.color(value'))assert.equal(Reflect.apply(fn,undefined,[w.ownedColor,'primaries']),'bt709');if(text.includes('bridge.chunk(value')){let result;try{result=Reflect.apply(fn,undefined,[w.ownedChunk,'timestamp'])}catch(error){assert.equal(error instanceof w.TypeError,true);assert.equal(error.message,'Illegal invocation');continue}assert.equal(result,31337);}}
++ const copy=w.structuredClone(w.ownedChunk),bytes=new w.Uint8Array(2);copy.copyTo(bytes);assert.deepEqual([...bytes],[2,3]);assert.equal(copy.timestamp,31337);
++});

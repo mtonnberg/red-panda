@@ -1,0 +1,6 @@
+(async()=>{const rows=[];for(const name of['AudioDecoder','VideoDecoder','AudioEncoder','VideoEncoder']){const C=globalThis[name],base=name.startsWith('Audio')?{codec:'opus',sampleRate:48000,numberOfChannels:2}:name==='VideoEncoder'?{codec:'vp8',width:16,height:16}:{codec:'vp8'};
+for(const [label,fn]of[['flush',()=>C.prototype.flush.call({})],['configure',()=>C.prototype.configure.call({}, {})],['operation',()=>C.prototype[name.endsWith('Decoder')?'decode':'encode'].call({}, {})]]){let phase='sync';try{const p=fn();phase='promise';await p;rows.push({name:name+':receiver:'+label,value:'ok'})}catch(e){rows.push({name:name+':receiver:'+label,value:{phase,name:e.name,message:e.message}})}}
+const order=[];try{new C({get error(){order.push('error');return 1},get output(){order.push('output');return()=>{}}})}catch(e){rows.push({name:name+':invalid-callback-order',value:{order,error:e.name,message:e.message}})}
+const c=new C({output(){},error(){}});c.close();try{c.configure({...base,codec:' '})}catch(e){rows.push({name:name+':closed-config-before-validation',value:{name:e.name,message:e.message}})}
+try{const copy=structuredClone(Object.create(C.prototype));rows.push({name:name+':fake-clone',value:{tag:Object.prototype.toString.call(copy),keys:Object.keys(copy)}})}catch(e){rows.push({name:name+':fake-clone',error:{name:e.name,message:e.message}})}
+}return rows})()

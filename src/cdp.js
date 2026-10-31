@@ -1,4 +1,6 @@
+import {consoleProtocolType} from './console.js';
 import {installHeapUtilityFactories} from './heap-worlds.js';
+import {ProtocolSerializer} from './protocol-serialization.js';
 import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
 import {canonicalUtilityValue} from './isolated-world.js';
 import http from 'node:http';
@@ -12,7 +14,7 @@ import { supportsDOM, runDOM, resetDOM } from './dom.js';
 import { supportsInput, runInput } from './input.js';
 import { createWebDriver } from './webdriver.js';
 import { supportsRuntime, runRuntime, resetRuntime } from './runtime.js';
-import { primitiveRemoteValue, describeRemoteValue, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
+import { primitiveRemoteValue, describeRemoteValue, needsRemoteHandle, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
 
 const timestamp = () => performance.now() / 1000;
 const protocolErrors = new WeakSet();
@@ -39,6 +41,7 @@ class Session {
     this.id = id;
     this.domains = new Set();
     this.objects = new Map();
+    this.serializer = new ProtocolSerializer();
     this.streams = new Map();
     this.nextStreamId = 1;
     this.worlds = new Map();
@@ -119,7 +122,7 @@ class Session {
       timestamp: Date.now(), exceptionDetails: this.exception(error, executionContextId),
     }));
     listen('frameConsole', ({ type, args, executionContextId }) => this.event('Runtime.consoleAPICalled', {
-      type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
+      type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
     }));
     listen('domContentLoaded', () => {
       this.event('Page.domContentEventFired', { timestamp: timestamp() });
@@ -163,7 +166,7 @@ class Session {
       requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
     }));
     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
-      type: type === 'log' ? 'log' : type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+      type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
       executionContextId, timestamp: Date.now(),
     }));
     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
@@ -218,8 +221,8 @@ class Session {
     const metadata = describeRemoteValue(value);
     if (byValue) {
       if (typeof value === 'symbol') throw new ProtocolError("Object couldn't be returned by value", -32000);
-      try { return { type: metadata.type, value: metadata.type === 'function' ? {} : JSON.parse(JSON.stringify(value)) }; }
-      catch { throw new ProtocolError('Internal error', -32603); }
+      try { return this.serializer.serialize(value,this.executionPage(contextId)); }
+      catch(error) { throw new ProtocolError(error.message,Number.isInteger(error.code)?error.code:-32603); }
     }
     const objectId = randomUUID();
     this.executionPage(contextId);
@@ -380,7 +383,7 @@ class Session {
             isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, group, contextId), writable: !!descriptor.writable } : {}),
             ...(descriptor.get ? { get: this.remote(descriptor.get, false, group, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, group, contextId) } : {}) };
         });
-        const prototype = object !== null && ['object', 'function'].includes(typeof object) && !types.isProxy(object) ? Object.getPrototypeOf(object) : null;
+        const prototype = needsRemoteHandle(object) && typeof object !== 'symbol' && !types.isProxy(object) ? Object.getPrototypeOf(object) : null;
         return { result, internalProperties: prototype === null ? [] : [{ name: '[[Prototype]]', value: this.remote(prototype, false, group, contextId) }] };
       }
       case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
@@ -478,6 +481,7 @@ class Session {
     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
   }
   close() {
+    this.serializer.close();
     this.utility.close();
     clearTimeout(this.idleTimer);
     resetDOM(this);

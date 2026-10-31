@@ -1,0 +1,1289 @@
+--- /dev/null
++++ b/src/webcodecs-values.js
+@@ -0,0 +1,103 @@
++import { types } from 'node:util';
++import { registerPlatformFactory, platformFactoryRecord } from './platform-factories.js';
++
++const installed=new WeakMap(),colorStates=new WeakMap(),chunkStates=new WeakMap(),nativeClone=globalThis.structuredClone;
++const typed=Object.getPrototypeOf(Uint8Array.prototype);
++const getter=(prototype,name)=>Object.getOwnPropertyDescriptor(prototype,name).get;
++const typedBuffer=getter(typed,'buffer'),typedLength=getter(typed,'byteLength'),typedOffset=getter(typed,'byteOffset');
++const viewBuffer=getter(DataView.prototype,'buffer'),viewLength=getter(DataView.prototype,'byteLength'),viewOffset=getter(DataView.prototype,'byteOffset');
++const isBuffer=value=>types.isArrayBuffer(value)||types.isSharedArrayBuffer(value);
++function allowedData(value){if(types.isArrayBuffer(value))return true;if(!ArrayBuffer.isView(value))return false;try{return !types.isSharedArrayBuffer((types.isDataView(value)?viewBuffer:typedBuffer).call(value))}catch{return false}}
++function byteView(value){
++ if(isBuffer(value)){try{return new Uint8Array(value)}catch{return new Uint8Array()}}
++ const dataView=types.isDataView(value),buffer=(dataView?viewBuffer:typedBuffer).call(value);
++ try{return new Uint8Array(buffer,(dataView?viewOffset:typedOffset).call(value),(dataView?viewLength:typedLength).call(value))}catch{return new Uint8Array()}
++}
++
++// Compiled inside the actual target VM. State and captured intrinsics are not
++// exposed through authored symbols, constructor names or implementation fields.
++function factory(g,bridge){
++ const TypeError=g.TypeError,Exception=g.DOMException,Array=g.Array;
++ const define=g.Object.defineProperty,keys=g.Reflect.ownKeys,apply=g.Reflect.apply,from=g.Array.from;
++ const Number=g.Number,String=g.String,finite=Number.isFinite,trunc=g.Math.trunc,abs=g.Math.abs;
++ const description=g.Object.getOwnPropertyDescriptor(g.Symbol.prototype,'description').get,iterator=g.Symbol.iterator;
++ const includes=Array.prototype.includes;
++ const error=message=>new TypeError(message),cloneError=()=>new Exception('The object can not be cloned','DataCloneError');
++ const dictionary=value=>{if(value==null)return{};if(typeof value!=='object'&&typeof value!=='function')throw error('invalid argument');return value};
++ const getColor=value=>{const state=bridge.color(value);if(!state)throw error('Illegal invocation');return state};
++ const enumeration=(value,allowed)=>{const string=typeof value==='symbol'?apply(description,value,[])??'':String(value);if(!apply(includes,allowed,[string]))throw error('');return string};
++ const integer=value=>{const number=+value;if(!finite(number)||abs(trunc(number))>9007199254740991)throw error('invalid argument');return trunc(number)||0};
++ const primaries=['bt709','bt470bg','smpte170m','bt2020','smpte432'];
++ const transfers=['bt709','smpte170m','iec61966-2-1','linear','pq','hlg'];
++ const matrices=['rgb','bt709','bt470bg','smpte170m','bt2020-ncl'];
++ class VideoColorSpace {
++  constructor(init={}){
++   const input=dictionary(init),fullRange=input.fullRange,matrix=input.matrix,primariesValue=input.primaries,transfer=input.transfer;
++   const state={primaries:primariesValue==null?null:enumeration(primariesValue,primaries),transfer:transfer==null?null:enumeration(transfer,transfers),matrix:matrix==null?null:enumeration(matrix,matrices),fullRange:fullRange==null?null:!!fullRange};
++   bridge.setColor(this,state);bridge.register(this,{kind:'VideoColorSpace',read:()=>({kind:'NonCloneableWebCodec'})});
++  }
++  get primaries(){return getColor(this).primaries}
++  get transfer(){return getColor(this).transfer}
++  get matrix(){return getColor(this).matrix}
++  get fullRange(){return getColor(this).fullRange}
++  toJSON(){const s=getColor(this);return{primaries:s.primaries,transfer:s.transfer,matrix:s.matrix,fullRange:s.fullRange}}
++ }
++ const shape=C=>{const p=C.prototype;for(const key of keys(p)){if(key==='constructor')continue;const d=g.Object.getOwnPropertyDescriptor(p,key);define(p,key,{...d,enumerable:true})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});};
++ shape(VideoColorSpace);
++ function makeChunk(name){
++  const stateFor=value=>{const state=bridge.chunk(value);if(!state)throw error('Illegal invocation');if(state.interface!==name)throw error('Illegal invocation');return state};
++  const C=class {
++   constructor(init){
++    const input=dictionary(init),data=input.data;
++    if(!bridge.isData(data))throw error('invalid argument');
++    const durationValue=input.duration;
++    const duration=durationValue==null?null:integer(durationValue);
++    if(duration!==null&&duration<0)throw error('invalid argument');
++    const timestampValue=input.timestamp;
++    if(timestampValue===undefined)throw error('invalid argument');
++    const timestamp=integer(timestampValue),transferValue=input.transfer;
++    let transfer=[];
++    if(transferValue!==undefined){if(transferValue==null||typeof transferValue[iterator]!=='function')throw error('invalid argument');transfer=apply(from,Array,[transferValue]);}
++    const typeValue=input.type;
++    if(typeValue===undefined)throw error('invalid argument');
++    const type=enumeration(typeValue,['key','delta']);
++    for(let index=0;index<transfer.length;index++)if(!bridge.isTransfer(transfer[index]))throw error('');
++    const preparation=bridge.snapshot(data,transfer);
++    if(!preparation.ok)throw cloneError();
++    const state={interface:name,type,timestamp,duration,bytes:preparation.bytes};bridge.setChunk(this,state);
++    bridge.register(this,{kind:name,read:()=>({kind:'EncodedChunk',interface:name,type,timestamp,duration,bytes:bridge.copy(state.bytes)})});
++   }
++   get type(){return stateFor(this).type}
++   get timestamp(){return stateFor(this).timestamp}
++   get duration(){return stateFor(this).duration}
++   get byteLength(){return stateFor(this).bytes.length}
++   copyTo(destination){const state=stateFor(this);if(!bridge.isData(destination))throw error('invalid argument');if(!bridge.write(destination,state.bytes))throw error('')}
++  };
++  define(C,'name',{value:name,configurable:true});shape(C);return C;
++ }
++ const EncodedAudioChunk=makeChunk('EncodedAudioChunk'),EncodedVideoChunk=makeChunk('EncodedVideoChunk');
++ for(const C of[VideoColorSpace,EncodedAudioChunk,EncodedVideoChunk])define(g,C.name,{value:C,writable:true,configurable:true});
++ return{construct(record){const C=record.interface==='EncodedAudioChunk'?EncodedAudioChunk:record.interface==='EncodedVideoChunk'?EncodedVideoChunk:null;if(!C)throw cloneError();return new C({data:record.bytes,timestamp:record.timestamp,duration:record.duration,type:record.type})}};
++}
++
++export function installWebCodecsValues(realm){
++ if(installed.has(realm))return installed.get(realm);
++ const api=realm.eval(`(${factory.toString()})`)(realm,{
++  color:value=>colorStates.get(value),setColor:(value,state)=>colorStates.set(value,state),
++  chunk:value=>chunkStates.get(value),setChunk:(value,state)=>chunkStates.set(value,state),
++  register(value,record){registerPlatformFactory(value,{...record,globalObject:realm})},
++  isData:allowedData,
++  isTransfer:value=>types.isArrayBuffer(value),
++  copy:bytes=>bytes.slice(),
++  snapshot(data,transfer){
++   const seen=new Set(),buffers=[];for(let index=0;index<transfer.length;index++){const buffer=transfer[index];if(seen.has(buffer))return{ok:false};seen.add(buffer);try{new Uint8Array(buffer)}catch{return{ok:false}}buffers.push(buffer)}
++   const bytes=byteView(data).slice();
++   try{nativeClone(null,{transfer:buffers});return{ok:true,bytes}}catch{return{ok:false}}
++  },
++  write(destination,bytes){try{const view=byteView(destination);if(view.length<bytes.length)return false;view.set(bytes);return true}catch{return false}},
++ });
++ installed.set(realm,api);return api;
++}
++export function encodedChunkData(value){const provenance=platformFactoryRecord(value);return provenance&&['EncodedAudioChunk','EncodedVideoChunk'].includes(provenance.kind)?provenance.read():null}
++export function validEncodedChunk(record){return !!record&&record.kind==='EncodedChunk'&&['EncodedAudioChunk','EncodedVideoChunk'].includes(record.interface)&&['key','delta'].includes(record.type)&&Number.isSafeInteger(record.timestamp)&&(record.duration===null||Number.isSafeInteger(record.duration)&&record.duration>=0)&&types.isUint8Array(record.bytes)}
++export function deserializeEncodedChunk(realm,record){const api=installed.get(realm);if(!api||!validEncodedChunk(record))throw Error('Invalid encoded chunk receiver');return api.construct(record)}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -45,6 +45,7 @@
+ import { installAbortSignals } from './abort-signals.js';
+ import { loadCollectionsBinding, installCollections } from './collections.js';
+ import { installStyles } from './styles.js';
++import { installWebCodecsValues } from './webcodecs-values.js';
+ import { installGeometry } from './geometry.js';
+ import { installBlobURLs, resolveBlobURL } from './blob-urls.js';
+ import { renderDocument } from './render.js';
+@@ -250,6 +251,7 @@
+       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
+       installBroadcast(this, window);
+       installGeometry(window);
++      installWebCodecsValues(window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -9,6 +9,7 @@
+ import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+ import { resolveBlobURL } from './blob-urls.js';
++import { installWebCodecsValues } from './webcodecs-values.js';
+ import { installGeometry } from './geometry.js';
+ import { installNavigator } from './navigator.js';
+ import { installStreams } from './streams.js';
+@@ -304,6 +305,7 @@
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+   installGeometry(vm.runInContext('globalThis', context));
++  installWebCodecsValues(vm.runInContext('globalThis', context));
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import { encodedChunkData, validEncodedChunk, deserializeEncodedChunk } from './webcodecs-values.js';
+ import { installNativePlatformFactories } from './native-platform-factories.js';
+ import { platformFactoryRecord } from './platform-factories.js';
+ import { geometryFactoryData, validGeometryRecord, deserializeGeometry } from './geometry-platform.js';
+@@ -24,6 +25,8 @@
+  function serialize(value){
+   const provenance=platformFactoryRecord(value);
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
++  if(provenance?.kind==='VideoColorSpace')throw failure('The object can not be cloned');
++  const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+   const geometry=geometryFactoryData(value);
+   if(geometry){if(!validGeometryRecord(geometry))throw failure('The object can not be cloned');return geometry;}
+   if(!probe)return null;
+@@ -41,7 +44,8 @@
+   if(message.platforms===undefined)return null;
+   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
+   for(const[placeholder,record]of message.platforms){
+-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry'].includes(record.kind))throw failure('Malformed platform node');
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk'].includes(record.kind))throw failure('Malformed platform node');
++   if(record.kind==='EncodedChunk'){if(!validEncodedChunk(record))throw failure('Malformed encoded chunk');continue;}
+    if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
+    if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
+    else if(record.bytes===undefined||typeof record.type!=='string')throw failure('Platform node has no byte snapshot');
+@@ -65,6 +69,7 @@
+   return stripNativeHandles(message);
+  }
+  function deserialize(record){
++  if(record.kind==='EncodedChunk'){try{return deserializeEncodedChunk(realm,record)}catch{throw failure('Invalid encoded chunk receiver')}}
+   if(record.kind==='Geometry'){try{return deserializeGeometry(realm,record)}catch{throw failure('Invalid geometry receiver')}}
+   if(!probe)throw failure('Receiver realm does not support Blob');
+   if(record.kind==='File'&&typeof File!=='function')throw failure('Receiver realm does not support File');
+--- a/src/clone-object-kind.js
++++ b/src/clone-object-kind.js
+@@ -4,7 +4,7 @@
+ import { platformFactoryRecord } from './platform-factories.js';
+ import { knownPlatformFactoryKind } from './platform-factory-hooks.js';
+ const descriptor = Object.getOwnPropertyDescriptor, prototype = Object.getPrototypeOf;
+-const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad']);
++const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad','EncodedAudioChunk','EncodedVideoChunk','VideoColorSpace']);
+ export function cloneObjectKind(value) {
+   if (Array.isArray(value)) return 'Array';
+   for (const [kind, test] of [['Map',types.isMap],['Set',types.isSet],['Error',types.isNativeError],['ArrayBuffer',types.isAnyArrayBuffer],['View',ArrayBuffer.isView],['Date',types.isDate],['RegExp',types.isRegExp]]) if (test(value)) return kind;
+--- /dev/null
++++ b/test/webcodecs-values.test.js
+@@ -0,0 +1,57 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++import { Browser, until } from '../src/browser.js';
++
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(t){const browser=new Browser({loadResources:['iframe','worker']});t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body></body>');return{browser,page,w:page.dom.window}}
++const expected=JSON.parse(await readFile(new URL('../oracle/webcodecs-native-values.json',import.meta.url),'utf8')).result.result.value;
++const expression=await readFile(new URL('../oracle/webcodecs-value-expression.js',import.meta.url),'utf8');
++
++test('value types match actual native conversion, enum, byte, transfer and clone controls',async t=>{
++ const {page}=await fixture(t);assert.deepEqual(plain(await page.evaluate(expression)),expected);
++});
++
++test('encoded chunks snapshot view bytes, preserve metadata and write only the selected destination slice',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const input=new Uint8Array([0,7,8,0]),chunk=new EncodedVideoChunk({data:new DataView(input.buffer,1,2),timestamp:-3,duration:4,type:'key'});input.fill(9);const target=new Uint8Array([1,1,1,1]);chunk.copyTo(target.subarray(1,3));return{bytes:[...target],length:chunk.byteLength,type:chunk.type,timestamp:chunk.timestamp,duration:chunk.duration,own:Object.keys(chunk),realm:EncodedVideoChunk instanceof Function}})()`);assert.deepEqual(plain(actual),{bytes:[1,7,8,1],length:2,type:'key',timestamp:-3,duration:4,own:[],realm:true});
++});
++
++test('buffer transfer validates every actual buffer before detaching any source',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const a=new ArrayBuffer(3),b=new ArrayBuffer(2),dead=new ArrayBuffer(1);dead.transfer(0);const rows=[];for(const list of[[a,a],[a,dead],[a,new Uint8Array(1)]]){try{new EncodedAudioChunk({data:a,timestamp:0,type:'key',transfer:list})}catch(e){rows.push([e.name,a.detached])}}const chunk=new EncodedAudioChunk({data:a,timestamp:0,type:'key',transfer:[b]});return{rows,a:a.detached,b:b.detached,length:chunk.byteLength}})()`);assert.deepEqual(plain(actual),{rows:[['DataCloneError',false],['DataCloneError',false],['TypeError',false]],a:false,b:true,length:3});
++});
++
++test('constructor observes real dictionary order and snapshots detached input after conversion',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const order=[],data=new Uint8Array([1,2]);const chunk=new EncodedVideoChunk({get data(){order.push('data');return data},get duration(){order.push('duration');return 1},get timestamp(){order.push('timestamp');data.buffer.transfer(0);return 2},get transfer(){order.push('transfer');return[]},get type(){order.push('type');return'key'}});return{order,bytes:chunk.byteLength}})()`);assert.deepEqual(plain(actual),{order:['data','duration','timestamp','transfer','type'],bytes:0});
++});
++
++test('separate chunk brands reject cross-interface methods and copied prototypes',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const audio=new EncodedAudioChunk({data:new Uint8Array(1),timestamp:0,type:'key'}),fake=Object.create(EncodedAudioChunk.prototype),rows=[];for(const call of[()=>EncodedVideoChunk.prototype.copyTo.call(audio,new Uint8Array(1)),()=>Object.getOwnPropertyDescriptor(EncodedVideoChunk.prototype,'type').get.call(audio),()=>EncodedAudioChunk.prototype.copyTo.call(fake,new Uint8Array(1))]){try{call()}catch(e){rows.push([e.name,e.message,e instanceof TypeError])}}const clone=structuredClone(fake);return{rows,plain:Object.getPrototypeOf(clone)===Object.prototype,keys:Object.keys(clone)}})()`);assert.deepEqual(plain(actual),{rows:Array.from({length:3},()=>['TypeError','Illegal invocation',true]),plain:true,keys:[]});
++});
++
++test('structuredClone preserves chunk cycles and aliases while ignoring authored metadata getters',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const chunk=new EncodedAudioChunk({data:new Uint8Array([6,7]),timestamp:8,duration:9,type:'delta'});for(const k of['type','timestamp','duration','byteLength'])Object.defineProperty(chunk,k,{get(){throw Error('authored')}});const payload={chunk,again:chunk,map:new Map([[chunk,chunk]])};payload.self=payload;const copy=structuredClone(payload),data=new Uint8Array(2);copy.chunk.copyTo(data);return{cycle:copy.self===copy,alias:copy.chunk===copy.again&&copy.map.get(copy.chunk)===copy.chunk,brand:copy.chunk instanceof EncodedAudioChunk,bytes:[...data],metadata:[copy.chunk.type,copy.chunk.timestamp,copy.chunk.duration]}})()`);assert.deepEqual(plain(actual),{cycle:true,alias:true,brand:true,bytes:[6,7],metadata:['delta',8,9]});
++});
++
++test('native rejects cloning VideoColorSpace and accepts Symbol enum descriptions',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const color=new VideoColorSpace({matrix:Symbol('rgb'),primaries:Symbol('bt709')});let error;try{structuredClone(color)}catch(e){error=[e.name,e instanceof DOMException]}return{json:color.toJSON(),error,type:new EncodedVideoChunk({data:new Uint8Array(),timestamp:0,type:Symbol('delta')}).type}})()`);assert.deepEqual(plain(actual),{json:{primaries:'bt709',transfer:null,matrix:'rgb',fullRange:null},error:['DataCloneError',true],type:'delta'});
++});
++
++test('real shared backing stores are rejected without invoking authored BufferSource properties',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const rows=[];for(const data of[new SharedArrayBuffer(2),new Uint8Array(new SharedArrayBuffer(2)),new DataView(new SharedArrayBuffer(2))]){try{new EncodedVideoChunk({data,timestamp:0,type:'key'})}catch(e){rows.push([e.name,e.message])}}const input=new Uint8Array([4,5]);for(const key of['buffer','byteOffset','byteLength'])Object.defineProperty(input,key,{get(){throw Error('authored')}});const chunk=new EncodedVideoChunk({data:input,timestamp:0,type:'key'}),dest=new Uint8Array(2);for(const key of['buffer','byteOffset','byteLength'])Object.defineProperty(dest,key,{get(){throw Error('authored')}});chunk.copyTo(dest);return{rows,bytes:[...dest]}})()`);assert.deepEqual(plain(actual),{rows:Array.from({length:3},()=>['TypeError','invalid argument']),bytes:[4,5]});
++});
++
++test('genuine child-frame values retain shared brands and borrowed method realm',async t=>{
++ const {page,w}=await fixture(t),frame=w.document.createElement('iframe');frame.srcdoc='<body>child</body>';w.document.body.append(frame);await until(()=>frame.contentDocument?.readyState==='complete',{timeout:2000});const child=frame.contentWindow,chunk=new child.EncodedAudioChunk({data:new child.Uint8Array([2,3]),timestamp:4,type:'key'}),dest=new w.Uint8Array(2);w.EncodedAudioChunk.prototype.copyTo.call(chunk,dest);assert.deepEqual([...dest],[2,3]);const color=new child.VideoColorSpace({matrix:'rgb'}),json=w.VideoColorSpace.prototype.toJSON.call(color);assert.equal(Object.getPrototypeOf(json),w.Object.prototype);assert.equal(json.matrix,'rgb');assert.throws(()=>w.EncodedVideoChunk.prototype.copyTo.call(chunk,dest),{name:'TypeError',message:'Illegal invocation'});
++});
++
++test('real MessagePorts carry immutable encoded bytes with genuine receiving brands',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`new Promise(resolve=>{const channel=new MessageChannel(),bytes=new Uint8Array([7,8]),chunk=new EncodedVideoChunk({data:bytes,timestamp:1,type:'delta'});channel.port2.onmessage=event=>{const data=new Uint8Array(2);event.data.chunk.copyTo(data);resolve({brand:event.data.chunk instanceof EncodedVideoChunk,alias:event.data.chunk===event.data.again,bytes:[...data]});channel.port1.close();channel.port2.close()};channel.port1.postMessage({chunk,again:chunk});bytes.fill(0)})`);assert.deepEqual(plain(actual),{brand:true,alias:true,bytes:[7,8]});
++});
++
++test('actual worker threads construct and round-trip encoded bytes through the platform codec',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`new Promise((resolve,reject)=>{const source='onmessage=event=>{const received=event.data;const bytes=new Uint8Array(received.byteLength);received.copyTo(bytes);const reply=new EncodedAudioChunk({data:bytes,timestamp:received.timestamp+1,type:received.type});postMessage({reply,brand:received instanceof EncodedVideoChunk,color:new VideoColorSpace({matrix:"rgb"}).matrix})}',url=URL.createObjectURL(new Blob([source],{type:'text/javascript'})),worker=new Worker(url),timer=setTimeout(()=>{worker.terminate();reject(Error('worker deadline'))},5000);worker.onerror=e=>{clearTimeout(timer);worker.terminate();reject(Error(e.message))};worker.onmessage=e=>{clearTimeout(timer);const bytes=new Uint8Array(e.data.reply.byteLength);e.data.reply.copyTo(bytes);resolve({inputBrand:e.data.brand,outputBrand:e.data.reply instanceof EncodedAudioChunk,bytes:[...bytes],timestamp:e.data.reply.timestamp,color:e.data.color});worker.terminate();URL.revokeObjectURL(url)};worker.postMessage(new EncodedVideoChunk({data:new Uint8Array([9,8,7]),timestamp:10,type:'key'}))})`);assert.deepEqual(plain(actual),{inputBrand:true,outputBrand:true,bytes:[9,8,7],timestamp:11,color:'rgb'});
++});
++
++test('private transfer snapshots and platform brands ignore later authored intrinsic replacements',async t=>{
++ const {page}=await fixture(t);const actual=await page.evaluate(`(()=>{const symbol=Symbol.iterator,originalIterator=Array.prototype[symbol],get=WeakMap.prototype.get,set=WeakMap.prototype.set,originalArray=Array,originalSymbol=Symbol,originalApply=Reflect.apply,buffer=new ArrayBuffer(2),bytes=new Uint8Array(buffer);bytes[0]=7;const transfer={*[symbol](){yield buffer}};let result;try{Array.prototype[symbol]=function(){throw Error('private iterator exposed')};WeakMap.prototype.get=WeakMap.prototype.set=()=>{throw Error('private brand exposed')};globalThis.Array=function(){throw Error('Array replacement')};globalThis.Symbol={};Reflect.apply=()=>{throw Error('apply replacement')};const chunk=new EncodedVideoChunk({data:bytes,timestamp:1,type:'key',transfer}),dest=new Uint8Array(2);chunk.copyTo(dest);result={byte:dest[0],length:chunk.byteLength,detached:buffer.detached,color:new VideoColorSpace({matrix:'rgb'}).matrix}}finally{Array=originalArray;Symbol=originalSymbol;Reflect.apply=originalApply;Array.prototype[symbol]=originalIterator;WeakMap.prototype.get=get;WeakMap.prototype.set=set}return result})()`);assert.deepEqual(plain(actual),{byte:7,length:2,detached:true,color:'rgb'});
++});
+--- /dev/null
++++ b/oracle/webcodecs-native-values.json
+@@ -0,0 +1,1009 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "3bce1e2cae372ce58bddc93147e940a0ad1cd7403f25eeb98700334ae7872bb4",
++  "expressionSHA256": "e6b3b732653d48b22c7261c245760c9275c4cc050f652563432a3ffdbc8b5ea0",
++  "result": {
++    "result": {
++      "type": "object",
++      "value": [
++        {
++          "name": "availability",
++          "value": {
++            "VideoColorSpace": "function",
++            "EncodedAudioChunk": "function",
++            "EncodedVideoChunk": "function",
++            "SharedArrayBuffer": "function"
++          }
++        },
++        {
++          "name": "colors",
++          "value": {
++            "length": 0,
++            "keys": [
++              "primaries",
++              "transfer",
++              "matrix",
++              "fullRange",
++              "toJSON",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ],
++            "value": {
++              "primaries": null,
++              "transfer": null,
++              "matrix": null,
++              "fullRange": null
++            },
++            "realm": true
++          }
++        },
++        {
++          "name": "color-init:null",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": null,
++            "fullRange": null
++          }
++        },
++        {
++          "name": "color-init:undefined",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": null,
++            "fullRange": null
++          }
++        },
++        {
++          "name": "color-init:1",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "color-init:true",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "color-init:value",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "color-init:[object Object]",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": null,
++            "fullRange": null
++          }
++        },
++        {
++          "name": "color-init:[object Object]",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": null,
++            "fullRange": false
++          }
++        },
++        {
++          "name": "color-init:[object Object]",
++          "value": {
++            "primaries": null,
++            "transfer": null,
++            "matrix": null,
++            "fullRange": true
++          }
++        },
++        {
++          "name": "color:primaries:bt709",
++          "value": "bt709"
++        },
++        {
++          "name": "color:primaries:bt470m",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:primaries:bt470bg",
++          "value": "bt470bg"
++        },
++        {
++          "name": "color:primaries:smpte170m",
++          "value": "smpte170m"
++        },
++        {
++          "name": "color:primaries:smpte240m",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:primaries:film",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:primaries:bt2020",
++          "value": "bt2020"
++        },
++        {
++          "name": "color:primaries:smpte428",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:primaries:smpte431",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:primaries:smpte432",
++          "value": "smpte432"
++        },
++        {
++          "name": "color:primaries:jedec-p22",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:primaries:ebu3213",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:bt709",
++          "value": "bt709"
++        },
++        {
++          "name": "color:transfer:smpte170m",
++          "value": "smpte170m"
++        },
++        {
++          "name": "color:transfer:iec61966-2-1",
++          "value": "iec61966-2-1"
++        },
++        {
++          "name": "color:transfer:linear",
++          "value": "linear"
++        },
++        {
++          "name": "color:transfer:pq",
++          "value": "pq"
++        },
++        {
++          "name": "color:transfer:hlg",
++          "value": "hlg"
++        },
++        {
++          "name": "color:transfer:bt2020-10",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:bt2020-12",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:smpte240m",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:log",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:log-sqrt",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:iec61966-2-4",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:bt1361",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:transfer:smpte428",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:matrix:rgb",
++          "value": "rgb"
++        },
++        {
++          "name": "color:matrix:bt709",
++          "value": "bt709"
++        },
++        {
++          "name": "color:matrix:bt470bg",
++          "value": "bt470bg"
++        },
++        {
++          "name": "color:matrix:smpte170m",
++          "value": "smpte170m"
++        },
++        {
++          "name": "color:matrix:bt2020-ncl",
++          "value": "bt2020-ncl"
++        },
++        {
++          "name": "color:matrix:bt2020-cl",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:matrix:smpte240m",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:matrix:fcc",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:matrix:ycgco",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color:matrix:ictcp",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "color-order",
++          "value": [
++            "fullRange",
++            "matrix",
++            "primaries",
++            "transfer"
++          ]
++        },
++        {
++          "name": "color-brand",
++          "error": {
++            "name": "TypeError",
++            "message": "Illegal invocation"
++          }
++        },
++        {
++          "name": "color-clone",
++          "error": {
++            "name": "DataCloneError",
++            "message": "The object can not be cloned"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:shape",
++          "value": {
++            "length": 1,
++            "keys": [
++              "type",
++              "timestamp",
++              "duration",
++              "byteLength",
++              "copyTo",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ],
++            "copyToLength": 1,
++            "tag": "[object EncodedAudioChunk]"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:null",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:primitive",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:data-missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:ts-missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:type-missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:data-string",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration-null",
++          "value": [
++            "key",
++            0,
++            null,
++            1
++          ]
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:-1",
++          "value": -1
++        },
++        {
++          "name": "EncodedAudioChunk:duration:-1",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:-0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:duration:-0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:duration:0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:-Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:-Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:9223372036854776000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:9223372036854776000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:18446744073709552000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:18446744073709552000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:17",
++          "value": 17
++        },
++        {
++          "name": "EncodedAudioChunk:duration:17",
++          "value": 17
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:null",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:duration:null",
++          "value": null
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:1",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a BigInt value to a number"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:1",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a BigInt value to a number"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:timestamp:Symbol(x)",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a Symbol value to a number"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:duration:Symbol(x)",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a Symbol value to a number"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:order",
++          "value": [
++            "data",
++            "duration",
++            "timestamp",
++            "transfer",
++            "type"
++          ]
++        },
++        {
++          "name": "EncodedAudioChunk:immutable-bytes",
++          "value": [
++            0,
++            7,
++            8,
++            0
++          ]
++        },
++        {
++          "name": "EncodedAudioChunk:detached-getter",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:detached-input",
++          "value": 0
++        },
++        {
++          "name": "EncodedAudioChunk:transfer:duplicate",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:transfer:detached",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "dataDetached": false,
++            "otherDetached": true
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:transfer:foreign",
++          "value": {
++            "length": 2,
++            "dataDetached": false,
++            "otherDetached": true
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:transfer:not-buffer",
++          "value": {
++            "error": "TypeError",
++            "message": "",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:transfer:shared",
++          "value": {
++            "error": "TypeError",
++            "message": "",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:brand",
++          "error": {
++            "name": "TypeError",
++            "message": "Illegal invocation"
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:destination-small",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:destination-detached",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "EncodedAudioChunk:clone",
++          "value": {
++            "same": true,
++            "instance": true,
++            "bytes": [
++              4,
++              5
++            ],
++            "type": "delta",
++            "timestamp": -10,
++            "duration": 5
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:shape",
++          "value": {
++            "length": 1,
++            "keys": [
++              "type",
++              "timestamp",
++              "duration",
++              "byteLength",
++              "copyTo",
++              "constructor",
++              "Symbol(Symbol.toStringTag)"
++            ],
++            "copyToLength": 1,
++            "tag": "[object EncodedVideoChunk]"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:null",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:primitive",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:data-missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:ts-missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:type-missing",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:data-string",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration-null",
++          "value": [
++            "key",
++            0,
++            null,
++            1
++          ]
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:-1",
++          "value": -1
++        },
++        {
++          "name": "EncodedVideoChunk:duration:-1",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:-0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:duration:-0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:duration:0.5",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:NaN",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:-Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:-Infinity",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:9007199254740992",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:9223372036854776000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:9223372036854776000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:18446744073709552000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:18446744073709552000",
++          "error": {
++            "name": "TypeError",
++            "message": "invalid argument"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:17",
++          "value": 17
++        },
++        {
++          "name": "EncodedVideoChunk:duration:17",
++          "value": 17
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:null",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:duration:null",
++          "value": null
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:1",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a BigInt value to a number"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:1",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a BigInt value to a number"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:timestamp:Symbol(x)",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a Symbol value to a number"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:duration:Symbol(x)",
++          "error": {
++            "name": "TypeError",
++            "message": "Cannot convert a Symbol value to a number"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:order",
++          "value": [
++            "data",
++            "duration",
++            "timestamp",
++            "transfer",
++            "type"
++          ]
++        },
++        {
++          "name": "EncodedVideoChunk:immutable-bytes",
++          "value": [
++            0,
++            7,
++            8,
++            0
++          ]
++        },
++        {
++          "name": "EncodedVideoChunk:detached-getter",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:detached-input",
++          "value": 0
++        },
++        {
++          "name": "EncodedVideoChunk:transfer:duplicate",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:transfer:detached",
++          "value": {
++            "error": "DataCloneError",
++            "message": "The object can not be cloned",
++            "dataDetached": false,
++            "otherDetached": true
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:transfer:foreign",
++          "value": {
++            "length": 2,
++            "dataDetached": false,
++            "otherDetached": true
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:transfer:not-buffer",
++          "value": {
++            "error": "TypeError",
++            "message": "",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:transfer:shared",
++          "value": {
++            "error": "TypeError",
++            "message": "",
++            "dataDetached": false,
++            "otherDetached": false
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:brand",
++          "error": {
++            "name": "TypeError",
++            "message": "Illegal invocation"
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:destination-small",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:destination-detached",
++          "error": {
++            "name": "TypeError",
++            "message": ""
++          }
++        },
++        {
++          "name": "EncodedVideoChunk:clone",
++          "value": {
++            "same": true,
++            "instance": true,
++            "bytes": [
++              4,
++              5
++            ],
++            "type": "delta",
++            "timestamp": -10,
++            "duration": 5
++          }
++        }
++      ]
++    }
++  }
++}
+--- /dev/null
++++ b/oracle/webcodecs-value-expression.js
+@@ -0,0 +1,27 @@
++(() => {
++  const rows=[];
++  const run=(name,fn)=>{try{rows.push({name,value:fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++  const types=['EncodedAudioChunk','EncodedVideoChunk'];
++  run('availability',()=>Object.fromEntries(['VideoColorSpace',...types,'SharedArrayBuffer'].map(k=>[k,typeof globalThis[k]])));
++  run('colors',()=>({length:VideoColorSpace.length,keys:Reflect.ownKeys(VideoColorSpace.prototype).map(String),value:new VideoColorSpace().toJSON(),realm:Object.getPrototypeOf(new VideoColorSpace().toJSON())===Object.prototype}));
++  for(const init of [null,undefined,1,true,'value',{primaries:null,transfer:undefined,matrix:null,fullRange:null},{fullRange:0},{fullRange:'false'}])run('color-init:'+String(init),()=>new VideoColorSpace(init).toJSON());
++  for(const [member,values]of Object.entries({primaries:['bt709','bt470m','bt470bg','smpte170m','smpte240m','film','bt2020','smpte428','smpte431','smpte432','jedec-p22','ebu3213'],transfer:['bt709','smpte170m','iec61966-2-1','linear','pq','hlg','bt2020-10','bt2020-12','smpte240m','log','log-sqrt','iec61966-2-4','bt1361','smpte428'],matrix:['rgb','bt709','bt470bg','smpte170m','bt2020-ncl','bt2020-cl','smpte240m','fcc','ycgco','ictcp']}))for(const value of values)run('color:'+member+':'+value,()=>new VideoColorSpace({[member]:value})[member]);
++  run('color-order',()=>{const order=[];new VideoColorSpace(new Proxy({fullRange:true,matrix:'rgb',primaries:'bt709',transfer:'linear'},{get(t,k){order.push(String(k));return t[k]}}));return order});
++  run('color-brand',()=>VideoColorSpace.prototype.toJSON.call({}));
++  run('color-clone',()=>{const copy=structuredClone(new VideoColorSpace({matrix:'rgb'}));return{instance:copy instanceof VideoColorSpace,json:JSON.stringify(copy),keys:Object.keys(copy)}});
++  for(const name of types){const C=globalThis[name];
++    run(name+':shape',()=>({length:C.length,keys:Reflect.ownKeys(C.prototype).map(String),copyToLength:C.prototype.copyTo.length,tag:Object.prototype.toString.call(new C({data:new Uint8Array([1]),timestamp:0,type:'key'}))}));
++    for(const [label,init]of [['missing',undefined],['null',null],['primitive',1],['data-missing',{timestamp:0,type:'key'}],['ts-missing',{data:new Uint8Array(1),type:'key'}],['type-missing',{data:new Uint8Array(1),timestamp:0}],['data-string',{data:'abc',timestamp:0,type:'key'}],['duration-null',{data:new Uint8Array(1),duration:null,timestamp:0,type:'key'}]])run(name+':'+label,()=>{const c=new C(init);return[c.type,c.timestamp,c.duration,c.byteLength]});
++    for(const value of [-1,-0.5,0.5,NaN,Infinity,-Infinity,2**53,2**63,2**64,'17',null,1n,Symbol('x')])for(const field of['timestamp','duration'])run(name+':'+field+':'+String(value),()=>new C({data:new Uint8Array(1),timestamp:0,type:'key',[field]:value})[field]);
++    run(name+':order',()=>{const order=[];new C(new Proxy({data:new Uint8Array([1]),duration:2,timestamp:3,transfer:[],type:'key'},{get(t,k){order.push(String(k));return t[k]}}));return order});
++    run(name+':immutable-bytes',()=>{const source=new Uint8Array([0,7,8,0]);const c=new C({data:source.subarray(1,3),timestamp:0,type:'delta'});source.fill(9);const dest=new Uint8Array([0,0,0,0]);c.copyTo(new DataView(dest.buffer,1,2));return [...dest]});
++    run(name+':detached-getter',()=>{const data=new Uint8Array([1,2,3]);const c=new C({data,get timestamp(){data.buffer.transfer(0);return 0},type:'key'});return c.byteLength});
++    run(name+':detached-input',()=>{const data=new ArrayBuffer(3);data.transfer(0);return new C({data,timestamp:0,type:'key'}).byteLength});
++    for(const transfer of ['duplicate','detached','foreign','not-buffer','shared'])run(name+':transfer:'+transfer,()=>{const data=new Uint8Array([1,2]).buffer;const other=new ArrayBuffer(2);let list;if(transfer==='duplicate')list=[data,data];if(transfer==='detached'){other.transfer(0);list=[other]}if(transfer==='foreign')list=[other];if(transfer==='not-buffer')list=[new Uint8Array(1)];if(transfer==='shared')list=[new SharedArrayBuffer(2)];try{const c=new C({data,timestamp:0,type:'key',transfer:list});return{length:c.byteLength,dataDetached:data.detached,otherDetached:other.detached}}catch(e){return{error:e.name,message:e.message,dataDetached:data.detached,otherDetached:other.detached}}});
++    run(name+':brand',()=>C.prototype.copyTo.call({},new Uint8Array(1)));
++    run(name+':destination-small',()=>new C({data:new Uint8Array(2),timestamp:0,type:'key'}).copyTo(new Uint8Array(1)));
++    run(name+':destination-detached',()=>{const b=new ArrayBuffer(2);b.transfer(0);return new C({data:new Uint8Array(1),timestamp:0,type:'key'}).copyTo(b)});
++    run(name+':clone',()=>{const c=new C({data:new Uint8Array([4,5]),timestamp:-10,duration:5,type:'delta'});const copy=structuredClone({first:c,again:c});const bytes=new Uint8Array(2);copy.first.copyTo(bytes);return{same:copy.first===copy.again,instance:copy.first instanceof C,bytes:[...bytes],type:copy.first.type,timestamp:copy.first.timestamp,duration:copy.first.duration}});
++  }
++  return rows;
++})()

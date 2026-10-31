@@ -1,0 +1,157 @@
+diff --git a/src/context-names.js b/src/context-names.js
+--- a/src/context-names.js
++++ b/src/context-names.js
+@@ -9,7 +9,7 @@
+   // Duplicate module instances must share the actual factory's association;
+   // stacked name overrides would otherwise invalidate the outer module's map.
+   if (vm.createContext[HOOK]) { registry = vm.createContext[HOOK]; return; }
+-  const original = vm.createContext, names = new WeakMap();
++  const original = vm.createContext, names = new WeakMap(),globalPrototypes=new WeakMap();
+   const prefix = `red-panda-vm-${randomUUID()}-`;
+   let sequence = 0;
+   function createContext(contextObject, options) {
+@@ -32,13 +32,15 @@
+     });
+     const context = Reflect.apply(original, this, [contextObject, namedOptions]);
+     names.set(context, name);
++    globalPrototypes.set(context,Object.getPrototypeOf(vm.runInContext('this',context)));
+     return context;
+   }
+   Object.defineProperty(createContext, 'name', { value: original.name, configurable: true });
+   Object.defineProperty(createContext, 'length', { value: original.length, configurable: true });
+-  registry = { names, prefix };
++  registry = { names, prefix,globalPrototypes };
+   Object.defineProperty(createContext, HOOK, { value: registry });
+   vm.createContext = createContext;
+ }
+ export function nameForVMContext(context) { return registry?.names.get(context); }
++export function originalGlobalPrototypeFor(context){return registry?.globalPrototypes?.get(context);}
+ export function isOwnedVMContextName(name) { return typeof name === 'string' && !!registry && name.startsWith(registry.prefix); }
+diff --git a/src/main-idl-prototypes.js b/src/main-idl-prototypes.js
+--- a/src/main-idl-prototypes.js
++++ b/src/main-idl-prototypes.js
+@@ -3,6 +3,8 @@
+ // unchanged except the explicitly realm-compiled sequence method below.
+ import 'jsdom';
+ import vm from 'node:vm';
++import {restoreWindowGlobalInheritance} from './window-global.js';
++import {originalGlobalPrototypeFor} from './context-names.js';
+ import {createRequire} from 'node:module';
+ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const interfaces=require('jsdom/lib/jsdom/living/interfaces.js');
+@@ -23,6 +25,7 @@
+  for(const fn of functions)if(prototypeOf(fn)===hostFunction)setPrototype(fn,functionPrototype);
+  const property=descriptor(window.Element.prototype,'getAttributeNames');
+  const context=utils.implForWrapper(window.document)._globalObject;
++ if(originalGlobalPrototypeFor(context))restoreWindowGlobalInheritance(window,context);
+  const wrapper=vm.compileFunction('return ({getAttributeNames(...args){const values=apply(original,this,args);return apply(from,ArrayConstructor,[values]);}}).getAttributeNames;',['original','apply','from','ArrayConstructor'],{parsingContext:context})(property.value,window.Reflect.apply,window.Array.from,window.Array);
+  for(const key of ['name','length'])Object.defineProperty(wrapper,key,descriptor(property.value,key));
+  Object.defineProperty(window.Element.prototype,'getAttributeNames',{...property,value:wrapper});
+diff --git a/src/isolated-world.js b/src/isolated-world.js
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,4 @@
++import {restoreWindowGlobalInheritance} from './window-global.js';
+ import {installConsole,consoleProtocolType} from './console.js';
+ import {registerPlatformFactory} from './platform-factories.js';
+ // Independent genuine VM/IDL-world prototype. Generated wrapper source comes
+@@ -22,7 +23,7 @@
+ export function utilityNodeIdentity(value){const record=utilityWrapperRecord(value);if(!record)return undefined;const type=own(record.impl,'nodeType')?.value;if(!Number.isInteger(type)||type<1||type>12)return undefined;const document=type===9?record.impl:own(record.impl,'_ownerDocument')?.value;return {nodeType:type,ownerDocument:hostUtils.wrapperForImpl(document),className:record.interfaceName};}
+ 
+ export function createIsolatedWorld(mainWindow,{name='independent-utility-world',timeout=1000,signal,isWindowClosed,onError,resolveWindow,resolveImplementation,onConsole,onRealm,onWrapper}={}) {
+- const context=vm.createContext({}, {name});const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
++ const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
+  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
+  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+@@ -87,7 +88,7 @@
+  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
+  Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
+  const windowImpl=hostUtils.implForWrapper(mainWindow);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
+- global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);Object.setPrototypeOf(global,global.Window.prototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
++ global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);restoreWindowGlobalInheritance(global,context,originalGlobalPrototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
+  const add=global.EventTarget.prototype.addEventListener,remove=global.EventTarget.prototype.removeEventListener;
+  const removeImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype.removeEventListener;
+  global.EventTarget.prototype.addEventListener=realmFunction(function(...args){requireLive();const impl=wrapperImpls.get(this),before=new Set(Object.values(impl?._eventListeners??{}).flat());const result=Reflect.apply(add,this,args);for(const[type,entries]of Object.entries(impl._eventListeners))for(const entry of entries)if(!before.has(entry))listeners.push({impl:new WeakRef(impl),type,entry:new WeakRef(entry)});return result;});
+diff --git a/src/window-global.js b/src/window-global.js
+new file mode 100644
+--- /dev/null
++++ b/src/window-global.js
+@@ -0,0 +1,16 @@
++// Restore the actual V8 global's intrinsic prototype captured before jsdom or
++// the utility installer replaces it. No depth-only object is manufactured.
++import {originalGlobalPrototypeFor} from './context-names.js';
++const installed=new WeakSet(),get=Object.getOwnPropertyDescriptor,setPrototype=Object.setPrototypeOf,define=Object.defineProperty;
++export function restoreWindowGlobalInheritance(global,context,intrinsic=originalGlobalPrototypeFor(context)){
++ if(installed.has(global))return;
++ const prototype=global.Window?.prototype,eventTarget=global.EventTarget?.prototype;
++ const constructor=intrinsic&&get(intrinsic,'constructor')?.value;
++ if(!intrinsic||typeof constructor!=='function'||get(constructor,'prototype')?.value!==intrinsic||!prototype||!eventTarget)throw Error('Original Window global prototype is unavailable');
++ setPrototype(prototype,eventTarget);
++ setPrototype(intrinsic,prototype);
++ // This is the original, distinct engine global constructor, not Window's
++ // public illegal-constructor function. Keep its actual call/new behavior.
++ define(constructor,'name',{...get(constructor,'name'),value:'Window'});
++ setPrototype(global,intrinsic);installed.add(global);
++}
+diff --git a/test/window-global.test.js b/test/window-global.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/window-global.test.js
+@@ -0,0 +1,56 @@
++import{test}from'node:test';
++import assert from'node:assert/strict';
++import vm from'node:vm';
++import{JSDOM}from'jsdom';
++import{createRequire}from'node:module';
++import{Browser}from'../src/browser.js';
++import{originalGlobalPrototypeFor}from'../src/context-names.js';
++import{restoreWindowGlobalInheritance}from'../src/window-global.js';
++import{createIsolatedWorld}from'../src/isolated-world.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),tracker=require('jsdom/lib/jsdom/named-properties-tracker.js');
++
++function assertChain(window,context){
++ const intrinsic=Object.getPrototypeOf(window);
++ if(originalGlobalPrototypeFor(context))assert.equal(intrinsic,originalGlobalPrototypeFor(context));
++ assert.notEqual(intrinsic,window.Window.prototype);assert.equal(Object.getPrototypeOf(intrinsic),window.Window.prototype);
++ assert.equal(Object.getPrototypeOf(window.Window.prototype),window.EventTarget.prototype);assert.equal(Object.getPrototypeOf(window.EventTarget.prototype),window.Object.prototype);
++ assert.deepEqual(Object.getOwnPropertyNames(intrinsic),['constructor']);assert.notEqual(intrinsic.constructor,window.Window);assert.equal(intrinsic.constructor.name,'Window');assert.equal(intrinsic.constructor.prototype,intrinsic);
++ assert.equal(Reflect.apply(intrinsic.constructor,undefined,[]),window);
++ const constructed=new intrinsic.constructor();assert.equal(Object.getPrototypeOf(constructed),intrinsic);assert.equal(constructed instanceof window.Window,true);assert.equal(constructed instanceof window.EventTarget,true);
++}
++
++test('main and frame globals retain their actual intrinsic global prototype and real Window/EventTarget inheritance',async t=>{
++ const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());
++ await page.navigate('data:text/html,<p>root</p><iframe id=f srcdoc="<p>child</p>"></iframe>');
++ const main=page.dom.window,child=main.document.getElementById('f').contentWindow,frame=page.frames.findElement(main.document.getElementById('f'));
++ for(const[w,context]of[[main,page.dom.getInternalVMContext()],[child,frame.dom.getInternalVMContext()]]){
++  assertChain(w,context);let current;w.addEventListener('actual-global',function(){current=this});w.dispatchEvent(new w.Event('actual-global'));assert.equal(current,w);
++ }
++});
++
++test('genuine utility globals use their original VM layer over real generated EventTarget wrappers',t=>{
++ const dom=new JSDOM('<p id=p>text</p>',{runScripts:'dangerously'}),world=createIsolatedWorld(dom.window);t.after(()=>{world.dispose();dom.window.close()});
++ assertChain(world.global,world.context);
++ assert.equal(world.evaluate('globalThis.eventThis=false;addEventListener("actual-global",function(){eventThis=this===globalThis});dispatchEvent(new Event("actual-global"));eventThis'),true);
++ assert.equal(world.evaluate('document.getElementById("p") instanceof HTMLParagraphElement'),true);
++});
++
++test('original prototype capture uses the actual global rather than supplied public Object/globalThis aliases',()=>{
++ let calls=0;const context=vm.createContext({Object:{getPrototypeOf(){calls++;throw Error('authored')}},globalThis:{fake:true}});
++ const actual=vm.runInContext('this',context);assert.equal(originalGlobalPrototypeFor(context),Object.getPrototypeOf(actual));assert.equal(calls,0);
++});
++
++test('restoring inheritance preserves the actual named-property tracker, duplicate live collections and lexical shadowing',t=>{
++ let before,tracking,ctor;const dom=new JSDOM('<body>',{runScripts:'dangerously',beforeParse(window){before=window.document;ctor=window.Window;tracking=tracker.get(window._globalObject);restoreWindowGlobalInheritance(window,utils.implForWrapper(window.document)._globalObject)}});t.after(()=>dom.window.close());
++ const w=dom.window,d=w.document;assert.equal(d,before);assert.equal(w.Window,ctor);assert.equal(tracker.get(w._globalObject),tracking);
++ const a=d.createElement('div'),b=d.createElement('div');a.id=b.id='actualNamed';d.body.append(a);assert.equal(w.actualNamed,a);d.body.append(b);const collection=w.actualNamed;assert.equal(collection instanceof w.HTMLCollection,true);assert.deepEqual([...collection],[a,b]);a.remove();assert.equal(w.actualNamed,b);b.id='renamed';assert.equal(w.actualNamed,undefined);assert.equal(w.renamed,b);b.remove();assert.equal(w.renamed,undefined);
++ const form=d.createElement('form');form.name='actualForm';d.body.append(form);assert.equal(w.actualForm,form);form.name='nextForm';assert.equal(w.actualForm,undefined);assert.equal(w.nextForm,form);w.nextForm=17;form.remove();assert.equal(w.nextForm,17);
++ const context=utils.implForWrapper(d)._globalObject;vm.runInContext('let namedLexical=51',context);const element=d.createElement('i');element.id='namedLexical';d.body.append(element);assert.equal(vm.runInContext('namedLexical',context),51);assert.equal(w.namedLexical,element);
++});
++
++test('foreign and retired frames keep actual document-driven ID/name access after global prototype restoration',async t=>{
++ const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<iframe id=f name=actualFrame srcdoc="<p>child</p>"></iframe>');
++ const w=page.dom.window,frame=w.document.getElementById('f'),child=frame.contentWindow,node=child.document.createElement('div');node.id='foreignNode';child.document.body.append(node);
++ assert.equal(w.actualFrame,child);assert.equal(child.foreignNode,node);node.id='nextNode';assert.equal(child.foreignNode,undefined);assert.equal(child.nextNode,node);frame.name='nextFrame';assert.equal(w.actualFrame,undefined);assert.equal(w.nextFrame,child);
++ frame.remove();assert.equal(child.closed,true);assert.equal(child.nextNode,node);
++});

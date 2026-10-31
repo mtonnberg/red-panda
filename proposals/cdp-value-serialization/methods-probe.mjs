@@ -1,0 +1,34 @@
+import{readFile,writeFile}from'node:fs/promises';import{createHash}from'node:crypto';
+import{startReference}from'/workspace/red-panda/scripts/reference-server.mjs';import{connect}from'/workspace/red-panda/test/cdp-client.js';
+const binary=process.argv[2],output=process.argv[3],sha=x=>createHash('sha256').update(x).digest('hex'),binarySHA256=sha(await readFile(binary));if(binary.includes('lightpanda')&&binarySHA256!=='9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f')throw Error('wrong Native binary');
+let service,client;const observations=[];
+try{
+ service=await startReference(binary,{args:['--load-resources','iframe']});client=await connect(service.endpoint,{timeout:5000});const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
+ const send=(method,params={})=>client.send(method,params,sessionId);const call=async(label,method,params)=>{try{const result=await send(method,params);observations.push({label,method,params,result});return result;}catch(error){observations.push({label,method,params,error:{code:error.code,message:error.message}})}};
+ await send('Runtime.enable');const initialTree=await send('Page.getFrameTree');const mainContext=client.events.find(event=>event.method==='Runtime.executionContextCreated'&&event.params.context.auxData?.isDefault&&event.params.context.auxData.frameId===initialTree.frameTree.frame.id)?.params.context.id;if(!mainContext)throw Error('missing actual main context');
+ await call('init','Runtime.evaluate',{expression:'globalThis.hits=[];true',returnByValue:true});
+ await call('call-own-toJSON','Runtime.callFunctionOn',{executionContextId:mainContext,functionDeclaration:'function(){return {a:1,toJSON(){hits.push("toJSON");return 9}}}',returnByValue:true});
+ await call('call-bigint','Runtime.callFunctionOn',{executionContextId:mainContext,functionDeclaration:'function(){return {a:1n}}',returnByValue:true});
+ const script=await send('Runtime.compileScript',{executionContextId:mainContext,expression:'({a:1,toJSON(){hits.push("toJSON");return 9}})',sourceURL:'owned-value.js',persistScript:true});
+ await call('run-own-toJSON','Runtime.runScript',{scriptId:script.scriptId,executionContextId:mainContext,returnByValue:true});
+ const cycle=await send('Runtime.compileScript',{executionContextId:mainContext,expression:'(()=>{const a={};a.self=a;return a})()',sourceURL:'owned-cycle.js',persistScript:true});
+ await call('run-cycle','Runtime.runScript',{scriptId:cycle.scriptId,executionContextId:mainContext,returnByValue:true});
+ const promise=await send('Runtime.evaluate',{expression:'Promise.resolve({a:1,toJSON(){hits.push("toJSON");return 9}})'});
+ await call('await-own-toJSON','Runtime.awaitPromise',{promiseObjectId:promise.result.objectId,returnByValue:true});
+ const badPromise=await send('Runtime.evaluate',{expression:'Promise.resolve((()=>{const a={};a.self=a;return a})())'});
+ await call('await-cycle','Runtime.awaitPromise',{promiseObjectId:badPromise.result.objectId,returnByValue:true});
+ await call('own-undefined','Runtime.evaluate',{expression:'({u:undefined,f(){}})',returnByValue:true});
+ await call('array-undefined','Runtime.evaluate',{expression:'[undefined,function(){}]',returnByValue:true});
+ await call('function-own-property','Runtime.evaluate',{expression:'Object.assign(function(){},{marker:17})',returnByValue:true});
+ await call('array-proxy','Runtime.evaluate',{expression:'new Proxy([1,2],{get(t,k,r){hits.push("get:"+String(k));return Reflect.get(t,k,r)}})',returnByValue:true});
+ await call('getter-microtask','Runtime.evaluate',{expression:'({get value(){hits.push("get");queueMicrotask(()=>hits.push("microtask"));return 1}})',returnByValue:true});
+ await call('side-effects','Runtime.evaluate',{expression:'hits',returnByValue:true});
+ const tree=await send('Page.getFrameTree');const{executionContextId:id}=await send('Page.createIsolatedWorld',{frameId:tree.frameTree.frame.id,worldName:'serialization'});
+ await call('utility-listen','Runtime.evaluate',{contextId:id,expression:'globalThis.foreign=null;document.addEventListener("actual-value",event=>{globalThis.foreign=event.detail});true',returnByValue:true});
+ await call('main-transfer','Runtime.evaluate',{expression:'globalThis.foreign={marker:17,toJSON(){hits.push("foreign-toJSON");return 9}};document.dispatchEvent(new CustomEvent("actual-value",{detail:foreign}));true',returnByValue:true});
+ await call('utility-foreign','Runtime.evaluate',{contextId:id,expression:'foreign',returnByValue:true});
+ await call('utility-foreign-call','Runtime.callFunctionOn',{executionContextId:id,functionDeclaration:'function(){return {foreign,nested:{toJSON(){return 9},marker:23}}}',returnByValue:true});
+ await call('utility-public-intrinsics','Runtime.evaluate',{contextId:id,expression:'globalThis.saved=Object.create({toJSON(){throw Error("called")}});saved.marker=29;JSON.parse=JSON.stringify=()=>{throw Error("JSON")};Function.prototype.apply=Reflect.apply=()=>{throw Error("apply")};saved',returnByValue:true});
+ await call('main-public-intrinsics','Runtime.evaluate',{expression:'JSON.parse=JSON.stringify=()=>{throw Error("JSON")};Function.prototype.apply=Reflect.apply=()=>{throw Error("apply")};foreign',returnByValue:true});
+ await call('main-toJSON-hits','Runtime.evaluate',{expression:'hits',returnByValue:true});
+}finally{await client?.close();await service?.close();await writeFile(output,JSON.stringify({binarySHA256,driverSHA256:sha(await readFile(new URL(import.meta.url))),observations},null,2)+'\n');}

@@ -4,7 +4,7 @@ import { types } from 'node:util';
 import { platformFactoryRecord } from './platform-factories.js';
 import { knownPlatformFactoryKind } from './platform-factory-hooks.js';
 const descriptor = Object.getOwnPropertyDescriptor, prototype = Object.getPrototypeOf;
-const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad']);
+const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad','EncodedAudioChunk','EncodedVideoChunk','VideoColorSpace']);
 export function cloneObjectKind(value) {
   if (Array.isArray(value)) return 'Array';
   for (const [kind, test] of [['Map',types.isMap],['Set',types.isSet],['Error',types.isNativeError],['ArrayBuffer',types.isAnyArrayBuffer],['View',ArrayBuffer.isView],['Date',types.isDate],['RegExp',types.isRegExp]]) if (test(value)) return kind;

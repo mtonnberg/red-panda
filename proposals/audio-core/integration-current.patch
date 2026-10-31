@@ -1,0 +1,276 @@
+--- /dev/null
++++ b/src/audio-core.js
+@@ -0,0 +1,198 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {types} from 'node:util';
++import {createInvocationTrampoline} from './invocation.js';
++import {registerPlatformFactory} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const require=createRequire(import.meta.url),{implForWrapper,wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const {createAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
++const reportException=require('jsdom/lib/jsdom/living/helpers/runtime-script-errors.js');
++const installed=new WeakMap(),shared={buffers:new WeakMap(),contexts:new WeakMap(),nodes:new WeakMap(),params:new WeakMap(),events:new WeakMap()};
++const typed=Object.getPrototypeOf(Float32Array.prototype),typedLength=Object.getOwnPropertyDescriptor(typed,'length').get;
++const hostSetTimeout=setTimeout,hostClearTimeout=clearTimeout;
++function audioFactory(g,bridge){
++ const {buffers,contexts,nodes,params,events}=bridge.shared;
++ const TypeError=g.TypeError,RangeError=g.RangeError,Exception=g.DOMException,EventTarget=g.EventTarget,Event=g.Event,Promise=g.Promise,F32=g.Float32Array;
++ const Set=bridge.Set,String=g.String,internal=()=>new bridge.Array(),promiseReject=Promise.reject,addListener=EventTarget.prototype.addEventListener,removeListener=EventTarget.prototype.removeEventListener;
++ const define=Object.defineProperty,create=Object.create,setPrototype=Object.setPrototypeOf,getDescriptor=Object.getOwnPropertyDescriptor,keys=Object.getOwnPropertyNames;
++ const finite=Number.isFinite,fround=Math.fround,ceil=Math.ceil,floor=Math.floor,round=Math.round,min=Math.min,max=Math.max,abs=Math.abs,pow=Math.pow,exp=Math.exp;
++ const constant=3.4028234663852886e38,token={},apply=Reflect.apply;
++ const error=()=>new TypeError('invalid argument'),illegal=()=>{throw new TypeError('Illegal Constructor')};
++ const dom=(name)=>new Exception({NotSupportedError:'The operation is not supported',IndexSizeError:'Index or size is negative or greater than the allowed amount',InvalidStateError:'The object is in an invalid state',InvalidAccessError:'The object does not support the operation or argument'}[name]??'The operation is not supported',name);
++ const brand=(map,value)=>{const state=map.get(value);if(!state)throw new TypeError('Illegal invocation');return state};
++ const dictionary=value=>{if(value==null)return{};if(typeof value!=='object'&&typeof value!=='function')throw error();return value};
++ const number=value=>+value,uint=value=>number(value)>>>0,restricted=value=>{const result=number(value);if(!finite(result))throw new TypeError('');return result;},float=value=>{const result=fround(number(value));if(!finite(result))throw new TypeError('');return result};
++ const nonnegative=value=>{const result=restricted(value);if(result<0)throw new RangeError('');return result};
++ const arrayLength=value=>bridge.arrayLength(value);
++ function publish(value,kind){bridge.publish(value,kind);return value;}
++ function validate(channels,length,rate){if(!length||!channels||channels>32||!finite(rate)||rate<3000||rate>768000)throw dom('NotSupportedError');if(length*channels>33554432)throw dom('NotSupportedError');}
++ function channel(state,index){index=uint(index);if(index>=state.channels.length)throw dom('IndexSizeError');return state.channels[index];}
++ function bufferState(length,channels,rate){validate(channels,length,rate);const state={length,rate,channels:internal()};for(let index=0;index<channels;index++)state.channels.push(new F32(length));return state;}
++ function makeBuffer(length,channels,rate){const result=create(AudioBuffer.prototype);buffers.set(result,bufferState(length,channels,rate));return publish(result,'AudioBuffer');}
++ class AudioBuffer{
++  constructor(options){if(!arguments.length)throw error();options=dictionary(options);const lengthValue=options.length;if(!('length'in options))throw error();const length=uint(lengthValue),channelsValue=options.numberOfChannels,channels=channelsValue===undefined?1:uint(channelsValue);if(!('sampleRate'in options))throw error();const rate=fround(number(options.sampleRate));buffers.set(this,bufferState(length,channels,rate));publish(this,'AudioBuffer');}
++  get sampleRate(){return brand(buffers,this).rate;}
++  get length(){return brand(buffers,this).length;}
++  get duration(){const state=brand(buffers,this);return state.length/state.rate;}
++  get numberOfChannels(){return brand(buffers,this).channels.length;}
++  getChannelData(index){const state=brand(buffers,this);if(!arguments.length)throw error();return channel(state,index);}
++  copyFromChannel(destination,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(destination))throw new TypeError('');const source=channel(state,index),offset=uint(start),length=min(arrayLength(destination),max(0,arrayLength(source)-offset));for(let at=0;at<length;at++)destination[at]=source[offset+at];}
++  copyToChannel(source,index,start=0){const state=brand(buffers,this);if(arguments.length<2)throw error();if(!bridge.isFloat32(source))throw new TypeError('');const destination=channel(state,index),offset=uint(start),length=min(arrayLength(source),max(0,arrayLength(destination)-offset));const snapshot=internal();for(let at=0;at<length;at++)snapshot.push(source[at]);for(let at=0;at<length;at++)destination[offset+at]=snapshot[at];}
++ }
++ function makeParam(context,value,automation='k-rate'){const object=create(AudioParam.prototype);params.set(object,{context,value:fround(value),defaultValue:fround(value),automation,events:internal(),sequence:0});return publish(object,'AudioParam');}
++ function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);state.events.push({type,value,time,extra,sequence:state.sequence++});state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return object;}
++ function paramValue(state,time){let value=state.value,previousTime=0,target=null,curve=null;
++  for(const event of state.events){
++   if(event.type==='linear'||event.type==='exponential'){
++    if(event.time>time){const fraction=event.time===previousTime?1:max(0,min(1,(time-previousTime)/(event.time-previousTime)));return event.type==='linear'?value+(event.value-value)*fraction:value*pow(event.value/value,fraction);}
++    value=event.value;previousTime=event.time;target=null;curve=null;continue;
++   }
++   if(event.time>time)break;
++   if(target)value=target.value+(value-target.value)*exp(-(event.time-previousTime)/target.constant);
++   if(curve){const at=min(curve.values.length-1,max(0,(event.time-previousTime)/curve.duration*(curve.values.length-1))),low=floor(at);value=curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}
++   if(event.type==='target'){target={value:event.value,constant:event.extra};curve=null;}else if(event.type==='curve'){curve={values:event.extra.values,duration:event.extra.duration};target=null;value=curve.values[0];}else{value=event.value;target=null;curve=null;}
++   previousTime=event.time;
++  }
++  if(target)return target.constant===0?target.value:target.value+(value-target.value)*exp(-(time-previousTime)/target.constant);
++  if(curve){const at=min(curve.values.length-1,max(0,(time-previousTime)/curve.duration*(curve.values.length-1))),low=floor(at);return curve.values[low]+(curve.values[min(low+1,curve.values.length-1)]-curve.values[low])*(at-low);}
++  return value;
++ }
++ class AudioParam{
++  constructor(){illegal();}
++  get value(){const state=brand(params,this),context=contexts.get(state.context);return context.frame?fround(paramValue(state,context.frame/context.rate)):state.value;}
++  set value(value){brand(params,this).value=float(value);}
++  get automationRate(){return brand(params,this).automation;}
++  set automationRate(value){const state=brand(params,this);value=String(value);if(!['a-rate','k-rate'].includes(value))return;if(value!==state.automation)throw dom('InvalidStateError');}
++  get defaultValue(){return brand(params,this).defaultValue;}
++  get minValue(){brand(params,this);return -constant;}
++  get maxValue(){brand(params,this);return constant;}
++  setValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'set',value,time);}
++  linearRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'linear',value,time);}
++  exponentialRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();value=float(value);if(value<=0)throw new RangeError('');return addParam(this,'exponential',value,time);}
++  setTargetAtTime(value,time,constant){brand(params,this);if(arguments.length<3)throw error();constant=nonnegative(constant);return addParam(this,'target',value,time,constant);}
++  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();if(!bridge.isFloat32(values))throw new TypeError('');const length=arrayLength(values);if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));state.events.push({type:'curve',time,extra:{values:copy,duration},sequence:state.sequence++});state.events.sort((a,b)=>a.time-b.time||a.sequence-b.sequence);return this;}
++  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);return this;}
++  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);state.events=state.events.filter(event=>event.time<time);return addParam(this,'set',value,time);}
++ }
++ function handler(target,state,key,value){const previous=state.handlers[key];if(previous)apply(removeListener,target,[key,previous]);const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next)apply(addListener,target,[key,next]);}
++ class AudioNode extends EventTarget{
++  constructor(context,key){super();if(key!==token)illegal();brand(contexts,context);nodes.set(this,{context,inputs:1,outputs:1,channelCount:2,mode:'max',interpretation:'speakers',connections:new Set(),handlers:create(null)});}
++  get context(){return brand(nodes,this).context;}
++  get numberOfInputs(){return brand(nodes,this).inputs;}
++  get numberOfOutputs(){return brand(nodes,this).outputs;}
++  get channelCount(){return brand(nodes,this).channelCount;}
++  set channelCount(value){const state=brand(nodes,this);value=uint(value);if(!value||value>32)throw dom('NotSupportedError');state.channelCount=value;}
++  get channelCountMode(){return brand(nodes,this).mode;}
++  set channelCountMode(value){const state=brand(nodes,this);value=String(value);if(['max','clamped-max','explicit'].includes(value))state.mode=value;}
++  get channelInterpretation(){return brand(nodes,this).interpretation;}
++  set channelInterpretation(value){const state=brand(nodes,this);value=String(value);if(['speakers','discrete'].includes(value))state.interpretation=value;}
++  connect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length)throw error();const next=nodes.get(destination);if(!next){if(params.has(destination))throw dom('NotSupportedError');throw error();}output=uint(output);input=uint(input);if(next.context!==state.context)throw dom('InvalidAccessError');if(output>=state.outputs||input>=next.inputs)throw dom('IndexSizeError');state.connections.add(destination);return destination;}
++  disconnect(destination,output=0,input=0){const state=brand(nodes,this);if(!arguments.length){state.connections.clear();return;}if(typeof destination==='number'){if(uint(destination)>=state.outputs)throw dom('IndexSizeError');state.connections.clear();return;}const next=nodes.get(destination);if(!next)throw error();if(uint(output)>=state.outputs||uint(input)>=next.inputs)throw dom('IndexSizeError');if(!state.connections.delete(destination))throw dom('InvalidAccessError');}
++ }
++ class AudioDestinationNode extends AudioNode{constructor(context,key){super(context,key);if(key!==token)illegal();const state=nodes.get(this),ctx=contexts.get(context);state.channelCount=ctx.channels;state.mode='explicit';state.kind='destination';publish(this,'AudioDestinationNode');}get maxChannelCount(){return brand(contexts,brand(nodes,this).context).channels;}}
++ class AudioScheduledSourceNode extends AudioNode{
++  constructor(context,key){super(context,key);if(key!==token)illegal();const state=nodes.get(this);state.kind='source';state.inputs=0;state.started=false;state.ended=false;state.stop=Infinity;contexts.get(context).sources.add(this);}
++  start(when=0){const state=brand(nodes,this);when=nonnegative(when);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=when;}
++  stop(when=0){const state=brand(nodes,this);when=nonnegative(when);if(!state.started)throw dom('InvalidStateError');state.stop=when;}
++  get onended(){return brand(nodes,this).handlers.ended??null;}
++  set onended(value){handler(this,brand(nodes,this),'ended',value);}
++ }
++ class AudioBufferSourceNode extends AudioScheduledSourceNode{
++  constructor(context,options={}){if(!arguments.length||!contexts.has(context))throw error();super(context,token);options=dictionary(options);const state=nodes.get(this);state.buffer=null;state.bufferSet=false;state.playbackRate=makeParam(context,1);state.detune=makeParam(context,0);state.loop=false;state.loopStart=0;state.loopEnd=0;
++   const buffer=options.buffer;if(buffer!==undefined)this.buffer=buffer;const detune=options.detune;if(detune!==undefined)state.detune.value=detune;const loop=options.loop;if(loop!==undefined)state.loop=!!loop;const loopEnd=options.loopEnd;if(loopEnd!==undefined)state.loopEnd=restricted(loopEnd);const loopStart=options.loopStart;if(loopStart!==undefined)state.loopStart=restricted(loopStart);const playback=options.playbackRate;if(playback!==undefined)state.playbackRate.value=playback;publish(this,'AudioBufferSourceNode');}
++  get buffer(){return brand(nodes,this).buffer;}
++  set buffer(value){const state=brand(nodes,this);if(value!==null&&!buffers.has(value))throw error();if(value!==null&&state.bufferSet)throw dom('InvalidStateError');state.buffer=value;if(value!==null)state.bufferSet=true;}
++  get playbackRate(){return brand(nodes,this).playbackRate;}
++  get detune(){return brand(nodes,this).detune;}
++  get loop(){return brand(nodes,this).loop;}
++  set loop(value){brand(nodes,this).loop=!!value;}
++  get loopStart(){return brand(nodes,this).loopStart;}
++  set loopStart(value){brand(nodes,this).loopStart=restricted(value);}
++  get loopEnd(){return brand(nodes,this).loopEnd;}
++  set loopEnd(value){brand(nodes,this).loopEnd=restricted(value);}
++  start(when=0,offset=0,duration){const state=brand(nodes,this);when=nonnegative(when);offset=nonnegative(offset);if(duration!==undefined)duration=nonnegative(duration);if(state.started)throw dom('InvalidStateError');state.started=true;state.when=when;state.offset=offset;state.duration=duration;}
++ }
++ class BaseAudioContext extends EventTarget{
++  constructor(key){super();if(key!==token)illegal();}
++  get destination(){return brand(contexts,this).destination;}
++  get sampleRate(){return brand(contexts,this).rate;}
++  get currentTime(){const state=brand(contexts,this);return state.frame/state.rate;}
++  get state(){return brand(contexts,this).state;}
++  get onstatechange(){return brand(contexts,this).handlers.statechange??null;}
++  set onstatechange(value){handler(this,brand(contexts,this),'statechange',value);}
++  createBuffer(channels,length,rate){brand(contexts,this);if(arguments.length<3)throw error();return makeBuffer(uint(length),uint(channels),fround(number(rate)));}
++  createBufferSource(){brand(contexts,this);return new AudioBufferSourceNode(this);}
++ }
++ class OfflineAudioCompletionEvent extends Event{
++  constructor(type,init){if(arguments.length<2)throw error();init=dictionary(init);const buffer=init.renderedBuffer;if(!buffers.has(buffer))throw error();super(type,init);events.set(this,buffer);}
++  get renderedBuffer(){if(!events.has(this))throw new TypeError('Illegal invocation');return events.get(this);}
++ }
++ function fire(target,type,buffer){const event=bridge.event(target,type);if(type==='complete'){setPrototype(event,OfflineAudioCompletionEvent.prototype);events.set(event,buffer);}bridge.dispatch(target,event);}
++ function schedule(action){bridge.schedule(action);}
++ function sourceFrames(source,ctx,quantumFrames){const state=nodes.get(source);if(!state.started||state.ended)return {ended:false,samples:null};const b=state.buffer===null?null:buffers.get(state.buffer),samples=internal();for(let ch=0;ch<(b?.channels.length??1);ch++)samples.push(new F32(quantumFrames));
++  let position=b?round((state.offset??0)*b.rate):0,consumed=0,started=false,ended=false;
++  let loopStart=0,loopEnd=b?.length??0;
++  if(b&&state.loop){const start=max(0,min(b.length,round(state.loopStart*b.rate))),end=state.loopEnd>0?max(0,min(b.length,round(state.loopEnd*b.rate))):b.length;if(start<b.length&&end>start){loopStart=start;loopEnd=end;}if(position>=loopEnd)position=loopStart;}
++  const when=ceil(state.when*ctx.rate),stop=ceil(state.stop*ctx.rate),duration=b&&state.duration!==undefined?state.duration*b.rate:Infinity;
++  for(let frame=0;frame<quantumFrames;frame++){
++   if(frame<when)continue;
++   if(frame>=stop||!b||consumed>=duration||!state.loop&&(position<0||position>=b.length)){ended=true;break;}
++   started=true;
++   if(state.loop){const span=loopEnd-loopStart;if(position>=loopEnd)position=loopStart+(position-loopEnd)%span;if(position<0){ended=true;break;}}
++   const lower=floor(position),fraction=position-lower,next=state.loop&&lower+1>=loopEnd?loopStart:min(lower+1,b.length-1);
++   for(let ch=0;ch<b.channels.length;ch++){const data=b.channels[ch];samples[ch][frame]=data[lower]+(data[next]-data[lower])*fraction;}
++   const time=floor(frame/128)*128/ctx.rate,step=paramValue(params.get(state.playbackRate),time)*pow(2,paramValue(params.get(state.detune),time)/1200)*b.rate/ctx.rate;
++   position+=step;consumed+=abs(step);
++  }
++  // The engine executes the full final quantum, even though only requested
++  // output frames are returned. A source ending exactly at that boundary ends.
++  if(started&&b&&!state.loop&&(position<0||position>=b.length)||started&&consumed>=duration||stop<=quantumFrames)ended=true;
++  return {ended,samples};
++ }
++ function render(context,state){if(!bridge.active())return;const frames=ceil(state.length/128)*128,output=makeBuffer(state.length,state.channels,state.rate),out=buffers.get(output),finished=internal();
++  for(const source of state.sources){const result=sourceFrames(source,state,frames),sourceState=nodes.get(source);if(result.ended){sourceState.ended=true;finished.push(source);}if(!sourceState.connections.has(state.destination)||!result.samples)continue;
++   const channels=result.samples.length;
++   for(let ch=0;ch<state.channels;ch++)for(let frame=0;frame<state.length;frame++){
++    let value=0;if(sourceState.interpretation==='discrete'){if(ch<channels)value=result.samples[ch][frame];}
++    else if(channels===1)value=result.samples[0][frame];else if(state.channels===1&&channels===2)value=(result.samples[0][frame]+result.samples[1][frame])*.5;else if(ch<channels)value=result.samples[ch][frame];
++    out.channels[ch][frame]+=value;
++   }
++  }
++  state.frame=frames;
++  for(const source of finished)schedule(()=>fire(source,'ended'));
++  schedule(()=>{if(!bridge.active())return;state.state='closed';fire(context,'complete',output);state.resolve(output);schedule(()=>fire(context,'statechange'));});
++ }
++ class OfflineAudioContext extends BaseAudioContext{
++  constructor(options,length,rate){if(!arguments.length)throw error();super(token);let channels;
++   if(arguments.length===1){if(options!=null&&typeof options!=='object'&&typeof options!=='function')throw new TypeError('');options=dictionary(options);const lengthValue=options.length;if(!('length'in options))throw error();length=uint(lengthValue);const count=options.numberOfChannels;channels=count===undefined?1:uint(count);if(!('sampleRate'in options))throw error();const sample=options.sampleRate;rate=fround(number(sample));}
++   else{if(arguments.length<3)throw new TypeError('');channels=uint(options);length=uint(length);rate=fround(number(rate));}
++   validate(channels,length,rate);const state={channels,length,rate,frame:0,state:'suspended',sources:new Set(),handlers:create(null),rendered:false};contexts.set(this,state);state.destination=new AudioDestinationNode(this,token);publish(this,'OfflineAudioContext');}
++  get length(){return brand(contexts,this).length;}
++  get oncomplete(){return brand(contexts,this).handlers.complete??null;}
++  set oncomplete(value){handler(this,brand(contexts,this),'complete',value);}
++  startRendering(){const state=brand(contexts,this);if(state.rendered||!bridge.active())return apply(promiseReject,Promise,[dom('InvalidStateError')]);state.rendered=true;state.state='running';const promise=new Promise(resolve=>{state.resolve=resolve;});schedule(()=>fire(this,'statechange'));schedule(()=>render(this,state));return promise;}
++  suspend(){brand(contexts,this);return apply(promiseReject,Promise,[dom('NotSupportedError')]);}
++  resume(){brand(contexts,this);return apply(promiseReject,Promise,[dom('NotSupportedError')]);}
++ }
++ for(const [name,Constructor]of Object.entries({AudioBuffer,BaseAudioContext,OfflineAudioContext,AudioNode,AudioParam,AudioDestinationNode,AudioScheduledSourceNode,AudioBufferSourceNode,OfflineAudioCompletionEvent})){
++  define(Constructor,'length',{value:{AudioBuffer:1,BaseAudioContext:0,OfflineAudioContext:1,AudioNode:0,AudioParam:0,AudioDestinationNode:0,AudioScheduledSourceNode:0,AudioBufferSourceNode:1,OfflineAudioCompletionEvent:2}[name],configurable:true});
++  const constructor=getDescriptor(Constructor.prototype,'constructor');delete Constructor.prototype.constructor;
++  for(const key of keys(Constructor.prototype)){const descriptor=getDescriptor(Constructor.prototype,key);define(Constructor.prototype,key,{...descriptor,enumerable:true});}
++  define(Constructor.prototype,'constructor',constructor);define(Constructor.prototype,Symbol.toStringTag,{value:name,configurable:true});define(g,name,{value:Constructor,writable:true,configurable:true,enumerable:false});
++ }
++ return {};
++}
++export function installAudioCore(page,window){
++ if(installed.has(window))return installed.get(window);
++ for(const kind of ['AudioBuffer','BaseAudioContext','OfflineAudioContext','AudioNode','AudioParam','AudioDestinationNode','AudioScheduledSourceNode','AudioBufferSourceNode','OfflineAudioCompletionEvent'])registerPlatformFactoryKind(kind);
++ const signal=page.documentAbort?.signal,timers=new Set(),invoke=createInvocationTrampoline(implForWrapper(window)._globalObject),deadline={timeout:Math.min(page.timeout??2000,2000),displayErrors:false};let disposed=false;
++ const active=()=>!disposed&&!page.closed&&!signal?.aborted&&!!window.document;
++ const bridge={shared,Array,Set,isFloat32:types.isFloat32Array,arrayLength:value=>typedLength.call(value),publish:(value,kind)=>registerPlatformFactory(value,{kind,globalObject:window}),active,
++  schedule(callback){if(!active())return;const id=hostSetTimeout(()=>{timers.delete(id);if(active()){try{invoke.invoke(callback,window,[],deadline);}catch(error){if(active())reportException(window,error);}}},0);timers.add(id);},
++  event:(target,type)=>wrapperForImpl(createAnEvent(type,implForWrapper(target)._globalObject)),
++  dispatch:(target,event)=>implForWrapper(target)._dispatch(implForWrapper(event)),
++ };
++ const controller=window.eval(`(${audioFactory.toString()})`)(window,bridge);
++ const dispose=()=>{if(disposed)return;disposed=true;for(const id of timers)hostClearTimeout(id);timers.clear();signal?.removeEventListener('abort',dispose);};
++ signal?.addEventListener('abort',dispose,{once:true});const result={dispose,controller};installed.set(window,result);return result;
++}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installAudioCore} from './audio-core.js';
+ import { installImageData } from './image-data.js';
+ import { SyncHTTP } from './sync-http.js';
+ import {installFrameActivity} from './frame-activity.js';
+@@ -259,6 +260,7 @@
+       installDOMEvents(this, window);
+       installDOMLifecycle(this, window);
+       installMedia(this, window);
++      installAudioCore(this, window);
+       installXHR(this, window);
+       if (main) this.frames = installFrames(this, window, {
+         prepareWindow: (page, child) => Page.prototype.prepareWindow.call(page, child, null, { main: false }),
+--- a/src/platform-factory-hooks.js
++++ b/src/platform-factory-hooks.js
+@@ -7,6 +7,11 @@
+ let installed = false;
+ const knownKinds = new Set();
+ export function knownPlatformFactoryKind(kind) { return knownKinds.has(kind); }
++// Known names only affect ordinary lookalike classification, never branding.
++export function registerPlatformFactoryKind(kind) {
++  if (typeof kind !== 'string' || !kind) throw new TypeError('Platform factory kind is required');
++  knownKinds.add(kind);
++}
+ // Only successful trusted generated setup/new returns register an identity.
+ // Candidate classification never discovers brands from implementation symbols.
+ export function installPlatformFactoryHooks() {
+--- /dev/null
++++ b/test/audio-core.test.js
+@@ -0,0 +1,43 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {setTimeout as delay} from 'node:timers/promises';
++import {JSDOM} from 'jsdom';
++import {Browser} from '../src/browser.js';
++import {installAudioCore} from '../src/audio-core.js';
++import {queryHeapObjects} from '../src/heap-query.js';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(action){const browser=new Browser({timeout:3000,loadResources:['iframe','worker']}),page=browser.createPage();try{await page.navigate('data:text/html,<!doctype html><body>Audio');await action({browser,page,w:page.dom.window});}finally{browser.close();}}
++async function render(w,{channels=1,length=16,rate=8000,samples=[[0,1,2,3,4,5,6,7]],sourceRate=rate,options={},when=0,offset=0,duration,stop}={}){const context=new w.OfflineAudioContext(channels,length,rate),source=new w.AudioBufferSourceNode(context,options),buffer=context.createBuffer(samples.length,samples[0].length,sourceRate);for(let at=0;at<samples.length;at++)buffer.copyToChannel(new w.Float32Array(samples[at]),at);source.buffer=buffer;source.connect(context.destination);source.start(when,offset,...(duration===undefined?[]:[duration]));if(stop!==undefined)source.stop(stop);return {context,source,output:await context.startRendering()};}
++
++test('AudioBuffer retains live genuine realm Float32Arrays and actual bounded channel copies',()=>fixture(async({w})=>{const b=new w.AudioBuffer({length:4,numberOfChannels:2,sampleRate:22050.123});assert.equal(b.sampleRate,Math.fround(22050.123));assert.equal(b.numberOfChannels,2);assert.equal(b.duration,4/b.sampleRate);const data=b.getChannelData(1);assert.equal(data instanceof w.Float32Array,true);assert.equal(data,b.getChannelData(1));assert.deepEqual([...data],[0,0,0,0]);b.copyToChannel(new w.Float32Array([1,2,3]),1,1);assert.deepEqual([...data],[0,1,2,3]);const target=new w.Float32Array([8,8,8]);b.copyFromChannel(target,1,2);assert.deepEqual([...target],[2,3,8]);assert.deepEqual(Object.keys(b),[]);}));
++
++test('required dictionary fields, ordered conversion, native sample rates and actual realm errors are enforced',()=>fixture(async({w})=>{const order=[];new w.AudioBuffer({get sampleRate(){order.push('sampleRate');return 8000},get length(){order.push('length');return 2},get numberOfChannels(){order.push('numberOfChannels');return 1}});assert.deepEqual(order,['length','numberOfChannels','sampleRate']);for(const options of [{length:0,sampleRate:8000},{length:1,numberOfChannels:33,sampleRate:8000},{length:1,sampleRate:2999},{length:1,sampleRate:768001},{length:1,sampleRate:NaN}])assert.throws(()=>new w.AudioBuffer(options),e=>e instanceof w.DOMException&&e.name==='NotSupportedError');for(const options of [{length:1},{sampleRate:8000},2])assert.throws(()=>new w.AudioBuffer(options),w.TypeError);assert.equal(new w.AudioBuffer({length:1,sampleRate:3000}).sampleRate,3000);assert.equal(new w.AudioBuffer({length:1,sampleRate:768000}).sampleRate,768000);}));
++
++test('copying uses actual typed-array slots despite own metadata getters and supports overlapping channel storage',()=>fixture(async({w})=>{const b=new w.AudioBuffer({length:4,sampleRate:8000}),data=b.getChannelData(0);data.set([1,2,3,4]);Object.defineProperty(data,'length',{get(){throw Error('authored length')}});b.copyToChannel(data,0,1);assert.deepEqual([...data],[1,1,2,3]);assert.throws(()=>b.copyFromChannel([],0),w.TypeError);assert.throws(()=>b.getChannelData(2),e=>e.name==='IndexSizeError');let hits=0;const fake=new Proxy({}, {get(){hits++;throw Error('authored')}});assert.throws(()=>w.AudioBuffer.prototype.getChannelData.call(fake,0),w.TypeError);assert.equal(hits,0);}));
++
++test('actual EventTarget/AudioNode/source hierarchy and one-time non-null buffer assignment preserve identities',()=>fixture(async({w})=>{const c=new w.OfflineAudioContext(1,8,8000),s=c.createBufferSource(),b=c.createBuffer(1,4,8000);assert.equal(c instanceof w.BaseAudioContext,true);assert.equal(c instanceof w.EventTarget,true);assert.equal(s instanceof w.AudioScheduledSourceNode,true);assert.equal(s instanceof w.AudioNode,true);assert.equal(s.context,c);assert.equal(s.playbackRate instanceof w.AudioParam,true);assert.equal(s.playbackRate,s.playbackRate);s.buffer=b;assert.equal(s.buffer,b);assert.throws(()=>{s.buffer=b},e=>e.name==='InvalidStateError');s.buffer=null;assert.equal(s.buffer,null);assert.throws(()=>{s.buffer=b},e=>e.name==='InvalidStateError');for(const C of [w.BaseAudioContext,w.AudioNode,w.AudioParam,w.AudioScheduledSourceNode,w.AudioDestinationNode])assert.throws(()=>new C(c),w.TypeError);}));
++
++test('real sample-rate conversion interpolates bytes and downmixes stereo without synthetic silence',()=>fixture(async({w})=>{const a=await render(w,{samples:[[2,4,6,8],[6,8,10,12]],sourceRate:4000,length:8});assert.deepEqual([...a.output.getChannelData(0)],[4,5,6,7,8,9,10,10]);const b=await render(w,{channels:2,samples:[[1,2,3,4]],length:4});assert.deepEqual([...b.output.getChannelData(0)],[1,2,3,4]);assert.deepEqual([...b.output.getChannelData(1)],[1,2,3,4]);}));
++
++test('buffer sources implement genuine loop bounds, playback rate and duration in buffer time',()=>fixture(async({w})=>{const {output}=await render(w,{length:16,options:{loop:true,loopStart:2/8000,loopEnd:6/8000,playbackRate:2},duration:10/8000});assert.deepEqual([...output.getChannelData(0)],[0,2,4,2,4,0,0,0,0,0,0,0,0,0,0,0]);}));
++
++test('reverse and zero playback rates consume or hold real selected source samples',()=>fixture(async({w})=>{const a=await render(w,{length:8,samples:[[2,4,6,8]],options:{playbackRate:-1},offset:3/8000});assert.deepEqual([...a.output.getChannelData(0)],[8,6,4,2,0,0,0,0]);const b=await render(w,{length:8,samples:[[2,4,6,8]],options:{playbackRate:0},offset:1/8000});assert.deepEqual([...b.output.getChannelData(0)],[4,4,4,4,4,4,4,4]);}));
++
++test('start/stop, detune and actual connection deduplication control the rendered mix',()=>fixture(async({w})=>{const c=new w.OfflineAudioContext(1,8,8000);for(const factor of [1,2]){const s=c.createBufferSource(),b=c.createBuffer(1,8,8000);b.copyToChannel(new w.Float32Array([1,2,3,4,5,6,7,8].map(x=>x*factor)),0);s.buffer=b;s.detune.value=1200;s.connect(c.destination);s.connect(c.destination);s.start(.4/8000);s.stop(3/8000);}assert.deepEqual([...(await c.startRendering()).getChannelData(0)],[0,3,9,0,0,0,0,0]);const a=c.createBufferSource();assert.throws(()=>a.connect(new w.OfflineAudioContext(1,4,8000).destination),e=>e.name==='InvalidAccessError');assert.throws(()=>a.connect(c.destination,1),e=>e.name==='IndexSizeError');assert.throws(()=>a.stop(),e=>e.name==='InvalidStateError');}));
++
++test('render completion produces real trusted realm events, Promise ordering and 128-frame time quanta',()=>fixture(async({page,w})=>{const actual=await page.evaluate(`(async()=>{const c=new OfflineAudioContext(1,4,8000),s=c.createBufferSource(),b=c.createBuffer(1,4,8000);b.getChannelData(0).set([1,2,3,4]);s.buffer=b;s.connect(c.destination);const events=[];c.onstatechange=e=>events.push(['state',c.state,e.isTrusted]);s.onended=e=>{events.push(['ended',c.state,e.isTrusted]);Promise.resolve().then(()=>events.push('ended-micro'))};c.oncomplete=e=>events.push(['complete',c.state,e instanceof OfflineAudioCompletionEvent,e.renderedBuffer.length,e.isTrusted]);s.start();const p=c.startRendering();events.push(['start',c.state,p instanceof Promise]);await p;events.push('resolved');await new Promise(r=>setTimeout(r,10));return {events,time:c.currentTime}})()`);assert.deepEqual(plain(actual),{events:[['start','running',true],['state','running',true],['ended','running',true],'ended-micro',['complete','closed',true,4,true],'resolved',['state','closed',true]],time:.016});const b=new w.AudioBuffer({length:1,sampleRate:8000}),e=new w.OfflineAudioCompletionEvent('complete',{renderedBuffer:b});assert.equal(e.renderedBuffer,b);assert.equal(e.isTrusted,false);}));
++
++test('only one actual rendering starts and repeat calls reject in the actual context Promise realm',()=>fixture(async({w})=>{const c=new w.OfflineAudioContext(1,4,8000),first=c.startRendering(),repeat=c.startRendering();assert.equal(first instanceof w.Promise,true);assert.equal(repeat instanceof w.Promise,true);await assert.rejects(repeat,e=>e instanceof w.DOMException&&e.name==='InvalidStateError');await first;await assert.rejects(c.startRendering(),e=>e.name==='InvalidStateError');}));
++
++test('cross-frame methods share genuine private brands while buffers retain actual allocating-realm channel arrays',()=>fixture(async({w})=>{const frame=w.document.createElement('iframe');w.document.body.append(frame);const child=frame.contentWindow,buffer=new child.AudioBuffer({length:4,sampleRate:8000});buffer.copyToChannel(new w.Float32Array([2,4,6,8]),0);const borrowed=w.AudioBuffer.prototype.getChannelData.call(buffer,0);assert.equal(borrowed instanceof child.Float32Array,true);assert.equal(borrowed instanceof w.Float32Array,false);const c=new w.OfflineAudioContext(1,4,8000),s=c.createBufferSource();s.buffer=buffer;s.connect(c.destination);s.start();assert.deepEqual([...(await c.startRendering()).getChannelData(0)],[2,4,6,8]);}));
++
++test('private scheduling and allocation use captured native intrinsics after authored global/prototype replacement',()=>fixture(async({page})=>{const expression=await readFile(new URL('../proposals/audio-core/private-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../proposals/audio-core/native-private.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(plain(await page.evaluate(expression)),expected);}));
++
++test('the same bounded 40-control public renderer probe matches retained exact Native values',()=>fixture(async({page})=>{const expression=await readFile(new URL('../proposals/audio-core/render-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../proposals/audio-core/native-render.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(plain(await page.evaluate(expression)),expected);}));
++
++test('live channel acquisition and scheduled k-rate parameter changes match actual Native audio samples',()=>fixture(async({page})=>{const expression=await readFile(new URL('../proposals/audio-core/ownership-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../proposals/audio-core/native-ownership.json',import.meta.url),'utf8')).result.result.value;assert.deepEqual(plain(await page.evaluate(expression)),expected);}));
++
++test('public audio values have real heap identities and ordinary clone rejection cannot authenticate a fake prototype',()=>fixture(async({page,w})=>{const b=new w.AudioBuffer({length:4,sampleRate:8000});w.heldAudio=b;const values=queryHeapObjects(w.AudioBuffer.prototype,page.dom.getInternalVMContext()).objects;assert.ok(values.includes(b));assert.equal(Object.getPrototypeOf(values),w.Array.prototype);assert.throws(()=>w.structuredClone(b),e=>e.name==='DataCloneError');const fake=Object.create(w.AudioBuffer.prototype);Object.defineProperty(fake,'length',{value:7,enumerable:true});assert.deepEqual(plain(w.structuredClone(fake)),{length:7});}));
++
++test('document disposal cancels actual pending render tasks without stale events and unrelated windows are untouched',()=>fixture(async({page,w})=>{const outside=new JSDOM('',{runScripts:'outside-only'});try{const before=outside.window.AudioBuffer,c=new w.OfflineAudioContext(1,4,8000),s=c.createBufferSource();let events=0;s.onended=()=>events++;c.oncomplete=()=>events++;s.start();const pending=c.startRendering();assert.equal(pending instanceof w.Promise,true);const controller=installAudioCore(page,w);assert.equal(controller,installAudioCore(page,w));page.close();await delay(20);assert.equal(events,0);assert.equal(outside.window.AudioBuffer,before);}finally{outside.window.close();}}));

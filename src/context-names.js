@@ -9,7 +9,7 @@ export function installVMContextNames() {
   // Duplicate module instances must share the actual factory's association;
   // stacked name overrides would otherwise invalidate the outer module's map.
   if (vm.createContext[HOOK]) { registry = vm.createContext[HOOK]; return; }
-  const original = vm.createContext, names = new WeakMap();
+  const original = vm.createContext, names = new WeakMap(),globalPrototypes=new WeakMap();
   const prefix = `red-panda-vm-${randomUUID()}-`;
   let sequence = 0;
   function createContext(contextObject, options) {
@@ -32,13 +32,15 @@ export function installVMContextNames() {
     });
     const context = Reflect.apply(original, this, [contextObject, namedOptions]);
     names.set(context, name);
+    globalPrototypes.set(context,Object.getPrototypeOf(vm.runInContext('this',context)));
     return context;
   }
   Object.defineProperty(createContext, 'name', { value: original.name, configurable: true });
   Object.defineProperty(createContext, 'length', { value: original.length, configurable: true });
-  registry = { names, prefix };
+  registry = { names, prefix,globalPrototypes };
   Object.defineProperty(createContext, HOOK, { value: registry });
   vm.createContext = createContext;
 }
 export function nameForVMContext(context) { return registry?.names.get(context); }
+export function originalGlobalPrototypeFor(context){return registry?.globalPrototypes?.get(context);}
 export function isOwnedVMContextName(name) { return typeof name === 'string' && !!registry && name.startsWith(registry.prefix); }

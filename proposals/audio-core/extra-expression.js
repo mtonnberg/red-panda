@@ -1,0 +1,11 @@
+(async()=>{const rows=[],run=(name,f)=>{try{rows.push([name,{value:f()}])}catch(e){rows.push([name,{error:e.name,message:e.message}])}},ar=async(name,f)=>{try{rows.push([name,{value:await f()}])}catch(e){rows.push([name,{error:e.name,message:e.message}])}};
+run('context:order',()=>{const trace=[];new OfflineAudioContext({get length(){trace.push('length');return 4},get numberOfChannels(){trace.push('numberOfChannels');return 1},get sampleRate(){trace.push('sampleRate');return 8000}});return trace});
+run('buffer:missingRateGetter',()=>{let read=0;try{new AudioBuffer({length:2,get sampleRate(){read++;return undefined}})}catch(e){return[e.name,read]}});
+run('buffer:detached',()=>{const b=new AudioBuffer({length:4,sampleRate:8000}),d=b.getChannelData(0);d.set([1,2,3,4]);const x=structuredClone(d.buffer,{transfer:[d.buffer]});const after=b.getChannelData(0);return{before:d.length,after:Array.from(after),same:after===d,transferred:Array.from(new Float32Array(x))}});
+run('buffer:fakeOwnDimensions',()=>{const b=new AudioBuffer({length:4,sampleRate:8000}),d=b.getChannelData(0);Object.defineProperty(d,'length',{get(){throw Error('ownlength')}});const into=new Float32Array([1,2,3]);b.copyToChannel(into,0,1);return Array.from(Float32Array.prototype.values.call(d))});
+for(const key of ['automationRate'])for(const value of ['a-rate','k-rate','bogus',null])run('param:'+key+':'+value,()=>{const p=new OfflineAudioContext(1,4,8000).createBufferSource().playbackRate;p[key]=value;return p[key]});
+for(const method of ['setValueAtTime','linearRampToValueAtTime','exponentialRampToValueAtTime','setTargetAtTime','cancelScheduledValues','cancelAndHoldAtTime'])run('paramError:'+method,()=>{const p=new OfflineAudioContext(1,4,8000).createBufferSource().playbackRate;return p[method](1,-1,1)});
+async function render(offset){const c=new OfflineAudioContext(1,4,8000),s=c.createBufferSource(),b=c.createBuffer(1,4,8000);b.getChannelData(0).set([2,4,6,8]);s.buffer=b;s.connect(c.destination);s.start(0,offset);return Array.from((await c.startRendering()).getChannelData(0))}
+await ar('offset.1',()=>render(.1/8000));await ar('offset.4',()=>render(.4/8000));
+run('buffer:cloning',()=>structuredClone(new AudioBuffer({length:2,sampleRate:8000})));
+return rows})()

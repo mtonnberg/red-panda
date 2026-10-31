@@ -1,0 +1,348 @@
+diff --git a/src/cdp.js b/src/cdp.js
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,4 +1,5 @@
+ import {installHeapUtilityFactories} from './heap-worlds.js';
++import {ProtocolSerializer} from './protocol-serialization.js';
+ import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+ import {canonicalUtilityValue} from './isolated-world.js';
+ import http from 'node:http';
+@@ -39,6 +40,7 @@
+     this.id = id;
+     this.domains = new Set();
+     this.objects = new Map();
++    this.serializer = new ProtocolSerializer();
+     this.streams = new Map();
+     this.nextStreamId = 1;
+     this.worlds = new Map();
+@@ -218,8 +220,8 @@
+     const metadata = describeRemoteValue(value);
+     if (byValue) {
+       if (typeof value === 'symbol') throw new ProtocolError("Object couldn't be returned by value", -32000);
+-      try { return { type: metadata.type, value: metadata.type === 'function' ? {} : JSON.parse(JSON.stringify(value)) }; }
+-      catch { throw new ProtocolError('Internal error', -32603); }
++      try { return this.serializer.serialize(value,this.executionPage(contextId)); }
++      catch(error) { throw new ProtocolError(error.message,Number.isInteger(error.code)?error.code:-32603); }
+     }
+     const objectId = randomUUID();
+     this.executionPage(contextId);
+@@ -478,6 +480,7 @@
+     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
+   }
+   close() {
++    this.serializer.close();
+     this.utility.close();
+     clearTimeout(this.idleTimer);
+     resetDOM(this);
+diff --git a/src/runtime.js b/src/runtime.js
+--- a/src/runtime.js
++++ b/src/runtime.js
+@@ -43,7 +43,7 @@
+   return { ...session.exception(error, contextId), executionContextId: contextId };
+ }
+ 
+-class RealmInspector {
++export class RealmInspector {
+   constructor(page) {
+     this.page = page; this.inspector = new InspectorSession(); this.inspector.connect();
+     this.contexts = new Map(); this.enabled = false; this.selected = undefined; this.closed = false;
+@@ -64,6 +64,23 @@
+       });
+     });
+   }
++  postSync(method,params={}) {
++    if(this.closed)throw new RuntimeError('Execution context was destroyed',-32000);
++    let completed=false,result,failure;
++    this.inspector.post(method,params,(error,value)=>{completed=true;failure=error;result=value;});
++    if(!completed)throw new RuntimeError('Synchronous protocol serialization unavailable',-32603);
++    if(failure){const match=/^Inspector error (-?\d+): ([\s\S]*)$/.exec(failure.message);throw new RuntimeError(match?match[2]:'Internal error',match?Number(match[1]):-32603);}
++    return result;
++  }
++  realmSync() {
++    const name=nameForVMContext(this.page.dom.getInternalVMContext());
++    if(!name||!isOwnedVMContextName(name))throw new RuntimeError('Selected page VM context has no registered name',-32000);
++    if(this.selected!==undefined&&this.contexts.get(this.selected)===name)return this.selected;
++    if(!this.enabled){this.postSync('Runtime.enable');this.enabled=true;}
++    const matches=[...this.contexts].filter(([,candidate])=>candidate===name).map(([id])=>id);
++    if(matches.length!==1)throw new RuntimeError('Could not identify one named page execution context',-32000);
++    this.selected=matches[0];return this.selected;
++  }
+   async realm() {
+     const name = nameForVMContext(this.page.dom.getInternalVMContext());
+     if (!name) throw new RuntimeError('Selected page VM context has no registered name', -32000);
+@@ -76,7 +93,7 @@
+   async lexicalNames() { return this.post('Runtime.globalLexicalScopeNames', { executionContextId: await this.realm() }); }
+   close() {
+     if (this.closed) return;
+-    this.closed = true; this.inspector.disconnect(); this.contexts.clear();
++    this.inspector.disconnect(); this.closed = true; this.contexts.clear();
+   }
+ }
+ 
+@@ -187,33 +204,34 @@
+       const script = state.scripts.get(params.scriptId);
+       if (!script) throw new RuntimeError('No script with given id', -32000);
+       state.scripts.delete(params.scriptId); // V8 persisted scripts are single-use.
++      let value;
+       try {
+-        let value;
+         try { value = script.runInContext(page.dom.getInternalVMContext(), { timeout: Math.min(page.timeout, 2000), displayErrors: false }); }
+         finally { page.reconcileURL?.(); }
+         if (params.awaitPromise) value = await awaitInState(state, value);
+         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+-        return { result: session.remote(value, params.returnByValue, params.objectGroup, contextId) };
+       } catch (error) {
+         if (error instanceof RuntimeError) throw error;
+         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+         return { result: { type: 'undefined' }, exceptionDetails: details(session, error, contextId) };
+       }
++      return { result: session.remote(value, params.returnByValue, params.objectGroup, contextId) };
+     }
+     case 'Runtime.awaitPromise': {
+       string(params.promiseObjectId, 'promiseObjectId'); boolean(params.returnByValue, 'returnByValue');
+       const promise = session.object(params.promiseObjectId);
+       if (!types.isPromise(promise)) throw new RuntimeError('Object is not a Promise');
+       const group = session.objects?.get(params.promiseObjectId)?.group;
++      let value;
+       try {
+-        const value = await awaitInState(state, promise);
+-        if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+-        return { result: session.remote(value, params.returnByValue, group, contextId) };
++        value = await awaitInState(state, promise);
++        if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+       } catch (error) {
+         if (error instanceof RuntimeError) throw error;
+         if (!current(state)) throw new RuntimeError('Execution context was destroyed', -32000);
+         return { result: session.remote(error, params.returnByValue, group, contextId), exceptionDetails: details(session, error, contextId) };
+       }
++      return { result: session.remote(value, params.returnByValue, group, contextId) };
+     }
+     case 'Runtime.globalLexicalScopeNames': {
+       const result=await inspector().lexicalNames(),owned=invocationBindingFor(page.dom.getInternalVMContext());
+diff --git a/src/invocation.js b/src/invocation.js
+--- a/src/invocation.js
++++ b/src/invocation.js
+@@ -3,6 +3,7 @@
+ // is not a native private slot: code that learns the name can address it.
+ import vm from 'node:vm';
+ import { randomUUID } from 'node:crypto';
++import {setImmediate as hostSchedule,clearImmediate as hostCancel} from 'node:timers';
+ 
+ const installed = new WeakMap();
+ const hostApply = Reflect.apply;
+@@ -15,23 +16,49 @@
+     const ${binding} = (() => {
+       const apply = Reflect.apply;
+       const ErrorConstructor = Error;
++      const parents = new WeakMap(), parentGet = WeakMap.prototype.get, parentSet = WeakMap.prototype.set;
++      const WeakSetConstructor = WeakSet, seenHas = WeakSet.prototype.has, seenAdd = WeakSet.prototype.add;
+       let current = null;
+       return Object.freeze({
+-        enter(frame) { const previous = current; current = frame; return previous; },
++        enter(frame) { const previous = current; apply(parentSet, parents, [frame, previous]); current = frame; return previous; },
+         leave(previous) { current = previous; },
++        unwind(frame, previous) {
++          const seen = new WeakSetConstructor();
++          for (let cursor = current; cursor !== null && cursor !== undefined; cursor = apply(parentGet, parents, [cursor])) {
++            if (cursor === frame) { current = previous; return; }
++            if (apply(seenHas, seen, [cursor])) return;
++            apply(seenAdd, seen, [cursor]);
++          }
++        },
+         run() {
+           const frame = current;
+           if (frame === null) throw new ErrorConstructor('No owned invocation frame');
+           return apply(frame.fn, frame.receiver, frame.args);
++        },
++        inspect() {
++          const frame = current;
++          if (frame === null) throw new ErrorConstructor('No owned invocation frame');
++          return apply(frame.inspect, undefined, []);
+         }
+       });
+     })();
+     ${binding};`, { filename: 'red-panda:invocation-bootstrap' }).runInContext(context);
+-  const enter = controller.enter, leave = controller.leave;
++  const enter = controller.enter, leave = controller.leave, unwind = controller.unwind;
+   const invocation = new vm.Script(`${binding}.run()`, { filename: 'red-panda:owned-invocation' });
++  const inspection = new vm.Script(`${binding}.inspect()`, { filename: 'red-panda:owned-serialization' });
++  const pendingInspections=new Set();let recovery;
++  function recover(){recovery=undefined;for(const token of [...pendingInspections].reverse())hostApply(unwind,controller,[token.frame,token.previous]);pendingInspections.clear();}
+   let disposed = false;
+   const adapter = Object.freeze({
+     binding,
++    withValue(value, inspect, options) {
++      if (disposed) throw new Error('Invocation context is disposed');
++      const token={frame:{ fn: () => value, receiver: undefined, args: [], inspect: () => inspect(`${binding}.run()`) },previous:null};
++      pendingInspections.add(token);recovery??=hostSchedule(recover);
++      token.previous = hostApply(enter, controller, [token.frame]);
++      try { return inspection.runInContext(context, options); }
++      finally {hostApply(leave,controller,[token.previous]);pendingInspections.delete(token);if(!pendingInspections.size&&recovery!==undefined){hostCancel(recovery);recovery=undefined;}}
++    },
+     invoke(fn, receiver, args, options) {
+       if (disposed) throw new Error('Invocation context is disposed');
+       const previous = hostApply(enter, controller, [{ fn, receiver, args }]);
+diff --git a/src/protocol-serialization.js b/src/protocol-serialization.js
+new file mode 100644
+--- /dev/null
++++ b/src/protocol-serialization.js
+@@ -0,0 +1,39 @@
++// The actual V8 inspector serializer operates on original owned-VM values.
++// JSON.stringify is not equivalent: toJSON is not a protocol serialization hook.
++import {RealmInspector} from './runtime.js';
++import {createInvocationTrampoline} from './invocation.js';
++import {setImmediate as hostSchedule,clearImmediate as hostCancel} from 'node:timers';
++export class ProtocolSerializer {
++ constructor(){this.contexts=new WeakMap();this.records=new Set();this.pending=new Set();this.recovery=undefined;this.closed=false;}
++ release(operation){
++  const record=operation.record;record.operations.delete(operation);
++  if(record.disposed&&!record.operations.size)record.inspector.close();
++  this.pending.delete(operation);
++  if(!this.pending.size&&this.recovery!==undefined){hostCancel(this.recovery);this.recovery=undefined;}
++ }
++ recover(){
++  this.recovery=undefined;
++  for(const operation of [...this.pending].reverse()){operation.record.dispose();this.release(operation);}
++ }
++ serialize(value,page){
++  if(this.closed||page.closed||page.documentAbort?.signal.aborted)throw Object.assign(Error('Execution context was destroyed'),{code:-32000});
++  const context=page.dom.getInternalVMContext();
++  let record=this.contexts.get(context);
++  if(!record){
++   const inspector=new RealmInspector(page),signal=page.documentAbort?.signal;
++   record={inspector,operations:new Set(),disposed:false,dispose:()=>{record.disposed=true;signal?.removeEventListener('abort',record.dispose);this.records.delete(record);this.contexts.delete(context);if(!record.operations.size)inspector.close();}};
++   this.contexts.set(context,record);this.records.add(record);signal?.addEventListener('abort',record.dispose,{once:true});
++  }
++  const operation={record};this.pending.add(operation);this.recovery??=hostSchedule(()=>this.recover());record.operations.add(operation);
++  try{return createInvocationTrampoline(context).withValue(value,expression=>{
++   const id=record.inspector.realmSync();
++   const result=record.inspector.postSync('Runtime.evaluate',{expression,contextId:id,returnByValue:true,silent:true});
++   if(record.disposed||page.closed||page.documentAbort?.signal.aborted)throw Object.assign(Error('Execution context was destroyed'),{code:-32000});
++   if(result.exceptionDetails)throw Object.assign(Error('Internal error'),{code:-32603});
++   return result.result;
++  },{timeout:Math.min(page.timeout,2000),displayErrors:false});}
++  catch(error){if(error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT')record.dispose();throw error;}
++  finally{this.release(operation);}
++ }
++ close(){if(this.closed)return;this.closed=true;for(const record of this.records)record.dispose();this.records.clear();}
++}
+diff --git a/test/protocol-serialization.test.js b/test/protocol-serialization.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/protocol-serialization.test.js
+@@ -0,0 +1,64 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {spawnSync} from 'node:child_process';
++import {fileURLToPath} from 'node:url';
++import {serve} from '../src/cdp.js';
++import {Browser} from '../src/browser.js';
++import {ProtocolSerializer} from '../src/protocol-serialization.js';
++import {connect} from './cdp-client.js';
++async function fixture(t){
++ const service=await serve({port:0,loadResources:['iframe']}),client=await connect(`ws://127.0.0.1:${service.port}/`);
++ t.after(async()=>{await client.close();await service.close()});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
++ const send=(method,params={})=>client.send(method,params,sessionId);await send('Runtime.enable');const evaluate=(expression,options={})=>send('Runtime.evaluate',{expression,...options});
++ return{send,evaluate,page:service.browser.pages.get(targetId)};
++}
++test('protocol by-value serialization preserves own properties and never invokes toJSON methods',async t=>{
++ const{evaluate}=await fixture(t);const actual=await evaluate('globalThis.hits=0;({a:1,toJSON(){hits++;return 9},nested:Object.assign(Object.create({toJSON(){hits++;return 8}}),{b:2}),array:Object.assign([1,function(){}],{toJSON(){hits++;return 7}})})',{returnByValue:true});
++ assert.deepEqual(actual.result,{type:'object',value:{a:1,toJSON:{},nested:{b:2},array:[1,{}]}});assert.equal((await evaluate('hits',{returnByValue:true})).result.value,0);
++});
++test('actual V8 proxy and getter serialization side effects match the Native own-property contract',async t=>{
++ const{evaluate}=await fixture(t);let actual=await evaluate('globalThis.hits=[];new Proxy({a:1},{ownKeys(t){hits.push("keys");return Reflect.ownKeys(t)},getOwnPropertyDescriptor(t,k){hits.push("descriptor");return Reflect.getOwnPropertyDescriptor(t,k)},get(t,k,r){hits.push("get");return Reflect.get(t,k,r)}})',{returnByValue:true});
++ assert.deepEqual(actual.result.value,{});assert.deepEqual((await evaluate('hits',{returnByValue:true})).result.value,['keys','descriptor']);
++ actual=await evaluate('({get visible(){hits.push("visible");return 7}})',{returnByValue:true});assert.deepEqual(actual.result.value,{visible:7});
++ await assert.rejects(evaluate('({get visible(){throw Error("authored")}})',{returnByValue:true}),{code:-32603,message:'Internal error'});assert.equal((await evaluate('42',{returnByValue:true})).result.value,42);
++});
++test('serialization failures remain protocol errors across evaluate, callFunctionOn, runScript and awaitPromise',async t=>{
++ const{send,evaluate,page}=await fixture(t),expression='(()=>{const a={};a.self=a;return a})()';
++ const expected={code:-32000,message:'Object reference chain is too long'};
++ await assert.rejects(evaluate(expression,{returnByValue:true}),expected);
++ await assert.rejects(send('Runtime.callFunctionOn',{executionContextId:page.executionContextId,functionDeclaration:`function(){return ${expression}}`,returnByValue:true}),expected);
++ const compiled=await send('Runtime.compileScript',{expression,sourceURL:'cycle.js',persistScript:true});await assert.rejects(send('Runtime.runScript',{scriptId:compiled.scriptId,returnByValue:true}),expected);
++ const promise=await evaluate(`Promise.resolve(${expression})`);await assert.rejects(send('Runtime.awaitPromise',{promiseObjectId:promise.result.objectId,returnByValue:true}),expected);
++ for(const bad of ['({nested:1n})','({nested:Symbol("s")})'])await assert.rejects(evaluate(bad,{returnByValue:true}),{code:-32000,message:"Object couldn't be returned by value"});
++});
++test('genuine foreign values serialize in selected utility contexts after authored intrinsic replacement',async t=>{
++ const{send,evaluate,page}=await fixture(t),{executionContextId:id}=await send('Page.createIsolatedWorld',{frameId:page.frameId,worldName:'protocol-values'});
++ await evaluate('document.addEventListener("protocol-foreign",event=>{globalThis.foreign=event.detail})',{contextId:id});
++ await evaluate('globalThis.hits=0;globalThis.foreign={marker:17,toJSON(){hits++;return 9}};document.dispatchEvent(new CustomEvent("protocol-foreign",{detail:foreign}))');
++ assert.deepEqual((await evaluate('foreign',{contextId:id,returnByValue:true})).result.value,{marker:17,toJSON:{}});
++ const actual=await evaluate('JSON.parse=JSON.stringify=()=>{throw Error("JSON")};Function.prototype.apply=Reflect.apply=()=>{throw Error("apply")};foreign',{contextId:id,returnByValue:true});assert.deepEqual(actual.result.value,{marker:17,toJSON:{}});assert.equal((await evaluate('hits',{returnByValue:true})).result.value,0);
++ const called=await send('Runtime.callFunctionOn',{executionContextId:id,functionDeclaration:'function(){return {marker:23,toJSON(){throw Error("toJSON")}}}',returnByValue:true});assert.deepEqual(called.result.value,{marker:23,toJSON:{}});
++});
++test('protocol serializer releases inspector contexts on actual document abort and rejects stale authority',async t=>{
++ const browser=new Browser(),page=browser.createPage(),serializer=new ProtocolSerializer();t.after(()=>{serializer.close();browser.close()});
++ for(let i=0;i<5;i++){await page.navigate('data:text/html,<p>'+i);assert.deepEqual(serializer.serialize(page.evaluate('({marker:17})'),page).value,{marker:17});assert.equal(serializer.records.size,1)}
++ page.close();assert.equal(serializer.records.size,0);assert.throws(()=>serializer.serialize({},page),{code:-32000});
++});
++test('reentrant owned serialization restores the original private invocation frame',t=>{
++ const browser=new Browser(),page=browser.createPage(),serializer=new ProtocolSerializer();t.after(()=>{serializer.close();browser.close()});
++ page.dom.window.reenter=()=>serializer.serialize({nested:17},page).value;
++ const value=page.evaluate('({get value(){return reenter()},marker:23})');assert.deepEqual(serializer.serialize(value,page).value,{value:{nested:17},marker:23});assert.equal(page.callFunction('function(){return 42}',null,[]),42);
++});
++test('closing the actual page during a getter defers inspector disconnection until the active command unwinds',t=>{
++ const browser=new Browser(),page=browser.createPage(),serializer=new ProtocolSerializer();t.after(()=>{serializer.close();browser.close()});
++ page.dom.window.closeOwned=()=>page.close();const value=page.evaluate('({get value(){closeOwned();return 17}})');
++ assert.throws(()=>serializer.serialize(value,page),{code:-32000});assert.equal(serializer.records.size,0);
++});
++
++test('infinite by-value getters respect VM deadlines and abandoned nested host frames recover in an owned child',()=>{
++ const fixture=fileURLToPath(new URL('./fixtures/protocol-serialization-timeout.mjs',import.meta.url));
++ const child=spawnSync('/bin/sh',['-c','ulimit -c 0; exec "$@"','red-panda-owned-timeout',process.execPath,'--experimental-vm-modules',fixture],{encoding:'utf8',timeout:6000,killSignal:'SIGKILL'});
++ assert.equal(child.error,undefined,child.error?.message);assert.equal(child.signal,null,child.stderr);assert.equal(child.status,0,child.stderr);
++ assert.match(child.stdout,/Serialization timeout recovery verified/);
++});
+diff --git a/test/fixtures/protocol-serialization-timeout.mjs b/test/fixtures/protocol-serialization-timeout.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/protocol-serialization-timeout.mjs
+@@ -0,0 +1,46 @@
++import assert from 'node:assert/strict';
++import {Browser} from '../../src/browser.js';
++import {ProtocolSerializer} from '../../src/protocol-serialization.js';
++import {invocationBindingFor} from '../../src/invocation.js';
++import {queryHeapObjects} from '../../src/heap-query.js';
++
++const browser=new Browser({timeout:50}),page=browser.createPage(),serializer=new ProtocolSerializer();
++try{
++ const value=page.evaluate('({get slow(){globalThis.enteredGetter=true;for(;;){}}})');
++ assert.throws(()=>serializer.serialize(value,page),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});
++ assert.equal(page.evaluate('enteredGetter'),true);
++ assert.equal(serializer.pending.size,0);assert.equal(serializer.records.size,0);
++ assert.deepEqual(serializer.serialize(page.evaluate('({marker:42})'),page).value,{marker:42});
++
++ // A deadline in an ancestor VM can skip finally blocks in a host callback.
++ // The independently scheduled host checkpoint must clean those abandoned
++ // frames and inspector operations without canceling unrelated host tasks.
++ page.dom.window.enterSerialization=()=>{page.timeout=500;return serializer.serialize(value,page)};
++ let unrelated=0;setImmediate(()=>unrelated++);
++ assert.throws(()=>page.evaluate('enteredGetter=false;enterSerialization()'),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});
++ assert.equal(page.evaluate('enteredGetter'),true);
++ await new Promise(resolve=>setImmediate(resolve));
++ assert.equal(serializer.pending.size,0);assert.equal(serializer.records.size,0);assert.equal(unrelated,1);
++ page.timeout=50;
++ const binding=invocationBindingFor(page.dom.getInternalVMContext());
++ assert.throws(()=>page.evaluate(`${binding}.run()`),/No owned invocation frame/);
++ assert.deepEqual(serializer.serialize(page.evaluate('({marker:43})'),page).value,{marker:43});
++ // A getter can enter a regular owned invocation before the ancestor deadline.
++ // Recovery must discard that actual descendant frame as well.
++ page.dom.window.enterGeneric=()=>page.callFunction('function(){globalThis.enteredGeneric=true;for(;;){}}',null,[]);
++ const nested=page.evaluate('({get slow(){return enterGeneric()}})');
++ page.dom.window.enterNestedSerialization=()=>{page.timeout=500;return serializer.serialize(nested,page)};
++ assert.throws(()=>page.evaluate('enterNestedSerialization()'),{code:'ERR_SCRIPT_EXECUTION_TIMEOUT'});
++ await new Promise(resolve=>setImmediate(resolve));
++ assert.equal(page.evaluate('enteredGeneric'),true);assert.equal(serializer.pending.size,0);assert.equal(serializer.records.size,0);
++ assert.throws(()=>page.evaluate(`${binding}.run()`),/No owned invocation frame/);
++ page.timeout=50;
++ assert.deepEqual(serializer.serialize(page.evaluate('({marker:44})'),page).value,{marker:44});
++ page.evaluate('globalThis.P={};globalThis.item=Object.create(P)');
++ const objects=queryHeapObjects(page.dom.window.P,page.dom.getInternalVMContext()).objects;
++ assert.equal(objects.length,1);assert.equal(objects[0],page.dom.window.item);
++ assert.equal(page.callFunction('function(){return 42}',null,[]),42);
++ page.close();assert.equal(serializer.records.size,0);assert.equal(serializer.pending.size,0);
++}finally{serializer.close();browser.close()}
++await new Promise(resolve=>setTimeout(resolve,20));
++console.log('Serialization timeout recovery verified');

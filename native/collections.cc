@@ -55,7 +55,7 @@ Intercepted IndexQuery(uint32_t index, const PropertyCallbackInfo<Integer>& info
   Local<Value> args[] = {Integer::NewFromUnsigned(info.GetIsolate(), index)}, present;
   if (!Invoke(info.GetIsolate(), info.Data(), "hasIndex", 1, args, &present)) return Intercepted::kYes;
   if (!present->BooleanValue(info.GetIsolate())) return Intercepted::kNo;
-  info.GetReturnValue().Set(static_cast<int>(None));
+  info.GetReturnValue().Set(static_cast<int>(ReadOnly));
   return Intercepted::kYes;
 }
 
@@ -84,9 +84,9 @@ void Create(const FunctionCallbackInfo<Value>& info) {
   auto object = ObjectTemplate::New(isolate);
   object->MarkAsUndetectable();
   object->SetCallAsFunctionHandler(Call, bridge);
-  object->SetHandler(NamedPropertyHandlerConfiguration(NamedGet, nullptr, NamedQuery, nullptr, NamedKeys, bridge,
+  object->SetHandler(NamedPropertyHandlerConfiguration(NamedGet, nullptr, NamedQuery, nullptr, nullptr, bridge,
     static_cast<PropertyHandlerFlags>(static_cast<int>(PropertyHandlerFlags::kNonMasking) | static_cast<int>(PropertyHandlerFlags::kOnlyInterceptStrings))));
-  object->SetHandler(IndexedPropertyHandlerConfiguration(IndexGet, nullptr, IndexQuery, nullptr, IndexKeys, bridge));
+  object->SetHandler(IndexedPropertyHandlerConfiguration(IndexGet, nullptr, IndexQuery, nullptr, nullptr, bridge));
   Local<Object> collection;
   if (!object->NewInstance(context).ToLocal(&collection)) return;
   if (!collection->SetPrototypeV2(context, info[1]).FromMaybe(false)) return;

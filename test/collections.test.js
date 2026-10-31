@@ -52,16 +52,18 @@ test('named lookup distinguishes IDs from eligible HTML name attributes', t => {
   assert.equal(all.namedItem('svg'), window.document.getElementById('svg'));
 });
 
-test('duplicate named matches return a live HTMLCollection without counting a node twice', t => {
+test('named lookup returns the native first ID or eligible name match without inventing a collection', t => {
   const window = fixture(t, '<input id="same" name="same"><a name="same"></a>');
-  const all = window.document.all, matches = all.namedItem('same');
-  assert.equal(matches.constructor.name, 'HTMLCollection'); assert.equal(matches.length, 2);
-  const extra = window.document.createElement('input'); extra.name = 'same'; window.document.body.append(extra);
-  assert.equal(matches.length, 3); assert.equal(matches[2], extra);
-  extra.name = 'different'; assert.equal(matches.length, 2);
+  const all = window.document.all, first = window.document.querySelector('input'), second = window.document.querySelector('a');
+  assert.equal(all.namedItem('same'), first); assert.equal(all('same'), first);
+  const extra = window.document.createElement('input'); extra.name = 'same'; window.document.body.prepend(extra);
+  assert.equal(all.namedItem('same'), first);
+  first.removeAttribute('id'); first.name = 'different';
+  assert.equal(all.namedItem('same'), extra); extra.remove();
+  assert.equal(all.namedItem('same'), second);
 });
 
-test('named properties are present and unenumerable while indexes are enumerable', t => {
+test('native virtual collection descriptors remain present without own-key enumeration', t => {
   const window = fixture(t, '<div id="a"></div><input name="field"><div name="ineligible"></div>');
   const all = window.document.all;
   assert.equal('a' in all, true); assert.equal(Object.hasOwn(all, 'a'), true);
@@ -69,8 +71,10 @@ test('named properties are present and unenumerable while indexes are enumerable
   assert.equal(Object.hasOwn(all, 'missing'), false);
   assert.equal(Object.getOwnPropertyDescriptor(all, 'a').enumerable, false);
   assert.equal(Object.getOwnPropertyDescriptor(all, '0').enumerable, true);
-  assert.ok(Reflect.ownKeys(all).includes('a')); assert.ok(!Object.keys(all).includes('a'));
-  assert.deepEqual(Object.keys(all), Array.from({ length: all.length }, (_, index) => String(index)));
+  assert.equal(Object.getOwnPropertyDescriptor(all, '0').writable, false);
+  assert.deepEqual(Reflect.ownKeys(all), []); assert.deepEqual(Object.getOwnPropertyNames(all), []); assert.deepEqual(Object.keys(all), []);
+  Object.defineProperty(all, 'owned', { value: 23, enumerable: true, configurable: true });
+  assert.deepEqual(Object.keys(all), ['owned']); assert.equal(all.owned, 23);
 });
 
 test('prototype members win named visibility and methods enforce their receiver brand', t => {

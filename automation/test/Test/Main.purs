@@ -214,5 +214,9 @@ main = launchAff_ $
           Browser.withHandle (Browser.queryObjects page prototype) \instances -> do
             publicForm <- Browser.evaluateHandleString instances "items=>JSON.stringify([items.includes(heapForm),Object.getPrototypeOf(items)===Array.prototype])"
             assert "PureScript heap queries retain the genuine public form proxy and owned handle lifetime" $ publicForm == "[true,true]"
+        mediaValues <- Browser.evaluateString page "(()=>{const data=new ImageData(new Uint8ClampedArray([255,0,0,255,0,128,0,255]),2,1);const cloned=structuredClone({one:data,two:data});const chunk=new EncodedVideoChunk({type:'key',timestamp:17,duration:23,data:new Uint8Array([0,128,255])});const bytes=new Uint8Array(3);chunk.copyTo(bytes);return JSON.stringify([cloned.one.width,cloned.one.height,Array.from(cloned.one.data),cloned.one===cloned.two,Array.from(bytes),chunk.timestamp,chunk.duration])})()"
+        assert "PureScript Puppeteer reads genuine cloned image pixels and immutable encoded bytes" $ mediaValues == "[2,1,[255,0,0,255,0,128,0,255],true,[0,128,255],17,23]"
+        audioSamples <- Browser.evaluateString page "(async()=>{const context=new OfflineAudioContext(1,8,8000);const buffer=context.createBuffer(1,4,8000);buffer.copyToChannel(new Float32Array([0.25,0.5,-0.5,-0.25]),0);const source=context.createBufferSource();source.buffer=buffer;source.connect(context.destination);source.start(2/8000);return JSON.stringify(Array.from((await context.startRendering()).getChannelData(0)))})()"
+        assert "PureScript Puppeteer receives actual scheduled offline audio samples" $ audioSamples == "[0,0,0.25,0.5,-0.5,-0.25,0,0]"
         Browser.closePage page
-        log "PureScript Puppeteer integration: 55 checks passed"
+        log "PureScript Puppeteer integration: 57 checks passed"

@@ -1,0 +1,4 @@
+(async()=>{const frame=document.createElement('iframe'),load=new Promise(r=>frame.onload=r);frame.srcdoc='<body>realm errors</body>';document.body.append(frame);await load;const child=frame.contentWindow,rows=[],c=new child.VideoDecoder({output(){},error(){}}),read=(name,e)=>rows.push({name,error:e.name,parent:e instanceof DOMException,child:e instanceof child.DOMException});
+try{await VideoDecoder.prototype.flush.call(c)}catch(e){read('unconfigured-flush',e)}
+VideoDecoder.prototype.configure.call(c,{codec:'vp8'});try{VideoDecoder.prototype.decode.call(c,new child.EncodedVideoChunk({type:'delta',timestamp:0,data:new child.Uint8Array(1)}))}catch(e){read('key-required',e)}c.reset();c.close();
+for(const name of['reset','close','configure','flush'])try{await VideoDecoder.prototype[name].call(c,...(name==='configure'?[{codec:'vp8'}]:[]))}catch(e){read('closed-'+name,e)}frame.remove();return rows})()

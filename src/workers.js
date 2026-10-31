@@ -1,3 +1,4 @@
+import { installImageData } from './image-data.js';
 import {workerSocketPolicy} from './worker-socket-policy.js';
 import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
 import {completeWorkerSyncResponse,createSyncWorkerRequest,completeWorkerSocketPolicy,createSyncWorkerSocketPolicy} from './worker-sync-transport.js';
@@ -9,6 +10,8 @@ import vm from 'node:vm';
 import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { createMessagingRealm, installMessaging } from './messaging.js';
 import { resolveBlobURL } from './blob-urls.js';
+import { installWebCodecsProcessors } from './webcodecs-processors.js';
+import { installWebCodecsValues } from './webcodecs-values.js';
 import { installGeometry } from './geometry.js';
 import { installNavigator } from './navigator.js';
 import { installStreams } from './streams.js';
@@ -303,7 +306,10 @@ async function runWorker() {
   Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+  installImageData(vm.runInContext('globalThis', context));
   installGeometry(vm.runInContext('globalThis', context));
+  installWebCodecsValues(vm.runInContext('globalThis', context));
+  installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});

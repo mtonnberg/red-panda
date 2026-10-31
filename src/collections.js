@@ -1,3 +1,4 @@
+import { registerProtocolPrototype } from './protocol-classes.js';
 import {registerHeapWrapper} from './heap-registry.js';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
@@ -6,11 +7,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
-const HTMLCollection = require('jsdom/lib/jsdom/living/generated/HTMLCollection.js');
 const RadioNodeListImpl = require('jsdom/lib/jsdom/living/nodes/RadioNodeList-impl.js').implementation;
-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const defaultPath = fileURLToPath(new URL(`../native/build/${process.platform}-${process.arch}/node-${process.versions.node}/collections.node`, import.meta.url));
 const installed = new WeakMap();
+// A genuine collection remains branded when a same-origin realm borrows a method.
+const collectionStates = new WeakMap();
 const collectionGlobals = new WeakSet();
 let patchedRadioUpdates = false;
 
@@ -52,11 +53,13 @@ export function installCollections(window, options = {}) {
   if (installed.has(window)) return installed.get(window);
   const binding = options.binding ?? loadCollectionsBinding();
   if (typeof binding?.create !== 'function') throw new TypeError('A native HTMLDDA collection binding is required');
-  const states = new WeakMap();
+  const states = collectionStates;
+  const integer = window.eval('(value => value | 0)');
   const getElements = window.Document.prototype.getElementsByTagName;
   const getAttribute = window.Element.prototype.getAttribute;
   const HTMLAllCollection = window.eval('(function HTMLAllCollection() { throw new TypeError("Illegal constructor"); })');
   const prototype = HTMLAllCollection.prototype;
+  registerProtocolPrototype(prototype, 'HTMLAllCollection');
   const brand = value => {
     if (!states.has(value)) throw new window.TypeError('Invalid HTMLAllCollection receiver');
     return states.get(value);
@@ -66,16 +69,12 @@ export function installCollections(window, options = {}) {
     return String(value);
   };
   const attribute = (element, name) => getAttribute.call(element, name);
-  const matching = (element, key) => attribute(element, 'id') === key ||
-    (element.namespaceURI === htmlNamespace && allNamedTags.has(element.localName) && attribute(element, 'name') === key);
   function named(state, input) {
     const key = string(input);
     if (!key) return null;
-    const matches = Array.from(state.elements).filter(element => matching(element, key));
-    if (!matches.length) return null;
-    if (matches.length === 1) return matches[0];
-    return HTMLCollection.create(window, [], { element: implForWrapper(state.document),
-      query: () => Array.from(state.elements).filter(element => matching(element, key)).map(implForWrapper) });
+    const elements = Array.from(state.elements);
+    return elements.find(element => attribute(element, 'id') === key) ??
+      elements.find(element => element.namespaceURI === htmlNamespace && allNamedTags.has(element.localName) && attribute(element, 'name') === key) ?? null;
   }
   function item(state, input) {
     const key = string(input);
@@ -84,7 +83,10 @@ export function installCollections(window, options = {}) {
   Object.defineProperties(prototype, {
     length: { configurable: true, enumerable: true, get() { return brand(this).elements.length; } },
     item: { configurable: true, writable: true, enumerable: true, value: function item_(nameOrIndex) {
-      const state = brand(this); return arguments.length ? item(state, nameOrIndex) : null;
+      const state = brand(this);
+      if (!arguments.length) throw new window.TypeError('invalid argument');
+      const index = integer(nameOrIndex);
+      return index < 0 ? null : state.elements.item(index);
     } },
     namedItem: { configurable: true, writable: true, enumerable: true, value: function namedItem(name) {
       const state = brand(this); if (!arguments.length) throw new window.TypeError('namedItem requires a name'); return named(state, name);

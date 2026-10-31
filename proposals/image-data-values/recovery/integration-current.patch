@@ -1,0 +1,1045 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import { installImageData } from './image-data.js';
+ import { SyncHTTP } from './sync-http.js';
+ import {installFrameActivity} from './frame-activity.js';
+ import {installHeapFactories,prepareHeapRealm} from './heap-registry.js';
+@@ -250,6 +251,7 @@
+       installServiceWorkers(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,spawn:workers.createService});
+       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
+       installBroadcast(this, window);
++      installImageData(window);
+       installGeometry(window);
+       installWebCodecsValues(window);
+       installSVG(this, window);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,4 @@
++import { installImageData } from './image-data.js';
+ import {workerSocketPolicy} from './worker-socket-policy.js';
+ import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
+ import {completeWorkerSyncResponse,createSyncWorkerRequest,completeWorkerSocketPolicy,createSyncWorkerSocketPolicy} from './worker-sync-transport.js';
+@@ -304,6 +305,7 @@
+   Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
++  installImageData(vm.runInContext('globalThis', context));
+   installGeometry(vm.runInContext('globalThis', context));
+   installWebCodecsValues(vm.runInContext('globalThis', context));
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import { installImageData } from './image-data.js';
+ import {installFonts} from './fonts.js';
+ import {installUtilityLayout} from './utility-layout.js';
+ import {installUtilityAnimationFrame} from './utility-platform.js';
+@@ -29,7 +30,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- record.global=record.controller.global;record.context=record.controller.context;installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ record.global=record.controller.global;record.context=record.controller.context;installImageData(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import { imageDataRecord, validImageDataRecord, deserializeImageData } from './image-data.js';
+ import { encodedChunkData, validEncodedChunk, deserializeEncodedChunk } from './webcodecs-values.js';
+ import { installNativePlatformFactories } from './native-platform-factories.js';
+ import { platformFactoryRecord } from './platform-factories.js';
+@@ -27,6 +28,7 @@
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+   if(provenance?.kind==='VideoColorSpace')throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
++  const image=imageDataRecord(value);if(image){if(!validImageDataRecord(image))throw failure('Invalid ImageData clone');return image;}
+   const geometry=geometryFactoryData(value);
+   if(geometry){if(!validGeometryRecord(geometry))throw failure('The object can not be cloned');return geometry;}
+   if(!probe)return null;
+@@ -44,8 +46,9 @@
+   if(message.platforms===undefined)return null;
+   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
+   for(const[placeholder,record]of message.platforms){
+-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk'].includes(record.kind))throw failure('Malformed platform node');
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData'].includes(record.kind))throw failure('Malformed platform node');
+    if(record.kind==='EncodedChunk'){if(!validEncodedChunk(record))throw failure('Malformed encoded chunk');continue;}
++   if(record.kind==='ImageData'){if(!validImageDataRecord(record))throw failure('Malformed ImageData node');continue;}
+    if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
+    if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
+    else if(record.bytes===undefined||typeof record.type!=='string')throw failure('Platform node has no byte snapshot');
+@@ -69,6 +72,7 @@
+   return stripNativeHandles(message);
+  }
+  function deserialize(record){
++  if(record.kind==='ImageData'){try{return deserializeImageData(realm,record)}catch{throw failure('Invalid ImageData receiver')}}
+   if(record.kind==='EncodedChunk'){try{return deserializeEncodedChunk(realm,record)}catch{throw failure('Invalid encoded chunk receiver')}}
+   if(record.kind==='Geometry'){try{return deserializeGeometry(realm,record)}catch{throw failure('Invalid geometry receiver')}}
+   if(!probe)throw failure('Receiver realm does not support Blob');
+--- a/src/clone-object-kind.js
++++ b/src/clone-object-kind.js
+@@ -4,7 +4,7 @@
+ import { platformFactoryRecord } from './platform-factories.js';
+ import { knownPlatformFactoryKind } from './platform-factory-hooks.js';
+ const descriptor = Object.getOwnPropertyDescriptor, prototype = Object.getPrototypeOf;
+-const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad','EncodedAudioChunk','EncodedVideoChunk','VideoColorSpace']);
++const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad','ImageData','EncodedAudioChunk','EncodedVideoChunk','VideoColorSpace']);
+ export function cloneObjectKind(value) {
+   if (Array.isArray(value)) return 'Array';
+   for (const [kind, test] of [['Map',types.isMap],['Set',types.isSet],['Error',types.isNativeError],['ArrayBuffer',types.isAnyArrayBuffer],['View',ArrayBuffer.isView],['Date',types.isDate],['RegExp',types.isRegExp]]) if (test(value)) return kind;
+--- /dev/null
++++ b/docs/reference/image-data-conversion-native-expression.js
+@@ -0,0 +1,6 @@
++(()=>{const rows=[],run=(name,fn)=>{try{rows.push({name,value:fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const[name,args]of[['wrap',[4294967297,1]],['negativeWrap',[-4294967295,1]],['widthBig',[2147483648,1]],['defaultFormat',[1,1,{colorSpace:'srgb',pixelFormat:'rgba-unorm8'}]],['symbolSpace',[1,1,{colorSpace:Symbol('srgb')}]],['symbolFormat',[1,1,{pixelFormat:Symbol('rgba-unorm8')}]],['arrayHeightZero',[new Uint8ClampedArray(4),1,0]],['arrayWidthInfinity',[new Uint8ClampedArray(4),Infinity]],['arrayHeightNaN',[new Uint8ClampedArray(4),1,NaN]]])run(name,()=>{const i=new ImageData(...args);return{w:i.width,h:i.height,len:i.data.length}});
++for(const array of[false,true])run('conversionOrder-'+array,()=>{const trace=[],n=(key,value=1)=>({valueOf(){trace.push(key);return value}}),str=(key,value)=>({toString(){trace.push(key);return value}}),o={get colorSpace(){trace.push('getSpace');return str('space','srgb')},get pixelFormat(){trace.push('getFormat');return str('format','rgba-unorm8')}};let value,error;try{const i=array?new ImageData(new Uint8ClampedArray(4),n('w'),n('h'),o):new ImageData(n('w'),n('h'),o);value={w:i.width,h:i.height}}catch(e){error=e.name}return{trace,value,error}});
++run('foreignData',()=>{const f=document.createElement('iframe');document.body.append(f);const a=new f.contentWindow.Uint8ClampedArray(4),i=new ImageData(a,1);const result={same:i.data===a,foreign:i.data instanceof f.contentWindow.Uint8ClampedArray,local:i.data instanceof Uint8ClampedArray};f.remove();return result});
++run('widthFailBeforeSettings',()=>{const trace=[],settings={get colorSpace(){trace.push('space');return'bad'}};let error;try{new ImageData({valueOf(){trace.push('w');throw Error('width')}},1,settings)}catch(e){error=e.name}return{trace,error}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/image-data-conversion-native.json
+@@ -0,0 +1,128 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "5cf5c3671bceadfb9a6b17a22a2ee63f2573ba639720a6decb335cabfa6acc27",
++  "observations": [
++    {
++      "name": "wrap",
++      "value": {
++        "w": 1,
++        "h": 1,
++        "len": 4
++      }
++    },
++    {
++      "name": "negativeWrap",
++      "value": {
++        "w": 1,
++        "h": 1,
++        "len": 4
++      }
++    },
++    {
++      "name": "widthBig",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "defaultFormat",
++      "value": {
++        "w": 1,
++        "h": 1,
++        "len": 4
++      }
++    },
++    {
++      "name": "symbolSpace",
++      "value": {
++        "w": 1,
++        "h": 1,
++        "len": 4
++      }
++    },
++    {
++      "name": "symbolFormat",
++      "value": {
++        "w": 1,
++        "h": 1,
++        "len": 4
++      }
++    },
++    {
++      "name": "arrayHeightZero",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayWidthInfinity",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayHeightNaN",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "conversionOrder-false",
++      "value": {
++        "trace": [
++          "h",
++          "getSpace",
++          "space",
++          "getFormat",
++          "format",
++          "w"
++        ],
++        "value": {
++          "w": 1,
++          "h": 1
++        }
++      }
++    },
++    {
++      "name": "conversionOrder-true",
++      "value": {
++        "trace": [
++          "w",
++          "getSpace",
++          "space",
++          "getFormat",
++          "format",
++          "h"
++        ],
++        "value": {
++          "w": 1,
++          "h": 1
++        }
++      }
++    },
++    {
++      "name": "foreignData",
++      "value": {
++        "same": true,
++        "foreign": true,
++        "local": false
++      }
++    },
++    {
++      "name": "widthFailBeforeSettings",
++      "value": {
++        "trace": [
++          "space",
++          "w"
++        ],
++        "error": "Error"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/image-data-deep-v2-native-expression.js
+@@ -0,0 +1,11 @@
++(()=>{const rows=[],run=(name,fn)=>{try{rows.push({name,value:fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}},summ=i=>({w:i.width,h:i.height,c:i.colorSpace,p:i.pixelFormat,len:i.data.length});
++run('descriptors',()=>({len:ImageData.length,name:ImageData.name,construct:(()=>{const d=Object.getOwnPropertyDescriptor(ImageData,'prototype');return{writable:d.writable,enumerable:d.enumerable,configurable:d.configurable}})(),protoParent:Object.getPrototypeOf(ImageData.prototype)===Object.prototype,props:Object.fromEntries(Reflect.ownKeys(ImageData.prototype).map(k=>{const d=Object.getOwnPropertyDescriptor(ImageData.prototype,k);return[String(k),{value:typeof d.value==='function'?{name:d.value.name,length:d.value.length}:d.value,get:d.get?{name:d.get.name,length:d.get.length}:null,set:typeof d.set,writable:d.writable,enumerable:d.enumerable,configurable:d.configurable}]}))}));
++for(const[name,args]of[['arrayThirdUndefined',[new Uint8ClampedArray(24),3,undefined,{colorSpace:'srgb'}]],['arrayThirdNull',[new Uint8ClampedArray(24),3,null]],['arrayFractional',[new Uint8ClampedArray(24),3.9,2.1]],['arrayNegative',[new Uint8ClampedArray(4),-1,1]],['arrayNoWidth',[new Uint8ClampedArray(4)]],['formatUndefined',[1,1,{pixelFormat:undefined,colorSpace:undefined}]],['primitiveSettings',[1,1,3]],['stringSettings',[1,1,'srgb']]])run(name,()=>summ(new ImageData(...args)));
++run('settingsOrderFailure',()=>{const order=[],a={valueOf(){order.push('width');return 1}},b={valueOf(){order.push('height');return 1}},o={get colorSpace(){order.push('colorSpace');return'invalid'},get pixelFormat(){order.push('pixelFormat');return'invalid'}};let error;try{new ImageData(a,b,o)}catch(e){error=e.name}return{order,error}});
++run('arrayOverloadOrder',()=>{const order=[],a={valueOf(){order.push('width');return 1}},b={valueOf(){order.push('height');return 1}},o={get colorSpace(){order.push('colorSpace');return'srgb'},get pixelFormat(){order.push('pixelFormat');return'rgba-unorm8'}};const im=new ImageData(new Uint8ClampedArray(4),a,b,o);return{order,summary:summ(im)}});
++run('clone',()=>{const i=new ImageData(2,1);i.data[0]=42;let reads=0;const data=i.data;Object.defineProperty(i,'data',{get(){reads++;throw Error('own data')}});Object.defineProperty(i,'width',{get(){reads++;throw Error('own width')}});const c=structuredClone({i,again:i,originalData:data,originalBuffer:data.buffer});c.i.data[1]=99;return{same:c.i===c.again,brand:c.i instanceof ImageData,summary:summ(c.i),byte:c.i.data[0],reads,dataAlias:c.i.data===c.originalData,bufferAlias:c.i.data.buffer===c.originalBuffer,ownArrayAlias:c.originalData.buffer===c.originalBuffer,independent:data[1]===0}});
++run('cloneFake',()=>{const x=Object.assign(Object.create(ImageData.prototype),{user:3}),y=structuredClone(x);return{keys:Object.keys(y),user:y.user,plain:Object.getPrototypeOf(y)===Object.prototype}});
++run('callWithNewTarget',()=>{class Sub extends ImageData{}const a=new Sub(1,1);return{isSub:a instanceof Sub,proto:Object.getPrototypeOf(a)===Sub.prototype}});
++run('arrayView',()=>{const a=new Uint8ClampedArray(12),sub=a.subarray(4,8),i=new ImageData(sub,1);return{same:i.data===sub,offset:i.data.byteOffset,buffer:i.data.buffer===a.buffer}});
++run('dataByteTransfer',()=>{const i=new ImageData(1,1),b=i.data.buffer,c=structuredClone(i,{transfer:[b]});return{oldLength:i.data.length,byteLength:b.byteLength,cloneLength:c.data.length,brand:c instanceof ImageData}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/image-data-deep-v2-native.json
+@@ -0,0 +1,234 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "11b0cef7ff981a25dcb01d1519c64fcb293c8bff8046c5d0287bc76a2e7bfc12",
++  "observations": [
++    {
++      "name": "descriptors",
++      "value": {
++        "len": 2,
++        "name": "ImageData",
++        "construct": {
++          "writable": false,
++          "enumerable": false,
++          "configurable": false
++        },
++        "protoParent": true,
++        "props": {
++          "colorSpace": {
++            "value": "srgb",
++            "get": null,
++            "set": "undefined",
++            "writable": false,
++            "enumerable": true,
++            "configurable": false
++          },
++          "pixelFormat": {
++            "value": "rgba-unorm8",
++            "get": null,
++            "set": "undefined",
++            "writable": false,
++            "enumerable": true,
++            "configurable": false
++          },
++          "data": {
++            "get": {
++              "name": "get data",
++              "length": 0
++            },
++            "set": "undefined",
++            "enumerable": true,
++            "configurable": true
++          },
++          "width": {
++            "get": {
++              "name": "get width",
++              "length": 0
++            },
++            "set": "undefined",
++            "enumerable": true,
++            "configurable": true
++          },
++          "height": {
++            "get": {
++              "name": "get height",
++              "length": 0
++            },
++            "set": "undefined",
++            "enumerable": true,
++            "configurable": true
++          },
++          "constructor": {
++            "value": {
++              "name": "ImageData",
++              "length": 2
++            },
++            "get": null,
++            "set": "undefined",
++            "writable": true,
++            "enumerable": false,
++            "configurable": true
++          },
++          "Symbol(Symbol.toStringTag)": {
++            "value": "ImageData",
++            "get": null,
++            "set": "undefined",
++            "writable": false,
++            "enumerable": false,
++            "configurable": true
++          }
++        }
++      }
++    },
++    {
++      "name": "arrayThirdUndefined",
++      "value": {
++        "w": 3,
++        "h": 2,
++        "c": "srgb",
++        "p": "rgba-unorm8",
++        "len": 24
++      }
++    },
++    {
++      "name": "arrayThirdNull",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayFractional",
++      "value": {
++        "w": 3,
++        "h": 2,
++        "c": "srgb",
++        "p": "rgba-unorm8",
++        "len": 24
++      }
++    },
++    {
++      "name": "arrayNegative",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayNoWidth",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "formatUndefined",
++      "value": {
++        "w": 1,
++        "h": 1,
++        "c": "srgb",
++        "p": "rgba-unorm8",
++        "len": 4
++      }
++    },
++    {
++      "name": "primitiveSettings",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "stringSettings",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "settingsOrderFailure",
++      "value": {
++        "order": [
++          "height",
++          "colorSpace",
++          "pixelFormat",
++          "width"
++        ],
++        "error": "TypeError"
++      }
++    },
++    {
++      "name": "arrayOverloadOrder",
++      "value": {
++        "order": [
++          "width",
++          "colorSpace",
++          "pixelFormat",
++          "height"
++        ],
++        "summary": {
++          "w": 1,
++          "h": 1,
++          "c": "srgb",
++          "p": "rgba-unorm8",
++          "len": 4
++        }
++      }
++    },
++    {
++      "name": "clone",
++      "value": {
++        "same": true,
++        "brand": true,
++        "summary": {
++          "w": 2,
++          "h": 1,
++          "c": "srgb",
++          "p": "rgba-unorm8",
++          "len": 8
++        },
++        "byte": 42,
++        "reads": 0,
++        "dataAlias": false,
++        "bufferAlias": false,
++        "ownArrayAlias": true,
++        "independent": true
++      }
++    },
++    {
++      "name": "cloneFake",
++      "value": {
++        "keys": [
++          "user"
++        ],
++        "user": 3,
++        "plain": true
++      }
++    },
++    {
++      "name": "callWithNewTarget",
++      "value": {
++        "isSub": true,
++        "proto": true
++      }
++    },
++    {
++      "name": "arrayView",
++      "value": {
++        "same": true,
++        "offset": 4,
++        "buffer": true
++      }
++    },
++    {
++      "name": "dataByteTransfer",
++      "value": {
++        "oldLength": 4,
++        "byteLength": 4,
++        "cloneLength": 4,
++        "brand": true
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/image-data-native-expression.js
+@@ -0,0 +1,11 @@
++(()=>{const rows=[],run=(name,fn)=>{try{rows.push({name,value:fn()})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}},sum=i=>({width:i.width,height:i.height,colorSpace:i.colorSpace,pixelFormat:i.pixelFormat,len:i.data.length,kind:i.data.constructor.name,keys:Object.keys(i),tag:Object.prototype.toString.call(i)});
++for(const[name,args]of[['basic',[2,3]],['zeroWidth',[0,1]],['zeroHeight',[1,0]],['negative',[-1,1]],['float',[2.9,3.1]],['nan',[NaN,1]],['infinity',[Infinity,1]],['missing',[]],['one',[1]],['undefined',[undefined,1]],['null',[null,1]],['bigint',[1n,1]],['symbol',[Symbol(),1]],['string',['2','3']],['spaceP3',[1,1,{colorSpace:'display-p3'}]],['spaceInvalid',[1,1,{colorSpace:'bad'}]],['format16',[1,1,{pixelFormat:'rgba-float16'}]],['formatInvalid',[1,1,{pixelFormat:'bad'}]],['nullSettings',[1,1,null]]])run(name,()=>sum(new ImageData(...args)));
++for(const[name,fn]of[['array',()=>new ImageData(new Uint8ClampedArray(24),3,2)],['derive',()=>new ImageData(new Uint8ClampedArray(24),3)],['explicitUndefined',()=>new ImageData(new Uint8ClampedArray(24),3,undefined,{colorSpace:'display-p3'})],['arrayBadHeight',()=>new ImageData(new Uint8ClampedArray(24),3,3)],['arrayBadWidth',()=>new ImageData(new Uint8ClampedArray(24),4)],['arrayZeroWidth',()=>new ImageData(new Uint8ClampedArray(24),0)],['arrayZero',()=>new ImageData(new Uint8ClampedArray(0),1)],['arrayNotRGBA',()=>new ImageData(new Uint8ClampedArray(5),1)],['uint8',()=>new ImageData(new Uint8Array(4),1)],['float32',()=>new ImageData(new Float32Array(4),1)],['arraySettingsThird',()=>new ImageData(new Uint8ClampedArray(4),1,{colorSpace:'display-p3'})],['arrayWithFormat16',()=>new ImageData(new Uint8ClampedArray(4),1,1,{pixelFormat:'rgba-float16'})]])run(name,()=>sum(fn()));
++run('properties',()=>({length:ImageData.length,name:ImageData.name,parent:Object.getPrototypeOf(ImageData.prototype)===Object.prototype,descriptors:Object.fromEntries(['width','height','data','colorSpace','pixelFormat'].map(k=>{const d=Object.getOwnPropertyDescriptor(ImageData.prototype,k);return[k,{get:typeof d.get,set:typeof d.set,enumerable:d.enumerable,configurable:d.configurable,name:d.get.name,length:d.get.length}]}))}));
++run('identity',()=>{const a=new Uint8ClampedArray(4),i=new ImageData(a,1);i.data[0]=7;return{same:i.data===a,byte:a[0],readonly:Reflect.set(i,'width',2),realm:i instanceof ImageData&&i.data instanceof Uint8ClampedArray}});
++run('call',()=>ImageData(1,1));run('fakeGetter',()=>Object.getOwnPropertyDescriptor(ImageData.prototype,'width').get.call(Object.create(ImageData.prototype)));
++run('order',()=>{const trace=[],n=k=>({valueOf(){trace.push(k);return 1}}),o={get colorSpace(){trace.push('colorSpace');return'srgb'},get pixelFormat(){trace.push('pixelFormat');return'rgba-unorm8'}};const i=new ImageData(n('width'),n('height'),o);return{trace,result:sum(i)}});
++run('arrayOrder',()=>{const trace=[],n=k=>({valueOf(){trace.push(k);return 1}}),o={get colorSpace(){trace.push('colorSpace');return'srgb'},get pixelFormat(){trace.push('pixelFormat');return'rgba-unorm8'}};const i=new ImageData(new Uint8ClampedArray(4),n('width'),n('height'),o);return{trace,result:sum(i)}});
++run('detached',()=>{const a=new Uint8ClampedArray(4);structuredClone(a.buffer,{transfer:[a.buffer]});return sum(new ImageData(a,1))});
++run('clone',()=>{const i=new ImageData(2,1,{colorSpace:'display-p3'});i.data[0]=42;let reads=0;Object.defineProperty(i,'data',{get(){reads++;throw Error('own data')}});Object.defineProperty(i,'width',{get(){reads++;throw Error('own width')}});const c=structuredClone({i,again:i});return{same:c.i===c.again,brand:c.i instanceof ImageData,summary:sum(c.i),byte:c.i.data[0],reads}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/image-data-native.json
+@@ -0,0 +1,353 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "6eaf3790cf0df3578493dbe59e83ff6f53ae5e1d6727e091d9e2e69f96e9db46",
++  "observations": [
++    {
++      "name": "basic",
++      "value": {
++        "width": 2,
++        "height": 3,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 24,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "zeroWidth",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "zeroHeight",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "negative",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "float",
++      "value": {
++        "width": 2,
++        "height": 3,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 24,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "nan",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "infinity",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "missing",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "one",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "undefined",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "null",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "bigint",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot convert a BigInt value to a number"
++      }
++    },
++    {
++      "name": "symbol",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    },
++    {
++      "name": "string",
++      "value": {
++        "width": 2,
++        "height": 3,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 24,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "spaceP3",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "spaceInvalid",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "format16",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "formatInvalid",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "nullSettings",
++      "value": {
++        "width": 1,
++        "height": 1,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 4,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "array",
++      "value": {
++        "width": 3,
++        "height": 2,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 24,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "derive",
++      "value": {
++        "width": 3,
++        "height": 2,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 24,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "explicitUndefined",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "arrayBadHeight",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayBadWidth",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayZeroWidth",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayZero",
++      "error": {
++        "name": "InvalidStateError",
++        "message": "The object is in an invalid state"
++      }
++    },
++    {
++      "name": "arrayNotRGBA",
++      "error": {
++        "name": "InvalidStateError",
++        "message": "The object is in an invalid state"
++      }
++    },
++    {
++      "name": "uint8",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "float32",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arraySettingsThird",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "arrayWithFormat16",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "properties",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot read properties of undefined (reading 'name')"
++      }
++    },
++    {
++      "name": "identity",
++      "value": {
++        "same": true,
++        "byte": 7,
++        "readonly": false,
++        "realm": true
++      }
++    },
++    {
++      "name": "call",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "fakeGetter",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation"
++      }
++    },
++    {
++      "name": "order",
++      "value": {
++        "trace": [
++          "height",
++          "colorSpace",
++          "pixelFormat",
++          "width"
++        ],
++        "result": {
++          "width": 1,
++          "height": 1,
++          "colorSpace": "srgb",
++          "pixelFormat": "rgba-unorm8",
++          "len": 4,
++          "kind": "Uint8ClampedArray",
++          "keys": [],
++          "tag": "[object ImageData]"
++        }
++      }
++    },
++    {
++      "name": "arrayOrder",
++      "value": {
++        "trace": [
++          "width",
++          "colorSpace",
++          "pixelFormat",
++          "height"
++        ],
++        "result": {
++          "width": 1,
++          "height": 1,
++          "colorSpace": "srgb",
++          "pixelFormat": "rgba-unorm8",
++          "len": 4,
++          "kind": "Uint8ClampedArray",
++          "keys": [],
++          "tag": "[object ImageData]"
++        }
++      }
++    },
++    {
++      "name": "detached",
++      "value": {
++        "width": 1,
++        "height": 1,
++        "colorSpace": "srgb",
++        "pixelFormat": "rgba-unorm8",
++        "len": 4,
++        "kind": "Uint8ClampedArray",
++        "keys": [],
++        "tag": "[object ImageData]"
++      }
++    },
++    {
++      "name": "clone",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/image-data-utility-native-expression.js
+@@ -0,0 +1 @@
++(()=>{const i=new ImageData(2,1);i.data.set([1,2,3,4]);class Derived extends ImageData{}const d=new Derived(1,1);return{brand:i instanceof ImageData,array:i.data instanceof Uint8ClampedArray,prototype:Object.getPrototypeOf(i)===ImageData.prototype,derived:d instanceof ImageData&&d instanceof Derived,bytes:[...i.data],funcRealm:ImageData instanceof Function,getterRealm:Object.getOwnPropertyDescriptor(ImageData.prototype,'width').get instanceof Function}})()
+--- /dev/null
++++ b/docs/reference/image-data-utility-native.json
+@@ -0,0 +1,24 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "afb7bd4137f823911b598cb082f2a480c82c21df8393227be37e08980edfa037",
++  "expressionSHA256": "e3a4aecedd9faf55b41be61c4a118315331a0be073feca010d2e584040424adf",
++  "observations": {
++    "brand": true,
++    "array": true,
++    "prototype": true,
++    "derived": true,
++    "bytes": [
++      1,
++      2,
++      3,
++      4,
++      0,
++      0,
++      0,
++      0
++    ],
++    "funcRealm": true,
++    "getterRealm": true
++  }
++}
+--- /dev/null
++++ b/src/image-data.js
+@@ -0,0 +1,75 @@
++// Independent ImageData values backed by actual realm-local clamped bytes.
++// Successful factory identities, not authored prototype/tag/symbol fields,
++// provide private state and clone provenance.
++import { types } from 'node:util';
++import { registerPlatformFactory, platformFactoryRecord } from './platform-factories.js';
++const states=new WeakMap(),installed=new WeakMap();
++const typed=Object.getPrototypeOf(Uint8Array.prototype),length=Object.getOwnPropertyDescriptor(typed,'length').get;
++const uint8Set=Uint8Array.prototype.set;
++const MAX_BYTES=64*1024*1024;
++function copyBytes(data){const size=length.call(data);if(size>MAX_BYTES)throw new RangeError('ImageData clone exceeds the independent backend byte limit');const bytes=new Uint8Array(size);uint8Set.call(bytes,data);return bytes}
++function factory(g,bridge){
++ const TypeError=g.TypeError,RangeError=g.RangeError,Exception=g.DOMException,Clamped=g.Uint8ClampedArray;
++ const define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,safeInteger=g.Number.isSafeInteger;
++ const String=g.String,description=descriptor(g.Symbol.prototype,'description').get;
++ const number=value=>(+value)>>>0;
++ const text=value=>typeof value==='symbol'?apply(description,value,[])??'':String(value);
++ const index=()=>new Exception('Index or size is negative or greater than the allowed amount','IndexSizeError');
++ const invalid=()=>new Exception('The object is in an invalid state','InvalidStateError');
++ function settings(value){
++  if(value==null)return{colorSpace:'srgb',pixelFormat:'rgba-unorm8'};
++  if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('invalid argument');
++  const c=value.colorSpace,colorSpace=c===undefined?'srgb':text(c);
++  const p=value.pixelFormat,pixelFormat=p===undefined?'rgba-unorm8':text(p);
++  return{colorSpace,pixelFormat};
++ }
++ function ImageData(sw,sh){
++  if(new.target===undefined||arguments.length<2)throw new TypeError('invalid argument');
++  const array=bridge.isData(sw);let width,height,data,options;
++  if(array){
++   width=number(sh);options=settings(arguments[3]);
++   height=arguments[2]===undefined?undefined:number(arguments[2]);
++   const n=bridge.length(sw);
++   if(options.colorSpace!=='srgb'||options.pixelFormat!=='rgba-unorm8')throw new TypeError('');
++   if(!n||n%4)throw invalid();
++   if(!width||width>2147483647||n%(4*width))throw index();
++   const derived=n/(4*width);if(height===undefined)height=derived;
++   if(!height||height>2147483647||height!==derived)throw index();
++   data=sw;
++  }else{
++   height=number(sh);options=settings(arguments[2]);width=number(sw);
++   if(options.colorSpace!=='srgb'||options.pixelFormat!=='rgba-unorm8')throw new TypeError('');
++   const n=width*height*4;
++   if(!width||!height||width>2147483647||height>2147483647||!safeInteger(n)||n>2147483647)throw index();
++   if(n>bridge.maxBytes)throw new RangeError('ImageData allocation exceeds the independent backend byte limit');
++   data=new Clamped(n);
++  }
++  bridge.store(this,width,height,data);
++ }
++ const p=ImageData.prototype;delete p.constructor;
++ define(ImageData,'prototype',{writable:false});
++ define(p,'colorSpace',{value:'srgb',enumerable:true});
++ define(p,'pixelFormat',{value:'rgba-unorm8',enumerable:true});
++ const accessors={get data(){return bridge.read(this,'data')},get width(){return bridge.read(this,'width')},get height(){return bridge.read(this,'height')}};
++ for(const key of['data','width','height'])define(p,key,{...descriptor(accessors,key),enumerable:true,configurable:true});
++ define(p,'constructor',{value:ImageData,writable:true,configurable:true});
++ define(p,g.Symbol.toStringTag,{value:'ImageData',configurable:true});
++ define(g,'ImageData',{value:ImageData,writable:true,configurable:true});
++ return{construct(record){const data=new Clamped(record.bytes.length);for(let i=0;i<record.bytes.length;i++)data[i]=record.bytes[i];return new ImageData(data,record.width,record.height)}};
++}
++export function installImageData(realm){
++ if(installed.has(realm))return installed.get(realm);
++ const ErrorCtor=realm.TypeError;
++ const api=realm.eval(`(${factory.toString()})`)(realm,{
++  store(value,width,height,data){
++   const state=Object.freeze(Object.assign(Object.create(null),{width,height,data}));states.set(value,state);
++   registerPlatformFactory(value,{kind:'ImageData',implementation:state,globalObject:realm,read:()=>({kind:'ImageData',width,height,bytes:copyBytes(data)})});
++  },
++  read(value,key){const state=states.get(value);if(!state)throw new ErrorCtor('Illegal invocation');return state[key]},
++  isData:types.isUint8ClampedArray,length:value=>length.call(value),maxBytes:MAX_BYTES,
++ });
++ installed.set(realm,api);return api;
++}
++export function imageDataRecord(value){const provenance=platformFactoryRecord(value);return provenance?.kind==='ImageData'&&states.has(value)?provenance.read():null}
++export function validImageDataRecord(record){return record?.kind==='ImageData'&&Number.isInteger(record.width)&&record.width>0&&record.width<=2147483647&&Number.isInteger(record.height)&&record.height>0&&record.height<=2147483647&&types.isUint8Array(record.bytes)&&record.bytes.length===record.width*record.height*4&&record.bytes.length<=MAX_BYTES}
++export function deserializeImageData(realm,record){const api=installed.get(realm);if(!api||!validImageDataRecord(record))throw new TypeError('Invalid ImageData receiver');return api.construct(record)}
+--- /dev/null
++++ b/test/image-data.test.js
+@@ -0,0 +1,81 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++import {imageDataRecord,validImageDataRecord} from '../src/image-data.js';
++import {platformFactoryRecord} from '../src/platform-factories.js';
++async function fixture(t){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body></body>');return{browser,page,window:page.dom.window}}
++const plain=v=>JSON.parse(JSON.stringify(v));
++for(const file of['image-data-native','image-data-deep-v2-native','image-data-conversion-native'])test(`actual ImageData measured Native controls: ${file}`,async t=>{
++ const{page}=await fixture(t),expression=await readFile(new URL(`../docs/reference/${file}-expression.js`,import.meta.url),'utf8');
++ const expected=JSON.parse(await readFile(new URL(`../docs/reference/${file}.json`,import.meta.url),'utf8')).observations;
++ const actual=plain(await page.evaluate(expression));
++ // Native structuredClone does not detach ArrayBuffers; this backend's actual
++ // transfer detaches them. Keep that known transport divergence outside value
++ // constructor/metadata assertions instead of manufacturing attached buffers.
++ const exclude=new Set(['detached','dataByteTransfer']);
++ assert.deepEqual(actual.filter(row=>!exclude.has(row.name)),expected.filter(row=>!exclude.has(row.name)));
++});
++
++test('private ImageData factory records hold genuine clamped bytes and reject copied descriptors/prototype lookalikes',async t=>{
++ const{window}=await fixture(t);const image=new window.ImageData(2,1);image.data.set([7,8,9,10]);const record=imageDataRecord(image);
++ assert.equal(platformFactoryRecord(image).kind,'ImageData');assert.equal(validImageDataRecord(record),true);assert.deepEqual([...record.bytes],[7,8,9,10,0,0,0,0]);
++ const fake=Object.create(window.ImageData.prototype,Object.getOwnPropertyDescriptors(image));assert.equal(imageDataRecord(fake),null);assert.equal(platformFactoryRecord(fake),undefined);
++ image.data[0]=99;assert.equal(record.bytes[0],7);const clone=window.structuredClone(image);assert.ok(clone instanceof window.ImageData);assert.equal(clone.data[0],99);
++});
++
++test('ImageData uses captured real typed-array slots and constructors without authored getter or constructor calls',async t=>{
++ const{page}=await fixture(t);const actual=page.evaluate(`(()=>{const Image=ImageData,C=Uint8ClampedArray,data=new C(4);let calls=0;for(const key of['length','byteLength','buffer'])Object.defineProperty(data,key,{get(){calls++;throw Error('authored')}});globalThis.ImageData=globalThis.Uint8ClampedArray=function(){throw Error('authored constructor')};const image=new Image(data,1),clone=structuredClone(image);return{calls,same:image.data===data,brand:clone instanceof Image,array:clone.data instanceof C,width:clone.width,height:clone.height,byte:clone.data[0]}})()`);
++ assert.deepEqual(plain(actual),{calls:0,same:true,brand:true,array:true,width:1,height:1,byte:0});
++});
++
++test('ImageData structured clone isolates backing bytes while preserving graph aliases and actual buffer transfers',async t=>{
++ const{page}=await fixture(t);const actual=page.evaluate(`(()=>{const image=new ImageData(1,1),data=image.data;data.set([1,2,3,4]);const graph={image,again:image,data,buffer:data.buffer};graph.self=graph;const c=structuredClone(graph,{transfer:[data.buffer]});return{cycle:c.self===c,alias:c.image===c.again,brand:c.image instanceof ImageData,imageBytes:[...c.image.data],dataBytes:[...c.data],bufferAlias:c.data.buffer===c.buffer,separate:c.image.data.buffer!==c.buffer,detached:data.byteLength===0}})()`);
++ assert.deepEqual(plain(actual),{cycle:true,alias:true,brand:true,imageBytes:[1,2,3,4],dataBytes:[1,2,3,4],bufferAlias:true,separate:true,detached:true});
++});
++
++test('ImageData crosses actual ports and BroadcastChannel as independent receiver values alongside real Files',async t=>{
++ const{page}=await fixture(t);const actual=await page.evaluate(`new Promise(resolve=>{const image=new ImageData(1,1);image.data.set([9,8,7,6]);const pair=new MessageChannel();pair.port2.onmessage=async e=>{const p=e.data.image;const name='image-'+Math.random(),a=new BroadcastChannel(name),b=new BroadcastChannel(name);b.onmessage=async event=>{const q=event.data.image;resolve({port:p instanceof ImageData,portArray:p.data instanceof Uint8ClampedArray,portAlias:e.data.again===p,bc:q instanceof ImageData,bytes:[...q.data],different:q!==p,file:await event.data.file.text()});a.close();b.close();pair.port1.close();pair.port2.close()};a.postMessage({image:p,file:e.data.file})};pair.port1.postMessage({image,again:image,file:new File(['bytes'],'image.txt')})})`);
++ assert.deepEqual(plain(actual),{port:true,portArray:true,portAlias:true,bc:true,bytes:[9,8,7,6],different:true,file:'bytes'});
++});
++
++test('actual worker ImageData values preserve bytes, aliases and independent clamped-array realms in both directions',async t=>{
++ const{page}=await fixture(t);const actual=await page.evaluate(`new Promise(resolve=>{const worker=new Worker(URL.createObjectURL(new Blob(["onmessage=e=>{const image=e.data.image,local=new ImageData(1,1);local.data.set([5,6,7,8]);postMessage({local,again:local,seen:{brand:image instanceof ImageData,array:image.data instanceof Uint8ClampedArray,bytes:[...image.data],alias:e.data.again===image}})}"],{type:'text/javascript'})));worker.onerror=e=>{e.preventDefault();resolve({error:e.message})};worker.onmessage=e=>{resolve({brand:e.data.local instanceof ImageData,array:e.data.local.data instanceof Uint8ClampedArray,bytes:[...e.data.local.data],alias:e.data.local===e.data.again,seen:e.data.seen});worker.terminate()};const image=new ImageData(1,1);image.data.set([1,2,3,4]);worker.postMessage({image,again:image})})`);
++ assert.deepEqual(plain(actual),{brand:true,array:true,bytes:[5,6,7,8],alias:true,seen:{brand:true,array:true,bytes:[1,2,3,4],alias:true}});
++});
++
++test('real child-frame ImageData owns selected realm arrays while foreign constructor input retains original identity',async t=>{
++ const{page}=await fixture(t);const actual=page.evaluate(`(()=>{const f=document.createElement('iframe');document.body.append(f);const w=f.contentWindow,image=new w.ImageData(1,1),foreign=new ImageData(image.data,1);const c=structuredClone(image);return{child:image instanceof w.ImageData,childArray:image.data instanceof w.Uint8ClampedArray,notMain:!(image instanceof ImageData),foreignSame:foreign.data===image.data,cloneMain:c instanceof ImageData&&c.data instanceof Uint8ClampedArray}})()`);
++ assert.deepEqual(plain(actual),{child:true,childArray:true,notMain:true,foreignSame:true,cloneMain:true});
++});
++
++test('ImageData allocation bounds and failed clone remain explicit and atomic for transferables',async t=>{
++ const{page}=await fixture(t);const actual=page.evaluate(`(()=>{let bound;try{new ImageData(10000,10000)}catch(e){bound=e.name}const image=new ImageData(1,1),buffer=new ArrayBuffer(4);let error;try{structuredClone({image,callback(){}},{transfer:[buffer]})}catch(e){error=e.name}return{bound,error,attached:buffer.byteLength===4}})()`);
++ assert.deepEqual(plain(actual),{bound:'RangeError',error:'DataCloneError',attached:true});
++});
++
++test('actual utility ImageData compiles in selected VM and preserves foreign authored values without alias globals',async t=>{
++ const{serve}=await import('../src/cdp.js'),{connect}=await import('./cdp-client.js');const service=await serve({host:'127.0.0.1',port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(m,p)=>client.send(m,p,sessionId);
++ const{frameTree}=await send('Page.getFrameTree',{}),{executionContextId}=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'image-data-control'});
++ const expression=await readFile(new URL('../docs/reference/image-data-utility-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/image-data-utility-native.json',import.meta.url),'utf8')).observations;
++ const value=await send('Runtime.evaluate',{expression,contextId:executionContextId,returnByValue:true});assert.equal(value.exceptionDetails,undefined);assert.deepEqual(value.result.value,expected);
++ await send('Runtime.evaluate',{contextId:executionContextId,expression:"document.addEventListener('image-value',e=>{globalThis.foreignResult={foreign:!(e.detail instanceof ImageData),arrayForeign:!(e.detail.data instanceof Uint8ClampedArray),identity:new ImageData(e.detail.data,1).data===e.detail.data}})"});
++ await send('Runtime.evaluate',{expression:"document.dispatchEvent(new CustomEvent('image-value',{detail:new ImageData(1,1)}))"});
++ const foreign=await send('Runtime.evaluate',{contextId:executionContextId,expression:'foreignResult',returnByValue:true});assert.deepEqual(foreign.result.value,{foreign:true,arrayForeign:true,identity:true});
++});
++
++test('unchanged pinned image_data.html fixture runs nonzero native-branch assertions',async t=>{
++ const{upstreamTestRoot}=await import('./upstream-reference.js'),{startFixtureServer}=await import('../scripts/upstream-fixture-server.mjs'),{createHash}=await import('node:crypto');
++ const root=await upstreamTestRoot(),source=await readFile(`${root}/image_data.html`);assert.equal(createHash('sha256').update(source).digest('hex'),'ba24860cd7d51cae38bbf8f2d10cec27d8be02b4437ea71a6057b78adb277526');
++ const server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());const browser=new Browser({userAgent:'Lightpanda/1.0'});t.after(()=>browser.close());const page=browser.createPage(),errors=[];page.on('console',e=>{if(e.type==='error')errors.push(e.args.map(String).join(' '))});page.newDocumentScripts.set('external',{source:'globalThis.__lp_external_runner=true;'});
++ await page.navigate(`${server.origin}/src/browser/tests/image_data.html`);assert.equal(page.evaluate('testing.IS_TEST_RUNNER'),true);assert.equal(page.evaluate('testing.assertOk()'),true,JSON.stringify(errors));assert.deepEqual(errors,[]);
++});
++
++test('actual heap queries return real ImageData identities without exposing mutable private slot records',async t=>{
++ const{page,window}=await fixture(t);window.imageForHeap=new window.ImageData(1,1);const {queryHeapObjects}=await import('../src/heap-query.js'),context=page.dom.getInternalVMContext();
++ const images=queryHeapObjects(window.ImageData.prototype,context).objects;assert.ok(images.includes(window.imageForHeap));assert.equal(Object.getPrototypeOf(images),window.Array.prototype);
++ const objects=queryHeapObjects(window.Object.prototype,context).objects;
++ const slots=objects.filter(value=>{const w=Object.getOwnPropertyDescriptor(value,'width'),h=Object.getOwnPropertyDescriptor(value,'height'),d=Object.getOwnPropertyDescriptor(value,'data');return w?.value===1&&h?.value===1&&d?.value===window.imageForHeap.data});
++ assert.equal(slots.length,0,'Host-private slots must not become public VM objects through Runtime.queryObjects');
++});

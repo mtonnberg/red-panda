@@ -1,3 +1,5 @@
+import {restoreWindowGlobalInheritance} from './window-global.js';
+import {installConsole,consoleProtocolType} from './console.js';
 import {registerPlatformFactory} from './platform-factories.js';
 // Independent genuine VM/IDL-world prototype. Generated wrapper source comes
 // from the pinned existing jsdom dependency; no target engine source is used.
@@ -21,7 +23,7 @@ export function canonicalUtilityValue(value){const record=utilityWrapperRecord(v
 export function utilityNodeIdentity(value){const record=utilityWrapperRecord(value);if(!record)return undefined;const type=own(record.impl,'nodeType')?.value;if(!Number.isInteger(type)||type<1||type>12)return undefined;const document=type===9?record.impl:own(record.impl,'_ownerDocument')?.value;return {nodeType:type,ownerDocument:hostUtils.wrapperForImpl(document),className:record.interfaceName};}
 
 export function createIsolatedWorld(mainWindow,{name='independent-utility-world',timeout=1000,signal,isWindowClosed,onError,resolveWindow,resolveImplementation,onConsole,onRealm,onWrapper}={}) {
- const context=vm.createContext({}, {name});const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
+ const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
@@ -86,7 +88,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
  Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
  const windowImpl=hostUtils.implForWrapper(mainWindow);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
- global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);Object.setPrototypeOf(global,global.Window.prototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
+ global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);restoreWindowGlobalInheritance(global,context,originalGlobalPrototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
  const add=global.EventTarget.prototype.addEventListener,remove=global.EventTarget.prototype.removeEventListener;
  const removeImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype.removeEventListener;
  global.EventTarget.prototype.addEventListener=realmFunction(function(...args){requireLive();const impl=wrapperImpls.get(this),before=new Set(Object.values(impl?._eventListeners??{}).flat());const result=Reflect.apply(add,this,args);for(const[type,entries]of Object.entries(impl._eventListeners))for(const entry of entries)if(!before.has(entry))listeners.push({impl:new WeakRef(impl),type,entry:new WeakRef(entry)});return result;});
@@ -96,7 +98,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  const clearTimer=id=>{const handle=timerHandles.get(id);if(handle!==undefined){clearTimeout(handle);clearInterval(handle);}timerHandles.delete(id);timers.delete(id);};
  global.setTimeout=realmFunction((...args)=>timerBridge(false,...args));global.setInterval=realmFunction((...args)=>timerBridge(true,...args));const cancellations=vm.compileFunction("return {clearTimeout(id=0){const n=+id;clear(Number.isFinite(n)?Math.trunc(n)|0:0)},clearInterval(id=0){const n=+id;clear(Number.isFinite(n)?Math.trunc(n)|0:0)}}",["clear"],{parsingContext:context})(clearTimer);global.clearTimeout=cancellations.clearTimeout;global.clearInterval=cancellations.clearInterval;
  global.queueMicrotask=realmFunction(callback=>{if(typeof callback!=='function')throw new global.TypeError('Callback must be a function');queueMicrotask(()=>{if(!disposed)Reflect.apply(callback,undefined,[]);});});
- global.console=vm.runInContext('({})',context);for(const method of ['log','warn','error','info','debug'])global.console[method]=realmFunction((...args)=>onConsole?onConsole(method,args):mainWindow.console[method](...args));
+ installConsole(global,{evaluate:source=>vm.runInContext(source,context),emit:(type,args)=>onConsole?onConsole(consoleProtocolType(type),args):Reflect.apply(mainWindow.console[type],mainWindow.console,args)});
  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;

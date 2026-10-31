@@ -116,6 +116,8 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket and FileReaderSync |
 | Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
+| Media values | Genuine ImageData pixels/clones, encoded audio/video chunk bytes and VideoColorSpace; codec state/queue/reset/flush/error behavior with unsupported media processing reported explicitly |
+| Offline audio | Real AudioBuffer channel data and scheduled buffer-source rendering, resampling, loops, playback rate/detune and completion events; wider audio nodes remain incomplete |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
@@ -173,6 +175,19 @@ coverage still differ from Lightpanda. Earlier inspector-based attempts and
 their crashes remain in the [historical evidence](docs/reference/runtime-query-contract.md);
 the [current backend](proposals/runtime-heap-worlds/README.md) uses a separate
 owned native binding. No speed or memory parity is claimed.
+
+Protocol by-value serialization uses the real V8 inspector over original values
+in their selected realm. It enumerates own properties and getters, ignores
+inherited `toJSON`, and reports actual serialization errors. A real VM deadline
+bounds JavaScript getters; interrupted invocation frames recover before later
+requests. Main, frame and utility globals retain their actual engine prototype
+layer. Console namespaces use genuine realm methods and measured event types.
+
+Media value objects retain actual bytes and receiving-realm identities. Codec
+processors reproduce the measured unsupported configuration/task behavior and
+produce no encoded or decoded media. Offline audio renders real buffer samples;
+AudioContext, wider DSP nodes and suspension remain unfinished. Canvas contexts,
+AudioData and VideoFrame remain separate implementation work.
 
 ES modules use Node's experimental VM-module API in the actual page realm. The
 Linux CLI enables it by replacing its own process, preserving its PID. Embedding

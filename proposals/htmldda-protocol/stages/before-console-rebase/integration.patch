@@ -1,0 +1,302 @@
+--- a/native/collections.cc
++++ b/native/collections.cc
+@@ -55,7 +55,7 @@
+   Local<Value> args[] = {Integer::NewFromUnsigned(info.GetIsolate(), index)}, present;
+   if (!Invoke(info.GetIsolate(), info.Data(), "hasIndex", 1, args, &present)) return Intercepted::kYes;
+   if (!present->BooleanValue(info.GetIsolate())) return Intercepted::kNo;
+-  info.GetReturnValue().Set(static_cast<int>(None));
++  info.GetReturnValue().Set(static_cast<int>(ReadOnly));
+   return Intercepted::kYes;
+ }
+ 
+@@ -84,9 +84,9 @@
+   auto object = ObjectTemplate::New(isolate);
+   object->MarkAsUndetectable();
+   object->SetCallAsFunctionHandler(Call, bridge);
+-  object->SetHandler(NamedPropertyHandlerConfiguration(NamedGet, nullptr, NamedQuery, nullptr, NamedKeys, bridge,
++  object->SetHandler(NamedPropertyHandlerConfiguration(NamedGet, nullptr, NamedQuery, nullptr, nullptr, bridge,
+     static_cast<PropertyHandlerFlags>(static_cast<int>(PropertyHandlerFlags::kNonMasking) | static_cast<int>(PropertyHandlerFlags::kOnlyInterceptStrings))));
+-  object->SetHandler(IndexedPropertyHandlerConfiguration(IndexGet, nullptr, IndexQuery, nullptr, IndexKeys, bridge));
++  object->SetHandler(IndexedPropertyHandlerConfiguration(IndexGet, nullptr, IndexQuery, nullptr, nullptr, bridge));
+   Local<Object> collection;
+   if (!object->NewInstance(context).ToLocal(&collection)) return;
+   if (!collection->SetPrototypeV2(context, info[1]).FromMaybe(false)) return;
+--- a/native/README.md
++++ b/native/README.md
+@@ -3,7 +3,7 @@
+ `collections.cc` supplies a small V8 binding for the real `[[IsHTMLDDA]]`
+ behavior of `document.all`. A JavaScript Proxy cannot supply this engine bit.
+ The binding marks an object undetectable, makes it callable, and delegates live
+-property lookup/enumeration to `src/collections.js`. It contains no upstream
++property lookup to `src/collections.js`. It contains no upstream
+ Lightpanda implementation code, native DOM, JavaScript parser, or browser engine.
+ V8 owns the bridge references and collection objects; the binding uses no
+ process-global persistent V8 handles or external object pointers.
+@@ -13,9 +13,19 @@
+ - `typeof document.all === 'undefined'`, falsiness and equality with `null` or
+   `undefined`, while strict equality with `undefined` remains false;
+ - live element indexing, iteration, callable lookup, `item` and `namedItem`;
+-- IDs, eligible HTML `name` attributes, duplicate-match live HTMLCollections;
+-- enumerable indexed properties and unenumerable named properties;
+-- the `HTMLAllCollection` prototype and receiver checks.
++- IDs and eligible HTML `name` attributes, with the native first-ID/name result;
++- indexed/named presence and descriptors, with no virtual keys in own-key enumeration;
++- the `HTMLAllCollection` prototype and genuine borrowed-realm receiver checks.
++
++Native controls confirm that virtual indices/names remain accessible but are not
++returned by `Object.keys`, `getOwnPropertyNames` or `Reflect.ownKeys`. Real authored
++own properties still enumerate. The binding therefore supplies no interceptor
++enumerators; actual V8 protocol serialization observes this behavior directly.
++Indexed descriptors are read-only, `item` uses signed32 numeric conversion, and
++`namedItem`/callable name lookup prioritizes the first matching ID. The measured
++native engine returns a fresh collection on each `document.all` access.
++See [the protocol evidence](../proposals/htmldda-protocol/README.md) for by-reference
++identity, by-value serialization, genuine prototype metadata and clone controls.
+ 
+ The JS adapter also fixes two related jsdom26 RadioNodeList issues: a derived
+ list must refresh its lazy form-controls parent, and its value setter must
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,4 +1,3 @@
+-import {consoleProtocolType} from './console.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {ProtocolSerializer} from './protocol-serialization.js';
+ import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+@@ -14,7 +13,7 @@
+ import { supportsInput, runInput } from './input.js';
+ import { createWebDriver } from './webdriver.js';
+ import { supportsRuntime, runRuntime, resetRuntime } from './runtime.js';
+-import { primitiveRemoteValue, describeRemoteValue, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
++import { primitiveRemoteValue, describeRemoteValue, needsRemoteHandle, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
+ 
+ const timestamp = () => performance.now() / 1000;
+ const protocolErrors = new WeakSet();
+@@ -122,7 +121,7 @@
+       timestamp: Date.now(), exceptionDetails: this.exception(error, executionContextId),
+     }));
+     listen('frameConsole', ({ type, args, executionContextId }) => this.event('Runtime.consoleAPICalled', {
+-      type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
++      type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)), executionContextId, timestamp: Date.now(),
+     }));
+     listen('domContentLoaded', () => {
+       this.event('Page.domContentEventFired', { timestamp: timestamp() });
+@@ -166,7 +165,7 @@
+       requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
+     }));
+     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
+-      type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
++      type: type === 'log' ? 'log' : type, args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+       executionContextId, timestamp: Date.now(),
+     }));
+     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
+@@ -383,7 +382,7 @@
+             isOwn: true, ...(Object.hasOwn(descriptor, 'value') ? { value: this.remote(descriptor.value, false, group, contextId), writable: !!descriptor.writable } : {}),
+             ...(descriptor.get ? { get: this.remote(descriptor.get, false, group, contextId) } : {}), ...(descriptor.set ? { set: this.remote(descriptor.set, false, group, contextId) } : {}) };
+         });
+-        const prototype = object !== null && ['object', 'function'].includes(typeof object) && !types.isProxy(object) ? Object.getPrototypeOf(object) : null;
++        const prototype = needsRemoteHandle(object) && typeof object !== 'symbol' && !types.isProxy(object) ? Object.getPrototypeOf(object) : null;
+         return { result, internalProperties: prototype === null ? [] : [{ name: '[[Prototype]]', value: this.remote(prototype, false, group, contextId) }] };
+       }
+       case 'Runtime.releaseObject': this.objects.delete(params.objectId); return {};
+--- a/src/collections.js
++++ b/src/collections.js
+@@ -1,3 +1,4 @@
++import { registerProtocolPrototype } from './protocol-classes.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import { createRequire } from 'node:module';
+ import { createHash } from 'node:crypto';
+@@ -6,11 +7,11 @@
+ import { fileURLToPath } from 'node:url';
+ 
+ const require = createRequire(import.meta.url);
+-const HTMLCollection = require('jsdom/lib/jsdom/living/generated/HTMLCollection.js');
+ const RadioNodeListImpl = require('jsdom/lib/jsdom/living/nodes/RadioNodeList-impl.js').implementation;
+-const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ const defaultPath = fileURLToPath(new URL(`../native/build/${process.platform}-${process.arch}/node-${process.versions.node}/collections.node`, import.meta.url));
+ const installed = new WeakMap();
++// A genuine collection remains branded when a same-origin realm borrows a method.
++const collectionStates = new WeakMap();
+ const collectionGlobals = new WeakSet();
+ let patchedRadioUpdates = false;
+ 
+@@ -52,11 +53,13 @@
+   if (installed.has(window)) return installed.get(window);
+   const binding = options.binding ?? loadCollectionsBinding();
+   if (typeof binding?.create !== 'function') throw new TypeError('A native HTMLDDA collection binding is required');
+-  const states = new WeakMap();
++  const states = collectionStates;
++  const integer = window.eval('(value => value | 0)');
+   const getElements = window.Document.prototype.getElementsByTagName;
+   const getAttribute = window.Element.prototype.getAttribute;
+   const HTMLAllCollection = window.eval('(function HTMLAllCollection() { throw new TypeError("Illegal constructor"); })');
+   const prototype = HTMLAllCollection.prototype;
++  registerProtocolPrototype(prototype, 'HTMLAllCollection');
+   const brand = value => {
+     if (!states.has(value)) throw new window.TypeError('Invalid HTMLAllCollection receiver');
+     return states.get(value);
+@@ -66,16 +69,12 @@
+     return String(value);
+   };
+   const attribute = (element, name) => getAttribute.call(element, name);
+-  const matching = (element, key) => attribute(element, 'id') === key ||
+-    (element.namespaceURI === htmlNamespace && allNamedTags.has(element.localName) && attribute(element, 'name') === key);
+   function named(state, input) {
+     const key = string(input);
+     if (!key) return null;
+-    const matches = Array.from(state.elements).filter(element => matching(element, key));
+-    if (!matches.length) return null;
+-    if (matches.length === 1) return matches[0];
+-    return HTMLCollection.create(window, [], { element: implForWrapper(state.document),
+-      query: () => Array.from(state.elements).filter(element => matching(element, key)).map(implForWrapper) });
++    const elements = Array.from(state.elements);
++    return elements.find(element => attribute(element, 'id') === key) ??
++      elements.find(element => element.namespaceURI === htmlNamespace && allNamedTags.has(element.localName) && attribute(element, 'name') === key) ?? null;
+   }
+   function item(state, input) {
+     const key = string(input);
+@@ -84,7 +83,10 @@
+   Object.defineProperties(prototype, {
+     length: { configurable: true, enumerable: true, get() { return brand(this).elements.length; } },
+     item: { configurable: true, writable: true, enumerable: true, value: function item_(nameOrIndex) {
+-      const state = brand(this); return arguments.length ? item(state, nameOrIndex) : null;
++      const state = brand(this);
++      if (!arguments.length) throw new window.TypeError('invalid argument');
++      const index = integer(nameOrIndex);
++      return index < 0 ? null : state.elements.item(index);
+     } },
+     namedItem: { configurable: true, writable: true, enumerable: true, value: function namedItem(name) {
+       const state = brand(this); if (!arguments.length) throw new window.TypeError('namedItem requires a name'); return named(state, name);
+--- a/src/remote-values.js
++++ b/src/remote-values.js
+@@ -1,3 +1,4 @@
++import { protocolPrototypeClass } from './protocol-classes.js';
+ import {utilityNodeIdentity} from './isolated-world.js';
+ // CDP value metadata without evaluating page getters or coercion hooks. This
+ // module deliberately does not allocate handles or select execution contexts.
+@@ -157,6 +158,8 @@
+   if (primitive) return primitive;
+   if (typeof value==='symbol') return { type:'symbol',description:apply(symbolText,value,[]) };
+   if (htmlDDA(value)) return { type:'function',className:'HTMLAllCollection',description:'function () { [native code] }' };
++  const prototypeClass = protocolPrototypeClass(value);
++  if (prototypeClass !== undefined) return { type:'object',className:prototypeClass,description:prototypeClass };
+   const type=typeof value;
+   // JS cannot unwrap or distinguish revocation of a Proxy without extra native
+   // support. A generic Proxy description is truthful and never invokes traps.
+--- a/test/collections.test.js
++++ b/test/collections.test.js
+@@ -52,16 +52,18 @@
+   assert.equal(all.namedItem('svg'), window.document.getElementById('svg'));
+ });
+ 
+-test('duplicate named matches return a live HTMLCollection without counting a node twice', t => {
++test('named lookup returns the native first ID or eligible name match without inventing a collection', t => {
+   const window = fixture(t, '<input id="same" name="same"><a name="same"></a>');
+-  const all = window.document.all, matches = all.namedItem('same');
+-  assert.equal(matches.constructor.name, 'HTMLCollection'); assert.equal(matches.length, 2);
+-  const extra = window.document.createElement('input'); extra.name = 'same'; window.document.body.append(extra);
+-  assert.equal(matches.length, 3); assert.equal(matches[2], extra);
+-  extra.name = 'different'; assert.equal(matches.length, 2);
++  const all = window.document.all, first = window.document.querySelector('input'), second = window.document.querySelector('a');
++  assert.equal(all.namedItem('same'), first); assert.equal(all('same'), first);
++  const extra = window.document.createElement('input'); extra.name = 'same'; window.document.body.prepend(extra);
++  assert.equal(all.namedItem('same'), first);
++  first.removeAttribute('id'); first.name = 'different';
++  assert.equal(all.namedItem('same'), extra); extra.remove();
++  assert.equal(all.namedItem('same'), second);
+ });
+ 
+-test('named properties are present and unenumerable while indexes are enumerable', t => {
++test('native virtual collection descriptors remain present without own-key enumeration', t => {
+   const window = fixture(t, '<div id="a"></div><input name="field"><div name="ineligible"></div>');
+   const all = window.document.all;
+   assert.equal('a' in all, true); assert.equal(Object.hasOwn(all, 'a'), true);
+@@ -69,8 +71,10 @@
+   assert.equal(Object.hasOwn(all, 'missing'), false);
+   assert.equal(Object.getOwnPropertyDescriptor(all, 'a').enumerable, false);
+   assert.equal(Object.getOwnPropertyDescriptor(all, '0').enumerable, true);
+-  assert.ok(Reflect.ownKeys(all).includes('a')); assert.ok(!Object.keys(all).includes('a'));
+-  assert.deepEqual(Object.keys(all), Array.from({ length: all.length }, (_, index) => String(index)));
++  assert.equal(Object.getOwnPropertyDescriptor(all, '0').writable, false);
++  assert.deepEqual(Reflect.ownKeys(all), []); assert.deepEqual(Object.getOwnPropertyNames(all), []); assert.deepEqual(Object.keys(all), []);
++  Object.defineProperty(all, 'owned', { value: 23, enumerable: true, configurable: true });
++  assert.deepEqual(Object.keys(all), ['owned']); assert.equal(all.owned, 23);
+ });
+ 
+ test('prototype members win named visibility and methods enforce their receiver brand', t => {
+--- /dev/null
++++ b/src/protocol-classes.js
+@@ -0,0 +1,10 @@
++// Metadata for exact adapter-owned public prototypes. This does not participate
++// in structured-clone brands, heap factories, or candidate property inspection.
++const prototypes = new WeakMap();
++export function registerProtocolPrototype(value, className) {
++  if (value === null || !['object', 'function'].includes(typeof value) || typeof className !== 'string' || !className) throw new TypeError('Invalid protocol prototype metadata');
++  const previous = prototypes.get(value);
++  if (previous !== undefined && previous !== className) throw new TypeError('Protocol prototype metadata conflict');
++  prototypes.set(value, className);
++}
++export function protocolPrototypeClass(value) { return prototypes.get(value); }
+--- /dev/null
++++ b/test/htmldda-protocol.test.js
+@@ -0,0 +1,61 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++async function fixture(t){
++ const service=await serve({host:'127.0.0.1',port:0,loadResources:['iframe']});t.after(()=>service.close());
++ const client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(()=>client.close());
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
++ const send=(method,params={})=>client.send(method,params,sessionId);
++ await send('Runtime.enable');await send('Page.navigate',{url:'data:text/html,'+encodeURIComponent('<!doctype html><html><head><title>Owned</title></head><body><form id="one" name="shared"></form><form id="two" name="shared"></form><iframe id="f" srcdoc="<p id=child>child</p>"></iframe></body></html>')});
++ const evaluate=(expression,extra={})=>send('Runtime.evaluate',{expression,returnByValue:true,...extra});
++ await evaluate('globalThis.savedAll=document.all;true');return{service,client,send,evaluate,targetId};
++}
++const metadata={type:'function',className:'HTMLAllCollection',description:'function () { [native code] }'};
++test('genuine HTMLDDA handles preserve receiver/argument identity and actual prototype metadata',async t=>{
++ const{send,evaluate}=await fixture(t);const handle=(await evaluate('savedAll',{returnByValue:false,objectGroup:'owned-dda'})).result;
++ const{objectId,...description}=handle;assert.deepEqual(description,metadata);assert.equal(typeof objectId,'string');
++ const called=await send('Runtime.callFunctionOn',{objectId,functionDeclaration:'function(value){return {same:this===savedAll&&value===savedAll,type:typeof value,bool:!!value,strictUndefined:value===undefined,looseNull:value==null,first:this[0]===document.documentElement,call:this("one")===document.getElementById("one")}}',arguments:[{objectId}],returnByValue:true});
++ assert.deepEqual(called.result.value,{same:true,type:'undefined',bool:false,strictUndefined:false,looseNull:true,first:true,call:true});
++ const properties=await send('Runtime.getProperties',{objectId,ownProperties:true});assert.deepEqual(properties.result,[]);const proto=properties.internalProperties.find(p=>p.name==='[[Prototype]]').value;assert.equal(proto.className,'HTMLAllCollection');
++ const identity=await send('Runtime.callFunctionOn',{objectId:proto.objectId,functionDeclaration:'function(){return this===Object.getPrototypeOf(savedAll)&&this.constructor===HTMLAllCollection}',returnByValue:true});assert.equal(identity.result.value,true);
++ const held=(await evaluate('({held:savedAll})',{returnByValue:false})).result;
++ const own=await send('Runtime.getProperties',{objectId:held.objectId,ownProperties:true});const property=own.result.find(p=>p.name==='held');const{objectId:heldID,...heldDescription}=property.value;assert.deepEqual(heldDescription,metadata);assert.equal(typeof heldID,'string');
++ await send('Runtime.releaseObjectGroup',{objectGroup:'owned-dda'});await assert.rejects(send('Runtime.callFunctionOn',{objectId,functionDeclaration:'function(){return 1}'}),{code:-32000});
++});
++test('actual V8 HTMLDDA serialization omits interceptor keys while retaining explicitly authored own data',async t=>{
++ const{evaluate}=await fixture(t);assert.deepEqual((await evaluate('savedAll')).result,{type:'function',value:{}});
++ assert.deepEqual((await evaluate('({all:savedAll,undef:undefined,array:[savedAll,undefined]})')).result,{type:'object',value:{all:{},array:[{},null]}});
++ const enumeration=await evaluate('({keys:Object.keys(savedAll),names:Object.getOwnPropertyNames(savedAll),present:Object.hasOwn(savedAll,"0"),writable:Object.getOwnPropertyDescriptor(savedAll,"0").writable,first:savedAll[0]===document.documentElement})');
++ assert.deepEqual(enumeration.result.value,{keys:[],names:[],present:true,writable:false,first:true});
++ await evaluate('Object.defineProperty(savedAll,"owned",{value:23,enumerable:true,configurable:true});true');
++ assert.deepEqual((await evaluate('savedAll')).result,{type:'function',value:{owned:23}});
++ assert.equal((await evaluate('savedAll("one")===document.getElementById("one")')).result.value,true);
++});
++test('HTMLDDA cloning/messages reject genuine identity without detaching another transferable resource',async t=>{
++ const{evaluate}=await fixture(t);const result=await evaluate(`(async()=>{
++  const rejections=[];for(const value of [savedAll,{all:savedAll},[savedAll],new Map([['all',savedAll]]),new Set([savedAll])]){try{structuredClone(value);rejections.push('cloned')}catch(e){rejections.push(e.name)}}
++  let prototypeError;try{structuredClone(HTMLAllCollection.prototype)}catch(e){prototypeError=e.name}
++  const buffer=new ArrayBuffer(8);let transferError;try{structuredClone({all:savedAll,buffer},{transfer:[buffer]})}catch(e){transferError=e.name}
++  const channel=new MessageChannel();let portError;try{channel.port1.postMessage(savedAll)}catch(e){portError=e.name}
++  const delivered=new Promise(resolve=>channel.port2.onmessage=e=>resolve({value:e.data,realm:e.data instanceof Object}));channel.port1.postMessage({marker:17});const actual=await delivered;channel.port1.close();channel.port2.close();
++  let windowError;try{window.postMessage(savedAll,'*')}catch(e){windowError=e.name}
++  const broadcast=new BroadcastChannel('owned-HTMLDDA');let broadcastError;try{broadcast.postMessage(savedAll)}catch(e){broadcastError=e.name}finally{broadcast.close()}
++  return{rejections,prototypeError,transferError,bufferLength:buffer.byteLength,portError,windowError,broadcastError,actual};
++ })()`,{awaitPromise:true});
++ assert.deepEqual(result.result.value,{rejections:Array(5).fill('DataCloneError'),prototypeError:'TypeError',transferError:'DataCloneError',bufferLength:8,portError:'DataCloneError',windowError:'DataCloneError',broadcastError:'DataCloneError',actual:{value:{marker:17},realm:true}});
++});
++test('borrowed collection methods accept genuine foreign-realm values and retain native numeric item conversion',async t=>{
++ const{evaluate}=await fixture(t);const result=await evaluate(`(()=>{const c=document.getElementById('f').contentWindow;return{
++  main:c.HTMLAllCollection.prototype.item.call(savedAll,0)===document.documentElement,
++  child:HTMLAllCollection.prototype.item.call(c.document.all,0)===c.document.documentElement,
++  named:c.HTMLAllCollection.prototype.namedItem.call(savedAll,'one')===document.getElementById('one'),
++  length:Object.getOwnPropertyDescriptor(c.HTMLAllCollection.prototype,'length').get.call(savedAll),
++  nonNumeric:savedAll.item('one')===document.documentElement,
++  firstNamed:savedAll.namedItem('shared')===document.getElementById('one')};})()`);
++ assert.deepEqual(result.result.value,{main:true,child:true,named:true,length:7,nonNumeric:true,firstNamed:true});
++});
++test('a thrown genuine HTMLDDA remains an actual retained exception object',async t=>{
++ const{send,evaluate}=await fixture(t);const thrown=await evaluate('(()=>{throw savedAll})()',{returnByValue:false});
++ for(const value of [thrown.result,thrown.exceptionDetails.exception]){const{objectId,...description}=value;assert.deepEqual(description,metadata);const retained=await send('Runtime.callFunctionOn',{objectId,functionDeclaration:'function(){return this===savedAll&&this!==undefined&&typeof this==="undefined"}',returnByValue:true});assert.equal(retained.result.value,true)}
++});

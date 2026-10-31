@@ -1,3 +1,5 @@
+import { imageDataRecord, validImageDataRecord, deserializeImageData } from './image-data.js';
+import { encodedChunkData, validEncodedChunk, deserializeEncodedChunk } from './webcodecs-values.js';
 import { installNativePlatformFactories } from './native-platform-factories.js';
 import { platformFactoryRecord } from './platform-factories.js';
 import { geometryFactoryData, validGeometryRecord, deserializeGeometry } from './geometry-platform.js';
@@ -24,6 +26,9 @@ export function createPlatformCodec(realm){
  function serialize(value){
   const provenance=platformFactoryRecord(value);
   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+  if(provenance?.kind==='VideoColorSpace')throw failure('The object can not be cloned');
+  const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+  const image=imageDataRecord(value);if(image){if(!validImageDataRecord(image))throw failure('Invalid ImageData clone');return image;}
   const geometry=geometryFactoryData(value);
   if(geometry){if(!validGeometryRecord(geometry))throw failure('The object can not be cloned');return geometry;}
   if(!probe)return null;
@@ -41,7 +46,9 @@ export function createPlatformCodec(realm){
   if(message.platforms===undefined)return null;
   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
   for(const[placeholder,record]of message.platforms){
-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry'].includes(record.kind))throw failure('Malformed platform node');
+   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry','EncodedChunk','ImageData'].includes(record.kind))throw failure('Malformed platform node');
+   if(record.kind==='EncodedChunk'){if(!validEncodedChunk(record))throw failure('Malformed encoded chunk');continue;}
+   if(record.kind==='ImageData'){if(!validImageDataRecord(record))throw failure('Malformed ImageData node');continue;}
    if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
    if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
    else if(record.bytes===undefined||typeof record.type!=='string')throw failure('Platform node has no byte snapshot');
@@ -65,6 +72,8 @@ export function createPlatformCodec(realm){
   return stripNativeHandles(message);
  }
  function deserialize(record){
+  if(record.kind==='ImageData'){try{return deserializeImageData(realm,record)}catch{throw failure('Invalid ImageData receiver')}}
+  if(record.kind==='EncodedChunk'){try{return deserializeEncodedChunk(realm,record)}catch{throw failure('Invalid encoded chunk receiver')}}
   if(record.kind==='Geometry'){try{return deserializeGeometry(realm,record)}catch{throw failure('Invalid geometry receiver')}}
   if(!probe)throw failure('Receiver realm does not support Blob');
   if(record.kind==='File'&&typeof File!=='function')throw failure('Receiver realm does not support File');

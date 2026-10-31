@@ -1,0 +1,1 @@
+(async()=>{const rows=[];for(const codec of['opus','flac','unsupported.fake'])for(const bitrate of[499,500,5999,6000,510000,510001,512000,4294967295]){try{rows.push({codec,bitrate,value:await AudioEncoder.isConfigSupported({codec,bitrate,sampleRate:48000,numberOfChannels:2})})}catch(e){rows.push({codec,bitrate,error:{name:e.name,message:e.message}})}}return rows})()
