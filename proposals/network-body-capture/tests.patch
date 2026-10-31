@@ -1,0 +1,168 @@
+--- /dev/null
++++ b/test/network-body-capture.test.js
+@@ -0,0 +1,140 @@
++import {test, before, after} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {gzipSync} from 'node:zlib';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++
++const text=Buffer.from('actual é 🐼'), binary=Buffer.from([0,255,128,195,40,65]);
++const requests=[], timers=new Set();
++let server, origin;
++before(async()=>{
++  server=http.createServer(async(req,res)=>{
++    const chunks=[];for await(const chunk of req)chunks.push(chunk);
++    const body=Buffer.concat(chunks), url=new URL(req.url,'http://127.0.0.1');
++    requests.push({url:req.url,body:Buffer.from(body)});
++    let bytes=text, type=url.searchParams.get('type')??'text/plain; charset=UTF-8';
++    if(url.pathname==='/doc'){bytes=Buffer.from('<!doctype html><body>owned document');type='text/html; charset=UTF-8'}
++    if(url.pathname==='/frame'){bytes=Buffer.from('<!doctype html><body>real frame');type='text/html; charset=UTF-8'}
++    if(url.pathname==='/worker.js'){bytes=Buffer.from('onmessage=async e=>{const r=await fetch(e.data);postMessage([...new Uint8Array(await r.arrayBuffer())])}');type='text/javascript; charset=UTF-8'}
++    if(url.pathname==='/binary'){bytes=binary;type='application/octet-stream'}
++    if(url.pathname==='/invalid'){bytes=binary;type='text/plain; charset=UTF-8'}
++    if(url.pathname==='/echo'){bytes=body;type=req.headers['content-type']??'application/octet-stream'}
++    if(url.pathname==='/empty')bytes=Buffer.alloc(0);
++    if(url.pathname==='/small')bytes=Buffer.from('abc');
++    if(url.pathname==='/large')bytes=Buffer.from('12345');
++    if(url.pathname==='/plain')bytes=Buffer.from('\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
++    if(url.pathname==='/gzip'){bytes=gzipSync(text);res.setHeader('content-encoding','gzip')}
++    res.setHeader('content-type',type);res.setHeader('content-length',bytes.length);
++    if(url.pathname==='/slow'){
++      res.flushHeaders();res.write(bytes.subarray(0,3));
++      const timer=setTimeout(()=>{timers.delete(timer);res.end(bytes.subarray(3))},120);
++      timers.add(timer);res.once('close',()=>{clearTimeout(timer);timers.delete(timer)});
++    }else res.end(bytes);
++  });
++  server.listen(0,'127.0.0.1');await once(server,'listening');
++  origin='http://127.0.0.1:'+server.address().port;
++});
++after(async()=>{for(const timer of timers)clearTimeout(timer);server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});
++
++async function session(t,{network=true,limits={}}={}){
++  const service=await serve({port:0,loadResources:['iframe','worker']});
++  const client=await connect('ws://127.0.0.1:'+service.port+'/');
++  t.after(async()=>{await client.close();await service.close()});
++  const context=(await client.send('Target.createBrowserContext')).browserContextId;
++  const target=(await client.send('Target.createTarget',{url:'about:blank',browserContextId:context})).targetId;
++  const sid=(await client.send('Target.attachToTarget',{targetId:target,flatten:true})).sessionId;
++  const send=(method,params={})=>client.send(method,params,sid);
++  await send('Page.enable');await send('Runtime.enable');if(network)await send('Network.enable',limits);
++  await send('Page.navigate',{url:origin+'/doc'});
++  const evaluate=async expression=>{const result=await send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});assert.equal(result.exceptionDetails,undefined,JSON.stringify(result.exceptionDetails));return result.result.value};
++  async function fetchOne(path,options='{}'){
++    const url=origin+path,start=client.events.length;
++    const actual=JSON.parse(await evaluate(`(async()=>{const r=await fetch(${JSON.stringify(url)},${options});return JSON.stringify([...new Uint8Array(await r.arrayBuffer())])})()`));
++    const event=client.events.slice(start).find(e=>e.method==='Network.requestWillBeSent'&&e.params.request.url===url);
++    assert.ok(event,'actual request event');return{id:event.params.requestId,request:event.params.request,actual};
++  }
++  return{client,send,evaluate,fetchOne,context,target,sid};
++}
++const notFound={code:-31998,message:'RequestNotFound'};
++
++test('inspector preserves actual binary and decoded gzip bytes with measured MIME policy',async t=>{
++  const s=await session(t);
++  for(const[path,expected,encoded]of[
++    ['/binary',binary,true],['/invalid',binary,true],['/gzip',text,false],['/text',text,false],
++    ['/text?type='+encodeURIComponent('text/plain; charset=utf8'),text,true],
++    ['/text?type='+encodeURIComponent('application/xml; charset=UTF-8'),text,true],
++    ['/text?type='+encodeURIComponent('text/plain; charset=UTF-8; charset=ISO-8859-1'),text,false],
++  ]){
++    const r=await s.fetchOne(path),body=await s.send('Network.getResponseBody',{requestId:r.id});
++    assert.deepEqual(r.actual,[...expected]);assert.deepEqual(body,{body:expected.toString(encoded?'base64':'utf8'),base64Encoded:encoded});
++  }
++});
++
++test('real POST bytes produce SafeString and base64 entries independently of inline cap',async t=>{
++  const s=await session(t),mixed=Buffer.from([65,240,159,144,188,255,195,169,128,66]);
++  const r=await s.fetchOne('/echo?mixed=1',`{method:'POST',body:new Uint8Array(${JSON.stringify([...mixed])})}`);
++  assert.deepEqual(r.actual,[...mixed]);assert.equal(r.request.hasPostData,true);
++  assert.equal(r.request.postData,mixed.toString('latin1'));assert.deepEqual(r.request.postDataEntries,[{bytes:mixed.toString('base64')}]);
++  assert.deepEqual(await s.send('Network.getRequestPostData',{requestId:r.id}),{postData:mixed.toString('latin1')});
++  const empty=await s.fetchOne('/echo?empty=1',"{method:'POST',body:''}");
++  assert.equal(empty.request.hasPostData,true);assert.equal(empty.request.postData,'');assert.deepEqual(empty.request.postDataEntries,[{bytes:''}]);
++  await assert.rejects(s.send('Network.getRequestPostData',{requestId:empty.id}),notFound);
++  await s.send('Network.enable',{maxPostDataSize:3});
++  const capped=await s.fetchOne('/echo?capped=1',"{method:'POST',body:'abcdefghi'}");
++  assert.equal(capped.request.hasPostData,true);assert.equal(Object.hasOwn(capped.request,'postData'),false);assert.equal(Object.hasOwn(capped.request,'postDataEntries'),false);
++  assert.deepEqual(await s.send('Network.getRequestPostData',{requestId:capped.id}),{postData:'abcdefghi'});
++  await s.send('Network.enable',{maxPostDataSize:0});
++  const unlimited=await s.fetchOne('/echo?unlimited=1',"{method:'POST',body:'abcdefghi'}");assert.equal(unlimited.request.postData,'abcdefghi');
++});
++
++test('bounded capture evicts oldest bytes and oversized bodies while retaining empty responses',async t=>{
++  const s=await session(t,{limits:{maxTotalBufferSize:8,maxResourceBufferSize:4}});
++  const a=await s.fetchOne('/small?a'),b=await s.fetchOne('/small?b'),c=await s.fetchOne('/small?c');
++  await assert.rejects(s.send('Network.getResponseBody',{requestId:a.id}),{code:-32000,message:'Request content was evicted from inspector cache'});
++  assert.equal((await s.send('Network.getResponseBody',{requestId:b.id})).body,'abc');assert.equal((await s.send('Network.getResponseBody',{requestId:c.id})).body,'abc');
++  const large=await s.fetchOne('/large');await assert.rejects(s.send('Network.getResponseBody',{requestId:large.id}),{code:-32000});
++  await s.send('Network.enable',{maxResourceBufferSize:0,maxTotalBufferSize:0});
++  const empty=await s.fetchOne('/empty');assert.deepEqual(await s.send('Network.getResponseBody',{requestId:empty.id}),{body:'',base64Encoded:false});
++});
++
++test('Network enable gates capture, navigation retains it, and disable clears only responses',async t=>{
++  const s=await session(t,{network:false});
++  const old=(await s.send('Page.navigate',{url:origin+'/doc?never-enabled'})).loaderId;
++  await s.send('Network.enable');await assert.rejects(s.send('Network.getResponseBody',{requestId:old}),notFound);
++  const post=await s.fetchOne('/echo?retained',"{method:'POST',headers:{'content-type':'application/octet-stream'},body:'actual post'}");
++  const nav=await s.send('Page.navigate',{url:origin+'/plain'});
++  assert.deepEqual(await s.send('Network.getResponseBody',{requestId:post.id}),{body:Buffer.from('actual post').toString('base64'),base64Encoded:true});
++  assert.deepEqual(await s.send('Network.getResponseBody',{requestId:nav.loaderId}),{body:'\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>',base64Encoded:false});
++  assert.equal(await s.evaluate('typeof shouldNotRun'),'undefined');assert.equal(await s.evaluate('document.querySelector("b")'),null);
++  await s.send('Network.disable');await assert.rejects(s.send('Network.getResponseBody',{requestId:post.id}),notFound);
++  assert.deepEqual(await s.send('Network.getRequestPostData',{requestId:post.id}),{postData:'actual post'});
++  const disabled=(await s.send('Page.navigate',{url:origin+'/doc?disabled'})).loaderId;
++  await s.send('Network.enable');await assert.rejects(s.send('Network.getResponseBody',{requestId:disabled}),notFound);
++});
++
++test('same-context sessions share limits and captures survive genuine frame and Worker retirement',async t=>{
++  const s=await session(t);
++  const start=s.client.events.length;
++  assert.equal(await s.evaluate(`(async()=>{globalThis.frame=document.createElement('iframe');frame.src='/frame';await new Promise(r=>{frame.onload=r;document.body.append(frame)});const r=await frame.contentWindow.fetch('/binary?frame');await r.arrayBuffer();frame.remove();globalThis.worker=new Worker('/worker.js');const result=await new Promise(r=>{worker.onmessage=e=>r(e.data);worker.postMessage(${JSON.stringify(origin+'/binary?worker')})});worker.terminate();return JSON.stringify(result)})()`),JSON.stringify([...binary]));
++  const events=s.client.events.slice(start).filter(e=>e.method==='Network.requestWillBeSent'&&/binary\?(frame|worker)$/.test(e.params.request.url));assert.equal(events.length,2);
++  const second=(await s.client.send('Target.attachToTarget',{targetId:s.target,flatten:true})).sessionId;
++  for(const e of events)assert.deepEqual(await s.client.send('Network.getResponseBody',{requestId:e.params.requestId},second),{body:binary.toString('base64'),base64Encoded:true});
++  await s.client.send('Network.enable',{maxResourceBufferSize:1},second);
++  for(const e of events)await assert.rejects(s.send('Network.getResponseBody',{requestId:e.params.requestId}),{code:-32000});
++});
++
++test('buffered Fetch exposes no invented partial body and validates inspector parameters atomically',async t=>{
++  const s=await session(t);
++  await s.evaluate(`globalThis.pending=fetch('/slow').then(r=>r.arrayBuffer());'started'`);
++  const until=performance.now()+1000;let event;
++  while(!(event=s.client.events.find(e=>e.method==='Network.requestWillBeSent'&&e.params.request.url===origin+'/slow'))&&performance.now()<until)await new Promise(r=>setTimeout(r,5));
++  assert.ok(event);await assert.rejects(s.send('Network.getResponseBody',{requestId:event.params.requestId}),notFound);
++  await s.evaluate('pending.then(b=>b.byteLength)');assert.deepEqual(await s.send('Network.getResponseBody',{requestId:event.params.requestId}),{body:text.toString(),base64Encoded:false});
++  for(const[params,message]of[[{},'MissingField'],[{requestId:null},'UnexpectedToken'],[{requestId:7},'UnexpectedToken'],[{requestId:'not-an-id'},'InvalidParams'],[{requestId:'REQ-4294967295'},'RequestNotFound']])
++    for(const method of ['Network.getResponseBody','Network.getRequestPostData'])await assert.rejects(s.send(method,params),{code:-31998,message});
++  for(const[value,message]of[[-1,'Overflow'],[1.5,'InvalidNumber'],[true,'UnexpectedToken'],[4294967296,'Overflow']])await assert.rejects(s.send('Network.enable',{maxResourceBufferSize:value}),{code:-31998,message});
++  assert.equal((await s.send('Network.getResponseBody',{requestId:event.params.requestId})).body,text.toString());
++  await s.send('Network.enable',{maxResourceBufferSize:'4'});await assert.rejects(s.send('Network.getResponseBody',{requestId:event.params.requestId}),{code:-32000});
++});
+--- a/test/browser.test.js
++++ b/test/browser.test.js
+@@ -6,6 +6,7 @@
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import { Browser } from '../src/browser.js';
++import {enableNetworkCapture,capturedResponseBody} from '../src/network-capture.js';
+ import { createFixture } from './fixture.js';
+ 
+ const exec = promisify(execFile);
+@@ -190,12 +191,13 @@
+   const browser = new Browser();
+   try {
+     const page = browser.createPage();
++    enableNetworkCapture(page.context);
+     await page.navigate(`${fixture.url}plain-text`);
+     assert.equal(page.evaluate('document.contentType'), 'text/plain');
+     assert.equal(page.evaluate('typeof globalThis.shouldNotRun'), 'undefined');
+     assert.equal(page.dom.window.document.querySelector('b'), null);
+     assert.equal(page.evaluate('document.body.textContent'), '\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
+-    assert.equal(page.responseBodies.get(page.loaderId), '\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
++    assert.deepEqual(capturedResponseBody(page.context,{requestId:page.loaderId}), {body:'\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>',base64Encoded:false});
+     await page.navigate(`${fixture.url}api`);
+     assert.equal(page.evaluate('document.contentType'), 'application/json');
+     assert.equal(page.evaluate('document.querySelector("pre").textContent'), '{"message":"async data"}');

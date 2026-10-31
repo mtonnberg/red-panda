@@ -1,0 +1,332 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -53,6 +53,7 @@
+ import { installListenerOwnership } from './listener-ownership.js';
+ import { installSelectors } from './selectors.js';
+ import { installDialogs, isPopoverOpen, getDialogStateRevision } from './dialogs.js';
++import {initializeJavaScriptDialogs,registerJavaScriptDialogContext,disposeJavaScriptDialogContext,disposeJavaScriptDialogs,installJavaScriptDialogs} from './javascript-dialogs.js';
+ import { installInnerText } from './inner-text.js';
+ import { installCheckVisibility } from './check-visibility.js';
+ import { EventEmitter } from 'node:events';
+@@ -171,15 +172,18 @@
+     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
+     this.pages = new Map();
+     this.nextExecutionContext = 1;
++    initializeJavaScriptDialogs(this);
+   }
+   createContext() {
+     const id = randomUUID();
+     this.contexts.set(id, { id, cookies: new CookieJar() });
++    registerJavaScriptDialogContext(this,this.contexts.get(id));
+     return id;
+   }
+   createPage(contextId = 'default') {
+     const context = this.contexts.get(contextId);
+     if (!context) throw new Error('Unknown browser context');
++    registerJavaScriptDialogContext(this,context);
+     const page = new Page(this, context);
+     this.pages.set(page.id, page);
+     page.once('close', () => { this.pages.delete(page.id); this.emit('targetDestroyed', page); });
+@@ -193,10 +197,12 @@
+   }
+   disposeContext(id) {
+     if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');
++    const context=this.contexts.get(id);
+     for (const page of [...this.pages.values()]) if (page.context.id === id) page.close();
+     this.contexts.delete(id);
+-  }
+-  close() { for (const page of [...this.pages.values()]) page.close(); this.syncHTTP.close(); }
++    disposeJavaScriptDialogContext(this,context);
++  }
++  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); this.syncHTTP.close(); }
+ }
+ 
+ export class Page extends EventEmitter {
+@@ -310,6 +316,7 @@
+       installNavigationAPI(this,window);
+       installNavigation(this, window);
+       installDialogs(this, window);
++      installJavaScriptDialogs(this,window);
+       installForms(this, window);
+       installDocumentXML(this, window);
+       installHTMLReflections(window);
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -16,6 +16,7 @@
+ import { supportsInput, runInput } from './input.js';
+ import { createWebDriver } from './webdriver.js';
+ import { supportsRuntime, runRuntime, resetRuntime } from './runtime.js';
++import {armJavaScriptDialog,selectJavaScriptDialogContext,subscribeJavaScriptDialogs} from './javascript-dialogs.js';
+ import { primitiveRemoteValue, describeRemoteValue, needsRemoteHandle, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
+ 
+ const timestamp = () => performance.now() / 1000;
+@@ -27,6 +28,17 @@
+ const SESSION_DISABLE_METHODS = new Set(['Page.disable','Runtime.disable','Network.disable','Log.disable','Performance.disable','Audits.disable']);
+ class ProtocolError extends Error {
+   constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
++}
++function dialogParameters(params){
++  if(!Object.hasOwn(params,'accept'))throw new ProtocolError('MissingField',-31998);
++  if(typeof params.accept!=='boolean'||params.promptText!==undefined&&params.promptText!==null&&typeof params.promptText!=='string')throw new ProtocolError('UnexpectedToken',-31998);
++  return params;
++}
++function dialogCommand(browser,method,params,context){
++  const value=dialogParameters(params);
++  if(method==='Page.handleJavaScriptDialog')throw new ProtocolError('No dialog is showing',-32000);
++  if(!armJavaScriptDialog(browser,context??selectJavaScriptDialogContext(browser),value.accept,value.promptText))throw new ProtocolError('NoBrowserContext',-31998);
++  return {};
+ }
+ 
+ export function targetInfo(page) {
+@@ -177,6 +189,7 @@
+     }));
+     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
+     listen('close', () => connection.detach(this.id));
++    this.disposeJavaScriptDialogs=subscribeJavaScriptDialogs(page,connection,params=>connection.send({method:'Page.javascriptDialogOpening',params,...(this.id?{sessionId:this.id}:{})}));
+   }
+   event(method, params) {
+     if (this.domains.has(method.split('.')[0])) this.connection.send({ method, params, ...(this.id ? { sessionId: this.id } : {}) });
+@@ -452,6 +465,8 @@
+         if (!this.streams.delete(params.handle)) throw new ProtocolError('Invalid stream handle', -32000);
+         return {};
+       }
++      case 'Page.handleJavaScriptDialog':
++      case 'LP.handleJavaScriptDialog': return dialogCommand(page.browser,method,params,page.context);
+       case 'LP.dump': {
+         const format = params.format ?? 'html';
+         if (params.strip !== undefined && (!params.strip || typeof params.strip !== 'object' || Array.isArray(params.strip))) throw new ProtocolError('strip must be an object');
+@@ -487,6 +502,7 @@
+   }
+   close() {
+     this.serializer.close();
++    this.disposeJavaScriptDialogs?.();
+     this.utility.close();
+     clearTimeout(this.idleTimer);
+     resetDOM(this);
+@@ -592,6 +608,8 @@
+         page.close(); return { success: true };
+       }
+       case 'Browser.close': browser.close(); return {};
++      case 'Page.handleJavaScriptDialog':
++      case 'LP.handleJavaScriptDialog': return dialogCommand(browser,method,params,parent?.page.context);
+       case 'Storage.getCookies': {
+         const context = params.browserContextId===undefined&&parent?parent.page.context:selectCDPCookieContext(browser,params.browserContextId);
+         if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,4 +1,5 @@
+ import {installFetch} from './fetch.js';
++import {installJavaScriptDialogs} from './javascript-dialogs.js';
+ import {installUtilityMessaging} from './messaging.js';
+ import {installSharedWorkers} from './shared-workers.js';
+ import {installHTMLElementState} from './html-element-state.js';
+@@ -51,7 +52,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLElementState(page,record.global,{context:record.context,mainWindow:window});installHTMLReflections(record.global,{context:record.context});installFetch(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source)});const utilityMessaging=installUtilityMessaging(page,record.controller);installSharedWorkers(page,record.global,{enabled:page.browser.options.loadResources===undefined||page.browser.options.loadResources.includes('worker'),mainWindow:window,messaging:utilityMessaging,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLElementState(page,record.global,{context:record.context,mainWindow:window});installHTMLReflections(record.global,{context:record.context});installFetch(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source)});const utilityMessaging=installUtilityMessaging(page,record.controller);installSharedWorkers(page,record.global,{enabled:page.browser.options.loadResources===undefined||page.browser.options.loadResources.includes('worker'),mainWindow:window,messaging:utilityMessaging,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installJavaScriptDialogs(page,record.global,{context:record.context,mainWindow:window});installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- /dev/null
++++ b/src/javascript-dialogs.js
+@@ -0,0 +1,102 @@
++// Native-calibrated headless dialog operations over actual owned contexts.
++// No Window facade, VM factory table, public owner property or protocol mask.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {getRuntimeBinding} from './native-runtime.js';
++
++const require=createRequire(import.meta.url);
++const utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const browsers=new WeakMap(),contexts=new WeakMap(),windows=new WeakMap(),callers=new WeakMap();
++const apply=Reflect.apply,define=Object.defineProperty,descriptor=Object.getOwnPropertyDescriptor;
++const slot=properties=>Object.assign(Object.create(null),properties);
++
++export function initializeJavaScriptDialogs(browser){
++ if(!browsers.has(browser))browsers.set(browser,slot({contexts:new Set(),closed:false}));
++}
++export function registerJavaScriptDialogContext(browser,context){
++ initializeJavaScriptDialogs(browser);
++ if(!context||browser.contexts.get(context.id)!==context)throw new TypeError('An actual owned browser context is required');
++ let state=contexts.get(context);
++ if(!state){state=slot({browser,context,pending:undefined,disposed:false,observers:new Map()});contexts.set(context,state);browsers.get(browser).contexts.add(state);}
++ return context;
++}
++export function disposeJavaScriptDialogContext(browser,context){
++ const state=contexts.get(context);if(!state||state.browser!==browser)return;
++ state.pending=undefined;state.disposed=true;state.observers.clear();browsers.get(browser)?.contexts.delete(state);
++}
++export function disposeJavaScriptDialogs(browser){
++ const state=browsers.get(browser);if(!state)return;state.closed=true;
++ for(const context of [...state.contexts])disposeJavaScriptDialogContext(browser,context.context);
++}
++function activeContext(state){return !!state&&!state.disposed&&!browsers.get(state.browser)?.closed&&state.browser.contexts.get(state.context.id)===state.context;}
++export function selectJavaScriptDialogContext(browser){
++ // Native has one actual context per connection. For Root's additional
++ // multiple-context API, an attached Session supplies exact authority;
++ // an ambiguous root request cannot guess another page's context.
++ const states=[...(browsers.get(browser)?.contexts??[])].filter(activeContext);
++ return states.length===1?states[0].context:undefined;
++}
++export function armJavaScriptDialog(browser,context,accept,promptText){
++ const state=contexts.get(context);if(!activeContext(state)||state.browser!==browser)return false;
++ state.pending=slot({accept,promptText});return true;
++}
++function rootFor(page){const seen=new Set();while(page.registry?.page&&page.registry.page!==page&&!seen.has(page)){seen.add(page);page=page.registry.page;}return page;}
++export function subscribeJavaScriptDialogs(page,connection,notify){
++ const root=rootFor(page),state=contexts.get(root.context);
++ if(!activeContext(state))throw new Error('Actual dialog context is not registered');
++ let observers=state.observers.get(root);if(!observers){observers=new Map();state.observers.set(root,observers);}
++ let members=observers.get(connection);if(!members){members=new Set();observers.set(connection,members);}
++ members.add(notify);
++ return()=>{members.delete(notify);if(!members.size)observers.delete(connection);if(!observers.size)state.observers.delete(root);};
++}
++function live(record){return !!record&&!record.signal?.aborted&&!record.page.closed&&record.document._defaultView!==null&&activeContext(record.state);}
++function text(record,value){
++ if(value===null||value===undefined)return '';
++ // The target bridge converts Symbol to its description (including the
++ // literal "undefined" for Symbol()), rather than ECMAScript ToString.
++ const converted=apply(record.String,undefined,[typeof value==='symbol'?apply(record.symbolDescription,value,[]):value]);
++ return apply(record.wellFormed,converted,[]);
++}
++function operation(record,kind,caller,receiver,args){
++ const owner=windows.get(receiver);
++ if(!owner||!activeContext(owner.state))throw new record.TypeError('Illegal invocation');
++ // A live foreign Window method keeps its captured actual Document. Once
++ // that Document retires, the measured operation runs in the real active
++ // incumbent context; old nodes/Documents are never retargeted to fake it.
++ let source=record;
++ if(!live(source)){
++  const incumbent=callers.get(caller);
++  if(!live(incumbent)||incumbent.state!==record.state)throw new record.TypeError('Illegal invocation');
++  source=incumbent;
++ }
++ const message=text(record,args[0]);
++ const defaultText=kind==='prompt'?text(record,args[1]):'';
++ const response=source.state.pending;source.state.pending=undefined;
++ const params=slot({url:source.document.URL,message,type:kind,hasBrowserHandler:false,defaultPrompt:''});
++ for(const members of source.state.observers.get(source.root)?.values()??[]){
++  // First actual attached Session for this real page/connection is primary.
++  const notify=members.values().next().value;if(notify)notify(params);
++ }
++ if(kind==='confirm')return response?.accept??false;
++ if(kind==='prompt')return response?.accept?(response.promptText??defaultText):null;
++}
++
++export function installJavaScriptDialogs(page,global,{context,mainWindow=global}={}){
++ if(windows.has(global))return;
++ const root=rootFor(page),browser=root.browser;
++ registerJavaScriptDialogContext(browser,root.context);
++ const document=utils.implForWrapper(mainWindow.document);
++ context??=document._globalObject;
++ if(!vm.isContext(context))throw new TypeError('JavaScript dialogs require their actual VM context');
++ const actualGlobal=vm.runInContext('globalThis',context);
++ const record=slot({page,root,state:contexts.get(root.context),document,signal:page.documentAbort?.signal,
++  TypeError:global.TypeError,String:global.String,wellFormed:global.String.prototype.toWellFormed,
++  symbolDescription:descriptor(global.Symbol.prototype,'description').get});
++ windows.set(global,record);windows.set(actualGlobal,record);callers.set(actualGlobal,record);
++ const binding=getRuntimeBinding();
++ for(const name of ['alert','confirm','prompt']){
++  const entry=binding.createEntry((caller,receiver,args)=>operation(record,name,caller,receiver,args),actualGlobal,name);
++  define(entry,'length',{value:0,configurable:true});
++  define(global,name,{value:entry,writable:true,enumerable:true,configurable:true});
++ }
++}
+--- /dev/null
++++ b/test/javascript-dialogs.test.js
+@@ -0,0 +1,93 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++import {configureUtilityFactories} from '../src/world-sessions.js';
++import {getHeapBinding} from '../src/native-heap.js';
++
++async function setup(t){
++ const service=await serve({port:0,loadResources:['iframe']}),client=await connect(`ws://127.0.0.1:${service.port}/`);
++ t.after(async()=>{await client.close();await service.close();});
++ const root=(method,params={})=>client.send(method,params);
++ const create=async browserContextId=>{const{targetId}=await root('Target.createTarget',{url:'about:blank',...(browserContextId?{browserContextId}:{})});const{sessionId}=await root('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Runtime.enable');return{targetId,sessionId,send,page:service.browser.pages.get(targetId)};};
++ return{service,client,root,create};
++}
++async function value(send,expression,contextId){const result=await send('Runtime.evaluate',{expression,returnByValue:true,...(contextId?{contextId}:{})});assert.equal(result.exceptionDetails,undefined,JSON.stringify(result));return result.result.value;}
++async function until(send,expression){const deadline=Date.now()+2000;while(Date.now()<deadline){if(await value(send,expression))return;await new Promise(resolve=>setTimeout(resolve,5));}throw Error('Actual document/task condition not observed within2000ms');}
++async function fixture(t){
++ const server=http.createServer((req,res)=>{const pages={
++  '/inline':'<!doctype html><title>before</title><script>globalThis.results=[confirm("inline-confirm"),prompt("inline-prompt","page-default"),typeof alert("inline-alert")];document.title="after";setTimeout(()=>{globalThis.taskResult=confirm("task-confirm");globalThis.taskDone=true},0)</script>',
++  '/parent':'<!doctype html><iframe src="/child"></iframe>',
++  '/child':'<!doctype html><p>actual child</p>',
++  '/next':'<!doctype html><p>actual new child</p>',
++ };const body=pages[req.url];if(body===undefined){res.writeHead(404);res.end();return;}res.writeHead(200,{'content-type':'text/html; charset=utf-8','content-length':Buffer.byteLength(body)});res.end(body);});
++ server.listen(0,'127.0.0.1');await once(server,'listening');t.after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));});return'http://127.0.0.1:'+server.address().port;
++}
++
++test('real context responses survive target recreation and clear on actual context disposal',async t=>{
++ const{root,create}=await setup(t);
++ const absent=error=>error.code===-31998&&error.message==='NoBrowserContext';
++ await assert.rejects(root('LP.handleJavaScriptDialog',{accept:true}),absent);
++ await assert.rejects(root('Page.handleJavaScriptDialog',{accept:true}),error=>error.code===-32000&&error.message==='No dialog is showing');
++ const{browserContextId}=await root('Target.createBrowserContext');
++ await root('LP.handleJavaScriptDialog',{accept:true});
++ let target=await create(browserContextId);assert.equal(await value(target.send,'confirm("before-target-arm")'),true);
++ await target.send('LP.handleJavaScriptDialog',{accept:true,promptText:'actual client Δ'});
++ for(const[params,message]of[[{},'MissingField'],[{accept:'yes'},'UnexpectedToken'],[{accept:true,promptText:17},'UnexpectedToken']])await assert.rejects(target.send('LP.handleJavaScriptDialog',params),error=>error.code===-31998&&error.message===message);
++ assert.equal(await value(target.send,'prompt("actual prompt","page default")'),'actual client Δ');
++ await target.send('LP.handleJavaScriptDialog',{accept:true});await assert.rejects(target.send('Page.handleJavaScriptDialog',{accept:false}),error=>error.code===-32000);
++ await root('Target.closeTarget',{targetId:target.targetId});target=await create(browserContextId);assert.equal(await value(target.send,'confirm("survives-target-close")'),true);
++ await target.send('LP.handleJavaScriptDialog',{accept:true});await root('Target.closeTarget',{targetId:target.targetId});await root('Target.disposeBrowserContext',{browserContextId});
++ await assert.rejects(root('LP.handleJavaScriptDialog',{accept:true}),absent);target=await create();assert.equal(await value(target.send,'confirm("disposed-response-cannot-leak")'),false);
++});
++
++test('actual inline and later-task dialogs continue and opening events ignore Page.enable while selecting the primary session',async t=>{
++ const{root,client,create}=await setup(t),origin=await fixture(t),target=await create();
++ const{sessionId:secondary}=await root('Target.attachToTarget',{targetId:target.targetId,flatten:true});
++ await target.send('Page.navigate',{url:origin+'/inline'});await until(target.send,'document.readyState==="complete"&&globalThis.taskDone===true');
++ assert.deepEqual(await value(target.send,'({results,title:document.title,taskResult})'),{results:[false,null,'undefined'],title:'after',taskResult:false});
++ let events=client.events.filter(event=>event.method==='Page.javascriptDialogOpening');assert.equal(events.length,4);assert.ok(events.every(event=>event.sessionId===target.sessionId&&event.params.url===origin+'/inline'&&!event.params.hasBrowserHandler&&event.params.defaultPrompt===''));
++ await client.send('LP.handleJavaScriptDialog',{accept:true,promptText:'from secondary'},secondary);
++ assert.equal(await value((method,params)=>client.send(method,params,secondary),'prompt("secondary","page")'),'from secondary');
++ await target.send('LP.handleJavaScriptDialog',{accept:true});await value(target.send,'alert("consuming-alert")');assert.equal(await value(target.send,'confirm("after-alert")'),false);
++ await target.send('LP.handleJavaScriptDialog',{accept:true});await value(target.send,'globalThis.laterDone=false;setTimeout(()=>{globalThis.laterValue=confirm("armed-later-task");globalThis.laterDone=true},0);true');await until(target.send,'globalThis.laterDone===true');assert.equal(await value(target.send,'laterValue'),true);
++ events=client.events.filter(event=>event.method==='Page.javascriptDialogOpening');assert.ok(events.every(event=>event.sessionId===target.sessionId));assert.equal(client.events.filter(event=>event.method==='Page.javascriptDialogClosed').length,0);
++});
++
++test('main, frame and utility dialog entries and real receiver errors have actual selected V8 creation contexts',async t=>{
++ const authorities=[];configureUtilityFactories({onRealm(global,context){authorities.push({global,context});}});t.after(()=>configureUtilityFactories({}));
++ const{create}=await setup(t),origin=await fixture(t),target=await create();await target.send('Page.navigate',{url:origin+'/parent'});await until(target.send,'document.readyState==="complete"');
++ const tree=await target.send('Page.getFrameTree'),child=target.page.frames.findFrame(tree.frameTree.childFrames[0].frame.id);
++ const{executionContextId}=await target.send('Page.createIsolatedWorld',{frameId:target.page.frameId,worldName:'actual-dialog-entry-realm'});
++ assert.equal(authorities.length,1);
++ const binding=getHeapBinding(),host={};
++ for(const global of[target.page.dom.window,child.dom.window,authorities[0].global]){
++  const anchor=global.Object.prototype;
++  for(const name of['alert','confirm','prompt']){
++   const fn=global[name],d=Object.getOwnPropertyDescriptor(global,name);
++   assert.equal(fn.name,name);assert.equal(fn.length,0);assert.equal(Object.hasOwn(fn,'prototype'),false);assert.equal(Object.getPrototypeOf(fn),global.Function.prototype);assert.equal(d.enumerable,true);assert.equal(d.configurable,true);assert.equal(d.writable,true);
++   assert.equal(binding.sameRealm(fn,anchor),true);assert.equal(binding.sameRealm(fn,host),false);assert.equal(binding.creationGlobal(fn),binding.creationGlobal(anchor));Object.setPrototypeOf(fn,null);assert.equal(binding.sameRealm(fn,anchor),true);assert.equal(binding.sameRealm(fn,host),false);
++  }
++ }
++ // Each function still executes after prototype removal. Its private bridge
++ // authenticates exact real Windows and uses captured genuine intrinsics.
++ for(const contextId of[undefined,child.executionContextId,executionContextId]){
++  await target.send('LP.handleJavaScriptDialog',{accept:true});
++  const result=await value(target.send,'(()=>{const apply=Reflect.apply,TE=TypeError,S=String,description=Object.getOwnPropertyDescriptor(Symbol.prototype,"description");globalThis.dialogBrandHits=0;const fake=new Proxy({}, {get(){dialogBrandHits++;throw Error("untrusted get")},getPrototypeOf(){dialogBrandHits++;throw Error("untrusted prototype")}});globalThis.String=()=>{throw Error("authored String")};globalThis.TypeError=()=>{throw Error("authored TypeError")};Object.defineProperty(Symbol.prototype,"description",{get(){dialogBrandHits++;throw Error("authored description")},configurable:true});let caught;try{apply(confirm,fake,["fake"])}catch(error){caught=error;globalThis.actualDialogError=error}try{return {real:apply(confirm,globalThis,[Symbol("captured-description")]),brand:caught instanceof TE,message:caught.message,hits:dialogBrandHits}}finally{globalThis.String=S;globalThis.TypeError=TE;Object.defineProperty(Symbol.prototype,"description",description)}})()',contextId);
++  assert.deepEqual(result,{real:true,brand:true,message:'Illegal invocation',hits:0});
++ }
++ for(const global of[target.page.dom.window,child.dom.window,authorities[0].global]){const error=global.actualDialogError;assert.equal(binding.sameRealm(error,global.Object.prototype),true);Object.setPrototypeOf(error,null);assert.equal(binding.sameRealm(error,global.Object.prototype),true);assert.equal(binding.sameRealm(error,host),false);}
++});
++
++test('real retained frame methods consume context state through their actual active incumbent without retargeting old documents',async t=>{
++ const{client,create}=await setup(t),origin=await fixture(t),target=await create();await target.send('Page.navigate',{url:origin+'/parent'});await until(target.send,'document.readyState==="complete"');
++ await value(target.send,'(()=>{const w=document.querySelector("iframe").contentWindow;globalThis.oldDialog={window:w,document:w.document,method:w.confirm};return true})()');
++ await value(target.send,'document.querySelector("iframe").src="/next";true');await until(target.send,'!!document.querySelector("iframe").contentDocument&&document.querySelector("iframe").contentDocument.URL.endsWith("/next")&&document.querySelector("iframe").contentDocument.readyState==="complete"');
++ for(const removed of[false,true]){
++  if(removed)await value(target.send,'document.querySelector("iframe").remove();true');
++  await target.send('LP.handleJavaScriptDialog',{accept:true});assert.equal(await value(target.send,'oldDialog.method.call(oldDialog.window,"actual-retained-call")'),true);assert.equal(await value(target.send,'confirm("after-retained-call")'),false);
++  const event=client.events.filter(event=>event.method==='Page.javascriptDialogOpening'&&event.params.message==='actual-retained-call').at(-1);assert.equal(event.params.url,origin+'/parent');
++ }
++});

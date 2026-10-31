@@ -1,0 +1,21 @@
+import{test}from'node:test';import assert from'node:assert/strict';import{Worker}from'node:worker_threads';import{once}from'node:events';import{serve}from'../src/cdp.js';import{connect}from'./cdp-client.js';
+test('CDP Unicode cookies retain actual text and UTF8 size, reach real HTTP bytes, and keep authored Headers conversion',async t=>{
+ const fixture=new Worker(new URL('./fixtures/cookie-wire-fixture.mjs',import.meta.url),{execArgv:[]}),{origin}=await once(fixture,'message').then(([value])=>value),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close();await fixture.terminate()});
+ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true}),send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/owner'});assert.deepEqual(await send('Network.setCookie',{name:'café',value:'雪',url:origin+'/'}),{success:true});
+ const[cookie]=(await send('Network.getAllCookies')).cookies;assert.equal(cookie.name,'café');assert.equal(cookie.value,'雪');assert.equal(cookie.size,8);
+ const response=await send('Runtime.evaluate',{expression:'fetch("/echo",{credentials:"include"}).then(r=>r.text())',awaitPromise:true,returnByValue:true});assert.equal(response.exceptionDetails,undefined);const actual=JSON.parse(response.result.value);assert.deepEqual(actual.cookieBytes,[99,97,102,195,169,61,233,155,170]);
+ const authored=await send('Runtime.evaluate',{expression:'(()=>{try{new Headers({"x-authored":"雪"});return "accepted"}catch(e){return e.name}})()',returnByValue:true});assert.equal(authored.result.value,'TypeError');
+ await send('Network.deleteCookies',{name:'café',url:origin+'/owner'});assert.deepEqual((await send('Network.getAllCookies')).cookies,[]);const empty=await send('Runtime.evaluate',{expression:'fetch("/echo").then(r=>r.text())',awaitPromise:true,returnByValue:true});assert.deepEqual(JSON.parse(empty.result.value).cookieBytes,[]);
+});
+test('actual synchronous/asynchronous XHR, event stream and WebSocket owners send the stored UTF8 cookie bytes',async t=>{
+ const fixture=new Worker(new URL('./fixtures/cookie-wire-fixture.mjs',import.meta.url),{execArgv:[]}),{origin}=await once(fixture,'message').then(([value])=>value),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close();await fixture.terminate()});
+ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true}),send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/owner'});await send('Network.setCookie',{name:'café',value:'雪',url:origin+'/'});
+ const cases=[
+ ['xhr-async','new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open("GET","/echo?channel=xhr-async");x.onload=()=>resolve(JSON.parse(x.responseText));x.onerror=()=>reject(Error("actual XHR failure"));x.send()})'],
+ ['xhr-sync','(()=>{const x=new XMLHttpRequest();x.open("GET","/echo?channel=xhr-sync",false);x.send();return JSON.parse(x.responseText)})()'],
+ ['eventsource','new Promise((resolve,reject)=>{const s=new EventSource("/event?channel=eventsource");s.onmessage=e=>{s.close();resolve(JSON.parse(e.data))};s.onerror=()=>{s.close();reject(Error("actual SSE failure"))}})'],
+ ['websocket','new Promise((resolve,reject)=>{const s=new WebSocket('+JSON.stringify(origin.replace('http:','ws:')+'/socket?channel=websocket')+');s.onmessage=e=>{s.close();resolve(JSON.parse(e.data))};s.onerror=()=>reject(Error("actual WS failure"))})'],
+ ];
+ for(const[channel,code]of cases){const result=await send('Runtime.evaluate',{expression:'(async()=>JSON.stringify(await('+code+')))()',awaitPromise:true,returnByValue:true});assert.equal(result.exceptionDetails,undefined,channel);assert.deepEqual(JSON.parse(result.result.value).cookieBytes,[99,97,102,195,169,61,233,155,170],channel)}
+ const[cookie]=(await send('Network.getAllCookies')).cookies;assert.equal(cookie.name,'café');assert.equal(cookie.value,'雪');assert.equal(cookie.size,8);
+});

@@ -1,0 +1,150 @@
+diff --git a/test/page-lifecycle.test.js b/test/page-lifecycle.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/page-lifecycle.test.js
+@@ -0,0 +1,121 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createServer} from 'node:http';
++import {spawn} from 'node:child_process';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
++async function until(predicate,label){const end=Date.now()+2000;for(;;){if(await predicate())return;if(Date.now()>=end)throw Error(label+' original2s deadline');await sleep(5)}}
++async function fixture(t){
++ const requests=[],held=new Map(),clients=[];
++ const server=createServer((request,response)=>{
++  const path=new URL(request.url,'http://fixture.invalid').pathname,item={path,response,earlyClosed:false};requests.push(item);
++  response.on('close',()=>{item.earlyClosed=!response.writableFinished});response.setHeader('content-type',path.endsWith('.js')?'text/javascript':'text/html');
++  if(path==='/pending'||path==='/fetch'||path==='/xhr'||path==='/frame'||path==='/defer.js'){held.set(path,response);return;}
++  if(path==='/partial'){
++   response.flushHeaders();const bytes=Buffer.from('<!doctype html><html><head><script>globalThis.prefixRan=true</script></head><body><p id=prefix>panda 🐼</p>');
++   // Actual received bytes cross UTF-8 chunk boundaries; normal navigate owns
++   // the only decode/parse operation after its reader has genuinely finished.
++   const split=bytes.indexOf(Buffer.from('🐼'))+1;response.write(bytes.subarray(0,split));response.write(bytes.subarray(split));held.set(path,response);return;
++  }
++  if(path==='/resources'){
++   response.end(`<!doctype html><html><head><script>globalThis.fetchOutcome='pending';fetch('/fetch').then(r=>r.text()).then(v=>fetchOutcome=v,e=>fetchOutcome=e.name+':'+e.message);globalThis.xhrEvents=[];globalThis.xhr=new XMLHttpRequest();for(const type of ['abort','loadend','load','error'])xhr.addEventListener(type,()=>xhrEvents.push(type));xhr.open('GET','/xhr');xhr.send();globalThis.arm=()=>setTimeout(()=>fetch('/task'),125);</script><script defer src=/defer.js></script></head><body><iframe src=/frame></iframe><p id=resources>actual resource document</p></body></html>`);return;
++  }
++  response.end('<!doctype html><html><body id=stable>actual stable document</body></html>');
++ });
++ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
++ const origin='http://127.0.0.1:'+server.address().port,service=await serve({port:0,timeout:2000,loadResources:['iframe']});
++ t.after(async()=>{for(const client of clients)await client.close();await service.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});
++ async function client(){const c=await connect('ws://127.0.0.1:'+service.port+'/',{timeout:2000});clients.push(c);return c;}
++ const c=await client();
++ async function page({enable=true}={}){
++  const{targetId}=await c.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await c.send('Target.attachToTarget',{targetId,flatten:true});
++  if(enable)await c.send('Page.enable',{},sessionId);await c.send('Runtime.enable',{},sessionId);await c.send('Network.enable',{},sessionId);
++  return{targetId,sessionId,actual:service.browser.pages.get(targetId)};
++ }
++ const evaluate=async(page,expression)=>{const result=await c.send('Runtime.evaluate',{expression,returnByValue:true},page.sessionId);assert.equal(result.exceptionDetails,undefined);return result.result.value};
++ const ready=async(page,path='/stable')=>{await c.send('Page.navigate',{url:origin+path},page.sessionId);await until(()=>evaluate(page,'document.readyState==="complete"'),'real load');};
++ return{c,page,client,evaluate,ready,requests,held,origin,service};
++}
++test('Page.close acknowledges before genuine primary/auxiliary detach and target removal, with or without Page.enable',{timeout:8000},async t=>{
++ const f=await fixture(t);await f.c.send('Target.setDiscoverTargets',{discover:true});
++ for(const enable of[true,false]){
++  const p=await f.page({enable});await f.ready(p);const{sessionId:aux}=await f.c.send('Target.attachToTarget',{targetId:p.targetId,flatten:true});
++  await f.evaluate(p,'setTimeout(()=>fetch("/closed-task"),125);true');
++  const messages=[],listen=data=>messages.push(JSON.parse(data.toString()));f.c.socket.on('message',listen);
++  assert.deepEqual(await f.c.send('Page.close',{},p.sessionId),{});await until(()=>messages.some(m=>m.method==='Target.targetDestroyed'&&m.params.targetId===p.targetId),'target removal');f.c.socket.off('message',listen);
++  assert.deepEqual(messages[0].result,{});assert.equal(messages[0].sessionId,p.sessionId);
++  const events=messages.filter(m=>['Inspector.detached','Target.detachedFromTarget','Target.targetDestroyed'].includes(m.method));
++  assert.deepEqual(events.map(m=>m.method),['Inspector.detached','Target.detachedFromTarget','Inspector.detached','Target.detachedFromTarget','Target.targetDestroyed']);
++  assert.deepEqual(events.filter(m=>m.method==='Inspector.detached').map(m=>m.sessionId),[p.sessionId,aux]);
++  for(const event of events.slice(0,4))assert.equal(event.params.reason,'Render process gone.');
++  assert.equal(p.actual.closed,true);assert.equal(f.service.browser.pages.has(p.targetId),false);
++  for(const session of[p.sessionId,aux])await assert.rejects(f.c.send('Runtime.evaluate',{expression:'1'},session),error=>error.code===-32001&&error.message==='Unknown sessionId');
++  await assert.rejects(f.c.send('Page.close',{},p.sessionId),error=>error.code===-32001);
++ }
++ await sleep(180);assert.equal(f.requests.some(r=>r.path==='/closed-task'),false);
++ await assert.rejects(f.c.send('Page.close'),error=>error.code===-31998&&error.message==='TargetNotLoaded');
++});
++test('Page.close cancels real pending navigation HTTP and retires its pending session response',{timeout:5000},async t=>{
++ const f=await fixture(t),p=await f.page();await f.ready(p);
++ const pending=f.c.send('Page.navigate',{url:f.origin+'/pending'},p.sessionId);const rejected=assert.rejects(pending,/CDP timeout: Page.navigate/);
++ await until(()=>f.held.has('/pending'),'real pending navigation');assert.deepEqual(await f.c.send('Page.close',{},p.sessionId),{});
++ await until(()=>f.requests.find(r=>r.path==='/pending')?.earlyClosed,'real canceled HTTP');await rejected;
++ assert.deepEqual(await f.c.send('Target.getTargets'),{targetInfos:[]});assert.equal(p.actual.closed,true);
++});
++test('closing one real target preserves unrelated target sessions and future navigation',{timeout:6000},async t=>{
++ const f=await fixture(t),first=await f.page(),second=await f.page();await f.ready(first);await f.ready(second);
++ assert.deepEqual(await f.c.send('Page.close',{},first.sessionId),{});assert.equal(await f.evaluate(second,'document.body.id'),'stable');
++ assert.equal(second.actual.closed,false);await f.ready(second,'/next-actual');assert.equal(await f.evaluate(second,'location.pathname'),'/next-actual');
++ assert.deepEqual(await f.c.send('Target.closeTarget',{targetId:second.targetId}),{success:true});
++ const{browserContextId}=await f.c.send('Target.createBrowserContext');
++ const{targetId}=await f.c.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await f.c.send('Target.attachToTarget',{targetId,flatten:true});
++ // A browser/target control command still acknowledges its real disposition;
++ // only in-flight page-domain work loses a retired session receiver.
++ assert.deepEqual(await f.c.send('Target.disposeBrowserContext',{browserContextId},sessionId),{});
++});
++test('idle Page.stopLoading uses private captured authority and preserves the actual Document and task queue',{timeout:5000},async t=>{
++ const f=await fixture(t),p=await f.page();await f.ready(p);
++ await f.evaluate(p,'globalThis.retained=document;globalThis.ticks=0;setInterval(()=>ticks++,25);setTimeout(()=>fetch("/task"),125);window.stop=()=>{throw new Error("authored stop must not run")};true');
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});
++ await until(()=>f.requests.some(r=>r.path==='/task'),'real surviving timer HTTP');assert.equal(await f.evaluate(p,'retained===document&&ticks>0'),true);
++});
++test('Page.stopLoading before headers cancels the actual request, retains the old document and allows recovery',{timeout:5000},async t=>{
++ const f=await fixture(t);await assert.rejects(f.c.send('Page.stopLoading'),error=>error.code===-31998&&error.message==='BrowserContextNotLoaded');
++ const p=await f.page();await f.ready(p);await f.evaluate(p,'globalThis.retained=document;true');const offset=f.c.events.length;
++ const pending=f.c.send('Page.navigate',{url:f.origin+'/pending'},p.sessionId);await until(()=>f.held.has('/pending'),'real pending navigation');
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});assert.equal((await pending).errorText,'net::ERR_ABORTED');
++ await until(()=>f.requests.find(r=>r.path==='/pending')?.earlyClosed,'actual HTTP cancellation');
++ assert.equal(await f.evaluate(p,'retained===document'),true);assert.equal(f.c.events.slice(offset).some(e=>e.method==='Runtime.exceptionThrown'),false);
++ assert.ok(f.c.events.slice(offset).some(e=>e.method==='Network.loadingFailed'&&e.params.errorText==='net::ERR_ABORTED'&&e.params.canceled));
++ await f.ready(p,'/recovered');assert.equal(await f.evaluate(p,'location.pathname'),'/recovered');
++});
++test('Page.stopLoading finishes real received UTF-8 bytes early and commits them through the normal parser',{timeout:6000},async t=>{
++ const f=await fixture(t),p=await f.page();await f.ready(p);await f.evaluate(p,'globalThis.retained=document;true');
++ const pending=f.c.send('Page.navigate',{url:f.origin+'/partial'},p.sessionId);await until(()=>f.held.has('/partial'),'partial response sent');await sleep(40);
++ assert.equal(await f.evaluate(p,'retained===document&&document.body.id==="stable"'),true);
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});assert.equal((await pending).errorText,undefined);
++ await until(()=>f.evaluate(p,'document.readyState==="complete"'),'genuine prefix document load');
++ assert.equal(await f.evaluate(p,'document.getElementById("prefix").textContent'),'panda 🐼');assert.equal(await f.evaluate(p,'prefixRan'),true);
++ await until(()=>f.requests.find(r=>r.path==='/partial')?.earlyClosed,'real stream canceled');
++ f.held.get('/partial').end('<script>globalThis.suffixRan=true</script><p id=suffix>must remain excluded</p>');await sleep(40);
++ assert.equal(await f.evaluate(p,'globalThis.suffixRan===undefined&&document.getElementById("suffix")===null'),true);
++ await f.ready(p,'/after-prefix');assert.equal(await f.evaluate(p,'location.pathname'),'/after-prefix');
++});
++test('Page.stopLoading aborts genuine script/frame/Fetch/XHR load owners and keeps independent timers alive',{timeout:6000},async t=>{
++ const f=await fixture(t),p=await f.page();const pending=f.c.send('Page.navigate',{url:f.origin+'/resources'},p.sessionId);
++ await until(()=>['/defer.js','/frame','/fetch','/xhr'].every(path=>f.held.has(path)),'four real load owners');await f.evaluate(p,'arm();true');
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});await pending;
++ await until(()=>f.evaluate(p,'document.readyState==="complete"&&fetchOutcome!=="pending"'),'actual resource abort completion');
++ assert.equal(await f.evaluate(p,'fetchOutcome'),'TypeError:fetch error');assert.deepEqual(JSON.parse(await f.evaluate(p,'JSON.stringify(xhrEvents)')),['abort','loadend']);assert.equal(await f.evaluate(p,'xhr.readyState'),0);
++ await until(()=>['/defer.js','/frame','/fetch','/xhr'].every(path=>f.requests.find(r=>r.path===path)?.earlyClosed),'four actual canceled HTTP transfers');
++ await until(()=>f.requests.some(r=>r.path==='/task'),'timer survives stop');assert.equal(await f.evaluate(p,'globalThis.lateScript===undefined'),true);assert.equal(p.actual.closed,false);
++ await f.ready(p,'/after-resources');assert.equal(p.actual.activeRequests.size,0);
++});
++test('CDP stop authored abort callbacks obey the captured real VM watchdog and allow recovery and disposal',{timeout:8000},async()=>{
++ const child=spawn(process.execPath,['--experimental-vm-modules',new URL('./fixtures/page-stop-watchdog.mjs',import.meta.url).pathname],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
++ let expired=false;const deadline=setTimeout(()=>{expired=true;child.kill('SIGKILL')},7000);
++ const{code,signal}=await new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(deadline);
++ assert.equal(expired,false,stdout+stderr);assert.equal(signal,null,stdout+stderr);assert.equal(code,0,stdout+stderr);
++ const report=JSON.parse(stdout.trim().split('\n').at(-1));assert.equal(report.entered,true);assert.equal(report.recovered,true);assert.equal(report.disposed,true);assert.equal(report.effectiveTimeout,200);
++});
+diff --git a/test/fixtures/page-stop-watchdog.mjs b/test/fixtures/page-stop-watchdog.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/page-stop-watchdog.mjs
+@@ -0,0 +1,19 @@
++import {createServer} from 'node:http';
++import assert from 'node:assert/strict';
++import {serve} from '../../src/cdp.js';
++import {connect} from '../cdp-client.js';
++const requests=[],server=createServer((req,res)=>{requests.push(req.url);if(req.url==='/held')return;res.setHeader('content-type','text/html');res.end('<!doctype html><body>real guarded page</body>')});
++let service,client,report={effectiveTimeout:200};
++try{
++ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));service=await serve({port:0,timeout:200});client=await connect('ws://127.0.0.1:'+service.port+'/',{timeout:2000});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
++ const send=(method,params={})=>client.send(method,params,sessionId);await send('Page.navigate',{url:'http://127.0.0.1:'+server.address().port+'/'});
++ await send('Runtime.evaluate',{expression:'globalThis.entered=false;globalThis.x=new XMLHttpRequest();x.open("GET","/held");x.addEventListener("abort",()=>{entered=true;while(true){}});x.send();true'});
++ const end=Date.now()+2000;while(!requests.includes('/held')){if(Date.now()>=end)throw Error('Original2s actual request deadline');await new Promise(r=>setTimeout(r,5))}
++ process.stdout.write(JSON.stringify({marker:'armed',effectiveTimeout:200})+'\n');
++ const begin=Date.now();try{report.stop=await send('Page.stopLoading')}catch(error){report.stopError={message:error.message,code:error.code}}report.stopElapsedMS=Date.now()-begin;
++ const query=await send('Runtime.evaluate',{expression:'({entered,alive:document.body.textContent,ready:document.readyState})',returnByValue:true});assert.equal(query.exceptionDetails,undefined);report.entered=query.result.value.entered;report.recovered=query.result.value.alive==='real guarded page';
++ assert.equal(report.entered,true);assert.equal(report.recovered,true);assert.ok(report.stopElapsedMS<1500);
++ await send('Page.close');report.disposed=service.browser.pages.size===0;
++}finally{await client?.close();await service?.close();server.closeAllConnections();if(server.listening)await new Promise(resolve=>server.close(resolve))}
++console.log(JSON.stringify(report));

@@ -1,3 +1,4 @@
+import {internalCookieHeader} from './internal-cookie-header.js';
 // Genuine Node WebSocket transports and Browser/App-owned admission leases.
 // The quota and transport records never enter an authored VM.
 import {WebSocket as Socket} from 'ws';
@@ -16,7 +17,7 @@ export function validWebSocketProtocols(values){return values.every(value=>/^[!#
 export function socketHeaders(page,url){
  const destination=new URL(url);destination.protocol=destination.protocol==='wss:'?'https:':'http:';
  const result={'Accept':'*/*'};if(page.userAgent)result['User-Agent']=page.userAgent;if(page.acceptLanguage)result['Accept-Language']=page.acceptLanguage;
- const cookies=page.context?.cookies?.getCookieStringSync(destination.href);if(cookies)result.Cookie=cookies;return result;
+ const cookies=page.context?.cookies?.getCookieStringSync(destination.href);if(cookies)result.Cookie=internalCookieHeader(cookies);return result;
 }
 export function openWebSocketTransport({quota,owner,url,protocols=[],origin,headers,emit,deferUpgrade=false}){
  const release=blocked.has(Number(new URL(url).port))?null:quota.acquire();

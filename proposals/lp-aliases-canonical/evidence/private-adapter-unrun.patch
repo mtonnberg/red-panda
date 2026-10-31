@@ -1,0 +1,2209 @@
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import {dumpMarkdownNode} from './markdown-node.js';
+ import{setWindowDeviceMetrics}from'./window-viewport.js';
+ import {consoleProtocolType} from './console.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+@@ -30,6 +31,22 @@
+ const CONFIGURATION_ACK_METHODS = new Set(['CSS.enable','Inspector.enable','Inspector.disable','Security.enable','Security.disable']);
+ class ProtocolError extends Error {
+   constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
++}
++
++function markdownAlias(page,params,resolveNode){
++  let id=params.nodeId;
++  if(id!==undefined&&id!==null){
++    if(typeof id==='string'){
++      if(!/^[0-9]+$/.test(id))throw new ProtocolError('InvalidCharacter',-31998);
++      id=Number(id);
++    }
++    if(typeof id!=='number')throw new ProtocolError('UnexpectedToken',-31998);
++    if(!Number.isInteger(id))throw new ProtocolError('InvalidNumber',-31998);
++    if(id<0||id>4294967295)throw new ProtocolError('Overflow',-31998);
++  }
++  const root=id===undefined||id===null?page.dom.window.document:resolveNode(id);
++  if(!root)throw new ProtocolError('InvalidNodeId',-31998);
++  return { markdown: dumpMarkdownNode(root) };
+ }
+ 
+ export function targetInfo(page) {
+@@ -455,6 +472,8 @@
+         if (!this.streams.delete(params.handle)) throw new ProtocolError('Invalid stream handle', -32000);
+         return {};
+       }
++      case 'LP.version': return { version: VERSION };
++      case 'LP.getMarkdown': return markdownAlias(page,params,id=>this.nodes?.get(id));
+       case 'LP.dump': {
+         const format = params.format ?? 'html';
+         if (params.strip !== undefined && (!params.strip || typeof params.strip !== 'object' || Array.isArray(params.strip))) throw new ProtocolError('strip must be an object');
+@@ -541,11 +560,11 @@
+     try {
+       message = JSON.parse(raw);
+       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+-          (message.params !== undefined && !(message.params === null && CONFIGURATION_ACK_METHODS.has(message.method)) &&
+-            (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
++          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version')) && (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
+         throw new ProtocolError('Invalid CDP request', -32600);
+       }
+-      const { method, params = {}, sessionId } = message;
++      const { method, sessionId } = message;
++      const params = message.params ?? {};
+       const session = this.sessions.get(sessionId ?? '');
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
+       const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+@@ -558,6 +577,18 @@
+   async run(method, params, parent) {
+     const browser = this.browser;
+     switch (method) {
++      case 'LP.version': return { version: VERSION };
++      case 'LP.getMarkdown': {
++        const context=selectCDPCookieContext(browser);
++        if(!context)throw new ProtocolError('NoBrowserContext',-31998);
++        const page=[...browser.pages.values()].find(value=>value.context===context&&!value.closed);
++        if(!page)throw new ProtocolError('FrameNotLoaded',-31998);
++        return markdownAlias(page,params,id=>{
++          const matches=new Set();
++          for(const session of this.sessions.values())if(session.page===page){const node=session.nodes?.get(id);if(node)matches.add(node)}
++          return matches.size===1?[...matches][0]:undefined;
++        });
++      }
+       case 'Browser.getVersion': return { protocolVersion: '1.3', product: `RedPanda/${VERSION}`, revision: VERSION, userAgent: `RedPanda/${VERSION}`, jsVersion: process.versions.v8 };
+       case 'Browser.getBrowserCommandLine': return { arguments: [] };
+       case 'Target.setDiscoverTargets':
+--- a/src/dump.js
++++ b/src/dump.js
+@@ -74,33 +74,46 @@
+ }
+ 
+ function markdown(root, sources) {
++  return formatMarkdown(root, {
++    type:node=>node.nodeType, data:node=>node.data, tag:node=>node.localName,
++    children:node=>[...node.childNodes], elements:node=>[...node.children],
++    style:node=>computed(node,sources), hidden:node=>node.hidden,
++    attr:(node,name)=>node.getAttribute(name), hasAttr:(node,name)=>node.hasAttribute(name),
++    href:node=>(sources.get(node)??node).href, src:node=>(sources.get(node)??node).src,
++    alt:node=>node.alt, parentTag:node=>node.parentElement?.localName,
++    text:node=>node.textContent, inputType:node=>node.type, checked:node=>node.checked,
++    selectedOptions:node=>[...node.selectedOptions], rows:node=>[...node.rows],
++    firstRow:node=>node.rows[0], cells:node=>[...node.cells], hasHeader:node=>node?.querySelector('th'),
++  });
++}
++export function formatMarkdown(root, read) {
+   const render = (node, listIndex = 1) => {
+-    if (node.nodeType === 3) return node.data.replace(/\s+/g, ' ');
+-    if (node.nodeType === 9 || node.nodeType === 11) return [...node.childNodes].map(child => render(child)).join('');
+-    if (node.nodeType !== 1) return '';
+-    const tag = node.localName, style = computed(node, sources);
+-    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || node.hidden || node.getAttribute('aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return '';
+-    const content = [...node.childNodes].map(child => render(child)).join('');
++    if (read.type(node) === 3) return read.data(node).replace(/\s+/g, ' ');
++    if (read.type(node) === 9 || read.type(node) === 11) return read.children(node).map(child => render(child)).join('');
++    if (read.type(node) !== 1) return '';
++    const tag = read.tag(node), style = read.style(node);
++    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || read.hidden(node) || read.attr(node, 'aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return '';
++    const content = read.children(node).map(child => render(child)).join('');
+     if (/^h[1-6]$/.test(tag)) return `\n${'#'.repeat(Number(tag[1]))} ${content.trim()}\n`;
+     if (tag === 'a') {
+-      const link = node.hasAttribute('href') ? `[${content.trim()}](${(sources.get(node) ?? node).href || node.getAttribute('href')})` : content;
+-      return ['body', 'div', 'main', 'article', 'section', 'nav', 'aside', 'header', 'footer'].includes(node.parentElement?.localName) ? `${link}\n` : link;
+-    }
+-    if (tag === 'img') return `![${node.alt ?? ''}](${(sources.get(node) ?? node).src || node.getAttribute('src') || ''})`;
++      const link = read.hasAttr(node, 'href') ? `[${content.trim()}](${read.href(node) || read.attr(node, 'href')})` : content;
++      return ['body', 'div', 'main', 'article', 'section', 'nav', 'aside', 'header', 'footer'].includes(read.parentTag(node)) ? `${link}\n` : link;
++    }
++    if (tag === 'img') return `![${read.alt(node) ?? ''}](${read.src(node) || read.attr(node, 'src') || ''})`;
+     if (tag === 'br') return '\n';
+     if (tag === 'hr') return '\n---\n';
+-    if (tag === 'ul' || tag === 'ol') return [...node.children].map((child, index) => render(child, index + Number(node.getAttribute('start') ?? 1))).join('');
+-    if (tag === 'li') return `${node.parentElement?.localName === 'ol' ? `${listIndex}.` : '-'} ${content.trim()}\n`;
+-    if (tag === 'pre') return `\n\`\`\`\n${node.textContent.trim()}\n\`\`\`\n`;
+-    if (tag === 'code') return node.parentElement?.localName === 'pre' ? content : `\`${content}\``;
++    if (tag === 'ul' || tag === 'ol') return read.elements(node).map((child, index) => render(child, index + Number(read.attr(node, 'start') ?? 1))).join('');
++    if (tag === 'li') return `${read.parentTag(node) === 'ol' ? `${listIndex}.` : '-'} ${content.trim()}\n`;
++    if (tag === 'pre') return `\n\`\`\`\n${read.text(node).trim()}\n\`\`\`\n`;
++    if (tag === 'code') return read.parentTag(node) === 'pre' ? content : `\`${content}\``;
+     if (tag === 'b' || tag === 'strong') return `**${content}**`;
+     if (tag === 'i' || tag === 'em') return `*${content}*`;
+     if (tag === 'del' || tag === 's') return `~~${content}~~`;
+-    if (tag === 'input') return ['checkbox', 'radio'].includes(node.type) ? `[${node.checked ? 'x' : ' '}] ` : '';
+-    if (tag === 'select') return [...node.selectedOptions].map(option => option.textContent).join(', ');
++    if (tag === 'input') return ['checkbox', 'radio'].includes(read.inputType(node)) ? `[${read.checked(node) ? 'x' : ' '}] ` : '';
++    if (tag === 'select') return read.selectedOptions(node).map(option => read.text(option)).join(', ');
+     if (tag === 'table') {
+-      const rows = [...node.rows].map(row => `| ${[...row.cells].map(cell => render(cell).trim().replaceAll('|', '\\|')).join(' | ')} |\n`);
+-      if (node.rows[0]?.querySelector('th')) rows.splice(1, 0, `|${[...node.rows[0].cells].map(() => '---').join('|')}|\n`);
++      const rows = read.rows(node).map(row => `| ${read.cells(row).map(cell => render(cell).trim().replaceAll('|', '\\|')).join(' | ')} |\n`);
++      if (read.hasHeader(read.firstRow(node))) rows.splice(1, 0, `|${read.cells(read.firstRow(node)).map(() => '---').join('|')}|\n`);
+       return `\n${rows.join('')}`;
+     }
+     if (tag === 'blockquote') return `\n${content.trim().split('\n').map(line => `> ${line}`).join('\n')}\n`;
+--- /dev/null
++++ b/src/markdown-node.js
+@@ -0,0 +1,36 @@
++// Host-only read adapter over actual authenticated DOM implementations. It
++// allocates no DOM clones/fronts and invokes no authored Node accessors.
++import{createRequire}from'node:module';
++import{platformFactoryRecord}from'./platform-factories.js';
++import{formatMarkdown,DumpError}from'./dump.js';
++const require=createRequire(import.meta.url),NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation,ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation,InputImpl=require('jsdom/lib/jsdom/living/nodes/HTMLInputElement-impl.js').implementation;
++const{domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js'),childrenIterator=domSymbolTree.childrenIterator,parent=domSymbolTree.parent,treeIterator=domSymbolTree.treeIterator;
++const descriptor=Object.getOwnPropertyDescriptor,apply=Reflect.apply,hasInstance=Function.prototype[Symbol.hasInstance],getAttribute=ElementImpl.prototype.getAttribute,hasAttribute=ElementImpl.prototype.hasAttribute,baseURI=descriptor(NodeImpl.prototype,'baseURI').get,textContent=descriptor(NodeImpl.prototype,'textContent').get,inputType=descriptor(InputImpl.prototype,'type').get,checked=descriptor(InputImpl.prototype,'checked').get;
++const dependencyRequire=createRequire(require.resolve('jsdom/lib/jsdom/living/helpers/style-rules.js')),cssValue=dependencyRequire('cssstyle').CSSStyleDeclaration.prototype.getPropertyValue,URLConstructor=URL,HTML='http://www.w3.org/1999/xhtml';
++const children=node=>Array.from(apply(childrenIterator,domSymbolTree,[node])),descendants=node=>Array.from(apply(treeIterator,domSymbolTree,[node])).slice(1),tag=node=>node?._localName;
++const attr=(node,name)=>apply(getAttribute,node,[name]),isHTML=(node,name)=>node.nodeType===1&&node._namespaceURI===HTML&&node._localName===name;
++function link(node,name){const raw=attr(node,name);if(raw===null)return'';try{return new URLConstructor(raw,apply(baseURI,node,[])).href}catch{return raw}}
++function rows(node){const head=[],body=[],foot=[];for(const child of children(node)){if(isHTML(child,'tr'))body.push(child);else if(child._namespaceURI===HTML&&['thead','tbody','tfoot'].includes(tag(child))){const group=tag(child)==='thead'?head:tag(child)==='tfoot'?foot:body;for(const row of children(child))if(isHTML(row,'tr'))group.push(row)}}return[...head,...body,...foot]}
++function inlineStyle(node){
++ // No public cascade fallback: it would run authored DOM getters. Active
++ // author sheets require a separate canonical private cascade bridge.
++ if(node._ownerDocument?._styleSheets?._list?.length)throw new DumpError('Author stylesheet visibility is not supported by the private markdown adapter','UnsupportedMarkdownStyle');
++ const value=name=>node._style?apply(cssValue,node._style,[name]):'';
++ return{display:value('display'),visibility:value('visibility')};
++}
++const read=Object.freeze({
++ type:node=>node.nodeType,data:node=>node._data,tag,children,
++ elements:node=>children(node).filter(child=>child.nodeType===1),
++ style:inlineStyle,hidden:node=>apply(hasAttribute,node,['hidden']),attr,
++ hasAttr:(node,name)=>apply(hasAttribute,node,[name]),href:node=>link(node,'href'),src:node=>link(node,'src'),alt:node=>attr(node,'alt')??'',
++ parentTag:node=>{const value=apply(parent,domSymbolTree,[node]);return value?.nodeType===1?tag(value):undefined},
++ text:node=>apply(textContent,node,[]),inputType:node=>apply(inputType,node,[]),checked:node=>apply(checked,node,[]),
++ selectedOptions:node=>descendants(node).filter(value=>isHTML(value,'option')&&value._selectedness===true),
++ rows,firstRow:node=>rows(node)[0],cells:node=>children(node).filter(value=>isHTML(value,'td')||isHTML(value,'th')),
++ hasHeader:node=>node?descendants(node).some(value=>isHTML(value,'th')):false,
++});
++export function dumpMarkdownNode(value){
++ const node=platformFactoryRecord(value)?.implementation;
++ if(!node||!apply(hasInstance,NodeImpl,[node]))throw new DumpError('A genuine registered DOM node is required');
++ return formatMarkdown(node,read);
++}
+--- /dev/null
++++ b/test/lp-aliases.test.js
+@@ -0,0 +1,59 @@
++import{test}from'node:test';
++import assert from'node:assert/strict';
++import http from'node:http';
++import{readFile}from'node:fs/promises';
++import{createRequire}from'node:module';
++import{serve}from'../src/cdp.js';
++import{Browser,VERSION}from'../src/browser.js';
++import{dumpMarkdownNode}from'../src/markdown-node.js';
++import{connect}from'./cdp-client.js';
++const native=JSON.parse(await readFile(new URL('../docs/reference/lp-aliases/native-r2.json',import.meta.url),'utf8'));
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++function expected(label,origin){const row=native.rows.find(value=>value.label===label);assert.ok(row,label);assert.equal(row.response.diagnosticTimeout,undefined);if(row.response.error)return row.response.error;const result=row.response.result;return typeof result?.markdown==='string'?{markdown:result.markdown.replaceAll(native.sourceURL,origin)}:result}
++async function fixture(t){
++ let service,client;const server=http.createServer((request,response)=>{response.setHeader('content-type','text/html; charset=utf-8');response.end(request.url==='/child'?native.documents.child:native.documents.main.replaceAll(native.sourceURL,origin))});
++ t.after(async()=>{await client?.close();await service?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});
++ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+server.address().port;service=await serve({port:0});client=await connect('ws://127.0.0.1:'+service.port+'/');
++ const create=async()=>{const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});return{targetId,sessionId,send:(method,params)=>client.send(method,params,sessionId)}};
++ const load=async()=>{const target=await create();await target.send('Page.navigate',{url:origin+'/'});await target.send('Runtime.evaluate',{expression:"new Promise(resolve=>{if(document.readyState==='complete')resolve(true);else addEventListener('load',()=>resolve(true),{once:true})})",awaitPromise:true,returnByValue:true});const{root}=await target.send('DOM.getDocument',{depth:-1,pierce:true});const{nodeId}=await target.send('DOM.querySelector',{nodeId:root.nodeId,selector:'#scope'});const{node}=await target.send('DOM.describeNode',{nodeId,depth:1});return{...target,root,scope:node,text:node.children.find(child=>child.nodeType===3)}};
++ return{origin,service,client,create,load};
++}
++
++test('LP.version uses Native payload shape with Red Panda own version before and after target creation',async t=>{
++ const{client,service,create}=await fixture(t);assert.deepEqual(Object.keys(expected('root-version-before')),['version']);assert.deepEqual(await client.send('LP.version'),{version:VERSION});const{send}=await create();assert.deepEqual(await send('LP.version',{ignored:1}),{version:VERSION});assert.deepEqual(await send('LP.version',null),{version:VERSION});for(const method of['CSS.enable','Inspector.enable','Inspector.disable','Security.enable','Security.disable']){assert.deepEqual(await client.send(method,null),{});assert.deepEqual(await send(method,null),{})}const version=await client.send('Browser.getVersion'),discovery=await fetch('http://127.0.0.1:'+service.port+'/json/version').then(value=>value.json());assert.equal(version.product,'RedPanda/'+VERSION);assert.equal(discovery.Browser,'RedPanda/'+VERSION);assert.notEqual(VERSION,expected('root-version-before').version);
++});
++
++test('LP.getMarkdown preserves actual Native document Element Text and ignored-option scopes',async t=>{
++ const f=await fixture(t),{send,root,scope,text}=await f.load();for(const[label,params]of[['document-markdown',{}],['document-node-markdown',{nodeId:root.nodeId}],['scoped-markdown',{nodeId:scope.nodeId}],['actual-text-node-markdown',{nodeId:text.nodeId}],['scoped-ignored-fields',{nodeId:scope.nodeId,selector:'[',maxBytes:1,format:'html',strip:{invisible:true}}],['null-params',null]])assert.deepEqual(await send('LP.getMarkdown',params),expected(label,f.origin),label);assert.deepEqual(await f.client.send('LP.getMarkdown',{nodeId:scope.nodeId}),expected('scoped-markdown',f.origin));const alias=await send('LP.getMarkdown'),dump=await send('LP.dump',{format:'markdown'});assert.equal(alias.markdown,dump.content);
++});
++
++test('LP.getMarkdown scopes genuine child-frame registry nodes and ignores frameId on a document request',async t=>{
++ const f=await fixture(t),{send}=await f.load();const object=await send('Runtime.evaluate',{expression:"document.querySelector('iframe').contentDocument.querySelector('#child')"});assert.ok(object.result.objectId);const{node}=await send('DOM.describeNode',{objectId:object.result.objectId});assert.deepEqual(await send('LP.getMarkdown',{nodeId:node.nodeId}),expected('actual-child-node-description-markdown',f.origin));const{frameTree}=await send('Page.getFrameTree');assert.ok(frameTree.childFrames[0].frame.id);assert.deepEqual(await send('LP.getMarkdown',{frameId:frameTree.childFrames[0].frame.id}),expected('actual-child-frame-parameter',f.origin));
++});
++
++test('LP node conversion retains observed Native errors and current malformed-envelope rejection',async t=>{
++ const f=await fixture(t),{send,root}=await f.load();for(const[label,nodeId]of[['unknown-node',4294967295],['negative-node',-1],['zero-node',0],['fractional-node',1.25]])await assert.rejects(send('LP.getMarkdown',{nodeId}),error=>{assert.deepEqual({code:error.code,message:error.message},expected(label,f.origin));return true});assert.deepEqual(await send('LP.getMarkdown',{nodeId:String(root.nodeId)}),expected('document-node-markdown',f.origin));for(const params of[[],3])await assert.rejects(send('LP.getMarkdown',params),error=>error.code===-32600&&error.message==='Invalid CDP request');
++});
++
++test('LP markdown reflects real document mutation while authored selector and clone methods cannot choose its source',async t=>{
++ const f=await fixture(t),{send,scope}=await f.load();await send('Runtime.evaluate',{expression:"globalThis.cloneCalls=0;const real=document.querySelector('#scope'),fake=document.createElement('p');fake.textContent='forged clone';real.cloneNode=()=>{cloneCalls++;return fake};document.querySelector=()=>{throw Error('authored selector')};'poisoned'",returnByValue:true});assert.deepEqual(await send('LP.getMarkdown',{nodeId:scope.nodeId,selector:'anything'}),expected('scoped-markdown',f.origin));assert.equal((await send('Runtime.evaluate',{expression:'cloneCalls',returnByValue:true})).result.value,0);await send('Runtime.evaluate',{expression:"document.getElementsByTagName('h1')[0].textContent='Real mutation';'changed'",returnByValue:true});assert.deepEqual(await send('LP.getMarkdown'),expected('markdown-after-mutation',f.origin));
++});
++
++test('LP aliases retain actual root context target-close and detached-session lifetime errors',async t=>{
++ const f=await fixture(t);await assert.rejects(f.client.send('LP.getMarkdown'),error=>{assert.deepEqual({code:error.code,message:error.message},expected('root-markdown-before',f.origin));return true});const target=await f.load();assert.deepEqual(await f.client.send('LP.getMarkdown'),expected('root-markdown-loaded',f.origin));await f.client.send('Target.detachFromTarget',{sessionId:target.sessionId});for(const[method,label]of[['LP.version','version-detached-session'],['LP.getMarkdown','markdown-detached-session']])await assert.rejects(target.send(method),error=>{assert.deepEqual({code:error.code,message:error.message},expected(label,f.origin));return true});await f.client.send('Target.closeTarget',{targetId:target.targetId});assert.deepEqual(await f.client.send('LP.version'),{version:VERSION});await assert.rejects(f.client.send('LP.getMarkdown'),error=>{assert.deepEqual({code:error.code,message:error.message},expected('markdown-after-close',f.origin));return true});
++});
++
++test('new scoped markdown producer rejects copied implementation symbols and proxies before authored reads',async t=>{
++ const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<p>real node</p>');const node=page.dom.window.document.querySelector('p'),fake=Object.create(Object.getPrototypeOf(node));Object.defineProperty(fake,utils.implSymbol,{value:utils.implForWrapper(node)});let reads=0;const proxy=new Proxy(node,{get(){reads++;throw Error('authored read')},getOwnPropertyDescriptor(){reads++;throw Error('authored descriptor')}});for(const value of[fake,proxy,Object.create(node)])assert.throws(()=>dumpMarkdownNode(value),/genuine registered DOM node/);assert.equal(reads,0);assert.equal(dumpMarkdownNode(node),'\nreal node\n');
++});
++
++// These authored controls have independent actual Native counts and output.
++test('LP canonical node reads create no custom-element reactions and invoke no poisoned Node or Element fronts',async t=>{
++ const{send}=await(await fixture(t)).create();const controls=JSON.parse(await readFile(new URL('../docs/reference/lp-aliases/native-sideeffects.json',import.meta.url),'utf8'));let nodeId;
++ for(const row of controls.rows){
++  if(row.label==='document'){await send(row.method,row.params);const{root}=await send('DOM.getDocument',{depth:-1});nodeId=root.nodeId;assert.ok(Number.isInteger(nodeId));continue}
++  const result=await send(row.method,row.method==='LP.getMarkdown'?{nodeId}:row.params);
++  if(row.method==='LP.getMarkdown')assert.deepEqual(result,row.result,row.label);
++  else{assert.equal(result.exceptionDetails,undefined,row.label);assert.deepEqual(result.result.value,row.result.result.value,row.label)}
++ }
++});
+--- /dev/null
++++ b/docs/reference/lp-aliases/native-r2.json
+@@ -0,0 +1,1684 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "1771798cf79a64e1e82a25665994cd87fd962015c267d0f959f24acad201a2aa",
++  "rows": [
++    {
++      "label": "root-version-before",
++      "request": {
++        "id": 1,
++        "method": "LP.version"
++      },
++      "response": {
++        "id": 1,
++        "result": {
++          "version": "1.1.0-nightly.11326+948d77378"
++        }
++      }
++    },
++    {
++      "label": "root-markdown-before",
++      "request": {
++        "id": 2,
++        "method": "LP.getMarkdown",
++        "params": {}
++      },
++      "response": {
++        "id": 2,
++        "error": {
++          "code": -31998,
++          "message": "NoBrowserContext"
++        }
++      }
++    },
++    {
++      "label": "create-target",
++      "request": {
++        "id": 3,
++        "method": "Target.createTarget",
++        "params": {
++          "url": "about:blank"
++        }
++      },
++      "response": {
++        "id": 3,
++        "result": {
++          "targetId": "FID-0000000001"
++        }
++      }
++    },
++    {
++      "label": "attach-target",
++      "request": {
++        "id": 4,
++        "method": "Target.attachToTarget",
++        "params": {
++          "targetId": "FID-0000000001",
++          "flatten": true
++        }
++      },
++      "response": {
++        "id": 4,
++        "result": {
++          "sessionId": "SID-1"
++        }
++      }
++    },
++    {
++      "label": "session-version",
++      "request": {
++        "id": 5,
++        "method": "LP.version",
++        "params": {},
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 5,
++        "result": {
++          "version": "1.1.0-nightly.11326+948d77378"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "blank-markdown",
++      "request": {
++        "id": 6,
++        "method": "LP.getMarkdown",
++        "params": {},
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 6,
++        "result": {
++          "markdown": ""
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "navigate-document",
++      "request": {
++        "id": 7,
++        "method": "Page.navigate",
++        "params": {
++          "url": "http://127.0.0.1:36427/"
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 7,
++        "result": {
++          "frameId": "FID-0000000001",
++          "loaderId": "LID-0000000001"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-document-ready",
++      "request": {
++        "id": 8,
++        "method": "Runtime.evaluate",
++        "params": {
++          "expression": "new Promise(resolve=>{if(document.readyState==='complete')resolve(document.body.textContent);else addEventListener('load',()=>resolve(document.body.textContent),{once:true})})",
++          "awaitPromise": true,
++          "returnByValue": true
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 8,
++        "result": {
++          "result": {
++            "type": "string",
++            "value": "Red PandaActual document and next.Hidden content"
++          }
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-dom",
++      "request": {
++        "id": 9,
++        "method": "DOM.getDocument",
++        "params": {
++          "depth": -1,
++          "pierce": true
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 9,
++        "result": {
++          "root": {
++            "nodeId": 1,
++            "backendNodeId": 1,
++            "localName": "",
++            "nodeType": 9,
++            "nodeName": "#document",
++            "nodeValue": "",
++            "documentURL": null,
++            "baseURL": null,
++            "xmlVersion": "",
++            "compatibilityMode": "NoQuirksMode",
++            "isScrollable": false,
++            "children": [
++              {
++                "nodeId": 2,
++                "backendNodeId": 2,
++                "parentId": 1,
++                "localName": "",
++                "nodeType": 10,
++                "nodeName": "html",
++                "nodeValue": "",
++                "documentURL": null,
++                "baseURL": null,
++                "xmlVersion": "",
++                "compatibilityMode": "NoQuirksMode",
++                "isScrollable": false,
++                "children": [],
++                "childNodeCount": 0
++              },
++              {
++                "nodeId": 3,
++                "backendNodeId": 3,
++                "parentId": 1,
++                "localName": "html",
++                "frameId": "FID-0000000001",
++                "nodeType": 1,
++                "nodeName": "HTML",
++                "nodeValue": "",
++                "documentURL": null,
++                "baseURL": null,
++                "xmlVersion": "",
++                "compatibilityMode": "NoQuirksMode",
++                "isScrollable": false,
++                "children": [
++                  {
++                    "nodeId": 4,
++                    "backendNodeId": 4,
++                    "parentId": 3,
++                    "localName": "head",
++                    "nodeType": 1,
++                    "nodeName": "HEAD",
++                    "nodeValue": "",
++                    "documentURL": null,
++                    "baseURL": null,
++                    "xmlVersion": "",
++                    "compatibilityMode": "NoQuirksMode",
++                    "isScrollable": false,
++                    "children": [
++                      {
++                        "nodeId": 5,
++                        "backendNodeId": 5,
++                        "parentId": 4,
++                        "localName": "title",
++                        "nodeType": 1,
++                        "nodeName": "TITLE",
++                        "nodeValue": "",
++                        "documentURL": null,
++                        "baseURL": null,
++                        "xmlVersion": "",
++                        "compatibilityMode": "NoQuirksMode",
++                        "isScrollable": false,
++                        "children": [
++                          {
++                            "nodeId": 6,
++                            "backendNodeId": 6,
++                            "parentId": 5,
++                            "localName": "",
++                            "nodeType": 3,
++                            "nodeName": "#text",
++                            "nodeValue": "LP aliases",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [],
++                            "childNodeCount": 0
++                          }
++                        ],
++                        "childNodeCount": 1
++                      }
++                    ],
++                    "childNodeCount": 1
++                  },
++                  {
++                    "nodeId": 7,
++                    "backendNodeId": 7,
++                    "parentId": 3,
++                    "localName": "body",
++                    "nodeType": 1,
++                    "nodeName": "BODY",
++                    "nodeValue": "",
++                    "documentURL": null,
++                    "baseURL": null,
++                    "xmlVersion": "",
++                    "compatibilityMode": "NoQuirksMode",
++                    "isScrollable": false,
++                    "children": [
++                      {
++                        "nodeId": 8,
++                        "backendNodeId": 8,
++                        "parentId": 7,
++                        "localName": "h1",
++                        "nodeType": 1,
++                        "nodeName": "H1",
++                        "nodeValue": "",
++                        "documentURL": null,
++                        "baseURL": null,
++                        "xmlVersion": "",
++                        "compatibilityMode": "NoQuirksMode",
++                        "isScrollable": false,
++                        "children": [
++                          {
++                            "nodeId": 9,
++                            "backendNodeId": 9,
++                            "parentId": 8,
++                            "localName": "",
++                            "nodeType": 3,
++                            "nodeName": "#text",
++                            "nodeValue": "Red Panda",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [],
++                            "childNodeCount": 0
++                          }
++                        ],
++                        "childNodeCount": 1
++                      },
++                      {
++                        "nodeId": 10,
++                        "backendNodeId": 10,
++                        "parentId": 7,
++                        "attributes": [
++                          "id",
++                          "scope"
++                        ],
++                        "localName": "p",
++                        "nodeType": 1,
++                        "nodeName": "P",
++                        "nodeValue": "",
++                        "documentURL": null,
++                        "baseURL": null,
++                        "xmlVersion": "",
++                        "compatibilityMode": "NoQuirksMode",
++                        "isScrollable": false,
++                        "children": [
++                          {
++                            "nodeId": 11,
++                            "backendNodeId": 11,
++                            "parentId": 10,
++                            "localName": "",
++                            "nodeType": 3,
++                            "nodeName": "#text",
++                            "nodeValue": "Actual ",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [],
++                            "childNodeCount": 0
++                          },
++                          {
++                            "nodeId": 12,
++                            "backendNodeId": 12,
++                            "parentId": 10,
++                            "localName": "strong",
++                            "nodeType": 1,
++                            "nodeName": "STRONG",
++                            "nodeValue": "",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [
++                              {
++                                "nodeId": 13,
++                                "backendNodeId": 13,
++                                "parentId": 12,
++                                "localName": "",
++                                "nodeType": 3,
++                                "nodeName": "#text",
++                                "nodeValue": "document",
++                                "documentURL": null,
++                                "baseURL": null,
++                                "xmlVersion": "",
++                                "compatibilityMode": "NoQuirksMode",
++                                "isScrollable": false,
++                                "children": [],
++                                "childNodeCount": 0
++                              }
++                            ],
++                            "childNodeCount": 1
++                          },
++                          {
++                            "nodeId": 14,
++                            "backendNodeId": 14,
++                            "parentId": 10,
++                            "localName": "",
++                            "nodeType": 3,
++                            "nodeName": "#text",
++                            "nodeValue": " and ",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [],
++                            "childNodeCount": 0
++                          },
++                          {
++                            "nodeId": 15,
++                            "backendNodeId": 15,
++                            "parentId": 10,
++                            "attributes": [
++                              "href",
++                              "/next"
++                            ],
++                            "localName": "a",
++                            "nodeType": 1,
++                            "nodeName": "A",
++                            "nodeValue": "",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [
++                              {
++                                "nodeId": 16,
++                                "backendNodeId": 16,
++                                "parentId": 15,
++                                "localName": "",
++                                "nodeType": 3,
++                                "nodeName": "#text",
++                                "nodeValue": "next",
++                                "documentURL": null,
++                                "baseURL": null,
++                                "xmlVersion": "",
++                                "compatibilityMode": "NoQuirksMode",
++                                "isScrollable": false,
++                                "children": [],
++                                "childNodeCount": 0
++                              }
++                            ],
++                            "childNodeCount": 1
++                          },
++                          {
++                            "nodeId": 17,
++                            "backendNodeId": 17,
++                            "parentId": 10,
++                            "localName": "",
++                            "nodeType": 3,
++                            "nodeName": "#text",
++                            "nodeValue": ".",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [],
++                            "childNodeCount": 0
++                          }
++                        ],
++                        "childNodeCount": 5
++                      },
++                      {
++                        "nodeId": 18,
++                        "backendNodeId": 18,
++                        "parentId": 7,
++                        "attributes": [
++                          "hidden",
++                          ""
++                        ],
++                        "localName": "div",
++                        "nodeType": 1,
++                        "nodeName": "DIV",
++                        "nodeValue": "",
++                        "documentURL": null,
++                        "baseURL": null,
++                        "xmlVersion": "",
++                        "compatibilityMode": "NoQuirksMode",
++                        "isScrollable": false,
++                        "children": [
++                          {
++                            "nodeId": 19,
++                            "backendNodeId": 19,
++                            "parentId": 18,
++                            "localName": "",
++                            "nodeType": 3,
++                            "nodeName": "#text",
++                            "nodeValue": "Hidden content",
++                            "documentURL": null,
++                            "baseURL": null,
++                            "xmlVersion": "",
++                            "compatibilityMode": "NoQuirksMode",
++                            "isScrollable": false,
++                            "children": [],
++                            "childNodeCount": 0
++                          }
++                        ],
++                        "childNodeCount": 1
++                      },
++                      {
++                        "nodeId": 20,
++                        "backendNodeId": 20,
++                        "parentId": 7,
++                        "attributes": [
++                          "src",
++                          "http://127.0.0.1:36427/child"
++                        ],
++                        "localName": "iframe",
++                        "frameId": "FID-0000000002",
++                        "nodeType": 1,
++                        "nodeName": "IFRAME",
++                        "nodeValue": "",
++                        "documentURL": null,
++                        "baseURL": null,
++                        "xmlVersion": "",
++                        "compatibilityMode": "NoQuirksMode",
++                        "isScrollable": false,
++                        "children": [],
++                        "childNodeCount": 0
++                      }
++                    ],
++                    "childNodeCount": 4
++                  }
++                ],
++                "childNodeCount": 2
++              }
++            ],
++            "childNodeCount": 2
++          }
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "document-markdown",
++      "request": {
++        "id": 10,
++        "method": "LP.getMarkdown",
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 10,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "document-dump-markdown",
++      "request": {
++        "id": 11,
++        "method": "LP.dump",
++        "params": {
++          "format": "markdown"
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 11,
++        "result": {
++          "format": "markdown",
++          "content": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "document-node-markdown",
++      "request": {
++        "id": 12,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 1
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 12,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "scoped-markdown",
++      "request": {
++        "id": 13,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 10
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 13,
++        "result": {
++          "markdown": "\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "scoped-ignored-fields",
++      "request": {
++        "id": 14,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 10,
++          "maxBytes": 1,
++          "selector": "[",
++          "format": "html",
++          "strip": {
++            "invisible": true
++          }
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 14,
++        "result": {
++          "markdown": "\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "scoped-dump-markdown",
++      "request": {
++        "id": 15,
++        "method": "LP.dump",
++        "params": {
++          "format": "markdown",
++          "backendNodeId": 10
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 15,
++        "result": {
++          "format": "markdown",
++          "content": "\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-child-node-object",
++      "request": {
++        "id": 16,
++        "method": "Runtime.evaluate",
++        "params": {
++          "expression": "document.querySelector('iframe').contentDocument.querySelector('#child')"
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 16,
++        "result": {
++          "result": {
++            "type": "object",
++            "subtype": "node",
++            "className": "HTMLHeadingElement",
++            "description": "",
++            "objectId": "2.2.1"
++          }
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-child-node-description",
++      "request": {
++        "id": 17,
++        "method": "DOM.describeNode",
++        "params": {
++          "objectId": "2.2.1"
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 17,
++        "result": {
++          "node": {
++            "nodeId": 21,
++            "backendNodeId": 21,
++            "parentId": 22,
++            "attributes": [
++              "id",
++              "child"
++            ],
++            "localName": "h2",
++            "nodeType": 1,
++            "nodeName": "H2",
++            "nodeValue": "",
++            "documentURL": null,
++            "baseURL": null,
++            "xmlVersion": "",
++            "compatibilityMode": "NoQuirksMode",
++            "isScrollable": false,
++            "children": [
++              {
++                "nodeId": 23,
++                "backendNodeId": 23,
++                "parentId": 21,
++                "localName": "",
++                "nodeType": 3,
++                "nodeName": "#text",
++                "nodeValue": "Real child",
++                "childNodeCount": 0,
++                "documentURL": null,
++                "baseURL": null,
++                "xmlVersion": "",
++                "compatibilityMode": "NoQuirksMode",
++                "isScrollable": false
++              }
++            ],
++            "childNodeCount": 1
++          }
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-child-node-description-markdown",
++      "request": {
++        "id": 18,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 21
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 18,
++        "result": {
++          "markdown": "\n## Real child\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-frame-tree",
++      "request": {
++        "id": 19,
++        "method": "Page.getFrameTree",
++        "params": {},
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 19,
++        "result": {
++          "frameTree": {
++            "frame": {
++              "id": "FID-0000000001",
++              "loaderId": "LID-0000000001",
++              "url": "http://127.0.0.1:36427/",
++              "domainAndRegistry": "",
++              "securityOrigin": "http://127.0.0.1:36427",
++              "mimeType": "text/html",
++              "adFrameStatus": {
++                "adFrameType": "none"
++              },
++              "secureContextType": "InsecureScheme",
++              "crossOriginIsolatedContextType": "NotIsolated",
++              "gatedAPIFeatures": []
++            },
++            "childFrames": [
++              {
++                "frame": {
++                  "id": "FID-0000000002",
++                  "parentId": "FID-0000000001",
++                  "loaderId": "LID-0000000002",
++                  "url": "http://127.0.0.1:36427/child",
++                  "domainAndRegistry": "",
++                  "securityOrigin": "http://127.0.0.1:36427",
++                  "mimeType": "text/html",
++                  "adFrameStatus": {
++                    "adFrameType": "none"
++                  },
++                  "secureContextType": "InsecureScheme",
++                  "crossOriginIsolatedContextType": "NotIsolated",
++                  "gatedAPIFeatures": []
++                }
++              }
++            ]
++          }
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-child-frame-parameter",
++      "request": {
++        "id": 20,
++        "method": "LP.getMarkdown",
++        "params": {
++          "frameId": "FID-0000000002"
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 20,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "actual-text-node-markdown",
++      "request": {
++        "id": 21,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 11
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 21,
++        "result": {
++          "markdown": "Actual \n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "unknown-node",
++      "request": {
++        "id": 22,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 4294967295
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 22,
++        "error": {
++          "code": -31998,
++          "message": "InvalidNodeId"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "negative-node",
++      "request": {
++        "id": 23,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": -1
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 23,
++        "error": {
++          "code": -31998,
++          "message": "Overflow"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "zero-node",
++      "request": {
++        "id": 24,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 0
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 24,
++        "error": {
++          "code": -31998,
++          "message": "InvalidNodeId"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "fractional-node",
++      "request": {
++        "id": 25,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": 1.25
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 25,
++        "error": {
++          "code": -31998,
++          "message": "InvalidNumber"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "string-node",
++      "request": {
++        "id": 26,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": "1"
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 26,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "null-node",
++      "request": {
++        "id": 27,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": null
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 27,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "ignored-fields",
++      "request": {
++        "id": 28,
++        "method": "LP.getMarkdown",
++        "params": {
++          "nodeId": null,
++          "frameId": "not-a-real-frame",
++          "selector": "[",
++          "maxBytes": 0
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 28,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "null-params",
++      "request": {
++        "id": 29,
++        "method": "LP.getMarkdown",
++        "params": null,
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 29,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "version-extra",
++      "request": {
++        "id": 30,
++        "method": "LP.version",
++        "params": {
++          "ignored": 1
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 30,
++        "result": {
++          "version": "1.1.0-nightly.11326+948d77378"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "version-null",
++      "request": {
++        "id": 31,
++        "method": "LP.version",
++        "params": null,
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 31,
++        "result": {
++          "version": "1.1.0-nightly.11326+948d77378"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "browser-identity",
++      "request": {
++        "id": 32,
++        "method": "Browser.getVersion"
++      },
++      "response": {
++        "id": 32,
++        "result": {
++          "protocolVersion": "1.3",
++          "product": "Chrome/124.0.6367.29",
++          "revision": "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4",
++          "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
++          "jsVersion": "12.4.254.8"
++        }
++      }
++    },
++    {
++      "label": "root-version-loaded",
++      "request": {
++        "id": 33,
++        "method": "LP.version",
++        "params": {}
++      },
++      "response": {
++        "id": 33,
++        "result": {
++          "version": "1.1.0-nightly.11326+948d77378"
++        }
++      }
++    },
++    {
++      "label": "root-markdown-loaded",
++      "request": {
++        "id": 34,
++        "method": "LP.getMarkdown",
++        "params": {}
++      },
++      "response": {
++        "id": 34,
++        "result": {
++          "markdown": "\n# Red Panda\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        }
++      }
++    },
++    {
++      "label": "actual-mutation",
++      "request": {
++        "id": 35,
++        "method": "Runtime.evaluate",
++        "params": {
++          "expression": "document.querySelector('h1').textContent='Real mutation';'changed'",
++          "returnByValue": true
++        },
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 35,
++        "result": {
++          "result": {
++            "type": "string",
++            "value": "changed"
++          }
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "markdown-after-mutation",
++      "request": {
++        "id": 36,
++        "method": "LP.getMarkdown",
++        "params": {},
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 36,
++        "result": {
++          "markdown": "\n# Real mutation\n\nActual **document** and [next](http://127.0.0.1:36427/next).\n"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "detach-real-session",
++      "request": {
++        "id": 37,
++        "method": "Target.detachFromTarget",
++        "params": {
++          "sessionId": "SID-1"
++        }
++      },
++      "response": {
++        "id": 37,
++        "result": {}
++      }
++    },
++    {
++      "label": "version-detached-session",
++      "request": {
++        "id": 38,
++        "method": "LP.version",
++        "params": {},
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 38,
++        "error": {
++          "code": -32001,
++          "message": "Unknown sessionId"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "markdown-detached-session",
++      "request": {
++        "id": 39,
++        "method": "LP.getMarkdown",
++        "params": {},
++        "sessionId": "SID-1"
++      },
++      "response": {
++        "id": 39,
++        "error": {
++          "code": -32001,
++          "message": "Unknown sessionId"
++        },
++        "sessionId": "SID-1"
++      }
++    },
++    {
++      "label": "close-real-target",
++      "request": {
++        "id": 40,
++        "method": "Target.closeTarget",
++        "params": {
++          "targetId": "FID-0000000001"
++        }
++      },
++      "response": {
++        "id": 40,
++        "result": {
++          "success": true
++        }
++      }
++    },
++    {
++      "label": "version-after-close",
++      "request": {
++        "id": 41,
++        "method": "LP.version",
++        "params": {}
++      },
++      "response": {
++        "id": 41,
++        "result": {
++          "version": "1.1.0-nightly.11326+948d77378"
++        }
++      }
++    },
++    {
++      "label": "markdown-after-close",
++      "request": {
++        "id": 42,
++        "method": "LP.getMarkdown",
++        "params": {}
++      },
++      "response": {
++        "id": 42,
++        "error": {
++          "code": -31998,
++          "message": "FrameNotLoaded"
++        }
++      }
++    },
++    {
++      "label": "isolated-LP.getMarkdown-object",
++      "request": {
++        "id": 43,
++        "method": "LP.getMarkdown",
++        "params": []
++      },
++      "response": {
++        "diagnosticTimeout": true
++      }
++    },
++    {
++      "label": "isolated-LP.getMarkdown-number",
++      "request": {
++        "id": 44,
++        "method": "LP.getMarkdown",
++        "params": 3
++      },
++      "response": {
++        "diagnosticTimeout": true
++      }
++    },
++    {
++      "label": "isolated-LP.version-object",
++      "request": {
++        "id": 45,
++        "method": "LP.version",
++        "params": []
++      },
++      "response": {
++        "diagnosticTimeout": true
++      }
++    },
++    {
++      "label": "isolated-LP.version-number",
++      "request": {
++        "id": 46,
++        "method": "LP.version",
++        "params": 3
++      },
++      "response": {
++        "diagnosticTimeout": true
++      }
++    }
++  ],
++  "wire": [
++    {
++      "direction": "sent",
++      "data": "{\"id\":1,\"method\":\"LP.version\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":1,\"result\":{\"version\":\"1.1.0-nightly.11326+948d77378\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":2,\"method\":\"LP.getMarkdown\",\"params\":{}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":2,\"error\":{\"code\":-31998,\"message\":\"NoBrowserContext\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":3,\"method\":\"Target.createTarget\",\"params\":{\"url\":\"about:blank\"}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Target.targetCreated\",\"params\":{\"targetInfo\":{\"url\":\"about:blank\",\"title\":\"\",\"targetId\":\"FID-0000000001\",\"attached\":false,\"type\":\"page\",\"canAccessOpener\":false,\"browserContextId\":\"BID-1\"}}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":3,\"result\":{\"targetId\":\"FID-0000000001\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":4,\"method\":\"Target.attachToTarget\",\"params\":{\"targetId\":\"FID-0000000001\",\"flatten\":true}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Target.attachedToTarget\",\"params\":{\"sessionId\":\"SID-1\",\"targetInfo\":{\"url\":\"about:blank\",\"title\":\"\",\"targetId\":\"FID-0000000001\",\"attached\":true,\"type\":\"page\",\"canAccessOpener\":false,\"browserContextId\":\"BID-1\"},\"waitingForDebugger\":false}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":4,\"result\":{\"sessionId\":\"SID-1\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":5,\"method\":\"LP.version\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":5,\"result\":{\"version\":\"1.1.0-nightly.11326+948d77378\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":6,\"method\":\"LP.getMarkdown\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":6,\"result\":{\"markdown\":\"\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":7,\"method\":\"Page.navigate\",\"params\":{\"url\":\"http://127.0.0.1:36427/\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameStartedNavigating\",\"params\":{\"frameId\":\"FID-0000000001\",\"url\":\"http://127.0.0.1:36427/\",\"loaderId\":\"LID-0000000001\",\"navigationType\":\"differentDocument\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameStartedLoading\",\"params\":{\"frameId\":\"FID-0000000001\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":7,\"result\":{\"frameId\":\"FID-0000000001\",\"loaderId\":\"LID-0000000001\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Runtime.executionContextsCleared\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameNavigated\",\"params\":{\"type\":\"Navigation\",\"frame\":{\"id\":\"FID-0000000001\",\"loaderId\":\"LID-0000000001\",\"url\":\"http://127.0.0.1:36427/\",\"domainAndRegistry\":\"\",\"securityOrigin\":\"http://127.0.0.1:36427\",\"mimeType\":\"text/html\",\"adFrameStatus\":{\"adFrameType\":\"none\"},\"secureContextType\":\"InsecureScheme\",\"crossOriginIsolatedContextType\":\"NotIsolated\",\"gatedAPIFeatures\":[]}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"DOM.documentUpdated\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameAttached\",\"params\":{\"frameId\":\"FID-0000000002\",\"parentFrameId\":\"FID-0000000001\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameRequestedNavigation\",\"params\":{\"frameId\":\"FID-0000000002\",\"reason\":\"initialFrameNavigation\",\"url\":\"http://127.0.0.1:36427/child\",\"disposition\":\"currentTab\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameStartedNavigating\",\"params\":{\"frameId\":\"FID-0000000002\",\"url\":\"http://127.0.0.1:36427/child\",\"loaderId\":\"LID-0000000002\",\"navigationType\":\"differentDocument\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameStartedLoading\",\"params\":{\"frameId\":\"FID-0000000002\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.domContentEventFired\",\"params\":{\"timestamp\":69659},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":8,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"new Promise(resolve=>{if(document.readyState==='complete')resolve(document.body.textContent);else addEventListener('load',()=>resolve(document.body.textContent),{once:true})})\",\"awaitPromise\":true,\"returnByValue\":true},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameClearedScheduledNavigation\",\"params\":{\"frameId\":\"FID-0000000002\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameNavigated\",\"params\":{\"type\":\"Navigation\",\"frame\":{\"id\":\"FID-0000000002\",\"parentId\":\"FID-0000000001\",\"loaderId\":\"LID-0000000002\",\"url\":\"http://127.0.0.1:36427/child\",\"domainAndRegistry\":\"\",\"securityOrigin\":\"http://127.0.0.1:36427\",\"mimeType\":\"text/html\",\"adFrameStatus\":{\"adFrameType\":\"none\"},\"secureContextType\":\"InsecureScheme\",\"crossOriginIsolatedContextType\":\"NotIsolated\",\"gatedAPIFeatures\":[]}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"DOM.documentUpdated\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.domContentEventFired\",\"params\":{\"timestamp\":69659},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.loadEventFired\",\"params\":{\"timestamp\":69659},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameStoppedLoading\",\"params\":{\"frameId\":\"FID-0000000002\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":8,\"result\":{\"result\":{\"type\":\"string\",\"value\":\"Red PandaActual document and next.Hidden content\"}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.loadEventFired\",\"params\":{\"timestamp\":69659},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Page.frameStoppedLoading\",\"params\":{\"frameId\":\"FID-0000000001\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":9,\"method\":\"DOM.getDocument\",\"params\":{\"depth\":-1,\"pierce\":true},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":9,\"result\":{\"root\":{\"nodeId\":1,\"backendNodeId\":1,\"localName\":\"\",\"nodeType\":9,\"nodeName\":\"#document\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":2,\"backendNodeId\":2,\"parentId\":1,\"localName\":\"\",\"nodeType\":10,\"nodeName\":\"html\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0},{\"nodeId\":3,\"backendNodeId\":3,\"parentId\":1,\"localName\":\"html\",\"frameId\":\"FID-0000000001\",\"nodeType\":1,\"nodeName\":\"HTML\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":4,\"backendNodeId\":4,\"parentId\":3,\"localName\":\"head\",\"nodeType\":1,\"nodeName\":\"HEAD\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":5,\"backendNodeId\":5,\"parentId\":4,\"localName\":\"title\",\"nodeType\":1,\"nodeName\":\"TITLE\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":6,\"backendNodeId\":6,\"parentId\":5,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"LP aliases\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":1}],\"childNodeCount\":1},{\"nodeId\":7,\"backendNodeId\":7,\"parentId\":3,\"localName\":\"body\",\"nodeType\":1,\"nodeName\":\"BODY\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":8,\"backendNodeId\":8,\"parentId\":7,\"localName\":\"h1\",\"nodeType\":1,\"nodeName\":\"H1\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":9,\"backendNodeId\":9,\"parentId\":8,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"Red Panda\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":1},{\"nodeId\":10,\"backendNodeId\":10,\"parentId\":7,\"attributes\":[\"id\",\"scope\"],\"localName\":\"p\",\"nodeType\":1,\"nodeName\":\"P\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":11,\"backendNodeId\":11,\"parentId\":10,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"Actual \",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0},{\"nodeId\":12,\"backendNodeId\":12,\"parentId\":10,\"localName\":\"strong\",\"nodeType\":1,\"nodeName\":\"STRONG\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":13,\"backendNodeId\":13,\"parentId\":12,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"document\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":1},{\"nodeId\":14,\"backendNodeId\":14,\"parentId\":10,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\" and \",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0},{\"nodeId\":15,\"backendNodeId\":15,\"parentId\":10,\"attributes\":[\"href\",\"/next\"],\"localName\":\"a\",\"nodeType\":1,\"nodeName\":\"A\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":16,\"backendNodeId\":16,\"parentId\":15,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"next\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":1},{\"nodeId\":17,\"backendNodeId\":17,\"parentId\":10,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\".\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":5},{\"nodeId\":18,\"backendNodeId\":18,\"parentId\":7,\"attributes\":[\"hidden\",\"\"],\"localName\":\"div\",\"nodeType\":1,\"nodeName\":\"DIV\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":19,\"backendNodeId\":19,\"parentId\":18,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"Hidden content\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":1},{\"nodeId\":20,\"backendNodeId\":20,\"parentId\":7,\"attributes\":[\"src\",\"http://127.0.0.1:36427/child\"],\"localName\":\"iframe\",\"frameId\":\"FID-0000000002\",\"nodeType\":1,\"nodeName\":\"IFRAME\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[],\"childNodeCount\":0}],\"childNodeCount\":4}],\"childNodeCount\":2}],\"childNodeCount\":2}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":10,\"method\":\"LP.getMarkdown\",\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":10,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":11,\"method\":\"LP.dump\",\"params\":{\"format\":\"markdown\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":11,\"result\":{\"format\":\"markdown\",\"content\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":12,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":1},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":12,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":13,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":10},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":13,\"result\":{\"markdown\":\"\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":14,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":10,\"maxBytes\":1,\"selector\":\"[\",\"format\":\"html\",\"strip\":{\"invisible\":true}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":14,\"result\":{\"markdown\":\"\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":15,\"method\":\"LP.dump\",\"params\":{\"format\":\"markdown\",\"backendNodeId\":10},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":15,\"result\":{\"format\":\"markdown\",\"content\":\"\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":16,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"document.querySelector('iframe').contentDocument.querySelector('#child')\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":16,\"result\":{\"result\":{\"type\":\"object\",\"subtype\":\"node\",\"className\":\"HTMLHeadingElement\",\"description\":\"\",\"objectId\":\"2.2.1\"}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":17,\"method\":\"DOM.describeNode\",\"params\":{\"objectId\":\"2.2.1\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":17,\"result\":{\"node\":{\"nodeId\":21,\"backendNodeId\":21,\"parentId\":22,\"attributes\":[\"id\",\"child\"],\"localName\":\"h2\",\"nodeType\":1,\"nodeName\":\"H2\",\"nodeValue\":\"\",\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false,\"children\":[{\"nodeId\":23,\"backendNodeId\":23,\"parentId\":21,\"localName\":\"\",\"nodeType\":3,\"nodeName\":\"#text\",\"nodeValue\":\"Real child\",\"childNodeCount\":0,\"documentURL\":null,\"baseURL\":null,\"xmlVersion\":\"\",\"compatibilityMode\":\"NoQuirksMode\",\"isScrollable\":false}],\"childNodeCount\":1}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":18,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":21},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":18,\"result\":{\"markdown\":\"\\n## Real child\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":19,\"method\":\"Page.getFrameTree\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":19,\"result\":{\"frameTree\":{\"frame\":{\"id\":\"FID-0000000001\",\"loaderId\":\"LID-0000000001\",\"url\":\"http://127.0.0.1:36427/\",\"domainAndRegistry\":\"\",\"securityOrigin\":\"http://127.0.0.1:36427\",\"mimeType\":\"text/html\",\"adFrameStatus\":{\"adFrameType\":\"none\"},\"secureContextType\":\"InsecureScheme\",\"crossOriginIsolatedContextType\":\"NotIsolated\",\"gatedAPIFeatures\":[]},\"childFrames\":[{\"frame\":{\"id\":\"FID-0000000002\",\"parentId\":\"FID-0000000001\",\"loaderId\":\"LID-0000000002\",\"url\":\"http://127.0.0.1:36427/child\",\"domainAndRegistry\":\"\",\"securityOrigin\":\"http://127.0.0.1:36427\",\"mimeType\":\"text/html\",\"adFrameStatus\":{\"adFrameType\":\"none\"},\"secureContextType\":\"InsecureScheme\",\"crossOriginIsolatedContextType\":\"NotIsolated\",\"gatedAPIFeatures\":[]}}]}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":20,\"method\":\"LP.getMarkdown\",\"params\":{\"frameId\":\"FID-0000000002\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":20,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":21,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":11},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":21,\"result\":{\"markdown\":\"Actual \\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":22,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":4294967295},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":22,\"error\":{\"code\":-31998,\"message\":\"InvalidNodeId\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":23,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":-1},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":23,\"error\":{\"code\":-31998,\"message\":\"Overflow\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":24,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":0},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":24,\"error\":{\"code\":-31998,\"message\":\"InvalidNodeId\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":25,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":1.25},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":25,\"error\":{\"code\":-31998,\"message\":\"InvalidNumber\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":26,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":\"1\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":26,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":27,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":null},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":27,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":28,\"method\":\"LP.getMarkdown\",\"params\":{\"nodeId\":null,\"frameId\":\"not-a-real-frame\",\"selector\":\"[\",\"maxBytes\":0},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":28,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":29,\"method\":\"LP.getMarkdown\",\"params\":null,\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":29,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":30,\"method\":\"LP.version\",\"params\":{\"ignored\":1},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":30,\"result\":{\"version\":\"1.1.0-nightly.11326+948d77378\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":31,\"method\":\"LP.version\",\"params\":null,\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":31,\"result\":{\"version\":\"1.1.0-nightly.11326+948d77378\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":32,\"method\":\"Browser.getVersion\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":32,\"result\":{\"protocolVersion\":\"1.3\",\"product\":\"Chrome/124.0.6367.29\",\"revision\":\"@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4\",\"userAgent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\",\"jsVersion\":\"12.4.254.8\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":33,\"method\":\"LP.version\",\"params\":{}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":33,\"result\":{\"version\":\"1.1.0-nightly.11326+948d77378\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":34,\"method\":\"LP.getMarkdown\",\"params\":{}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":34,\"result\":{\"markdown\":\"\\n# Red Panda\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":35,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"document.querySelector('h1').textContent='Real mutation';'changed'\",\"returnByValue\":true},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":35,\"result\":{\"result\":{\"type\":\"string\",\"value\":\"changed\"}},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":36,\"method\":\"LP.getMarkdown\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":36,\"result\":{\"markdown\":\"\\n# Real mutation\\n\\nActual **document** and [next](http://127.0.0.1:36427/next).\\n\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":37,\"method\":\"Target.detachFromTarget\",\"params\":{\"sessionId\":\"SID-1\"}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Target.detachedFromTarget\",\"params\":{\"sessionId\":\"SID-1\"}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":37,\"result\":{}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":38,\"method\":\"LP.version\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":38,\"error\":{\"code\":-32001,\"message\":\"Unknown sessionId\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":39,\"method\":\"LP.getMarkdown\",\"params\":{},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":39,\"error\":{\"code\":-32001,\"message\":\"Unknown sessionId\"},\"sessionId\":\"SID-1\"}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":40,\"method\":\"Target.closeTarget\",\"params\":{\"targetId\":\"FID-0000000001\"}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":40,\"result\":{\"success\":true}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"method\":\"Target.targetDestroyed\",\"params\":{\"targetId\":\"FID-0000000001\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":41,\"method\":\"LP.version\",\"params\":{}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":41,\"result\":{\"version\":\"1.1.0-nightly.11326+948d77378\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":42,\"method\":\"LP.getMarkdown\",\"params\":{}}"
++    },
++    {
++      "direction": "received",
++      "data": "{\"id\":42,\"error\":{\"code\":-31998,\"message\":\"FrameNotLoaded\"}}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":43,\"method\":\"LP.getMarkdown\",\"params\":[]}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":44,\"method\":\"LP.getMarkdown\",\"params\":3}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":45,\"method\":\"LP.version\",\"params\":[]}"
++    },
++    {
++      "direction": "sent",
++      "data": "{\"id\":46,\"method\":\"LP.version\",\"params\":3}"
++    }
++  ],
++  "requests": [
++    "/",
++    "/child"
++  ],
++  "documents": {
++    "child": "<!doctype html><h2 id=\"child\">Real child</h2><p>Child body.</p>",
++    "main": "<!doctype html><head><title>LP aliases</title></head><body><h1>Red Panda</h1><p id=\"scope\">Actual <strong>document</strong> and <a href=\"/next\">next</a>.</p><div hidden>Hidden content</div><iframe src=\"http://127.0.0.1:36427/child\"></iframe></body>"
++  },
++  "sourceURL": "http://127.0.0.1:36427",
++  "pid": 603696,
++  "nodeKinds": {
++    "root": 9,
++    "scope": 1
++  },
++  "isolatedMalformed": [
++    {
++      "method": "LP.getMarkdown",
++      "params": [],
++      "error": "Stopped after missing actual reply: isolated-LP.getMarkdown-object"
++    },
++    {
++      "method": "LP.getMarkdown",
++      "params": 3,
++      "error": "Stopped after missing actual reply: isolated-LP.getMarkdown-number"
++    },
++    {
++      "method": "LP.version",
++      "params": [],
++      "error": "Stopped after missing actual reply: isolated-LP.version-object"
++    },
++    {
++      "method": "LP.version",
++      "params": 3,
++      "error": "Stopped after missing actual reply: isolated-LP.version-number"
++    }
++  ],
++  "stderr": "$time=1793473174901 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:41071 max_connections=16120 max_browser_connections=16\n"
++}
+--- /dev/null
++++ b/docs/reference/lp-aliases/native-sideeffects.json
+@@ -0,0 +1,278 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "45af8e96e440e6293ddcaa05cc033eeacde02444c4c862321411a843e20f5d2d",
++  "rows": [
++    {
++      "label": "document",
++      "method": "Page.navigate",
++      "params": {
++        "url": "data:text/html,<!doctype html><body><h1>Real heading</h1><p id=scope>Actual <strong>text</strong> and <a href=https://example.test/next>link</a>.</p>"
++      },
++      "result": {
++        "frameId": "FID-0000000001",
++        "loaderId": "LID-0000000001"
++      }
++    },
++    {
++      "label": "install-real-custom-element",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "(()=>{globalThis.__lpEffects={constructors:0,nodeReads:0,elementReads:0};customElements.define('x-alias-effects',class extends HTMLElement{constructor(){super();__lpEffects.constructors++}});const el=document.createElement('x-alias-effects');el.textContent='Custom element text';document.body.append(el);globalThis.__lpRestore=()=>{};return __lpEffects})()",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    },
++    {
++      "label": "custom-element-before",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "Promise.resolve().then(()=>({...__lpEffects}))",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    },
++    {
++      "label": "custom-element-markdown",
++      "method": "LP.getMarkdown",
++      "params": {},
++      "result": {
++        "markdown": "\n# Real heading\n\nActual **text** and [link](https://example.test/next).\nCustom element text\n"
++      }
++    },
++    {
++      "label": "custom-element-after",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "Promise.resolve().then(()=>({...__lpEffects}))",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    },
++    {
++      "label": "poison-node-getters",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "(()=>{const saved=[];for(const[prototype,key]of[[Node.prototype,'nodeType'],[Node.prototype,'childNodes'],[Node.prototype,'textContent'],[CharacterData.prototype,'data']]){const descriptor=Object.getOwnPropertyDescriptor(prototype,key);saved.push([prototype,key,descriptor]);Object.defineProperty(prototype,key,{get(){__lpEffects.nodeReads++;throw Error('authored Node getter '+key)},configurable:true})}__lpRestore=()=>{for(const[prototype,key,descriptor]of saved)Object.defineProperty(prototype,key,descriptor)};return {...__lpEffects}})()",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    },
++    {
++      "label": "node-getters-markdown",
++      "method": "LP.getMarkdown",
++      "params": {},
++      "result": {
++        "markdown": "\n# Real heading\n\nActual **text** and [link](https://example.test/next).\nCustom element text\n"
++      }
++    },
++    {
++      "label": "node-getters-after-and-restore",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "(()=>{const value={...__lpEffects};__lpRestore();return value})()",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    },
++    {
++      "label": "poison-element-fronts",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "(()=>{const saved=[];for(const[prototype,key]of[[Element.prototype,'localName'],[HTMLElement.prototype,'hidden'],[HTMLAnchorElement.prototype,'href']]){const descriptor=Object.getOwnPropertyDescriptor(prototype,key);saved.push([prototype,key,descriptor]);Object.defineProperty(prototype,key,{get(){__lpEffects.elementReads++;throw Error('authored Element getter '+key)},configurable:true})}const original=Element.prototype.getAttribute;saved.push([Element.prototype,'getAttribute',Object.getOwnPropertyDescriptor(Element.prototype,'getAttribute')]);Object.defineProperty(Element.prototype,'getAttribute',{value:function(){__lpEffects.elementReads++;throw Error('authored attribute getter')},writable:true,configurable:true});__lpRestore=()=>{for(const[prototype,key,descriptor]of saved)Object.defineProperty(prototype,key,descriptor)};return {...__lpEffects}})()",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    },
++    {
++      "label": "element-fronts-markdown",
++      "method": "LP.getMarkdown",
++      "params": {},
++      "result": {
++        "markdown": "\n# Real heading\n\nActual **text** and [link](https://example.test/next).\nCustom element text\n"
++      }
++    },
++    {
++      "label": "element-fronts-after-and-restore",
++      "method": "Runtime.evaluate",
++      "params": {
++        "expression": "(()=>{const value={...__lpEffects};__lpRestore();return value})()",
++        "awaitPromise": true,
++        "returnByValue": true
++      },
++      "result": {
++        "result": {
++          "type": "object",
++          "value": {
++            "constructors": 1,
++            "nodeReads": 0,
++            "elementReads": 0
++          }
++        }
++      }
++    }
++  ],
++  "pid": 606245,
++  "stderr": "$time=1793473607107 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:46215 max_connections=16120 max_browser_connections=16\n",
++  "events": [
++    {
++      "method": "Target.targetCreated",
++      "params": {
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": false,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        }
++      }
++    },
++    {
++      "method": "Target.attachedToTarget",
++      "params": {
++        "sessionId": "SID-1",
++        "targetInfo": {
++          "url": "about:blank",
++          "title": "",
++          "targetId": "FID-0000000001",
++          "attached": true,
++          "type": "page",
++          "canAccessOpener": false,
++          "browserContextId": "BID-1"
++        },
++        "waitingForDebugger": false
++      }
++    },
++    {
++      "method": "Page.frameStartedNavigating",
++      "params": {
++        "frameId": "FID-0000000001",
++        "url": "data:text/html,<!doctype html><body><h1>Real heading</h1><p id=scope>Actual <strong>text</strong> and <a href=https://example.test/next>link</a>.</p>",
++        "loaderId": "LID-0000000001",
++        "navigationType": "differentDocument"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStartedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Runtime.executionContextsCleared",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameNavigated",
++      "params": {
++        "type": "Navigation",
++        "frame": {
++          "id": "FID-0000000001",
++          "loaderId": "LID-0000000001",
++          "url": "data:text/html,<!doctype html><body><h1>Real heading</h1><p id=scope>Actual <strong>text</strong> and <a href=https://example.test/next>link</a>.</p>",
++          "domainAndRegistry": "",
++          "securityOrigin": "://",
++          "mimeType": "text/html",
++          "adFrameStatus": {
++            "adFrameType": "none"
++          },
++          "secureContextType": "InsecureScheme",
++          "crossOriginIsolatedContextType": "NotIsolated",
++          "gatedAPIFeatures": []
++        }
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "DOM.documentUpdated",
++      "params": {},
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.domContentEventFired",
++      "params": {
++        "timestamp": 70091
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.loadEventFired",
++      "params": {
++        "timestamp": 70091
++      },
++      "sessionId": "SID-1"
++    },
++    {
++      "method": "Page.frameStoppedLoading",
++      "params": {
++        "frameId": "FID-0000000001"
++      },
++      "sessionId": "SID-1"
++    }
++  ]
++}

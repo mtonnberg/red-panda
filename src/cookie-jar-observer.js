@@ -12,16 +12,25 @@ function readContext(value){
  return value;
 }
 const snapshot=cookie=>record({name:cookie.key,value:cookie.value,domain:cookie.domain,hostOnly:cookie.hostOnly,path:cookie.path,expires:cookie.expiryTime(),secure:!!cookie.secure,httpOnly:!!cookie.httpOnly,sameSite:cookie.sameSite??'lax'});
+function notify(jar,kind,cookie){const state=observers.get(jar);if(!state)return;const value=snapshot(cookie);for(const callback of [...state.listeners])callback(kind,value);}
+// Explicit inspector deletion is a successful real mutation producer. Keep
+// expiry pruning and blanket clearing on their existing separate paths.
+export async function removeObservedCookie(jar,domain,path,name){
+ const store=jar.store;return new Promise((resolve,reject)=>apply(store.findCookie,store,[domain,path,name,(error,cookie)=>{
+  if(error){reject(error);return}if(!cookie){resolve(false);return}
+  apply(store.removeCookie,store,[domain,path,name,error=>{if(error){reject(error);return}if(cookie.expiryTime()>Date.now())notify(jar,'deleted',cookie);resolve(true);}]);
+ }]));
+}
 export function observeCookieJar(jar,listener){
  let state=observers.get(jar);
  if(!state){
   const store=jar.store,put=store.putCookie,find=store.findCookie,read=jar.getCookies;
   state=record({listeners:new Set()});observers.set(jar,state);
-  const notify=(kind,cookie)=>{const value=snapshot(cookie);for(const callback of [...state.listeners])callback(kind,value);};
+  const publish=(kind,cookie)=>notify(jar,kind,cookie);
   const mutation=(callback,operation,done)=>{if(typeof callback==='function')return operation((error,value)=>{if(!error)done();callback(error,value);});return operation(undefined).then(value=>{done();return value;});};
   // BrowserContexts use the real synchronous MemoryCookieStore. Its update
   // method delegates to putCookie, so observing put avoids duplicate updates.
-  store.putCookie=function(cookie,callback){let old;apply(find,this,[cookie.domain,cookie.path,cookie.key,(_error,value)=>{old=value;}]);return mutation(callback,cb=>apply(put,this,[cookie,cb]),()=>{if(cookie.expiryTime()<=Date.now()){if(old&&old.expiryTime()>Date.now())notify('deleted',old);}else notify('changed',cookie);});};
+  store.putCookie=function(cookie,callback){let old;apply(find,this,[cookie.domain,cookie.path,cookie.key,(_error,value)=>{old=value;}]);return mutation(callback,cb=>apply(put,this,[cookie,cb]),()=>{if(cookie.expiryTime()<=Date.now()){if(old&&old.expiryTime()>Date.now())publish('deleted',old);}else publish('changed',cookie);});};
   // Native expiry pruning and CDP jar clearing are silent; only successful
   // set/replace and expired-set deletion publish mutation notifications.
   jar.getCookies=function(url,...args){return apply(read,this,[readContext(url),...args]);};

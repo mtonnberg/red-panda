@@ -129,18 +129,26 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Experimental storage | `--experimental-features serviceworker` enables secure-context Cache and threaded service-worker lifecycle; in-memory context storage |
 | CLI | Batch `fetch`, `serve`, `mcp`, saved-script `run`, `version`, per-page JSON errors, preloads, JSON/Netscape cookie import/export |
 | CDP targets | Discovery, isolated cookie contexts, pages, flattened sessions, attach/detach/disposal |
-| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, actual isolated VM worlds over shared DOM implementations, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; by-reference serialization preserves thrown primitives/Symbols without calling authored getters |
+| CDP page/runtime | Document/fragment/history navigation, reload, frame tree, actual isolated VM worlds over shared DOM implementations, evaluation/functions/promises, persisted scripts, lexical names, heap measurements, handles/properties and preloads; thrown objects retain actual handles even when returnByValue is requested; Page close/stop with real request cancellation and buffered-prefix completion |
 | CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, nested frame/shadow keyboard focus, Enter form activation, Tab traversal, surrogate quads/boxes/hit testing and viewport dimensions |
-| CDP network/storage | Request/response events, response bodies, cookies, per-page extra HTTP headers, user agent, language/platform overrides |
+| CDP network/storage | Request/response events, bounded byte-accurate response and POST retention, cookie deletion/clearing and attached writes, UTF-8 cookie transport, per-page extra HTTP headers, user agent, language/platform overrides |
 | Rendering | Text-only CLI dumps, CDP screenshots/PDF streams and MCP screenshots, with real font rasterization and selectable PDF text |
-| Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64 |
+| Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64; `LP.version`, canonical-node `LP.getMarkdown`, and measured one-shot JavaScript dialog handling |
 | WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
 | MCP / saved scripts | Stdio and HTTP MCP sessions, extraction/actions/waits/cookies/downloads; saved scripts with top-level await/return and synchronous browser actions |
-| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, responses, preloads, headers, waits, keyboard/text input, coordinate clicks, cookies, screenshots, PDFs and `content` |
+| PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, response text/bytes, preloads, headers, waits, keyboard/text input, coordinate clicks, cookies/deletion, typed permission/geolocation overrides, screenshots, PDFs and `content` |
 
 Unsupported commands return a CDP error with code `-32601`. HTTP discovery
 provides `/json/version`, `/json`, `/json/list`, and `/health`. Puppeteer should
 connect with `defaultViewport: null` (already configured by the PureScript FFI).
+
+Permission controls affect actual browser-owned state and queued geolocation
+callbacks. Main/frame results have measured native controls; utility/worker and
+retained foreign-target ownership remain incomplete. The private `LP.getMarkdown`
+adapter reads canonical DOM state without cloning nodes or calling authored DOM
+getters. Active document stylesheets currently produce
+`UnsupportedMarkdownStyle`; adopted/shadow styles and full rendering policy are
+unfinished. Red Panda retains its own product, user-agent and client-hint branding.
 
 Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), including
 flow/flex width calculations, word wrapping, boxes, hit testing and actual scroll state. It is not a CSS renderer. Intersection

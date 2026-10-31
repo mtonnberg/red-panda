@@ -1,15 +1,18 @@
 module RedPanda.Puppeteer
-  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, PreloadScript, Header, ByteArray
+  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, PreloadScript, Header, ByteArray, Cookie
+  , Permission(..), GeolocationOptions
   , connect, disconnect, createContext, closeContext, newPage, closePage
-  , goto, gotoResponse, responseStatus, responseText
+  , goto, gotoResponse, responseStatus, responseText, responseBytes
   , withNavigation, goBack, goForward, reload, pageUrl
   , childFrame, evaluateFrameString, gotoFrame, focusFrame
   , screenshot, pdf, byteLength, signature
   , evaluateOnNewDocument, removePreload
   , setExtraHTTPHeaders, setUserAgent
+  , overridePermissions, clearPermissionOverrides, setGeolocation, clearGeolocation
   , click, focus, typeText, pressKey, insertText
   , UtilityWorld, withUtilityWorld, evaluateUtilityString
   , evaluateString, textContent, waitForSelector, waitForFunction, dispatchClick, content, cookieNames, setCookie
+  , cookies, cookieName, cookieValue, deleteCookie
   , evaluateHandle, queryObjects, evaluateHandleString, disposeHandle, withHandle
   , Async, fromAsync, quote
   ) where
@@ -31,6 +34,12 @@ foreign import data JSHandle :: Type
 foreign import data PendingNavigation :: Type
 foreign import data ByteArray :: Type
 foreign import data ProtocolSession :: Type
+foreign import data Cookie :: Type
+
+-- This bounded enum exposes the permissions exercised against this backend.
+data Permission = GeolocationPermission | NotificationsPermission
+
+type GeolocationOptions = { latitude :: Number, longitude :: Number, accuracy :: Number }
 
 newtype UtilityWorld = UtilityWorld { session :: ProtocolSession, contextId :: Int }
 
@@ -77,10 +86,15 @@ foreign import byteLength :: ByteArray -> Int
 foreign import signature :: ByteArray -> String
 foreign import responseStatus :: Response -> Int
 foreign import responseTextImpl :: Response -> Async String
+foreign import responseBytesImpl :: Response -> Async ByteArray
 foreign import evaluateOnNewDocumentImpl :: Page -> String -> Async String
 foreign import removePreloadImpl :: Page -> String -> Async Unit
 foreign import setExtraHTTPHeadersImpl :: Page -> Array Header -> Async Unit
 foreign import setUserAgentImpl :: Page -> String -> Async Unit
+foreign import overridePermissionsImpl :: BrowserContext -> String -> Array String -> Async Unit
+foreign import clearPermissionOverridesImpl :: BrowserContext -> Async Unit
+foreign import setGeolocationImpl :: Page -> GeolocationOptions -> Async Unit
+foreign import clearGeolocationImpl :: Page -> Async Unit
 foreign import focusImpl :: Page -> String -> Async Unit
 foreign import clickImpl :: Page -> String -> Async Unit
 foreign import typeTextImpl :: Page -> String -> String -> Async Unit
@@ -96,6 +110,10 @@ foreign import waitForFunctionImpl :: Page -> String -> Async Unit
 foreign import contentImpl :: Page -> Async String
 foreign import setCookieImpl :: BrowserContext -> String -> String -> String -> Async Unit
 foreign import cookieNamesImpl :: BrowserContext -> Async (Array String)
+foreign import cookiesImpl :: BrowserContext -> Async (Array Cookie)
+foreign import cookieName :: Cookie -> String
+foreign import cookieValue :: Cookie -> String
+foreign import deleteCookieImpl :: BrowserContext -> Cookie -> Async Unit
 
 connect :: String -> Aff Browser
 connect endpoint = fromAsync $ connectImpl endpoint
@@ -177,6 +195,9 @@ pdf page = fromAsync $ pdfImpl page
 responseText :: Response -> Aff String
 responseText response = fromAsync $ responseTextImpl response
 
+responseBytes :: Response -> Aff ByteArray
+responseBytes response = fromAsync $ responseBytesImpl response
+
 evaluateOnNewDocument :: Page -> String -> Aff PreloadScript
 evaluateOnNewDocument page source = PreloadScript <$> fromAsync (evaluateOnNewDocumentImpl page source)
 
@@ -188,6 +209,22 @@ setExtraHTTPHeaders page headers = fromAsync $ setExtraHTTPHeadersImpl page head
 
 setUserAgent :: Page -> String -> Aff Unit
 setUserAgent page userAgent = fromAsync $ setUserAgentImpl page userAgent
+
+permissionName :: Permission -> String
+permissionName GeolocationPermission = "geolocation"
+permissionName NotificationsPermission = "notifications"
+
+overridePermissions :: BrowserContext -> String -> Array Permission -> Aff Unit
+overridePermissions context origin permissions = fromAsync $ overridePermissionsImpl context origin (map permissionName permissions)
+
+clearPermissionOverrides :: BrowserContext -> Aff Unit
+clearPermissionOverrides context = fromAsync $ clearPermissionOverridesImpl context
+
+setGeolocation :: Page -> GeolocationOptions -> Aff Unit
+setGeolocation page options = fromAsync $ setGeolocationImpl page options
+
+clearGeolocation :: Page -> Aff Unit
+clearGeolocation page = fromAsync $ clearGeolocationImpl page
 
 focus :: Page -> String -> Aff Unit
 focus page selector = fromAsync $ focusImpl page selector
@@ -247,3 +284,10 @@ setCookie context url name value = fromAsync $ setCookieImpl context url name va
 
 cookieNames :: BrowserContext -> Aff (Array String)
 cookieNames context = fromAsync $ cookieNamesImpl context
+
+cookies :: BrowserContext -> Aff (Array Cookie)
+cookies context = fromAsync $ cookiesImpl context
+
+-- Delete the actual complete Cookie produced by context.cookies().
+deleteCookie :: BrowserContext -> Cookie -> Aff Unit
+deleteCookie context cookie = fromAsync $ deleteCookieImpl context cookie

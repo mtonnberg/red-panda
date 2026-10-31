@@ -1,0 +1,17 @@
+# Missing CDP cookie actions: Native-first preparation
+
+All controls and implementation work in this directory are UNRUN. This is an owned no-Git source/native copy of Root78dbea8; Root, the prior cookie handoffs and current Coverage runtime reservation remain untouched.
+
+Current gaps are Network.deleteCookies and Storage.clearCookies, plus attached-session Storage.setCookies dispatch. Existing attached Storage.getCookies delegates to the connection with its actual parent session, whereas attached Storage.setCookies falls through. Do not infer that new methods use exactly the getter's semantics until their Native ownership/error controls run.
+
+The existing CDP metadata observer already watches successful actual MemoryCookieStore removeCookie, removeCookies and removeAllCookies calls. New handlers should delete the real owned jar records and reuse those hooks, preserving group/order history, original callback timing and Promise returns. Do not filter inspector output or install new blanket jar wrappers. CookieStore/Document/CLI identities and policies stay in place; deletion/clear event behavior needs actual Native observation.
+
+Native reference use is limited to pinned948d773786 protocol signatures/dispatch contracts. It declares deleteCookies name plus optional URL/domain/path and Storage context selectors. No target engine code is copied/imported and no matching algorithm is inferred from those signatures.
+
+Prepare two independent quiet profiles. The filter profile loads one real127.0.0.1 document and seeds actual named/nameless, host/domain, root/deep-path, sibling-site and expired cookies through already verified write APIs. For each new delete command, record the actual before/after jar, real same-site request Cookie header, retained Document/CookieStore identity and observed change events. Cases distinguish name-only, URL-derived domain/path, explicit domain/path, conflicting URL versus fields, path-only, empty name, malformed URL and shape failures. Existing get-all/getter behavior is merely the readout, not re-calibrated.
+
+The ownership profile starts genuinely unloaded, probes context-before-schema ordering for clear and delete, creates a sole explicit context, then checks root versus attached writes/clears with absent/null/actual/unknown context identifiers. It records actual callback-backed metadata order after clearing and reseeding, and behavior after disposal. A separate fresh default-context profile can establish default versus sole-explicit aliasing without assuming Native supports multiple loaded contexts. Root's already supported parallel-context extension must retain actual separation in later candidate regressions.
+
+Implementation should be small after facts: a Host-only actual-store delete/filter helper, Session/Connection dispatch for the two missing methods, and attached Storage.setCookies delegation/scoping. Validate schema and context in measured order; await real backend mutation. Preserve actual CookieJar domain/path/expiry/HttpOnly data, URL eligibility, authority and metadata callbacks. No fake successful clear/write and no public-field inference of a browsing-context owner.
+
+Do not redo the38 write-validation controls or existing metadata profiles. Native/candidate runs, new source handlers and tests await Parent's future explicit runtime grant after Coverage. No canonical ports, new dependencies or native build are required.

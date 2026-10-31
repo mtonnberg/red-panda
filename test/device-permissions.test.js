@@ -56,10 +56,11 @@ test('Permissions reads descriptors on the call stack, preserves real rejection 
  assert.deepEqual(plain(result),{events:['get','sync'],name:'geolocation',state:'prompt',target:true,rejection:{name:'TypeError',message:'invalid argument',realm:true},changed:1});
  const sentinel={original:true};const promise=w.navigator.permissions.query({get name(){throw sentinel}});await assert.rejects(promise,error=>error===sentinel);
 });
-test('unsupported permission grants and location overrides return actual protocol errors and never acknowledge a fabricated grant',async t=>{
+test('permission grants and location overrides change actual query state and real callback values',async t=>{
  const service=await serve({port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});
  const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
- await assert.rejects(client.send('Browser.grantPermissions',{permissions:['geolocation']}),{code:-32601});
- await assert.rejects(client.send('Emulation.setGeolocationOverride',{latitude:1,longitude:2,accuracy:3},sessionId),{code:-32601});
- const value=await client.send('Runtime.evaluate',{expression:'new Promise(resolve=>navigator.geolocation.getCurrentPosition(()=>resolve("invented"),e=>resolve(e.code)))',returnByValue:true,awaitPromise:true},sessionId);assert.equal(value.result.value,1);
+ await client.send('Browser.grantPermissions',{permissions:['geolocation']});
+ await client.send('Emulation.setGeolocationOverride',{latitude:1,longitude:2,accuracy:3},sessionId);
+ const value=await client.send('Runtime.evaluate',{expression:'new Promise(resolve=>navigator.geolocation.getCurrentPosition(p=>resolve([p.coords.latitude,p.coords.longitude,p.coords.accuracy,p instanceof GeolocationPosition]),e=>resolve([e.code])))',returnByValue:true,awaitPromise:true},sessionId);assert.deepEqual(value.result.value,[1,2,3,true]);
+ const state=await client.send('Runtime.evaluate',{expression:'navigator.permissions.query({name:"geolocation"}).then(s=>s.state)',returnByValue:true,awaitPromise:true},sessionId);assert.equal(state.result.value,'granted');
 });

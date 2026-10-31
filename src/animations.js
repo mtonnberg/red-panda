@@ -6,6 +6,7 @@ import {createRequire} from 'node:module';
 import {platformFactoryRecord,registerPlatformFactory} from './platform-factories.js';
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import {onFrameRetirement} from './frame-activity.js';
+import {captureWindowTaskOwner} from './window-lifecycle-timers.js';
 const require=createRequire(import.meta.url);
 const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
 const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
@@ -79,12 +80,12 @@ export function installAnimations(page,realm){
  if(installed.has(realm))return;
  registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
  const Promise=realm.Promise,convertListener=EventListener.convert;
- const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
+ const taskOwner=captureWindowTaskOwner(page,realm);
  const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,playbackConstructor:null,disposed:false,automatic:new Set(),events:new Set()});
  const task=(callback,automatic=false)=>{
   if(runtime.disposed)return;
   const tasks=automatic?runtime.automatic:runtime.events;let id;
-  id=apply(setTimer,realm,[()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0]);tasks.add(id);
+  id=taskOwner.schedule(()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0);tasks.add(id);
  };
  function event(value,type,bubbles,cancelable,composed,currentTime,timelineTime){
   // Setup preserves the exact object allocated by its actual VM constructor.
@@ -138,7 +139,7 @@ export function installAnimations(page,realm){
   eventTime(value,key){return key==='currentTime'||key==='timelineTime'?playbackEvents.get(value)[key]:undefined},
  });
  realm.eval(`(${factory.toString()})`)(realm,bridge);
- const clear=tasks=>{for(const id of tasks)apply(clearTimer,realm,[id]);tasks.clear()};
+ const clear=tasks=>{for(const id of tasks)taskOwner.cancel(id);tasks.clear()};
  onFrameRetirement(realm,()=>{clear(runtime.automatic);clear(runtime.events)});
  page.documentAbort?.signal.addEventListener('abort',()=>{runtime.disposed=true;clear(runtime.automatic);clear(runtime.events)},{once:true});
  installed.set(realm,runtime);

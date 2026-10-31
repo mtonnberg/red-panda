@@ -2,7 +2,7 @@ module Test.Main where
 
 import Prelude
 
-import Data.Foldable (elem)
+import Data.Foldable (elem, any, for_)
 import Data.Either (Either(..))
 import Effect (Effect)
 import Effect.Aff (Aff, bracket, launchAff_, throwError, attempt)
@@ -17,9 +17,67 @@ foreign import fixtureUrl :: Fixture -> String
 foreign import fixtureEndpoint :: Fixture -> String
 foreign import fixtureStreamUrl :: Fixture -> String
 foreign import fixtureSocketUrl :: Fixture -> String
+foreign import fixtureCapabilityOrigin :: Fixture -> String
 
 assert :: String -> Boolean -> Aff Unit
 assert label ok = if ok then log $ "PASS " <> label else throwError $ error $ "FAIL " <> label
+
+-- PureScript sequences every real Puppeteer operation and owns both resources
+-- and override cleanup. The page expressions only observe browser API values.
+capabilityChecks :: Fixture -> Browser.Browser -> Aff Unit
+capabilityChecks fixture browser =
+  bracket (Browser.createContext browser) Browser.closeContext \context ->
+    bracket (Browser.newPage context) Browser.closePage \page ->
+      bracket (pure unit)
+        (\_ -> Browser.clearGeolocation page *> Browser.clearPermissionOverrides context)
+        \_ -> do
+          let origin = fixtureCapabilityOrigin fixture
+          status <- Browser.goto page $ origin <> "/capability"
+          assert "typed capability checks navigate a real isolated context" $ status == 200
+          initialPermission <- Browser.evaluateString page "navigator.permissions.query({name:'geolocation'}).then(status=>status.state)"
+          assert "fresh geolocation permission starts prompt" $ initialPermission == "prompt"
+          Browser.setGeolocation page { latitude: 59.95, longitude: 30.31667, accuracy: 7.0 }
+          denied <- Browser.evaluateString page "new Promise(resolve=>navigator.geolocation.getCurrentPosition(()=>resolve('unexpected position'),error=>resolve(JSON.stringify([error.code,error.message]))))"
+          assert "configured coordinates still require an actual permission grant" $ denied == "[1,\"User denied Geolocation\"]"
+          Browser.overridePermissions context origin [ Browser.GeolocationPermission ]
+          granted <- Browser.evaluateString page "navigator.permissions.query({name:'geolocation'}).then(status=>status.state)"
+          assert "context.overridePermissions changes the actual query result" $ granted == "granted"
+          located <- Browser.evaluateString page "new Promise((resolve,reject)=>navigator.geolocation.getCurrentPosition(position=>resolve(JSON.stringify([position.coords.latitude,position.coords.longitude,position.coords.accuracy,position instanceof GeolocationPosition,position.coords instanceof GeolocationCoordinates])),reject))"
+          assert "page.setGeolocation supplies genuine browser position values" $ located == "[59.95,30.31667,7,true,true]"
+          invalid <- attempt $ Browser.setGeolocation page { latitude: 91.0, longitude: 0.0, accuracy: 0.0 }
+          assert "Puppeteer rejects invalid typed geolocation options" $ case invalid of
+            Left _ -> true
+            Right _ -> false
+          retained <- Browser.evaluateString page "new Promise((resolve,reject)=>navigator.geolocation.getCurrentPosition(position=>resolve(JSON.stringify([position.coords.latitude,position.coords.longitude,position.coords.accuracy])),reject))"
+          assert "a rejected Puppeteer option keeps the previous real override" $ retained == "[59.95,30.31667,7]"
+          Browser.clearGeolocation page
+          unavailable <- Browser.evaluateString page "new Promise(resolve=>navigator.geolocation.getCurrentPosition(()=>resolve('unexpected position'),error=>resolve(JSON.stringify([error.code,error.message]))))"
+          assert "clearing coordinates produces the real unavailable callback" $ unavailable == "[2,\"Position unavailable\"]"
+          Browser.overridePermissions context origin [ Browser.NotificationsPermission ]
+          notificationPermission <- Browser.evaluateString page "navigator.permissions.query({name:'notifications'}).then(status=>status.state)"
+          assert "the typed notifications permission reaches the real controller" $ notificationPermission == "granted"
+          Browser.clearPermissionOverrides context
+          reset <- Browser.evaluateString page "Promise.all([navigator.permissions.query({name:'geolocation'}),navigator.permissions.query({name:'notifications'})]).then(statuses=>JSON.stringify(statuses.map(status=>status.state)))"
+          assert "clearPermissionOverrides resets actual permission queries" $ reset == "[\"prompt\",\"prompt\"]"
+          resetPosition <- Browser.evaluateString page "new Promise(resolve=>navigator.geolocation.getCurrentPosition(()=>resolve('unexpected position'),error=>resolve(String(error.code))))"
+          assert "reset permission restores the real denied geolocation result" $ resetPosition == "1"
+          Browser.setCookie context origin "café" "雪"
+          stored <- Browser.cookies context
+          assert "Puppeteer returns the actual Unicode Cookie producer" $ any (\cookie -> Browser.cookieName cookie == "café" && Browser.cookieValue cookie == "雪") stored
+          cookieBytes <- Browser.evaluateString page "fetch('/cookie-bytes').then(response=>response.text())"
+          assert "the Unicode Cookie reaches real HTTP as UTF8 bytes" $ cookieBytes == "[99,97,102,195,169,61,233,155,170]"
+          for_ stored \cookie -> when (Browser.cookieName cookie == "café") $ Browser.deleteCookie context cookie
+          remaining <- Browser.cookies context
+          assert "context.deleteCookie removes its actual complete Cookie" $ not $ elem "café" $ map Browser.cookieName remaining
+          deletedBytes <- Browser.evaluateString page "fetch('/cookie-bytes').then(response=>response.text())"
+          assert "cookie deletion changes the next real HTTP request" $ deletedBytes == "[]"
+          response <- Browser.gotoResponse page $ origin <> "/binary"
+          bytes <- Browser.responseBytes response
+          assert "HTTPResponse.content preserves actual nonUTF8 response bytes" $ Browser.responseStatus response == 200 && Browser.byteLength bytes == 6 && Browser.signature bytes == "00ff80c32841"
+          invalidText <- attempt $ Browser.responseText response
+          assert "the actual Puppeteer text decoder rejects nonUTF8 bytes" $ case invalidText of
+            Left _ -> true
+            Right _ -> false
 
 main :: Effect Unit
 main = launchAff_ $
@@ -311,5 +369,6 @@ main = launchAff_ $
           void $ Browser.evaluateString page "psSharedWorker.port.close();URL.revokeObjectURL(psSharedSource);delete globalThis.psSharedWorker;delete globalThis.psSharedSource;String(true)"
         navigationApiValues <- Browser.evaluateString page "(async()=>{const original=document,events=[],listener=event=>events.push([event.type,event.isTrusted]);for(const type of['navigate','currententrychange','navigatesuccess'])navigation.addEventListener(type,listener);const state={nested:{value:42}},result=navigation.navigate('#purescript-navigation',{state});state.nested.value=99;const committed=await result.committed,finished=await result.finished;for(const type of['navigate','currententrychange','navigatesuccess'])navigation.removeEventListener(type,listener);return JSON.stringify([document===original,location.hash,navigation.currentEntry.getState().nested.value,typeof committed,typeof finished,events])})()"
         assert "PureScript Puppeteer completes genuine same-document Navigation events and copied state" $ navigationApiValues == "[true,\"#purescript-navigation\",42,\"undefined\",\"undefined\",[[\"navigate\",true],[\"currententrychange\",true],[\"navigatesuccess\",true]]]"
+        capabilityChecks fixture browser
         Browser.closePage page
-        log "PureScript Puppeteer integration: 100 checks passed"
+        log "PureScript Puppeteer integration: 117 checks passed"

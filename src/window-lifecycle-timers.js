@@ -9,6 +9,17 @@ import {fetchStopAuthority} from './fetch.js';
 import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
 const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
 const queueTask=setImmediate,cancelTask=clearImmediate;
+export function captureWindowTaskOwner(page,window){
+ const record=pages.get(page);
+ if(!record||record.window!==window)throw new TypeError('The actual initialized Window task owner is required');
+ return record.internalTasks;
+}
+export function stopPageLoading(page){
+ const record=pages.get(page);if(!record||record.disposed)return;
+ // Protocol entry has no outer Runtime.evaluate VM guard. Enter the actual
+ // captured context so authored abort handlers retain the same real watchdog.
+ return record.invocation.invoke(record.stopLoads,undefined,[],record.options);
+}
 function publicMethods(bridge){'use strict';return{
  setTimeout(handler,delay=0,...args){return bridge.timer(this,false,arguments.length,handler,delay,args)},
  setInterval(handler,delay=0,...args){return bridge.timer(this,true,arguments.length,handler,delay,args)},
@@ -59,6 +70,14 @@ export function installWindowLifecycleTimers(page,window){
    for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
   },
  });
+ // Trusted startup clients capture this Host-only authority once. Internal
+ // work shares the actual Window task queue and watchdog without consulting
+ // authored globals, timer functions or a public owner/brand property.
+ record.internalTasks=Object.freeze(Object.assign(Object.create(null),{
+  schedule:(callback,delay)=>bridge.timer(window,false,2,callback,delay,[]),
+  cancel:handle=>cancel(record,handle),
+ }));
+ record.stopLoads=()=>bridge.stop(window);
  const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
  for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});
  const cancelTimers=()=>{for(const id of [...record.timers.keys()])cancel(record,id);record.timers.clear();record.intervals=0};

@@ -1,0 +1,3 @@
+Narrow queue-only Node24 acceptance: 28 tests and six controlled state projections pass; one of seven Native diagnostics remains unmet
+
+All28 passed, including unchanged originalAnimation12, timer12, actualV8allocation2 and authority/eventwatchdog2. Six state projections match. Six of seven Native wholeobjects match; actualiframe removal omits queuedfinish whileNative still emits it. This lifetime/ordering gap remains explicit. Rawchild641145 entered200ms guardedloop and recovered/query/futureautomatic producer/close, exited0. No late poison exceptions after exactdescriptor restoration. No Promise-watchdog recovery or completeNative parity claimed.

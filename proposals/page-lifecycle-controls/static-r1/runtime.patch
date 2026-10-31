@@ -1,0 +1,292 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,5 +1,6 @@
+ import {withLocationFactory} from './location-factory.js';
+ import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
++import {beginNavigationTransfer,navigationResponseReader,finishNavigationReader,endNavigationTransfer,stoppedNavigationError} from './navigation-transfer.js';
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+ import {httpResponseCookie} from './http-cookie-ingress.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
+@@ -433,7 +434,7 @@
+   requestFailed(id, error) {
+     this.activeRequests.delete(id);
+     this.lastActivity = Date.now();
+-    this.emit('requestFailed', { id, message: error.message, timestamp: now() });
++    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(stoppedNavigationError(error)?{canceled:true}:{}) });
+   }
+ 
+   setExtraHTTPHeaders(values) {
+@@ -577,13 +578,20 @@
+         const chunks = [];
+         let size = 0;
+         const reader = response.body?.getReader();
+-        if (reader) while (true) {
+-          const { done, value } = await reader.read();
+-          if (done) break;
+-          size += value.byteLength;
+-          if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
+-          chunks.push(value);
+-        }
++        const navigationReader=type==='Document'?navigationResponseReader(this,init.signal,reader):null;
++        try{
++          if (reader) while (true) {
++            const { done, value } = await reader.read();
++            if (done||navigationReader?.finishedEarly) break;
++            size += value.byteLength;
++            if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
++            chunks.push(value);
++          }
++          // A real timeout, replacement or Page.close takes precedence over an
++          // early finish. Neither transport failure nor foreign bytes become a
++          // successful prefix merely because stop ran in the same checkpoint.
++          if(navigationReader)signal.throwIfAborted();
++        }finally{finishNavigationReader(navigationReader)}
+         const bytes = Buffer.concat(chunks);
+         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
+           { status: response.status, statusText: response.statusText, headers: response.headers });
+@@ -617,6 +625,7 @@
+     this.performanceNavigationType = historyMode === 'reload' ? 'reload' : historyMode === 'traverse' ? 'back_forward' : 'navigate';
+     this.loaderId = randomUUID();
+     this.emit('navigationStarted');
++    const transfer=beginNavigationTransfer(this,this.navigationAbort);
+     try {
+       let html;
+       let response;
+@@ -736,9 +745,9 @@
+       if (waitMs > 0) await delay(waitMs);
+       return { url: this.url, status: this.status };
+     } catch (error) {
+-      if (generation === this.navigationGeneration) this.emit('navigationError', error);
++      if (generation === this.navigationGeneration&&!stoppedNavigationError(error)) this.emit('navigationError', error);
+       throw error;
+-    } finally { if (captureRedirect) this.off('navigationRequested', captureRedirect); }
++    } finally { endNavigationTransfer(transfer);if (captureRedirect) this.off('navigationRequested', captureRedirect); }
+   }
+ 
+   evaluate(expression) {
+diff --git a/src/cdp.js b/src/cdp.js
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,5 +1,6 @@
+ import{setWindowDeviceMetrics}from'./window-viewport.js';
+ import {consoleProtocolType} from './console.js';
++import {stopPageLoading} from './window-lifecycle-timers.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {ProtocolSerializer} from './protocol-serialization.js';
+ import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+@@ -20,6 +21,8 @@
+ 
+ const timestamp = () => performance.now() / 1000;
+ const protocolErrors = new WeakSet();
++const protocolCompletions=new WeakMap();
++function completedResponse(result,complete){const token=Object.create(null);protocolCompletions.set(token,{result,complete});return token;}
+ // DOM lifecycle is owned by supportsDOM/runDOM above Session's generic branch.
+ // Keep existing known Root extensions explicit; arbitrary suffixes never brand
+ // a wire method as a supported domain command.
+@@ -172,7 +175,7 @@
+       this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
+     });
+     listen('requestFailed', request => this.event('Network.loadingFailed', {
+-      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
++      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: request.canceled??false,
+     }));
+     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
+       type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+@@ -283,6 +286,8 @@
+     }
+     if (SESSION_DISABLE_METHODS.has(method)) { if(method==='Runtime.disable'&&this.domains.has('Runtime'))this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
+     switch (method) {
++      case 'Page.close':return completedResponse({},()=>page.close());
++      case 'Page.stopLoading':stopPageLoading(page);return {};
+       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
+       case 'Page.getLayoutMetrics': {
+         const { width, height } = page.layout.viewport, { x, y } = page.layout.scroll;
+@@ -489,6 +494,7 @@
+     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
+   }
+   close() {
++    if(this.closed)return;this.closed=true;
+     this.serializer.close();
+     this.utility.close();
+     clearTimeout(this.idleTimer);
+@@ -514,6 +520,7 @@
+       if (this.autoAttach) this.attach(page);
+     };
+     this.destroyed = page => {
++      for(const session of [...this.sessions.values()])if(session.page===page)this.detach(session.id,{targetClosed:true});
+       if (this.discover) this.send({ method: 'Target.targetDestroyed', params: { targetId: page.id } });
+     };
+     browser.on('targetCreated', this.created);
+@@ -530,14 +537,15 @@
+     this.send({ method: 'Target.attachedToTarget', params: { sessionId: session.id, targetInfo: targetInfo(page), waitingForDebugger: false } });
+     return session.id;
+   }
+-  detach(id) {
++  detach(id,{targetClosed=false}={}) {
+     const session = this.sessions.get(id);
+     if (!session) return;
+     session.close(); this.sessions.delete(id);
+-    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id } });
++    if(targetClosed)this.send({method:'Inspector.detached',params:{reason:'Render process gone.'},sessionId:id});
++    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id,...(targetClosed?{reason:'Render process gone.'}:{}) } });
+   }
+   async receive(raw) {
+-    let message;
++    let message,dispatchedSession,replied=false;
+     try {
+       message = JSON.parse(raw);
+       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+@@ -548,10 +556,17 @@
+       const { method, params = {}, sessionId } = message;
+       const session = this.sessions.get(sessionId ?? '');
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
++      dispatchedSession=session;
+       const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+-      this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
++      // Closed sessions have no receiver for their pending command replies.
++      // Page.close itself completes only after its successful response below.
++      if(session&&this.sessions.get(session.id)!==session)return;
++      const completion=protocolCompletions.get(result);
++      this.send({ id: message.id, result:completion?completion.result:result, ...(sessionId ? { sessionId } : {}) });replied=true;
++      completion?.complete();
+     } catch (error) {
++      if(replied||dispatchedSession&&this.sessions.get(dispatchedSession.id)!==dispatchedSession)return;
+       this.send({ id: message?.id ?? null, error: protocolErrorFields(error), ...(message?.sessionId ? { sessionId: message.sessionId } : {}) });
+     }
+   }
+@@ -592,8 +607,11 @@
+       case 'Target.detachFromTarget': this.detach(params.sessionId); return {};
+       case 'Target.closeTarget': {
+         const page = browser.pages.get(params.targetId);
+-        if (!page) throw new ProtocolError('Unknown target');
+-        page.close(); return { success: true };
++        if (!page){
++          const context=parent?.page.context??selectCDPCookieContext(browser);
++          throw new ProtocolError(!context?'BrowserContextNotLoaded':[...browser.pages.values()].some(value=>value.context===context)?'UnknownTargetId':'TargetNotLoaded',-31998);
++        }
++        return completedResponse({success:true},()=>page.close());
+       }
+       case 'Browser.close': browser.close(); return {};
+       case 'Storage.getCookies': {
+@@ -606,6 +624,15 @@
+         if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
+         await setCDPCookies(context.cookies, params.cookies, 'about:blank');
+         return {};
++      }
++      case 'Page.close':case 'Page.stopLoading':{
++        const context=selectCDPCookieContext(browser);
++        if(!context)throw new ProtocolError('BrowserContextNotLoaded',-31998);
++        const loaded=[...browser.pages.values()].filter(page=>page.context===context);
++        if(loaded.length!==1)throw new ProtocolError('TargetNotLoaded',-31998);
++        const page=loaded[0];
++        if(method==='Page.close')return completedResponse({},()=>page.close());
++        stopPageLoading(page);return {};
+       }
+       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+     }
+diff --git a/src/navigation-api.js b/src/navigation-api.js
+--- a/src/navigation-api.js
++++ b/src/navigation-api.js
+@@ -174,4 +174,4 @@
+  return result;
+ }
+ function linked(operation,pending){if(!operation||!pending)return;operation.pending=pending;pending.promise.then(()=>finishOperation(operation),()=>{if(operation.sameDocument)abortOperation(operation);else finishOperation(operation)})}
+-setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.initial?null:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:true})}}));
++setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.initial?null:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page,options){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:options?.cancelTransport??true})}}));
+diff --git a/src/navigation-lifecycle.js b/src/navigation-lifecycle.js
+--- a/src/navigation-lifecycle.js
++++ b/src/navigation-lifecycle.js
+@@ -6,4 +6,4 @@
+ export function committedNavigation(page,details){return observer?.committed(page,details)}
+ export function documentNavigation(page,details){return observer?.document(page,details)}
+ export function linkedNavigation(operation,pending){observer?.linked(operation,pending)}
+-export function stopNavigation(page){observer?.stop(page)}
++export function stopNavigation(page,options){observer?.stop(page,options)}
+diff --git a/src/navigation-transfer.js b/src/navigation-transfer.js
+new file mode 100644
+--- /dev/null
++++ b/src/navigation-transfer.js
+@@ -0,0 +1,37 @@
++// Host-private ownership of the actual top-level navigation HTTP reader.
++// Finishing early returns only received bytes to the normal document parser.
++const transfers=new WeakMap(),stopReasons=new WeakSet();
++export function beginNavigationTransfer(page,controller){
++ const transfer={page,controller,signal:controller.signal,phase:'request',reader:null,finishedEarly:false,stopReason:null};
++ transfers.set(page,transfer);return transfer;
++}
++export function navigationResponseReader(page,signal,reader){
++ const transfer=transfers.get(page);
++ if(!transfer||transfer.signal!==signal||transfer.signal.aborted||transfer.phase!=='request')return null;
++ transfer.phase='body';transfer.reader=reader;return transfer;
++}
++export function finishNavigationReader(transfer){if(transfer){transfer.reader=null;transfer.phase='received'}}
++export function endNavigationTransfer(transfer){
++ if(!transfer)return;
++ transfer.reader=null;transfer.phase='complete';
++ if(transfers.get(transfer.page)===transfer)transfers.delete(transfer.page);
++}
++export function stopNavigationRequest(page){
++ const transfer=transfers.get(page);
++ if(transfer?.finishedEarly)return true;
++ if(transfer?.phase==='body'&&transfer.reader&&!transfer.signal.aborted){
++  transfer.finishedEarly=true;
++  // cancel settles the actual pending reader.read and closes its HTTP body.
++  // Mark ownership first: cancellation can enqueue arbitrary promise reactions.
++  try{Promise.resolve(transfer.reader.cancel()).catch(()=>{})}catch{}
++  return true;
++ }
++ const controller=transfer?.controller??page.navigationAbort;
++ if(controller&&!controller.signal.aborted){
++  const reason=new DOMException('net::ERR_ABORTED','AbortError');stopReasons.add(reason);
++  if(transfer)transfer.stopReason=reason;
++  controller.abort(reason);
++ }
++ return false;
++}
++export function stoppedNavigationError(error){return error!==null&&(typeof error==='object'||typeof error==='function')&&stopReasons.has(error)}
+diff --git a/src/navigation.js b/src/navigation.js
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -2,6 +2,7 @@
+ import {reportWindowException} from './errors.js';
+ import vm from 'node:vm';
+ import {beforeNavigation,linkedNavigation,stopNavigation} from './navigation-lifecycle.js';
++import {stopNavigationRequest} from './navigation-transfer.js';
+ import { createRequire } from 'node:module';
+ import {onFrameRetirement} from './frame-activity.js';
+ 
+@@ -240,7 +241,7 @@
+   record.controller = { dispose };
+   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
+   DOCUMENTS.set(documentImpl, record);
+-  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');record.page.navigationAbort?.abort();stopNavigation(record.page);return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
++  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');const finishedEarly=stopNavigationRequest(record.page);stopNavigation(record.page,{cancelTransport:!finishedEarly});return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
+   record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');for(const timer of record.javascriptTasks)clearTimer(record,timer);record.javascriptTasks.clear();});
+   record.close = function () { dispose(); return record.originalClose.call(window); };
+   window.close = record.close;
+diff --git a/src/window-lifecycle-timers.js b/src/window-lifecycle-timers.js
+--- a/src/window-lifecycle-timers.js
++++ b/src/window-lifecycle-timers.js
+@@ -9,6 +9,12 @@
+ import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
+ const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
+ const queueTask=setImmediate,cancelTask=clearImmediate;
++export function stopPageLoading(page){
++ const record=pages.get(page);if(!record||record.disposed)return;
++ // Protocol entry has no outer Runtime.evaluate VM guard. Enter the actual
++ // captured context so authored abort handlers retain the same real watchdog.
++ return record.invocation.invoke(record.stopLoads,undefined,[],record.options);
++}
+ function publicMethods(bridge){'use strict';return{
+  setTimeout(handler,delay=0,...args){return bridge.timer(this,false,arguments.length,handler,delay,args)},
+  setInterval(handler,delay=0,...args){return bridge.timer(this,true,arguments.length,handler,delay,args)},
+@@ -59,6 +65,7 @@
+    for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
+   },
+  });
++ record.stopLoads=()=>bridge.stop(window);
+  const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
+  for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});
+  const cancelTimers=()=>{for(const id of [...record.timers.keys()])cancel(record,id);record.timers.clear();record.intervals=0};

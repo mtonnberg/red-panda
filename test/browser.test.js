@@ -6,6 +6,7 @@ import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Browser } from '../src/browser.js';
+import {enableNetworkCapture,capturedResponseBody} from '../src/network-capture.js';
 import { createFixture } from './fixture.js';
 
 const exec = promisify(execFile);
@@ -190,12 +191,13 @@ test('plain-text and JSON responses display text rather than executing or parsin
   const browser = new Browser();
   try {
     const page = browser.createPage();
+    enableNetworkCapture(page.context);
     await page.navigate(`${fixture.url}plain-text`);
     assert.equal(page.evaluate('document.contentType'), 'text/plain');
     assert.equal(page.evaluate('typeof globalThis.shouldNotRun'), 'undefined');
     assert.equal(page.dom.window.document.querySelector('b'), null);
     assert.equal(page.evaluate('document.body.textContent'), '\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
-    assert.equal(page.responseBodies.get(page.loaderId), '\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>');
+    assert.deepEqual(capturedResponseBody(page.context,{requestId:page.loaderId}), {body:'\n<script>globalThis.shouldNotRun=true</script><b>literal & text</b>',base64Encoded:false});
     await page.navigate(`${fixture.url}api`);
     assert.equal(page.evaluate('document.contentType'), 'application/json');
     assert.equal(page.evaluate('document.querySelector("pre").textContent'), '{"message":"async data"}');

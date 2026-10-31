@@ -1,0 +1,1 @@
+Original candidate functional controls core18/lifetime9/authority8 ran with this source. Public createEntry length was1, contrary Native0; raw original authority report retained. Final candidate must define measured length0 before publication. Do not relabel previous rawreports as corrected reflection validation.

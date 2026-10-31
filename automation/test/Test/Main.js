@@ -7,6 +7,21 @@ import { WebSocketServer } from 'ws';
 
 async function createTransports() {
   const server = http.createServer((request, response) => {
+    if (request.url === '/capability') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=UTF-8' });
+      response.end('<!doctype html><title>Owned Puppeteer capability fixture</title><body>Red Panda');
+      return;
+    }
+    if (request.url === '/cookie-bytes') {
+      response.writeHead(200, { 'content-type': 'application/json; charset=UTF-8' });
+      response.end(JSON.stringify([...Buffer.from(request.headers.cookie ?? '', 'latin1')]));
+      return;
+    }
+    if (request.url === '/binary') {
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      response.end(Buffer.from([0, 255, 128, 195, 40, 65]));
+      return;
+    }
     if (request.url !== '/events') { response.writeHead(404); response.end(); return; }
     response.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -30,6 +45,7 @@ async function createTransports() {
   const port = server.address().port;
   let closing;
   return {
+    origin: `http://127.0.0.1:${port}`,
     streamUrl: `http://127.0.0.1:${port}/events`,
     socketUrl: `ws://127.0.0.1:${port}/echo`,
     close: () => closing ??= (async () => {
@@ -57,7 +73,7 @@ export const startImpl = async(async () => {
   try {
     transports = await createTransports();
     const service = await serve({ port: 0 });
-    return { url: fixture.url, endpoint: `ws://127.0.0.1:${service.port}/`, streamUrl: transports.streamUrl, socketUrl: transports.socketUrl,
+    return { url: fixture.url, endpoint: `ws://127.0.0.1:${service.port}/`, streamUrl: transports.streamUrl, socketUrl: transports.socketUrl, capabilityOrigin: transports.origin,
       close: async () => { try { await service.close(); } finally { try { await transports.close(); } finally { await fixture.close(); } } } };
   } catch (error) { try { await transports?.close(); } finally { await fixture.close(); } throw error; }
 });
@@ -66,3 +82,4 @@ export const fixtureUrl = fixture => fixture.url;
 export const fixtureEndpoint = fixture => fixture.endpoint;
 export const fixtureStreamUrl = fixture => fixture.streamUrl;
 export const fixtureSocketUrl = fixture => fixture.socketUrl;
+export const fixtureCapabilityOrigin = fixture => fixture.capabilityOrigin;

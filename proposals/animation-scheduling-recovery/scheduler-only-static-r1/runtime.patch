@@ -1,0 +1,83 @@
+diff --git a/src/animations.js b/src/animations.js
+--- a/src/animations.js
++++ b/src/animations.js
+@@ -6,6 +6,7 @@
+ import {platformFactoryRecord,registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {onFrameRetirement} from './frame-activity.js';
++import {captureWindowTaskOwner} from './window-lifecycle-timers.js';
+ const require=createRequire(import.meta.url);
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
+@@ -79,12 +80,12 @@
+  if(installed.has(realm))return;
+  registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
+  const Promise=realm.Promise,convertListener=EventListener.convert;
+- const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
++ const taskOwner=captureWindowTaskOwner(page,realm);
+  const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,playbackConstructor:null,disposed:false,automatic:new Set(),events:new Set()});
+  const task=(callback,automatic=false)=>{
+   if(runtime.disposed)return;
+   const tasks=automatic?runtime.automatic:runtime.events;let id;
+-  id=apply(setTimer,realm,[()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0]);tasks.add(id);
++  id=taskOwner.schedule(()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0);tasks.add(id);
+  };
+  function event(value,type,bubbles,cancelable,composed,currentTime,timelineTime){
+   // Setup preserves the exact object allocated by its actual VM constructor.
+@@ -138,7 +139,7 @@
+   eventTime(value,key){return key==='currentTime'||key==='timelineTime'?playbackEvents.get(value)[key]:undefined},
+  });
+  realm.eval(`(${factory.toString()})`)(realm,bridge);
+- const clear=tasks=>{for(const id of tasks)apply(clearTimer,realm,[id]);tasks.clear()};
++ const clear=tasks=>{for(const id of tasks)taskOwner.cancel(id);tasks.clear()};
+  onFrameRetirement(realm,()=>{clear(runtime.automatic);clear(runtime.events)});
+  page.documentAbort?.signal.addEventListener('abort',()=>{runtime.disposed=true;clear(runtime.automatic);clear(runtime.events)},{once:true});
+  installed.set(realm,runtime);
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -352,7 +352,6 @@
+       installAudioData(window);
+       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
+       installWebCodecsProcessors(window);
+-      installAnimations(this,window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
+@@ -373,6 +372,7 @@
+     prepareUtilityPlatform(window);
+     installFrameActivity(this,window);
+     installWindowLifecycleTimers(this,window);
++    listenerOwnership.scope(()=>installAnimations(this,window));
+     installScheduler(this,window);
+     installWindowOpen(this,window);
+     prepareHeapRealm(this,window);
+diff --git a/src/window-lifecycle-timers.js b/src/window-lifecycle-timers.js
+--- a/src/window-lifecycle-timers.js
++++ b/src/window-lifecycle-timers.js
+@@ -9,6 +9,11 @@
+ import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
+ const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
+ const queueTask=setImmediate,cancelTask=clearImmediate;
++export function captureWindowTaskOwner(page,window){
++ const record=pages.get(page);
++ if(!record||record.window!==window)throw new TypeError('The actual initialized Window task owner is required');
++ return record.internalTasks;
++}
+ export function stopPageLoading(page){
+  const record=pages.get(page);if(!record||record.disposed)return;
+  // Protocol entry has no outer Runtime.evaluate VM guard. Enter the actual
+@@ -65,6 +70,13 @@
+    for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
+   },
+  });
++ // Trusted startup clients capture this Host-only authority once. Internal
++ // work shares the actual Window task queue and watchdog without consulting
++ // authored globals, timer functions or a public owner/brand property.
++ record.internalTasks=Object.freeze(Object.assign(Object.create(null),{
++  schedule:(callback,delay)=>bridge.timer(window,false,2,callback,delay,[]),
++  cancel:handle=>cancel(record,handle),
++ }));
+  record.stopLoads=()=>bridge.stop(window);
+  const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
+  for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});

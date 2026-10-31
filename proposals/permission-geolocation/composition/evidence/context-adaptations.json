@@ -1,0 +1,167 @@
+{
+  "runtimeExecuted": false,
+  "RootEdits": false,
+  "sealedPatchSHA256": "27661165daa7a44768f848d80615191b8082c952708d3fa1cc21789b142e1304",
+  "events": [
+    {
+      "path": "src/navigator.js",
+      "kind": "exact sealed fragment",
+      "fragment": "evidence/exact-fragment-src_navigator.js.patch"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "kind": "exact sealed fragment",
+      "fragment": "evidence/exact-fragment-src_device-permissions.js.patch"
+    },
+    {
+      "path": "test/device-permissions.test.js",
+      "kind": "exact sealed fragment",
+      "fragment": "evidence/exact-fragment-test_device-permissions.test.js.patch"
+    },
+    {
+      "path": "src/protocol-float.js",
+      "kind": "exact sealed new leaf"
+    },
+    {
+      "path": "src/permission-control.js",
+      "kind": "exact sealed new leaf"
+    },
+    {
+      "path": "test/permission-control.test.js",
+      "kind": "exact sealed new leaf"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "import {installDevicePermissions} from './device-permissions.js';",
+      "new": "import {installDevicePermissions} from './device-permissions.js';\nimport {defaultPermissionOwner,registerPermissionContext,disposePermissionContext,registerPermissionPage,permissionOwnerForPage,closePermissionBrowser} from './permission-control.js';"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "    this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);",
+      "new": "    this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);\n    registerPermissionContext(this.contexts.get('default'),defaultPermissionOwner(this));"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "  createContext() {",
+      "new": "  createContext(options = {}) {"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "    this.contexts.set(id, { id, cookies: new CookieJar() });",
+      "new": "    this.contexts.set(id, { id, cookies: new CookieJar() });\n    registerPermissionContext(this.contexts.get(id),options?.permissionOwner??defaultPermissionOwner(this));"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "  createPage(contextId = 'default') {",
+      "new": "  createPage(contextId = 'default', options = {}) {"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "    const page = new Page(this, context);",
+      "new": "    const page = new Page(this, context, {permissionOwner:options?.permissionOwner});"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "  constructor(browser, context, {popup}={}) {",
+      "new": "  constructor(browser, context, {popup,permissionOwner}={}) {"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current Dialog/Lifecycle/Unicode source",
+      "old": "    this.context = context;",
+      "new": "    this.context = context;\n    registerPermissionPage(this,permissionOwner??(popup?permissionOwnerForPage(popup.root):defaultPermissionOwner(browser)));"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "reuse actual existing Context; preserve Dialog disposal before new permission disposal",
+      "old": "    disposeJavaScriptDialogContext(this,context);",
+      "new": "    disposeJavaScriptDialogContext(this,context);\n    disposePermissionContext(context);"
+    },
+    {
+      "path": "src/browser.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain real Page close and Dialog disposal, then clear permission controllers before transport cleanup",
+      "old": "  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); this.syncHTTP.close(); }",
+      "new": "  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); closePermissionBrowser(this); this.syncHTTP.close(); }"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current completion/session/cookie/LP source",
+      "old": "import{setWindowDeviceMetrics}from'./window-viewport.js';",
+      "new": "import{setWindowDeviceMetrics}from'./window-viewport.js';\nimport {supportsPermissionControl,initializePermissionConnection,permissionOwnerForConnection,releasePermissionConnection,runPermissionControl} from './permission-control.js';"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current completion/session/cookie/LP source",
+      "old": "    this.browser = browser;",
+      "new": "    this.browser = browser;\n    initializePermissionConnection(this,directPage);"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current completion/session/cookie/LP source",
+      "old": "      const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session",
+      "new": "      const result = supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current completion/session/cookie/LP source",
+      "old": "const id=browser.createContext();markCDPCookieContext",
+      "new": "const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current completion/session/cookie/LP source",
+      "old": "        const page = browser.createPage(params.browserContextId);",
+      "new": "        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "retain exact tested permission addition beside current completion/session/cookie/LP source",
+      "old": "  close() {\n    this.browser.off('targetCreated', this.created);",
+      "new": "  close() {\n    releasePermissionConnection(this);\n    this.browser.off('targetCreated', this.created);"
+    },
+    {
+      "path": "src/cdp.js",
+      "kind": "guarded narrow hunk",
+      "label": "extend existing config5/LP-null union only with exact five permission operations",
+      "old": "(CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version')",
+      "new": "(CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version' || supportsPermissionControl(message.method))"
+    }
+  ],
+  "sharedFilePreservation": [
+    {
+      "path": "src/browser.js",
+      "allCurrentBytesPreservedAfterReversingOnlyPermissionAdditions": true,
+      "beforeSHA256": "d6b0608781935a19d643a9e875ac15e9746654974e06c57221dcadec0b0be7a0",
+      "afterSHA256": "a7e62bb1cce03c1e9ce73073da2d809348df151b64204225c2ff09585a061c68"
+    },
+    {
+      "path": "src/cdp.js",
+      "allCurrentBytesPreservedAfterReversingOnlyPermissionAdditions": true,
+      "beforeSHA256": "2714e8c1e0ebbcb8fc807ed8f67c86fed5869e447ffe9be2be5035333dd26015",
+      "afterSHA256": "2479d68679b599e42fc972b387e780c41c4ab68fdfafbfde656506365dc2b595"
+    }
+  ]
+}

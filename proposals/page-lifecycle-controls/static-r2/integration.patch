@@ -1,0 +1,472 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,5 +1,7 @@
+ import {withLocationFactory} from './location-factory.js';
+ import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
++import {beginNavigationTransfer,navigationResponseReader,finishNavigationReader,endNavigationTransfer,stoppedNavigationError} from './navigation-transfer.js';
++import {notifyPageClosing} from './page-closing.js';
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+ import {httpResponseCookie} from './http-cookie-ingress.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
+@@ -433,7 +435,7 @@
+   requestFailed(id, error) {
+     this.activeRequests.delete(id);
+     this.lastActivity = Date.now();
+-    this.emit('requestFailed', { id, message: error.message, timestamp: now() });
++    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(stoppedNavigationError(error)?{canceled:true}:{}) });
+   }
+ 
+   setExtraHTTPHeaders(values) {
+@@ -577,13 +579,20 @@
+         const chunks = [];
+         let size = 0;
+         const reader = response.body?.getReader();
+-        if (reader) while (true) {
+-          const { done, value } = await reader.read();
+-          if (done) break;
+-          size += value.byteLength;
+-          if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
+-          chunks.push(value);
+-        }
++        const navigationReader=type==='Document'?navigationResponseReader(this,init.signal,reader):null;
++        try{
++          if (reader) while (true) {
++            const { done, value } = await reader.read();
++            if (done||navigationReader?.finishedEarly) break;
++            size += value.byteLength;
++            if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
++            chunks.push(value);
++          }
++          // A real timeout, replacement or Page.close takes precedence over an
++          // early finish. Neither transport failure nor foreign bytes become a
++          // successful prefix merely because stop ran in the same checkpoint.
++          if(navigationReader)signal.throwIfAborted();
++        }finally{finishNavigationReader(navigationReader)}
+         const bytes = Buffer.concat(chunks);
+         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
+           { status: response.status, statusText: response.statusText, headers: response.headers });
+@@ -617,6 +626,7 @@
+     this.performanceNavigationType = historyMode === 'reload' ? 'reload' : historyMode === 'traverse' ? 'back_forward' : 'navigate';
+     this.loaderId = randomUUID();
+     this.emit('navigationStarted');
++    const transfer=beginNavigationTransfer(this,this.navigationAbort);
+     try {
+       let html;
+       let response;
+@@ -736,9 +746,9 @@
+       if (waitMs > 0) await delay(waitMs);
+       return { url: this.url, status: this.status };
+     } catch (error) {
+-      if (generation === this.navigationGeneration) this.emit('navigationError', error);
++      if (generation === this.navigationGeneration&&!stoppedNavigationError(error)) this.emit('navigationError', error);
+       throw error;
+-    } finally { if (captureRedirect) this.off('navigationRequested', captureRedirect); }
++    } finally { endNavigationTransfer(transfer);if (captureRedirect) this.off('navigationRequested', captureRedirect); }
+   }
+ 
+   evaluate(expression) {
+@@ -772,6 +782,7 @@
+     if (this.closed) return;
+     this.closed = true;
+     this.navigationGeneration++;
++    notifyPageClosing(this);
+     this.navigationAbort?.abort();
+     this.documentAbort.abort();
+     disposeOwnedPopups(this);
+diff --git a/src/cdp.js b/src/cdp.js
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,5 +1,7 @@
+ import{setWindowDeviceMetrics}from'./window-viewport.js';
+ import {consoleProtocolType} from './console.js';
++import {stopPageLoading} from './window-lifecycle-timers.js';
++import {onPageClosing} from './page-closing.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {ProtocolSerializer} from './protocol-serialization.js';
+ import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+@@ -20,6 +22,8 @@
+ 
+ const timestamp = () => performance.now() / 1000;
+ const protocolErrors = new WeakSet();
++const protocolCompletions=new WeakMap();
++function completedResponse(result,complete){const token=Object.create(null);protocolCompletions.set(token,{result,complete});return token;}
+ // DOM lifecycle is owned by supportsDOM/runDOM above Session's generic branch.
+ // Keep existing known Root extensions explicit; arbitrary suffixes never brand
+ // a wire method as a supported domain command.
+@@ -172,14 +176,14 @@
+       this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
+     });
+     listen('requestFailed', request => this.event('Network.loadingFailed', {
+-      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
++      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: request.canceled??false,
+     }));
+     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
+       type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+       executionContextId, timestamp: Date.now(),
+     }));
+     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
+-    listen('close', () => connection.detach(this.id));
++    this.releaseClosing=onPageClosing(page,()=>connection.detach(this.id,{targetClosed:true}));
+   }
+   event(method, params) {
+     if (this.domains.has(method.split('.')[0])) this.connection.send({ method, params, ...(this.id ? { sessionId: this.id } : {}) });
+@@ -283,6 +287,8 @@
+     }
+     if (SESSION_DISABLE_METHODS.has(method)) { if(method==='Runtime.disable'&&this.domains.has('Runtime'))this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
+     switch (method) {
++      case 'Page.close':return completedResponse({},()=>page.close());
++      case 'Page.stopLoading':stopPageLoading(page);return {};
+       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
+       case 'Page.getLayoutMetrics': {
+         const { width, height } = page.layout.viewport, { x, y } = page.layout.scroll;
+@@ -489,6 +495,8 @@
+     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
+   }
+   close() {
++    if(this.closed)return;this.closed=true;
++    this.releaseClosing?.();
+     this.serializer.close();
+     this.utility.close();
+     clearTimeout(this.idleTimer);
+@@ -514,6 +522,7 @@
+       if (this.autoAttach) this.attach(page);
+     };
+     this.destroyed = page => {
++      for(const session of [...this.sessions.values()])if(session.page===page)this.detach(session.id,{targetClosed:true});
+       if (this.discover) this.send({ method: 'Target.targetDestroyed', params: { targetId: page.id } });
+     };
+     browser.on('targetCreated', this.created);
+@@ -530,14 +539,15 @@
+     this.send({ method: 'Target.attachedToTarget', params: { sessionId: session.id, targetInfo: targetInfo(page), waitingForDebugger: false } });
+     return session.id;
+   }
+-  detach(id) {
++  detach(id,{targetClosed=false}={}) {
+     const session = this.sessions.get(id);
+     if (!session) return;
+     session.close(); this.sessions.delete(id);
+-    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id } });
++    if(targetClosed)this.send({method:'Inspector.detached',params:{reason:'Render process gone.'},sessionId:id});
++    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id,...(targetClosed?{reason:'Render process gone.'}:{}) } });
+   }
+   async receive(raw) {
+-    let message;
++    let message,dispatchedSession,replied=false;
+     try {
+       message = JSON.parse(raw);
+       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+@@ -548,10 +558,17 @@
+       const { method, params = {}, sessionId } = message;
+       const session = this.sessions.get(sessionId ?? '');
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
++      dispatchedSession=session;
+       const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+-      this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
++      // Closed sessions have no receiver for their pending command replies.
++      // Page.close itself completes only after its successful response below.
++      if(session&&this.sessions.get(session.id)!==session)return;
++      const completion=protocolCompletions.get(result);
++      this.send({ id: message.id, result:completion?completion.result:result, ...(sessionId ? { sessionId } : {}) });replied=true;
++      completion?.complete();
+     } catch (error) {
++      if(replied||dispatchedSession&&this.sessions.get(dispatchedSession.id)!==dispatchedSession)return;
+       this.send({ id: message?.id ?? null, error: protocolErrorFields(error), ...(message?.sessionId ? { sessionId: message.sessionId } : {}) });
+     }
+   }
+@@ -592,8 +609,11 @@
+       case 'Target.detachFromTarget': this.detach(params.sessionId); return {};
+       case 'Target.closeTarget': {
+         const page = browser.pages.get(params.targetId);
+-        if (!page) throw new ProtocolError('Unknown target');
+-        page.close(); return { success: true };
++        if (!page){
++          const context=parent?.page.context??selectCDPCookieContext(browser);
++          throw new ProtocolError(!context?'BrowserContextNotLoaded':[...browser.pages.values()].some(value=>value.context===context)?'UnknownTargetId':'TargetNotLoaded',-31998);
++        }
++        return completedResponse({success:true},()=>page.close());
+       }
+       case 'Browser.close': browser.close(); return {};
+       case 'Storage.getCookies': {
+@@ -606,6 +626,15 @@
+         if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
+         await setCDPCookies(context.cookies, params.cookies, 'about:blank');
+         return {};
++      }
++      case 'Page.close':case 'Page.stopLoading':{
++        const context=selectCDPCookieContext(browser);
++        if(!context)throw new ProtocolError('BrowserContextNotLoaded',-31998);
++        const loaded=[...browser.pages.values()].filter(page=>page.context===context);
++        if(loaded.length!==1)throw new ProtocolError('TargetNotLoaded',-31998);
++        const page=loaded[0];
++        if(method==='Page.close')return completedResponse({},()=>page.close());
++        stopPageLoading(page);return {};
+       }
+       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+     }
+diff --git a/src/navigation-api.js b/src/navigation-api.js
+--- a/src/navigation-api.js
++++ b/src/navigation-api.js
+@@ -174,4 +174,4 @@
+  return result;
+ }
+ function linked(operation,pending){if(!operation||!pending)return;operation.pending=pending;pending.promise.then(()=>finishOperation(operation),()=>{if(operation.sameDocument)abortOperation(operation);else finishOperation(operation)})}
+-setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.initial?null:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:true})}}));
++setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.initial?null:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page,options){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:options?.cancelTransport??true})}}));
+diff --git a/src/navigation-lifecycle.js b/src/navigation-lifecycle.js
+--- a/src/navigation-lifecycle.js
++++ b/src/navigation-lifecycle.js
+@@ -6,4 +6,4 @@
+ export function committedNavigation(page,details){return observer?.committed(page,details)}
+ export function documentNavigation(page,details){return observer?.document(page,details)}
+ export function linkedNavigation(operation,pending){observer?.linked(operation,pending)}
+-export function stopNavigation(page){observer?.stop(page)}
++export function stopNavigation(page,options){observer?.stop(page,options)}
+diff --git a/src/navigation-transfer.js b/src/navigation-transfer.js
+new file mode 100644
+--- /dev/null
++++ b/src/navigation-transfer.js
+@@ -0,0 +1,37 @@
++// Host-private ownership of the actual top-level navigation HTTP reader.
++// Finishing early returns only received bytes to the normal document parser.
++const transfers=new WeakMap(),stopReasons=new WeakSet();
++export function beginNavigationTransfer(page,controller){
++ const transfer={page,controller,signal:controller.signal,phase:'request',reader:null,finishedEarly:false,stopReason:null};
++ transfers.set(page,transfer);return transfer;
++}
++export function navigationResponseReader(page,signal,reader){
++ const transfer=transfers.get(page);
++ if(!transfer||transfer.signal!==signal||transfer.signal.aborted||transfer.phase!=='request')return null;
++ transfer.phase='body';transfer.reader=reader;return transfer;
++}
++export function finishNavigationReader(transfer){if(transfer){transfer.reader=null;transfer.phase='received'}}
++export function endNavigationTransfer(transfer){
++ if(!transfer)return;
++ transfer.reader=null;transfer.phase='complete';
++ if(transfers.get(transfer.page)===transfer)transfers.delete(transfer.page);
++}
++export function stopNavigationRequest(page){
++ const transfer=transfers.get(page);
++ if(transfer?.finishedEarly)return true;
++ if(transfer?.phase==='body'&&transfer.reader&&!transfer.signal.aborted){
++  transfer.finishedEarly=true;
++  // cancel settles the actual pending reader.read and closes its HTTP body.
++  // Mark ownership first: cancellation can enqueue arbitrary promise reactions.
++  try{Promise.resolve(transfer.reader.cancel()).catch(()=>{})}catch{}
++  return true;
++ }
++ const controller=transfer?.controller??page.navigationAbort;
++ if(controller&&!controller.signal.aborted){
++  const reason=new DOMException('net::ERR_ABORTED','AbortError');stopReasons.add(reason);
++  if(transfer)transfer.stopReason=reason;
++  controller.abort(reason);
++ }
++ return false;
++}
++export function stoppedNavigationError(error){return error!==null&&(typeof error==='object'||typeof error==='function')&&stopReasons.has(error)}
+diff --git a/src/navigation.js b/src/navigation.js
+--- a/src/navigation.js
++++ b/src/navigation.js
+@@ -2,6 +2,7 @@
+ import {reportWindowException} from './errors.js';
+ import vm from 'node:vm';
+ import {beforeNavigation,linkedNavigation,stopNavigation} from './navigation-lifecycle.js';
++import {stopNavigationRequest} from './navigation-transfer.js';
+ import { createRequire } from 'node:module';
+ import {onFrameRetirement} from './frame-activity.js';
+ 
+@@ -240,7 +241,7 @@
+   record.controller = { dispose };
+   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
+   DOCUMENTS.set(documentImpl, record);
+-  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');record.page.navigationAbort?.abort();stopNavigation(record.page);return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
++  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');const finishedEarly=stopNavigationRequest(record.page);stopNavigation(record.page,{cancelTransport:!finishedEarly});return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
+   record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');for(const timer of record.javascriptTasks)clearTimer(record,timer);record.javascriptTasks.clear();});
+   record.close = function () { dispose(); return record.originalClose.call(window); };
+   window.close = record.close;
+diff --git a/src/page-closing.js b/src/page-closing.js
+new file mode 100644
+--- /dev/null
++++ b/src/page-closing.js
+@@ -0,0 +1,11 @@
++// Host-private protocol retirement checkpoint, before actual document teardown.
++const subscribers=new WeakMap();
++export function onPageClosing(page,callback){
++ let callbacks=subscribers.get(page);if(!callbacks){callbacks=new Set();subscribers.set(page,callbacks)}callbacks.add(callback);
++ return()=>{callbacks.delete(callback);if(!callbacks.size&&subscribers.get(page)===callbacks)subscribers.delete(page)};
++}
++export function notifyPageClosing(page){
++ const callbacks=subscribers.get(page);if(!callbacks)return;
++ subscribers.delete(page);
++ for(const callback of callbacks)callback();
++}
+diff --git a/src/window-lifecycle-timers.js b/src/window-lifecycle-timers.js
+--- a/src/window-lifecycle-timers.js
++++ b/src/window-lifecycle-timers.js
+@@ -9,6 +9,12 @@
+ import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
+ const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
+ const queueTask=setImmediate,cancelTask=clearImmediate;
++export function stopPageLoading(page){
++ const record=pages.get(page);if(!record||record.disposed)return;
++ // Protocol entry has no outer Runtime.evaluate VM guard. Enter the actual
++ // captured context so authored abort handlers retain the same real watchdog.
++ return record.invocation.invoke(record.stopLoads,undefined,[],record.options);
++}
+ function publicMethods(bridge){'use strict';return{
+  setTimeout(handler,delay=0,...args){return bridge.timer(this,false,arguments.length,handler,delay,args)},
+  setInterval(handler,delay=0,...args){return bridge.timer(this,true,arguments.length,handler,delay,args)},
+@@ -59,6 +65,7 @@
+    for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
+   },
+  });
++ record.stopLoads=()=>bridge.stop(window);
+  const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
+  for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});
+  const cancelTimers=()=>{for(const id of [...record.timers.keys()])cancel(record,id);record.timers.clear();record.intervals=0};
+diff --git a/test/page-lifecycle.test.js b/test/page-lifecycle.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/page-lifecycle.test.js
+@@ -0,0 +1,116 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createServer} from 'node:http';
++import {spawn} from 'node:child_process';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
++async function until(predicate,label){const end=Date.now()+2000;for(;;){if(await predicate())return;if(Date.now()>=end)throw Error(label+' original2s deadline');await sleep(5)}}
++async function fixture(t){
++ const requests=[],held=new Map(),clients=[];
++ const server=createServer((request,response)=>{
++  const path=new URL(request.url,'http://fixture.invalid').pathname,item={path,response,earlyClosed:false};requests.push(item);
++  response.on('close',()=>{item.earlyClosed=!response.writableFinished});response.setHeader('content-type',path.endsWith('.js')?'text/javascript':'text/html');
++  if(path==='/pending'||path==='/fetch'||path==='/xhr'||path==='/frame'||path==='/defer.js'){held.set(path,response);return;}
++  if(path==='/partial'){
++   response.flushHeaders();const bytes=Buffer.from('<!doctype html><html><head><script>globalThis.prefixRan=true</script></head><body><p id=prefix>panda 🐼</p>');
++   // Actual received bytes cross UTF-8 chunk boundaries; normal navigate owns
++   // the only decode/parse operation after its reader has genuinely finished.
++   const split=bytes.indexOf(Buffer.from('🐼'))+1;response.write(bytes.subarray(0,split));response.write(bytes.subarray(split));held.set(path,response);return;
++  }
++  if(path==='/resources'){
++   response.end(`<!doctype html><html><head><script>globalThis.fetchOutcome='pending';fetch('/fetch').then(r=>r.text()).then(v=>fetchOutcome=v,e=>fetchOutcome=e.name+':'+e.message);globalThis.xhrEvents=[];globalThis.xhr=new XMLHttpRequest();for(const type of ['abort','loadend','load','error'])xhr.addEventListener(type,()=>xhrEvents.push(type));xhr.open('GET','/xhr');xhr.send();globalThis.arm=()=>setTimeout(()=>fetch('/task'),125);</script><script defer src=/defer.js></script></head><body><iframe src=/frame></iframe><p id=resources>actual resource document</p></body></html>`);return;
++  }
++  response.end('<!doctype html><html><body id=stable>actual stable document</body></html>');
++ });
++ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
++ const origin='http://127.0.0.1:'+server.address().port,service=await serve({port:0,timeout:2000,loadResources:['iframe']});
++ t.after(async()=>{for(const client of clients)await client.close();await service.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});
++ async function client(){const c=await connect('ws://127.0.0.1:'+service.port+'/',{timeout:2000});clients.push(c);return c;}
++ const c=await client();
++ async function page({enable=true}={}){
++  const{targetId}=await c.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await c.send('Target.attachToTarget',{targetId,flatten:true});
++  if(enable)await c.send('Page.enable',{},sessionId);await c.send('Runtime.enable',{},sessionId);await c.send('Network.enable',{},sessionId);
++  return{targetId,sessionId,actual:service.browser.pages.get(targetId)};
++ }
++ const evaluate=async(page,expression)=>{const result=await c.send('Runtime.evaluate',{expression,returnByValue:true},page.sessionId);assert.equal(result.exceptionDetails,undefined);return result.result.value};
++ const ready=async(page,path='/stable')=>{await c.send('Page.navigate',{url:origin+path},page.sessionId);await until(()=>evaluate(page,'document.readyState==="complete"'),'real load');};
++ return{c,page,client,evaluate,ready,requests,held,origin,service};
++}
++test('Page.close acknowledges before genuine primary/auxiliary detach and target removal, with or without Page.enable',{timeout:8000},async t=>{
++ const f=await fixture(t);await f.c.send('Target.setDiscoverTargets',{discover:true});
++ for(const enable of[true,false]){
++  const p=await f.page({enable});await f.ready(p);const{sessionId:aux}=await f.c.send('Target.attachToTarget',{targetId:p.targetId,flatten:true});
++  await f.evaluate(p,'setTimeout(()=>fetch("/closed-task"),125);true');
++  const messages=[],listen=data=>messages.push(JSON.parse(data.toString()));f.c.socket.on('message',listen);
++  assert.deepEqual(await f.c.send('Page.close',{},p.sessionId),{});await until(()=>messages.some(m=>m.method==='Target.targetDestroyed'&&m.params.targetId===p.targetId),'target removal');f.c.socket.off('message',listen);
++  assert.deepEqual(messages[0].result,{});assert.equal(messages[0].sessionId,p.sessionId);
++  const events=messages.filter(m=>['Inspector.detached','Target.detachedFromTarget','Target.targetDestroyed'].includes(m.method));
++  assert.deepEqual(events.map(m=>m.method),['Inspector.detached','Target.detachedFromTarget','Inspector.detached','Target.detachedFromTarget','Target.targetDestroyed']);
++  assert.deepEqual(events.filter(m=>m.method==='Inspector.detached').map(m=>m.sessionId),[p.sessionId,aux]);
++  for(const event of events.slice(0,4))assert.equal(event.params.reason,'Render process gone.');
++  assert.equal(p.actual.closed,true);assert.equal(f.service.browser.pages.has(p.targetId),false);
++  for(const session of[p.sessionId,aux])await assert.rejects(f.c.send('Runtime.evaluate',{expression:'1'},session),error=>error.code===-32001&&error.message==='Unknown sessionId');
++  await assert.rejects(f.c.send('Page.close',{},p.sessionId),error=>error.code===-32001);
++ }
++ await sleep(180);assert.equal(f.requests.some(r=>r.path==='/closed-task'),false);
++ await assert.rejects(f.c.send('Page.close'),error=>error.code===-31998&&error.message==='TargetNotLoaded');
++});
++test('Page.close cancels real pending navigation HTTP and retires its pending session response',{timeout:5000},async t=>{
++ const f=await fixture(t),p=await f.page();await f.ready(p);
++ const pending=f.c.send('Page.navigate',{url:f.origin+'/pending'},p.sessionId);const rejected=assert.rejects(pending,/CDP timeout: Page.navigate/);
++ await until(()=>f.held.has('/pending'),'real pending navigation');assert.deepEqual(await f.c.send('Page.close',{},p.sessionId),{});
++ await until(()=>f.requests.find(r=>r.path==='/pending')?.earlyClosed,'real canceled HTTP');await rejected;
++ assert.deepEqual(await f.c.send('Target.getTargets'),{targetInfos:[]});assert.equal(p.actual.closed,true);
++});
++test('closing one real target preserves unrelated target sessions and future navigation',{timeout:6000},async t=>{
++ const f=await fixture(t),first=await f.page(),second=await f.page();await f.ready(first);await f.ready(second);
++ assert.deepEqual(await f.c.send('Page.close',{},first.sessionId),{});assert.equal(await f.evaluate(second,'document.body.id'),'stable');
++ assert.equal(second.actual.closed,false);await f.ready(second,'/next-actual');assert.equal(await f.evaluate(second,'location.pathname'),'/next-actual');
++ assert.deepEqual(await f.c.send('Target.closeTarget',{targetId:second.targetId}),{success:true});
++});
++test('idle Page.stopLoading uses private captured authority and preserves the actual Document and task queue',{timeout:5000},async t=>{
++ const f=await fixture(t),p=await f.page();await f.ready(p);
++ await f.evaluate(p,'globalThis.retained=document;globalThis.ticks=0;setInterval(()=>ticks++,25);setTimeout(()=>fetch("/task"),125);window.stop=()=>{throw new Error("authored stop must not run")};true');
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});
++ await until(()=>f.requests.some(r=>r.path==='/task'),'real surviving timer HTTP');assert.equal(await f.evaluate(p,'retained===document&&ticks>0'),true);
++});
++test('Page.stopLoading before headers cancels the actual request, retains the old document and allows recovery',{timeout:5000},async t=>{
++ const f=await fixture(t);await assert.rejects(f.c.send('Page.stopLoading'),error=>error.code===-31998&&error.message==='BrowserContextNotLoaded');
++ const p=await f.page();await f.ready(p);await f.evaluate(p,'globalThis.retained=document;true');const offset=f.c.events.length;
++ const pending=f.c.send('Page.navigate',{url:f.origin+'/pending'},p.sessionId);await until(()=>f.held.has('/pending'),'real pending navigation');
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});assert.equal((await pending).errorText,'net::ERR_ABORTED');
++ await until(()=>f.requests.find(r=>r.path==='/pending')?.earlyClosed,'actual HTTP cancellation');
++ assert.equal(await f.evaluate(p,'retained===document'),true);assert.equal(f.c.events.slice(offset).some(e=>e.method==='Runtime.exceptionThrown'),false);
++ assert.ok(f.c.events.slice(offset).some(e=>e.method==='Network.loadingFailed'&&e.params.errorText==='net::ERR_ABORTED'&&e.params.canceled));
++ await f.ready(p,'/recovered');assert.equal(await f.evaluate(p,'location.pathname'),'/recovered');
++});
++test('Page.stopLoading finishes real received UTF-8 bytes early and commits them through the normal parser',{timeout:6000},async t=>{
++ const f=await fixture(t),p=await f.page();await f.ready(p);await f.evaluate(p,'globalThis.retained=document;true');
++ const pending=f.c.send('Page.navigate',{url:f.origin+'/partial'},p.sessionId);await until(()=>f.held.has('/partial'),'partial response sent');await sleep(40);
++ assert.equal(await f.evaluate(p,'retained===document&&document.body.id==="stable"'),true);
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});assert.equal((await pending).errorText,undefined);
++ await until(()=>f.evaluate(p,'document.readyState==="complete"'),'genuine prefix document load');
++ assert.equal(await f.evaluate(p,'document.getElementById("prefix").textContent'),'panda 🐼');assert.equal(await f.evaluate(p,'prefixRan'),true);
++ await until(()=>f.requests.find(r=>r.path==='/partial')?.earlyClosed,'real stream canceled');
++ f.held.get('/partial').end('<script>globalThis.suffixRan=true</script><p id=suffix>must remain excluded</p>');await sleep(40);
++ assert.equal(await f.evaluate(p,'globalThis.suffixRan===undefined&&document.getElementById("suffix")===null'),true);
++ await f.ready(p,'/after-prefix');assert.equal(await f.evaluate(p,'location.pathname'),'/after-prefix');
++});
++test('Page.stopLoading aborts genuine script/frame/Fetch/XHR load owners and keeps independent timers alive',{timeout:6000},async t=>{
++ const f=await fixture(t),p=await f.page();const pending=f.c.send('Page.navigate',{url:f.origin+'/resources'},p.sessionId);
++ await until(()=>['/defer.js','/frame','/fetch','/xhr'].every(path=>f.held.has(path)),'four real load owners');await f.evaluate(p,'arm();true');
++ assert.deepEqual(await f.c.send('Page.stopLoading',{},p.sessionId),{});await pending;
++ await until(()=>f.evaluate(p,'document.readyState==="complete"&&fetchOutcome!=="pending"'),'actual resource abort completion');
++ assert.equal(await f.evaluate(p,'fetchOutcome'),'TypeError:fetch error');assert.deepEqual(JSON.parse(await f.evaluate(p,'JSON.stringify(xhrEvents)')),['abort','loadend']);assert.equal(await f.evaluate(p,'xhr.readyState'),0);
++ await until(()=>['/defer.js','/frame','/fetch','/xhr'].every(path=>f.requests.find(r=>r.path===path)?.earlyClosed),'four actual canceled HTTP transfers');
++ await until(()=>f.requests.some(r=>r.path==='/task'),'timer survives stop');assert.equal(await f.evaluate(p,'globalThis.lateScript===undefined'),true);assert.equal(p.actual.closed,false);
++ await f.ready(p,'/after-resources');assert.equal(p.actual.activeRequests.size,0);
++});
++test('CDP stop authored abort callbacks obey the captured real VM watchdog and allow recovery and disposal',{timeout:8000},async()=>{
++ const child=spawn(process.execPath,['--experimental-vm-modules',new URL('./fixtures/page-stop-watchdog.mjs',import.meta.url).pathname],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
++ let expired=false;const deadline=setTimeout(()=>{expired=true;child.kill('SIGKILL')},7000);
++ const{code,signal}=await new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(deadline);
++ assert.equal(expired,false,stdout+stderr);assert.equal(signal,null,stdout+stderr);assert.equal(code,0,stdout+stderr);
++ const report=JSON.parse(stdout.trim().split('\n').at(-1));assert.equal(report.entered,true);assert.equal(report.recovered,true);assert.equal(report.disposed,true);assert.equal(report.effectiveTimeout,200);
++});
+diff --git a/test/fixtures/page-stop-watchdog.mjs b/test/fixtures/page-stop-watchdog.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/page-stop-watchdog.mjs
+@@ -0,0 +1,19 @@
++import {createServer} from 'node:http';
++import assert from 'node:assert/strict';
++import {serve} from '../../src/cdp.js';
++import {connect} from '../cdp-client.js';
++const requests=[],server=createServer((req,res)=>{requests.push(req.url);if(req.url==='/held')return;res.setHeader('content-type','text/html');res.end('<!doctype html><body>real guarded page</body>')});
++let service,client,report={effectiveTimeout:200};
++try{
++ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));service=await serve({port:0,timeout:200});client=await connect('ws://127.0.0.1:'+service.port+'/',{timeout:2000});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
++ const send=(method,params={})=>client.send(method,params,sessionId);await send('Page.navigate',{url:'http://127.0.0.1:'+server.address().port+'/'});
++ await send('Runtime.evaluate',{expression:'globalThis.entered=false;globalThis.x=new XMLHttpRequest();x.open("GET","/held");x.addEventListener("abort",()=>{entered=true;while(true){}});x.send();true'});
++ const end=Date.now()+2000;while(!requests.includes('/held')){if(Date.now()>=end)throw Error('Original2s actual request deadline');await new Promise(r=>setTimeout(r,5))}
++ process.stdout.write(JSON.stringify({marker:'armed',effectiveTimeout:200})+'\n');
++ const begin=Date.now();try{report.stop=await send('Page.stopLoading')}catch(error){report.stopError={message:error.message,code:error.code}}report.stopElapsedMS=Date.now()-begin;
++ const query=await send('Runtime.evaluate',{expression:'({entered,alive:document.body.textContent,ready:document.readyState})',returnByValue:true});assert.equal(query.exceptionDetails,undefined);report.entered=query.result.value.entered;report.recovered=query.result.value.alive==='real guarded page';
++ assert.equal(report.entered,true);assert.equal(report.recovered,true);assert.ok(report.stopElapsedMS<1500);
++ await send('Page.close');report.disposed=service.browser.pages.size===0;
++}finally{await client?.close();await service?.close();server.closeAllConnections();if(server.listening)await new Promise(resolve=>server.close(resolve))}
++console.log(JSON.stringify(report));

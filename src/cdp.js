@@ -1,5 +1,10 @@
+import {dumpMarkdownNode} from './markdown-node.js';
+import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
 import{setWindowDeviceMetrics}from'./window-viewport.js';
+import {supportsPermissionControl,initializePermissionConnection,permissionOwnerForConnection,releasePermissionConnection,runPermissionControl} from './permission-control.js';
 import {consoleProtocolType} from './console.js';
+import {stopPageLoading} from './window-lifecycle-timers.js';
+import {onPageClosing} from './page-closing.js';
 import {installHeapUtilityFactories} from './heap-worlds.js';
 import {ProtocolSerializer} from './protocol-serialization.js';
 import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
@@ -12,14 +17,18 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Browser, VERSION, withTimeout } from './browser.js';
 import {initializeCDPCookieMetadata,markCDPCookieContext,selectCDPCookieContext,listCDPCookies} from './cdp-cookie-metadata.js';
 import {setCDPCookie,setCDPCookies} from './cdp-cookies.js';
+import {cookieActionContext,requireCookieSession,decodeCookieDeletion,deleteCDPCookies} from './cdp-cookie-actions.js';
 import { supportsDOM, runDOM, resetDOM } from './dom.js';
 import { supportsInput, runInput } from './input.js';
 import { createWebDriver } from './webdriver.js';
 import { supportsRuntime, runRuntime, resetRuntime } from './runtime.js';
+import {armJavaScriptDialog,selectJavaScriptDialogContext,subscribeJavaScriptDialogs} from './javascript-dialogs.js';
 import { primitiveRemoteValue, describeRemoteValue, needsRemoteHandle, ownerDocumentOf, protocolErrorFields, exceptionDetailsFor } from './remote-values.js';
 
 const timestamp = () => performance.now() / 1000;
 const protocolErrors = new WeakSet();
+const protocolCompletions=new WeakMap();
+function completedResponse(result,complete){const token=Object.create(null);protocolCompletions.set(token,{result,complete});return token;}
 // DOM lifecycle is owned by supportsDOM/runDOM above Session's generic branch.
 // Keep existing known Root extensions explicit; arbitrary suffixes never brand
 // a wire method as a supported domain command.
@@ -30,6 +39,33 @@ const SESSION_DISABLE_METHODS = new Set(['Page.disable','Runtime.disable','Netwo
 const CONFIGURATION_ACK_METHODS = new Set(['CSS.enable','Inspector.enable','Inspector.disable','Security.enable','Security.disable']);
 class ProtocolError extends Error {
   constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
+}
+function dialogParameters(params){
+  if(!Object.hasOwn(params,'accept'))throw new ProtocolError('MissingField',-31998);
+  if(typeof params.accept!=='boolean'||params.promptText!==undefined&&params.promptText!==null&&typeof params.promptText!=='string')throw new ProtocolError('UnexpectedToken',-31998);
+  return params;
+}
+function dialogCommand(browser,method,params,context){
+  const value=dialogParameters(params);
+  if(method==='Page.handleJavaScriptDialog')throw new ProtocolError('No dialog is showing',-32000);
+  if(!armJavaScriptDialog(browser,context??selectJavaScriptDialogContext(browser),value.accept,value.promptText))throw new ProtocolError('NoBrowserContext',-31998);
+  return {};
+}
+
+function markdownAlias(page,params,resolveNode){
+  let id=params.nodeId;
+  if(id!==undefined&&id!==null){
+    if(typeof id==='string'){
+      if(!/^[0-9]+$/.test(id))throw new ProtocolError('InvalidCharacter',-31998);
+      id=Number(id);
+    }
+    if(typeof id!=='number')throw new ProtocolError('UnexpectedToken',-31998);
+    if(!Number.isInteger(id))throw new ProtocolError('InvalidNumber',-31998);
+    if(id<0||id>4294967295)throw new ProtocolError('Overflow',-31998);
+  }
+  const root=id===undefined||id===null?page.dom.window.document:resolveNode(id);
+  if(!root)throw new ProtocolError('InvalidNodeId',-31998);
+  return { markdown: dumpMarkdownNode(root) };
 }
 
 export function targetInfo(page) {
@@ -153,7 +189,7 @@ class Session {
       this.event('Network.requestWillBeSent', {
         requestId: request.id, loaderId: request.loaderId ?? page.loaderId, documentURL: page.frames?.findFrame(request.frameId)?.url ?? page.url,
         request: { url: request.url, method: request.method, headers: request.headers,
-          initialPriority: 'High', referrerPolicy: 'no-referrer-when-downgrade' },
+          ...request.postDataFields,initialPriority: 'High', referrerPolicy: 'no-referrer-when-downgrade' },
         timestamp: request.timestamp, wallTime: Date.now() / 1000,
         initiator: { type: 'other' }, type: request.type, frameId: request.frameId ?? page.frameId,
         hasUserGesture: false,
@@ -172,14 +208,15 @@ class Session {
       this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
     });
     listen('requestFailed', request => this.event('Network.loadingFailed', {
-      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: false,
+      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: request.canceled??false,
     }));
     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
       type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
       executionContextId, timestamp: Date.now(),
     }));
     listen('pageError', error => this.event('Runtime.exceptionThrown', { timestamp: Date.now(), exceptionDetails: this.exception(error) }));
-    listen('close', () => connection.detach(this.id));
+    this.releaseClosing=onPageClosing(page,()=>connection.detach(this.id,{targetClosed:true}));
+    this.disposeJavaScriptDialogs=subscribeJavaScriptDialogs(page,connection,params=>connection.send({method:'Page.javascriptDialogOpening',params,...(this.id?{sessionId:this.id}:{})}));
   }
   event(method, params) {
     if (this.domains.has(method.split('.')[0])) this.connection.send({ method, params, ...(this.id ? { sessionId: this.id } : {}) });
@@ -271,6 +308,8 @@ class Session {
     if (supportsDOM(method)) return runDOM(this, method, params);
     if (supportsInput(method)) return runInput(this, method, params);
     if (supportsRuntime(method)) return runRuntime(this, method, params);
+    if(method==='Network.enable')enableNetworkCapture(page.context,params);
+    if(method==='Network.disable')disableNetworkCapture(page.context);
     if (SESSION_ENABLE_METHODS.has(method)) {
       if(method==='Runtime.enable'&&this.domains.has('Runtime'))return {};
       this.domains.add(method.split('.')[0]);
@@ -283,6 +322,8 @@ class Session {
     }
     if (SESSION_DISABLE_METHODS.has(method)) { if(method==='Runtime.disable'&&this.domains.has('Runtime'))this.utility.runtimeDisabled();this.domains.delete(method.split('.')[0]); return {}; }
     switch (method) {
+      case 'Page.close':return completedResponse({},()=>page.close());
+      case 'Page.stopLoading':stopPageLoading(page);return {};
       case 'Page.getFrameTree': return { frameTree: page.frames?.getTree() ?? { frame: frameInfo(page) } };
       case 'Page.getLayoutMetrics': {
         const { width, height } = page.layout.viewport, { x, y } = page.layout.scroll;
@@ -375,7 +416,7 @@ class Session {
           if (params.awaitPromise) value = await withTimeout(Promise.resolve(value), target.timeout);
         } catch (error) {
           if (protocolErrors.has(error)) throw error;
-          return { result: this.remote(error, params.returnByValue, group, contextId),
+          return { result: this.remote(error, false, group, contextId),
             exceptionDetails: this.exception(error, contextId, group) };
         }
         return { result: this.remote(value, params.returnByValue, group, contextId) };
@@ -404,14 +445,15 @@ class Session {
         return { cookies: await listCDPCookies(page.context.cookies, urls.map(value=>value)) };
       }
       case 'Storage.getCookies': return this.connection.run(method,params,this);
+      case 'Storage.setCookies':
+      case 'Storage.clearCookies':
+      case 'Network.deleteCookies': return this.connection.run(method,params,this);
       case 'Network.getAllCookies': return { cookies: await listCDPCookies(page.context.cookies) };
       case 'Network.setCookie': return { success: await setCDPCookie(page.context.cookies, params, page.url) };
       case 'Network.setCookies': await setCDPCookies(page.context.cookies, params.cookies, page.url); return {};
       case 'Network.clearBrowserCookies': await page.context.cookies.removeAllCookies(); return {};
-      case 'Network.getResponseBody': {
-        if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
-        return { body: page.responseBodies.get(params.requestId), base64Encoded: false };
-      }
+      case 'Network.getResponseBody': return capturedResponseBody(page.context,params);
+      case 'Network.getRequestPostData': return capturedRequestPostData(page.context,params);
       case 'Network.setExtraHTTPHeaders': page.setExtraHTTPHeaders(params.headers); return {};
       case 'Network.setUserAgentOverride': page.setUserAgentOverride(params); return {};
       case 'Page.captureScreenshot': {
@@ -455,6 +497,10 @@ class Session {
         if (!this.streams.delete(params.handle)) throw new ProtocolError('Invalid stream handle', -32000);
         return {};
       }
+      case 'Page.handleJavaScriptDialog':
+      case 'LP.handleJavaScriptDialog': return dialogCommand(page.browser,method,params,page.context);
+      case 'LP.version': return { version: VERSION };
+      case 'LP.getMarkdown': return markdownAlias(page,params,id=>this.nodes?.get(id));
       case 'LP.dump': {
         const format = params.format ?? 'html';
         if (params.strip !== undefined && (!params.strip || typeof params.strip !== 'object' || Array.isArray(params.strip))) throw new ProtocolError('strip must be an object');
@@ -489,7 +535,10 @@ class Session {
     const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
   }
   close() {
+    if(this.closed)return;this.closed=true;
+    this.releaseClosing?.();
     this.serializer.close();
+    this.disposeJavaScriptDialogs?.();
     this.utility.close();
     clearTimeout(this.idleTimer);
     resetDOM(this);
@@ -505,6 +554,7 @@ class Connection {
   constructor(socket, browser, directPage) {
     this.socket = socket;
     this.browser = browser;
+    initializePermissionConnection(this,directPage);
     this.sessions = new Map();
     this.discover = false;
     this.autoAttach = false;
@@ -514,6 +564,7 @@ class Connection {
       if (this.autoAttach) this.attach(page);
     };
     this.destroyed = page => {
+      for(const session of [...this.sessions.values()])if(session.page===page)this.detach(session.id,{targetClosed:true});
       if (this.discover) this.send({ method: 'Target.targetDestroyed', params: { targetId: page.id } });
     };
     browser.on('targetCreated', this.created);
@@ -530,34 +581,56 @@ class Connection {
     this.send({ method: 'Target.attachedToTarget', params: { sessionId: session.id, targetInfo: targetInfo(page), waitingForDebugger: false } });
     return session.id;
   }
-  detach(id) {
+  detach(id,{targetClosed=false}={}) {
     const session = this.sessions.get(id);
     if (!session) return;
     session.close(); this.sessions.delete(id);
-    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id } });
+    if(targetClosed)this.send({method:'Inspector.detached',params:{reason:'Render process gone.'},sessionId:id});
+    this.send({ method: 'Target.detachedFromTarget', params: { sessionId: id, targetId: session.page.id,...(targetClosed?{reason:'Render process gone.'}:{}) } });
   }
   async receive(raw) {
-    let message;
+    let message,dispatchedSession,replied=false;
     try {
       message = JSON.parse(raw);
       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
-          (message.params !== undefined && !(message.params === null && CONFIGURATION_ACK_METHODS.has(message.method)) &&
+          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version' || supportsPermissionControl(message.method))) &&
             (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
         throw new ProtocolError('Invalid CDP request', -32600);
       }
-      const { method, params = {}, sessionId } = message;
+      const { method, sessionId } = message;
+      const params = message.params ?? {};
       const session = this.sessions.get(sessionId ?? '');
       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
-      const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+      const sessionCommand=session&&!method.startsWith('Browser.')&&!method.startsWith('Target.')&&!CONFIGURATION_ACK_METHODS.has(method);
+      dispatchedSession=sessionCommand?session:undefined;
+      const result = supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
         ? await session.run(method, params) : await this.run(method, params, session);
-      this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
+      // Closed sessions have no receiver for their pending command replies.
+      // Page.close itself completes only after its successful response below.
+      if(dispatchedSession&&this.sessions.get(dispatchedSession.id)!==dispatchedSession)return;
+      const completion=protocolCompletions.get(result);
+      this.send({ id: message.id, result:completion?completion.result:result, ...(sessionId ? { sessionId } : {}) });replied=true;
+      completion?.complete();
     } catch (error) {
+      if(replied||dispatchedSession&&this.sessions.get(dispatchedSession.id)!==dispatchedSession)return;
       this.send({ id: message?.id ?? null, error: protocolErrorFields(error), ...(message?.sessionId ? { sessionId: message.sessionId } : {}) });
     }
   }
   async run(method, params, parent) {
     const browser = this.browser;
     switch (method) {
+      case 'LP.version': return { version: VERSION };
+      case 'LP.getMarkdown': {
+        const context=selectCDPCookieContext(browser);
+        if(!context)throw new ProtocolError('NoBrowserContext',-31998);
+        const page=[...browser.pages.values()].find(value=>value.context===context&&!value.closed);
+        if(!page)throw new ProtocolError('FrameNotLoaded',-31998);
+        return markdownAlias(page,params,id=>{
+          const matches=new Set();
+          for(const session of this.sessions.values())if(session.page===page){const node=session.nodes?.get(id);if(node)matches.add(node)}
+          return matches.size===1?[...matches][0]:undefined;
+        });
+      }
       case 'Browser.getVersion': return { protocolVersion: '1.3', product: `RedPanda/${VERSION}`, revision: VERSION, userAgent: `RedPanda/${VERSION}`, jsVersion: process.versions.v8 };
       case 'Browser.getBrowserCommandLine': return { arguments: [] };
       case 'Target.setDiscoverTargets':
@@ -572,10 +645,10 @@ class Connection {
         return {};
       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
-      case 'Target.createBrowserContext': {const id=browser.createContext();markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
+      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
       case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId); return {};
       case 'Target.createTarget': {
-        const page = browser.createPage(params.browserContextId);
+        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});
         if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
         return { targetId: page.id };
       }
@@ -592,25 +665,45 @@ class Connection {
       case 'Target.detachFromTarget': this.detach(params.sessionId); return {};
       case 'Target.closeTarget': {
         const page = browser.pages.get(params.targetId);
-        if (!page) throw new ProtocolError('Unknown target');
-        page.close(); return { success: true };
+        if (!page){
+          const context=parent?.page.context??selectCDPCookieContext(browser);
+          throw new ProtocolError(!context?'BrowserContextNotLoaded':[...browser.pages.values()].some(value=>value.context===context)?'UnknownTargetId':'TargetNotLoaded',-31998);
+        }
+        return completedResponse({success:true},()=>page.close());
       }
       case 'Browser.close': browser.close(); return {};
+      case 'Page.handleJavaScriptDialog':
+      case 'LP.handleJavaScriptDialog': return dialogCommand(browser,method,params,parent?.page.context);
       case 'Storage.getCookies': {
         const context = params.browserContextId===undefined&&parent?parent.page.context:selectCDPCookieContext(browser,params.browserContextId);
         if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
         return { cookies: await listCDPCookies(context.cookies) };
       }
       case 'Storage.setCookies': {
-        const context = selectCDPCookieContext(browser,params.browserContextId);
-        if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
+        const context = cookieActionContext(browser,parent,params.browserContextId);
         await setCDPCookies(context.cookies, params.cookies, 'about:blank');
         return {};
+      }
+      case 'Storage.clearCookies': {
+        const context=cookieActionContext(browser,parent,params.browserContextId);await context.cookies.removeAllCookies();return {};
+      }
+      case 'Network.deleteCookies': {
+        requireCookieSession(browser,parent);const input=decodeCookieDeletion(params),context=cookieActionContext(browser,parent);await deleteCDPCookies(context.cookies,input);return {};
+      }
+      case 'Page.close':case 'Page.stopLoading':{
+        const context=selectCDPCookieContext(browser);
+        if(!context)throw new ProtocolError('BrowserContextNotLoaded',-31998);
+        const loaded=[...browser.pages.values()].filter(page=>page.context===context);
+        if(loaded.length!==1)throw new ProtocolError('TargetNotLoaded',-31998);
+        const page=loaded[0];
+        if(method==='Page.close')return completedResponse({},()=>page.close());
+        stopPageLoading(page);return {};
       }
       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
     }
   }
   close() {
+    releasePermissionConnection(this);
     this.browser.off('targetCreated', this.created);
     this.browser.off('targetDestroyed', this.destroyed);
     for (const session of this.sessions.values()) session.close();

@@ -1,0 +1,410 @@
+diff --git a/oracle/animations-native-producer.json b/oracle/animations-native-producer.json
+new file mode 100644
+--- /dev/null
++++ b/oracle/animations-native-producer.json
+@@ -0,0 +1,63 @@
++{
++  "scope": "Actual Native animation producer/checkpoint observations; raw source and results retained",
++  "sourceSHA256": "551a48303561cfbafe9e76dfea28d1ee76680bb018697c4c6efa30d9169fcfa5",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "rawEvidence": "/workspace/red-panda/proposals/animation-scheduling-recovery/private-owner-validation-r1/Native-event-producers.json",
++  "rawEvidenceSHA256": "9bade04201724ae71515a304b62cf75dbfed4c0db7a2524372a7b8dece6279dc",
++  "result": [
++    {
++      "mode": "automatic",
++      "order": [
++        "after-action:running",
++        "promise:resolved",
++        "event:finish"
++      ],
++      "event": {
++        "type": "finish",
++        "state": "finished",
++        "trusted": true,
++        "event": true,
++        "target": true,
++        "currentTime": null,
++        "timelineTime": null
++      },
++      "state": "finished"
++    },
++    {
++      "mode": "explicit-finish",
++      "order": [
++        "after-action:finished",
++        "promise:resolved",
++        "event:finish"
++      ],
++      "event": {
++        "type": "finish",
++        "state": "finished",
++        "trusted": true,
++        "event": true,
++        "target": true,
++        "currentTime": null,
++        "timelineTime": null
++      },
++      "state": "finished"
++    },
++    {
++      "mode": "explicit-cancel",
++      "order": [
++        "after-action:idle",
++        "promise:rejected:AbortError",
++        "event:cancel"
++      ],
++      "event": {
++        "type": "cancel",
++        "state": "idle",
++        "trusted": true,
++        "event": true,
++        "target": true,
++        "currentTime": null,
++        "timelineTime": null
++      },
++      "state": "idle"
++    }
++  ]
++}
+diff --git a/oracle/animations-native-reaction-boundary.json b/oracle/animations-native-reaction-boundary.json
+new file mode 100644
+--- /dev/null
++++ b/oracle/animations-native-reaction-boundary.json
+@@ -0,0 +1,102 @@
++{
++  "scope": "Actual Native animation producer/checkpoint observations; raw source and results retained",
++  "sourceSHA256": "a0e19ed7d01a992503cf8e5b4ff8c7249d072b592a21de4c6e5dd7427b808244",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "rawEvidence": "/workspace/red-panda/proposals/animation-scheduling-recovery/native-causal-r2/Native.json",
++  "rawEvidenceSHA256": "35125efc89be751b5eb8ac5a84ed2dbf18ed4bbe399baf184135ed25284ae31e",
++  "result": [
++    {
++      "mode": "deep-chain",
++      "order": [
++        "reaction:1",
++        "reaction:2",
++        "reaction:3",
++        "event:finish:finished"
++      ],
++      "events": [
++        {
++          "type": "finish",
++          "state": "finished",
++          "trusted": true,
++          "target": true,
++          "event": true
++        }
++      ],
++      "state": "finished",
++      "sameFinished": true
++    },
++    {
++      "mode": "reaction-cancel",
++      "order": [
++        "reaction:1",
++        "after-cancel:idle",
++        "event:finish:idle",
++        "event:cancel:idle"
++      ],
++      "events": [
++        {
++          "type": "finish",
++          "state": "idle",
++          "trusted": true,
++          "target": true,
++          "event": true
++        },
++        {
++          "type": "cancel",
++          "state": "idle",
++          "trusted": true,
++          "target": true,
++          "event": true
++        }
++      ],
++      "state": "idle",
++      "sameFinished": false
++    },
++    {
++      "mode": "reaction-replay",
++      "order": [
++        "reaction:1",
++        "after-play:running",
++        "event:finish:running",
++        "event:finish:finished"
++      ],
++      "events": [
++        {
++          "type": "finish",
++          "state": "running",
++          "trusted": true,
++          "target": true,
++          "event": true
++        },
++        {
++          "type": "finish",
++          "state": "finished",
++          "trusted": true,
++          "target": true,
++          "event": true
++        }
++      ],
++      "state": "finished",
++      "sameFinished": true
++    },
++    {
++      "mode": "reaction-removes-iframe",
++      "order": [
++        "reaction",
++        "after-remove",
++        "event:finish"
++      ],
++      "events": [
++        {
++          "type": "finish",
++          "state": "finished",
++          "trusted": true,
++          "target": true,
++          "event": true
++        }
++      ],
++      "state": "finished",
++      "connected": false
++    }
++  ]
++}
+diff --git a/oracle/animations-producer-expression.js b/oracle/animations-producer-expression.js
+new file mode 100644
+--- /dev/null
++++ b/oracle/animations-producer-expression.js
+@@ -0,0 +1,19 @@
++// Additional Native calibration: distinguish actual automatic, explicit-finish
++// and explicit-cancel producers without a close-spaced wall-clock assertion.
++(async()=>{
++ const rows=[],element=document.createElement('div');
++ for(const mode of['automatic','explicit-finish','explicit-cancel']){
++  const animation=element.animate(),order=[],first=animation.finished;
++  first.then(()=>order.push('promise:resolved'),error=>order.push('promise:rejected:'+error.name));
++  let observed;const eventDone=new Promise(resolve=>{
++   const handler=event=>{order.push('event:'+event.type);observed={type:event.type,state:animation.playState,trusted:event.isTrusted,event:event instanceof AnimationPlaybackEvent,target:event.target===animation,currentTime:event.currentTime,timelineTime:event.timelineTime};resolve()};
++   animation.onfinish=handler;animation.oncancel=handler;
++  });
++  if(mode==='explicit-finish')animation.finish();else if(mode==='explicit-cancel')animation.cancel();
++  order.push('after-action:'+animation.playState);
++  await Promise.all([first.catch(()=>{}),eventDone]);await Promise.resolve();
++  rows.push({mode,order,event:observed,state:animation.playState});
++  animation.onfinish=null;animation.oncancel=null;animation.finished.catch(()=>{});animation.cancel();
++ }
++ return rows;
++})()
+diff --git a/oracle/animations-reaction-boundary-expression.js b/oracle/animations-reaction-boundary-expression.js
+new file mode 100644
+--- /dev/null
++++ b/oracle/animations-reaction-boundary-expression.js
+@@ -0,0 +1,27 @@
++// Additional Native-only calibration. No expected event/lifetime policy here.
++(async()=>{
++ const rows=[],wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),element=document.createElement('div');
++ for(const mode of['deep-chain','reaction-cancel','reaction-replay']){
++  const animation=element.animate(),order=[],events=[],first=animation.finished;
++  const record=event=>{order.push('event:'+event.type+':'+animation.playState);events.push({type:event.type,state:animation.playState,trusted:event.isTrusted,target:event.target===animation,event:event instanceof AnimationPlaybackEvent})};
++  animation.onfinish=record;animation.oncancel=record;
++  first.then(()=>{
++   order.push('reaction:1');
++   if(mode==='deep-chain')Promise.resolve().then(()=>{order.push('reaction:2');Promise.resolve().then(()=>order.push('reaction:3'))});
++   else if(mode==='reaction-cancel'){animation.cancel();order.push('after-cancel:'+animation.playState)}
++   else{animation.play();order.push('after-play:'+animation.playState)}
++  });
++  await wait(35);await wait(0);rows.push({mode,order,events,state:animation.playState,sameFinished:first===animation.finished});
++  animation.onfinish=null;animation.oncancel=null;animation.finished.catch(()=>{});animation.cancel();
++ }
++ {
++  const frame=document.createElement('iframe');frame.src='/';const loaded=new Promise(resolve=>frame.onload=resolve);document.body.append(frame);await loaded;
++  const child=frame.contentWindow,PlaybackEvent=child.AnimationPlaybackEvent,animation=child.document.createElement('div').animate(),order=[],events=[],first=animation.finished;
++  animation.onfinish=event=>{order.push('event:finish');events.push({type:event.type,state:animation.playState,trusted:event.isTrusted,target:event.target===animation,event:event instanceof PlaybackEvent})};
++  first.then(()=>{order.push('reaction');frame.remove();order.push('after-remove')});
++  await wait(35);await wait(0);let state,stateError;try{state=animation.playState}catch(error){stateError={name:error.name,message:error.message}}
++  rows.push({mode:'reaction-removes-iframe',order,events,state,stateError,connected:frame.isConnected});
++  animation.onfinish=null;animation.finished.catch(()=>{});animation.cancel();
++ }
++ return rows;
++})()
+diff --git a/src/animations.js b/src/animations.js
+--- a/src/animations.js
++++ b/src/animations.js
+@@ -6,6 +6,7 @@
+ import {platformFactoryRecord,registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {onFrameRetirement} from './frame-activity.js';
++import {captureWindowTaskOwner} from './window-lifecycle-timers.js';
+ const require=createRequire(import.meta.url);
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
+@@ -79,12 +80,13 @@
+  if(installed.has(realm))return;
+  registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
+  const Promise=realm.Promise,convertListener=EventListener.convert;
+- const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
++ const taskOwner=captureWindowTaskOwner(page,realm);
++ const checkpoint=page.browser.runtimeBinding.checkpoint;
+  const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,playbackConstructor:null,disposed:false,automatic:new Set(),events:new Set()});
+  const task=(callback,automatic=false)=>{
+   if(runtime.disposed)return;
+   const tasks=automatic?runtime.automatic:runtime.events;let id;
+-  id=apply(setTimer,realm,[()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0]);tasks.add(id);
++  id=taskOwner.schedule(()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0);tasks.add(id);
+  };
+  function event(value,type,bubbles,cancelable,composed,currentTime,timelineTime){
+   // Setup preserves the exact object allocated by its actual VM constructor.
+@@ -93,15 +95,23 @@
+   const state=hidden({currentTime,timelineTime,implementation});playbackEvents.set(value,state);registerPlatformFactory(value,{kind:'AnimationPlaybackEvent',implementation:state,globalObject:realm});
+   return value;
+  }
+- runtime.emit=(state,type)=>task(()=>{
++ const dispatch=(state,type)=>{
+   // The captured ordinary VM constructor cannot be replaced by page globals;
+   // it allocates the real receiver that Event.setup initializes above.
+   const value=new runtime.playbackConstructor(type),implementation=playbackEvents.get(value).implementation;
+   implementation.isTrusted=true;apply(dispatchImpl,state.target,[implementation]);
+- });
++ };
++ runtime.emit=(state,type)=>task(()=>dispatch(state,type));
+  runtime.automaticTask=callback=>task(callback,true);
+- const finish=state=>{if(state.playState==='finished')return;state.playState='finished';state.finishedResolve?.(state.value);state.runtime.emit(state,'finish')};
+- const play=state=>{if(state.playState==='running')return;state.playState='running';state.runtime.automaticTask(()=>{if(state.playState==='running')finish(state)})};
++ const finish=(state,automatic=false)=>{
++  if(state.playState==='finished')return;state.playState='finished';state.finishedResolve?.(state.value);
++  // The actual automatic producer resolves and drains real V8 reactions before
++  // direct event dispatch. It runs inside the captured Window's timed VM task.
++  // A reaction may cancel/replay or remove its frame: those measured mutations
++  // do not suppress the already-producing finish event after this checkpoint.
++  if(automatic){checkpoint();dispatch(state,'finish')}else state.runtime.emit(state,'finish');
++ };
++ const play=state=>{if(state.playState==='running')return;state.playState='running';state.runtime.automaticTask(()=>{if(state.playState==='running')finish(state,true)})};
+  const makePromise=(state,key)=>{
+   // First getter's actual VM owns this genuine Promise; state stays Host-only.
+   let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no});
+@@ -138,7 +148,7 @@
+   eventTime(value,key){return key==='currentTime'||key==='timelineTime'?playbackEvents.get(value)[key]:undefined},
+  });
+  realm.eval(`(${factory.toString()})`)(realm,bridge);
+- const clear=tasks=>{for(const id of tasks)apply(clearTimer,realm,[id]);tasks.clear()};
++ const clear=tasks=>{for(const id of tasks)taskOwner.cancel(id);tasks.clear()};
+  onFrameRetirement(realm,()=>{clear(runtime.automatic);clear(runtime.events)});
+  page.documentAbort?.signal.addEventListener('abort',()=>{runtime.disposed=true;clear(runtime.automatic);clear(runtime.events)},{once:true});
+  installed.set(realm,runtime);
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -352,7 +352,6 @@
+       installAudioData(window);
+       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
+       installWebCodecsProcessors(window);
+-      installAnimations(this,window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
+@@ -373,6 +372,7 @@
+     prepareUtilityPlatform(window);
+     installFrameActivity(this,window);
+     installWindowLifecycleTimers(this,window);
++    listenerOwnership.scope(()=>installAnimations(this,window));
+     installScheduler(this,window);
+     installWindowOpen(this,window);
+     prepareHeapRealm(this,window);
+diff --git a/src/window-lifecycle-timers.js b/src/window-lifecycle-timers.js
+--- a/src/window-lifecycle-timers.js
++++ b/src/window-lifecycle-timers.js
+@@ -9,6 +9,11 @@
+ import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
+ const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
+ const queueTask=setImmediate,cancelTask=clearImmediate;
++export function captureWindowTaskOwner(page,window){
++ const record=pages.get(page);
++ if(!record||record.window!==window)throw new TypeError('The actual initialized Window task owner is required');
++ return record.internalTasks;
++}
+ export function stopPageLoading(page){
+  const record=pages.get(page);if(!record||record.disposed)return;
+  // Protocol entry has no outer Runtime.evaluate VM guard. Enter the actual
+@@ -65,6 +70,13 @@
+    for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
+   },
+  });
++ // Trusted startup clients capture this Host-only authority once. Internal
++ // work shares the actual Window task queue and watchdog without consulting
++ // authored globals, timer functions or a public owner/brand property.
++ record.internalTasks=Object.freeze(Object.assign(Object.create(null),{
++  schedule:(callback,delay)=>bridge.timer(window,false,2,callback,delay,[]),
++  cancel:handle=>cancel(record,handle),
++ }));
+  record.stopLoads=()=>bridge.stop(window);
+  const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
+  for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});
+diff --git a/test/animation-task-owner.test.js b/test/animation-task-owner.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/animation-task-owner.test.js
+@@ -0,0 +1,36 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {spawn} from 'node:child_process';
++import {Browser} from '../src/browser.js';
++import {readFile,writeFile} from 'node:fs/promises';
++import {createHash} from 'node:crypto';
++import {createFixture} from './fixture.js';
++
++test('actual internal animation task authority survives authored Window timer replacement',{timeout:5000},async t=>{
++ const browser=new Browser({timeout:2000}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>actual task owner</body>');
++ const window=page.dom.window;let intercepted=0;
++ for(const name of['setTimeout','clearTimeout','setInterval','clearInterval'])window[name]=()=>{intercepted++;throw new Error('authored timer replacement')};
++ const animation=window.document.createElement('div').animate();
++ const finished=new Promise(resolve=>animation.onfinish=resolve);await animation.finished;const event=await finished;
++ assert.equal(animation.playState,'finished');assert.equal(event.isTrusted,true);assert.equal(event instanceof window.AnimationPlaybackEvent,true);assert.equal(event.target,animation);
++ const canceled=new Promise(resolve=>animation.oncancel=resolve);animation.cancel();assert.equal((await canceled).type,'cancel');assert.equal(intercepted,0);
++ page.close();assert.equal(page.closed,true);
++});
++
++for(const phase of['event','promise'])test('actual private animation '+phase+' callback uses the captured Window watchdog and leaves future checkpoints usable',{timeout:8000},async()=>{
++ const child=spawn(process.execPath,['--experimental-vm-modules',new URL('./fixtures/animation-task-watchdog.mjs',import.meta.url).pathname,phase],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
++ let expired=false;const guard=setTimeout(()=>{expired=true;child.kill('SIGKILL')},7000);
++ const{code,signal}=await new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(guard);
++ if(process.env.ANIMATION_WATCHDOG_EVIDENCE)await writeFile(process.env.ANIMATION_WATCHDOG_EVIDENCE+'-'+phase+'.json',JSON.stringify({phase,pid:child.pid,code,signal,expired,stdout,stderr},null,2)+'\n',{flag:'wx'});
++ assert.equal(expired,false,stdout+stderr);assert.equal(signal,null,stdout+stderr);assert.equal(code,0,stdout+stderr);
++ const report=JSON.parse(stdout.trim().split('\n').at(-1));assert.equal(report.entered,true);assert.equal(report.state,'finished');assert.equal(report.recovered,true);assert.equal(report.disposed,true);assert.equal(report.effectiveTimeout,200);assert.deepEqual(report.futureOrder,['promise','event']);
++});
++
++test('actual Native animation producer checkpoints, deeper chains, state mutations and real frame retirement match',{timeout:10000},async t=>{
++ const sha=value=>createHash('sha256').update(value).digest('hex');
++ for(const name of['producer','reaction-boundary']){
++  const expression=await readFile(new URL('../oracle/animations-'+name+'-expression.js',import.meta.url),'utf8'),native=JSON.parse(await readFile(new URL('../oracle/animations-native-'+name+'.json',import.meta.url),'utf8'));assert.equal(sha(expression),native.sourceSHA256);
++  const server=await createFixture(),browser=new Browser({timeout:10000,loadResources:['iframe','worker']});t.after(async()=>{browser.close();await server.close()});const page=browser.createPage();await page.navigate('data:text/html,<body>animations</body>');await page.navigate(server.url);
++  assert.deepEqual(JSON.parse(JSON.stringify(await page.evaluate(expression))),native.result);
++ }
++});
+diff --git a/test/fixtures/animation-task-watchdog.mjs b/test/fixtures/animation-task-watchdog.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/animation-task-watchdog.mjs
+@@ -0,0 +1,21 @@
++import assert from 'node:assert/strict';
++import {Browser} from '../../src/browser.js';
++const phase=process.argv[2]??'event',browser=new Browser({timeout:200}),page=browser.createPage(),report={phase,effectiveTimeout:200};let timeoutError;
++try{
++ await page.navigate('data:text/html,<body>actual animation watchdog</body>');
++ page.on('pageError',error=>{timeoutError=error});
++ const source=phase==='promise'?'globalThis.entered=false;globalThis.animation=document.createElement("div").animate();animation.finished.then(()=>{entered=true;while(true){}});true':'globalThis.entered=false;globalThis.animation=document.createElement("div").animate();animation.onfinish=()=>{entered=true;while(true){}};true';
++ page.evaluate(source);
++ process.stdout.write(JSON.stringify({marker:'armed',phase,effectiveTimeout:200})+'\n');
++ const end=Date.now()+2000;while(!timeoutError){if(Date.now()>=end)throw Error('Original2s diagnostic callback-error deadline');await new Promise(resolve=>setTimeout(resolve,5))}
++ assert.match(timeoutError.message,/timed out/);
++ const result=page.evaluate('({entered,state:animation.playState,text:document.body.textContent})');report.entered=result.entered;report.state=result.state;report.recovered=result.text==='actual animation watchdog';
++ assert.equal(report.entered,true);assert.equal(report.recovered,true);assert.equal(report.state,'finished');
++ // A later real automatic producer must still perform its actual checkpoint;
++ // a latched native busy/reentrant flag cannot masquerade as recovery.
++ page.evaluate('globalThis.recoveryOrder=[];globalThis.nextAnimation=document.createElement("div").animate();nextAnimation.finished.then(()=>recoveryOrder.push("promise"));nextAnimation.onfinish=()=>recoveryOrder.push("event");true');
++ const recoveryEnd=Date.now()+2000;while(page.evaluate('recoveryOrder.length')!==2){if(Date.now()>=recoveryEnd)throw Error('Original2s futurecheckpoint deadline');await new Promise(resolve=>setTimeout(resolve,5))}
++ report.futureOrder=Array.from(page.evaluate('recoveryOrder'));assert.deepEqual(report.futureOrder,['promise','event']);
++ page.close();report.disposed=page.closed;
++}finally{browser.close()}
++console.log(JSON.stringify(report));

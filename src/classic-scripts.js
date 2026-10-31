@@ -1,3 +1,4 @@
+import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import{randomUUID}from'node:crypto';
 import{resolveBlobURL}from'./blob-urls.js';
@@ -186,10 +187,10 @@ function synchronousStylesheet(record,loader,fetch,url,options,delivery){
   const protocol=new URL(url).protocol;
   if(protocol==='blob:'||protocol==='data:'){
    let snapshot;if(protocol==='blob:')snapshot=resolveBlobURL(page,url);else{const parsed=require('data-urls')(url);if(!parsed)throw Error('Invalid data URL');snapshot={bytes:parsed.body,mimeType:parsed.mimeType.toString(),url};}
-   const id=randomUUID();op.local=id;owner.activeRequests.add(id);owner.lastActivity=Date.now();owner.emit('request',{id,url,type:'Stylesheet',method:'GET',headers:{},timestamp:performance.now()/1000,frameId:page.frameId,loaderId:page.loaderId});
+   const id=randomUUID(),capture=startNetworkCapture(owner.context,id);op.local=id;owner.activeRequests.add(id);owner.lastActivity=Date.now();owner.emit('request',{id,url,type:'Stylesheet',method:'GET',headers:{},postDataFields:inlinePostData(capture),timestamp:performance.now()/1000,frameId:page.frameId,loaderId:page.loaderId});
    if(!delivery.current())throw Error('Synchronous stylesheet canceled');
    if(snapshot.bytes.byteLength>4*1024*1024)throw Error('Stylesheet exceeds 4 MiB limit');
-   response={status:200,statusText:'OK',headers:new Headers(snapshot.mimeType?{'content-type':snapshot.mimeType}:{}),bytes:Buffer.from(snapshot.bytes),url:snapshot.url};owner.responseBodies??=new Map();if(owner.responseBodies.size>=100)owner.responseBodies.delete(owner.responseBodies.keys().next().value);owner.responseBodies.set(id,response.bytes.toString('utf8'));
+   response={status:200,statusText:'OK',headers:new Headers(snapshot.mimeType?{'content-type':snapshot.mimeType}:{}),bytes:Buffer.from(snapshot.bytes),url:snapshot.url};beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,response.bytes);finishNetworkResponse(capture);
    owner.activeRequests.delete(id);owner.requestFinished(id,url,200,response.bytes.length,Object.fromEntries(response.headers),'Stylesheet',page.frameId,page.loaderId);op.local=null;
   }else{
    const headers=new Headers(),referrer=page.referrerFor?.(url,record.window.document.URL);if(referrer)headers.set('referer',referrer);

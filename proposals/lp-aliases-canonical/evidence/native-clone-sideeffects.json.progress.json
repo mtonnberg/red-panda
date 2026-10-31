@@ -1,0 +1,176 @@
+{
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "probeSHA256": "45af8e96e440e6293ddcaa05cc033eeacde02444c4c862321411a843e20f5d2d",
+  "rows": [
+    {
+      "label": "document",
+      "method": "Page.navigate",
+      "params": {
+        "url": "data:text/html,<!doctype html><body><h1>Real heading</h1><p id=scope>Actual <strong>text</strong> and <a href=https://example.test/next>link</a>.</p>"
+      },
+      "result": {
+        "frameId": "FID-0000000001",
+        "loaderId": "LID-0000000001"
+      }
+    },
+    {
+      "label": "install-real-custom-element",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{globalThis.__lpEffects={constructors:0,nodeReads:0,elementReads:0};customElements.define('x-alias-effects',class extends HTMLElement{constructor(){super();__lpEffects.constructors++}});const el=document.createElement('x-alias-effects');el.textContent='Custom element text';document.body.append(el);globalThis.__lpRestore=()=>{};return __lpEffects})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "custom-element-before",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "Promise.resolve().then(()=>({...__lpEffects}))",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "custom-element-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Real heading\n\nActual **text** and [link](https://example.test/next).\nCustom element text\n"
+      }
+    },
+    {
+      "label": "custom-element-after",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "Promise.resolve().then(()=>({...__lpEffects}))",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "poison-node-getters",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const saved=[];for(const[prototype,key]of[[Node.prototype,'nodeType'],[Node.prototype,'childNodes'],[Node.prototype,'textContent'],[CharacterData.prototype,'data']]){const descriptor=Object.getOwnPropertyDescriptor(prototype,key);saved.push([prototype,key,descriptor]);Object.defineProperty(prototype,key,{get(){__lpEffects.nodeReads++;throw Error('authored Node getter '+key)},configurable:true})}__lpRestore=()=>{for(const[prototype,key,descriptor]of saved)Object.defineProperty(prototype,key,descriptor)};return {...__lpEffects}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "node-getters-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Real heading\n\nActual **text** and [link](https://example.test/next).\nCustom element text\n"
+      }
+    },
+    {
+      "label": "node-getters-after-and-restore",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const value={...__lpEffects};__lpRestore();return value})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "poison-element-fronts",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const saved=[];for(const[prototype,key]of[[Element.prototype,'localName'],[HTMLElement.prototype,'hidden'],[HTMLAnchorElement.prototype,'href']]){const descriptor=Object.getOwnPropertyDescriptor(prototype,key);saved.push([prototype,key,descriptor]);Object.defineProperty(prototype,key,{get(){__lpEffects.elementReads++;throw Error('authored Element getter '+key)},configurable:true})}const original=Element.prototype.getAttribute;saved.push([Element.prototype,'getAttribute',Object.getOwnPropertyDescriptor(Element.prototype,'getAttribute')]);Object.defineProperty(Element.prototype,'getAttribute',{value:function(){__lpEffects.elementReads++;throw Error('authored attribute getter')},writable:true,configurable:true});__lpRestore=()=>{for(const[prototype,key,descriptor]of saved)Object.defineProperty(prototype,key,descriptor)};return {...__lpEffects}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "element-fronts-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Real heading\n\nActual **text** and [link](https://example.test/next).\nCustom element text\n"
+      }
+    },
+    {
+      "label": "element-fronts-after-and-restore",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const value={...__lpEffects};__lpRestore();return value})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0
+          }
+        }
+      }
+    }
+  ],
+  "pid": 606245
+}

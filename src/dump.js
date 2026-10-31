@@ -74,33 +74,46 @@ export function truncateDump(value, maximum) {
 }
 
 function markdown(root, sources) {
+  return formatMarkdown(root, {
+    type:node=>node.nodeType, data:node=>node.data, tag:node=>node.localName,
+    children:node=>[...node.childNodes], elements:node=>[...node.children],
+    style:node=>computed(node,sources), hidden:node=>node.hidden,
+    attr:(node,name)=>node.getAttribute(name), hasAttr:(node,name)=>node.hasAttribute(name),
+    href:node=>(sources.get(node)??node).href, src:node=>(sources.get(node)??node).src,
+    alt:node=>node.alt, parentTag:node=>node.parentElement?.localName,
+    text:node=>node.textContent, inputType:node=>node.type, checked:node=>node.checked,
+    selectedOptions:node=>[...node.selectedOptions], rows:node=>[...node.rows],
+    firstRow:node=>node.rows[0], cells:node=>[...node.cells], hasHeader:node=>node?.querySelector('th'),
+  });
+}
+export function formatMarkdown(root, read) {
   const render = (node, listIndex = 1) => {
-    if (node.nodeType === 3) return node.data.replace(/\s+/g, ' ');
-    if (node.nodeType === 9 || node.nodeType === 11) return [...node.childNodes].map(child => render(child)).join('');
-    if (node.nodeType !== 1) return '';
-    const tag = node.localName, style = computed(node, sources);
-    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || node.hidden || node.getAttribute('aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return '';
-    const content = [...node.childNodes].map(child => render(child)).join('');
+    if (read.type(node) === 3) return read.data(node).replace(/\s+/g, ' ');
+    if (read.type(node) === 9 || read.type(node) === 11) return read.children(node).map(child => render(child)).join('');
+    if (read.type(node) !== 1) return '';
+    const tag = read.tag(node), style = read.style(node);
+    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || read.hidden(node) || read.attr(node, 'aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return '';
+    const content = read.children(node).map(child => render(child)).join('');
     if (/^h[1-6]$/.test(tag)) return `\n${'#'.repeat(Number(tag[1]))} ${content.trim()}\n`;
     if (tag === 'a') {
-      const link = node.hasAttribute('href') ? `[${content.trim()}](${(sources.get(node) ?? node).href || node.getAttribute('href')})` : content;
-      return ['body', 'div', 'main', 'article', 'section', 'nav', 'aside', 'header', 'footer'].includes(node.parentElement?.localName) ? `${link}\n` : link;
+      const link = read.hasAttr(node, 'href') ? `[${content.trim()}](${read.href(node) || read.attr(node, 'href')})` : content;
+      return ['body', 'div', 'main', 'article', 'section', 'nav', 'aside', 'header', 'footer'].includes(read.parentTag(node)) ? `${link}\n` : link;
     }
-    if (tag === 'img') return `![${node.alt ?? ''}](${(sources.get(node) ?? node).src || node.getAttribute('src') || ''})`;
+    if (tag === 'img') return `![${read.alt(node) ?? ''}](${read.src(node) || read.attr(node, 'src') || ''})`;
     if (tag === 'br') return '\n';
     if (tag === 'hr') return '\n---\n';
-    if (tag === 'ul' || tag === 'ol') return [...node.children].map((child, index) => render(child, index + Number(node.getAttribute('start') ?? 1))).join('');
-    if (tag === 'li') return `${node.parentElement?.localName === 'ol' ? `${listIndex}.` : '-'} ${content.trim()}\n`;
-    if (tag === 'pre') return `\n\`\`\`\n${node.textContent.trim()}\n\`\`\`\n`;
-    if (tag === 'code') return node.parentElement?.localName === 'pre' ? content : `\`${content}\``;
+    if (tag === 'ul' || tag === 'ol') return read.elements(node).map((child, index) => render(child, index + Number(read.attr(node, 'start') ?? 1))).join('');
+    if (tag === 'li') return `${read.parentTag(node) === 'ol' ? `${listIndex}.` : '-'} ${content.trim()}\n`;
+    if (tag === 'pre') return `\n\`\`\`\n${read.text(node).trim()}\n\`\`\`\n`;
+    if (tag === 'code') return read.parentTag(node) === 'pre' ? content : `\`${content}\``;
     if (tag === 'b' || tag === 'strong') return `**${content}**`;
     if (tag === 'i' || tag === 'em') return `*${content}*`;
     if (tag === 'del' || tag === 's') return `~~${content}~~`;
-    if (tag === 'input') return ['checkbox', 'radio'].includes(node.type) ? `[${node.checked ? 'x' : ' '}] ` : '';
-    if (tag === 'select') return [...node.selectedOptions].map(option => option.textContent).join(', ');
+    if (tag === 'input') return ['checkbox', 'radio'].includes(read.inputType(node)) ? `[${read.checked(node) ? 'x' : ' '}] ` : '';
+    if (tag === 'select') return read.selectedOptions(node).map(option => read.text(option)).join(', ');
     if (tag === 'table') {
-      const rows = [...node.rows].map(row => `| ${[...row.cells].map(cell => render(cell).trim().replaceAll('|', '\\|')).join(' | ')} |\n`);
-      if (node.rows[0]?.querySelector('th')) rows.splice(1, 0, `|${[...node.rows[0].cells].map(() => '---').join('|')}|\n`);
+      const rows = read.rows(node).map(row => `| ${read.cells(row).map(cell => render(cell).trim().replaceAll('|', '\\|')).join(' | ')} |\n`);
+      if (read.hasHeader(read.firstRow(node))) rows.splice(1, 0, `|${read.cells(read.firstRow(node)).map(() => '---').join('|')}|\n`);
       return `\n${rows.join('')}`;
     }
     if (tag === 'blockquote') return `\n${content.trim().split('\n').map(line => `> ${line}`).join('\n')}\n`;

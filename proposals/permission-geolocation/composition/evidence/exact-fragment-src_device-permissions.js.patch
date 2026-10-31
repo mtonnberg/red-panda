@@ -1,0 +1,89 @@
+--- a/src/device-permissions.js
++++ b/src/device-permissions.js
+@@ -6,12 +6,13 @@
+ import {installErrors} from './errors.js';
+ import {registerProtocolPrototype} from './protocol-classes.js';
+ import {getRuntimeBinding} from './native-runtime.js';
++import {permissionOwnerForPage,permissionState,geolocationOverride} from './permission-control.js';
+ 
+ // Records and task ownership remain in Host code; page objects carry no private
+ // symbols, implementation fields, permission grants, or manufactured positions.
+ const records=new WeakMap(),navigators=new WeakMap(),geolocations=new WeakMap(),errors=new WeakMap(),notifications=new WeakMap();
+ const positions=new WeakMap(),coordinates=new WeakMap();
+-const apply=Reflect.apply,hostCreate=Object.create,hostAssign=Object.assign,hostDefine=Object.defineProperty,hostOwn=Object.getOwnPropertyDescriptor;
++const apply=Reflect.apply,hostCreate=Object.create,hostAssign=Object.assign,hostDefine=Object.defineProperty,hostOwn=Object.getOwnPropertyDescriptor,hostSetPrototype=Object.setPrototypeOf,hostNow=Date.now;
+ const privateRecord=data=>hostAssign(hostCreate(null),data);
+ const {implForWrapper}=createRequire(import.meta.url)('jsdom/lib/jsdom/living/generated/utils.js');
+ 
+@@ -72,13 +73,13 @@
+   get altitudeAccuracy(){if(!bridge.hasCoordinates(this))invocation();return bridge.coordinate(this,'altitudeAccuracy');},
+   get heading(){if(!bridge.hasCoordinates(this))invocation();return bridge.coordinate(this,'heading');},
+   get speed(){if(!bridge.hasCoordinates(this))invocation();return bridge.coordinate(this,'speed');},
+-  toJSON(){if(!bridge.hasCoordinates(this))invocation();return{accuracy:this.accuracy,latitude:this.latitude,longitude:this.longitude,altitude:this.altitude,altitudeAccuracy:this.altitudeAccuracy,heading:this.heading,speed:this.speed};},
++  toJSON(){if(!bridge.hasCoordinates(this))invocation();return{accuracy:bridge.coordinate(this,'accuracy'),latitude:bridge.coordinate(this,'latitude'),longitude:bridge.coordinate(this,'longitude'),altitude:bridge.coordinate(this,'altitude'),altitudeAccuracy:bridge.coordinate(this,'altitudeAccuracy'),heading:bridge.coordinate(this,'heading'),speed:bridge.coordinate(this,'speed')};},
+  };
+  installPrototype(GeolocationCoordinates,coordinatePrototype);
+  const positionPrototype={
+   get coords(){if(!bridge.hasPosition(this))invocation();return bridge.position(this,'coords');},
+   get timestamp(){if(!bridge.hasPosition(this))invocation();return bridge.position(this,'timestamp');},
+-  toJSON(){if(!bridge.hasPosition(this))invocation();return{coords:this.coords.toJSON(),timestamp:this.timestamp};},
++  toJSON(){if(!bridge.hasPosition(this))invocation();const c=bridge.position(this,'coords');return{coords:{accuracy:bridge.coordinate(c,'accuracy'),latitude:bridge.coordinate(c,'latitude'),longitude:bridge.coordinate(c,'longitude'),altitude:bridge.coordinate(c,'altitude'),altitudeAccuracy:bridge.coordinate(c,'altitudeAccuracy'),heading:bridge.coordinate(c,'heading'),speed:bridge.coordinate(c,'speed')},timestamp:bridge.position(this,'timestamp')};},
+  };
+  installPrototype(GeolocationPosition,positionPrototype);
+  function Notification(title){
+@@ -106,7 +107,7 @@
+  const permission=()=> 'default',maxActions=()=>2,requestPermission=()=>apply(resolvePromise,PromiseConstructor,['default']);
+  defineProperty(permission,'name',{value:'get permission',configurable:true});defineProperty(maxActions,'name',{value:'get maxActions',configurable:true});defineProperty(requestPermission,'name',{value:'requestPermission',configurable:true});
+  defineProperty(Notification,'permission',{get:permission,enumerable:true,configurable:true});defineProperty(Notification,'maxActions',{get:maxActions,enumerable:true,configurable:true});defineProperty(Notification,'requestPermission',{value:requestPermission,writable:true,enumerable:true,configurable:true});
+- const geo=create(Geolocation.prototype);bridge.initializeGeo(geo);
++ const geo=bridge.createValue(Geolocation.prototype);bridge.initializeGeo(geo);
+  bridge.exportInterfaces(Geolocation,GeolocationPosition,GeolocationCoordinates,GeolocationPositionError,Notification,geo);
+ 
+ }
+@@ -118,12 +119,14 @@
+  if(!vm.isContext(context))throw new TypeError('Device APIs require the actual owning VM context');
+  const invocation=createInvocationTrampoline(context),report=installErrors(page,window),tasks=new Set();
+  const record=privateRecord({page,window,document,signal,tasks,disposed:false});
+- const api=privateRecord({interfaces:hostCreate(null)}),createErrorObject=window.Object.create;let errorPrototype;
++ const api=privateRecord({interfaces:hostCreate(null)}),ObjectConstructor=vm.runInContext('Object',context),owner=permissionOwnerForPage(page);let errorPrototype,positionPrototype,coordinatePrototype;
++ const createValue=prototype=>hostSetPrototype(Reflect.construct(ObjectConstructor,[]),prototype);
+  const active=()=>!record.disposed&&!page.closed&&!signal?.aborted&&window.document===document;
+  function cancel(job){cancelTask(job.timer);job.owner.tasks.delete(job);if(job.watchId)job.state.watches.delete(job.watchId);job.success=job.error=null;}
+  record.cancel=()=>{for(const job of tasks)cancel(job)};
+  const bridge=privateRecord({
+-  initializeGeo(value){geolocations.set(value,privateRecord({next:0,watches:new Map()}));},navigatorGeo:receiver=>navigators.get(receiver)?.geo,
++  createValue,
++  initializeGeo(value){geolocations.set(value,privateRecord({owner,next:0,watches:new Map()}));},navigatorGeo:receiver=>navigators.get(receiver)?.geo,
+   hasGeo:receiver=>geolocations.has(receiver),hasError:receiver=>errors.has(receiver),error:(receiver,key)=>errors.get(receiver)[key],
+   hasPosition:value=>positions.has(value),position:(value,key)=>positions.get(value)[key],hasCoordinates:value=>coordinates.has(value),coordinate:(value,key)=>coordinates.get(value)[key],
+   notification(value,data){notifications.set(value,Object.freeze(privateRecord(data)))},hasNotification:value=>notifications.has(value),notificationValue:(value,key)=>notifications.get(value)[key],
+@@ -133,10 +136,16 @@
+    const job=privateRecord({owner:record,state,watchId,success,error});if(watch)state.watches.set(watchId,job);tasks.add(job);
+    job.timer=hostTask(()=>{
+     tasks.delete(job);if(watchId)state.watches.delete(watchId);
+-    const callback=job.error;job.success=job.error=null;
+-    if(!active()||typeof callback!=='function')return;
+-    const value=apply(createErrorObject,undefined,[errorPrototype]);
+-    errors.set(value,privateRecord({code:1,message:'User denied Geolocation'}));
++    if(!active()){job.success=job.error=null;return;}
++    const granted=permissionState(state.owner,'geolocation')==='granted',override=granted?geolocationOverride(state.owner):null;
++    const callback=override?job.success:job.error;job.success=job.error=null;
++    if(typeof callback!=='function')return;
++    let value;
++    if(override){
++     const coords=createValue(coordinatePrototype);value=createValue(positionPrototype);
++     coordinates.set(coords,Object.freeze(privateRecord({latitude:override.latitude,longitude:override.longitude,accuracy:override.accuracy,altitude:null,altitudeAccuracy:null,heading:null,speed:null})));
++     positions.set(value,Object.freeze(privateRecord({coords,timestamp:hostNow()})));
++    }else{value=createValue(errorPrototype);errors.set(value,privateRecord({code:granted?2:1,message:granted?'Position unavailable':'User denied Geolocation'}));}
+     try{invocation.invoke(callback,window,[value],{timeout:Math.min(page.timeout??10000,2000),displayErrors:false})}catch(error){report.report(error)}
+    },0);return watch?watchId:undefined;
+   },
+@@ -144,7 +153,7 @@
+   exportInterfaces(Geolocation,GeolocationPosition,GeolocationCoordinates,GeolocationPositionError,Notification,geo){
+    const values=privateRecord({Geolocation,GeolocationPosition,GeolocationCoordinates,GeolocationPositionError,Notification});
+    for(const[name,C]of Object.entries(values)){api.interfaces[name]=C;hostDefine(C,'prototype',{writable:false});hostDefine(window,name,{value:C,writable:true,enumerable:false,configurable:true});}
+-   api.geo=geo;errorPrototype=hostOwn(GeolocationPositionError,'prototype').value;
++   api.geo=geo;errorPrototype=hostOwn(GeolocationPositionError,'prototype').value;positionPrototype=hostOwn(GeolocationPosition,'prototype').value;coordinatePrototype=hostOwn(GeolocationCoordinates,'prototype').value;
+   },
+  });
+  vm.compileFunction(`(${factory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:context})(bridge);

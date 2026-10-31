@@ -4,7 +4,30 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The latest full-suite checkpoint passes **1,906 JavaScript tests, 100 PureScript
+The current combined checkpoint passes **1,956 JavaScript tests, 117 PureScript
+Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
+pedantic builds with zero warnings or errors. The
+[frozen validation](../proposals/phase25-full-accepted/README.md) records 9,995
+unchanged inputs and the exact 44 runtime/test/automation leaves.
+
+This integration adds measured cookie actions and Unicode HTTP transport,
+JavaScript dialog state, actual thrown-object handles, Page close/stop controls,
+canonical Markdown aliases, permissions/geolocation and bounded binary/POST
+capture. Its 43 new feature cases passed separately on each of Node 24.19, 24.22
+and 26.13. The narrow animation scheduling fix also passes 28 affected checks on
+each SDK. It captures the actual private Window task queue and leaves the
+original finish/play/queued-event code intact. Finish after frame removal and
+complete Promise interruption remain unfinished.
+
+The earlier [initial full run](../proposals/phase25-full-initial/README.md) remains
+failed: 1,951 of 1,954 JavaScript cases passed, with animation timing, a native
+heap-query timeout and a CLI child timeout. The shared timer queue inversion has
+measured causal controls; heap/CLI timeout causes remain unexplained. Passing
+single/whole-file diagnostics and the new full run do not relabel those failures
+or establish a causal fix. The ambient Node 26 timing-probe timeout and later
+canonical-environment positives are likewise separate epochs.
+
+The preceding fully passing full-suite checkpoint passes **1,906 JavaScript tests, 100 PureScript
 Puppeteer checks and 13 native differential groups**, syntax and strict/pedantic
 PureScript builds. [Validation](reference/phase23-integration/validation.json)
 records 13,487 unchanged monitored inputs. Its first1902-case full run had1899
@@ -54,12 +77,19 @@ All 27 focused cases pass on each prepared SDK with 8,341 monitored inputs
 unchanged. These acknowledgements do not implement stylesheet inspection,
 Inspector debugging, or TLS policy. [Configuration evidence](../proposals/cdp-configuration-acks/README.md).
 
-Functional work still includes complete cookie delete/clear/attached-write scope, Page/dialog and
-permission controls, binary response/post-data capture and real limits, cache,
-Fetch/downloads, trusted input/semantic tools, broader media and genuine Window/
-module boundaries. Source63/private104 and historical full455 results stay
-separate; no full browser/WPT/performance equivalence is claimed. Native C++ remains
-cb235f73; optional owned-context/module designs are not production.
+The new protocol/transport controls have bounded Native comparisons, with their
+remaining owner, parser and transport exclusions retained in each proposal.
+Functional work still includes full author-style Markdown, cache and actual
+Fetch interception/downloads, trusted file input/semantic tools, broader media,
+and genuine reusable Window/module boundaries. Shared/default-queue Promise
+interruption remains a foundational gap; an animation checkpoint experiment that
+corrupted Node's async-hook stack is excluded from production. The
+[current static ledger](../proposals/phase25-remaining-static/README.md) separates
+historical fixture outcomes from today's measured graph. Source63/private104 and
+historical full455 results stay separate; no full browser/WPT/performance
+equivalence is claimed. Native C++ remains cb235f73; optional owned-context/module
+designs are not production. Red Panda branding is intentional; a literal
+Lightpanda-name fixture failure does not establish its later assertions passed.
 
 The sections below retain earlier checkpoint evidence and its original limits.
 

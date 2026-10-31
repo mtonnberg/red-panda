@@ -1,3 +1,5 @@
+import {internalCookieHeader} from './internal-cookie-header.js';
+import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
 import {cookieHeaderForSync} from './cookie-site.js';
 import {httpResponseCookie} from './http-cookie-ingress.js';
 import { Worker } from 'node:worker_threads';
@@ -43,11 +45,11 @@ export class SyncHTTP {
    for(let redirects=0;redirects<=20;redirects++){
     checkpoint();
     const useCookies=init.credentials!=='omit'&&(init.credentials!=='same-origin'||new URL(url).origin===init.credentialsOrigin);
-    const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
+    const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',internalCookieHeader(cookie));else headers.delete('cookie');
     metadata(headers,url);
     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
-    const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
-    page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+    const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+    page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),postDataFields:inlinePostData(capture),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
     checkpoint();
     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
     this.#ensureWorker().postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
@@ -69,8 +71,7 @@ export class SyncHTTP {
      redirectResponse={url,status:response.status,statusText:response.statusText,headers:Object.fromEntries(response.headers),mimeType:response.headers.get('content-type')??'text/html',connectionReused:false,connectionId:0,encodedDataLength:0,securityState:'neutral'};
      url=next.href;continue;
     }
-    page.responseBodies??=new Map();if(page.responseBodies.size>=100)page.responseBodies.delete(page.responseBodies.keys().next().value);
-    page.responseBodies.set(id,bytes.toString('utf8'));
+    beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes);finishNetworkResponse(capture);
     // Remove the captured id before entering arbitrary event callbacks. The
     // operation itself remains owned until those callbacks return normally.
     page.activeRequests.delete(id);

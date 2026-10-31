@@ -1,0 +1,1 @@
+Rejectedfirstprivateownerprototype: capturedprivateWindowqueue butautomaticdirectHostdispatch ran eventbeforePromise; actualNative3producer control requiresPromisebeforeevent. Explicitfinish/cancelobjects match. Controllerstopped beforetimingand28tests:0testsrun, no retry. Bothcapturingprocesses/native exited0,7833guardsunchanged,4.642s. NoRootapply.

@@ -1,0 +1,136 @@
+diff --git a/src/animations.js b/src/animations.js
+--- a/src/animations.js
++++ b/src/animations.js
+@@ -6,6 +6,7 @@
+ import {platformFactoryRecord,registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {onFrameRetirement} from './frame-activity.js';
++import {captureWindowTaskOwner} from './window-lifecycle-timers.js';
+ const require=createRequire(import.meta.url);
+ const EventTarget=require('jsdom/lib/jsdom/living/generated/EventTarget.js');
+ const Event=require('jsdom/lib/jsdom/living/generated/Event.js');
+@@ -79,12 +80,12 @@
+  if(installed.has(realm))return;
+  registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
+  const Promise=realm.Promise,convertListener=EventListener.convert;
+- const setTimer=realm.setTimeout,clearTimer=realm.clearTimeout;
++ const taskOwner=captureWindowTaskOwner(page,realm);
+  const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,playbackConstructor:null,disposed:false,automatic:new Set(),events:new Set()});
+  const task=(callback,automatic=false)=>{
+   if(runtime.disposed)return;
+   const tasks=automatic?runtime.automatic:runtime.events;let id;
+-  id=apply(setTimer,realm,[()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0]);tasks.add(id);
++  id=taskOwner.schedule(()=>{tasks.delete(id);if(!runtime.disposed)callback()},automatic?10:0);tasks.add(id);
+  };
+  function event(value,type,bubbles,cancelable,composed,currentTime,timelineTime){
+   // Setup preserves the exact object allocated by its actual VM constructor.
+@@ -138,7 +139,7 @@
+   eventTime(value,key){return key==='currentTime'||key==='timelineTime'?playbackEvents.get(value)[key]:undefined},
+  });
+  realm.eval(`(${factory.toString()})`)(realm,bridge);
+- const clear=tasks=>{for(const id of tasks)apply(clearTimer,realm,[id]);tasks.clear()};
++ const clear=tasks=>{for(const id of tasks)taskOwner.cancel(id);tasks.clear()};
+  onFrameRetirement(realm,()=>{clear(runtime.automatic);clear(runtime.events)});
+  page.documentAbort?.signal.addEventListener('abort',()=>{runtime.disposed=true;clear(runtime.automatic);clear(runtime.events)},{once:true});
+  installed.set(realm,runtime);
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -352,7 +352,6 @@
+       installAudioData(window);
+       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
+       installWebCodecsProcessors(window);
+-      installAnimations(this,window);
+       installSVG(this, window);
+       installDOMIDL(this, window);
+       installDOMEvents(this, window);
+@@ -373,6 +372,7 @@
+     prepareUtilityPlatform(window);
+     installFrameActivity(this,window);
+     installWindowLifecycleTimers(this,window);
++    listenerOwnership.scope(()=>installAnimations(this,window));
+     installScheduler(this,window);
+     installWindowOpen(this,window);
+     prepareHeapRealm(this,window);
+diff --git a/src/window-lifecycle-timers.js b/src/window-lifecycle-timers.js
+--- a/src/window-lifecycle-timers.js
++++ b/src/window-lifecycle-timers.js
+@@ -9,6 +9,11 @@
+ import {xhrStopAuthority,xhrRetirementAuthority} from './xhr.js';
+ const owners=new WeakMap(),pages=new WeakMap(),apply=Reflect.apply,primitive=value=>value===null||typeof value!=='object'&&typeof value!=='function';
+ const queueTask=setImmediate,cancelTask=clearImmediate;
++export function captureWindowTaskOwner(page,window){
++ const record=pages.get(page);
++ if(!record||record.window!==window)throw new TypeError('The actual initialized Window task owner is required');
++ return record.internalTasks;
++}
+ export function stopPageLoading(page){
+  const record=pages.get(page);if(!record||record.disposed)return;
+  // Protocol entry has no outer Runtime.evaluate VM guard. Enter the actual
+@@ -65,6 +70,13 @@
+    for(const{fetches,xhrs}of loads){for(const cancel of fetches)cancel();for(const cancel of xhrs)cancel()}
+   },
+  });
++ // Trusted startup clients capture this Host-only authority once. Internal
++ // work shares the actual Window task queue and watchdog without consulting
++ // authored globals, timer functions or a public owner/brand property.
++ record.internalTasks=Object.freeze(Object.assign(Object.create(null),{
++  schedule:(callback,delay)=>bridge.timer(window,false,2,callback,delay,[]),
++  cancel:handle=>cancel(record,handle),
++ }));
+  record.stopLoads=()=>bridge.stop(window);
+  const methods=vm.compileFunction('return ('+publicMethods.toString()+')(bridge)',['bridge'],{parsingContext:context})(bridge);
+  for(const[name,value]of Object.entries(methods))Object.defineProperty(window,name,{value,writable:true,enumerable:true,configurable:true});
+diff --git a/test/animation-task-owner.test.js b/test/animation-task-owner.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/animation-task-owner.test.js
+@@ -0,0 +1,25 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {spawn} from 'node:child_process';
++import {Browser} from '../src/browser.js';
++
++test('actual internal animation task authority survives authored Window timer replacement',{timeout:5000},async t=>{
++ const browser=new Browser({timeout:2000}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>actual task owner</body>');
++ const window=page.dom.window;let intercepted=0;const originals=new Map(['setTimeout','clearTimeout','setInterval','clearInterval'].map(name=>[name,Object.getOwnPropertyDescriptor(window,name)]));
++ try{
++ for(const name of['setTimeout','clearTimeout','setInterval','clearInterval'])window[name]=()=>{intercepted++;throw new Error('authored timer replacement')};
++ const animation=window.document.createElement('div').animate();
++ const finished=new Promise(resolve=>animation.onfinish=resolve);await animation.finished;const event=await finished;
++ assert.equal(animation.playState,'finished');assert.equal(event.isTrusted,true);assert.equal(event instanceof window.AnimationPlaybackEvent,true);assert.equal(event.target,animation);
++ const canceled=new Promise(resolve=>animation.oncancel=resolve);animation.cancel();assert.equal((await canceled).type,'cancel');assert.equal(intercepted,0);
++ }finally{for(const[name,descriptor]of originals)Object.defineProperty(window,name,descriptor)}
++ page.close();assert.equal(page.closed,true);
++});
++
++test('actual private animation callback uses the captured Window watchdog and leaves later queries and close usable',{timeout:8000},async()=>{
++ const child=spawn(process.execPath,['--experimental-vm-modules',new URL('./fixtures/animation-task-watchdog.mjs',import.meta.url).pathname],{stdio:['ignore','pipe','pipe']});let stdout='',stderr='';child.stdout.on('data',v=>stdout+=v);child.stderr.on('data',v=>stderr+=v);
++ let expired=false;const guard=setTimeout(()=>{expired=true;child.kill('SIGKILL')},7000);
++ const{code,signal}=await new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));clearTimeout(guard);
++ assert.equal(expired,false,stdout+stderr);assert.equal(signal,null,stdout+stderr);assert.equal(code,0,stdout+stderr);
++ const report=JSON.parse(stdout.trim().split('\n').at(-1));assert.equal(report.entered,true);assert.equal(report.state,'finished');assert.equal(report.recovered,true);assert.equal(report.disposed,true);assert.equal(report.effectiveTimeout,200);assert.deepEqual(report.futureOrder,['promise','event']);
++});
+diff --git a/test/fixtures/animation-task-watchdog.mjs b/test/fixtures/animation-task-watchdog.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/fixtures/animation-task-watchdog.mjs
+@@ -0,0 +1,18 @@
++import assert from 'node:assert/strict';
++import {Browser} from '../../src/browser.js';
++const browser=new Browser({timeout:200}),page=browser.createPage(),report={effectiveTimeout:200};let timeoutError;
++try{
++ await page.navigate('data:text/html,<body>actual animation watchdog</body>');
++ page.on('pageError',error=>{timeoutError=error});
++ page.evaluate('globalThis.entered=false;globalThis.animation=document.createElement("div").animate();animation.onfinish=()=>{entered=true;while(true){}};true');
++ process.stdout.write(JSON.stringify({marker:'armed',effectiveTimeout:200})+'\n');
++ const end=Date.now()+2000;while(!timeoutError){if(Date.now()>=end)throw Error('Original2s diagnostic callback-error deadline');await new Promise(resolve=>setTimeout(resolve,5))}
++ assert.match(timeoutError.message,/timed out/);
++ const result=page.evaluate('({entered,state:animation.playState,text:document.body.textContent})');report.entered=result.entered;report.state=result.state;report.recovered=result.text==='actual animation watchdog';
++ assert.equal(report.entered,true);assert.equal(report.recovered,true);assert.equal(report.state,'finished');
++ page.evaluate('globalThis.recoveryOrder=[];const next=document.createElement("div").animate();next.finished.then(()=>recoveryOrder.push("promise"));next.onfinish=()=>recoveryOrder.push("event");true');
++ const recoveryEnd=Date.now()+2000;while(page.evaluate('recoveryOrder.length')!==2){if(Date.now()>=recoveryEnd)throw Error('Original2s positive producer deadline');await new Promise(resolve=>setTimeout(resolve,5))}
++ report.futureOrder=Array.from(page.evaluate('recoveryOrder'));assert.deepEqual(report.futureOrder,['promise','event']);
++ page.close();report.disposed=page.closed;
++}finally{browser.close()}
++console.log(JSON.stringify(report));

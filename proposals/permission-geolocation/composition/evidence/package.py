@@ -1,0 +1,21 @@
+from pathlib import Path
+import hashlib,json,difflib,shutil
+r=Path(__file__).resolve().parent.parent;e=r/'evidence';b=r/'base';c=r/'candidate';h=Path('/workspace/shared/permission-geolocation-handoff');sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+protected=['src/javascript-dialogs.js','src/page-closing.js','src/window-lifecycle-timers.js','src/navigation-lifecycle.js','src/navigation-transfer.js','src/cdp-cookie-actions.js','src/cdp-cookies.js','src/cdp-cookie-metadata.js','src/cookie-site.js','src/http-cookie-ingress.js','src/internal-cookie-header.js','src/runtime.js','src/world-sessions.js','src/protocol-serialization.js','src/dom-wrapper-realms.js','src/dom-event-target-state.js','src/location-factory.js','src/additional-control-interface-realms.js','src/option-alias.js','src/control-interface-realms.js','native/runtime.cc'];rows=[]
+for p in protected:assert(b/p).is_file()and sha(b/p)==sha(c/p),p;rows.append({'path':p,'unchanged':True,'SHA256':sha(b/p)})
+tokens={'src/browser.js':['initializeJavaScriptDialogs(this);','registerJavaScriptDialogContext(this,this.contexts.get(id));','registerJavaScriptDialogContext(this,context);','disposeJavaScriptDialogContext(this,context);','disposeJavaScriptDialogs(this);','notifyPageClosing(this);','internalCookieHeader','httpResponseCookie','navigationResponseReader'], 'src/cdp.js':["throw new ProtocolError('Unknown sessionId', -32001)",'let message,dispatchedSession,replied=false;','dispatchedSession=sessionCommand?session:undefined;','const completion=protocolCompletions.get(result);','completion?.complete();','if(replied||dispatchedSession&&this.sessions.get(dispatchedSession.id)!==dispatchedSession)return;','disposeJavaScriptDialogs','cookieActionContext','decodeCookieDeletion','stopPageLoading','completedResponse','markdownAlias']};tokenRows=[]
+for p,values in tokens.items():
+ before=(b/p).read_text();after=(c/p).read_text()
+ for token in values:assert before.count(token)>0 and before.count(token)==after.count(token),(p,token);tokenRows.append({'path':p,'token':token,'beforeCount':before.count(token),'afterCount':after.count(token),'preserved':True})
+(e/'critical-preservation.json').write_text(json.dumps({'runtimeExecuted':False,'RootEdits':False,'protectedModules':rows,'currentIntegrationTokenChecks':tokenRows,'fullSharedFileInverseByteEquality':'context-adaptations.json','earlyFinishPreservation':'Actual current navigation-transfer.js/window-lifecycle-timers.js bytes unchanged; finishEarly is not an identifier in the captured shared files, so no invented literal assertion is made.','genuineRuntimeErrorFalsePreservation':'runtime.js byte-identical and current cdp Session.run/body inverse equality; no new runtime assertion'},indent=2)+'\n')
+diff=''
+for p in ['src/browser.js','src/cdp.js']:diff+=''.join(difflib.unified_diff((h/'candidate'/p).read_text().splitlines(keepends=True),(c/p).read_text().splitlines(keepends=True),fromfile='tested-27661165/'+p,tofile='current-composed/'+p))
+(r/'tested-to-composed-shared-context.diff').write_text(diff)
+f=Path('/workspace/shared/permission-current-context-handoff');assert not f.exists();f.mkdir()
+for n in ['README.md','composed.patch','tested-to-composed-shared-context.diff']:shutil.copy2(r/n,f/n)
+shutil.copytree(e,f/'evidence');summary=json.loads((e/'composition-summary.json').read_text())
+for p in summary['after']:
+ for folder in ['base','candidate']:
+  source=r/folder/p
+  if source.exists():target=f/folder/p;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)
+files={str(p.relative_to(f)):sha(p)for p in sorted(f.rglob('*'))if p.is_file()};(f/'manifest.json').write_text(json.dumps({'kind':'STATIC ONLY current Root context composition; runtime not executed','files':files,'count':len(files),'composedPatchSHA256':sha(f/'composed.patch'),'originalTestedPatchSHA256':'27661165daa7a44768f848d80615191b8082c952708d3fa1cc21789b142e1304','runtimeExecuted':False,'RootEdits':False},indent=2)+'\n');assert all(sha(f/p)==v for p,v in files.items());print(json.dumps({'handoff':str(f),'manifestSHA256':sha(f/'manifest.json'),'artifacts':len(files),'composedPatchSHA256':sha(f/'composed.patch'),'runtimeExecuted':False,'RootEdits':False}))

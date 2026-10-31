@@ -1,0 +1,120 @@
+--- /dev/null
++++ b/src/internal-cookie-header.js
+@@ -0,0 +1,5 @@
++// Actual CookieJar text is UTF-8 on the HTTP wire. Native Headers and Node's
++// HTTP client accept byte-valued strings, so encode only this private producer.
++// Authored Headers and privileged configured-header validation stay unchanged.
++const from=Buffer.from;
++export function internalCookieHeader(value){return from(value,'utf8').toString('latin1')}
+--- a/src/cdp-cookie-metadata.js
++++ b/src/cdp-cookie-metadata.js
+@@ -34,7 +34,7 @@
+  // choice for its independently supported parallel-context extension.
+  return loaded.length>1?fallback:undefined;
+ }
+-export function formatCDPCookie(cookie){const expires=cookie.expiryTime();return{name:cookie.key,value:cookie.value,domain:`${cookie.hostOnly?'':'.'}${cookie.domain}`,path:cookie.path,expires:expires===Infinity?-1:expires/1000,size:cookie.key.length+cookie.value.length,httpOnly:!!cookie.httpOnly,secure:!!cookie.secure,session:expires===Infinity,...(cookie.sameSite?{sameSite:cookie.sameSite[0].toUpperCase()+cookie.sameSite.slice(1)}:{})}}
++export function formatCDPCookie(cookie){const expires=cookie.expiryTime();return{name:cookie.key,value:cookie.value,domain:`${cookie.hostOnly?'':'.'}${cookie.domain}`,path:cookie.path,expires:expires===Infinity?-1:expires/1000,size:Buffer.byteLength(cookie.key)+Buffer.byteLength(cookie.value),httpOnly:!!cookie.httpOnly,secure:!!cookie.secure,session:expires===Infinity,...(cookie.sameSite?{sameSite:cookie.sameSite[0].toUpperCase()+cookie.sameSite.slice(1)}:{})}}
+ export async function listCDPCookies(jar,urls){
+  const state=watch(jar);let allowed;
+  if(urls!==undefined){allowed=new Set();for(const url of urls)for(const cookie of await jar.getCookies(url))allowed.add(key(cookie))}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -3,6 +3,7 @@
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+ import {httpResponseCookie} from './http-cookie-ingress.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
++import {internalCookieHeader} from './internal-cookie-header.js';
+ import {installNavigationAPI} from './navigation-api.js';
+ import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
+ import {installHTMLElementState} from './html-element-state.js';
+@@ -526,7 +527,7 @@
+       const useCookies = credentials !== 'omit' && (credentials !== 'same-origin' || new URL(url).origin === credentialsOrigin);
+       if (useCookies) {
+         const cookies = type==='Document'?await this.context.cookies.getCookieString(url):await cookieHeaderFor(this.context.cookies,this,url,init.frameId);
+-        if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
++        if (cookies) headers.set('cookie', internalCookieHeader(cookies)); else headers.delete('cookie');
+       } else headers.delete('cookie');
+       // Privileged CDP headers override request/default/jar values, including
+       // empty Cookie and credentials-omitted requests. Apply on every actual
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,3 +1,4 @@
++import {internalCookieHeader} from './internal-cookie-header.js';
+ import {cookieHeaderForSync} from './cookie-site.js';
+ import {httpResponseCookie} from './http-cookie-ingress.js';
+ import { Worker } from 'node:worker_threads';
+@@ -43,7 +44,7 @@
+    for(let redirects=0;redirects<=20;redirects++){
+     checkpoint();
+     const useCookies=init.credentials!=='omit'&&(init.credentials!=='same-origin'||new URL(url).origin===init.credentialsOrigin);
+-    const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
++    const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',internalCookieHeader(cookie));else headers.delete('cookie');
+     metadata(headers,url);
+     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
+     const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+--- a/src/eventsource-policy.js
++++ b/src/eventsource-policy.js
+@@ -1,3 +1,4 @@
++import {internalCookieHeader} from './internal-cookie-header.js';
+ // Captured real document/worker principals select cookies, CORS and referrers.
+ export function eventSourcePolicy(page,{origin,referrer=page.url}){
+  return{
+@@ -5,7 +6,7 @@
+    const headers=new Headers({'accept':'text/event-stream','cache-control':'no-cache'});if(page.userAgent)headers.set('user-agent',page.userAgent);if(page.acceptLanguage)headers.set('accept-language',page.acceptLanguage);
+    const same=target.origin===origin;if(!same)headers.set('origin',origin);if(lastId)headers.set('last-event-id',Buffer.from(lastId,'utf8').toString('latin1'));
+    const referer=page.referrerFor?.(target.href,referrer);if(referer)headers.set('referer',referer);
+-   if(credentials||same){const cookie=await page.context?.cookies?.getCookieString(target.href);if(cookie)headers.set('cookie',cookie)}
++   if(credentials||same){const cookie=await page.context?.cookies?.getCookieString(target.href);if(cookie)headers.set('cookie',internalCookieHeader(cookie))}
+    page.extraHTTPHeaders?.forEach((value,name)=>headers.set(name,value));page.cliHTTPHeaders?.forEach((value,name)=>headers.set(name,value));return headers;
+   },
+   cors(response,target,credentials){if(target.origin===origin)return true;const allowed=response.headers.get('access-control-allow-origin');return (allowed===origin||!credentials&&allowed==='*')&&(!credentials||response.headers.get('access-control-allow-credentials')==='true')},
+--- a/src/websocket-transports.js
++++ b/src/websocket-transports.js
+@@ -1,3 +1,4 @@
++import {internalCookieHeader} from './internal-cookie-header.js';
+ // Genuine Node WebSocket transports and Browser/App-owned admission leases.
+ // The quota and transport records never enter an authored VM.
+ import {WebSocket as Socket} from 'ws';
+@@ -16,7 +17,7 @@
+ export function socketHeaders(page,url){
+  const destination=new URL(url);destination.protocol=destination.protocol==='wss:'?'https:':'http:';
+  const result={'Accept':'*/*'};if(page.userAgent)result['User-Agent']=page.userAgent;if(page.acceptLanguage)result['Accept-Language']=page.acceptLanguage;
+- const cookies=page.context?.cookies?.getCookieStringSync(destination.href);if(cookies)result.Cookie=cookies;return result;
++ const cookies=page.context?.cookies?.getCookieStringSync(destination.href);if(cookies)result.Cookie=internalCookieHeader(cookies);return result;
+ }
+ export function openWebSocketTransport({quota,owner,url,protocols=[],origin,headers,emit,deferUpgrade=false}){
+  const release=blocked.has(Number(new URL(url).port))?null:quota.acquire();
+--- /dev/null
++++ b/test/cookie-unicode-transport.test.js
+@@ -0,0 +1,21 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Worker}from'node:worker_threads';import{once}from'node:events';import{serve}from'../src/cdp.js';import{connect}from'./cdp-client.js';
++test('CDP Unicode cookies retain actual text and UTF8 size, reach real HTTP bytes, and keep authored Headers conversion',async t=>{
++ const fixture=new Worker(new URL('./fixtures/cookie-wire-fixture.mjs',import.meta.url),{execArgv:[]}),{origin}=await once(fixture,'message').then(([value])=>value),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close();await fixture.terminate()});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true}),send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/owner'});assert.deepEqual(await send('Network.setCookie',{name:'café',value:'雪',url:origin+'/'}),{success:true});
++ const[cookie]=(await send('Network.getAllCookies')).cookies;assert.equal(cookie.name,'café');assert.equal(cookie.value,'雪');assert.equal(cookie.size,8);
++ const response=await send('Runtime.evaluate',{expression:'fetch("/echo",{credentials:"include"}).then(r=>r.text())',awaitPromise:true,returnByValue:true});assert.equal(response.exceptionDetails,undefined);const actual=JSON.parse(response.result.value);assert.deepEqual(actual.cookieBytes,[99,97,102,195,169,61,233,155,170]);
++ const authored=await send('Runtime.evaluate',{expression:'(()=>{try{new Headers({"x-authored":"雪"});return "accepted"}catch(e){return e.name}})()',returnByValue:true});assert.equal(authored.result.value,'TypeError');
++ await send('Network.deleteCookies',{name:'café',url:origin+'/owner'});assert.deepEqual((await send('Network.getAllCookies')).cookies,[]);const empty=await send('Runtime.evaluate',{expression:'fetch("/echo").then(r=>r.text())',awaitPromise:true,returnByValue:true});assert.deepEqual(JSON.parse(empty.result.value).cookieBytes,[]);
++});
++test('actual synchronous/asynchronous XHR, event stream and WebSocket owners send the stored UTF8 cookie bytes',async t=>{
++ const fixture=new Worker(new URL('./fixtures/cookie-wire-fixture.mjs',import.meta.url),{execArgv:[]}),{origin}=await once(fixture,'message').then(([value])=>value),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close();await fixture.terminate()});
++ const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true}),send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/owner'});await send('Network.setCookie',{name:'café',value:'雪',url:origin+'/'});
++ const cases=[
++ ['xhr-async','new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open("GET","/echo?channel=xhr-async");x.onload=()=>resolve(JSON.parse(x.responseText));x.onerror=()=>reject(Error("actual XHR failure"));x.send()})'],
++ ['xhr-sync','(()=>{const x=new XMLHttpRequest();x.open("GET","/echo?channel=xhr-sync",false);x.send();return JSON.parse(x.responseText)})()'],
++ ['eventsource','new Promise((resolve,reject)=>{const s=new EventSource("/event?channel=eventsource");s.onmessage=e=>{s.close();resolve(JSON.parse(e.data))};s.onerror=()=>{s.close();reject(Error("actual SSE failure"))}})'],
++ ['websocket','new Promise((resolve,reject)=>{const s=new WebSocket('+JSON.stringify(origin.replace('http:','ws:')+'/socket?channel=websocket')+');s.onmessage=e=>{s.close();resolve(JSON.parse(e.data))};s.onerror=()=>reject(Error("actual WS failure"))})'],
++ ];
++ for(const[channel,code]of cases){const result=await send('Runtime.evaluate',{expression:'(async()=>JSON.stringify(await('+code+')))()',awaitPromise:true,returnByValue:true});assert.equal(result.exceptionDetails,undefined,channel);assert.deepEqual(JSON.parse(result.result.value).cookieBytes,[99,97,102,195,169,61,233,155,170],channel)}
++ const[cookie]=(await send('Network.getAllCookies')).cookies;assert.equal(cookie.name,'café');assert.equal(cookie.value,'雪');assert.equal(cookie.size,8);
++});
+--- /dev/null
++++ b/test/fixtures/cookie-wire-fixture.mjs
+@@ -0,0 +1,7 @@
++import{parentPort}from'node:worker_threads';import http from'node:http';import{WebSocketServer}from'ws';
++const wire=[],payload=request=>{const cookie=request.headers.cookie??'';const value={url:request.url,cookie,cookieBytes:[...Buffer.from(cookie,'latin1')]};wire.push(value);return value};
++const server=http.createServer((request,response)=>{const value=payload(request),url=new URL(request.url,'http://actual.invalid');
++ if(url.pathname==='/event'){response.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-store'});response.end('data: '+JSON.stringify(value)+'\n\n');return}
++ if(url.pathname==='/echo'){response.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});response.end(JSON.stringify(value));return}
++ response.writeHead(200,{'content-type':'text/html','cache-control':'no-store'});response.end('<!doctype html><script>globalThis.actualReady=true</script>');
++});const sockets=new WebSocketServer({server});sockets.on('connection',(socket,request)=>{socket.send(JSON.stringify(payload(request)));socket.close()});server.listen(0,'127.0.0.1',()=>parentPort.postMessage({ready:true,origin:'http://127.0.0.1:'+server.address().port}));parentPort.on('message',message=>{if(message==='wire')parentPort.postMessage({wire})});

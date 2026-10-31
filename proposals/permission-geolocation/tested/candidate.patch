@@ -1,0 +1,432 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -23,6 +23,7 @@
+ import {installCookieStore} from './cookie-store.js';
+ import { installScheduler } from './scheduler.js';
+ import {installDevicePermissions} from './device-permissions.js';
++import {defaultPermissionOwner,registerPermissionContext,disposePermissionContext,registerPermissionPage,permissionOwnerForPage,closePermissionBrowser} from './permission-control.js';
+ import { installURLPattern } from './url-pattern.js';
+ import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
+@@ -169,18 +170,20 @@
+     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
+     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
+     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
++    registerPermissionContext(this.contexts.get('default'),defaultPermissionOwner(this));
+     this.pages = new Map();
+     this.nextExecutionContext = 1;
+   }
+-  createContext() {
++  createContext(options = {}) {
+     const id = randomUUID();
+     this.contexts.set(id, { id, cookies: new CookieJar() });
++    registerPermissionContext(this.contexts.get(id),options?.permissionOwner??defaultPermissionOwner(this));
+     return id;
+   }
+-  createPage(contextId = 'default') {
++  createPage(contextId = 'default', options = {}) {
+     const context = this.contexts.get(contextId);
+     if (!context) throw new Error('Unknown browser context');
+-    const page = new Page(this, context);
++    const page = new Page(this, context, {permissionOwner:options?.permissionOwner});
+     this.pages.set(page.id, page);
+     page.once('close', () => { this.pages.delete(page.id); this.emit('targetDestroyed', page); });
+     this.emit('targetCreated', page);
+@@ -193,17 +196,20 @@
+   }
+   disposeContext(id) {
+     if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');
++    const permissionContext=this.contexts.get(id);
+     for (const page of [...this.pages.values()]) if (page.context.id === id) page.close();
+     this.contexts.delete(id);
+-  }
+-  close() { for (const page of [...this.pages.values()]) page.close(); this.syncHTTP.close(); }
++    disposePermissionContext(permissionContext);
++  }
++  close() { for (const page of [...this.pages.values()]) page.close(); closePermissionBrowser(this); this.syncHTTP.close(); }
+ }
+ 
+ export class Page extends EventEmitter {
+-  constructor(browser, context, {popup}={}) {
++  constructor(browser, context, {popup,permissionOwner}={}) {
+     super();
+     this.browser = browser;
+     this.context = context;
++    registerPermissionPage(this,permissionOwner??(popup?permissionOwnerForPage(popup.root):defaultPermissionOwner(browser)));
+     this.id = randomUUID();
+     this.frameId = this.id;
+     this.loaderId = randomUUID();
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,4 +1,5 @@
+ import{setWindowDeviceMetrics}from'./window-viewport.js';
++import {supportsPermissionControl,initializePermissionConnection,permissionOwnerForConnection,releasePermissionConnection,runPermissionControl} from './permission-control.js';
+ import {consoleProtocolType} from './console.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {ProtocolSerializer} from './protocol-serialization.js';
+@@ -509,6 +510,7 @@
+   constructor(socket, browser, directPage) {
+     this.socket = socket;
+     this.browser = browser;
++    initializePermissionConnection(this,directPage);
+     this.sessions = new Map();
+     this.discover = false;
+     this.autoAttach = false;
+@@ -545,14 +547,14 @@
+     try {
+       message = JSON.parse(raw);
+       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+-          (message.params !== undefined && !(message.params === null && CONFIGURATION_ACK_METHODS.has(message.method)) &&
++          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method)||supportsPermissionControl(message.method))) &&
+             (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
+         throw new ProtocolError('Invalid CDP request', -32600);
+       }
+       const { method, params = {}, sessionId } = message;
+       const session = this.sessions.get(sessionId ?? '');
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
+-      const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
++      const result = supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+       this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
+     } catch (error) {
+@@ -576,10 +578,10 @@
+         return {};
+       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
+       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
+-      case 'Target.createBrowserContext': {const id=browser.createContext();markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
++      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
+       case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId); return {};
+       case 'Target.createTarget': {
+-        const page = browser.createPage(params.browserContextId);
++        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});
+         if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
+         return { targetId: page.id };
+       }
+@@ -620,6 +622,7 @@
+     }
+   }
+   close() {
++    releasePermissionConnection(this);
+     this.browser.off('targetCreated', this.created);
+     this.browser.off('targetDestroyed', this.destroyed);
+     for (const session of this.sessions.values()) session.close();
+--- a/src/device-permissions.js
++++ b/src/device-permissions.js
+@@ -6,12 +6,13 @@
+ import {installErrors} from './errors.js';
+ import {registerProtocolPrototype} from './protocol-classes.js';
+ import {getRuntimeBinding} from './native-runtime.js';
++import {permissionOwnerForPage,permissionState,geolocationOverride} from './permission-control.js';
+ 
+ // Records and task ownership remain in Host code; page objects carry no private
+ // symbols, implementation fields, permission grants, or manufactured positions.
+ const records=new WeakMap(),navigators=new WeakMap(),geolocations=new WeakMap(),errors=new WeakMap(),notifications=new WeakMap();
+ const positions=new WeakMap(),coordinates=new WeakMap();
+-const apply=Reflect.apply,hostCreate=Object.create,hostAssign=Object.assign,hostDefine=Object.defineProperty,hostOwn=Object.getOwnPropertyDescriptor;
++const apply=Reflect.apply,hostCreate=Object.create,hostAssign=Object.assign,hostDefine=Object.defineProperty,hostOwn=Object.getOwnPropertyDescriptor,hostSetPrototype=Object.setPrototypeOf,hostNow=Date.now;
+ const privateRecord=data=>hostAssign(hostCreate(null),data);
+ const {implForWrapper}=createRequire(import.meta.url)('jsdom/lib/jsdom/living/generated/utils.js');
+ 
+@@ -72,13 +73,13 @@
+   get altitudeAccuracy(){if(!bridge.hasCoordinates(this))invocation();return bridge.coordinate(this,'altitudeAccuracy');},
+   get heading(){if(!bridge.hasCoordinates(this))invocation();return bridge.coordinate(this,'heading');},
+   get speed(){if(!bridge.hasCoordinates(this))invocation();return bridge.coordinate(this,'speed');},
+-  toJSON(){if(!bridge.hasCoordinates(this))invocation();return{accuracy:this.accuracy,latitude:this.latitude,longitude:this.longitude,altitude:this.altitude,altitudeAccuracy:this.altitudeAccuracy,heading:this.heading,speed:this.speed};},
++  toJSON(){if(!bridge.hasCoordinates(this))invocation();return{accuracy:bridge.coordinate(this,'accuracy'),latitude:bridge.coordinate(this,'latitude'),longitude:bridge.coordinate(this,'longitude'),altitude:bridge.coordinate(this,'altitude'),altitudeAccuracy:bridge.coordinate(this,'altitudeAccuracy'),heading:bridge.coordinate(this,'heading'),speed:bridge.coordinate(this,'speed')};},
+  };
+  installPrototype(GeolocationCoordinates,coordinatePrototype);
+  const positionPrototype={
+   get coords(){if(!bridge.hasPosition(this))invocation();return bridge.position(this,'coords');},
+   get timestamp(){if(!bridge.hasPosition(this))invocation();return bridge.position(this,'timestamp');},
+-  toJSON(){if(!bridge.hasPosition(this))invocation();return{coords:this.coords.toJSON(),timestamp:this.timestamp};},
++  toJSON(){if(!bridge.hasPosition(this))invocation();const c=bridge.position(this,'coords');return{coords:{accuracy:bridge.coordinate(c,'accuracy'),latitude:bridge.coordinate(c,'latitude'),longitude:bridge.coordinate(c,'longitude'),altitude:bridge.coordinate(c,'altitude'),altitudeAccuracy:bridge.coordinate(c,'altitudeAccuracy'),heading:bridge.coordinate(c,'heading'),speed:bridge.coordinate(c,'speed')},timestamp:bridge.position(this,'timestamp')};},
+  };
+  installPrototype(GeolocationPosition,positionPrototype);
+  function Notification(title){
+@@ -106,7 +107,7 @@
+  const permission=()=> 'default',maxActions=()=>2,requestPermission=()=>apply(resolvePromise,PromiseConstructor,['default']);
+  defineProperty(permission,'name',{value:'get permission',configurable:true});defineProperty(maxActions,'name',{value:'get maxActions',configurable:true});defineProperty(requestPermission,'name',{value:'requestPermission',configurable:true});
+  defineProperty(Notification,'permission',{get:permission,enumerable:true,configurable:true});defineProperty(Notification,'maxActions',{get:maxActions,enumerable:true,configurable:true});defineProperty(Notification,'requestPermission',{value:requestPermission,writable:true,enumerable:true,configurable:true});
+- const geo=create(Geolocation.prototype);bridge.initializeGeo(geo);
++ const geo=bridge.createValue(Geolocation.prototype);bridge.initializeGeo(geo);
+  bridge.exportInterfaces(Geolocation,GeolocationPosition,GeolocationCoordinates,GeolocationPositionError,Notification,geo);
+ 
+ }
+@@ -118,12 +119,14 @@
+  if(!vm.isContext(context))throw new TypeError('Device APIs require the actual owning VM context');
+  const invocation=createInvocationTrampoline(context),report=installErrors(page,window),tasks=new Set();
+  const record=privateRecord({page,window,document,signal,tasks,disposed:false});
+- const api=privateRecord({interfaces:hostCreate(null)}),createErrorObject=window.Object.create;let errorPrototype;
++ const api=privateRecord({interfaces:hostCreate(null)}),ObjectConstructor=vm.runInContext('Object',context),owner=permissionOwnerForPage(page);let errorPrototype,positionPrototype,coordinatePrototype;
++ const createValue=prototype=>hostSetPrototype(Reflect.construct(ObjectConstructor,[]),prototype);
+  const active=()=>!record.disposed&&!page.closed&&!signal?.aborted&&window.document===document;
+  function cancel(job){cancelTask(job.timer);job.owner.tasks.delete(job);if(job.watchId)job.state.watches.delete(job.watchId);job.success=job.error=null;}
+  record.cancel=()=>{for(const job of tasks)cancel(job)};
+  const bridge=privateRecord({
+-  initializeGeo(value){geolocations.set(value,privateRecord({next:0,watches:new Map()}));},navigatorGeo:receiver=>navigators.get(receiver)?.geo,
++  createValue,
++  initializeGeo(value){geolocations.set(value,privateRecord({owner,next:0,watches:new Map()}));},navigatorGeo:receiver=>navigators.get(receiver)?.geo,
+   hasGeo:receiver=>geolocations.has(receiver),hasError:receiver=>errors.has(receiver),error:(receiver,key)=>errors.get(receiver)[key],
+   hasPosition:value=>positions.has(value),position:(value,key)=>positions.get(value)[key],hasCoordinates:value=>coordinates.has(value),coordinate:(value,key)=>coordinates.get(value)[key],
+   notification(value,data){notifications.set(value,Object.freeze(privateRecord(data)))},hasNotification:value=>notifications.has(value),notificationValue:(value,key)=>notifications.get(value)[key],
+@@ -133,10 +136,16 @@
+    const job=privateRecord({owner:record,state,watchId,success,error});if(watch)state.watches.set(watchId,job);tasks.add(job);
+    job.timer=hostTask(()=>{
+     tasks.delete(job);if(watchId)state.watches.delete(watchId);
+-    const callback=job.error;job.success=job.error=null;
+-    if(!active()||typeof callback!=='function')return;
+-    const value=apply(createErrorObject,undefined,[errorPrototype]);
+-    errors.set(value,privateRecord({code:1,message:'User denied Geolocation'}));
++    if(!active()){job.success=job.error=null;return;}
++    const granted=permissionState(state.owner,'geolocation')==='granted',override=granted?geolocationOverride(state.owner):null;
++    const callback=override?job.success:job.error;job.success=job.error=null;
++    if(typeof callback!=='function')return;
++    let value;
++    if(override){
++     const coords=createValue(coordinatePrototype);value=createValue(positionPrototype);
++     coordinates.set(coords,Object.freeze(privateRecord({latitude:override.latitude,longitude:override.longitude,accuracy:override.accuracy,altitude:null,altitudeAccuracy:null,heading:null,speed:null})));
++     positions.set(value,Object.freeze(privateRecord({coords,timestamp:hostNow()})));
++    }else{value=createValue(errorPrototype);errors.set(value,privateRecord({code:granted?2:1,message:granted?'Position unavailable':'User denied Geolocation'}));}
+     try{invocation.invoke(callback,window,[value],{timeout:Math.min(page.timeout??10000,2000),displayErrors:false})}catch(error){report.report(error)}
+    },0);return watch?watchId:undefined;
+   },
+@@ -144,7 +153,7 @@
+   exportInterfaces(Geolocation,GeolocationPosition,GeolocationCoordinates,GeolocationPositionError,Notification,geo){
+    const values=privateRecord({Geolocation,GeolocationPosition,GeolocationCoordinates,GeolocationPositionError,Notification});
+    for(const[name,C]of Object.entries(values)){api.interfaces[name]=C;hostDefine(C,'prototype',{writable:false});hostDefine(window,name,{value:C,writable:true,enumerable:false,configurable:true});}
+-   api.geo=geo;errorPrototype=hostOwn(GeolocationPositionError,'prototype').value;
++   api.geo=geo;errorPrototype=hostOwn(GeolocationPositionError,'prototype').value;positionPrototype=hostOwn(GeolocationPosition,'prototype').value;coordinatePrototype=hostOwn(GeolocationCoordinates,'prototype').value;
+   },
+  });
+  vm.compileFunction(`(${factory.toString()})(globalThis,bridge)`,['bridge'],{parsingContext:context})(bridge);
+--- a/src/navigator.js
++++ b/src/navigator.js
+@@ -1,5 +1,6 @@
+ import { createRequire } from 'node:module';
+ import { arch, availableParallelism, totalmem } from 'node:os';
++import {permissionStateProvider} from './permission-control.js';
+ 
+ const require = createRequire(import.meta.url);
+ const { version } = require('../package.json');
+@@ -16,12 +17,12 @@
+  * get(name) supplies live navigator configuration; profile carries engine/CPU
+  * metadata. estimate() optionally reads a real managed-storage provider.
+  * Default managed storage is empty with the observed 1-GiB virtual origin
+- * budget. No persistence, device access or permission grant is claimed.
+- * Permissions follow the reference's observable metadata policy: any provided
+- * name is string-coerced and queried as prompt; each query returns a new status.
++ * budget. Device access is not performed. Permissions capture the actual
++ * private owner provider state at query time (prompt without a provider); each
++ * name is string-coerced and each query returns a new snapshot status.
+  */
+ export function createNavigatorRealm(realm, {
+-  worker = false, get = () => undefined, profile = {}, estimate, active = () => true,
++  worker = false, get = () => undefined, profile = {}, estimate, active = () => true, permissionState,
+ } = {}) {
+   const Object = realm.Object, Array = realm.Array, Promise = realm.Promise, TypeErrorConstructor = realm.TypeError;
+   const symbolDescription = Object.getOwnPropertyDescriptor(realm.Symbol.prototype, 'description').get;
+@@ -59,10 +60,10 @@
+   };
+   class PermissionStatus extends realm.EventTarget {
+     constructor(token, name) {
+-      super(); if (token !== secret) fail('Illegal constructor'); statuses.set(this, { name, onchange: null });
++      super(); if (token !== secret) fail('Illegal constructor'); statuses.set(this, { name, state:arguments[2]??'prompt', onchange: null });
+     }
+     get name() { const value = statuses.get(this); if (!value) fail(); return value.name; }
+-    get state() { check(statuses, this); return 'prompt'; }
++    get state() { const value=statuses.get(this);if(!value)fail();return value.state; }
+     get onchange() { const value = statuses.get(this); if (!value) fail(); return value.onchange; }
+     set onchange(value) {
+       const state = statuses.get(this); if (!state) fail();
+@@ -75,7 +76,7 @@
+   class Permissions {
+     constructor(token) { if (token !== secret) fail('Illegal constructor'); permissionsObjects.add(this); }
+     query(descriptor) {
+-      let name, failure, failed = false;
++      let name, state, failure, failed = false;
+       // Native argument conversion runs before returning the realm Promise.
+       // Actual settlement still belongs to this document's private lifetime.
+       try {
+@@ -84,10 +85,11 @@
+         const input = descriptor.name;
+         if (input === undefined) fail('invalid argument');
+         name = typeof input === 'symbol' ? String(Reflect.apply(symbolDescription, input, [])) : text(input);
++        state=permissionState?permissionState(name):'prompt';
+       } catch (error) { failed = true; failure = error; }
+       return promise(() => {
+         if (failed) throw failure;
+-        return new PermissionStatus(secret, name);
++        return new PermissionStatus(secret, name, state);
+       });
+     }
+     get [Symbol.toStringTag]() { return 'Permissions'; }
+@@ -201,7 +203,8 @@
+   });
+   const active = options.active ?? (() => !source?.closed && (!signal || !signal.aborted) &&
+     (generation === undefined || source?.documentGeneration === generation) && (options.worker || !!realm.document));
+-  const result = createNavigatorRealm(realm, { ...options, get, active, profile: { ...navigatorProfile, ...options.profile } });
++  const permissionState=options.permissionState??(source?.browser?permissionStateProvider(source):undefined);
++  const result = createNavigatorRealm(realm, { ...options, get, active, permissionState, profile: { ...navigatorProfile, ...options.profile } });
+   signal?.addEventListener('abort', () => result.dispose(), { once: true });
+   INSTALLED.set(realm, result); return result;
+ }
+--- /dev/null
++++ b/src/permission-control.js
+@@ -0,0 +1,43 @@
++// Permission-only Host authorities. Root Browser/Context/Target architecture
++// and cookies remain independent; no state or controller slot is public VM data.
++import {parseProtocolFloat,protocolFloatError} from './protocol-float.js';
++const owners=new WeakMap(),browsers=new WeakMap(),connections=new WeakMap(),pages=new WeakMap(),contexts=new WeakMap();
++const record=data=>Object.assign(Object.create(null),data);
++const methods=new Set(['Browser.grantPermissions','Browser.setPermission','Browser.resetPermissions','Emulation.setGeolocationOverride','Emulation.clearGeolocationOverride']);
++export const supportsPermissionControl=method=>methods.has(method);
++function browserRecord(browser){let state=browsers.get(browser);if(!state){state=record({owners:new Set()});browsers.set(browser,state)}return state}
++function createOwner(browser){const owner=Object.create(null),state=record({browser,permissions:new Map(),override:null,connections:0,pages:0,contexts:0});owners.set(owner,state);browserRecord(browser).owners.add(owner);return owner}
++export function defaultPermissionOwner(browser){const state=browserRecord(browser);return state.default??=(createOwner(browser))}
++function state(owner){const value=owners.get(owner);if(!value)throw new TypeError('A genuine permission authority is required');return value}
++function release(owner){const value=state(owner);if(value.connections||value.pages||value.contexts)return;value.permissions.clear();value.override=null;browserRecord(value.browser).owners.delete(owner)}
++export function registerPermissionContext(context,owner){if(contexts.has(context)){if(contexts.get(context)!==owner)throw new TypeError('Permission context authority cannot be retargeted');return}state(owner).contexts++;contexts.set(context,owner)}
++export function disposePermissionContext(context){const owner=contexts.get(context);if(!owner)return;contexts.delete(context);const value=state(owner);value.permissions.clear();value.contexts--;release(owner)}
++export function registerPermissionPage(page,owner){if(pages.has(page)){if(pages.get(page)!==owner)throw new TypeError('Permission Page authority cannot be retargeted');return}state(owner).pages++;pages.set(page,owner);page.once('close',()=>{state(owner).pages--;release(owner)})}
++export function permissionOwnerForPage(page){let owner=pages.get(page);if(owner)return owner;const parent=page.registry?.page;owner=parent&&parent!==page?permissionOwnerForPage(parent):defaultPermissionOwner(page.browser??page);pages.set(page,owner);return owner}
++export function initializePermissionConnection(connection,directPage){if(connections.has(connection))return;const owner=directPage?permissionOwnerForPage(directPage):createOwner(connection.browser);state(owner).connections++;connections.set(connection,owner)}
++export function permissionOwnerForConnection(connection,page){return page?permissionOwnerForPage(page):connections.get(connection)}
++export function releasePermissionConnection(connection){const owner=connections.get(connection);if(!owner)return;connections.delete(connection);state(owner).connections--;release(owner)}
++export function closePermissionBrowser(browser){for(const owner of browserRecord(browser).owners){const value=state(owner);value.permissions.clear();value.override=null}}
++export const permissionState=(owner,name)=>state(owner).permissions.get(name)??'prompt';
++export function permissionStateProvider(page){const owner=permissionOwnerForPage(page);return name=>permissionState(owner,name)}
++export const geolocationOverride=owner=>state(owner).override;
++export function runPermissionControl(owner,method,params,present,ProtocolError){
++ const value=state(owner),fail=message=>{throw new ProtocolError(message,-31998)};
++ if(method==='Browser.resetPermissions'){value.permissions.clear();return{}}
++ if(method==='Emulation.clearGeolocationOverride'){value.override=null;return{}}
++ if(method==='Emulation.setGeolocationOverride'){
++  const input=params??{};const values=record({});
++  for(const name of ['latitude','longitude','accuracy']){const item=input[name];if(item===undefined||item===null)values[name]=null;else try{values[name]=parseProtocolFloat(item)}catch(error){const message=protocolFloatError(error);if(message)fail(message);throw error}}
++  value.override=values.latitude===null||values.longitude===null?null:Object.freeze(record({latitude:values.latitude,longitude:values.longitude,accuracy:values.accuracy??0}));return{};
++ }
++ if(!present||params===null||params===undefined)fail('InvalidParams');
++ const required=(object,key,type)=>{if(!Object.hasOwn(object,key))fail('MissingField');const item=object[key];if(typeof item!==type||item===null)fail('UnexpectedToken');return item};
++ for(const key of ['origin','browserContextId'])if(params[key]!=null&&typeof params[key]!=='string')fail('UnexpectedToken');
++ if(method==='Browser.grantPermissions'){
++  if(!Object.hasOwn(params,'permissions'))fail('MissingField');const names=params.permissions;if(!Array.isArray(names)||names.some(name=>typeof name!=='string'))fail('UnexpectedToken');for(const name of names)value.permissions.set(name,'granted');return{};
++ }
++ if(method==='Browser.setPermission'){
++  const permission=required(params,'permission','object');if(Array.isArray(permission))fail('UnexpectedToken');const name=required(permission,'name','string'),setting=required(params,'setting','string');if(!['granted','prompt','denied'].includes(setting))fail('InvalidPermissionSetting');value.permissions.set(name,setting);return{};
++ }
++ throw new TypeError('Unknown permission-control operation');
++}
+--- /dev/null
++++ b/src/protocol-float.js
+@@ -0,0 +1,38 @@
++// Independent std-JSON f64 token parser. Grammar is scanned before numerical
++// conversion; whitespace/empty/partial tokens never use JavaScript coercion.
++const errors=new WeakSet(),number=Number,lower=String.prototype.toLowerCase;
++function fail(message){const error=new Error(message);errors.add(error);throw error}
++export const protocolFloatError=error=>errors.has(error)?error.message:undefined;
++const digit=(code,radix)=>code>=48&&code<=57?code-48:radix===16&&code>=65&&code<=70?code-55:radix===16&&code>=97&&code<=102?code-87:-1;
++function exponent(text,limit){let index=0,sign=1,value=0;if(text[index]==='+'||text[index]==='-'){if(text[index++]==='-')sign=-1}for(;index<text.length;index++){value=Math.min(limit,value*10+(text.charCodeAt(index)-48))}return sign*value}
++function binary64(coefficient,power,sticky,negative){
++ if(coefficient===0n)return negative?-0:0;
++ const bits=coefficient.toString(2).length,top=bits-1+power;if(top>1023)return negative?-Infinity:Infinity;if(top< -1075)return negative?-0:0;
++ const unit=Math.max(-1074,top-52),shift=unit-power;let rounded;
++ if(shift>0){const n=BigInt(shift),whole=coefficient>>n,discarded=coefficient-(whole<<n),half=1n<<(n-1n);rounded=whole+(discarded>half||discarded===half&&(sticky||(whole&1n)===1n)?1n:0n)}else rounded=coefficient<<BigInt(-shift);
++ const value=number(rounded)*2**unit;return negative?-value:value;
++}
++export function parseProtocolFloat(value){
++ if(typeof value==='number')return value;if(typeof value!=='string')fail('UnexpectedToken');
++ const source=value;if(!source.length)fail('InvalidCharacter');let index=0,negative=false;
++ if(source[index]==='+'||source[index]==='-'){negative=source[index++]==='-';if(index===source.length)fail('InvalidCharacter')}
++ const special=Reflect.apply(lower,source.slice(index),[]);
++ if(special==='inf'||special==='infinity')return negative?-Infinity:Infinity;if(special==='nan')return negative?-NaN:NaN;
++ const hexadecimal=source[index]==='0'&&(source[index+1]==='x'||source[index+1]==='X');if(hexadecimal)index+=2;
++ const radix=hexadecimal?16:10;
++ function digits(base){let result='',seen=false,lastDigit=false;while(index<source.length){const code=source.charCodeAt(index),d=digit(code,base);if(d>=0&&d<base){result+=source[index++];seen=lastDigit=true;continue}if(source[index]==='_'){if(!lastDigit)fail('InvalidCharacter');index++;const next=digit(source.charCodeAt(index),base);if(next<0||next>=base)fail('InvalidCharacter');lastDigit=false;continue}break}return{result,seen}}
++ const integer=digits(radix);let fraction={result:'',seen:false};if(source[index]==='.'){index++;fraction=digits(radix)}
++ if(!integer.seen&&!fraction.seen)fail('InvalidCharacter');
++ let exp='';const marker=source[index];if(marker&&(hexadecimal?marker==='p'||marker==='P':marker==='e'||marker==='E')){index++;if(source[index]==='+'||source[index]==='-')exp=source[index++];const parsed=digits(10);if(!parsed.seen)fail('InvalidCharacter');exp+=parsed.result}
++ if(index!==source.length)fail('InvalidCharacter');
++ if(!hexadecimal){
++  // Only accepted decimal grammar reaches the engine's correctly rounded
++  // decimal-to-binary64 primitive. Number does not decide token acceptance.
++  return number((negative?'-':'')+(integer.result||'0')+(fraction.seen?'.'+fraction.result:'')+(exp?'e'+exp:''));
++ }
++ const significant=(integer.result+fraction.result).replace(/^0+/, '');if(!significant)return negative?-0:0;
++ // Keep sufficient exact binary guard bits and a sticky tail. This avoids
++ // constructing an unbounded BigInt for a long, otherwise valid hex token.
++ const kept=significant.slice(0,64),tail=significant.slice(64),power=(exp?exponent(exp,source.length*4+10000):0)-fraction.result.length*4+tail.length*4;
++ return binary64(BigInt('0x'+kept),power,/[1-9a-fA-F]/.test(tail),negative);
++}
+--- a/test/device-permissions.test.js
++++ b/test/device-permissions.test.js
+@@ -56,10 +56,11 @@
+  assert.deepEqual(plain(result),{events:['get','sync'],name:'geolocation',state:'prompt',target:true,rejection:{name:'TypeError',message:'invalid argument',realm:true},changed:1});
+  const sentinel={original:true};const promise=w.navigator.permissions.query({get name(){throw sentinel}});await assert.rejects(promise,error=>error===sentinel);
+ });
+-test('unsupported permission grants and location overrides return actual protocol errors and never acknowledge a fabricated grant',async t=>{
++test('permission grants and location overrides change actual query state and real callback values',async t=>{
+  const service=await serve({port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});
+  const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});
+- await assert.rejects(client.send('Browser.grantPermissions',{permissions:['geolocation']}),{code:-32601});
+- await assert.rejects(client.send('Emulation.setGeolocationOverride',{latitude:1,longitude:2,accuracy:3},sessionId),{code:-32601});
+- const value=await client.send('Runtime.evaluate',{expression:'new Promise(resolve=>navigator.geolocation.getCurrentPosition(()=>resolve("invented"),e=>resolve(e.code)))',returnByValue:true,awaitPromise:true},sessionId);assert.equal(value.result.value,1);
++ await client.send('Browser.grantPermissions',{permissions:['geolocation']});
++ await client.send('Emulation.setGeolocationOverride',{latitude:1,longitude:2,accuracy:3},sessionId);
++ const value=await client.send('Runtime.evaluate',{expression:'new Promise(resolve=>navigator.geolocation.getCurrentPosition(p=>resolve([p.coords.latitude,p.coords.longitude,p.coords.accuracy,p instanceof GeolocationPosition]),e=>resolve([e.code])))',returnByValue:true,awaitPromise:true},sessionId);assert.deepEqual(value.result.value,[1,2,3,true]);
++ const state=await client.send('Runtime.evaluate',{expression:'navigator.permissions.query({name:"geolocation"}).then(s=>s.state)',returnByValue:true,awaitPromise:true},sessionId);assert.equal(state.result.value,'granted');
+ });
+--- /dev/null
++++ b/test/permission-control.test.js
+@@ -0,0 +1,52 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {setImmediate as turn} from 'node:timers/promises';
++import {Browser} from '../src/browser.js';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++import {defaultPermissionOwner,permissionOwnerForPage,runPermissionControl} from '../src/permission-control.js';
++import {installDevicePermissions} from '../src/device-permissions.js';
++import {getHeapBinding} from '../src/native-heap.js';
++const binding=getHeapBinding(),plain=value=>JSON.parse(JSON.stringify(value));
++class WireError extends Error{constructor(message,code){super(message);this.code=code}}
++const configure=(owner,method,params)=>runPermissionControl(owner,method,params,params!==undefined,WireError);
++function actualRealm(value,w){const proto=Object.getPrototypeOf(value),anchor=w.eval('[]');try{for(let n=0;n<2;n++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,proto)}}
++const locate=w=>new Promise((resolve,reject)=>w.navigator.geolocation.getCurrentPosition(resolve,reject));
++async function fixture(t){const browser=new Browser({timeout:1000,loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>owned<iframe></iframe>');return{browser,page,w:page.dom.window,owner:permissionOwnerForPage(page)}}
++async function protocol(t){const service=await serve({port:0,timeout:1000}),a=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await a.close();await service.close()});return{service,a}}
++async function target(a){const{browserContextId}=await a.send('Target.createBrowserContext'),{targetId}=await a.send('Target.createTarget',{browserContextId,url:'about:blank'}),{sessionId}=await a.send('Target.attachToTarget',{targetId,flatten:true});return{browserContextId,targetId,sessionId}}
++const evaluate=(a,s,expression)=>a.send('Runtime.evaluate',{expression:`(async()=>JSON.stringify(await(${expression})))()`,returnByValue:true,awaitPromise:true},s).then(v=>{assert.equal(v.exceptionDetails,undefined);return JSON.parse(v.result.value)});
++const query=(a,s)=>evaluate(a,s,'navigator.permissions.query({name:"geolocation"}).then(s=>s.state)');
++const geo=(a,s)=>evaluate(a,s,'new Promise(resolve=>navigator.geolocation.getCurrentPosition(p=>resolve({kind:"position",latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy}),e=>resolve({kind:"error",code:e.code,message:e.message})))');
++test('actual root controls set state before the first document and return real query/callback values',async t=>{
++ const{a}=await protocol(t);await a.send('Browser.grantPermissions',{permissions:['geolocation'],origin:'http://127.0.0.1:1',browserContextId:'owned-ignored'});await a.send('Emulation.setGeolocationOverride',{latitude:12.25,longitude:-20.5,accuracy:7.75});const s=await target(a);assert.equal(await query(a,s.sessionId),'granted');assert.deepEqual(await geo(a,s.sessionId),{kind:'position',latitude:12.25,longitude:-20.5,accuracy:7.75});await a.send('Emulation.clearGeolocationOverride',{},s.sessionId);assert.deepEqual(await geo(a,s.sessionId),{kind:'error',code:2,message:'Position unavailable'});
++});
++test('actual status snapshots capture state before settlement and retain genuine EventTarget behavior',async t=>{
++ const{w,owner}=await fixture(t);const old=w.navigator.permissions.query({name:'geolocation'});configure(owner,'Browser.grantPermissions',{permissions:['geolocation','owned-arbitrary']});const status=await old,fresh=await w.navigator.permissions.query({name:'geolocation'});assert.equal(status.state,'prompt');assert.equal(fresh.state,'granted');assert.notEqual(status,fresh);assert.equal((await w.navigator.permissions.query({name:'owned-arbitrary'})).state,'granted');actualRealm(fresh,w);let changed=0;fresh.onchange=()=>changed++;configure(owner,'Browser.resetPermissions',{});await turn();assert.equal(fresh.state,'granted');assert.equal(changed,0);fresh.dispatchEvent(new w.Event('change'));assert.equal(changed,1);assert.equal((await w.navigator.permissions.query({name:'geolocation'})).state,'prompt');
++});
++test('real main/frame Geolocation values are first-created in their VM and private records reject copies/proxies without traps',async t=>{
++ const{w,owner}=await fixture(t);configure(owner,'Browser.grantPermissions',{permissions:['geolocation']});configure(owner,'Emulation.setGeolocationOverride',{latitude:1,longitude:2,accuracy:3});for(const g of[w,w.document.querySelector('iframe').contentWindow]){const geo=g.navigator.geolocation,p=await locate(g),c=p.coords,status=await g.navigator.permissions.query({name:'geolocation'});for(const value of[geo,p,c,status,p.toJSON(),c.toJSON()])actualRealm(value,g);assert.equal(p.coords,c);assert.notEqual(p,c);assert.deepEqual(Object.keys(p),[]);assert.deepEqual(Object.keys(c),[]);assert.equal(p instanceof g.GeolocationPosition,true);assert.equal(c instanceof g.GeolocationCoordinates,true);let traps=0;for(const[real,prototype,name]of[[p,g.GeolocationPosition.prototype,'timestamp'],[c,g.GeolocationCoordinates.prototype,'latitude']]){const getter=Object.getOwnPropertyDescriptor(prototype,name).get;for(const fake of[Object.create(prototype,Object.getOwnPropertyDescriptors(real)),new Proxy(real,{get(){traps++;throw Error('authored get')},getPrototypeOf(){traps++;throw Error('authored prototype')}})])assert.throws(()=>getter.call(fake),e=>e instanceof g.TypeError&&e.message==='Illegal invocation')}assert.equal(traps,0);configure(owner,'Emulation.clearGeolocationOverride',{});const error=await new Promise(resolve=>geo.getCurrentPosition(()=>assert.fail('No configured position'),resolve));actualRealm(error,g);assert.equal(error.code,2);configure(owner,'Emulation.setGeolocationOverride',{latitude:1,longitude:2,accuracy:3})}
++});
++test('delivery reads actual current controller state, watch cancellation is real and delivered watches remain one-shot',async t=>{
++ const{w,owner}=await fixture(t);configure(owner,'Browser.grantPermissions',{permissions:['geolocation']});configure(owner,'Emulation.setGeolocationOverride',{latitude:1,longitude:2});const pending=locate(w);configure(owner,'Emulation.setGeolocationOverride',{latitude:8,longitude:9,accuracy:10});assert.equal((await pending).coords.latitude,8);let canceled=0,calls=0;const geo=w.navigator.geolocation,id=geo.watchPosition(()=>canceled++,()=>canceled++);geo.clearWatch(id);const value=await new Promise((resolve,reject)=>geo.watchPosition(p=>{calls++;resolve(p)},reject));assert.equal(value.coords.latitude,8);configure(owner,'Emulation.setGeolocationOverride',{latitude:18,longitude:19});assert.equal((await locate(w)).coords.latitude,18);assert.equal(calls,1);assert.equal(canceled,0);
++});
++test('actual public scalar values retain nonfinite numbers and signed zero before genuine JSON serialization',async t=>{
++ const{w,owner}=await fixture(t);configure(owner,'Browser.grantPermissions',{permissions:['geolocation']});configure(owner,'Emulation.setGeolocationOverride',{latitude:'Infinity',longitude:'NaN',accuracy:'-0'});const p=await locate(w),json=p.toJSON();assert.equal(p.coords.latitude,Infinity);assert.equal(Number.isNaN(p.coords.longitude),true);assert.equal(Object.is(p.coords.accuracy,-0),true);assert.equal(json.coords.latitude,Infinity);assert.equal(Number.isNaN(json.coords.longitude),true);assert.equal(Object.is(json.coords.accuracy,-0),true);assert.deepEqual(plain(json).coords,{accuracy:0,latitude:null,longitude:null,altitude:null,altitudeAccuracy:null,heading:null,speed:null});actualRealm(json,w);
++});
++test('navigation preserves controller values while context teardown resets only its permissions and retains the override',async t=>{
++ const{a}=await protocol(t);const first=await target(a);await a.send('Browser.grantPermissions',{permissions:['geolocation']});await a.send('Emulation.setGeolocationOverride',{latitude:18,longitude:19,accuracy:20},first.sessionId);await a.send('Page.navigate',{url:'data:text/html,actual-navigation'},first.sessionId);assert.equal(await query(a,first.sessionId),'granted');assert.equal((await geo(a,first.sessionId)).latitude,18);await a.send('Target.disposeBrowserContext',{browserContextId:first.browserContextId});const second=await target(a);assert.equal(await query(a,second.sessionId),'prompt');assert.equal((await geo(a,second.sessionId)).code,1);await a.send('Browser.grantPermissions',{permissions:['geolocation']});assert.equal((await geo(a,second.sessionId)).latitude,18);
++});
++test('two genuine connections isolate grants and configured positions without replacing the shared Browser or cookie contexts',async t=>{
++ const{service,a}=await protocol(t),first=await target(a);await a.send('Browser.grantPermissions',{permissions:['geolocation']});await a.send('Emulation.setGeolocationOverride',{latitude:18,longitude:19},first.sessionId);const b=await connect(`ws://127.0.0.1:${service.port}/`);t.after(()=>b.close());const second=await target(b);assert.equal(await query(b,second.sessionId),'prompt');await b.send('Browser.grantPermissions',{permissions:['geolocation']});assert.equal((await geo(b,second.sessionId)).code,2);await b.send('Emulation.setGeolocationOverride',{latitude:48,longitude:49},second.sessionId);assert.equal((await geo(a,first.sessionId)).latitude,18);assert.equal((await geo(b,second.sessionId)).latitude,48);await b.send('Target.disposeBrowserContext',{browserContextId:second.browserContextId});assert.equal(await query(a,first.sessionId),'granted');assert.equal((await geo(a,first.sessionId)).latitude,18);
++});
++test('owned embedding default state, genuine cleanup and retained position data survive actual Page retirement',async t=>{
++ const{browser,page,w,owner}=await fixture(t);assert.equal(owner,defaultPermissionOwner(browser));configure(owner,'Browser.grantPermissions',{permissions:['geolocation']});configure(owner,'Emulation.setGeolocationOverride',{latitude:7,longitude:8});const held=await locate(w),controller=installDevicePermissions(page,w);let calls=0;w.navigator.geolocation.getCurrentPosition(()=>calls++,()=>calls++);assert.equal(controller.pending,1);page.close();assert.equal(controller.pending,0);await turn();assert.equal(calls,0);assert.equal(held.coords.latitude,7);assert.equal(held.coords.longitude,8);assert.equal(held instanceof w.GeolocationPosition,true);
++});
++test('typed protocol failures keep the actual configured position and distinguish omitted required params',async t=>{
++ const{a}=await protocol(t),s=await target(a);await a.send('Browser.grantPermissions',{permissions:['geolocation']});await a.send('Emulation.setGeolocationOverride',{latitude:31,longitude:32,accuracy:33},s.sessionId);
++ for(const[method,params,message]of[['Browser.grantPermissions',{},'MissingField'],['Browser.grantPermissions',{permissions:null},'UnexpectedToken'],['Browser.grantPermissions',{permissions:[],origin:42},'UnexpectedToken'],['Browser.setPermission',{permission:{name:'geolocation'},setting:'owned-invalid'},'InvalidPermissionSetting'],['Emulation.setGeolocationOverride',{latitude:' 1 ',longitude:2},'InvalidCharacter'],['Emulation.setGeolocationOverride',{latitude:99,longitude:100,accuracy:false},'UnexpectedToken']]){await assert.rejects(a.send(method,params,s.sessionId),error=>error.code===-31998&&error.message===message);assert.deepEqual(await geo(a,s.sessionId),{kind:'position',latitude:31,longitude:32,accuracy:33})}
++ let next=100000;const raw=(method,params)=>new Promise((resolve,reject)=>{const id=next++,timer=setTimeout(()=>{a.socket.off('message',onMessage);reject(Error('Owned raw reply deadline'))},5000);function onMessage(bytes){const value=JSON.parse(String(bytes));if(value.id!==id)return;clearTimeout(timer);a.socket.off('message',onMessage);resolve(value)}a.socket.on('message',onMessage);a.socket.send(JSON.stringify({id,method,...(params===undefined?{}:{params}),sessionId:s.sessionId}))});
++ assert.deepEqual((await raw('Browser.grantPermissions')).error,{code:-31998,message:'InvalidParams'});assert.deepEqual((await raw('Browser.setPermission',null)).error,{code:-31998,message:'InvalidParams'});
++ await a.send('Emulation.setGeolocationOverride',{latitude:'0x10',longitude:'1_0',accuracy:'-0'},s.sessionId);assert.deepEqual(await geo(a,s.sessionId),{kind:'position',latitude:16,longitude:10,accuracy:0});assert.deepEqual((await raw('Browser.grantPermissionsSuffix',{permissions:['geolocation']})).error,{code:-32601,message:'Unsupported CDP method: Browser.grantPermissionsSuffix'});
++ const cleared=await raw('Emulation.setGeolocationOverride');assert.equal(cleared.error,undefined);assert.equal((await geo(a,s.sessionId)).code,2);
++});

@@ -174,4 +174,4 @@ function performNavigation(target,name,args,source,methodRealm){
  return result;
 }
 function linked(operation,pending){if(!operation||!pending)return;operation.pending=pending;pending.promise.then(()=>finishOperation(operation),()=>{if(operation.sameDocument)abortOperation(operation);else finishOperation(operation)})}
-setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.initial?null:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:true})}}));
+setNavigationLifecycle(record({begin,document(page,details){const owner=session(page);owner.activation=record({entry:details.entry,from:details.initial?null:details.previous??null,type:details.kind});if(!page.parentFrameId){owner.view=null;owner.entries=new WeakMap()}},committed:changed,linked,stop(page,options){abortOperation(session(page).operations.get(page.frameId),undefined,{cancelTransport:options?.cancelTransport??true})}}));

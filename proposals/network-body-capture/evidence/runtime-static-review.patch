@@ -1,0 +1,226 @@
+--- /dev/null
++++ b/src/network-capture.js
+@@ -0,0 +1,30 @@
++// Inspector captures are private snapshots from genuine transport producers.
++// Limits affect retained inspection bytes, never the actual HTTP transfer.
++import {isUtf8} from 'node:buffer';
++import {types,MIMEType} from 'node:util';
++const contexts=new WeakMap(),producers=new WeakMap(),defaults=Object.freeze({total:200000000,resource:20000000,post:65536});
++const arrayProto=Object.getPrototypeOf(Uint8Array.prototype),arrayBuffer=Object.getOwnPropertyDescriptor(arrayProto,'buffer').get,arrayOffset=Object.getOwnPropertyDescriptor(arrayProto,'byteOffset').get,arrayLength=Object.getOwnPropertyDescriptor(arrayProto,'byteLength').get;
++const viewBuffer=Object.getOwnPropertyDescriptor(DataView.prototype,'buffer').get,viewOffset=Object.getOwnPropertyDescriptor(DataView.prototype,'byteOffset').get,viewLength=Object.getOwnPropertyDescriptor(DataView.prototype,'byteLength').get;
++function bytes(value){if(value==null)return undefined;if(typeof value==='string')return Buffer.from(value);if(types.isArrayBuffer(value))return Buffer.from(new Uint8Array(value));if(ArrayBuffer.isView(value)){const data=types.isDataView(value);return Buffer.from(new Uint8Array((data?viewBuffer:arrayBuffer).call(value),(data?viewOffset:arrayOffset).call(value),(data?viewLength:arrayLength).call(value)))}return undefined}
++function state(context){let value=contexts.get(context);if(!value){value={enabled:false,disposed:false,limits:{...defaults},responses:new Map(),posts:new Map(),size:0};contexts.set(context,value)}return value}
++export class NetworkCaptureError extends Error{constructor(message,code=-31998){super(message);this.code=code}}
++function cap(value,fallback){if(value==null)return fallback;if(typeof value==='string'){if(!/^-?[0-9]+$/.test(value))throw new NetworkCaptureError('InvalidNumber');value=Number(value)}if(typeof value!=='number')throw new NetworkCaptureError('UnexpectedToken');if(!Number.isInteger(value))throw new NetworkCaptureError('InvalidNumber');if(value<0||value>4294967295)throw new NetworkCaptureError('Overflow');return value}
++function evict(owner,entry){if(entry.evicted)return;owner.size-=entry.size;entry.size=0;entry.chunks=[];entry.evicted=true}
++function space(owner,size){for(const entry of owner.responses.values()){if(owner.size+size<=owner.limits.total)return;if(!entry.evicted&&entry.size)evict(owner,entry)}}
++export function enableNetworkCapture(context,params={}){const limits={total:cap(params.maxTotalBufferSize,defaults.total),resource:cap(params.maxResourceBufferSize,defaults.resource),post:cap(params.maxPostDataSize,defaults.post)};if(limits.post===0)limits.post=Infinity;const owner=state(context);if(owner.disposed)throw new NetworkCaptureError('BrowserContextNotLoaded');owner.limits=limits;owner.enabled=true;for(const entry of owner.responses.values())if(entry.size>limits.resource)evict(owner,entry);space(owner,0)}
++export function disableNetworkCapture(context){const owner=state(context);owner.enabled=false;for(const entry of owner.responses.values())evict(owner,entry);owner.responses.clear();owner.size=0}
++export function disposeNetworkCapture(context){const owner=contexts.get(context);if(!owner)return;disableNetworkCapture(context);owner.posts.clear();owner.disposed=true}
++// Native uses whole-buffer Latin-1 fallback if any byte is invalid UTF-8.
++function postString(value){if(isUtf8(value))return value.toString('utf8');return value.toString('latin1')}
++export function startNetworkCapture(context,id,body){const owner=state(context),token=Object.create(null);let raw;if(owner.enabled&&!owner.disposed){try{raw=bytes(body)}catch{}if(raw?.length&&raw.length<=defaults.post)owner.posts.set(id,raw);else owner.posts.delete(id)}producers.set(token,{owner,id,entry:null,inline:raw});return token}
++export function inlinePostData(token){const capture=producers.get(token);if(!capture)throw Error('Unknown transport capture producer');const raw=capture.inline;capture.inline=undefined;return raw?{hasPostData:true,...(raw.length<=capture.owner.limits.post?{postData:postString(raw),postDataEntries:[{bytes:raw.toString('base64')}]}:{})}:{hasPostData:false}}
++// MIME classification is a Native-contract policy over a real parser. The
++// measured MIME/charset controls distinguish UTF-8 from the utf8 alias.
++const textMimes=new Set(['text/xml','text/html','text/css','text/plain','text/markdown','text/javascript','application/javascript','application/x-javascript','application/json']);
++function encodes(contentType){if(typeof contentType!=='string')return true;let mime;try{mime=new MIMEType(contentType)}catch{return true}if(!textMimes.has(mime.essence))return true;const charset=(mime.params.get('charset')??'utf-8').toLowerCase();return charset!=='utf-8'}
++export function beginNetworkResponse(token,headers){const capture=producers.get(token);if(!capture)throw Error('Unknown transport capture producer');const{owner,id}=capture;if(!owner.enabled||owner.disposed)return;const previous=owner.responses.get(id);if(previous)evict(owner,previous);const entry={chunks:[],size:0,evicted:false,complete:false,mustEncode:encodes(headers.get('content-type'))};owner.responses.set(id,entry);capture.entry=entry}
++export function appendNetworkResponse(token,value){const capture=producers.get(token);if(!capture)throw Error('Unknown transport capture producer');const{owner,id,entry}=capture;if(!owner.enabled||owner.disposed||!entry||owner.responses.get(id)!==entry||entry.evicted)return;const chunk=bytes(value);if(!chunk)throw Error('Actual response chunk is not a byte buffer');if(entry.size+chunk.length>owner.limits.resource||chunk.length>owner.limits.total){evict(owner,entry);return}space(owner,chunk.length);if(entry.evicted)return;entry.chunks.push(chunk);entry.size+=chunk.length;owner.size+=chunk.length}
++export function finishNetworkResponse(token){const capture=producers.get(token);if(capture?.entry)capture.entry.complete=true}
++function requestId(params,owner){if(!Object.hasOwn(params,'requestId'))throw new NetworkCaptureError('MissingField');const id=params.requestId;if(typeof id!=='string')throw new NetworkCaptureError('UnexpectedToken');if(owner.responses.has(id)||owner.posts.has(id))return id;const native=/^.{4}(\d+)$/.exec(id);const uuid=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id);if(!uuid&&(!native||Number(native[1])>4294967295))throw new NetworkCaptureError('InvalidParams');return id}
++export function capturedResponseBody(context,params){const owner=state(context),id=requestId(params,owner),entry=owner.responses.get(id);if(!entry)throw new NetworkCaptureError('RequestNotFound');if(entry.evicted)throw new NetworkCaptureError('Request content was evicted from inspector cache',-32000);const data=Buffer.concat(entry.chunks,entry.size),encode=entry.mustEncode||!isUtf8(data);return{body:data.toString(encode?'base64':'utf8'),base64Encoded:encode}}
++export function capturedRequestPostData(context,params){const owner=state(context),id=requestId(params,owner),raw=owner.posts.get(id);if(!raw)throw new NetworkCaptureError('RequestNotFound');return{postData:postString(raw)}}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse,disposeNetworkCapture}from'./network-capture.js';
+ import {withLocationFactory} from './location-factory.js';
+ import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+@@ -194,9 +195,10 @@
+   disposeContext(id) {
+     if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');
+     for (const page of [...this.pages.values()]) if (page.context.id === id) page.close();
++    disposeNetworkCapture(this.contexts.get(id));
+     this.contexts.delete(id);
+   }
+-  close() { for (const page of [...this.pages.values()]) page.close(); this.syncHTTP.close(); }
++  close() { for (const page of [...this.pages.values()]) page.close(); for(const context of this.contexts.values())disposeNetworkCapture(context);this.syncHTTP.close(); }
+ }
+ 
+ export class Page extends EventEmitter {
+@@ -402,11 +404,12 @@
+     } finally { this.flushingFrameEvents = false; }
+   }
+ 
+-  requestStarted(url, type = 'Document', method = 'GET', headers = {}, redirectResponse, frameId = this.frameId, loaderId = this.loaderId) {
++  requestStarted(url, type = 'Document', method = 'GET', headers = {}, redirectResponse, frameId = this.frameId, loaderId = this.loaderId, body, capture) {
+     const id = type === 'Document' ? loaderId : randomUUID();
++    const token=startNetworkCapture(this.context,id,body);capture?.(token);
+     this.activeRequests.add(id);
+     this.lastActivity = Date.now();
+-    this.emit('request', { id, url, type, method, headers, timestamp: now(), redirectResponse, frameId, loaderId });
++    this.emit('request', { id, url, type, method, headers, postDataFields:inlinePostData(token), timestamp: now(), redirectResponse, frameId, loaderId });
+     return id;
+   }
+ 
+@@ -488,7 +491,7 @@
+       const method = init.method ?? (input instanceof Request ? input.method : 'GET');
+       if (method.toUpperCase() !== 'GET') throw new TypeError('Object URL fetch supports GET only');
+       init.signal?.throwIfAborted();
+-      const id = this.requestStarted(url, type, method, {}, undefined, init.frameId, init.loaderId);
++      let capture;const id = this.requestStarted(url, type, method, {}, undefined, init.frameId, init.loaderId,undefined,token=>{capture=token});
+       try {
+         const response = new Response(snapshot.bytes, { status: 200, statusText: 'OK',
+           headers: snapshot.mimeType ? { 'content-type': snapshot.mimeType } : {},
+@@ -496,9 +499,7 @@
+         for (const [key, value] of Object.entries({ url: snapshot.url, finalUrl: snapshot.url, requestId: id,
+           redirected: false, requestMethod: method, requestBody: undefined, requestHeaders: {},
+         })) Object.defineProperty(response, key, { value });
+-        this.responseBodies ??= new Map();
+-        if (this.responseBodies.size >= 100) this.responseBodies.delete(this.responseBodies.keys().next().value);
+-        this.responseBodies.set(id, Buffer.from(snapshot.bytes).toString('utf8'));
++        beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,snapshot.bytes);finishNetworkResponse(capture);
+         this.requestFinished(id, snapshot.url, 200, snapshot.bytes.byteLength, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
+         return response;
+       } catch (error) { this.requestFailed(id, error); throw error; }
+@@ -535,7 +536,7 @@
+       this.extraHTTPHeaders.forEach((value, name) => headers.set(name, value));
+       // CLI headers retain final precedence over CDP and cookie defaults.
+       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
+-      const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId);
++      let capture;const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId,body,token=>{capture=token});
+       try {
+         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
+         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
+@@ -574,6 +575,9 @@
+           url = next.href;
+           continue;
+         }
++        // Native buffers ordinary resource notifications, while Documents
++        // expose their actual streaming transport to inspector capture.
++        if(type==='Document')beginNetworkResponse(capture,response.headers);
+         const chunks = [];
+         let size = 0;
+         const reader = response.body?.getReader();
+@@ -582,18 +586,18 @@
+           if (done) break;
+           size += value.byteLength;
+           if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
+-          chunks.push(value);
++          chunks.push(value);if(type==='Document')appendNetworkResponse(capture,value);
+         }
+         const bytes = Buffer.concat(chunks);
++        if(type!=='Document'){beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes)}
++        finishNetworkResponse(capture);
+         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
+           { status: response.status, statusText: response.statusText, headers: response.headers });
+         for (const [key, value] of Object.entries({ url, finalUrl: url, requestId: id, redirected: redirects > 0,
+           requestMethod: method, requestBody: body, requestHeaders: Object.fromEntries(headers) })) {
+           Object.defineProperty(buffered, key, { value });
+         }
+-        this.responseBodies ??= new Map();
+-        if (this.responseBodies.size >= 100) this.responseBodies.delete(this.responseBodies.keys().next().value);
+-        this.responseBodies.set(id, bytes.toString('utf8'));
++
+         this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
+         return buffered;
+       } catch (error) { this.requestFailed(id, error); throw error; }
+@@ -644,8 +648,8 @@
+         const textDocument = mime && !['text/html', 'application/xhtml+xml'].includes(mime);
+         const escaped = textDocument ? source.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') : source;
+         html = textDocument ? `<!doctype html><html><head><meta charset="utf-8"></head><body><pre>\n${escaped}</pre></body></html>` : source;
+-        this.responseBodies ??= new Map();
+-        this.responseBodies.set(response.requestId, source);
++        // Inspector bytes remain in the independent transport capture ledger.
++        // Parser decoding must not overwrite the captured document bytes.
+         this.responseHeaders = [...response.headers].map(([name, value]) => ({ name, value }));
+       }
+       if (generation !== this.navigationGeneration || this.closed) throw new Error('Navigation superseded');
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
+ import{setWindowDeviceMetrics}from'./window-viewport.js';
+ import {consoleProtocolType} from './console.js';
+ import {installHeapUtilityFactories} from './heap-worlds.js';
+@@ -150,7 +151,7 @@
+       this.event('Network.requestWillBeSent', {
+         requestId: request.id, loaderId: request.loaderId ?? page.loaderId, documentURL: page.frames?.findFrame(request.frameId)?.url ?? page.url,
+         request: { url: request.url, method: request.method, headers: request.headers,
+-          initialPriority: 'High', referrerPolicy: 'no-referrer-when-downgrade' },
++          ...request.postDataFields,initialPriority: 'High', referrerPolicy: 'no-referrer-when-downgrade' },
+         timestamp: request.timestamp, wallTime: Date.now() / 1000,
+         initiator: { type: 'other' }, type: request.type, frameId: request.frameId ?? page.frameId,
+         hasUserGesture: false,
+@@ -268,6 +269,8 @@
+     if (supportsDOM(method)) return runDOM(this, method, params);
+     if (supportsInput(method)) return runInput(this, method, params);
+     if (supportsRuntime(method)) return runRuntime(this, method, params);
++    if(method==='Network.enable')enableNetworkCapture(page.context,params);
++    if(method==='Network.disable')disableNetworkCapture(page.context);
+     if (SESSION_ENABLE_METHODS.has(method)) {
+       if(method==='Runtime.enable'&&this.domains.has('Runtime'))return {};
+       this.domains.add(method.split('.')[0]);
+@@ -405,10 +408,8 @@
+       case 'Network.setCookie': return { success: await setCDPCookie(page.context.cookies, params, page.url) };
+       case 'Network.setCookies': await setCDPCookies(page.context.cookies, params.cookies, page.url); return {};
+       case 'Network.clearBrowserCookies': await page.context.cookies.removeAllCookies(); return {};
+-      case 'Network.getResponseBody': {
+-        if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
+-        return { body: page.responseBodies.get(params.requestId), base64Encoded: false };
+-      }
++      case 'Network.getResponseBody': return capturedResponseBody(page.context,params);
++      case 'Network.getRequestPostData': return capturedRequestPostData(page.context,params);
+       case 'Network.setExtraHTTPHeaders': page.setExtraHTTPHeaders(params.headers); return {};
+       case 'Network.setUserAgentOverride': page.setUserAgentOverride(params); return {};
+       case 'Page.captureScreenshot': {
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,3 +1,4 @@
++import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
+ import {cookieHeaderForSync} from './cookie-site.js';
+ import {httpResponseCookie} from './http-cookie-ingress.js';
+ import { Worker } from 'node:worker_threads';
+@@ -46,8 +47,8 @@
+     const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
+     metadata(headers,url);
+     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
+-    const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+-    page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
++    const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
++    page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),postDataFields:inlinePostData(capture),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+     checkpoint();
+     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
+     this.#ensureWorker().postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
+@@ -69,8 +70,7 @@
+      redirectResponse={url,status:response.status,statusText:response.statusText,headers:Object.fromEntries(response.headers),mimeType:response.headers.get('content-type')??'text/html',connectionReused:false,connectionId:0,encodedDataLength:0,securityState:'neutral'};
+      url=next.href;continue;
+     }
+-    page.responseBodies??=new Map();if(page.responseBodies.size>=100)page.responseBodies.delete(page.responseBodies.keys().next().value);
+-    page.responseBodies.set(id,bytes.toString('utf8'));
++    beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes);finishNetworkResponse(capture);
+     // Remove the captured id before entering arbitrary event callbacks. The
+     // operation itself remains owned until those callbacks return normally.
+     page.activeRequests.delete(id);
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -1,3 +1,4 @@
++import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import{randomUUID}from'node:crypto';
+ import{resolveBlobURL}from'./blob-urls.js';
+@@ -186,10 +187,10 @@
+   const protocol=new URL(url).protocol;
+   if(protocol==='blob:'||protocol==='data:'){
+    let snapshot;if(protocol==='blob:')snapshot=resolveBlobURL(page,url);else{const parsed=require('data-urls')(url);if(!parsed)throw Error('Invalid data URL');snapshot={bytes:parsed.body,mimeType:parsed.mimeType.toString(),url};}
+-   const id=randomUUID();op.local=id;owner.activeRequests.add(id);owner.lastActivity=Date.now();owner.emit('request',{id,url,type:'Stylesheet',method:'GET',headers:{},timestamp:performance.now()/1000,frameId:page.frameId,loaderId:page.loaderId});
++   const id=randomUUID(),capture=startNetworkCapture(owner.context,id);op.local=id;owner.activeRequests.add(id);owner.lastActivity=Date.now();owner.emit('request',{id,url,type:'Stylesheet',method:'GET',headers:{},postDataFields:inlinePostData(capture),timestamp:performance.now()/1000,frameId:page.frameId,loaderId:page.loaderId});
+    if(!delivery.current())throw Error('Synchronous stylesheet canceled');
+    if(snapshot.bytes.byteLength>4*1024*1024)throw Error('Stylesheet exceeds 4 MiB limit');
+-   response={status:200,statusText:'OK',headers:new Headers(snapshot.mimeType?{'content-type':snapshot.mimeType}:{}),bytes:Buffer.from(snapshot.bytes),url:snapshot.url};owner.responseBodies??=new Map();if(owner.responseBodies.size>=100)owner.responseBodies.delete(owner.responseBodies.keys().next().value);owner.responseBodies.set(id,response.bytes.toString('utf8'));
++   response={status:200,statusText:'OK',headers:new Headers(snapshot.mimeType?{'content-type':snapshot.mimeType}:{}),bytes:Buffer.from(snapshot.bytes),url:snapshot.url};beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,response.bytes);finishNetworkResponse(capture);
+    owner.activeRequests.delete(id);owner.requestFinished(id,url,200,response.bytes.length,Object.fromEntries(response.headers),'Stylesheet',page.frameId,page.loaderId);op.local=null;
+   }else{
+    const headers=new Headers(),referrer=page.referrerFor?.(url,record.window.document.URL);if(referrer)headers.set('referer',referrer);

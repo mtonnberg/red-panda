@@ -1,0 +1,171 @@
+{
+  "runtimeExecuted": false,
+  "RootEdits": false,
+  "edits": [
+    {
+      "path": "src/browser.js",
+      "before": "import {installDevicePermissions} from './device-permissions.js';",
+      "after": "import {installDevicePermissions} from './device-permissions.js';\nimport {defaultPermissionOwner,registerPermissionContext,disposePermissionContext,registerPermissionPage,permissionOwnerForPage,closePermissionBrowser} from './permission-control.js';"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "    this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);",
+      "after": "    this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);\n    registerPermissionContext(this.contexts.get('default'),defaultPermissionOwner(this));"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "  createContext() {",
+      "after": "  createContext(options = {}) {"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "    this.contexts.set(id, { id, cookies: new CookieJar() });",
+      "after": "    this.contexts.set(id, { id, cookies: new CookieJar() });\n    registerPermissionContext(this.contexts.get(id),options?.permissionOwner??defaultPermissionOwner(this));"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "  createPage(contextId = 'default') {",
+      "after": "  createPage(contextId = 'default', options = {}) {"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "    const page = new Page(this, context);",
+      "after": "    const page = new Page(this, context, {permissionOwner:options?.permissionOwner});"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "    if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');",
+      "after": "    if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');\n    const permissionContext=this.contexts.get(id);"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "    this.contexts.delete(id);",
+      "after": "    this.contexts.delete(id);\n    disposePermissionContext(permissionContext);"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "  close() { for (const page of [...this.pages.values()]) page.close(); this.syncHTTP.close(); }",
+      "after": "  close() { for (const page of [...this.pages.values()]) page.close(); closePermissionBrowser(this); this.syncHTTP.close(); }"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "  constructor(browser, context, {popup}={}) {",
+      "after": "  constructor(browser, context, {popup,permissionOwner}={}) {"
+    },
+    {
+      "path": "src/browser.js",
+      "before": "    this.context = context;",
+      "after": "    this.context = context;\n    registerPermissionPage(this,permissionOwner??(popup?permissionOwnerForPage(popup.root):defaultPermissionOwner(browser)));"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "import { arch, availableParallelism, totalmem } from 'node:os';",
+      "after": "import { arch, availableParallelism, totalmem } from 'node:os';\nimport {permissionStateProvider} from './permission-control.js';"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "  worker = false, get = () => undefined, profile = {}, estimate, active = () => true,",
+      "after": "  worker = false, get = () => undefined, profile = {}, estimate, active = () => true, permissionState,"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "statuses.set(this, { name, onchange: null });",
+      "after": "statuses.set(this, { name, state:arguments[2]??'prompt', onchange: null });"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "    get state() { check(statuses, this); return 'prompt'; }",
+      "after": "    get state() { const value=statuses.get(this);if(!value)fail();return value.state; }"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "      let name, failure, failed = false;",
+      "after": "      let name, state, failure, failed = false;"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "        name = typeof input === 'symbol' ? String(Reflect.apply(symbolDescription, input, [])) : text(input);",
+      "after": "        name = typeof input === 'symbol' ? String(Reflect.apply(symbolDescription, input, [])) : text(input);\n        state=permissionState?permissionState(name):'prompt';"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "        return new PermissionStatus(secret, name);",
+      "after": "        return new PermissionStatus(secret, name, state);"
+    },
+    {
+      "path": "src/navigator.js",
+      "before": "  const result = createNavigatorRealm(realm, { ...options, get, active, profile: { ...navigatorProfile, ...options.profile } });",
+      "after": "  const permissionState=options.permissionState??(source?.browser?permissionStateProvider(source):undefined);\n  const result = createNavigatorRealm(realm, { ...options, get, active, permissionState, profile: { ...navigatorProfile, ...options.profile } });"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": "import {getRuntimeBinding} from './native-runtime.js';",
+      "after": "import {getRuntimeBinding} from './native-runtime.js';\nimport {permissionOwnerForPage,permissionState,geolocationOverride} from './permission-control.js';"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": "hostOwn=Object.getOwnPropertyDescriptor;",
+      "after": "hostOwn=Object.getOwnPropertyDescriptor,hostSetPrototype=Object.setPrototypeOf,hostNow=Date.now;"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": " const geo=create(Geolocation.prototype);bridge.initializeGeo(geo);",
+      "after": " const geo=bridge.createValue(Geolocation.prototype);bridge.initializeGeo(geo);"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": " const api=privateRecord({interfaces:hostCreate(null)}),createErrorObject=window.Object.create;let errorPrototype;",
+      "after": " const api=privateRecord({interfaces:hostCreate(null)}),ObjectConstructor=vm.runInContext('Object',context),owner=permissionOwnerForPage(page);let errorPrototype,positionPrototype,coordinatePrototype;\n const createValue=prototype=>hostSetPrototype(Reflect.construct(ObjectConstructor,[]),prototype);"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": " const bridge=privateRecord({\n  initializeGeo",
+      "after": " const bridge=privateRecord({\n  createValue,\n  initializeGeo"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": "    const callback=job.error;job.success=job.error=null;\n    if(!active()||typeof callback!=='function')return;\n    const value=apply(createErrorObject,undefined,[errorPrototype]);\n    errors.set(value,privateRecord({code:1,message:'User denied Geolocation'}));",
+      "after": "    if(!active()){job.success=job.error=null;return;}\n    const granted=permissionState(owner,'geolocation')==='granted',override=granted?geolocationOverride(owner):null;\n    const callback=override?job.success:job.error;job.success=job.error=null;\n    if(typeof callback!=='function')return;\n    let value;\n    if(override){\n     const coords=createValue(coordinatePrototype);value=createValue(positionPrototype);\n     coordinates.set(coords,Object.freeze(privateRecord({latitude:override.latitude,longitude:override.longitude,accuracy:override.accuracy,altitude:null,altitudeAccuracy:null,heading:null,speed:null})));\n     positions.set(value,Object.freeze(privateRecord({coords,timestamp:hostNow()})));\n    }else{value=createValue(errorPrototype);errors.set(value,privateRecord({code:granted?2:1,message:granted?'Position unavailable':'User denied Geolocation'}));}"
+    },
+    {
+      "path": "src/device-permissions.js",
+      "before": "   api.geo=geo;errorPrototype=hostOwn(GeolocationPositionError,'prototype').value;",
+      "after": "   api.geo=geo;errorPrototype=hostOwn(GeolocationPositionError,'prototype').value;positionPrototype=hostOwn(GeolocationPosition,'prototype').value;coordinatePrototype=hostOwn(GeolocationCoordinates,'prototype').value;"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "import{setWindowDeviceMetrics}from'./window-viewport.js';",
+      "after": "import{setWindowDeviceMetrics}from'./window-viewport.js';\nimport {supportsPermissionControl,initializePermissionConnection,permissionOwnerForConnection,releasePermissionConnection,runPermissionControl} from './permission-control.js';"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "    this.browser = browser;",
+      "after": "    this.browser = browser;\n    initializePermissionConnection(this,directPage);"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "message.params === null && CONFIGURATION_ACK_METHODS.has(message.method)",
+      "after": "message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method)||supportsPermissionControl(message.method))"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "      const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session",
+      "after": "      const result = supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "const id=browser.createContext();markCDPCookieContext",
+      "after": "const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "        const page = browser.createPage(params.browserContextId);",
+      "after": "        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});"
+    },
+    {
+      "path": "src/cdp.js",
+      "before": "  close() {\n    this.browser.off('targetCreated', this.created);",
+      "after": "  close() {\n    releasePermissionConnection(this);\n    this.browser.off('targetCreated', this.created);"
+    }
+  ]
+}

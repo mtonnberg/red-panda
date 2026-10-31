@@ -34,7 +34,7 @@ export function selectCDPCookieContext(browser,id){
  // choice for its independently supported parallel-context extension.
  return loaded.length>1?fallback:undefined;
 }
-export function formatCDPCookie(cookie){const expires=cookie.expiryTime();return{name:cookie.key,value:cookie.value,domain:`${cookie.hostOnly?'':'.'}${cookie.domain}`,path:cookie.path,expires:expires===Infinity?-1:expires/1000,size:cookie.key.length+cookie.value.length,httpOnly:!!cookie.httpOnly,secure:!!cookie.secure,session:expires===Infinity,...(cookie.sameSite?{sameSite:cookie.sameSite[0].toUpperCase()+cookie.sameSite.slice(1)}:{})}}
+export function formatCDPCookie(cookie){const expires=cookie.expiryTime();return{name:cookie.key,value:cookie.value,domain:`${cookie.hostOnly?'':'.'}${cookie.domain}`,path:cookie.path,expires:expires===Infinity?-1:expires/1000,size:Buffer.byteLength(cookie.key)+Buffer.byteLength(cookie.value),httpOnly:!!cookie.httpOnly,secure:!!cookie.secure,session:expires===Infinity,...(cookie.sameSite?{sameSite:cookie.sameSite[0].toUpperCase()+cookie.sameSite.slice(1)}:{})}}
 export async function listCDPCookies(jar,urls){
  const state=watch(jar);let allowed;
  if(urls!==undefined){allowed=new Set();for(const url of urls)for(const cookie of await jar.getCookies(url))allowed.add(key(cookie))}

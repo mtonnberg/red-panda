@@ -1,0 +1,45 @@
+import http from 'node:http';
+import {readFile,writeFile}from'node:fs/promises';
+import{createHash}from'node:crypto';
+import{writeFileSync}from'node:fs';
+import{WebSocket}from'ws';
+import{startReference}from'../scripts/reference-server.mjs';
+const binary=process.argv[2],output=process.argv[3],sha=value=>createHash('sha256').update(value).digest('hex'),record={binary,binarySHA256:sha(await readFile(binary)),probeSHA256:sha(await readFile(new URL(import.meta.url))),rows:[],wire:[],requests:[]};
+if(binary.includes('lightpanda')&&record.binarySHA256!=='9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f')throw Error('Native digest mismatch');
+let sourceURL;const documents={child:'<!doctype html><h2 id="child">Real child</h2><p>Child body.</p>'};
+const server=http.createServer((req,res)=>{record.requests.push(req.url);res.setHeader('content-type','text/html; charset=utf-8');res.end(req.url==='/child'?documents.child:documents.main)});
+let browser,socket,interrupted=false;const pending=new Map();let id=0;
+process.once('SIGTERM',()=>{interrupted=true;record.adminInterrupted='SIGTERM';writeFileSync(output+'.interrupted.json',JSON.stringify(record,null,2)+'\n');for(const entry of pending.values()){clearTimeout(entry.timer);entry.resolve({diagnosticInterrupted:true})}pending.clear();socket?.terminate()});
+async function closeConnection(){if(!socket||socket.readyState===WebSocket.CLOSED)return;const closed=new Promise(resolve=>socket.once('close',resolve)),timer=setTimeout(()=>socket.terminate(),1000);socket.close();await closed;clearTimeout(timer)}
+async function openConnection(){if(interrupted)throw Error('Administrative interruption');socket=new WebSocket(browser.endpoint);await new Promise((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject)});socket.on('message',data=>{const text=data.toString();record.wire.push({direction:'received',data:text});let value;try{value=JSON.parse(text)}catch{return}const entry=pending.get(value.id);if(entry){pending.delete(value.id);clearTimeout(entry.timer);entry.resolve(value)}})}
+const send=async(label,method,params,sessionId)=>{if(interrupted)throw Error('Administrative interruption');const request={id:++id,method,...(params===undefined?{}:{params}),...(sessionId===undefined?{}:{sessionId})},entry={label,request};record.rows.push(entry);record.wire.push({direction:'sent',data:JSON.stringify(request)});entry.response=await new Promise(resolve=>{const timer=setTimeout(()=>{pending.delete(request.id);resolve({diagnosticTimeout:true})},1500);pending.set(request.id,{resolve,timer});socket.send(JSON.stringify(request))});if(entry.response.diagnosticTimeout||entry.response.diagnosticInterrupted)throw Error('Stopped after missing actual reply: '+label);return entry.response};
+const find=(value,id)=>{if(!value||typeof value!=='object')return;const attrs=value.attributes;if(Array.isArray(attrs))for(let n=0;n<attrs.length;n+=2)if(attrs[n]==='id'&&attrs[n+1]===id)return value;for(const child of[...(value.children??[]),value.contentDocument]){const found=find(child,id);if(found)return found}};
+try{await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));sourceURL='http://127.0.0.1:'+server.address().port;documents.main='<!doctype html><head><title>LP aliases</title></head><body><h1>Red Panda</h1><p id="scope">Actual <strong>document</strong> and <a href="/next">next</a>.</p><div hidden>Hidden content</div><iframe src="'+sourceURL+'/child"></iframe></body>';record.documents=documents;record.sourceURL=sourceURL;
+ browser=await startReference(binary,{args:['--load-resources','iframe']});record.pid=browser.process.pid;await openConnection();
+ await send('root-version-before','LP.version');await send('root-markdown-before','LP.getMarkdown',{});
+ const target=(await send('create-target','Target.createTarget',{url:'about:blank'})).result?.targetId;
+ const session=(await send('attach-target','Target.attachToTarget',{targetId:target,flatten:true})).result?.sessionId;if(!session)throw Error('No genuine target session');
+ await send('session-version','LP.version',{},session);await send('blank-markdown','LP.getMarkdown',{},session);
+ await send('navigate-document','Page.navigate',{url:sourceURL+'/'},session);
+ await send('actual-document-ready','Runtime.evaluate',{expression:"new Promise(resolve=>{if(document.readyState==='complete')resolve(document.body.textContent);else addEventListener('load',()=>resolve(document.body.textContent),{once:true})})",awaitPromise:true,returnByValue:true},session);
+ const tree=(await send('actual-dom','DOM.getDocument',{depth:-1,pierce:true},session)).result?.root;
+ const scoped=find(tree,'scope'),child=find(tree,'child');record.nodeKinds={root:tree?.nodeType,scope:scoped?.nodeType,child:child?.nodeType};
+ await send('document-markdown','LP.getMarkdown',undefined,session);await send('document-dump-markdown','LP.dump',{format:'markdown'},session);
+ if(tree?.nodeId!==undefined)await send('document-node-markdown','LP.getMarkdown',{nodeId:tree.nodeId},session);
+ if(scoped?.nodeId!==undefined){await send('scoped-markdown','LP.getMarkdown',{nodeId:scoped.nodeId},session);await send('scoped-ignored-fields','LP.getMarkdown',{nodeId:scoped.nodeId,maxBytes:1,selector:'[',format:'html',strip:{invisible:true}},session);await send('scoped-dump-markdown','LP.dump',{format:'markdown',backendNodeId:scoped.backendNodeId},session)}
+ if(child?.nodeId!==undefined)await send('child-node-markdown','LP.getMarkdown',{nodeId:child.nodeId},session);
+ const childObject=(await send('actual-child-node-object','Runtime.evaluate',{expression:"document.querySelector('iframe').contentDocument.querySelector('#child')"},session)).result?.result?.objectId;
+ if(childObject){const described=(await send('actual-child-node-description','DOM.describeNode',{objectId:childObject},session)).result?.node;if(described?.nodeId!==undefined)await send('actual-child-node-description-markdown','LP.getMarkdown',{nodeId:described.nodeId},session)}
+ const frames=(await send('actual-frame-tree','Page.getFrameTree',{},session)).result?.frameTree;const actualChildFrame=frames?.childFrames?.[0]?.frame?.id;if(actualChildFrame)await send('actual-child-frame-parameter','LP.getMarkdown',{frameId:actualChildFrame},session);
+ const textNode=scoped?.children?.find(node=>node.nodeType===3);if(textNode?.nodeId!==undefined)await send('actual-text-node-markdown','LP.getMarkdown',{nodeId:textNode.nodeId},session);
+ for(const[label,params]of[['unknown-node',{nodeId:4294967295}],['negative-node',{nodeId:-1}],['zero-node',{nodeId:0}],['fractional-node',{nodeId:1.25}],['string-node',{nodeId:'1'}],['null-node',{nodeId:null}],['ignored-fields',{nodeId:null,frameId:'not-a-real-frame',selector:'[',maxBytes:0}],['null-params',null]])await send(label,'LP.getMarkdown',params,session);
+ for(const[label,params]of[['version-extra',{ignored:1}],['version-null',null]])await send(label,'LP.version',params,session);
+ await send('browser-identity','Browser.getVersion');await send('root-version-loaded','LP.version',{});await send('root-markdown-loaded','LP.getMarkdown',{});
+ await send('actual-mutation','Runtime.evaluate',{expression:"document.querySelector('h1').textContent='Real mutation';'changed'",returnByValue:true},session);await send('markdown-after-mutation','LP.getMarkdown',{},session);
+ await send('detach-real-session','Target.detachFromTarget',{sessionId:session});await send('version-detached-session','LP.version',{},session);await send('markdown-detached-session','LP.getMarkdown',{},session);
+ await send('close-real-target','Target.closeTarget',{targetId:target});await send('version-after-close','LP.version',{});await send('markdown-after-close','LP.getMarkdown',{});
+ await closeConnection();record.isolatedMalformed=[];
+ for(const[method,params]of[['LP.getMarkdown',[]],['LP.getMarkdown',3],['LP.version',[]],['LP.version',3]]){if(interrupted)break;await openConnection();try{await send('isolated-'+method+'-'+typeof params,method,params)}catch(error){record.isolatedMalformed.push({method,params,error:error.message})}finally{await closeConnection()}}
+ record.stderr=browser.stderr;
+}catch(error){record.failure={name:error.name,message:error.message,stack:error.stack}}finally{for(const entry of pending.values()){clearTimeout(entry.timer);entry.resolve({diagnosticClosed:true})}pending.clear();if(socket&&socket.readyState!==WebSocket.CLOSED){const closed=new Promise(resolve=>socket.once('close',resolve)),timer=setTimeout(()=>socket.terminate(),1000);socket.close();await closed;clearTimeout(timer)}await browser?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await writeFile(output,JSON.stringify(record,null,2)+'\n',{flag:'wx'})}
+console.log(JSON.stringify({binary,rows:record.rows.length,groups:['identity-version','real-document-and-node-markdown','invalid-params','mutation','frame-node','session-lifetime'],failure:record.failure,responses:record.rows.filter(row=>row.request.method.startsWith('LP.')).map(row=>({label:row.label,response:row.response}))}));

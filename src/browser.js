@@ -1,8 +1,12 @@
+import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse,disposeNetworkCapture}from'./network-capture.js';
 import {withLocationFactory} from './location-factory.js';
 import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+import {beginNavigationTransfer,navigationResponseReader,finishNavigationReader,endNavigationTransfer,stoppedNavigationError} from './navigation-transfer.js';
+import {notifyPageClosing} from './page-closing.js';
 import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
 import {httpResponseCookie} from './http-cookie-ingress.js';
 import {documentNavigation} from './navigation-lifecycle.js';
+import {internalCookieHeader} from './internal-cookie-header.js';
 import {installNavigationAPI} from './navigation-api.js';
 import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
 import {installHTMLElementState} from './html-element-state.js';
@@ -23,6 +27,7 @@ import { installIndexedDB } from './indexeddb.js';
 import {installCookieStore} from './cookie-store.js';
 import { installScheduler } from './scheduler.js';
 import {installDevicePermissions} from './device-permissions.js';
+import {defaultPermissionOwner,registerPermissionContext,disposePermissionContext,registerPermissionPage,permissionOwnerForPage,closePermissionBrowser} from './permission-control.js';
 import { installURLPattern } from './url-pattern.js';
 import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
 import {installCSSNamespace} from './css-namespace.js';
@@ -53,6 +58,7 @@ import { captureProtocolRealm } from './realm-values.js';
 import { installListenerOwnership } from './listener-ownership.js';
 import { installSelectors } from './selectors.js';
 import { installDialogs, isPopoverOpen, getDialogStateRevision } from './dialogs.js';
+import {initializeJavaScriptDialogs,registerJavaScriptDialogContext,disposeJavaScriptDialogContext,disposeJavaScriptDialogs,installJavaScriptDialogs} from './javascript-dialogs.js';
 import { installInnerText } from './inner-text.js';
 import { installCheckVisibility } from './check-visibility.js';
 import { EventEmitter } from 'node:events';
@@ -169,18 +175,23 @@ export class Browser extends EventEmitter {
     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
+    registerPermissionContext(this.contexts.get('default'),defaultPermissionOwner(this));
     this.pages = new Map();
     this.nextExecutionContext = 1;
+    initializeJavaScriptDialogs(this);
   }
-  createContext() {
+  createContext(options = {}) {
     const id = randomUUID();
     this.contexts.set(id, { id, cookies: new CookieJar() });
+    registerPermissionContext(this.contexts.get(id),options?.permissionOwner??defaultPermissionOwner(this));
+    registerJavaScriptDialogContext(this,this.contexts.get(id));
     return id;
   }
-  createPage(contextId = 'default') {
+  createPage(contextId = 'default', options = {}) {
     const context = this.contexts.get(contextId);
     if (!context) throw new Error('Unknown browser context');
-    const page = new Page(this, context);
+    registerJavaScriptDialogContext(this,context);
+    const page = new Page(this, context, {permissionOwner:options?.permissionOwner});
     this.pages.set(page.id, page);
     page.once('close', () => { this.pages.delete(page.id); this.emit('targetDestroyed', page); });
     this.emit('targetCreated', page);
@@ -193,17 +204,22 @@ export class Browser extends EventEmitter {
   }
   disposeContext(id) {
     if (id === 'default' || !this.contexts.has(id)) throw new Error('Unknown disposable browser context');
+    const context=this.contexts.get(id);
     for (const page of [...this.pages.values()]) if (page.context.id === id) page.close();
+    disposeNetworkCapture(this.contexts.get(id));
     this.contexts.delete(id);
+    disposeJavaScriptDialogContext(this,context);
+    disposePermissionContext(context);
   }
-  close() { for (const page of [...this.pages.values()]) page.close(); this.syncHTTP.close(); }
+  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); closePermissionBrowser(this); for(const context of this.contexts.values())disposeNetworkCapture(context);this.syncHTTP.close(); }
 }
 
 export class Page extends EventEmitter {
-  constructor(browser, context, {popup}={}) {
+  constructor(browser, context, {popup,permissionOwner}={}) {
     super();
     this.browser = browser;
     this.context = context;
+    registerPermissionPage(this,permissionOwner??(popup?permissionOwnerForPage(popup.root):defaultPermissionOwner(browser)));
     this.id = randomUUID();
     this.frameId = this.id;
     this.loaderId = randomUUID();
@@ -310,6 +326,7 @@ export class Page extends EventEmitter {
       installNavigationAPI(this,window);
       installNavigation(this, window);
       installDialogs(this, window);
+      installJavaScriptDialogs(this,window);
       installForms(this, window);
       installDocumentXML(this, window);
       installHTMLReflections(window);
@@ -335,7 +352,6 @@ export class Page extends EventEmitter {
       installAudioData(window);
       installVideoFrame(window,{canvasSnapshot,canvasDimensions});
       installWebCodecsProcessors(window);
-      installAnimations(this,window);
       installSVG(this, window);
       installDOMIDL(this, window);
       installDOMEvents(this, window);
@@ -356,6 +372,7 @@ export class Page extends EventEmitter {
     prepareUtilityPlatform(window);
     installFrameActivity(this,window);
     installWindowLifecycleTimers(this,window);
+    listenerOwnership.scope(()=>installAnimations(this,window));
     installScheduler(this,window);
     installWindowOpen(this,window);
     prepareHeapRealm(this,window);
@@ -402,11 +419,12 @@ export class Page extends EventEmitter {
     } finally { this.flushingFrameEvents = false; }
   }
 
-  requestStarted(url, type = 'Document', method = 'GET', headers = {}, redirectResponse, frameId = this.frameId, loaderId = this.loaderId) {
+  requestStarted(url, type = 'Document', method = 'GET', headers = {}, redirectResponse, frameId = this.frameId, loaderId = this.loaderId, body, capture) {
     const id = type === 'Document' ? loaderId : randomUUID();
+    const token=startNetworkCapture(this.context,id,body);capture?.(token);
     this.activeRequests.add(id);
     this.lastActivity = Date.now();
-    this.emit('request', { id, url, type, method, headers, timestamp: now(), redirectResponse, frameId, loaderId });
+    this.emit('request', { id, url, type, method, headers, postDataFields:inlinePostData(token), timestamp: now(), redirectResponse, frameId, loaderId });
     return id;
   }
 
@@ -433,7 +451,7 @@ export class Page extends EventEmitter {
   requestFailed(id, error) {
     this.activeRequests.delete(id);
     this.lastActivity = Date.now();
-    this.emit('requestFailed', { id, message: error.message, timestamp: now() });
+    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(stoppedNavigationError(error)?{canceled:true}:{}) });
   }
 
   setExtraHTTPHeaders(values) {
@@ -488,7 +506,7 @@ export class Page extends EventEmitter {
       const method = init.method ?? (input instanceof Request ? input.method : 'GET');
       if (method.toUpperCase() !== 'GET') throw new TypeError('Object URL fetch supports GET only');
       init.signal?.throwIfAborted();
-      const id = this.requestStarted(url, type, method, {}, undefined, init.frameId, init.loaderId);
+      let capture;const id = this.requestStarted(url, type, method, {}, undefined, init.frameId, init.loaderId,undefined,token=>{capture=token});
       try {
         const response = new Response(snapshot.bytes, { status: 200, statusText: 'OK',
           headers: snapshot.mimeType ? { 'content-type': snapshot.mimeType } : {},
@@ -496,9 +514,7 @@ export class Page extends EventEmitter {
         for (const [key, value] of Object.entries({ url: snapshot.url, finalUrl: snapshot.url, requestId: id,
           redirected: false, requestMethod: method, requestBody: undefined, requestHeaders: {},
         })) Object.defineProperty(response, key, { value });
-        this.responseBodies ??= new Map();
-        if (this.responseBodies.size >= 100) this.responseBodies.delete(this.responseBodies.keys().next().value);
-        this.responseBodies.set(id, Buffer.from(snapshot.bytes).toString('utf8'));
+        beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,snapshot.bytes);finishNetworkResponse(capture);
         this.requestFinished(id, snapshot.url, 200, snapshot.bytes.byteLength, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
         return response;
       } catch (error) { this.requestFailed(id, error); throw error; }
@@ -526,7 +542,7 @@ export class Page extends EventEmitter {
       const useCookies = credentials !== 'omit' && (credentials !== 'same-origin' || new URL(url).origin === credentialsOrigin);
       if (useCookies) {
         const cookies = type==='Document'?await this.context.cookies.getCookieString(url):await cookieHeaderFor(this.context.cookies,this,url,init.frameId);
-        if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
+        if (cookies) headers.set('cookie', internalCookieHeader(cookies)); else headers.delete('cookie');
       } else headers.delete('cookie');
       // Privileged CDP headers override request/default/jar values, including
       // empty Cookie and credentials-omitted requests. Apply on every actual
@@ -535,7 +551,7 @@ export class Page extends EventEmitter {
       this.extraHTTPHeaders.forEach((value, name) => headers.set(name, value));
       // CLI headers retain final precedence over CDP and cookie defaults.
       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
-      const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId);
+      let capture;const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId,body,token=>{capture=token});
       try {
         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
@@ -574,26 +590,36 @@ export class Page extends EventEmitter {
           url = next.href;
           continue;
         }
+        // Native buffers ordinary resource notifications, while Documents
+        // expose their actual streaming transport to inspector capture.
+        if(type==='Document')beginNetworkResponse(capture,response.headers);
         const chunks = [];
         let size = 0;
         const reader = response.body?.getReader();
-        if (reader) while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          size += value.byteLength;
-          if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
-          chunks.push(value);
-        }
+        const navigationReader=type==='Document'?navigationResponseReader(this,init.signal,reader):null;
+        try{
+          if (reader) while (true) {
+            const { done, value } = await reader.read();
+            if (done||navigationReader?.finishedEarly) break;
+            size += value.byteLength;
+            if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Response exceeds 16 MiB limit'); }
+            chunks.push(value);if(type==='Document')appendNetworkResponse(capture,value);
+          }
+          // A real timeout, replacement or Page.close takes precedence over an
+          // early finish. Neither transport failure nor foreign bytes become a
+          // successful prefix merely because stop ran in the same checkpoint.
+          if(navigationReader)signal.throwIfAborted();
+        }finally{finishNavigationReader(navigationReader)}
         const bytes = Buffer.concat(chunks);
+        if(type!=='Document'){beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes)}
+        finishNetworkResponse(capture);
         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
           { status: response.status, statusText: response.statusText, headers: response.headers });
         for (const [key, value] of Object.entries({ url, finalUrl: url, requestId: id, redirected: redirects > 0,
           requestMethod: method, requestBody: body, requestHeaders: Object.fromEntries(headers) })) {
           Object.defineProperty(buffered, key, { value });
         }
-        this.responseBodies ??= new Map();
-        if (this.responseBodies.size >= 100) this.responseBodies.delete(this.responseBodies.keys().next().value);
-        this.responseBodies.set(id, bytes.toString('utf8'));
+
         this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
         return buffered;
       } catch (error) { this.requestFailed(id, error); throw error; }
@@ -617,6 +643,7 @@ export class Page extends EventEmitter {
     this.performanceNavigationType = historyMode === 'reload' ? 'reload' : historyMode === 'traverse' ? 'back_forward' : 'navigate';
     this.loaderId = randomUUID();
     this.emit('navigationStarted');
+    const transfer=beginNavigationTransfer(this,this.navigationAbort);
     try {
       let html;
       let response;
@@ -644,8 +671,8 @@ export class Page extends EventEmitter {
         const textDocument = mime && !['text/html', 'application/xhtml+xml'].includes(mime);
         const escaped = textDocument ? source.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') : source;
         html = textDocument ? `<!doctype html><html><head><meta charset="utf-8"></head><body><pre>\n${escaped}</pre></body></html>` : source;
-        this.responseBodies ??= new Map();
-        this.responseBodies.set(response.requestId, source);
+        // Inspector bytes remain in the independent transport capture ledger.
+        // Parser decoding must not overwrite the captured document bytes.
         this.responseHeaders = [...response.headers].map(([name, value]) => ({ name, value }));
       }
       if (generation !== this.navigationGeneration || this.closed) throw new Error('Navigation superseded');
@@ -736,9 +763,9 @@ export class Page extends EventEmitter {
       if (waitMs > 0) await delay(waitMs);
       return { url: this.url, status: this.status };
     } catch (error) {
-      if (generation === this.navigationGeneration) this.emit('navigationError', error);
+      if (generation === this.navigationGeneration&&!stoppedNavigationError(error)) this.emit('navigationError', error);
       throw error;
-    } finally { if (captureRedirect) this.off('navigationRequested', captureRedirect); }
+    } finally { endNavigationTransfer(transfer);if (captureRedirect) this.off('navigationRequested', captureRedirect); }
   }
 
   evaluate(expression) {
@@ -772,6 +799,7 @@ export class Page extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     this.navigationGeneration++;
+    notifyPageClosing(this);
     this.navigationAbort?.abort();
     this.documentAbort.abort();
     disposeOwnedPopups(this);

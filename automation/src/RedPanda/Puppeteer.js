@@ -58,12 +58,17 @@ export const byteLength = bytes => bytes.byteLength;
 export const signature = bytes => Buffer.from(bytes.buffer, bytes.byteOffset, Math.min(8, bytes.byteLength)).toString('hex');
 export const responseStatus = response => response.status();
 export const responseTextImpl = response => async(() => response.text());
+export const responseBytesImpl = response => async(() => response.content());
 export const evaluateOnNewDocumentImpl = page => source => async(async () => (await page.evaluateOnNewDocument(source)).identifier);
 export const removePreloadImpl = page => identifier => async(async () => { await page.removeScriptToEvaluateOnNewDocument(identifier); });
 export const setExtraHTTPHeadersImpl = page => headers => async(async () => {
   await page.setExtraHTTPHeaders(Object.fromEntries(headers.map(({ name, value }) => [name, value])));
 });
 export const setUserAgentImpl = page => userAgent => async(async () => { await page.setUserAgent(userAgent); });
+export const overridePermissionsImpl = context => origin => permissions => async(() => context.overridePermissions(origin, permissions));
+export const clearPermissionOverridesImpl = context => async(() => context.clearPermissionOverrides());
+export const setGeolocationImpl = page => options => async(() => page.setGeolocation(options));
+export const clearGeolocationImpl = page => async(() => page.setGeolocation(null));
 export const focusImpl = page => selector => async(async () => { await page.focus(selector); });
 export const clickImpl = page => selector => async(async () => { await page.click(selector); });
 export const typeTextImpl = page => selector => text => async(async () => { await page.type(selector, text); });
@@ -95,6 +100,10 @@ export const setCookieImpl = context => url => name => value => async(async () =
   await context.setCookie({ name, value, domain: new URL(url).hostname, path: '/' });
 });
 export const cookieNamesImpl = context => async(async () => (await context.cookies()).map(cookie => cookie.name));
+export const cookiesImpl = context => async(() => context.cookies());
+export const cookieName = cookie => cookie.name;
+export const cookieValue = cookie => cookie.value;
+export const deleteCookieImpl = context => cookie => async(() => context.deleteCookie(cookie));
 export const quote = JSON.stringify;
 
 export const createProtocolSessionImpl = page => async(() => page.createCDPSession(), session => session.detach());

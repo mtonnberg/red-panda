@@ -1,0 +1,71 @@
+--- a/src/navigator.js
++++ b/src/navigator.js
+@@ -1,5 +1,6 @@
+ import { createRequire } from 'node:module';
+ import { arch, availableParallelism, totalmem } from 'node:os';
++import {permissionStateProvider} from './permission-control.js';
+ 
+ const require = createRequire(import.meta.url);
+ const { version } = require('../package.json');
+@@ -16,12 +17,12 @@
+  * get(name) supplies live navigator configuration; profile carries engine/CPU
+  * metadata. estimate() optionally reads a real managed-storage provider.
+  * Default managed storage is empty with the observed 1-GiB virtual origin
+- * budget. No persistence, device access or permission grant is claimed.
+- * Permissions follow the reference's observable metadata policy: any provided
+- * name is string-coerced and queried as prompt; each query returns a new status.
++ * budget. Device access is not performed. Permissions capture the actual
++ * private owner provider state at query time (prompt without a provider); each
++ * name is string-coerced and each query returns a new snapshot status.
+  */
+ export function createNavigatorRealm(realm, {
+-  worker = false, get = () => undefined, profile = {}, estimate, active = () => true,
++  worker = false, get = () => undefined, profile = {}, estimate, active = () => true, permissionState,
+ } = {}) {
+   const Object = realm.Object, Array = realm.Array, Promise = realm.Promise, TypeErrorConstructor = realm.TypeError;
+   const symbolDescription = Object.getOwnPropertyDescriptor(realm.Symbol.prototype, 'description').get;
+@@ -59,10 +60,10 @@
+   };
+   class PermissionStatus extends realm.EventTarget {
+     constructor(token, name) {
+-      super(); if (token !== secret) fail('Illegal constructor'); statuses.set(this, { name, onchange: null });
++      super(); if (token !== secret) fail('Illegal constructor'); statuses.set(this, { name, state:arguments[2]??'prompt', onchange: null });
+     }
+     get name() { const value = statuses.get(this); if (!value) fail(); return value.name; }
+-    get state() { check(statuses, this); return 'prompt'; }
++    get state() { const value=statuses.get(this);if(!value)fail();return value.state; }
+     get onchange() { const value = statuses.get(this); if (!value) fail(); return value.onchange; }
+     set onchange(value) {
+       const state = statuses.get(this); if (!state) fail();
+@@ -75,7 +76,7 @@
+   class Permissions {
+     constructor(token) { if (token !== secret) fail('Illegal constructor'); permissionsObjects.add(this); }
+     query(descriptor) {
+-      let name, failure, failed = false;
++      let name, state, failure, failed = false;
+       // Native argument conversion runs before returning the realm Promise.
+       // Actual settlement still belongs to this document's private lifetime.
+       try {
+@@ -84,10 +85,11 @@
+         const input = descriptor.name;
+         if (input === undefined) fail('invalid argument');
+         name = typeof input === 'symbol' ? String(Reflect.apply(symbolDescription, input, [])) : text(input);
++        state=permissionState?permissionState(name):'prompt';
+       } catch (error) { failed = true; failure = error; }
+       return promise(() => {
+         if (failed) throw failure;
+-        return new PermissionStatus(secret, name);
++        return new PermissionStatus(secret, name, state);
+       });
+     }
+     get [Symbol.toStringTag]() { return 'Permissions'; }
+@@ -201,7 +203,8 @@
+   });
+   const active = options.active ?? (() => !source?.closed && (!signal || !signal.aborted) &&
+     (generation === undefined || source?.documentGeneration === generation) && (options.worker || !!realm.document));
+-  const result = createNavigatorRealm(realm, { ...options, get, active, profile: { ...navigatorProfile, ...options.profile } });
++  const permissionState=options.permissionState??(source?.browser?permissionStateProvider(source):undefined);
++  const result = createNavigatorRealm(realm, { ...options, get, active, permissionState, profile: { ...navigatorProfile, ...options.profile } });
+   signal?.addEventListener('abort', () => result.dispose(), { once: true });
+   INSTALLED.set(realm, result); return result;
+ }

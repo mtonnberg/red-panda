@@ -2,6 +2,7 @@ import {canNavigateJavaScript} from './blob-urls.js';
 import {reportWindowException} from './errors.js';
 import vm from 'node:vm';
 import {beforeNavigation,linkedNavigation,stopNavigation} from './navigation-lifecycle.js';
+import {stopNavigationRequest} from './navigation-transfer.js';
 import { createRequire } from 'node:module';
 import {onFrameRetirement} from './frame-activity.js';
 
@@ -240,7 +241,7 @@ export function installNavigation(page, window) {
   record.controller = { dispose };
   if (record.signal?.aborted || page.closed) { record.disposed = true; return record.controller; }
   DOCUMENTS.set(documentImpl, record);
-  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');record.page.navigationAbort?.abort();stopNavigation(record.page);return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
+  const stop=function(){record.page.pendingNavigation?.cancel?.('Navigation was aborted');const finishedEarly=stopNavigationRequest(record.page);stopNavigation(record.page,{cancelTransport:!finishedEarly});return record.originalStop.call(window)};record.stop=stop;window.stop=stop;
   record.retirementUnsubscribe=onFrameRetirement(window,()=>{for(const pending of record.pending)if(!pending.started)pending.cancel('Target browsing context was retired');for(const timer of record.javascriptTasks)clearTimer(record,timer);record.javascriptTasks.clear();});
   record.close = function () { dispose(); return record.originalClose.call(window); };
   window.close = record.close;

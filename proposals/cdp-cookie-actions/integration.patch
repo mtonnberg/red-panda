@@ -1,0 +1,146 @@
+--- /dev/null
++++ b/src/cdp-cookie-actions.js
+@@ -0,0 +1,35 @@
++import {createRequire} from 'node:module';
++import {selectCDPCookieContext} from './cdp-cookie-metadata.js';
++import {removeObservedCookie} from './cookie-jar-observer.js';
++const{canonicalDomain,domainMatch,defaultPath}=createRequire(import.meta.url)('tough-cookie');
++const apply=Reflect.apply,record=value=>Object.assign(Object.create(null),value);
++function failure(message,code=-31998){const error=Error(message);Object.defineProperty(error,'code',{value:code});throw error;}
++function optional(value){if(value===undefined||value===null)return undefined;if(typeof value!=='string')failure('UnexpectedToken');return value;}
++export function requireCookieSession(browser,parent){if(parent&&(parent.page.closed||browser.contexts.get(parent.page.context.id)!==parent.page.context))failure('Unknown sessionId',-32001);}
++export function cookieActionContext(browser,parent,id){
++ requireCookieSession(browser,parent);
++ const current=parent?.page.context??selectCDPCookieContext(browser);
++ if(!current)failure('BrowserContextNotLoaded');
++ const selector=optional(id);if(selector===undefined)return current;
++ const context=selectCDPCookieContext(browser,selector);if(!context)failure('UnknownBrowserContextId');return context;
++}
++export function decodeCookieDeletion(params){
++ if(params.name===undefined)failure('MissingField');if(typeof params.name!=='string')failure('UnexpectedToken');
++ return record({name:params.name,url:optional(params.url),domain:optional(params.domain),path:optional(params.path)});
++}
++function deletionScope(input){
++ if(!input.url&&!input.domain)failure('InvalidDomain');
++ let url;if(input.url){try{url=new URL(input.url)}catch{return null;}if(!url.hostname)failure('InvalidDomain');}
++ const explicit=input.domain,raw=explicit??url.hostname,domain=canonicalDomain(raw);
++ if(!domain)failure('InvalidDomain');
++ if(url&&explicit&&!domainMatch(url.hostname.replace(/^\[|\]$/g,''),domain))failure('InvalidDomain');
++ const path=input.path?.startsWith('/')?input.path:(url?defaultPath(url.pathname):'/');
++ return record({domain,path});
++}
++export async function deleteCDPCookies(jar,input){
++ const scope=deletionScope(input);if(!scope)return;
++ // Read and mutate the real store. Its existing trusted metadata observers own
++ // callback/Promise timing and group history; inspector arrays are not filtered.
++ const store=jar.store,cookies=await apply(store.getAllCookies,store,[]);
++ for(const cookie of cookies)if(cookie.key===input.name&&cookie.domain===scope.domain&&cookie.path===scope.path)await removeObservedCookie(jar,cookie.domain,cookie.path,cookie.key);
++}
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -12,6 +12,7 @@
+ import { Browser, VERSION, withTimeout } from './browser.js';
+ import {initializeCDPCookieMetadata,markCDPCookieContext,selectCDPCookieContext,listCDPCookies} from './cdp-cookie-metadata.js';
+ import {setCDPCookie,setCDPCookies} from './cdp-cookies.js';
++import {cookieActionContext,requireCookieSession,decodeCookieDeletion,deleteCDPCookies} from './cdp-cookie-actions.js';
+ import { supportsDOM, runDOM, resetDOM } from './dom.js';
+ import { supportsInput, runInput } from './input.js';
+ import { createWebDriver } from './webdriver.js';
+@@ -404,6 +405,9 @@
+         return { cookies: await listCDPCookies(page.context.cookies, urls.map(value=>value)) };
+       }
+       case 'Storage.getCookies': return this.connection.run(method,params,this);
++      case 'Storage.setCookies':
++      case 'Storage.clearCookies':
++      case 'Network.deleteCookies': return this.connection.run(method,params,this);
+       case 'Network.getAllCookies': return { cookies: await listCDPCookies(page.context.cookies) };
+       case 'Network.setCookie': return { success: await setCDPCookie(page.context.cookies, params, page.url) };
+       case 'Network.setCookies': await setCDPCookies(page.context.cookies, params.cookies, page.url); return {};
+@@ -602,10 +606,15 @@
+         return { cookies: await listCDPCookies(context.cookies) };
+       }
+       case 'Storage.setCookies': {
+-        const context = selectCDPCookieContext(browser,params.browserContextId);
+-        if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
++        const context = cookieActionContext(browser,parent,params.browserContextId);
+         await setCDPCookies(context.cookies, params.cookies, 'about:blank');
+         return {};
++      }
++      case 'Storage.clearCookies': {
++        const context=cookieActionContext(browser,parent,params.browserContextId);await context.cookies.removeAllCookies();return {};
++      }
++      case 'Network.deleteCookies': {
++        requireCookieSession(browser,parent);const input=decodeCookieDeletion(params),context=cookieActionContext(browser,parent);await deleteCDPCookies(context.cookies,input);return {};
+       }
+       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+     }
+--- a/src/cookie-jar-observer.js
++++ b/src/cookie-jar-observer.js
+@@ -12,16 +12,25 @@
+  return value;
+ }
+ const snapshot=cookie=>record({name:cookie.key,value:cookie.value,domain:cookie.domain,hostOnly:cookie.hostOnly,path:cookie.path,expires:cookie.expiryTime(),secure:!!cookie.secure,httpOnly:!!cookie.httpOnly,sameSite:cookie.sameSite??'lax'});
++function notify(jar,kind,cookie){const state=observers.get(jar);if(!state)return;const value=snapshot(cookie);for(const callback of [...state.listeners])callback(kind,value);}
++// Explicit inspector deletion is a successful real mutation producer. Keep
++// expiry pruning and blanket clearing on their existing separate paths.
++export async function removeObservedCookie(jar,domain,path,name){
++ const store=jar.store;return new Promise((resolve,reject)=>apply(store.findCookie,store,[domain,path,name,(error,cookie)=>{
++  if(error){reject(error);return}if(!cookie){resolve(false);return}
++  apply(store.removeCookie,store,[domain,path,name,error=>{if(error){reject(error);return}if(cookie.expiryTime()>Date.now())notify(jar,'deleted',cookie);resolve(true);}]);
++ }]));
++}
+ export function observeCookieJar(jar,listener){
+  let state=observers.get(jar);
+  if(!state){
+   const store=jar.store,put=store.putCookie,find=store.findCookie,read=jar.getCookies;
+   state=record({listeners:new Set()});observers.set(jar,state);
+-  const notify=(kind,cookie)=>{const value=snapshot(cookie);for(const callback of [...state.listeners])callback(kind,value);};
++  const publish=(kind,cookie)=>notify(jar,kind,cookie);
+   const mutation=(callback,operation,done)=>{if(typeof callback==='function')return operation((error,value)=>{if(!error)done();callback(error,value);});return operation(undefined).then(value=>{done();return value;});};
+   // BrowserContexts use the real synchronous MemoryCookieStore. Its update
+   // method delegates to putCookie, so observing put avoids duplicate updates.
+-  store.putCookie=function(cookie,callback){let old;apply(find,this,[cookie.domain,cookie.path,cookie.key,(_error,value)=>{old=value;}]);return mutation(callback,cb=>apply(put,this,[cookie,cb]),()=>{if(cookie.expiryTime()<=Date.now()){if(old&&old.expiryTime()>Date.now())notify('deleted',old);}else notify('changed',cookie);});};
++  store.putCookie=function(cookie,callback){let old;apply(find,this,[cookie.domain,cookie.path,cookie.key,(_error,value)=>{old=value;}]);return mutation(callback,cb=>apply(put,this,[cookie,cb]),()=>{if(cookie.expiryTime()<=Date.now()){if(old&&old.expiryTime()>Date.now())publish('deleted',old);}else publish('changed',cookie);});};
+   // Native expiry pruning and CDP jar clearing are silent; only successful
+   // set/replace and expired-set deletion publish mutation notifications.
+   jar.getCookies=function(url,...args){return apply(read,this,[readContext(url),...args]);};
+--- /dev/null
++++ b/test/cdp-cookie-actions.test.js
+@@ -0,0 +1,37 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{createServer}from'node:http';import{once}from'node:events';import{serve}from'../src/cdp.js';import{connect}from'./cdp-client.js';
++async function fixture(t,{http=false}={}){
++ let origin,server;if(http){server=createServer((request,response)=>{response.writeHead(200,{'content-type':request.url==='/echo'?'text/plain':'text/html'});response.end(request.url==='/echo'?request.headers.cookie??'':'<!doctype html><body>Actual cookie action document')});server.listen(0,'127.0.0.1');await once(server,'listening');origin='http://127.0.0.1:'+server.address().port;}
++ const service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close();if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve))}});
++ const create=async()=>{const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);if(http){await send('Page.enable');await send('Page.navigate',{url:origin+'/owner'});}return{browserContextId,targetId,sessionId,send,jar:service.browser.contexts.get(browserContextId).cookies};};
++ return{client,service,origin,create};
++}
++const cookie=(name,value,url='https://child.example.com/',extra={})=>({name,value,url,path:'/',...extra});
++test('deletion mutates actual exact-domain/path cookie records and real HTTP while retaining Document and CookieStore',async t=>{
++ const f=await fixture(t,{http:true}),owner=await f.create(),{send,jar}=owner;
++ await send('Runtime.enable');await send('Runtime.evaluate',{expression:'globalThis.heldDoc=document;globalThis.heldStore=cookieStore;globalThis.changes=[];cookieStore.addEventListener("change",e=>changes.push(e.type))'});
++ await send('Network.setCookies',{cookies:[cookie('pick','owner',f.origin+'/'),cookie('sentinel','kept',f.origin+'/'),cookie('pick','root'),cookie('pick','alpha','https://child.example.com/alpha',{path:'/alpha'}),cookie('pick','deep','https://child.example.com/alpha/deep',{path:'/alpha/deep'}),cookie('pick','parent','https://child.example.com/',{domain:'.example.com'}),cookie('','nameless')]});
++ await send('Runtime.evaluate',{expression:'new Promise(r=>setTimeout(()=>{changes=[];r(true)},0))',awaitPromise:true});
++ assert.deepEqual(await send('Network.deleteCookies',{name:'pick',url:'https://child.example.com/alpha/deep?q=1#fragment'}),{});assert.equal((await jar.getCookies('https://child.example.com/alpha')).some(c=>c.key==='pick'&&c.path==='/alpha'),false);assert.equal((await jar.getCookies('https://child.example.com/alpha/deep')).some(c=>c.value==='deep'),true);
++ assert.deepEqual(await send('Network.deleteCookies',{name:'pick',domain:'.example.com'}),{});assert.equal((await jar.getCookies('https://sibling.example.com/')).some(c=>c.key==='pick'),false);
++ await send('Network.deleteCookies',{name:'',domain:'child.example.com'});assert.equal((await jar.getCookies('https://child.example.com/')).some(c=>c.key===''),false);
++ await send('Network.deleteCookies',{name:'pick',url:f.origin+'/owner'});const response=await send('Runtime.evaluate',{expression:'(async()=>{await new Promise(r=>setTimeout(r,0));return JSON.stringify({body:await(await fetch("/echo")).text(),doc:document===heldDoc,store:cookieStore===heldStore,changes})})()',awaitPromise:true,returnByValue:true});assert.deepEqual(JSON.parse(response.result.value),{body:'sentinel=kept',doc:true,store:true,changes:['change']});
++ await send('Runtime.evaluate',{expression:'changes=[]'});await send('Storage.clearCookies');const cleared=await send('Runtime.evaluate',{expression:'(async()=>{await new Promise(r=>setTimeout(r,0));return JSON.stringify({body:await(await fetch("/echo")).text(),doc:document===heldDoc,store:cookieStore===heldStore,changes})})()',awaitPromise:true,returnByValue:true});assert.deepEqual(JSON.parse(cleared.result.value),{body:'',doc:true,store:true,changes:[]});
++});
++test('delete schema and domain failures preserve the real jar and malformed URLs are silent no-ops',async t=>{
++ const f=await fixture(t),{send,jar}=await f.create();await send('Network.setCookies',{cookies:[cookie('pick','actual')]});
++ for(const[params,message]of[[{},'MissingField'],[{name:null},'UnexpectedToken'],[{name:'pick'},'InvalidDomain'],[{name:'pick',url:'https://other.example.net/',domain:'child.example.com'},'InvalidDomain']])await assert.rejects(send('Network.deleteCookies',params),error=>error.code===-31998&&error.message===message);
++ assert.deepEqual(await send('Network.deleteCookies',{name:'pick',url:'http://[/'}),{});assert.equal(await jar.getCookieString('https://child.example.com/'),'pick=actual');
++});
++test('attached Storage writes and clearing select actual contexts and preserve explicit parallel-context separation',async t=>{
++ const f=await fixture(t);await assert.rejects(f.client.send('Storage.clearCookies'),error=>error.code===-31998&&error.message==='BrowserContextNotLoaded');const one=await f.create(),two=await f.create();
++ await one.send('Storage.setCookies',{cookies:[cookie('one','actual')],browserContextId:null});await two.send('Storage.setCookies',{cookies:[cookie('two','actual')]});
++ await one.send('Network.deleteCookies',{name:'two',url:'https://child.example.com/',browserContextId:two.browserContextId});assert.equal(await two.jar.getCookieString('https://child.example.com/'),'two=actual');
++ await assert.rejects(one.send('Storage.setCookies',{cookies:[cookie('must-not-write','bad')],browserContextId:'unknown-owned-id'}),error=>error.code===-31998&&error.message==='UnknownBrowserContextId');assert.equal(await one.jar.getCookieString('https://child.example.com/'),'one=actual');
++ await one.send('Storage.clearCookies');assert.equal(await one.jar.getCookieString('https://child.example.com/'),'');assert.equal(await two.jar.getCookieString('https://child.example.com/'),'two=actual');
++ await f.client.send('Storage.clearCookies',{browserContextId:two.browserContextId});assert.equal(await two.jar.getCookieString('https://child.example.com/'),'');await f.client.send('Target.disposeBrowserContext',{browserContextId:one.browserContextId});await assert.rejects(one.send('Storage.setCookies',{cookies:[cookie('retired','bad')]}),error=>error.code===-32001&&error.message==='Unknown sessionId');
++});
++test('real store removal keeps metadata callbacks synchronous and clearing resets actual site-group history',async t=>{
++ const f=await fixture(t),owner=await f.create(),{send,jar}=owner;await send('Storage.setCookies',{cookies:[cookie('a','actual','https://127.0.0.1/'),cookie('b','actual','https://127.0.0.2/')]});
++ const store=jar.store,original=store.removeCookie;let actual;store.removeCookie=function(...args){return actual=Reflect.apply(original,this,args)};let synchronous=false;const returned=store.removeCookie('127.0.0.1','/','a',error=>{assert.ifError(error);synchronous=true});assert.equal(synchronous,true);assert.equal(returned,actual);assert.equal(typeof returned?.then,'function');
++ assert.deepEqual((await send('Network.getAllCookies')).cookies.map(c=>c.name),['b']);await send('Storage.clearCookies');await send('Storage.setCookies',{cookies:[cookie('new-b','actual','https://127.0.0.2/'),cookie('new-a','actual','https://127.0.0.1/')]});assert.deepEqual((await send('Network.getAllCookies')).cookies.map(c=>c.name),['new-b','new-a']);
++});
