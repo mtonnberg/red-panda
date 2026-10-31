@@ -1,0 +1,334 @@
+{
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "driverSHA256": "8cc390758d5c8f6fb5cb19d0fb82000ea9bf5ee655f86eedae6eecea549f1ac6",
+  "controls": [
+    {
+      "label": "preset-timeout",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.timeout=1000;try{x.open('GET',\"http://127.0.0.1:42767/echo\",false);return{ok:true,state:x.readyState}}catch(e){return{name:e.name,state:x.readyState}}})()",
+      "native": {
+        "value": {
+          "name": "InvalidAccessError",
+          "state": 0
+        }
+      },
+      "candidate": {
+        "value": {
+          "name": "InvalidAccessError",
+          "state": 0
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "string-content-type",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.open('POST',\"http://127.0.0.1:42767/echo\",false);x.setRequestHeader('content-type','text/plain;charset=windows-1252');x.send('é');const r=JSON.parse(x.responseText);return{type:r.headers['content-type'],body:r.base64}})()",
+      "native": {
+        "value": {
+          "type": "text/plain;charset=windows-1252",
+          "body": "w6k="
+        }
+      },
+      "candidate": {
+        "value": {
+          "type": "text/plain;charset=windows-1252",
+          "body": "w6k="
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "symbol-body",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.open('POST',\"http://127.0.0.1:42767/echo\",false);try{x.send(Symbol('body'));return{ok:true,state:x.readyState,body:JSON.parse(x.responseText).body}}catch(e){return{name:e.name,state:x.readyState}}})()",
+      "native": {
+        "value": {
+          "ok": true,
+          "state": 4,
+          "body": "body"
+        }
+      },
+      "candidate": {
+        "value": {
+          "ok": true,
+          "state": 4,
+          "body": "Symbol(body)"
+        }
+      },
+      "equal": false
+    },
+    {
+      "label": "throwing-string-body",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.open('POST',\"http://127.0.0.1:42767/echo\",false);try{x.send({toString(){throw new TypeError('body conversion')}});return{ok:true}}catch(e){return{name:e.name,state:x.readyState,message:e.message}}})()",
+      "native": {
+        "value": {
+          "name": "TypeError",
+          "state": 1,
+          "message": "body conversion"
+        }
+      },
+      "candidate": {
+        "value": {
+          "name": "NetworkError",
+          "state": 4,
+          "message": "A network error occurred"
+        }
+      },
+      "equal": false
+    },
+    {
+      "label": "fake-blob-body",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.open('POST',\"http://127.0.0.1:42767/echo\",false);x.send(Object.create(Blob.prototype));return JSON.parse(x.responseText).body})()",
+      "native": {
+        "value": "[object Blob]"
+      },
+      "candidate": {
+        "value": "[object Blob]"
+      },
+      "equal": true
+    },
+    {
+      "label": "events",
+      "expression": "(()=>{const x=new XMLHttpRequest(),events=[];for(const type of ['readystatechange','loadstart','progress','load','loadend','error'])x.addEventListener(type,e=>events.push([type,x.readyState,e.isTrusted]));x.open('GET',\"http://127.0.0.1:42767/echo\",false);x.send();return {status:x.status,events,method:JSON.parse(x.responseText).method,cookie:document.cookie.includes('syncCookie=received')}})()",
+      "native": {
+        "value": {
+          "status": 200,
+          "events": [
+            [
+              "readystatechange",
+              1,
+              true
+            ],
+            [
+              "readystatechange",
+              4,
+              true
+            ],
+            [
+              "load",
+              4,
+              true
+            ],
+            [
+              "loadend",
+              4,
+              true
+            ]
+          ],
+          "method": "GET",
+          "cookie": true
+        }
+      },
+      "candidate": {
+        "value": {
+          "status": 200,
+          "events": [
+            [
+              "readystatechange",
+              1,
+              true
+            ],
+            [
+              "readystatechange",
+              4,
+              true
+            ],
+            [
+              "load",
+              4,
+              true
+            ],
+            [
+              "loadend",
+              4,
+              true
+            ]
+          ],
+          "method": "GET",
+          "cookie": true
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "document-body",
+      "expression": "(()=>{const d=new DOMParser().parseFromString('<root/>','application/xml'),x=new XMLHttpRequest();x.open('POST',\"http://127.0.0.1:42767/echo\",false);x.send(d);const r=JSON.parse(x.responseText);return{body:r.body,type:r.headers['content-type']}})()",
+      "native": {
+        "value": {
+          "body": "[object XMLDocument]",
+          "type": "text/plain;charset=UTF-8"
+        }
+      },
+      "candidate": {
+        "value": {
+          "body": "[object XMLDocument]",
+          "type": "text/plain;charset=UTF-8"
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "encoding",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.open('GET',\"http://127.0.0.1:42767/latin\",false);x.overrideMimeType('text/plain;charset=windows-1252');x.send();return x.responseText})()",
+      "native": {
+        "value": "﻿caf�"
+      },
+      "candidate": {
+        "value": "﻿caf�"
+      },
+      "equal": true
+    },
+    {
+      "label": "preset-response-type",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.responseType='json';try{x.open('GET',\"http://127.0.0.1:42767/echo\",false);x.send();return{ok:true,state:x.readyState}}catch(e){return{name:e.name,state:x.readyState}}})()",
+      "native": {
+        "value": {
+          "name": "InvalidAccessError",
+          "state": 1
+        }
+      },
+      "candidate": {
+        "value": {
+          "name": "InvalidAccessError",
+          "state": 1
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "property-guards",
+      "expression": "(()=>{const x=new XMLHttpRequest(),result=[];x.open('GET',\"http://127.0.0.1:42767/echo\",false);for(const[k,v]of [['responseType',''],['responseType','text'],['timeout',0],['timeout',1]]){try{x[k]=v;result.push([k,v,'ok'])}catch(e){result.push([k,v,e.name])}}return result})()",
+      "native": {
+        "value": [
+          [
+            "responseType",
+            "",
+            "InvalidAccessError"
+          ],
+          [
+            "responseType",
+            "text",
+            "InvalidAccessError"
+          ],
+          [
+            "timeout",
+            0,
+            "InvalidAccessError"
+          ],
+          [
+            "timeout",
+            1,
+            "InvalidAccessError"
+          ]
+        ]
+      },
+      "candidate": {
+        "value": [
+          [
+            "responseType",
+            "",
+            "InvalidAccessError"
+          ],
+          [
+            "responseType",
+            "text",
+            "InvalidAccessError"
+          ],
+          [
+            "timeout",
+            0,
+            "InvalidAccessError"
+          ],
+          [
+            "timeout",
+            1,
+            "InvalidAccessError"
+          ]
+        ]
+      },
+      "equal": true
+    },
+    {
+      "label": "network-failure",
+      "expression": "(()=>{const x=new XMLHttpRequest(),events=[];for(const type of ['error','load','loadend','readystatechange'])x.addEventListener(type,()=>events.push(type));x.open('GET',\"http://127.0.0.1:42767/close\",false);try{x.send()}catch(e){return{name:e.name,state:x.readyState,status:x.status,events}}})()",
+      "native": {
+        "value": {
+          "name": "NetworkError",
+          "state": 4,
+          "status": 0,
+          "events": [
+            "readystatechange"
+          ]
+        }
+      },
+      "candidate": {
+        "value": {
+          "name": "NetworkError",
+          "state": 4,
+          "status": 0,
+          "events": [
+            "readystatechange"
+          ]
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "redirect",
+      "expression": "(()=>{const x=new XMLHttpRequest(),url=\"http://127.0.0.1:42767/redirect?status=302&to=http%3A%2F%2F127.0.0.1%3A42767%2Fecho\";x.open('POST',url,false);x.send('original');const r=JSON.parse(x.responseText);return{method:r.method,body:r.body,originalURL:x.responseURL===url}})()",
+      "native": {
+        "value": {
+          "method": "GET",
+          "body": "",
+          "originalURL": true
+        }
+      },
+      "candidate": {
+        "value": {
+          "method": "GET",
+          "body": "",
+          "originalURL": true
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "cors",
+      "expression": "(()=>{const x=new XMLHttpRequest();x.open('PUT',\"http://127.0.0.1:35297/cors\",false);x.setRequestHeader('x-custom','real');x.withCredentials=true;x.send('body');return{status:x.status,visible:x.getResponseHeader('x-visible'),hidden:x.getResponseHeader('x-hidden'),cookie:x.getResponseHeader('set-cookie')}})()",
+      "native": {
+        "value": {
+          "status": 200,
+          "visible": "yes",
+          "hidden": "secret",
+          "cookie": null
+        }
+      },
+      "candidate": {
+        "value": {
+          "status": 200,
+          "visible": "yes",
+          "hidden": "secret",
+          "cookie": null
+        }
+      },
+      "equal": true
+    },
+    {
+      "label": "about-blank-frame",
+      "expression": "(()=>{const f=document.createElement('iframe');document.body.append(f);const c=f.contentWindow,x=new c.XMLHttpRequest();x.open('POST',\"http://127.0.0.1:42767/echo\",false);x.send('frame');const r=JSON.parse(x.responseText);f.remove();return{status:x.status,origin:r.headers.origin===\"http://127.0.0.1:42767\",referrer:r.headers.referer??null}})()",
+      "native": {
+        "value": {
+          "status": 200,
+          "origin": true,
+          "referrer": "http://127.0.0.1:42767/"
+        }
+      },
+      "candidate": {
+        "value": {
+          "status": 200,
+          "origin": true,
+          "referrer": "http://127.0.0.1:42767/"
+        }
+      },
+      "equal": true
+    }
+  ]
+}

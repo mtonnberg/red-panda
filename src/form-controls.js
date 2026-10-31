@@ -1,3 +1,4 @@
+import {registerHeapFactoryValue} from './heap-registry.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -16,7 +17,7 @@ function active(document) { return documents.get(document)?.() === true; }
 // Named descriptors are writable and nonenumerable; assigning one creates an
 // ordinary nonenumerable shadow, and deleting that shadow restores the lookup.
 // Prototype members take precedence over controls with the same name.
-function wrap(raw, implementation, collection) {
+function wrap(raw, implementation, collection, globalObject, replace) {
   const value = key => {
     if (typeof key !== 'string' || Reflect.has(raw, key)) return absent;
     let result;
@@ -54,6 +55,7 @@ function wrap(raw, implementation, collection) {
     ownKeys: target => Reflect.ownKeys(target),
     preventExtensions: () => false,
   });
+  registerHeapFactoryValue(wrapper,{implementation,globalObject,replace});
   implementation[utils.wrapperSymbol] = wrapper;
   return wrapper;
 }
@@ -67,7 +69,7 @@ function patch() {
       const original = setup.call(this, raw, globalObject, ...args);
       const implementation = utils.implForWrapper(original);
       const document = collection ? utils.implForWrapper(globalObject.document) : implementation._ownerDocument;
-      return active(document) ? wrap(raw, implementation, collection) : original;
+      return active(document) ? wrap(raw, implementation, collection, globalObject, original) : original;
     };
   }
   const createForm = FormIDL.new;
@@ -78,7 +80,7 @@ function patch() {
     FormIDL._internalSetup(raw, globalObject);
     const implementation = Object.create(FormImpl.prototype);
     Object.defineProperty(raw, utils.implSymbol, { value: implementation, configurable: true });
-    wrap(raw, implementation, false);
+    wrap(raw, implementation, false, globalObject);
     return implementation;
   };
   for (const name of ['Button', 'FieldSet', 'Input', 'Object', 'Output', 'Select', 'TextArea']) {

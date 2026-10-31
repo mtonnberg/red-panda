@@ -1,3 +1,6 @@
+import { platformFactoryRecord } from './platform-factories.js';
+import { types as nodeTypes } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import { installBlobReads } from './blob.js';
 import { createRequire } from 'node:module';
 
@@ -48,7 +51,7 @@ function unsafeHeaders(headers) {
  * Redirects requiring a fresh preflight or an opaque redirect origin are
  * rejected. Page.fetch buffers responses, so progress represents one completed
  * body, not streamed chunks.
- * Synchronous requests throw NotSupportedError. Returns a silent cleanup hook.
+ * Synchronous requests use a browser-owned actual transport thread. Returns a silent cleanup hook.
  */
 export function installXHR(page, window) {
   if (INSTALLED.has(window)) return INSTALLED.get(window);
@@ -112,6 +115,49 @@ export function installXHR(page, window) {
     });
   }
   installBlobReads(window);
+  const typedPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+  const typedBuffer = Object.getOwnPropertyDescriptor(typedPrototype, 'buffer').get;
+  const typedOffset = Object.getOwnPropertyDescriptor(typedPrototype, 'byteOffset').get;
+  const typedLength = Object.getOwnPropertyDescriptor(typedPrototype, 'byteLength').get;
+  const dataBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get;
+  const dataOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get;
+  const dataLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
+  const paramsString = window.URLSearchParams.prototype.toString;
+  const symbolDescription = Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get;
+  function requestBodySync(body, headers) {
+    if (body == null) return undefined;
+    if (nodeTypes.isArrayBuffer(body)) return new Uint8Array(body).slice();
+    if (nodeTypes.isArrayBufferView(body)) {
+      const data = nodeTypes.isDataView(body), get = data ? [dataBuffer,dataOffset,dataLength] : [typedBuffer,typedOffset,typedLength];
+      return new Uint8Array(get[0].call(body),get[1].call(body),get[2].call(body)).slice();
+    }
+    const record=platformFactoryRecord(body);
+    if (record?.kind === 'Blob' || record?.kind === 'File') {
+      const impl=record.implementation;
+      if (!Buffer.isBuffer(impl?._buffer)) throw new window.TypeError('Invalid Blob');
+      if (impl.type && !headers.has('content-type')) headers.set('content-type',impl.type);
+      return Buffer.from(impl._buffer);
+    }
+    if (record?.kind === 'FormData') {
+      const boundary='----red-panda-'+randomUUID(), chunks=[];
+      const quote=value=>String(value).replace(/\r?\n|\r/g,'\r\n').replace(/\r/g,'%0D').replace(/\n/g,'%0A').replace(/"/g,'%22');
+      for (const entry of record.implementation._entries) {
+        const value=entry.value;
+        chunks.push(Buffer.from('--'+boundary+'\r\nContent-Disposition: form-data; name="'+quote(entry.name)+'"'));
+        if (typeof value==='string') chunks.push(Buffer.from('\r\n\r\n'+value+'\r\n'));
+        else chunks.push(Buffer.from('; filename="'+quote(value.name)+'"\r\nContent-Type: '+(value.type||'application/octet-stream')+'\r\n\r\n'),Buffer.from(value._buffer),Buffer.from('\r\n'));
+      }
+      chunks.push(Buffer.from('--'+boundary+'--\r\n'));
+      if (!headers.has('content-type')) headers.set('content-type','multipart/form-data; boundary='+boundary);
+      return Buffer.concat(chunks);
+    }
+    if (record?.kind === 'URLSearchParams') {
+      if(!headers.has('content-type'))headers.set('content-type','application/x-www-form-urlencoded;charset=UTF-8');
+      return paramsString.call(body);
+    }
+    if(!headers.has('content-type'))headers.set('content-type','text/plain;charset=UTF-8');
+    return typeof body === 'symbol' ? String(symbolDescription.call(body)) : String(body);
+  }
   async function requestBody(body, headers) {
     if (body === null || body === undefined) return undefined;
     if (body instanceof window.Document) {
@@ -180,6 +226,41 @@ export function installXHR(page, window) {
     impl.contentType = parsed.essence; impl._clearBaseURLCache();
     s.document = document;
     return document;
+  }
+  function performSync(xhr,s,op,headers,body) {
+    try {
+      if(s.responseType || s.timeout)throw domError('Synchronous Window XHR cannot use responseType or timeout','InvalidAccessError');
+      const origin=implForWrapper(window.document)?._origin??window.location.origin,credentials=s.withCredentials;
+      const cross=url=>['http:','https:'].includes(new URL(url).protocol)&&new URL(url).origin!==origin;
+      const unsafe=unsafeHeaders(headers),preflight=!SIMPLE_METHODS.has(s.method)||unsafe.length>0||op.uploadListeners;
+      const owner=page.registry?.page??page;
+      const fetch=(url,init)=>page.browser.syncHTTP.fetch(owner,url,{...init,signal:op.controller.signal,frameId:page.frameId,loaderId:page.loaderId});
+      if(cross(s.url)&&preflight){
+        const preflightHeaders=new Headers({origin,'access-control-request-method':s.method});if(unsafe.length)preflightHeaders.set('access-control-request-headers',unsafe.join(', '));
+        const response=fetch(s.url,{method:'OPTIONS',headers:preflightHeaders,credentials:'omit',onRedirect(){throw domError('CORS preflight redirects are unsupported','NetworkError')}});
+        if(response.status<200||response.status>299)throw domError('CORS preflight failed','NetworkError');corsResponse(response,origin,credentials);
+        const methods=(response.headers.get('access-control-allow-methods')??'').split(',').map(value=>value.trim());
+        const names=(response.headers.get('access-control-allow-headers')??'').split(',').map(value=>value.trim().toLowerCase());
+        if((!SIMPLE_METHODS.has(s.method)&&!methods.includes(s.method)&&!(methods.includes('*')&&!credentials))||unsafe.some(name=>!names.includes(name)&&!(names.includes('*')&&!credentials&&name!=='authorization')))throw domError('CORS preflight did not allow request','NetworkError');
+      }
+      const document=implForWrapper(window.document),source=window.location.protocol==='about:'?document._referrer:window.location.href;
+      const referrer=page.referrerFor?.(s.url,source);if(referrer)headers.set('referer',referrer);
+      if(cross(s.url)||!['GET','HEAD'].includes(s.method))headers.set('origin',origin);
+      const response=fetch(s.url,{method:s.method,headers,body,credentials:credentials?'include':'same-origin',credentialsOrigin:origin,onRedirect(response,next,previous,redirectHeaders){
+        if(cross(previous))corsResponse(response,origin,credentials);
+        if(cross(next)&&preflight)throw domError('Redirect requires fresh preflight','NetworkError');
+        if(cross(previous)&&new URL(previous).origin!==new URL(next).origin)throw domError('Redirect requires opaque CORS origin','NetworkError');
+        if(cross(next))redirectHeaders.set('origin',origin);
+      }});
+      if(!same(s,op)||op.done)return;
+      if(cross(response.url))corsResponse(response,origin,credentials);
+      s.status=response.status;s.statusText=response.statusText;s.responseURL=s.url;s.headers=exposedHeaders(response,false,credentials);
+      s.mime=s.overrideMime??mime(response.headers.get('content-type'));s.mimeValue=s.overrideMimeValue??response.headers.get('content-type')??'text/xml';s.bytes=response.bytes;
+      s.text=new TextDecoder('utf-8',{ignoreBOM:true}).decode(response.bytes);
+      cancelOperation(op);s.sending=false;s.readyState=4;emit(xhr,'readystatechange');if(!same(s,op))return;
+      const length=response.headers.get('content-length'),computable=length!==null&&/^\d+$/.test(length),total=computable?Number(length):0;
+      progress(xhr,'load',s.bytes.length,total,computable);if(same(s,op))progress(xhr,'loadend',s.bytes.length,total,computable);
+    }catch(error){cancelOperation(op);s.sending=false;clearResponse(s);s.readyState=4;if(error.name==='InvalidAccessError')throw error;throw domError('A network error occurred','NetworkError')}
   }
   async function perform(xhr, s, op, inputBody) {
     try {
@@ -295,7 +376,7 @@ export function installXHR(page, window) {
       method = String(method);
       if (!TOKEN.test(method)) throw domError('Invalid HTTP method', 'SyntaxError');
       if (['CONNECT', 'TRACE', 'TRACK'].includes(method.toUpperCase())) throw domError('Forbidden HTTP method', 'SecurityError');
-      if (!async) throw domError('Synchronous XMLHttpRequest is unsupported', 'NotSupportedError');
+      if (!async && s.timeout) throw domError('Synchronous Window XHR cannot use timeout', 'InvalidAccessError');
       if (['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'].includes(method.toUpperCase())) method = method.toUpperCase();
       let parsed;
       try { parsed = new URL(String(url), window.document.baseURI); } catch { throw domError('Invalid request URL', 'SyntaxError'); }
@@ -309,7 +390,7 @@ export function installXHR(page, window) {
         parsed.username = ''; parsed.password = '';
       }
       cancelOperation(s.op); s.op = null; s.sending = false;
-      s.method = method; s.url = parsed.href; s.authorization = authorization;
+      s.method = method; s.url = parsed.href; s.authorization = authorization; s.async = Boolean(async);
       s.requestHeaders = new Headers(); clearResponse(s);
       if (s.readyState !== 1) { s.readyState = 1; emit(this, 'readystatechange'); }
     }
@@ -328,11 +409,21 @@ export function installXHR(page, window) {
       const s = state(this);
       if (s.readyState !== 1 || s.sending) throw domError('Request is not OPENED or has already been sent');
       if (!activeDocument()) throw domError('The document has been disposed', 'InvalidStateError');
+      if (s.async === false && (s.responseType || s.timeout)) throw domError('Synchronous Window XHR cannot use responseType or timeout','InvalidAccessError');
+      let syncHeaders, syncBody;
+      if (s.async === false) {
+        syncHeaders = new Headers(s.requestHeaders);
+        if (!syncHeaders.has('accept')) syncHeaders.set('accept','*/*');
+        if (s.authorization && !syncHeaders.has('authorization')) syncHeaders.set('authorization',s.authorization);
+        syncBody = ['GET','HEAD'].includes(s.method) ? undefined : requestBodySync(body,syncHeaders);
+      }
       s.sending = true;
       const op = { xhr: this, state: s, controller: new AbortController(), started: Date.now(), done: false,
         uploadListeners: Object.values(implForWrapper(s.upload)._eventListeners).some(listeners => listeners.length > 0),
         uploadStarted: body !== null && body !== undefined && !['GET', 'HEAD'].includes(s.method), uploadComplete: false };
-      s.op = op; live.add(op); scheduleTimeout(this, s, op);
+      s.op = op; live.add(op);
+      if (!s.async) { queueMicrotask(()=>{if(!op.done){cancelOperation(op);s.sending=false}}); return performSync(this,s,op,syncHeaders,syncBody); }
+      scheduleTimeout(this, s, op);
       progress(this, 'loadstart');
       if (!same(s, op) || op.done) return;
       if (op.uploadStarted) progress(s.upload, 'loadstart');
@@ -377,6 +468,7 @@ export function installXHR(page, window) {
       const s = state(this);
       value = String(value);
       if (!RESPONSE_TYPES.has(value)) return;
+      if (s.async === false) throw domError('Synchronous Window XHR cannot use responseType','InvalidAccessError');
       if ([3, 4].includes(s.readyState)) throw domError('Cannot change responseType after loading starts');
       s.responseType = value;
     }
@@ -407,6 +499,7 @@ export function installXHR(page, window) {
     get timeout() { return state(this).timeout; }
     set timeout(value) {
       const s = state(this);
+      if (s.async === false) throw domError('Synchronous Window XHR cannot use timeout','InvalidAccessError');
       const numeric = Number(value);
       s.timeout = Number.isFinite(numeric) ? Math.trunc(numeric) >>> 0 : 0;
       if (s.sending && s.op) scheduleTimeout(this, s, s.op);

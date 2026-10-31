@@ -1,3 +1,4 @@
+import {registerHeapWrapper} from './heap-registry.js';
 import {computedTransform,computedFontSize} from './computed-values.js';
 import {evaluateMedia} from './media.js';
 import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher, selectorSubjectTypes } from './selectors.js';
@@ -677,6 +678,7 @@ function computedStyle(record, element, pseudo = '') {
     },
     set: readonly, deleteProperty: readonly, defineProperty: readonly,
   });
+  registerHeapWrapper(view,record.window);
   views.set(pseudo,view); return view;
 }
 

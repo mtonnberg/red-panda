@@ -1,0 +1,35 @@
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -618,6 +618,7 @@
+       if (raw.keepalive && body?.byteLength > 65536) throw new window.TypeError('Keepalive request body exceeds 64 KiB');
+       const unsafe = [...headers].filter(([name, value]) => !safeHeader(name, value)).map(([name]) => name).sort();
+       const preflight = !SIMPLE_METHODS.has(raw.method) || unsafe.length > 0;
++      let redirectUnsafe = unsafe;
+       const credentials = raw.credentials === 'include';
+       if (raw.mode === 'cors' && cross(raw.url) && preflight) {
+         const preflightHeaders = new NativeHeaders({ origin, 'access-control-request-method': raw.method });
+@@ -646,7 +647,10 @@
+           if (raw.mode === 'same-origin' && cross(next)) throw new window.TypeError('Cross-origin redirect blocked by same-origin mode');
+           if (raw.mode === 'cors') {
+             if (cross(previous)) cors(response, origin, credentials);
+-            if (cross(next) && preflight) throw new window.TypeError('Redirects requiring another CORS preflight are unsupported');
++            // Cross-origin transport strips authored Authorization before the next
++            // hop. It therefore stops contributing to that hop's preflight.
++            if (new URL(previous).origin !== new URL(next).origin) redirectUnsafe = redirectUnsafe.filter(name => name !== 'authorization');
++            if (cross(next) && (!SIMPLE_METHODS.has(raw.method) || redirectUnsafe.length > 0)) throw new window.TypeError('Redirects requiring another CORS preflight are unsupported');
+             if (cross(previous) && new URL(previous).origin !== new URL(next).origin) throw new window.TypeError('Opaque-origin CORS redirects are unsupported');
+           }
+           if (cross(next)) redirectHeaders?.set('origin', origin);
+--- a/test/http-headers.test.js
++++ b/test/http-headers.test.js
+@@ -16,3 +16,10 @@
+ test('actual asynchronous XMLHttpRequest uses current CDP Cookie and language across origins',async t=>{const{page,w,B}=await fixture(t);page.setExtraHTTPHeaders({Cookie:'cdp=forced','Accept-Language':'extra-language','User-Agent':'ExtraAgent'});for(const credentials of[false,true]){const result=await new Promise((resolve,reject)=>{const x=new w.XMLHttpRequest();x.open('GET',B+'/echo');x.withCredentials=credentials;x.onload=()=>resolve(JSON.parse(x.responseText));x.onerror=()=>reject(new Error('Actual XHR failed'));x.send();});assert.equal(result.headers.cookie,'cdp=forced');assert.equal(result.headers['accept-language'],'extra-language');assert.equal(result.headers['user-agent'],'ExtraAgent');}});
+ 
+ test('actual iframe fetch and real Worker HTTP requests share current live privileged headers',async t=>{const{page,w,A,requests}=await fixture(t);page.setExtraHTTPHeaders({Cookie:'initial=forced','Accept-Language':'initial-language'});const frame=w.document.createElement('iframe');frame.src=A+'/frame';w.document.body.append(frame);await until(()=>frame.contentWindow.location.href===A+'/frame'&&frame.contentDocument.readyState==='complete',{timeout:2500});page.setExtraHTTPHeaders({Cookie:'current=forced','Accept-Language':'current-language'});const childResult=await(await frame.contentWindow.fetch(A+'/echo',{credentials:'omit'})).json();assert.equal(childResult.headers.cookie,'current=forced');assert.equal(childResult.headers['accept-language'],'current-language');const worker=new w.Worker('/worker.js');t.after(()=>worker.terminate());const workerResult=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Owned real worker deadline')),4000);worker.onmessage=e=>{clearTimeout(timer);resolve(e.data)};worker.onerror=e=>{clearTimeout(timer);reject(new Error(e.message))};worker.postMessage({url:A+'/echo',credentials:'omit'});});assert.equal(workerResult.error,undefined);assert.equal(workerResult.headers.cookie,'current=forced');assert.equal(workerResult.headers['accept-language'],'current-language');assert.ok(requests.some(r=>new URL(r.url).pathname==='/worker.js'&&r.headers.cookie==='current=forced'));});
++
++
++test('cross-origin GET redirect strips authored Authorization and completes without an unnecessary preflight',async t=>{const{w,A,B,requests}=await fixture(t);const response=await w.fetch(A+'/redirect?to='+encodeURIComponent(B+'/echo'),{credentials:'include',headers:{Authorization:'Bearer authored'}});assert.equal(response.status,200);const body=await response.json();assert.equal(body.headers.authorization,undefined);assert.deepEqual(requests.slice(-2).map(r=>r.method),['GET','GET']);assert.equal(requests.at(-2).headers.authorization,'Bearer authored');assert.equal(requests.at(-1).headers.authorization,undefined);});
++
++test('stripped authored Authorization stays absent through a later same-origin redirect hop',async t=>{const{w,A,B,requests}=await fixture(t);const second=B+'/redirect?to='+encodeURIComponent(B+'/echo');const response=await w.fetch(A+'/redirect?to='+encodeURIComponent(second),{headers:{Authorization:'Bearer authored'}});assert.equal(response.status,200);const body=await response.json();assert.equal(body.headers.authorization,undefined);assert.deepEqual(requests.slice(-3).map(r=>r.method),['GET','GET','GET']);for(const row of requests.slice(-2))assert.equal(row.headers.authorization,undefined);});
++
++test('remaining authored unsafe headers still reject unsupported redirected preflight before cross-origin delivery',async t=>{const{w,A,B,requests}=await fixture(t);await assert.rejects(w.fetch(A+'/redirect?to='+encodeURIComponent(B+'/echo'),{headers:{Authorization:'Bearer authored','X-Author':'actual'}}),/Redirects requiring another CORS preflight/);assert.equal(requests.at(-1).index,0);assert.equal(requests.at(-1).headers.authorization,'Bearer authored');});

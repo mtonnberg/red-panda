@@ -1,5 +1,5 @@
 module RedPanda.Puppeteer
-  ( Browser, BrowserContext, Page, Frame, Response, PreloadScript, Header, ByteArray
+  ( Browser, BrowserContext, Page, Frame, Response, JSHandle, PreloadScript, Header, ByteArray
   , connect, disconnect, createContext, closeContext, newPage, closePage
   , goto, gotoResponse, responseStatus, responseText
   , withNavigation, goBack, goForward, reload, pageUrl
@@ -9,6 +9,7 @@ module RedPanda.Puppeteer
   , setExtraHTTPHeaders, setUserAgent
   , click, focus, typeText, pressKey, insertText
   , evaluateString, textContent, waitForSelector, dispatchClick, content, cookieNames, setCookie
+  , evaluateHandle, queryObjects, evaluateHandleString, disposeHandle, withHandle
   , Async, fromAsync, quote
   ) where
 
@@ -25,6 +26,7 @@ foreign import data BrowserContext :: Type
 foreign import data Page :: Type
 foreign import data Frame :: Type
 foreign import data Response :: Type
+foreign import data JSHandle :: Type
 foreign import data PendingNavigation :: Type
 foreign import data ByteArray :: Type
 
@@ -75,6 +77,10 @@ foreign import typeTextImpl :: Page -> String -> String -> Async Unit
 foreign import pressKeyImpl :: Page -> String -> Async Unit
 foreign import insertTextImpl :: Page -> String -> Async Unit
 foreign import evaluateStringImpl :: Page -> String -> Async String
+foreign import evaluateHandleImpl :: Page -> String -> Async JSHandle
+foreign import queryObjectsImpl :: Page -> JSHandle -> Async JSHandle
+foreign import evaluateHandleStringImpl :: JSHandle -> String -> Async String
+foreign import disposeHandleImpl :: JSHandle -> Async Unit
 foreign import waitForSelectorImpl :: Page -> String -> Async Unit
 foreign import contentImpl :: Page -> Async String
 foreign import setCookieImpl :: BrowserContext -> String -> String -> String -> Async Unit
@@ -176,6 +182,21 @@ insertText page text = fromAsync $ insertTextImpl page text
 
 evaluateString :: Page -> String -> Aff String
 evaluateString page expression = fromAsync $ evaluateStringImpl page expression
+
+evaluateHandle :: Page -> String -> Aff JSHandle
+evaluateHandle page expression = fromAsync $ evaluateHandleImpl page expression
+
+queryObjects :: Page -> JSHandle -> Aff JSHandle
+queryObjects page prototype = fromAsync $ queryObjectsImpl page prototype
+
+evaluateHandleString :: JSHandle -> String -> Aff String
+evaluateHandleString handle expression = fromAsync $ evaluateHandleStringImpl handle expression
+
+disposeHandle :: JSHandle -> Aff Unit
+disposeHandle handle = fromAsync $ disposeHandleImpl handle
+
+withHandle :: forall a. Aff JSHandle -> (JSHandle -> Aff a) -> Aff a
+withHandle acquire = bracket acquire disposeHandle
 
 textContent :: Page -> String -> Aff String
 textContent page selector = evaluateString page $

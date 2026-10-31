@@ -1,3 +1,4 @@
+import { registerNativeBlobFactory } from '../src/native-platform-factories.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Blob as NativeBlob,File as NativeFile} from 'node:buffer';
@@ -51,12 +52,12 @@ test('real workers clone actual Node/DOM File and Blob values in both directions
 });
 
 test('native Blob/File hydration preserves ordered delivery and suppresses disposed targets without authored markers',async t=>{
- const{page,window,bridge}=await fixture(t),native=new NativeFile(['host-native'],'native.txt',{lastModified:444,type:'text/plain'});
+ const{page,window,bridge}=await fixture(t),native=registerNativeBlobFactory(new NativeFile(['host-native'],'native.txt',{lastModified:444,type:'text/plain'}),{kind:'File'});
  const encode=data=>{const prepared=bridge.prepare(data);const envelope=structuredClone(prepared.message,{transfer:prepared.transfer});prepared.commit();return envelope};
  const received=[],target=new window.EventTarget();
  const first=bridge.deliver(target,encode({file:native,again:native}),data=>received.push(data));bridge.deliver(target,encode('after'),data=>received.push(data));await first;await delay(0);
  assert.equal(received.length,2);assert.ok(received[0].data.file instanceof window.File);assert.equal(received[0].data.file,received[0].data.again);assert.equal(received[0].data.file.name,'native.txt');assert.equal(await received[0].data.file.text(),'host-native');assert.equal(received[1].data,'after');
- const pending=bridge.deliver(new window.EventTarget(),encode(new NativeBlob(['cancelled'])),()=>received.push('should not dispatch'));queueMicrotask(()=>page.documentAbort.abort());await pending;assert.equal(received.length,2);
+ const pending=bridge.deliver(new window.EventTarget(),encode(registerNativeBlobFactory(new NativeBlob(['cancelled']))),()=>received.push('should not dispatch'));queueMicrotask(()=>page.documentAbort.abort());await pending;assert.equal(received.length,2);
 });
 
 test('native BC reservation fixes recipient snapshots/FIFO while a real parent-port clone outlives sender close',async t=>{
@@ -67,7 +68,7 @@ test('native BC reservation fixes recipient snapshots/FIFO while a real parent-p
  const sender=new sourceRealm.BroadcastChannel('reserved'),early=new window.BroadcastChannel('reserved'),closed=new window.BroadcastChannel('reserved'),events=[];let lateEvents=0,closedEvents=0;
  const received=new Promise(resolve=>{early.onmessage=async event=>{events.push(event.data.kind);if(event.data.kind==='file')assert.equal(await event.data.file.text(),'reserved bytes');if(events.length===2)resolve()}});
  closed.onmessage=()=>closedEvents++;
- sender.postMessage({kind:'file',file:new NativeFile(['reserved bytes'],'reserved.txt')});sender.postMessage({kind:'after'});sender.close();
+ sender.postMessage({kind:'file',file:registerNativeBlobFactory(new NativeFile(['reserved bytes'],'reserved.txt'),{kind:'File'})});sender.postMessage({kind:'after'});sender.close();
  const controller=installBroadcast(page,window);
  for(let i=0;i<100&&(messages.length<2||controller.pending<2);i++)await delay(2);
  assert.equal(messages.length,2);assert.equal(events.length,0);assert.ok(controller.pending>=2);
@@ -96,6 +97,6 @@ test('platform clone errors remain atomic, native SAB rejects and authored graph
  const{page,window,bridge}=await fixture(t);
  const value=page.evaluate(`(()=>{const carrier=new MessageChannel(),inner=new MessageChannel(),buffer=new ArrayBuffer(2),file=new File(['real'],'real.txt');let error;try{carrier.port1.postMessage({file,fn(){}},[inner.port2,buffer])}catch(e){error=e.name}const plain=structuredClone({kind:'File',name:'authored',lastModified:1,blob:{kind:'Blob'},bytes:[1,2]});let retry;try{carrier.port1.postMessage({port:inner.port2},[inner.port2]);retry=true}catch{retry=false}return{error,bufferBytes:buffer.byteLength,retry,plain:!(plain instanceof File)&&plain.kind==='File'&&!(plain.blob instanceof Blob)}})()`);
  assert.deepEqual(result(value),{error:'DataCloneError',bufferBytes:2,retry:true,plain:true});
- assert.throws(()=>bridge.clone(new NativeBlob(['async host backing in synchronous DOM clone'])),{name:'DataCloneError'});
+ assert.throws(()=>bridge.clone(registerNativeBlobFactory(new NativeBlob(['async host backing in synchronous DOM clone']))),{name:'DataCloneError'});
  assert.throws(()=>window.structuredClone(new SharedArrayBuffer(1)),{name:'DataCloneError'});
 });

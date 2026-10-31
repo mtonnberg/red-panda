@@ -1,11 +1,15 @@
+import { createGeometryBridge, registerGeometryRealm } from './geometry-platform.js';
+const installedGeometry = new WeakMap();
 // Keep this factory self-contained: its source also runs inside worker VM realms.
 // CSS transforms support numeric matrices, absolute lengths, angles and the
 // elementary transform functions below. Relative lengths, percentages and calc()
 // reject with SyntaxError instead of returning an invented matrix. Geometry
 // classes use real 4x4 math; descriptor/WebIDL edge cases are not exhaustive.
-function geometryFactory(g) {
-  const installation = Symbol.for('red-panda.geometry');
-  if (g[installation]) return g[installation];
+function geometryFactory(g, platform) {
+  const BaseWeakMap=g.WeakMap??globalThis.WeakMap,apply=(g.Reflect??globalThis.Reflect).apply,weakGet=BaseWeakMap.prototype.get,weakSet=BaseWeakMap.prototype.set,weakHas=BaseWeakMap.prototype.has,weakDelete=BaseWeakMap.prototype.delete;
+  class WeakMap extends BaseWeakMap { get(key){return apply(weakGet,this,[key]);} set(key,value){return apply(weakSet,this,[key,value]);} has(key){return apply(weakHas,this,[key]);} delete(key){return apply(weakDelete,this,[key]);} }
+  const mutablePoint = {}, mutableRect = {}, mutableMatrix = {};
+  const publish = (value, kind, read) => platform?.register(value, kind, read);
   const points = new WeakMap(), matrices = new WeakMap(), quads = new WeakMap(), rects = new WeakMap();
   const pointLinks = new WeakMap(), matrixLinks = new WeakMap();
   const number = value => +value;
@@ -16,7 +20,8 @@ function geometryFactory(g) {
   };
   const component = (value, key, fallback) => { const member = value[key]; return member === undefined ? fallback : number(member); };
   const brand = (map, object) => { if (!map.has(object)) throw new TypeError('Invalid geometry receiver'); return map.get(object); };
-  const error = (name, message) => typeof g.DOMException === 'function' ? new g.DOMException(message, name) : Object.assign(new Error(message), { name });
+  const Exception=g.DOMException,RealmError=g.Error;
+  const error = (name, message) => typeof Exception === 'function' ? new Exception(message, name) : Object.assign(new RealmError(message), { name });
   const identity = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   const names = Array.from({ length: 16 }, (_, i) => `m${Math.floor(i / 4) + 1}${i % 4 + 1}`);
   const aliases = { a: 0, b: 1, c: 4, d: 5, e: 12, f: 13 };
@@ -47,12 +52,13 @@ function geometryFactory(g) {
   };
 
   class DOMPointReadOnly {
-    constructor(x = 0, y = 0, z = 0, w = 1) { points.set(this, [number(x), number(y), number(z), number(w)]); }
+    constructor(x = 0, y = 0, z = 0, w = 1) { points.set(this, [number(x), number(y), number(z), number(w)]); if (arguments[4] !== mutablePoint) publish(this, 'DOMPointReadOnly', () => { const values=points.get(this); return [values[0],values[1],values[2],values[3]]; }); }
     static fromPoint(point = {}) { return new DOMPointReadOnly(...pointValues(point)); }
     matrixTransform(matrix = {}) { return DOMMatrixReadOnly.fromMatrix(matrix).transformPoint(this); }
     toJSON() { const [x, y, z, w] = brand(points, this); return { x, y, z, w }; }
   }
   class DOMPoint extends DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) { super(x,y,z,w,mutablePoint); publish(this, 'DOMPoint', () => { const values=points.get(this); return [values[0],values[1],values[2],values[3]]; }); }
     static fromPoint(point = {}) { return new DOMPoint(...pointValues(point)); }
   }
   for (const [index, key] of ['x', 'y', 'z', 'w'].entries()) {
@@ -62,7 +68,7 @@ function geometryFactory(g) {
   }
 
   class DOMRectReadOnlyFallback {
-    constructor(x = 0, y = 0, width = 0, height = 0) { rects.set(this, [number(x), number(y), number(width), number(height)]); }
+    constructor(x = 0, y = 0, width = 0, height = 0) { rects.set(this, [number(x), number(y), number(width), number(height)]); if (arguments[4] !== mutableRect) publish(this, 'DOMRectReadOnly', () => { const values=rects.get(this);return [values[0],values[1],values[2],values[3]]; }); }
     static fromRect(rect = {}) { rect = dictionary(rect); return new DOMRectReadOnlyFallback(...['x', 'y', 'width', 'height'].map(key => component(rect, key, 0))); }
     get top() { brand(rects, this); return Math.min(this.y, this.y + this.height); }
     get right() { brand(rects, this); return Math.max(this.x, this.x + this.width); }
@@ -71,6 +77,7 @@ function geometryFactory(g) {
     toJSON() { brand(rects, this); return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; }
   }
   class DOMRectFallback extends DOMRectReadOnlyFallback {
+    constructor(x = 0, y = 0, width = 0, height = 0) { super(x,y,width,height,mutableRect); publish(this, 'DOMRect', () => { const values=rects.get(this);return [values[0],values[1],values[2],values[3]]; }); }
     static fromRect(rect = {}) { rect = dictionary(rect); return new DOMRectFallback(...['x', 'y', 'width', 'height'].map(key => component(rect, key, 0))); }
   }
   Object.defineProperty(DOMRectReadOnlyFallback, 'name', { value: 'DOMRectReadOnly' });
@@ -100,15 +107,15 @@ function geometryFactory(g) {
 
   class DOMMatrixReadOnly {
     constructor(init) {
-      if (init === undefined) { matrices.set(this, { values: identity(), is2D: true }); return; }
+      if (init === undefined) { matrices.set(this, { values: identity(), is2D: true }); if(arguments[1]!==mutableMatrix)publish(this,'DOMMatrixReadOnly'); return; }
       if (typeof init !== 'string' && init != null && typeof init[Symbol.iterator] === 'function') {
         const sequence = Array.from(init, number);
         if (![6, 16].includes(sequence.length)) throw new TypeError('A matrix sequence must contain 6 or 16 numbers');
         const values = sequence.length === 16 ? sequence : identity();
         if (sequence.length === 6) for (const [i, index] of [0, 1, 4, 5, 12, 13].entries()) values[index] = sequence[i];
-        matrices.set(this, { values, is2D: sequence.length === 6 }); return;
+        matrices.set(this, { values, is2D: sequence.length === 6 }); if(arguments[1]!==mutableMatrix)publish(this,'DOMMatrixReadOnly'); return;
       }
-      matrices.set(this, parseTransform('' + init));
+      matrices.set(this, parseTransform('' + init)); if(arguments[1]!==mutableMatrix)publish(this,'DOMMatrixReadOnly');
     }
     static fromMatrix(other = {}) { const result = new DOMMatrixReadOnly(); matrices.set(result, matrixValues(other)); return result; }
     static fromFloat32Array(array) { return floatMatrix(DOMMatrixReadOnly, array, 'Float32Array'); }
@@ -150,6 +157,7 @@ function geometryFactory(g) {
     return new Constructor(array);
   }
   class DOMMatrix extends DOMMatrixReadOnly {
+    constructor(init) { super(init,mutableMatrix); publish(this,'DOMMatrix'); }
     static fromMatrix(other = {}) { const result = new DOMMatrix(); matrices.set(result, matrixValues(other)); return result; }
     static fromFloat32Array(array) { return floatMatrix(DOMMatrix, array, 'Float32Array'); }
     static fromFloat64Array(array) { return floatMatrix(DOMMatrix, array, 'Float64Array'); }
@@ -266,7 +274,7 @@ function geometryFactory(g) {
   Object.assign(g, { DOMPointReadOnly, DOMPoint, DOMQuad, DOMMatrixReadOnly, DOMMatrix });
 
   const originalClone = g.structuredClone;
-  if (typeof originalClone === 'function') {
+  if (typeof originalClone === 'function' && !platform?.nativeClone) {
     g.structuredClone = function structuredCloneGeometry(value, options) {
       const markers = new Map(), seen = new Map();
       const put = (object, key, value) => Object.defineProperty(object, key, { value, enumerable: true, writable: true, configurable: true });
@@ -278,17 +286,19 @@ function geometryFactory(g) {
         if (input === null || typeof input !== 'object') return input;
         if (seen.has(input)) return seen.get(input);
         let type, data;
-        if (points.has(input)) { type = input instanceof DOMPoint ? 'point' : 'point-ro'; data = [...points.get(input)]; }
-        else if (matrices.has(input)) { type = input instanceof DOMMatrix ? 'matrix' : 'matrix-ro'; data = { values: [...matrices.get(input).values], is2D: input.is2D }; }
+        const registered = platform?.serialize(input);
+        if (registered) { if (registered.interface === 'DOMMatrix' || registered.interface === 'DOMMatrixReadOnly') throw error('DataCloneError','The object can not be cloned'); type='platform-geometry';data=registered; }
+        else if (points.has(input)) { type = input instanceof DOMPoint ? 'point' : 'point-ro'; data = [...points.get(input)]; }
+        else if (matrices.has(input)) { throw error('DataCloneError','The object can not be cloned'); }
         else if (quads.has(input)) { type = 'quad'; data = input.toJSON(); }
-        else if (input instanceof g.DOMRectReadOnly) { type = input instanceof g.DOMRect ? 'rect' : 'rect-ro'; data = [input.x, input.y, input.width, input.height]; }
+        else if (!platform && input instanceof g.DOMRectReadOnly) { type = input instanceof g.DOMRect ? 'rect' : 'rect-ro'; data = [input.x, input.y, input.width, input.height]; }
         if (type) { const record = {}; seen.set(input, record); markers.set(record, { type, data }); return record; }
-        let result;
+        let result; const inputKind=platform?.classify(input);
         if (Array.isArray(input)) { result = new Array(input.length); seen.set(input, result); for (const key of Object.keys(input)) put(result, key, encode(input[key])); }
-        else if (Object.prototype.toString.call(input) === '[object Map]') { result = new Map(); seen.set(input, result); for (const [key, value] of input) result.set(encode(key), encode(value)); }
-        else if (Object.prototype.toString.call(input) === '[object Set]') { result = new Set(); seen.set(input, result); for (const value of input) result.add(encode(value)); }
-        else if (Object.prototype.toString.call(input) === '[object Error]') { result = copyError(input); seen.set(input, result); if (Object.hasOwn(input, 'cause')) Object.defineProperty(result, 'cause', { value: encode(input.cause), writable: true, configurable: true }); }
-        else if (Object.prototype.toString.call(input) === '[object Object]') { result = {}; seen.set(input, result); for (const key of Object.keys(input)) Object.defineProperty(result, key, { value: encode(input[key]), enumerable: true, configurable: true, writable: true }); }
+        else if (inputKind ? inputKind==='Map' : Object.prototype.toString.call(input) === '[object Map]') { result = new Map(); seen.set(input, result); for (const [key, value] of input) result.set(encode(key), encode(value)); }
+        else if (inputKind ? inputKind==='Set' : Object.prototype.toString.call(input) === '[object Set]') { result = new Set(); seen.set(input, result); for (const value of input) result.add(encode(value)); }
+        else if (inputKind ? inputKind==='Error' : Object.prototype.toString.call(input) === '[object Error]') { result = copyError(input); seen.set(input, result); if (Object.hasOwn(input, 'cause')) Object.defineProperty(result, 'cause', { value: encode(input.cause), writable: true, configurable: true }); }
+        else if (inputKind ? inputKind==='Object' : Object.prototype.toString.call(input) === '[object Object]') { result = {}; seen.set(input, result); for (const key of Object.keys(input)) Object.defineProperty(result, key, { value: encode(input[key]), enumerable: true, configurable: true, writable: true }); }
         else return input;
         return result;
       }
@@ -301,13 +311,14 @@ function geometryFactory(g) {
         let result;
         if (marker) {
           const { type, data } = marker;
-          if (type === 'point' || type === 'point-ro') result = new (type === 'point' ? DOMPoint : DOMPointReadOnly)(...data);
+          if (type === 'platform-geometry') result = platform.deserialize(data);
+          else if (type === 'point' || type === 'point-ro') result = new (type === 'point' ? DOMPoint : DOMPointReadOnly)(...data);
           else if (type === 'rect' || type === 'rect-ro') result = new (type === 'rect' ? g.DOMRect : g.DOMRectReadOnly)(...data);
           else if (type === 'quad') result = DOMQuad.fromQuad(data);
           else { result = type === 'matrix' ? new DOMMatrix() : new DOMMatrixReadOnly(); matrices.set(result, { values: Array.from(data.values), is2D: data.is2D }); }
         } else if (Array.isArray(input)) { result = new Array(input.length); copies.set(input, result); for (const key of Object.keys(input)) put(result, key, decode(input[key])); }
         else {
-          const tag = Object.prototype.toString.call(input);
+          const kind=platform?.classify(input),tag=kind?`[object ${kind}]`:Object.prototype.toString.call(input);
           if (tag === '[object Map]') { result = new Map(); copies.set(input, result); for (const [key, value] of input) result.set(decode(key), decode(value)); }
           else if (tag === '[object Set]') { result = new Set(); copies.set(input, result); for (const value of input) result.add(decode(value)); }
           else if (tag === '[object ArrayBuffer]') { result = new ArrayBuffer(input.byteLength); new Uint8Array(result).set(new Uint8Array(input)); }
@@ -349,14 +360,16 @@ function geometryFactory(g) {
     isMutablePoint(object) { return points.has(object) && object instanceof DOMPoint; },
     bindMatrix(object, link) { brand(matrices, object); if (!(object instanceof DOMMatrix)) throw new TypeError('invalid argument'); matrixLinks.set(object, link); },
   };
-  Object.defineProperty(g, installation, { value: controller }); return controller;
+  return controller;
 }
 
 export const GEOMETRY_SOURCE = `(${geometryFactory.toString()})(globalThis)`;
 
 export function installGeometry(realm) {
   if (typeof realm?.eval !== 'function') throw new TypeError('Geometry installation requires a realm eval function; workers can evaluate GEOMETRY_SOURCE in their VM context');
-  return realm.eval(GEOMETRY_SOURCE);
+  if (installedGeometry.has(realm)) return installedGeometry.get(realm);
+  const controller = realm.eval(`(${geometryFactory.toString()})`)(realm, createGeometryBridge(realm));
+  registerGeometryRealm(realm, controller); installedGeometry.set(realm, controller); return controller;
 }
 
 // A host-private kernel reuses the independent 4x4 implementation without

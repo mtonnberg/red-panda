@@ -1,0 +1,43 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {serve} from '../src/cdp.js';
+import {queryHeapObjects} from '../src/heap-query.js';
+import {registerPlatformFactory} from '../src/platform-factories.js';
+import {connect} from './cdp-client.js';
+async function fixture(body){const service=await serve({port:0,loadResources:['iframe']}),client=await connect(`ws://127.0.0.1:${service.port}/`);try{const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId,{timeout:15000});await send('Runtime.enable');await send('Page.enable');await send('Page.navigate',{url:'data:text/html,<form id=f><input name=x></form><button id=b>button</button><iframe id=child srcdoc="<title>child</title>"></iframe>'});const page=service.browser.pages.get(targetId);const world=async(name,frameId=page.frameId)=>(await send('Page.createIsolatedWorld',{frameId,worldName:name})).executionContextId;const evaluate=(expression,contextId,options={})=>send('Runtime.evaluate',{expression,contextId,...options});const query=async(expression,contextId,group)=>{const prototype=await evaluate(expression,contextId,{objectGroup:'prototypes'});const result=await send('Runtime.queryObjects',{prototypeObjectId:prototype.result.objectId,objectGroup:group});return {prototype:prototype.result.objectId,array:result.objects.objectId}};const call=(objectId,functionDeclaration,options={})=>send('Runtime.callFunctionOn',{objectId,functionDeclaration,returnByValue:true,...options});await body({service,page,send,world,evaluate,query,call})}finally{await client.close();await service.close()}}
+
+test('heap results preserve actual main, utility and frame identity, Array realm, and object groups',async()=>fixture(async({page,send,world,evaluate,query,call})=>{
+ const child=page.frames.findElement(page.dom.window.document.getElementById('child'));assert.ok(child);const contexts=[page.executionContextId,await world('heap-a'),await world('heap-b'),await world('heap-child',child.frameId)];
+ for(const id of contexts){await evaluate('globalThis.P={};globalThis.item=Object.create(P)',id);const result=await query('P',id,'matches');const actual=await call(result.array,'function(){this[0].changed=41;return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===Array.prototype,changed:item.changed}}');assert.deepEqual(actual.result.value,{length:1,same:true,realm:true,changed:41});const derived=await call(result.array,'function(){return this[0]}',{returnByValue:false});await send('Runtime.releaseObjectGroup',{objectGroup:'matches'});await assert.rejects(send('Runtime.getProperties',{objectId:result.array}),e=>e.code===-32000);await assert.rejects(send('Runtime.getProperties',{objectId:derived.result.objectId}),e=>e.code===-32000);assert.ok((await send('Runtime.queryObjects',{prototypeObjectId:result.prototype})).objects.objectId)}
+}));
+
+test('real utility public form/collection wrappers and foreign authored payloads keep their identities',async()=>fixture(async({send,world,evaluate,query,call})=>{
+ const id=await world('heap-dom');await evaluate('globalThis.mainForm=document.getElementById("f");mainForm.marker="main"');await evaluate('globalThis.form=document.getElementById("f");globalThis.controls=form.elements;form.marker="utility";document.addEventListener("heap-payload",event=>{globalThis.foreign=event.detail})',id);await evaluate('document.dispatchEvent(new CustomEvent("heap-payload",{detail:mainForm}))');
+ for(const [expression,expected]of [['HTMLFormElement.prototype','form'],['HTMLFormControlsCollection.prototype','controls'],['Object.prototype','form']]){const q=await query(expression,id);const result=await call(q.array,`function(){return {same:this.includes(${expected}),realm:Object.getPrototypeOf(this)===Array.prototype}}`);assert.deepEqual(result.result.value,{same:true,realm:true})}
+ const foreign=await query('Object.getPrototypeOf(foreign)',id),actual=await call(foreign.array,'function(){return {foreign:this.includes(foreign),own:this.includes(form),marker:foreign.marker,ownMarker:form.marker,equal:foreign===form}}');assert.deepEqual(actual.result.value,{foreign:false,own:false,marker:'main',ownMarker:'utility',equal:false});
+ await evaluate('globalThis.fake=Object.create(Object.getPrototypeOf(foreign));globalThis.fakeChild=Object.create(fake);globalThis.getterHits=0;for(const key of Object.getOwnPropertySymbols(form))Object.defineProperty(fake,key,{get(){getterHits++;throw Error("authored")}})',id);const fake=await query('Object.getPrototypeOf(foreign)',id),matches=await call(fake.array,'function(){return {fake:this.includes(fake),child:this.includes(fakeChild),hits:getterHits}}');assert.deepEqual(matches.result.value,{fake:true,child:true,hits:0});
+}));
+
+test('selected Array construction bypasses authored global constructor, inherited setters and getters',async()=>fixture(async({world,evaluate,query,call})=>{
+ const id=await world('heap-side-effects');await evaluate('globalThis.P={};globalThis.item=Object.create(P);globalThis.savedArray=Array;globalThis.hits=0;Object.defineProperty(Array.prototype,"0",{configurable:true,set(){hits++;throw Error("index")}});Object.defineProperty(Array.prototype,"constructor",{configurable:true,get(){hits++;throw Error("constructor")}});Object.defineProperty(Array.prototype,Symbol.toStringTag,{configurable:true,get(){hits++;throw Error("tag")}});globalThis.Array=new Proxy(function(){},{construct(){hits++;throw Error("global constructor")}})',id);const q=await query('P',id),actual=await call(q.array,'function(){return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===savedArray.prototype,hits}}');assert.deepEqual(actual.result.value,{length:1,same:true,realm:true,hits:0});
+}));
+
+test('resource limits fail explicitly without a partial Array and allow subsequent real queries',async()=>fixture(async({page,evaluate})=>{
+ await evaluate('globalThis.P={};globalThis.one=Object.create(P);globalThis.middle=Object.create(P);globalThis.two=Object.create(middle)');const p=page.dom.window.P,c=page.dom.getInternalVMContext();
+ for(const options of [{maxRawResults:1},{maxPublicResults:1},{maxVisited:1},{maxPrototypeDepth:1},{timeoutMs:1}])assert.throws(()=>queryHeapObjects(p,c,options),/ERR_HEAP_QUERY/);
+ let getter=0;const bad={get timeoutMs(){getter++;return 10000}};assert.throws(()=>queryHeapObjects(p,c,bad),/ERR_HEAP_QUERY_ARGUMENT/);assert.equal(getter,0);assert.equal(queryHeapObjects(p,c).objects.length,3);
+}));
+
+test('retained old utility contexts do not become authority after navigation and current lexical inspection still progresses',async()=>fixture(async({page,send,world,evaluate,query,call})=>{
+ const retained=[];for(let cycle=0;cycle<3;cycle++){
+  const id=await world('heap-lifetime');page.dom.window.document.addEventListener('retain-heap',event=>{retained.push(event.detail)},{once:true});await evaluate('let heapLexical=1;globalThis.P={};globalThis.item=Object.create(P);document.dispatchEvent(new CustomEvent("retain-heap",{detail:{global:window,P,item}}))',id);const q=await query('P',id);assert.equal((await call(q.array,'function(){return this.length===1&&this[0]===item}')).result.value,true);assert.ok((await send('Runtime.globalLexicalScopeNames',{executionContextId:id})).names.includes('heapLexical'));await send('Page.navigate',{url:'data:text/html,<title>successor-'+cycle+'</title>'});await assert.rejects(send('Runtime.queryObjects',{prototypeObjectId:q.prototype}),e=>e.code===-32000);
+ }assert.equal(retained.length,3);
+}));
+
+test('a trusted factory origin is a Host bridge fallback and cannot override actual registered object creation',async()=>fixture(async({page,world,evaluate,query,call})=>{
+ const id=await world('heap-actual-owner');let actual;page.dom.window.document.addEventListener('actual-owner',event=>{actual=event.detail},{once:true});await evaluate('globalThis.P={};globalThis.item=Object.create(P);document.dispatchEvent(new CustomEvent("actual-owner",{detail:item}))',id);
+ // A real host producer returns an existing foreign ScriptValue. Its own
+ // document is not authority to change that value's genuine VM identity.
+ const produce=()=>actual;const value=produce();registerPlatformFactory(value,{kind:'OwnedForeignFactoryResult',globalObject:page.dom.window});
+ const result=await query('P',id);assert.deepEqual((await call(result.array,'function(){return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===Array.prototype}}')).result.value,{length:1,same:true,realm:true});
+}));

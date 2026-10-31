@@ -10,7 +10,7 @@ export function utilityLayoutFor(page,value) {
   if(!identity||identity.nodeType!==1)throw new TypeError('Illegal invocation');
   const document=identity.ownerDocument;
   const registry=page.registry??page.frames;
-  const owner=[...(registry?.frames.values()??[page])].find(candidate=>candidate.dom.window.document===document)??page;
+  const owner=registry?.findDocument?.(document)??[...(registry?.frames.values()??[page])].find(candidate=>candidate.dom.window.document===document)??page;
   return {node,document,layout:owner.layout};
 }
 function geometryFactory(g,bridge) {

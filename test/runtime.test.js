@@ -145,7 +145,7 @@ test('compiled scripts and native inspector state are invalidated across navigat
 
 test('unsupported execution interruption/formatting and invalid parameters return explicit errors', async () => fixture(async ({ page, session }) => {
   assert.equal(supportsRuntime('Runtime.compileScript'), true); assert.equal(supportsRuntime('Runtime.evaluate'), false);
-  for (const method of ['Runtime.terminateExecution', 'Runtime.queryObjects', 'Runtime.setCustomObjectFormatterEnabled', 'Runtime.discardConsoleEntries']) {
+  for (const method of ['Runtime.terminateExecution', 'Runtime.setCustomObjectFormatterEnabled', 'Runtime.discardConsoleEntries']) {
     await assert.rejects(runRuntime(session, method), error => error.code === -32601);
   }
   await assert.rejects(runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: page.executionContextId + 1000 }), /Cannot find context/);
@@ -191,7 +191,7 @@ test('promise and exception handles infer their actual owning frame and preserve
   assert.equal(details.exceptionDetails.executionContextId, first.executionContextId); assert.match(details.exceptionDetails.text, /frame rejection/);
 }));
 
-test('frame destruction cancels pending Runtime work and leaves compiled parent/sibling scripts intact', async () => frameFixture(async ({ page, session, first, second, firstElement }) => {
+test('frame retirement retains real Runtime work until owning-page destruction and leaves siblings intact', async () => frameFixture(async ({ page, session, first, second, firstElement }) => {
   const compile = (target, expression) => runRuntime(session, 'Runtime.compileScript', {
     expression, sourceURL: 'pending-frame.js', persistScript: true, executionContextId: target.executionContextId,
   });
@@ -201,10 +201,13 @@ test('frame destruction cancels pending Runtime work and leaves compiled parent/
   const waitingScript = assert.rejects(runRuntime(session, 'Runtime.runScript', { scriptId: pendingScript.scriptId, awaitPromise: true }), /context was destroyed/);
   const waitingPromise = assert.rejects(runRuntime(session, 'Runtime.awaitPromise', { promiseObjectId: pendingPromise.objectId }), /context was destroyed/);
   const before = session.objects.size;
-  firstElement.remove(); await Promise.all([waitingScript, waitingPromise]);
-  assert.equal(session.objects.size, before); assert.throws(() => session.object(pendingPromise.objectId), /Cannot find context/);
+  firstElement.remove();assert.equal(first.retired,true);assert.equal(first.documentAbort.signal.aborted,false);
+  assert.equal(session.object(pendingPromise.objectId) instanceof first.dom.window.Promise,true);
+  assert.equal(first.evaluate("document.defaultView"),null);
+  const settled=await Promise.race([Promise.all([waitingScript,waitingPromise]).then(()=>true),new Promise(resolve=>setImmediate(()=>resolve(false)))]);assert.equal(settled,false);
   assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: parent.scriptId, returnByValue: true })).result.value, 42);
   assert.equal((await runRuntime(session, 'Runtime.runScript', { scriptId: sibling.scriptId, returnByValue: true })).result.value, 73);
+  page.documentAbort.abort();await Promise.all([waitingScript,waitingPromise]);assert.equal(session.objects.size,before);assert.throws(()=>session.object(pendingPromise.objectId),/Cannot find context/);
 }));
 
 test('native inspector names and stack-depth settings are scoped to actual iframe VM contexts', async () => frameFixture(async ({ page, session, first, second }) => {

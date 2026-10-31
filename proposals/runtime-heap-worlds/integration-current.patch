@@ -1,0 +1,636 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installHeapFactories,prepareHeapRealm} from './heap-registry.js';
+ import {prepareUtilityPlatform} from './utility-platform.js';
+ import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
+ import {createInvocationTrampoline} from './invocation.js';
+@@ -56,6 +57,7 @@
+ 
+ // Name root and frame VM contexts before any Window is constructed.
+ installVMContextNames();
++installHeapFactories();
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ let defaultCollectionsBinding;
+@@ -256,6 +258,7 @@
+       });
+     });
+     prepareUtilityPlatform(window);
++    prepareHeapRealm(this,window);
+     (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
+     for (const { source,worldName } of this.newDocumentScripts.values()) {
+       if(worldName)continue;
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import {installHeapUtilityFactories} from './heap-worlds.js';
+ import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
+ import {canonicalUtilityValue} from './isolated-world.js';
+ import http from 'node:http';
+@@ -487,6 +488,7 @@
+   }
+ }
+ 
++installHeapUtilityFactories();
+ class Connection {
+   constructor(socket, browser, directPage) {
+     this.socket = socket;
+--- a/src/collections.js
++++ b/src/collections.js
+@@ -1,3 +1,4 @@
++import {registerHeapWrapper} from './heap-registry.js';
+ import { createRequire } from 'node:module';
+ import { createHash } from 'node:crypto';
+ import { readFileSync } from 'node:fs';
+@@ -115,7 +116,7 @@
+       indices: () => Array.from({ length: state.elements.length }, (_, index) => index),
+       call: arguments_ => arguments_.length ? item(state, arguments_[0]) : null,
+     }, prototype);
+-    states.set(result, state); return result;
++    states.set(result, state); return registerHeapWrapper(result,window);
+   }
+   Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get() { return collection(this); } });
+   Object.defineProperty(window, 'HTMLAllCollection', { configurable: true, writable: true, value: HTMLAllCollection });
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -1,3 +1,4 @@
++import {registerHeapWrapper} from './heap-registry.js';
+ import { randomBytes } from 'node:crypto';
+ import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable, onReadableSettled, noteReadableOperation } from './request-stream-state.js';
+ import { createRequire } from 'node:module';
+@@ -263,11 +264,11 @@
+   }
+   function wrapHeaders(raw, guard) {
+     const result = Object.create(Headers.prototype);
+-    headersState.set(result, { raw, guard }); return result;
++    headersState.set(result, { raw, guard }); return registerHeapWrapper(result,window);
+   }
+   class Headers {
+     constructor(init) {
+-      try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); }
++      try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); registerHeapWrapper(this,window); }
+       catch (error) { throw headerError(error); }
+     }
+     append(name, value) { if (arguments.length < 2) throw new window.TypeError('append requires two arguments'); this._change('append', name, value); }
+@@ -374,7 +375,7 @@
+     for (const name of [...raw.headers.keys()]) raw.headers.delete(name);
+     for (const [name, value] of headers) raw.headers.set(name, value);
+     requestState.set(request, { raw, publicSignal: signal, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
+-    return request;
++    return registerHeapWrapper(request,window);
+   }
+   class Request {
+     constructor(input, init = {}) {
+@@ -411,7 +412,7 @@
+         const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes, publicSignal);
+         const state = requestState.get(wrapped);
+         if (streamBody) { state.streamBody = streamBody; state.streamUsed = false; if (streamBody === sourceState?.streamBody && sourceState.streamBytes) { state.streamBytes = sourceState.streamBytes; state.streamVersion = sourceState.streamVersion; } }
+-        requestState.set(this, state);
++        requestState.set(this, state); registerHeapWrapper(this,window);
+       } catch (error) { throw realmError(error); }
+     }
+     clone() {
+@@ -435,7 +436,7 @@
+     const response = Object.create(Response.prototype);
+     const { bufferedBytes, ...metadata } = view;
+     responseState.set(response, { raw, ...metadata, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
+-    return response;
++    return registerHeapWrapper(response,window);
+   }
+   function abortableBody(raw, signal) {
+     if (!raw.body) return raw;
+@@ -510,7 +511,7 @@
+         const prepared = bufferedInput(body);
+         const streamBody = isReadableSource(prepared.value) ? prepared.value : undefined;
+         const raw = new NativeResponse(streamBody ? new Uint8Array() : prepared.value, { status, statusText, headers: getHeaders(headers).raw });
+-        responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') });
++        responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') }); registerHeapWrapper(this,window);
+       } catch (error) { throw realmError(error); }
+     }
+     static error() { return wrapResponse(NativeResponse.error()); }
+--- a/src/form-controls.js
++++ b/src/form-controls.js
+@@ -1,3 +1,4 @@
++import {registerHeapFactoryValue} from './heap-registry.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -16,7 +17,7 @@
+ // Named descriptors are writable and nonenumerable; assigning one creates an
+ // ordinary nonenumerable shadow, and deleting that shadow restores the lookup.
+ // Prototype members take precedence over controls with the same name.
+-function wrap(raw, implementation, collection) {
++function wrap(raw, implementation, collection, globalObject, replace) {
+   const value = key => {
+     if (typeof key !== 'string' || Reflect.has(raw, key)) return absent;
+     let result;
+@@ -54,6 +55,7 @@
+     ownKeys: target => Reflect.ownKeys(target),
+     preventExtensions: () => false,
+   });
++  registerHeapFactoryValue(wrapper,{implementation,globalObject,replace});
+   implementation[utils.wrapperSymbol] = wrapper;
+   return wrapper;
+ }
+@@ -67,7 +69,7 @@
+       const original = setup.call(this, raw, globalObject, ...args);
+       const implementation = utils.implForWrapper(original);
+       const document = collection ? utils.implForWrapper(globalObject.document) : implementation._ownerDocument;
+-      return active(document) ? wrap(raw, implementation, collection) : original;
++      return active(document) ? wrap(raw, implementation, collection, globalObject, original) : original;
+     };
+   }
+   const createForm = FormIDL.new;
+@@ -78,7 +80,7 @@
+     FormIDL._internalSetup(raw, globalObject);
+     const implementation = Object.create(FormImpl.prototype);
+     Object.defineProperty(raw, utils.implSymbol, { value: implementation, configurable: true });
+-    wrap(raw, implementation, false);
++    wrap(raw, implementation, false, globalObject);
+     return implementation;
+   };
+   for (const name of ['Button', 'FieldSet', 'Input', 'Object', 'Output', 'Select', 'TextArea']) {
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,4 @@
++import {registerHeapWrapper} from './heap-registry.js';
+ import{installElementScroll}from './element-scroll.js';
+ import {resolveFlowLength,nativeTextHeight} from './flow-metrics.js';
+ import {createHorizontalLayout} from './horizontal-layout.js';
+@@ -299,6 +300,7 @@
+         return typeof value === 'function' ? value.bind(target) : value;
+       },
+     });
++    registerHeapWrapper(view,window,original);
+     computedViews.set(original,view); return view;
+   };
+   page.layout = layout;
+--- a/src/runtime.js
++++ b/src/runtime.js
+@@ -1,3 +1,4 @@
++import {runHeapQuery} from './heap-query.js';
+ import {invocationBindingFor} from './invocation.js';
+ import { Session as InspectorSession } from 'node:inspector';
+ import { randomUUID } from 'node:crypto';
+@@ -7,7 +8,7 @@
+ import { withTimeout } from './browser.js';
+ 
+ const methods = new Set([
+-  'Runtime.awaitPromise', 'Runtime.compileScript', 'Runtime.runScript',
++  'Runtime.queryObjects', 'Runtime.awaitPromise', 'Runtime.compileScript', 'Runtime.runScript',
+   'Runtime.globalLexicalScopeNames', 'Runtime.getHeapUsage', 'Runtime.getIsolateId',
+   'Runtime.getExceptionDetails', 'Runtime.setMaxCallStackSizeToCapture',
+ ]);
+@@ -142,6 +143,7 @@
+ export function supportsRuntime(method) { return methods.has(method); }
+ 
+ export async function runRuntime(session, method, params = {}) {
++  if(method==='Runtime.queryObjects')return runHeapQuery(session,params);
+   if (!supportsRuntime(method)) throw new RuntimeError(`Unsupported Runtime method: ${method}`, -32601);
+   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new RuntimeError('Parameters must be an object');
+   prune(session);
+--- a/src/streams.js
++++ b/src/streams.js
+@@ -1,3 +1,4 @@
++import {registerHeapWrapper} from './heap-registry.js';
+ import { createReadableState, bindReadable, bindTransformPair, bindReadableController, failReadable, noteReadableOperation } from './request-stream-state.js';
+ import * as web from 'node:stream/web';
+ import { TextEncoder, TextDecoder } from 'node:util';
+@@ -68,6 +69,7 @@
+   const finalization = new FinalizationRegistry(reference => references.delete(reference));
+   function tag(value, name) {
+     owned.set(value, name);
++    registerHeapWrapper(value,realm);
+     const reference = new WeakRef(value);
+     references.add(reference);
+     finalization.register(value, reference, reference);
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,3 +1,4 @@
++import {registerHeapWrapper} from './heap-registry.js';
+ import {computedTransform,computedFontSize} from './computed-values.js';
+ import {evaluateMedia} from './media.js';
+ import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher, selectorSubjectTypes } from './selectors.js';
+@@ -677,6 +678,7 @@
+     },
+     set: readonly, deleteProperty: readonly, defineProperty: readonly,
+   });
++  registerHeapWrapper(view,record.window);
+   views.set(pseudo,view); return view;
+ }
+ 
+--- a/native/build.mjs
++++ b/native/build.mjs
+@@ -1,5 +1,6 @@
++import {buildHeap} from './build-heap.mjs';
+ import { buildCollections } from './build-collections.mjs';
+ import { buildRuntime } from './build-runtime.mjs';
+ 
+-const [collections, runtime] = await Promise.all([buildCollections(), buildRuntime()]);
+-process.stdout.write(JSON.stringify({ collections, runtime }) + '\n');
++const [collections, runtime, heap] = await Promise.all([buildCollections(), buildRuntime(), buildHeap()]);
++process.stdout.write(JSON.stringify({ collections, runtime, heap }) + '\n');
+--- a/test/runtime.test.js
++++ b/test/runtime.test.js
+@@ -145,7 +145,7 @@
+ 
+ test('unsupported execution interruption/formatting and invalid parameters return explicit errors', async () => fixture(async ({ page, session }) => {
+   assert.equal(supportsRuntime('Runtime.compileScript'), true); assert.equal(supportsRuntime('Runtime.evaluate'), false);
+-  for (const method of ['Runtime.terminateExecution', 'Runtime.queryObjects', 'Runtime.setCustomObjectFormatterEnabled', 'Runtime.discardConsoleEntries']) {
++  for (const method of ['Runtime.terminateExecution', 'Runtime.setCustomObjectFormatterEnabled', 'Runtime.discardConsoleEntries']) {
+     await assert.rejects(runRuntime(session, method), error => error.code === -32601);
+   }
+   await assert.rejects(runRuntime(session, 'Runtime.globalLexicalScopeNames', { executionContextId: page.executionContextId + 1000 }), /Cannot find context/);
+--- /dev/null
++++ b/native/build-heap.mjs
+@@ -0,0 +1,23 @@
++import {spawn} from 'node:child_process';
++import {readFile,mkdir,rename,rm,writeFile,realpath} from 'node:fs/promises';
++import {createHash} from 'node:crypto';
++import {fileURLToPath} from 'node:url';
++import path from 'node:path';
++const source=fileURLToPath(new URL('./heap-query.cc',import.meta.url));
++export const defaultHeapPath=fileURLToPath(new URL(`./build/${process.platform}-${process.arch}/node-${process.versions.node}/heap-query.node`,import.meta.url));
++const hash=value=>createHash('sha256').update(value).digest('hex');
++function macro(text,name){const value=text.match(new RegExp('^#define\\s+'+name+'\\s+(\\d+)','m'))?.[1];if(value===undefined)throw Error('Missing SDK macro '+name);return value}
++async function sdk(explicit){
++ const executable=await realpath(process.execPath),candidates=[explicit,path.resolve(path.dirname(executable),'../include/node'),path.resolve(path.dirname(executable),`../node_modules/node-${process.platform}-${process.arch}/include/node`),`/workspace/shared/node-headers/${process.version}/node-${process.version}/include/node`,'/usr/include/node'].filter(Boolean);
++ for(const include of candidates){try{const node=await readFile(path.join(include,'node_version.h'),'utf8'),v8=await readFile(path.join(include,'v8-version.h'),'utf8');const version=['MAJOR','MINOR','PATCH'].map(part=>macro(node,'NODE_'+part+'_VERSION')).join('.'),v8Base=['MAJOR_VERSION','MINOR_VERSION','BUILD_NUMBER','PATCH_LEVEL'].map(part=>macro(v8,'V8_'+part)).join('.');if('v'+version!==process.version||macro(node,'NODE_MODULE_VERSION')!==process.versions.modules||v8Base!==process.versions.v8.split('-')[0])throw Error('Exact Node/V8/ABI SDK mismatch');return {include,node,v8}}catch(error){if(include===explicit)throw error}}
++ throw Error('Exact Node/V8 SDK is required; set RED_PANDA_NODE_HEADERS');
++}
++function execute(command,args,timeout=120000){return new Promise((resolve,reject)=>{const child=spawn(command,args,{stdio:['ignore','pipe','pipe']});let stdout='',stderr='',expired=false;const timer=setTimeout(()=>{expired=true;child.kill('SIGKILL')},timeout);const collect=(existing,data)=>existing.length<100000?existing+data:existing;child.stdout.on('data',data=>{stdout=collect(stdout,data)});child.stderr.on('data',data=>{stderr=collect(stderr,data)});child.once('error',error=>{clearTimeout(timer);reject(error)});child.once('close',code=>{clearTimeout(timer);if(expired)reject(Error('Heap compiler deadline exceeded'));else if(code!==0)reject(Error('Heap compiler failed: '+stderr));else resolve(stdout)})})}
++export async function buildHeap({headers=process.env.RED_PANDA_NODE_HEADERS,output=defaultHeapPath}={}){
++ if(process.platform!=='linux')throw Error('The independent heap addon currently has a Linux build recipe');
++ const header=await sdk(headers),compiler=process.env.CXX??'g++',compilerVersion=(await execute(compiler,['--version'],10000)).split('\n')[0];
++ output=path.resolve(output);await mkdir(path.dirname(output),{recursive:true});const temporary=output+'.'+process.pid+'.tmp';
++ const compilerArgs=['-std=c++20','-O2','-fno-strict-aliasing','-fPIC','-shared','-Wall','-Wextra','-Wno-unused-parameter','-Wno-cast-function-type','-DNODE_GYP_MODULE_NAME=red_panda_heap_query','-I'+header.include,source,'-o',temporary];
++ try{await execute(compiler,compilerArgs);const manifest={kind:'red-panda-heap-query',backend:'public-v8-query-objects',apiVersion:1,node:process.version,v8:process.versions.v8,abi:process.versions.modules,platform:process.platform,architecture:process.arch,sourceSHA256:hash(await readFile(source)),binarySHA256:hash(await readFile(temporary)),headers:{'node_version.h':hash(header.node),'v8-version.h':hash(header.v8)},compiler:compilerVersion,compilerArgs};await rename(temporary,output);await writeFile(output+'.json',JSON.stringify(manifest,null,2)+'\n');return {output,manifest}}finally{await rm(temporary,{force:true})}
++}
++if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){const args=process.argv.slice(2),option=name=>{const i=args.indexOf(name);return i<0?undefined:args[i+1]};process.stdout.write(JSON.stringify(await buildHeap({headers:option('--headers'),output:option('--output')}))+'\n')}
+--- /dev/null
++++ b/native/heap-query.cc
+@@ -0,0 +1,99 @@
++#include <node.h>
++#include <v8-profiler.h>
++#include <v8-version.h>
++#include <chrono>
++#include <cmath>
++#include <vector>
++#define HP_STR_INNER(x) #x
++#define HP_STR(x) HP_STR_INNER(x)
++#define HP_V8_BASE HP_STR(V8_MAJOR_VERSION) "." HP_STR(V8_MINOR_VERSION) "." HP_STR(V8_BUILD_NUMBER) "." HP_STR(V8_PATCH_LEVEL)
++namespace independent_heap_query {
++using namespace v8;
++void Throw(Isolate* isolate, const char* code) {
++  auto context=isolate->GetCurrentContext();
++  auto message=String::NewFromUtf8(isolate,code).ToLocalChecked();
++  auto error=Exception::Error(message).As<Object>();
++  error->CreateDataProperty(context,String::NewFromUtf8Literal(isolate,"code"),message).Check();
++  isolate->ThrowException(error);
++}
++bool Limit(Local<Value> value, double maximum, uint64_t* output) {
++  if(!value->IsNumber())return false;
++  double number=value.As<Number>()->Value();
++  if(!std::isfinite(number)||number<1||number>maximum||std::floor(number)!=number)return false;
++  *output=static_cast<uint64_t>(number);return true;
++}
++struct Predicate final:QueryObjectPredicate {
++  Isolate* isolate;Local<Object> prototype,anchor;uint64_t maxRaw,maxVisited,maxDepth,visited=0,matched=0;
++  const char* failure=nullptr;std::chrono::steady_clock::time_point deadline;
++  Predicate(Isolate*i,Local<Object>p,Local<Object>a,uint64_t raw,uint64_t visit,uint64_t depth,uint64_t time)
++   :isolate(i),prototype(p),anchor(a),maxRaw(raw),maxVisited(visit),maxDepth(depth),deadline(std::chrono::steady_clock::now()+std::chrono::milliseconds(time)){}
++  bool Filter(Local<Object> object)override {
++    HandleScope scope(isolate);if(failure)return false;
++    if(++visited>maxVisited){failure="ERR_HEAP_QUERY_VISIT_LIMIT";return false;}
++    if(object->StrictEquals(prototype)||object->StrictEquals(anchor))return false;
++    Local<Value> current=object;
++    for(uint64_t depth=0;depth<maxDepth;depth++){
++      if((depth&31)==0&&std::chrono::steady_clock::now()>deadline){failure="ERR_HEAP_QUERY_TIMEOUT";return false;}
++      if(!current->IsObject()||current->IsProxy())return false;
++      current=current.As<Object>()->GetPrototypeV2();
++      if(current.IsEmpty()){failure="ERR_HEAP_QUERY_PROTOTYPE";return false;}
++      if(current->StrictEquals(prototype)){
++        if(++matched>maxRaw){failure="ERR_HEAP_QUERY_RESULT_LIMIT";return false;}return true;
++      }
++      if(current->IsNull())return false;
++    }
++    failure="ERR_HEAP_QUERY_DEPTH_LIMIT";return false;
++  }
++};
++void Query(const FunctionCallbackInfo<Value>&info){
++  auto isolate=info.GetIsolate();auto host=isolate->GetCurrentContext();
++  if(info.Length()!=6||!info[0]->IsObject()||!info[1]->IsArray()||info[1]->IsProxy()){Throw(isolate,"ERR_HEAP_QUERY_ARGUMENT");return;}
++  uint64_t raw,visit,depth,time;
++  if(!Limit(info[2],500000,&raw)||!Limit(info[3],5000000,&visit)||!Limit(info[4],16384,&depth)||!Limit(info[5],60000,&time)){Throw(isolate,"ERR_HEAP_QUERY_ARGUMENT");return;}
++  Local<Context> context;if(!info[1].As<Object>()->GetCreationContext().ToLocal(&context)){Throw(isolate,"ERR_HEAP_QUERY_CONTEXT");return;}
++  auto started=std::chrono::steady_clock::now();Predicate predicate(isolate,info[0].As<Object>(),info[1].As<Object>(),raw,visit,depth,time);
++  std::vector<Global<Object>> objects;isolate->GetHeapProfiler()->QueryObjects(context,&predicate,&objects);
++  if(predicate.failure){for(auto&object:objects) { object.Reset(); }
++  objects.clear();Throw(isolate,predicate.failure);return;}
++  Local<Array> result;
++  {Context::Scope selected(context);result=Array::New(isolate,static_cast<int>(objects.size()));
++   for(uint32_t index=0;index<objects.size();index++){
++     if(std::chrono::steady_clock::now()>predicate.deadline){for(auto&object:objects) { object.Reset(); }
++  objects.clear();Throw(isolate,"ERR_HEAP_QUERY_TIMEOUT");return;}
++     if(!result->CreateDataProperty(context,index,objects[index].Get(isolate)).FromMaybe(false)){for(auto&object:objects) { object.Reset(); }
++  objects.clear();return;}
++   }}
++  for(auto&object:objects) { object.Reset(); }
++  objects.clear();
++  auto metadata=Object::New(isolate);metadata->CreateDataProperty(host,String::NewFromUtf8Literal(isolate,"objects"),result).Check();
++  metadata->CreateDataProperty(host,String::NewFromUtf8Literal(isolate,"visited"),Number::New(isolate,predicate.visited)).Check();
++  metadata->CreateDataProperty(host,String::NewFromUtf8Literal(isolate,"rawMatches"),Number::New(isolate,predicate.matched)).Check();
++  metadata->CreateDataProperty(host,String::NewFromUtf8Literal(isolate,"milliseconds"),Number::New(isolate,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count())).Check();
++  info.GetReturnValue().Set(metadata);
++}
++void Targets(const FunctionCallbackInfo<Value>&info){
++ auto isolate=info.GetIsolate();auto context=isolate->GetCurrentContext();auto array=Array::New(isolate);Local<Value> current=info[0];uint32_t index=0;
++ while(current->IsProxy()){
++  if(index==32){Throw(isolate,"ERR_HEAP_QUERY_PROXY_DEPTH");return;}
++  auto proxy=current.As<Proxy>();if(proxy->IsRevoked()){Throw(isolate,"ERR_HEAP_QUERY_REVOKED_FACTORY_PROXY");return;}
++  current=proxy->GetTarget();if(!array->CreateDataProperty(context,index++,current).FromMaybe(false))return;
++ }info.GetReturnValue().Set(array);
++}
++void SameRealm(const FunctionCallbackInfo<Value>&info){
++ if(info.Length()!=2||!info[0]->IsObject()||!info[1]->IsObject()){info.GetReturnValue().Set(false);return;}
++ Local<Context>a,b;bool same=info[0].As<Object>()->GetCreationContext().ToLocal(&a)&&info[1].As<Object>()->GetCreationContext().ToLocal(&b)&&a==b;info.GetReturnValue().Set(same);
++}
++void CreationGlobal(const FunctionCallbackInfo<Value>&info){
++ if(info.Length()!=1||!info[0]->IsObject()){info.GetReturnValue().SetNull();return;}
++ Local<Context> context;if(!info[0].As<Object>()->GetCreationContext().ToLocal(&context)){info.GetReturnValue().SetNull();return;}
++ info.GetReturnValue().Set(context->Global());
++}
++NODE_MODULE_INIT(){
++ auto isolate=Isolate::GetCurrent();NODE_SET_METHOD(exports,"queryObjects",Query);NODE_SET_METHOD(exports,"proxyTargets",Targets);NODE_SET_METHOD(exports,"sameRealm",SameRealm);NODE_SET_METHOD(exports,"creationGlobal",CreationGlobal);
++ exports->CreateDataProperty(context,String::NewFromUtf8Literal(isolate,"headersVersion"),String::NewFromUtf8Literal(isolate,NODE_VERSION)).Check();
++ exports->CreateDataProperty(context,String::NewFromUtf8Literal(isolate,"abiVersion"),Integer::New(isolate,NODE_MODULE_VERSION)).Check();
++ exports->CreateDataProperty(context,String::NewFromUtf8Literal(isolate,"apiVersion"),Integer::New(isolate,1)).Check();
++ exports->CreateDataProperty(context,String::NewFromUtf8Literal(isolate,"v8HeaderBase"),String::NewFromUtf8Literal(isolate,HP_V8_BASE)).Check();
++ exports->CreateDataProperty(context,String::NewFromUtf8Literal(isolate,"backend"),String::NewFromUtf8Literal(isolate,"public-v8-query-objects")).Check();
++}
++}
+--- /dev/null
++++ b/src/heap-query.js
+@@ -0,0 +1,27 @@
++import vm from 'node:vm';
++import { nameForVMContext,isOwnedVMContextName } from './context-names.js';
++import { getHeapBinding } from './native-heap.js';
++import { authorizeHeapRealm,authorizeHeapPrototype,canonicalizeHeapResult,assertHeapFactoryObservations } from './heap-registry.js';
++const defaults={maxRawResults:100000,maxPublicResults:100000,maxVisited:2000000,maxPrototypeDepth:4096,timeoutMs:10000};
++export function queryHeapObjects(prototype,context,options={},expectedContextId){
++ assertHeapFactoryObservations();
++ const name=nameForVMContext(context);if(!name||!isOwnedVMContextName(name))throw Error('ERR_HEAP_QUERY_UNOWNED_CONTEXT');
++ const limits={...defaults},hard={maxRawResults:500000,maxPublicResults:500000,maxVisited:5000000,maxPrototypeDepth:16384,timeoutMs:60000};
++ for(const key of Reflect.ownKeys(options)){const descriptor=Object.getOwnPropertyDescriptor(options,key);if(typeof key!=='string'||!Object.hasOwn(defaults,key)||!descriptor||!('value'in descriptor))throw Error('ERR_HEAP_QUERY_ARGUMENT');limits[key]=descriptor.value}
++ for(const [key,value]of Object.entries(limits))if(!Number.isSafeInteger(value)||value<1||value>hard[key])throw Error('ERR_HEAP_QUERY_ARGUMENT: '+key);
++ const anchor=vm.runInContext('[]',context),binding=getHeapBinding();if(!authorizeHeapRealm(anchor,expectedContextId))throw Error('ERR_HEAP_QUERY_UNSUPPORTED_REALM');if(!authorizeHeapPrototype(prototype,anchor))throw Error('ERR_HEAP_QUERY_UNOWNED_PROTOTYPE');
++ const deadline=performance.now()+limits.timeoutMs;
++ const raw=binding.queryObjects(prototype,anchor,limits.maxRawResults,limits.maxVisited,limits.maxPrototypeDepth,limits.timeoutMs);
++ return canonicalizeHeapResult(raw,{maxPublicResults:limits.maxPublicResults,deadline,selectedAnchor:anchor});
++}
++export function runHeapQuery(session,params){
++ if(!params||typeof params.prototypeObjectId!=='string'||(params.objectGroup!==undefined&&typeof params.objectGroup!=='string'))throw Object.assign(Error('Invalid parameters'),{code:-32602});
++ const entry=session.objects.get(params.prototypeObjectId);if(!entry)throw Object.assign(Error('Invalid remote object id'),{code:-32000});
++ const page=session.executionPage(entry.contextId);
++ if(entry.contextId!==page.executionContextId)throw Object.assign(Error('Runtime.queryObjects requires an actual VM realm; isolated-world aliases are unsupported'),{code:-32601});
++ let result;
++ try { result=queryHeapObjects(entry.value,page.dom.getInternalVMContext(),session.heapQueryLimits,entry.contextId); }
++ catch(error){const code=Object.getOwnPropertyDescriptor(error,'code')?.value;throw Object.assign(Error(error.message),{code:-32000,data:{kind:typeof code==='string'?code:'ERR_HEAP_QUERY_BACKEND'}})}
++ if(page.closed||entry.contextId!==page.executionContextId)throw Object.assign(Error('Execution context was destroyed'),{code:-32000});
++ return {objects:session.remote(result.objects,false,params.objectGroup,entry.contextId)};
++}
+--- /dev/null
++++ b/src/heap-registry.js
+@@ -0,0 +1,101 @@
++import {subscribePlatformFactories} from './platform-factories.js';
++import {installPlatformFactoryHooks} from './platform-factory-hooks.js';
++import { createRequire } from 'node:module';
++import vm from 'node:vm';
++import { getHeapBinding } from './native-heap.js';
++const require=createRequire(import.meta.url),canonical=new WeakMap(),factoryGlobals=new WeakMap(),knownGlobals=new WeakSet(),publicValues=new WeakSet(),prototypeOwners=new WeakMap(),globals=new WeakMap(),windows=new WeakMap(),privateValues=new WeakSet(),privatePrototypes=new WeakSet(),implementationValues=new WeakSet();
++const own=Object.getOwnPropertyDescriptor,keys=Reflect.ownKeys,define=Reflect.defineProperty,isProxy=require('node:util').types.isProxy;
++const hostIntrinsics=new WeakSet();
++for(const key of Reflect.ownKeys(globalThis)){const descriptor=own(globalThis,key);if(descriptor&&'value'in descriptor&&typeof descriptor.value==='function'){const prototype=own(descriptor.value,'prototype');if(prototype&&'value'in prototype&&object(prototype.value))hostIntrinsics.add(prototype.value)}}
++let installed=false,registrations=0,factoryObservationFailed=false;
++export function noteHeapFactoryFailure(){factoryObservationFailed=true}
++export function assertHeapFactoryObservations(){if(factoryObservationFailed)throw Object.assign(Error('Heap factory provenance is incomplete'),{code:'ERR_HEAP_QUERY_FACTORY_OBSERVATION'})}
++function object(value){return value!==null&&value!==undefined&&(typeof value==='object'||typeof value==='function'||typeof value==='undefined')}
++export function registerHeapWrapper(value,globalObject,replace){
++ if(!object(value))return value;
++ const binding=getHeapBinding(),targets=binding.proxyTargets(value);
++ for(const target of targets){const previous=canonical.get(target);if(previous!==undefined&&previous!==value&&previous!==replace)throw Error('Heap wrapper identity conflict');canonical.set(target,value)}
++ if(object(globalObject))factoryGlobals.set(value,new WeakRef(globalObject));
++ publicValues.add(value);privateValues.delete(value);for(const target of targets)privateValues.delete(target);registrations++;return value;
++}
++export function publishHeapObject(value){if(object(value)){publicValues.add(value);privateValues.delete(value)}return value}
++export function privateHeapObject(value){if(object(value))privateValues.add(value);return value}
++function privateImplementation(value){if(!object(value)||implementationValues.has(value))return;implementationValues.add(value);privateValues.add(value);if(isProxy(value))return;for(let prototype=Object.getPrototypeOf(value);prototype!==null;prototype=Object.getPrototypeOf(prototype)){if(isProxy(prototype))break;privatePrototypes.add(prototype)}}
++export function registerHeapFactoryValue(value,{implementation,globalObject,replace}={}){if(implementation!==undefined)privateImplementation(implementation);return registerHeapWrapper(value,globalObject,replace)}
++export function installHeapFactories(){
++ if(installed)return;installed=true;
++ subscribePlatformFactories((value,record)=>{
++  try{registerHeapFactoryValue(value,{implementation:record.implementation,globalObject:record.globalRef?.deref()});}
++  catch{noteHeapFactoryFailure();}
++ });
++ installPlatformFactoryHooks();
++ // Tag only real parser-owned allocations. Public stylesheet factories publish
++ // their final graph separately; the hidden jsdom UA sheet stays private.
++ const cssom=require('rrweb-cssom'),parseCSS=cssom.parse;
++ cssom.parse=function(...args){
++  const result=Reflect.apply(parseCSS,this,args),seen=new WeakSet();
++  function visit(value){if(!object(value)||seen.has(value))return;seen.add(value);privateHeapObject(value);
++   for(const key of ['style','cssRules','media']){const descriptor=own(value,key);if(!descriptor||!('value'in descriptor))continue;const child=descriptor.value;if(!object(child))continue;privateHeapObject(child);if(key==='cssRules'&&Array.isArray(child))for(const rule of child)visit(rule)}
++  }
++  visit(result);return result;
++ };
++
++}
++function markPrototype(prototype,owner){
++ if(!object(prototype))return;publicValues.add(prototype);let entries=prototypeOwners.get(prototype);if(!entries){entries=new Set();prototypeOwners.set(prototype,entries)}entries.add(new WeakRef(owner));
++ for(const key of keys(prototype)){const descriptor=own(prototype,key);if(!descriptor)continue;for(const value of [descriptor.value,descriptor.get,descriptor.set])if(typeof value==='function')publicValues.add(value)}
++}
++export function prepareHeapRealm(page,window){
++ const intrinsic=own(window,'Object')?.value;
++ const global=getHeapBinding().creationGlobal(intrinsic);if(global===null)throw Error('Actual heap realm is unavailable');
++ const owner={page:new WeakRef(page),window:new WeakRef(window),global:new WeakRef(global),id:page.executionContextId};knownGlobals.add(global);globals.set(global,owner);windows.set(window,owner);const rawGlobal=own(window,'_globalObject');if(rawGlobal&&'value'in rawGlobal&&object(rawGlobal.value))windows.set(rawGlobal.value,owner);publicValues.add(window);publicValues.add(window.document);
++ for(const key of keys(window)){if(typeof key!=='string'||key.startsWith('_'))continue;const descriptor=own(window,key);if(!descriptor||!('value'in descriptor)||typeof descriptor.value!=='function')continue;const constructor=descriptor.value;publicValues.add(constructor);const targets=getHeapBinding().proxyTargets(constructor),actual=targets.length?targets[targets.length-1]:constructor;const prototype=own(actual,'prototype');if(prototype&&'value'in prototype)markPrototype(prototype.value,owner)}
++}
++export function registerHeapRealmAuthority({context,contextId,isActive}){
++ if(!vm.isContext(context)||!Number.isSafeInteger(contextId)||typeof isActive!=='function')throw Error('ERR_HEAP_QUERY_REALM_ARGUMENT');
++ const anchor=vm.runInContext('[]',context),global=getHeapBinding().creationGlobal(anchor),previous=globals.get(global);
++ if(previous&&active(previous)&&previous.id!==contextId)throw Error('ERR_HEAP_QUERY_REALM_ALIAS');
++ const owner={id:contextId,global:new WeakRef(global),guard:isActive};knownGlobals.add(global);globals.set(global,owner);
++ return {dispose(){if(globals.get(global)===owner)globals.delete(global)}};
++}
++function active(owner){if(owner?.guard)return owner.guard()===true;const page=owner?.page.deref(),window=owner?.window.deref();return !!page&&!page.closed&&page.executionContextId===owner.id&&page.dom?.window===window&&!!window?.document}
++export function authorizeHeapRealm(anchor,expectedContextId){const owner=globals.get(getHeapBinding().creationGlobal(anchor));return !!owner&&active(owner)&&(expectedContextId===undefined||owner.id===expectedContextId)}
++export function authorizeHeapPrototype(prototype,anchor){
++ if(privateValues.has(prototype)||(canonical.has(prototype)&&canonical.get(prototype)!==prototype))return false;
++ const binding=getHeapBinding();if(binding.sameRealm(prototype,anchor))return true;
++
++ if(hostIntrinsics.has(prototype))return false;
++ if(publicValues.has(prototype))return true;
++ if(privatePrototypes.has(prototype))return false;
++ const owners=prototypeOwners.get(prototype);if(owners&&[...owners].some(reference=>active(reference.deref())))return true;
++ // GetCreationContext can follow a foreign prototype map, so it cannot reject
++ // an ordinary page-authored Object.create(DOMPrototype) value. Known private
++ // implementation prototypes are denied by exact factory-owned identity.
++ return true;
++}
++export function canonicalizeHeapResult(raw,{maxPublicResults=100000,deadline=Infinity,selectedAnchor}={}){
++ const binding=getHeapBinding(),selectedGlobal=selectedAnchor?binding.creationGlobal(selectedAnchor):undefined;
++ const array=raw.objects,length=own(array,'length').value,seen=new Set();let count=0,filtered=0;
++ for(let index=0;index<length;index++){
++  if(performance.now()>deadline)throw Object.assign(Error('ERR_HEAP_QUERY_TIMEOUT'),{code:'ERR_HEAP_QUERY_TIMEOUT'});
++  const value=own(array,String(index)).value,registered=canonical.has(value),publicValue=registered?canonical.get(value):value;
++  // The native oracle partitions genuine matches by their V8 creation context,
++  // including foreign-prototype allocations whose map follows another realm.
++  // Unknown host bridge contexts are not guessed from authored properties.
++  const creationGlobal=binding.creationGlobal(value);
++  if(selectedGlobal&&knownGlobals.has(creationGlobal)&&creationGlobal!==selectedGlobal){filtered++;continue}
++  // Resolve only the exact global captured by a successful trusted factory.
++  // Never discover ownership from properties of a heap candidate or its impl.
++  const factoryGlobal=factoryGlobals.get(publicValue)?.deref();
++  if(selectedGlobal&&!knownGlobals.has(creationGlobal)&&factoryGlobal){const owner=windows.get(factoryGlobal),actual=owner?owner.global.deref():binding.creationGlobal(factoryGlobal);if(owner&&!actual||knownGlobals.has(actual)&&actual!==selectedGlobal){filtered++;continue}}
++  // Only exact objects tagged private by their real host factory are omitted.
++  // Creation-context inference would drop legitimate foreign-prototype objects.
++  if(privateValues.has(publicValue)||(!registered&&privateValues.has(value))){filtered++;continue}
++  if(seen.has(publicValue))continue;
++  if(count===maxPublicResults)throw Object.assign(Error('ERR_HEAP_QUERY_PUBLIC_RESULT_LIMIT'),{code:'ERR_HEAP_QUERY_PUBLIC_RESULT_LIMIT'});
++  seen.add(publicValue);if(!define(array,String(count++),{value:publicValue,enumerable:true,writable:true,configurable:true}))throw Error('Heap result could not be finalized');
++ }
++ if(!define(array,'length',{value:count}))throw Error('Heap result length could not be finalized');
++ return {...raw,objects:array,publicMatches:count,filtered};
++}
++export function heapRegistryStatistics(){return {registrations}}
+--- /dev/null
++++ b/src/heap-worlds.js
+@@ -0,0 +1,10 @@
++import {configureUtilityFactories} from './world-sessions.js';
++import {registerHeapRealmAuthority,registerHeapFactoryValue} from './heap-registry.js';
++let installed=false;
++export function installHeapUtilityFactories(){
++ if(installed)return;installed=true;
++ configureUtilityFactories({
++  onRealm(global,context,metadata){const authority=registerHeapRealmAuthority({context,contextId:metadata.contextId,isActive:metadata.isActive});return ()=>authority.dispose();},
++  onWrapper(value,global,metadata){registerHeapFactoryValue(value,{implementation:metadata.impl,globalObject:global});}
++ });
++}
+--- /dev/null
++++ b/src/native-heap.js
+@@ -0,0 +1,19 @@
++import { createRequire } from 'node:module';
++import { readFileSync } from 'node:fs';
++import { createHash } from 'node:crypto';
++import { fileURLToPath } from 'node:url';
++const require=createRequire(import.meta.url),loaded=new Map();
++const digest=file=>createHash('sha256').update(readFileSync(file)).digest('hex');
++export function loadHeapBinding(filename=fileURLToPath(new URL(`../native/build/${process.platform}-${process.arch}/node-${process.versions.node}/heap-query.node`,import.meta.url))){
++ const manifest=JSON.parse(readFileSync(filename+'.json','utf8'));
++ for(const [key,value]of Object.entries({node:process.version,abi:process.versions.modules,v8:process.versions.v8,platform:process.platform,architecture:process.arch,apiVersion:1,kind:"red-panda-heap-query",backend:"public-v8-query-objects"}))if(manifest[key]!==value)throw Error('Heap binding runtime mismatch: '+key);
++ const source=fileURLToPath(new URL('../native/heap-query.cc',import.meta.url));
++ if(manifest.sourceSHA256!==digest(source)||manifest.binarySHA256!==digest(filename))throw Error('Heap binding source/binary digest mismatch');
++ if(loaded.has(filename)){if(loaded.get(filename).digest!==manifest.binarySHA256)throw Error('Loaded heap binding changed; restart required');return loaded.get(filename).binding}
++ const binding=require(filename);
++ if(binding.headersVersion!==process.version||String(binding.abiVersion)!==process.versions.modules||binding.apiVersion!==1||binding.backend!=="public-v8-query-objects"||binding.v8HeaderBase!==process.versions.v8.split("-")[0])throw Error('Compiled heap binding header/API mismatch');
++ loaded.set(filename,{binding,digest:manifest.binarySHA256});return binding;
++}
++
++let defaultBinding;
++export function getHeapBinding(){return defaultBinding??=loadHeapBinding()}
+--- /dev/null
++++ b/src/platform-factory-hooks.js
+@@ -0,0 +1,30 @@
++import 'jsdom';
++import { createRequire } from 'node:module';
++import { readdirSync } from 'node:fs';
++import path from 'node:path';
++import { registerPlatformFactory } from './platform-factories.js';
++const require = createRequire(import.meta.url);
++let installed = false;
++// Only successful trusted generated setup/new returns register an identity.
++// Candidate classification never discovers brands from implementation symbols.
++export function installPlatformFactoryHooks() {
++  if (installed) return; installed = true;
++  const directory = path.dirname(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'));
++  const modules = readdirSync(directory).filter(name => name.endsWith('.js') && name !== 'utils.js').map(name => ({ filename:path.join(directory,name), kind:path.basename(name,'.js'), utils:require('jsdom/lib/jsdom/living/generated/utils.js') }));
++  for (const kind of ['URL','URLSearchParams']) modules.push({ filename:require.resolve(`whatwg-url/lib/${kind}.js`), kind, utils:require('whatwg-url/lib/utils.js') });
++  for (const { filename, kind, utils } of modules) {
++    const factory = require(filename), setup = factory.setup, allocate = factory.new;
++    if (typeof setup === 'function') factory.setup = function (wrapper, globalObject, ...args) {
++      const value = setup.call(this, wrapper, globalObject, ...args);
++      const descriptor = Object.getOwnPropertyDescriptor(wrapper, utils.implSymbol);
++      registerPlatformFactory(value, { kind, implementation:descriptor?.value, globalObject });
++      return value;
++    };
++    if (typeof allocate === 'function') factory.new = function (globalObject, ...args) {
++      const implementation = allocate.call(this, globalObject, ...args);
++      const descriptor = Object.getOwnPropertyDescriptor(implementation, utils.wrapperSymbol);
++      if (descriptor?.value) registerPlatformFactory(descriptor.value, { kind, implementation, globalObject });
++      return implementation;
++    };
++  }
++}
+--- /dev/null
++++ b/test/heap-factory-failure.test.js
+@@ -0,0 +1,13 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {spawnSync} from 'node:child_process';
++test('isolated platform observer failures become explicit heap errors without changing factory return',()=>{
++ const module=name=>new URL('../src/'+name,import.meta.url).href;
++ const source=`import assert from 'node:assert/strict';
++ import {Browser} from ${JSON.stringify(module('browser.js'))};
++ import {installHeapUtilityFactories} from ${JSON.stringify(module('heap-worlds.js'))};
++ import {registerPlatformFactory} from ${JSON.stringify(module('platform-factories.js'))};
++ import {queryHeapObjects} from ${JSON.stringify(module('heap-query.js'))};
++ installHeapUtilityFactories();const browser=new Browser();try{const page=browser.createPage();const {proxy,revoke}=Proxy.revocable({},{});revoke();let record;assert.doesNotThrow(()=>{record=registerPlatformFactory(proxy,{kind:'OwnedFaultFixture',globalObject:page.dom.window})});assert.equal(record.kind,'OwnedFaultFixture');assert.throws(()=>queryHeapObjects(page.dom.window.Object.prototype,page.dom.getInternalVMContext()),error=>error.code==='ERR_HEAP_QUERY_FACTORY_OBSERVATION');console.log('EXPLICIT_FACTORY_FAILURE')}finally{browser.close()}`;
++ const result=spawnSync(process.execPath,['--input-type=module','--eval',source],{encoding:'utf8',timeout:20000,maxBuffer:1000000});assert.equal(result.status,0,result.stderr||result.error?.message);assert.match(result.stdout,/EXPLICIT_FACTORY_FAILURE/);
++});
+--- /dev/null
++++ b/test/heap-query-worlds.test.js
+@@ -0,0 +1,43 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {serve} from '../src/cdp.js';
++import {queryHeapObjects} from '../src/heap-query.js';
++import {registerPlatformFactory} from '../src/platform-factories.js';
++import {connect} from './cdp-client.js';
++async function fixture(body){const service=await serve({port:0,loadResources:['iframe']}),client=await connect(`ws://127.0.0.1:${service.port}/`);try{const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId,{timeout:15000});await send('Runtime.enable');await send('Page.enable');await send('Page.navigate',{url:'data:text/html,<form id=f><input name=x></form><button id=b>button</button><iframe id=child srcdoc="<title>child</title>"></iframe>'});const page=service.browser.pages.get(targetId);const world=async(name,frameId=page.frameId)=>(await send('Page.createIsolatedWorld',{frameId,worldName:name})).executionContextId;const evaluate=(expression,contextId,options={})=>send('Runtime.evaluate',{expression,contextId,...options});const query=async(expression,contextId,group)=>{const prototype=await evaluate(expression,contextId,{objectGroup:'prototypes'});const result=await send('Runtime.queryObjects',{prototypeObjectId:prototype.result.objectId,objectGroup:group});return {prototype:prototype.result.objectId,array:result.objects.objectId}};const call=(objectId,functionDeclaration,options={})=>send('Runtime.callFunctionOn',{objectId,functionDeclaration,returnByValue:true,...options});await body({service,page,send,world,evaluate,query,call})}finally{await client.close();await service.close()}}
++
++test('heap results preserve actual main, utility and frame identity, Array realm, and object groups',async()=>fixture(async({page,send,world,evaluate,query,call})=>{
++ const child=page.frames.findElement(page.dom.window.document.getElementById('child'));assert.ok(child);const contexts=[page.executionContextId,await world('heap-a'),await world('heap-b'),await world('heap-child',child.frameId)];
++ for(const id of contexts){await evaluate('globalThis.P={};globalThis.item=Object.create(P)',id);const result=await query('P',id,'matches');const actual=await call(result.array,'function(){this[0].changed=41;return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===Array.prototype,changed:item.changed}}');assert.deepEqual(actual.result.value,{length:1,same:true,realm:true,changed:41});const derived=await call(result.array,'function(){return this[0]}',{returnByValue:false});await send('Runtime.releaseObjectGroup',{objectGroup:'matches'});await assert.rejects(send('Runtime.getProperties',{objectId:result.array}),e=>e.code===-32000);await assert.rejects(send('Runtime.getProperties',{objectId:derived.result.objectId}),e=>e.code===-32000);assert.ok((await send('Runtime.queryObjects',{prototypeObjectId:result.prototype})).objects.objectId)}
++}));
++
++test('real utility public form/collection wrappers and foreign authored payloads keep their identities',async()=>fixture(async({send,world,evaluate,query,call})=>{
++ const id=await world('heap-dom');await evaluate('globalThis.mainForm=document.getElementById("f");mainForm.marker="main"');await evaluate('globalThis.form=document.getElementById("f");globalThis.controls=form.elements;form.marker="utility";document.addEventListener("heap-payload",event=>{globalThis.foreign=event.detail})',id);await evaluate('document.dispatchEvent(new CustomEvent("heap-payload",{detail:mainForm}))');
++ for(const [expression,expected]of [['HTMLFormElement.prototype','form'],['HTMLFormControlsCollection.prototype','controls'],['Object.prototype','form']]){const q=await query(expression,id);const result=await call(q.array,`function(){return {same:this.includes(${expected}),realm:Object.getPrototypeOf(this)===Array.prototype}}`);assert.deepEqual(result.result.value,{same:true,realm:true})}
++ const foreign=await query('Object.getPrototypeOf(foreign)',id),actual=await call(foreign.array,'function(){return {foreign:this.includes(foreign),own:this.includes(form),marker:foreign.marker,ownMarker:form.marker,equal:foreign===form}}');assert.deepEqual(actual.result.value,{foreign:false,own:false,marker:'main',ownMarker:'utility',equal:false});
++ await evaluate('globalThis.fake=Object.create(Object.getPrototypeOf(foreign));globalThis.fakeChild=Object.create(fake);globalThis.getterHits=0;for(const key of Object.getOwnPropertySymbols(form))Object.defineProperty(fake,key,{get(){getterHits++;throw Error("authored")}})',id);const fake=await query('Object.getPrototypeOf(foreign)',id),matches=await call(fake.array,'function(){return {fake:this.includes(fake),child:this.includes(fakeChild),hits:getterHits}}');assert.deepEqual(matches.result.value,{fake:true,child:true,hits:0});
++}));
++
++test('selected Array construction bypasses authored global constructor, inherited setters and getters',async()=>fixture(async({world,evaluate,query,call})=>{
++ const id=await world('heap-side-effects');await evaluate('globalThis.P={};globalThis.item=Object.create(P);globalThis.savedArray=Array;globalThis.hits=0;Object.defineProperty(Array.prototype,"0",{configurable:true,set(){hits++;throw Error("index")}});Object.defineProperty(Array.prototype,"constructor",{configurable:true,get(){hits++;throw Error("constructor")}});Object.defineProperty(Array.prototype,Symbol.toStringTag,{configurable:true,get(){hits++;throw Error("tag")}});globalThis.Array=new Proxy(function(){},{construct(){hits++;throw Error("global constructor")}})',id);const q=await query('P',id),actual=await call(q.array,'function(){return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===savedArray.prototype,hits}}');assert.deepEqual(actual.result.value,{length:1,same:true,realm:true,hits:0});
++}));
++
++test('resource limits fail explicitly without a partial Array and allow subsequent real queries',async()=>fixture(async({page,evaluate})=>{
++ await evaluate('globalThis.P={};globalThis.one=Object.create(P);globalThis.middle=Object.create(P);globalThis.two=Object.create(middle)');const p=page.dom.window.P,c=page.dom.getInternalVMContext();
++ for(const options of [{maxRawResults:1},{maxPublicResults:1},{maxVisited:1},{maxPrototypeDepth:1},{timeoutMs:1}])assert.throws(()=>queryHeapObjects(p,c,options),/ERR_HEAP_QUERY/);
++ let getter=0;const bad={get timeoutMs(){getter++;return 10000}};assert.throws(()=>queryHeapObjects(p,c,bad),/ERR_HEAP_QUERY_ARGUMENT/);assert.equal(getter,0);assert.equal(queryHeapObjects(p,c).objects.length,3);
++}));
++
++test('retained old utility contexts do not become authority after navigation and current lexical inspection still progresses',async()=>fixture(async({page,send,world,evaluate,query,call})=>{
++ const retained=[];for(let cycle=0;cycle<3;cycle++){
++  const id=await world('heap-lifetime');page.dom.window.document.addEventListener('retain-heap',event=>{retained.push(event.detail)},{once:true});await evaluate('let heapLexical=1;globalThis.P={};globalThis.item=Object.create(P);document.dispatchEvent(new CustomEvent("retain-heap",{detail:{global:window,P,item}}))',id);const q=await query('P',id);assert.equal((await call(q.array,'function(){return this.length===1&&this[0]===item}')).result.value,true);assert.ok((await send('Runtime.globalLexicalScopeNames',{executionContextId:id})).names.includes('heapLexical'));await send('Page.navigate',{url:'data:text/html,<title>successor-'+cycle+'</title>'});await assert.rejects(send('Runtime.queryObjects',{prototypeObjectId:q.prototype}),e=>e.code===-32000);
++ }assert.equal(retained.length,3);
++}));
++
++test('a trusted factory origin is a Host bridge fallback and cannot override actual registered object creation',async()=>fixture(async({page,world,evaluate,query,call})=>{
++ const id=await world('heap-actual-owner');let actual;page.dom.window.document.addEventListener('actual-owner',event=>{actual=event.detail},{once:true});await evaluate('globalThis.P={};globalThis.item=Object.create(P);document.dispatchEvent(new CustomEvent("actual-owner",{detail:item}))',id);
++ // A real host producer returns an existing foreign ScriptValue. Its own
++ // document is not authority to change that value's genuine VM identity.
++ const produce=()=>actual;const value=produce();registerPlatformFactory(value,{kind:'OwnedForeignFactoryResult',globalObject:page.dom.window});
++ const result=await query('P',id);assert.deepEqual((await call(result.array,'function(){return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===Array.prototype}}')).result.value,{length:1,same:true,realm:true});
++}));

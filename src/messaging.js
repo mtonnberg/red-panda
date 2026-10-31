@@ -1,3 +1,5 @@
+import { cloneObjectKind } from './clone-object-kind.js';
+import { registerPlatformFactory, platformFactoryRecord, registerPlatformCloneRealm } from './platform-factories.js';
 import { createPlatformCodec } from "./platform-codec.js";
 import { MessageChannel as NativeChannel, MessagePort as NativePort } from 'node:worker_threads';
 import { types } from 'node:util';
@@ -70,14 +72,14 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       if (live() && !state.detached && !state.closed) emit(port, 'messageerror', null, I.Object.freeze(new I.Array()));
     };
     state.close = () => { state.closed = true; release(state); };
-    PORTS.set(port, state); wrapped.set(native, port); owned.add(state);
+    PORTS.set(port, state); registerPlatformFactory(port,{kind:'MessagePort',globalObject:realm}); wrapped.set(native, port); owned.add(state);
     native.on('close', state.close); native.unref();
     return port;
   }
   function encode(value, allowed, seen = new Map(), platforms) {
     if (typeof value === 'function' || typeof value === 'symbol') throw cloneError('Value cannot be structured cloned');
     if (value === null || typeof value !== 'object') return value;
-    if (types.isProxy(value)) throw cloneError('Proxy objects cannot be structured cloned');
+    if (types.isProxy(value) && !platformFactoryRecord(value)) throw cloneError('Proxy objects cannot be structured cloned');
     const port = PORTS.get(value);
     if (port) {
       if (port.detached || !allowed.has(value)) throw cloneError('MessagePort must be transferred and cannot be detached');
@@ -105,9 +107,8 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       const result = new Set(); seen.set(value, result);
       for (const item of value) result.add(encode(item, allowed, seen, platforms)); return result;
     }
-    if (implForWrapper(value) || types.isPromise(value) || types.isWeakMap(value) || types.isWeakSet(value) ||
-        !['[object Object]', '[object Array]'].includes(Object.prototype.toString.call(value))) {
-      throw cloneError(`Unsupported structured clone type: ${Object.prototype.toString.call(value)}`);
+    if (platformFactoryRecord(value) || !['Object','Array'].includes(cloneObjectKind(value))) {
+      throw cloneError('Unsupported structured clone type');
     }
     const result = Array.isArray(value) ? new Array(value.length) : {};
     seen.set(value, result);
@@ -290,6 +291,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     for (const work of pendingDeliveries) dropMessage(work.message); pendingDeliveries.clear();
     for (const state of [...owned]) { state.closed = true; release(state); state.native.close(); }
   }
+  registerPlatformCloneRealm(realm);
   return { MessageChannel, MessagePort, prepare, receive, deliver, prepareBroadcast, broadcastBody: codec.broadcastBody, dispatchMessage, clone, discard, wrap,
     unwrap(port) { const state = record(port); if (state.detached) throw cloneError('MessagePort is detached'); return state.native; },
     isPort: value => PORTS.has(value), dispose, get size() { return owned.size; } };

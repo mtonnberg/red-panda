@@ -1,17 +1,12 @@
-import { Blob as NativeBlob, File as NativeFile } from 'node:buffer';
-import { createRequire } from 'node:module';
+import { installNativePlatformFactories } from './native-platform-factories.js';
+import { platformFactoryRecord } from './platform-factories.js';
+import { geometryFactoryData, validGeometryRecord, deserializeGeometry } from './geometry-platform.js';
+import { Blob as NativeBlob } from 'node:buffer';
 import { types } from 'node:util';
 
-const require=createRequire(import.meta.url);
-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
-const BlobImpl=require('jsdom/lib/jsdom/living/file-api/Blob-impl.js').implementation;
-const FileImpl=require('jsdom/lib/jsdom/living/file-api/File-impl.js').implementation;
 const nativeType=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
 const nativeSize=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'size').get;
-const nativeName=Object.getOwnPropertyDescriptor(NativeFile.prototype,'name').get;
-const nativeModified=Object.getOwnPropertyDescriptor(NativeFile.prototype,'lastModified').get;
 const nativeBytes=NativeBlob.prototype.arrayBuffer;
-const hasInstance=Function.prototype[Symbol.hasInstance];
 
 /** This codec never recognizes authored object tags or marker properties.
  * A private envelope Map associates genuine source platform objects' fresh
@@ -19,33 +14,35 @@ const hasInstance=Function.prototype[Symbol.hasInstance];
  * payload aliases. NativeBlob carries immutable bytes across actual threads.
  */
 export function createPlatformCodec(realm){
+ installNativePlatformFactories(realm);
  const Blob=realm.Blob,File=realm.File;
  const probe=typeof Blob==='function'?new Blob([]):null;
- const dom=probe&&implForWrapper(probe) instanceof BlobImpl;
- const failure=message=>new realm.DOMException(message,'DataCloneError');
+ const dom=probe&&!!platformFactoryRecord(probe)?.implementation;
+ const isBytes=record=>record.kind==='Blob'||record.kind==='File';
+ const Exception=realm.DOMException;
+ const failure=message=>new Exception(message,'DataCloneError');
  function serialize(value){
+  const provenance=platformFactoryRecord(value);
+  if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+  const geometry=geometryFactoryData(value);
+  if(geometry){if(!validGeometryRecord(geometry))throw failure('The object can not be cloned');return geometry;}
   if(!probe)return null;
-  const implementation=implForWrapper(value);
-  if(implementation instanceof BlobImpl){
-   const bytes=new Uint8Array(implementation._buffer),isFile=implementation instanceof FileImpl;
+  if(provenance&&(provenance.kind==='Blob'||provenance.kind==='File')){
+   if(provenance.read)return provenance.read();
+   const implementation=provenance.implementation;
+   const bytes=new Uint8Array(implementation._buffer),isFile=provenance.kind==='File';
    return{kind:isFile?'File':'Blob',blob:new NativeBlob([bytes],{type:implementation.type}),type:implementation.type,bytes,
     ...(isFile?{name:implementation.name,lastModified:implementation.lastModified}:{})};
   }
-  if(hasInstance.call(NativeBlob,value)){
-   // Captured intrinsic getters validate the actual Node platform state and
-   // ignore authored own size/type/name overrides. No private symbols are read.
-   const type=nativeType.call(value);nativeSize.call(value);
-   const isFile=hasInstance.call(NativeFile,value);
-   return{kind:isFile?'File':'Blob',blob:value,type,
-    ...(isFile?{name:nativeName.call(value),lastModified:nativeModified.call(value)}:{})};
-  }
+
   return null;
  }
  function records(message){
   if(message.platforms===undefined)return null;
   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
   for(const[placeholder,record]of message.platforms){
-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File'].includes(record.kind))throw failure('Malformed platform node');
+   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry'].includes(record.kind))throw failure('Malformed platform node');
+   if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
    if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
    else if(record.bytes===undefined||typeof record.type!=='string')throw failure('Platform node has no byte snapshot');
    if(record.bytes!==undefined&&!ArrayBuffer.isView(record.bytes))throw failure('Invalid platform byte snapshot');
@@ -54,20 +51,21 @@ export function createPlatformCodec(realm){
   return message.platforms;
  }
  function needsAsync(message){
-  const map=records(message);return !!(dom&&map&&[...map.values()].some(record=>record.bytes===undefined));
+  const map=records(message);return !!(dom&&map&&[...map.values()].some(record=>isBytes(record)&&record.bytes===undefined));
  }
  async function hydrate(message){
   const map=records(message);if(!dom||!map)return;
-  await Promise.all([...map.values()].filter(record=>record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
+  await Promise.all([...map.values()].filter(record=>isBytes(record)&&record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
  }
- function needsBroadcastBytes(message){const map=records(message);return!!(map&&[...map.values()].some(record=>record.bytes===undefined))}
- function stripNativeHandles(message){const map=records(message);if(map)for(const record of map.values()){if(record.bytes===undefined)throw failure('Broadcast bytes are not ready');delete record.blob}return message}
+ function needsBroadcastBytes(message){const map=records(message);return!!(map&&[...map.values()].some(record=>isBytes(record)&&record.bytes===undefined))}
+ function stripNativeHandles(message){const map=records(message);if(map)for(const record of map.values()){if(!isBytes(record))continue;if(record.bytes===undefined)throw failure('Broadcast bytes are not ready');delete record.blob}return message}
  async function broadcastBody(message){
   const map=records(message);
-  if(map)await Promise.all([...map.values()].filter(record=>record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
+  if(map)await Promise.all([...map.values()].filter(record=>isBytes(record)&&record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
   return stripNativeHandles(message);
  }
  function deserialize(record){
+  if(record.kind==='Geometry'){try{return deserializeGeometry(realm,record)}catch{throw failure('Invalid geometry receiver')}}
   if(!probe)throw failure('Receiver realm does not support Blob');
   if(record.kind==='File'&&typeof File!=='function')throw failure('Receiver realm does not support File');
   const type=record.type??nativeType.call(record.blob);

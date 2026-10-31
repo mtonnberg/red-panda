@@ -1,0 +1,297 @@
+{
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "fixtureSHA256": "feffa32279a3ddde2b19da350bdcdaeeb5c4cbd69c3667b04a3cf1330ca794c5",
+  "driverSHA256": "0e92256adf0d0f0cbed2f7a4f70afd304387f762ffee37ee2ff0f52e35610ad9",
+  "engines": {
+    "native": [
+      {
+        "label": "prepare-root",
+        "expression": "globalThis.child=document.getElementById('f').contentWindow;globalThis.rootURL=URL.createObjectURL(new Blob(['root-owned']));globalThis.readBlobURL=async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}};true",
+        "value": true
+      },
+      {
+        "label": "create-before-remove",
+        "expression": "globalThis.beforeURL=URL.createObjectURL(new Blob(['child-before'],{type:'text/plain'}));({url:beforeURL,closed,view:document.defaultView===window})",
+        "value": {
+          "url": "blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9",
+          "closed": false,
+          "view": true
+        }
+      },
+      {
+        "label": "fetch-parent-before",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "retain-real-response",
+        "expression": "(async()=>{globalThis.retainedResponse=await fetch(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\");globalThis.retainedBlob=await (await fetch(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\")).blob();return{status:retainedResponse.status,type:retainedBlob.type,size:retainedBlob.size}})()",
+        "value": {
+          "status": 200,
+          "type": "text/plain",
+          "size": 12
+        }
+      },
+      {
+        "label": "fetch-child-before",
+        "expression": "(async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}})(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "remove-frame",
+        "expression": "document.getElementById('f').remove();({closed:child.closed,viewNull:child.document.defaultView===null,length})",
+        "value": {
+          "closed": true,
+          "viewNull": true,
+          "length": 0
+        }
+      },
+      {
+        "label": "fetch-parent-old-after",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "fetch-child-old-after",
+        "expression": "(async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}})(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "retained-response-after",
+        "expression": "retainedResponse.text()",
+        "value": "child-before"
+      },
+      {
+        "label": "retained-blob-after",
+        "expression": "retainedBlob.text()",
+        "value": "child-before"
+      },
+      {
+        "label": "create-after-remove",
+        "expression": "globalThis.afterURL=URL.createObjectURL(new Blob(['child-after'],{type:'text/plain'}));({url:afterURL,closed,viewNull:document.defaultView===null})",
+        "value": {
+          "url": "blob:http://127.0.0.1:38523/9aa8bb0e-8c66-4b70-9397-c9c10ec84cea",
+          "closed": true,
+          "viewNull": true
+        }
+      },
+      {
+        "label": "fetch-parent-new-after",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/9aa8bb0e-8c66-4b70-9397-c9c10ec84cea\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-after"
+        }
+      },
+      {
+        "label": "fetch-child-new-after",
+        "expression": "(async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}})(\"blob:http://127.0.0.1:38523/9aa8bb0e-8c66-4b70-9397-c9c10ec84cea\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-after"
+        }
+      },
+      {
+        "label": "revoke-after-retirement",
+        "expression": "URL.revokeObjectURL(afterURL);true",
+        "value": true
+      },
+      {
+        "label": "fetch-parent-new-revoked",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/9aa8bb0e-8c66-4b70-9397-c9c10ec84cea\")",
+        "value": {
+          "error": "TypeError"
+        }
+      },
+      {
+        "label": "root-owned-survives",
+        "expression": "readBlobURL(rootURL)",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "root-owned"
+        }
+      },
+      {
+        "label": "root-revoke-old",
+        "expression": "URL.revokeObjectURL(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\");true",
+        "value": true
+      },
+      {
+        "label": "old-after-root-revoke",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/d81ac289-7c6a-481f-85d4-c494ccebe0b9\")",
+        "value": {
+          "error": "TypeError"
+        }
+      },
+      {
+        "label": "root-retained-bytes-after-revokes",
+        "expression": "retainedBlob.text()",
+        "value": "child-before"
+      }
+    ],
+    "candidate": [
+      {
+        "label": "prepare-root",
+        "expression": "globalThis.child=document.getElementById('f').contentWindow;globalThis.rootURL=URL.createObjectURL(new Blob(['root-owned']));globalThis.readBlobURL=async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}};true",
+        "value": true
+      },
+      {
+        "label": "create-before-remove",
+        "expression": "globalThis.beforeURL=URL.createObjectURL(new Blob(['child-before'],{type:'text/plain'}));({url:beforeURL,closed,view:document.defaultView===window})",
+        "value": {
+          "url": "blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16",
+          "closed": false,
+          "view": true
+        }
+      },
+      {
+        "label": "fetch-parent-before",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "retain-real-response",
+        "expression": "(async()=>{globalThis.retainedResponse=await fetch(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\");globalThis.retainedBlob=await (await fetch(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\")).blob();return{status:retainedResponse.status,type:retainedBlob.type,size:retainedBlob.size}})()",
+        "value": {
+          "status": 200,
+          "type": "text/plain",
+          "size": 12
+        }
+      },
+      {
+        "label": "fetch-child-before",
+        "expression": "(async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}})(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "remove-frame",
+        "expression": "document.getElementById('f').remove();({closed:child.closed,viewNull:child.document.defaultView===null,length})",
+        "value": {
+          "closed": true,
+          "viewNull": true,
+          "length": 0
+        }
+      },
+      {
+        "label": "fetch-parent-old-after",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-before"
+        }
+      },
+      {
+        "label": "fetch-child-old-after",
+        "expression": "(async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}})(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\")",
+        "value": {
+          "error": "TypeError"
+        }
+      },
+      {
+        "label": "retained-response-after",
+        "expression": "retainedResponse.text()",
+        "value": "child-before"
+      },
+      {
+        "label": "retained-blob-after",
+        "expression": "retainedBlob.text()",
+        "value": "child-before"
+      },
+      {
+        "label": "create-after-remove",
+        "expression": "globalThis.afterURL=URL.createObjectURL(new Blob(['child-after'],{type:'text/plain'}));({url:afterURL,closed,viewNull:document.defaultView===null})",
+        "value": {
+          "url": "blob:http://127.0.0.1:38523/599ee98b-7b16-4af9-93cb-33bec3c56c2c",
+          "closed": true,
+          "viewNull": true
+        }
+      },
+      {
+        "label": "fetch-parent-new-after",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/599ee98b-7b16-4af9-93cb-33bec3c56c2c\")",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "child-after"
+        }
+      },
+      {
+        "label": "fetch-child-new-after",
+        "expression": "(async url=>{try{const response=await fetch(url);return{ok:response.ok,status:response.status,text:await response.text()}}catch(e){return{error:e.name}}})(\"blob:http://127.0.0.1:38523/599ee98b-7b16-4af9-93cb-33bec3c56c2c\")",
+        "value": {
+          "error": "TypeError"
+        }
+      },
+      {
+        "label": "revoke-after-retirement",
+        "expression": "URL.revokeObjectURL(afterURL);true",
+        "value": true
+      },
+      {
+        "label": "fetch-parent-new-revoked",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/599ee98b-7b16-4af9-93cb-33bec3c56c2c\")",
+        "value": {
+          "error": "TypeError"
+        }
+      },
+      {
+        "label": "root-owned-survives",
+        "expression": "readBlobURL(rootURL)",
+        "value": {
+          "ok": true,
+          "status": 200,
+          "text": "root-owned"
+        }
+      },
+      {
+        "label": "root-revoke-old",
+        "expression": "URL.revokeObjectURL(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\");true",
+        "value": true
+      },
+      {
+        "label": "old-after-root-revoke",
+        "expression": "readBlobURL(\"blob:http://127.0.0.1:38523/344db41d-71b5-44f6-8ec9-4550852ebd16\")",
+        "value": {
+          "error": "TypeError"
+        }
+      },
+      {
+        "label": "root-retained-bytes-after-revokes",
+        "expression": "retainedBlob.text()",
+        "value": "child-before"
+      }
+    ]
+  },
+  "requests": [
+    "/",
+    "/"
+  ]
+}

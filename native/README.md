@@ -38,12 +38,29 @@ heap enumeration. Runtime and collection outputs share the versioned build
 folder but retain separate source and binary manifests. Rebuild and restart
 when either source or runtime changes; live replacement is unsupported.
 
-`npm run build:native` builds both. `node native/build-runtime.mjs` builds only
+`npm run build:native` builds all three bindings. `node native/build-runtime.mjs` builds only
 the runtime helper and accepts the same header/output overrides as the collection
 builder. The runtime entry, actual queued jobs, reentrancy guards, numeric
 prototype setters and native-trace tests pass on Node24.19.0,24.22.1 and26.13.0.
 The first Node26 compilation exposed a removed Context API; the final source
 uses the public current-Isolate API on all three versions.
+
+## Heap queries
+
+`heap-query.cc` uses the public V8 `HeapProfiler::QueryObjects` API. The selected
+context supplies a genuine result Array; entries retain actual heap identities.
+The JavaScript adapter partitions actual VM creation contexts and canonicalizes
+only wrappers identified by trusted factory hooks. Weak provenance tables do
+not enumerate or strongly retain every produced object. Authored getters and
+Proxy traps are not used to infer object ownership.
+
+`node native/build-heap.mjs` builds this binding alone. Its loader verifies exact
+Node/V8/ABI, platform, source and binary digests and compiled API metadata. Rebuild
+and restart after changes; no heap-query fallback is supplied. Raw/public match,
+visited-object, prototype-depth and cooperative time limits fail explicitly
+instead of returning truncated results. The profiler walk and GC are blocking.
+Exact counts and complete public wrapper coverage remain open; see the
+[backend evidence and bounds](../proposals/runtime-heap-worlds/README.md).
 
 ## Collection build and integration
 

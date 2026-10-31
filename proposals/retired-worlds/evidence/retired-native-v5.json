@@ -1,0 +1,467 @@
+{
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "driverSHA256": "8b5fb6f154dac563c802bd94af6f930c760040552cbfaa5fc26ad5d85ad9f8bf",
+  "fixtureSHA256": {
+    "root": "cf6771f3150fee0ecfcc09f8e7219e209c14d39421f4b1f41b6e7afb617230f8",
+    "child": "ccf401906cd2b0b5a4bb12c360cd6e06ebbfb7d98ff9e41e7c9652bf104a16b5"
+  },
+  "observations": [
+    {
+      "label": "enable-runtime",
+      "method": "Runtime.enable",
+      "params": {},
+      "result": {}
+    },
+    {
+      "label": "enable-page",
+      "method": "Page.enable",
+      "params": {},
+      "result": {}
+    },
+    {
+      "label": "navigate",
+      "method": "Page.navigate",
+      "params": {
+        "url": "http://127.0.0.1:42211/"
+      },
+      "result": {
+        "frameId": "FID-0000000001",
+        "loaderId": "LID-0000000001"
+      }
+    },
+    {
+      "label": "create-world",
+      "method": "Page.createIsolatedWorld",
+      "params": {
+        "frameId": "FID-0000000002",
+        "worldName": "retired-life"
+      },
+      "result": {
+        "executionContextId": 4
+      }
+    },
+    {
+      "label": "compile-main",
+      "method": "Runtime.compileScript",
+      "params": {
+        "expression": "globalThis.compiledRetiredMain=mainMark+23;compiledRetiredMain",
+        "sourceURL": "retired-main.js",
+        "persistScript": true,
+        "executionContextId": 3
+      },
+      "result": {
+        "scriptId": "6"
+      }
+    },
+    {
+      "label": "compile-utility",
+      "method": "Runtime.compileScript",
+      "params": {
+        "expression": "globalThis.compiledRetiredUtility=utilityMark+23;compiledRetiredUtility",
+        "sourceURL": "retired-utility.js",
+        "persistScript": true,
+        "executionContextId": 4
+      },
+      "result": {
+        "scriptId": "7"
+      }
+    },
+    {
+      "label": "prepare-main",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.rootDocument=parent.document;globalThis.savedDocument=document;globalThis.savedNode=document.getElementById('p');globalThis.savedOwner=frameElement;globalThis.savedArray=Array;for(const type of ['pagehide','unload','visibilitychange'])addEventListener(type,()=>parent.log.push('main-'+type));new MutationObserver(()=>parent.log.push('main-mutation')).observe(savedNode,{attributes:true});setTimeout(()=>{rootDocument.documentElement.setAttribute('main-timer','yes');parent.log.push('main-timer')},70);requestAnimationFrame(()=>{rootDocument.documentElement.setAttribute('main-raf',String(parent.didRemove));parent.log.push('main-raf-'+parent.didRemove)});fetch('/held').then(r=>r.text()).then(v=>{rootDocument.documentElement.setAttribute('main-fetch',v);parent.log.push('fetch-'+v)},e=>{rootDocument.documentElement.setAttribute('main-fetch-error',e.name);parent.log.push('fetch-error-'+e.name)});({closed,token:mainMark})",
+        "returnByValue": true,
+        "contextId": 3
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "closed": false,
+            "token": 17
+          }
+        }
+      }
+    },
+    {
+      "label": "prepare-utility",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.utilityMark=19;globalThis.rootDocument=parent.document;globalThis.savedDocument=document;globalThis.savedNode=document.getElementById('p');globalThis.savedOwner=frameElement;globalThis.savedArray=Array;setTimeout(()=>parent.document.documentElement.setAttribute('utility-timer','yes'),70);requestAnimationFrame(()=>parent.document.documentElement.setAttribute('utility-raf',String(parent.didRemove)));({closed,token:utilityMark})",
+        "returnByValue": true,
+        "contextId": 4
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "closed": false,
+            "token": 19
+          }
+        }
+      }
+    },
+    {
+      "label": "register-resolver-listener",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "document.addEventListener('resolve-retired',event=>setTimeout(()=>{rootDocument.documentElement.setAttribute('resolver-after-remove',String(parent.didRemove));event.detail(29)},80));true",
+        "returnByValue": true,
+        "contextId": 4
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "promise-before-remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "contextId": 3,
+        "expression": "globalThis.retainedPromise=new Promise(resolve=>globalThis.resolveRetained=resolve);document.dispatchEvent(new CustomEvent(\"resolve-retired\",{detail:resolveRetained}));retainedPromise"
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "subtype": "promise",
+          "className": "Promise",
+          "description": "Promise",
+          "objectId": "2.3.1"
+        }
+      }
+    },
+    {
+      "label": "remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "globalThis.savedFrame=document.getElementById(\"f\");globalThis.savedChild=savedFrame.contentWindow;savedFrame.remove();globalThis.didRemove=true;({closed:savedChild.closed,length,childDocument:!!savedChild.document})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "closed": true,
+            "length": 0,
+            "childDocument": true
+          }
+        }
+      }
+    },
+    {
+      "label": "main-after-remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({closed,sameDocument:document===savedDocument,sameNode:document.getElementById(\"p\")===savedNode,sameArray:Array===savedArray,view:document.defaultView===window,viewNull:document.defaultView===null,connected:document.isConnected,owner:frameElement===savedOwner,ownerNull:frameElement===null,body:document.body.textContent,token:mainMark})",
+        "returnByValue": true,
+        "contextId": 3
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "closed": true,
+            "sameDocument": true,
+            "sameNode": true,
+            "sameArray": true,
+            "view": false,
+            "viewNull": true,
+            "connected": true,
+            "owner": true,
+            "ownerNull": false,
+            "body": "Original childglobalThis.mainMark=17",
+            "token": 17
+          }
+        }
+      }
+    },
+    {
+      "label": "utility-after-remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({closed,sameDocument:document===savedDocument,sameNode:document.getElementById(\"p\")===savedNode,sameArray:Array===savedArray,view:document.defaultView===window,viewNull:document.defaultView===null,connected:document.isConnected,owner:frameElement===savedOwner,ownerNull:frameElement===null,body:document.body.textContent,token:utilityMark})",
+        "returnByValue": true,
+        "contextId": 4
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "closed": true,
+            "sameDocument": true,
+            "sameNode": true,
+            "sameArray": true,
+            "view": false,
+            "viewNull": true,
+            "connected": true,
+            "owner": true,
+            "ownerNull": false,
+            "body": "Original childglobalThis.mainMark=17",
+            "token": 19
+          }
+        }
+      }
+    },
+    {
+      "label": "run-main-after-remove",
+      "method": "Runtime.runScript",
+      "params": {
+        "scriptId": "6",
+        "executionContextId": 3,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 40,
+          "description": "40"
+        }
+      }
+    },
+    {
+      "label": "run-utility-after-remove",
+      "method": "Runtime.runScript",
+      "params": {
+        "scriptId": "7",
+        "executionContextId": 4,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 42,
+          "description": "42"
+        }
+      }
+    },
+    {
+      "label": "await-new-main-timer",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "new Promise(resolve=>setTimeout(()=>resolve(mainMark+24),20))",
+        "contextId": 3,
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 41,
+          "description": "41"
+        }
+      }
+    },
+    {
+      "label": "await-retained-promise",
+      "method": "Runtime.awaitPromise",
+      "params": {
+        "promiseObjectId": "2.3.1",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 29,
+          "description": "29"
+        }
+      }
+    },
+    {
+      "label": "new-fetch-after-remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "fetch('/new-fetch').then(r=>rootDocument.documentElement.setAttribute('new-fetch-status',String(r.status)),e=>rootDocument.documentElement.setAttribute('new-fetch-error',e.name));true",
+        "returnByValue": true,
+        "contextId": 3
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "new-tasks-main",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "setTimeout(()=>rootDocument.documentElement.setAttribute('main-new-timer','yes'),20);requestAnimationFrame(()=>rootDocument.documentElement.setAttribute('main-new-raf','yes'));true",
+        "returnByValue": true,
+        "contextId": 3
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "new-tasks-utility",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "setTimeout(()=>rootDocument.documentElement.setAttribute('utility-new-timer','yes'),20);requestAnimationFrame(()=>rootDocument.documentElement.setAttribute('utility-new-raf','yes'));true",
+        "returnByValue": true,
+        "contextId": 4
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "mutate-after-remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "savedNode.setAttribute(\"after-remove\",\"yes\");Promise.resolve(mainMark+1)",
+        "returnByValue": true,
+        "contextId": 3
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        }
+      }
+    },
+    {
+      "label": "new-world-after-remove",
+      "method": "Page.createIsolatedWorld",
+      "params": {
+        "frameId": "FID-0000000002",
+        "worldName": "another"
+      },
+      "error": {
+        "code": -32000,
+        "message": "Frame with the given id does not belong to the target."
+      }
+    },
+    {
+      "label": "tree-after-remove",
+      "method": "Page.getFrameTree",
+      "params": {},
+      "result": {
+        "frameTree": {
+          "frame": {
+            "id": "FID-0000000001",
+            "loaderId": "LID-0000000001",
+            "url": "http://127.0.0.1:42211/",
+            "domainAndRegistry": "",
+            "securityOrigin": "http://127.0.0.1:42211",
+            "mimeType": "text/html",
+            "adFrameStatus": {
+              "adFrameType": "none"
+            },
+            "secureContextType": "InsecureScheme",
+            "crossOriginIsolatedContextType": "NotIsolated",
+            "gatedAPIFeatures": []
+          }
+        }
+      }
+    },
+    {
+      "label": "callbacks-after-remove",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "({log,attrs:Object.fromEntries([...document.documentElement.attributes].map(a=>[a.name,a.value]))})",
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "log": [
+              "main-raf-undefined",
+              "main-mutation"
+            ],
+            "attrs": {
+              "main-raf": "undefined",
+              "utility-raf": "undefined",
+              "utility-timer": "yes",
+              "resolver-after-remove": "undefined",
+              "new-fetch-status": "200",
+              "main-new-raf": "yes",
+              "utility-new-raf": "yes",
+              "main-new-timer": "yes",
+              "utility-new-timer": "yes"
+            }
+          }
+        }
+      }
+    },
+    {
+      "label": "schedule-before-root-close",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "setTimeout(()=>fetch('http://127.0.0.1:42211/after-root-close'),60);true",
+        "returnByValue": true,
+        "contextId": 3
+      },
+      "result": {
+        "result": {
+          "type": "boolean",
+          "value": true
+        }
+      }
+    },
+    {
+      "label": "close-root",
+      "method": "Target.closeTarget",
+      "params": {
+        "targetId": "FID-0000000001"
+      },
+      "result": {
+        "success": true
+      }
+    }
+  ],
+  "events": [
+    {
+      "method": "Page.frameDetached",
+      "params": {
+        "frameId": "FID-0000000002",
+        "reason": "remove"
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Inspector.detached",
+      "params": {
+        "reason": "Render process gone."
+      },
+      "sessionId": "SID-1"
+    },
+    {
+      "method": "Target.detachedFromTarget",
+      "params": {
+        "targetId": "FID-0000000001",
+        "sessionId": "SID-1",
+        "reason": "Render process gone."
+      }
+    },
+    {
+      "method": "Target.targetDestroyed",
+      "params": {
+        "targetId": "FID-0000000001"
+      }
+    }
+  ],
+  "requests": [
+    "/",
+    "/child",
+    "/held",
+    "/new-fetch"
+  ],
+  "responseClosures": [
+    {
+      "url": "/held",
+      "ended": false
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+import {registerHeapWrapper} from './heap-registry.js';
 import { createReadableState, bindReadable, bindTransformPair, bindReadableController, failReadable, noteReadableOperation } from './request-stream-state.js';
 import * as web from 'node:stream/web';
 import { TextEncoder, TextDecoder } from 'node:util';
@@ -68,6 +69,7 @@ export function installStreams(page, realm, { signal = page?.documentAbort?.sign
   const finalization = new FinalizationRegistry(reference => references.delete(reference));
   function tag(value, name) {
     owned.set(value, name);
+    registerHeapWrapper(value,realm);
     const reference = new WeakRef(value);
     references.add(reference);
     finalization.register(value, reference, reference);

@@ -1,3 +1,4 @@
+import {registerHeapWrapper} from './heap-registry.js';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -115,7 +116,7 @@ export function installCollections(window, options = {}) {
       indices: () => Array.from({ length: state.elements.length }, (_, index) => index),
       call: arguments_ => arguments_.length ? item(state, arguments_[0]) : null,
     }, prototype);
-    states.set(result, state); return result;
+    states.set(result, state); return registerHeapWrapper(result,window);
   }
   Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get() { return collection(this); } });
   Object.defineProperty(window, 'HTMLAllCollection', { configurable: true, writable: true, value: HTMLAllCollection });

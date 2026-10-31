@@ -12,7 +12,7 @@ XHR/FileReaderSync and real WebSockets. Protocol invocation captures the actual
 realm apply intrinsic and enters through a private lexical trampoline with a VM
 timeout. These are bounded implementations: service-worker clients/controller,
 fetch interception, updates and persistence; full SVG/layout; worker network
-policy; runtime worlds/heap enumeration; and complete asynchronous execution
+policy; complete runtime worlds/heap enumeration; and complete asynchronous execution
 deadlines remain unfinished. See the source proposals and retained observations
 in `proposals/`; isolated proposals are not automatically production features.
 
@@ -646,6 +646,75 @@ provenance, custom elements, main synchronous XHR and HTTP header-policy proposa
 remain unmerged. Utility CSS/XML/SVG/messaging coverage, Worker error delivery,
 full async execution deadlines, browser isolation and full native performance
 remain incomplete.
+
+### Next integration: heap queries, custom elements and privileged headers
+
+The independent public-V8 heap backend is integrated after the checkpoint above.
+It uses real selected VM contexts and returns actual public object identities,
+including composed form proxies. Trusted factory provenance is weak and actual
+registered V8 creation context takes precedence over a host factory hint.
+Limits throw instead of returning truncated prefixes; GC/profiler execution is
+blocking and its timeout is cooperative. Exact counts, exhaustive wrapper
+coverage and complete utility Web APIs remain unresolved. Earlier inspector
+crashes remain historical evidence, not evidence that this backend passed.
+
+Custom elements now have realm-local registry promises, constructor lookup,
+parser/reaction integration, template-document behavior and shadow adoption
+ordering calibrated against bounded native controls. HTTP request construction
+applies default/jar values, privileged CDP headers, then CLI headers on each real
+redirect hop. Privileged Cookie/Authorization settings retain their native-
+observed precedence even for credentials-omitted requests; response-cookie
+import still follows credentials policy. The follow-up recomputes unsafe header
+names after authored Authorization is stripped; all52 measured same-site actions
+now match the native control. Redirects still requiring fresh preflight and
+cross-site SameSite behavior remain separate gaps.
+
+Fresh recovery validation passes syntax checks, strict/pedantic PureScript
+compilation and **55 PureScript Puppeteer checks**, including bracketed heap
+handle ownership and real form identities. Full JavaScript integration and
+native differential checks are recorded separately when they complete.
+
+Removed frames now retain their original main/utility VMs, Documents, objects and
+existing execution-context identities until owning-page teardown. They leave the
+active frame tree; new isolated-world creation is rejected. Original main-world
+timers/RAF/fetch are canceled while later work and retained utility work remain
+usable. Bounded native comparisons match39 common and10 selected nested controls;
+actual heap identities and authority revocation are covered by regressions.
+
+Geometry cloning now uses successful trusted factory records for Point/Rect
+values and actual receiving-realm constructors; Matrix values reject as observed
+in Native. Blob/File producers retain immutable bytes and copied implementation
+or Node handle symbols do not establish provenance. Unknown inherited static
+toStringTag classification remains a documented cloning limitation.
+
+Window/frame synchronous XHR uses a Browser-owned readiness-confirmed thread,
+actual response bytes and host cookie/redirect/CORS policy. Operation ownership
+covers the blocked wait, cookie processing and request/response/failure callbacks;
+real VM interruption cancels only captured request IDs. All15 native controls
+match, including native UTF-8/BOM, original responseURL and sync event quirks.
+Sync Blob URLs, utility XHR and broader redirect/coercion combinations remain
+incomplete. The CE parser fixes preserve callback-reparented nodes and apply the
+real dynamic-markup counter during initial construction, closing a process exit
+and a zero-observation fixture. They pass both unchanged source fixtures.
+
+Parent integration passes151 combined JavaScript checks and55 PureScript checks
+before the subsequent parser/XHR merge;54 parser checks and65 combined
+XHR/parser/realm/codec checks then pass. The first broad recovery run stopped
+with939 passes and4 fixture-network failures because managed proxy routing sent
+0.0.0.0 requests away from their owned server. An actual HTTP control observed
+zero owned requests before a local bypass and one after; all31 affected worker
+checks pass unchanged with that setup correction. This interrupted run is not a
+full-suite pass. The new complete stable-graph regression is recorded separately.
+
+The corrected checkpoint passes **1023 JavaScript tests,55 PureScript checks
+and13 native differential groups**, with syntax and strict/pedantic builds.
+[Validation](reference/phase14-integration/validation.json) binds245 unchanged
+source/test inputs and retains both the successful run and the earlier1021/1022
+run. Native confirms that frame-created Blob URLs survive removal; the actual
+retained frame now remains discoverable by Blob transport. Parent/child reads,
+new URLs, revocation, retained bytes and final owning-page cleanup are covered.
+The larger registration/WPT matrix, API breadth, performance and isolation goal
+remain incomplete; later isolated proposals are excluded from this checkpoint.
 
 The full suite passes **687 JavaScript tests and 53 PureScript Puppeteer
 assertions**. Syntax, strict/pedantic PureScript builds and all13 bounded native

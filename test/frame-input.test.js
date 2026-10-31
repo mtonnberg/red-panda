@@ -35,7 +35,7 @@ test('trusted keyboard input follows focus through actual nested iframe realms',
   page.dom.window.document.querySelector('#parent').focus();
   runInput({ page }, 'Input.insertText', { text: '!' });
   assert.equal(page.dom.window.document.querySelector('#parent').value, '!retained');
-  assert.equal(second.closed, true);
+  assert.equal(second.retired, true);assert.equal(second.closed, false);assert.equal(second.dom.window.closed, true);
 });
 
 test('keyboard input reaches focused controls in open and closed shadow roots', async t => {

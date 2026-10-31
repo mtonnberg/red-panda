@@ -204,5 +204,15 @@ main = launchAff_ $
         assert "PureScript Puppeteer receives a real PNG screenshot" $ Browser.signature image == "89504e470d0a1a0a" && Browser.byteLength image > 1000
         pdfBytes <- Browser.pdf page
         assert "PureScript Puppeteer reads a real PDF through CDP streams" $ Browser.signature pdfBytes == "255044462d312e34" && Browser.byteLength pdfBytes > 1000
+        void $ Browser.evaluateString page "globalThis.heapPrototype={};globalThis.heapObjects=[Object.create(heapPrototype),Object.create(heapPrototype)];heapObjects[0].label='actual';'ready'"
+        Browser.withHandle (Browser.evaluateHandle page "heapPrototype") \prototype ->
+          Browser.withHandle (Browser.queryObjects page prototype) \instances -> do
+            identities <- Browser.evaluateHandleString instances "items=>JSON.stringify([items.length,items.includes(heapObjects[0]),items.includes(heapObjects[1]),Object.getPrototypeOf(items)===Array.prototype])"
+            assert "PureScript Puppeteer queries actual heap identities in a real realm Array" $ identities == "[2,true,true,true]"
+        void $ Browser.evaluateString page "globalThis.heapForm=document.createElement('form');document.body.append(heapForm);'ready'"
+        Browser.withHandle (Browser.evaluateHandle page "HTMLFormElement.prototype") \prototype ->
+          Browser.withHandle (Browser.queryObjects page prototype) \instances -> do
+            publicForm <- Browser.evaluateHandleString instances "items=>JSON.stringify([items.includes(heapForm),Object.getPrototypeOf(items)===Array.prototype])"
+            assert "PureScript heap queries retain the genuine public form proxy and owned handle lifetime" $ publicForm == "[true,true]"
         Browser.closePage page
-        log "PureScript Puppeteer integration: 53 checks passed"
+        log "PureScript Puppeteer integration: 55 checks passed"

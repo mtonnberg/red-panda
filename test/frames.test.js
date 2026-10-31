@@ -147,16 +147,20 @@ test('child facade and location navigation affect only their own iframe', async 
   assert.equal(f.window.location.href, f.page.url); assert.equal(f.registry.getTree().frame.url, f.page.url);
 });
 
-test('detaching a parent removes descendant contexts and aborts each child document', async t => {
+test('detaching a parent retires real contexts until the owning document aborts', async t => {
   const f = fixture(t, '<iframe id="outer" srcdoc="<iframe></iframe>"></iframe>');
   const element = f.document.getElementById('outer'), outer = f.frame(element);
   const nested = f.frame(element.contentDocument.querySelector('iframe'));
   element.remove();
   assert.equal(f.registry.findFrame(outer.frameId), undefined); assert.equal(f.registry.findFrame(nested.frameId), undefined);
-  assert.equal(f.registry.findContext(nested.executionContextId), undefined);
-  assert.equal(outer.documentAbort.signal.aborted, true); assert.equal(nested.documentAbort.signal.aborted, true);
+  assert.equal(f.registry.findContext(nested.executionContextId).page, nested);
+  assert.equal(outer.retired, true);assert.equal(nested.retired, true);
+  assert.equal(outer.documentAbort.signal.aborted, false); assert.equal(nested.documentAbort.signal.aborted, false);
+  assert.equal(outer.dom.window.document.defaultView,null);assert.equal(nested.dom.window.document.defaultView,null);
+  assert.equal(element.contentDocument,null);assert.equal(element.contentWindow,null);assert.equal(outer.dom.window[0],nested.dom.window);assert.equal(outer.dom.window.length,1);
   assert.equal(f.registry.getTree().childFrames, undefined);
-  assert.equal(f.events.filter(event => event.name === 'frameDetached').length, 2);
+  assert.equal(f.events.filter(event => event.name === 'frameDetached').length, 1);
+  f.page.documentAbort.abort();assert.equal(outer.documentAbort.signal.aborted,true);assert.equal(nested.documentAbort.signal.aborted,true);assert.equal(f.registry.findContext(nested.executionContextId),undefined);
 });
 
 test('root document abort clears registered frame contexts and leaves unrelated jsdom documents unmodified', t => {

@@ -72,10 +72,11 @@ test('workers expose geometry constructors and clone geometry in their own realm
   const f = fixture(t, { 'https://example.test/app/geometry.js': `
     const matrix = new DOMMatrix().translate(5, 7).scale(2);
     const point = new DOMPoint(3, 4).matrixTransform(matrix);
-    const cloned = structuredClone({ point, matrix, rect: new DOMRect(1, 2, 3, 4) });
+    const cloned = structuredClone({ point, rect: new DOMRect(1, 2, 3, 4) });
+    let matrixError; try { structuredClone(matrix); } catch (error) { matrixError = error.name; }
     postMessage({ point: cloned.point.toJSON(), rect: cloned.rect.toJSON(),
-      ownRealm: [cloned.point instanceof DOMPoint, cloned.matrix instanceof DOMMatrix,
-        cloned.rect instanceof DOMRect], matrix: Array.from(cloned.matrix.toFloat64Array()) });
+      ownRealm: [cloned.point instanceof DOMPoint, matrixError === 'DataCloneError',
+        cloned.rect instanceof DOMRect], matrix: Array.from(matrix.toFloat64Array()) });
   ` });
   const worker = new f.window.Worker('./geometry.js');
   const data = await message(worker);

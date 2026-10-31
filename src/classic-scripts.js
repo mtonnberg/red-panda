@@ -1,6 +1,7 @@
 import { parseDocumentWriteFragment } from './shadow.js';
 import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
 import { prepareInputParserAdapter } from './input-controls.js';
+import { prepareCustomElementParserAdapter } from './custom-elements.js';
 import { installDocumentReset } from './document-reset.js';
 import { createParserStream } from './parser-stream.js';
 import { createRequire } from 'node:module';
@@ -125,6 +126,7 @@ function resumeAfterScript(record, script) {
 
 function makeParser(record, options) {
   prepareInputParserAdapter(options?.treeAdapter);
+  prepareCustomElementParserAdapter(options?.treeAdapter);
   const parser = new parse5.Parser(options, undefined, null, script => {
     const type = script._getTypeString()?.toLowerCase();
     if (type === 'module' || type === 'importmap' || !scriptTypes.has(type) || !script._canRunScript()) return;

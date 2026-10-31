@@ -1,3 +1,4 @@
+import {installHeapUtilityFactories} from './heap-worlds.js';
 import {initializeUtilitySession,utilitySessionController} from './world-sessions.js';
 import {canonicalUtilityValue} from './isolated-world.js';
 import http from 'node:http';
@@ -203,7 +204,7 @@ class Session {
   valueContext(value) {
     const utility=this.utility.valueContext(value);if(utility!==undefined)return utility;
     const document = ownerDocumentOf(value);
-    for (const page of this.page.frames?.frames.values() ?? []) {
+    for (const page of this.page.frames?.executionPages?.()??this.page.frames?.frames.values()??[]) {
       if (document && document === page.dom.window.document || value === page.dom.window) return page.executionContextId;
     }
     return this.page.executionContextId;
@@ -263,7 +264,7 @@ class Session {
       this.domains.add(method.split('.')[0]);
       if (method === 'Runtime.enable') {
         this.contextCreated();
-        for (const child of page.frames?.frames.values() ?? []) if (child !== page) this.contextCreated('', child.executionContextId, child);
+        for (const child of page.frames?.executionPages?.()??page.frames?.frames.values()??[]) if (child !== page) this.contextCreated('', child.executionContextId, child);
         this.utility.runtimeEnabled();
       }
       return {};
@@ -316,7 +317,7 @@ class Session {
         if(params.worldName===undefined)throw new ProtocolError('MissingField',-31998);
         if(typeof params.worldName!=='string')throw new ProtocolError('UnexpectedToken',-31998);
         const target = params.frameId === page.frameId ? page : page.frames?.findFrame(params.frameId);
-        if (!target) throw new ProtocolError('Unknown frame');
+        if (!target) throw new ProtocolError('Frame with the given id does not belong to the target.',-32000);
         const name = params.worldName ?? '';
         if (target === page) this.worldNames.add(name);
         const id = this.isolatedWorld(target, name);
@@ -487,6 +488,7 @@ class Session {
   }
 }
 
+installHeapUtilityFactories();
 class Connection {
   constructor(socket, browser, directPage) {
     this.socket = socket;

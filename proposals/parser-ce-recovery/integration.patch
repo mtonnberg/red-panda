@@ -1,0 +1,77 @@
+diff --git a/src/custom-elements.js b/src/custom-elements.js
+--- a/src/custom-elements.js
++++ b/src/custom-elements.js
+@@ -29,9 +29,20 @@
+ export function prepareCustomElementParserAdapter(adapter){
+  if(!adapter||adapter._fragment||adapters.has(adapter)||!recordFor(adapter._documentImpl))return;
+  adapters.add(adapter);
+- for(const key of['createElement','appendChild','insertBefore']){
++ const createdWithParent=new WeakSet(),create=adapter.createElement;
++ adapter.createElement=function(...args){
++  const node=reactions(()=>create.apply(this,args));
++  // Attribute reactions can give this new parser element a real parent.
++  // Retain that insertion while the open-element stack receives its children.
++  if(domSymbolTree.parent(node)!==null)createdWithParent.add(node);
++  return node;
++ };
++ for(const key of['appendChild','insertBefore']){
+   const original=adapter[key];
+-  adapter[key]=function(...args){return reactions(()=>original.apply(this,args));};
++  adapter[key]=function(parent,node,...args){
++   if(createdWithParent.delete(node))return;
++   return reactions(()=>original.call(this,parent,node,...args));
++  };
+  }
+ }
+ 
+diff --git a/src/document-reset.js b/src/document-reset.js
+--- a/src/document-reset.js
++++ b/src/document-reset.js
+@@ -78,7 +78,7 @@
+   DocumentImpl.prototype.open = function (...args) {
+     const context = contexts.get(this);
+     if (context && this._parsingMode === 'html' && !active(context)) return this;
+-    if (eligible(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
++    if (context && active(context) && this._parsingMode === 'html' && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
+     if (!eligible(context) || context.record.parserScriptDepth > 0 || this._parsingMode !== 'html' || this._throwOnDynamicMarkupInsertionCounter) return open.apply(this, args);
+     return reset(context, args);
+   };
+@@ -98,7 +98,7 @@
+   DocumentImpl.prototype.close = function (...args) {
+     const context = contexts.get(this), cycle = context?.current;
+     if (context && this._parsingMode === 'html' && !active(context)) return;
+-    if (cycle && active(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
++    if (context && active(context) && this._parsingMode === 'html' && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
+     if (cycle && active(context)) {
+       if (cycle.state.status === 'open') { context.record.closeRequested = args; cycle.close(); return; }
+       if (cycle.state.status === 'complete') {
+diff --git a/test/custom-elements.test.js b/test/custom-elements.test.js
+--- a/test/custom-elements.test.js
++++ b/test/custom-elements.test.js
+@@ -85,3 +85,26 @@
+  const dom=new JSDOM('',{runScripts:'outside-only'}),w=dom.window;class HostReplacement{}const prototype=HostReplacement.prototype,parent=Object.getPrototypeOf(HostReplacement),page={closed:false,documentAbort:new AbortController()};w.HTMLElement=HostReplacement;w.HTMLButtonElement=HostReplacement;const controller=installCustomElements(page,w);
+  try{assert.notEqual(w.HTMLElement,HostReplacement);assert.notEqual(w.HTMLButtonElement,HostReplacement);assert.equal(HostReplacement.prototype,prototype);assert.equal(HostReplacement.prototype.constructor,HostReplacement);assert.equal(Object.getPrototypeOf(HostReplacement),parent);class X extends w.HTMLElement{}w.customElements.define('standalone-private-original',X,{extends:'button'});assert.equal(w.document.createElement('button',{is:'standalone-private-original'}) instanceof X,true);}finally{controller.dispose();page.documentAbort.abort();w.close();}
+ });
++
++test('main parser preserves a custom element reaction-selected parent on append and foster insertion paths',()=>fixture(async({window:w})=>{
++ const d=w.document,stash=d.getElementById('stash'),appended=d.getElementById('appended'),fostered=d.getElementById('fostered');
++ assert.equal(appended.parentNode,stash);assert.equal(fostered.parentNode,stash);
++ assert.equal(appended.innerHTML,'<p>y</p>');assert.equal(fostered.innerHTML,'<i>z</i>');
++ assert.equal(d.getElementById('append_target').childNodes.length,0);
++ assert.equal(d.getElementById('foster_target').childNodes.length,1);
++ assert.equal(d.getElementById('foster_target').firstChild.tagName,'TABLE');
++ assert.deepEqual([...w.parserSnapshot],[true,true,0]);
++},`<!doctype html><body><div id=stash></div><script>class MoveToStash extends HTMLElement{static observedAttributes=['x'];attributeChangedCallback(){document.getElementById('stash').appendChild(this)}}customElements.define('move-to-stash',MoveToStash);</script><div id=append_target><move-to-stash id=appended x=1><p>y</p></move-to-stash></div><div id=foster_target><table><move-to-stash id=fostered x=1><i>z</i></move-to-stash><tr><td>c</td></tr></table></div><script>globalThis.parserSnapshot=[document.getElementById('appended').parentNode===document.getElementById('stash'),document.getElementById('fostered').parentNode===document.getElementById('stash'),document.getElementById('append_target').childNodes.length];</script>`));
++
++test('initial parser constructors cannot open, write or close their active Document and parsing continues',()=>fixture(async({window:w})=>{
++ assert.equal(w.constructorRan,true);assert.equal(w.afterConstructor,true);assert.equal(w.document.getElementById('after').textContent,'safe');
++ assert.equal(w.insertionErrors.length,3);
++ for(const error of w.insertionErrors){assert.equal(error instanceof w.DOMException,true);assert.equal(error.name,'InvalidStateError');}
++},`<!doctype html><head><script>globalThis.insertionErrors=[];class Guarded extends HTMLElement{constructor(){super();globalThis.constructorRan=true;for(const op of ['open','write','close'])try{document[op]('<b>must not replace</b>')}catch(error){insertionErrors.push(error)}}}customElements.define('guarded-element',Guarded);</script></head><body><guarded-element></guarded-element><p id=after>safe</p><script>globalThis.afterConstructor=true;</script>`));
++
++test('write-created parsers retain constructor markup guards and restore ordinary post-construction writes',()=>fixture(async({window:w})=>{
++ w.eval(`globalThis.guardErrors=[];class Guarded extends HTMLElement{constructor(){super();for(const op of ['open','write','close'])try{document[op]('unexpected')}catch(error){guardErrors.push(error.name)}}}customElements.define('guarded-write',Guarded);`);
++ const d=w.document;d.open();d.write('<guarded-write></guarded-write><p id=saved>saved</p>');d.close();
++ assert.deepEqual([...w.guardErrors],['InvalidStateError','InvalidStateError','InvalidStateError']);assert.equal(d.getElementById('saved').textContent,'saved');
++ d.open();d.write('<p id=next>next</p>');d.close();assert.equal(d.getElementById('next').textContent,'next');
++}));

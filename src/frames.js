@@ -1,3 +1,4 @@
+import {retireFrameActivity} from './frame-activity.js';
 import { completeInitialBlankFrame } from './document-reset.js';
 import { createInvocationTrampoline } from './invocation.js';
 import { installListenerOwnership, createOwnedWindow } from './listener-ownership.js';
@@ -11,13 +12,15 @@ import { createRequire } from 'node:module';
 // Scope: GET navigation, src/srcdoc/about:blank and normal jsdom subresources.
 // Frame history, POST navigation, named targets, sandbox/CSP/origin isolation and
 // cross-frame coordinate transforms are not implemented. Child facade close()
-// unregisters its browsing context; native detach/parent close closes windows.
+// retires browsing authority while preserving the actual realm and Document;
+// owning-page teardown finally aborts and closes the retained windows.
 const require = createRequire(import.meta.url);
 const FrameImpl = require('jsdom/lib/jsdom/living/nodes/HTMLFrameElement-impl.js').implementation;
 const WindowFactory = require('jsdom/lib/jsdom/browser/Window.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const { parseIntoDocument } = require('jsdom/lib/jsdom/browser/parser');
 const PerDocumentLoader = require('jsdom/lib/jsdom/browser/resources/per-document-resource-loader.js');
+const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
 const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/browser/Window.js'));
 const { parseURL } = jsdomRequire('whatwg-url');
 const DOCUMENTS = new WeakMap();
@@ -92,22 +95,21 @@ function patch() {
     request = fetchResource.call(this, url, { ...options, onLoad(data) {
       if (page.closed) throw stale();
       owner.registry.beforeFrameParse(frame, request);
-      page.documentAbort.signal.removeEventListener('abort', abort);
+      page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
       return loaded?.(data);
     }, onError(error) {
-      page.documentAbort.signal.removeEventListener('abort', abort);
-      if (!page.closed) owner.registry.announce('frameNavigationError', { frameId: page.frameId, error });
+      page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
+      if (!page.closed && !page.retired) owner.registry.announce('frameNavigationError', { frameId: page.frameId, error });
       return options.onError?.(error);
     } });
-    page.documentAbort.signal.addEventListener('abort', abort, { once: true });
+    page.documentAbort.signal.addEventListener('abort', abort, { once: true }); page.resourceRequests.add(request);
     return request;
   };
 }
 
 // Keep retained inactive Documents as real DOM trees. Delegate every other
 // cleanup operation to the original close, including timers, requests and ports.
-function closeRetainingDocument(document, close) {
-  const view = document._defaultView;
+function closeRetainingDocument(document, close, view = document._defaultView) {
   // Registry teardown already discarded child browsing contexts. Remove their
   // Window accessors before native close recurses; retained iframe DOM nodes
   // no longer have a live contentWindow after their own teardown.
@@ -152,7 +154,7 @@ class FramePage extends EventEmitter {
     this.executionContextId = registry.page.browser.nextExecutionContext++;
     this.executionContextUniqueId = randomUUID();
     this.documentGeneration = record.generation++; this.navigationGeneration = this.documentGeneration;
-    this.documentAbort = new AbortController(); this.closed = false;
+    this.documentAbort = new AbortController(); this.closed = false; this.resourceRequests = new Set();
     this.url = window.location.href;
     Object.defineProperty(this, 'securityOrigin', { get: () => originOf(window) });
     Object.defineProperty(this, 'mimeType', { get: () => implForWrapper(window.document).contentType });
@@ -200,7 +202,7 @@ class FramePage extends EventEmitter {
     return this.registry.navigate(this.frameId, url, options);
   }
   reconcileURL(window = this.dom.window) {
-    if (this.closed || window !== this.dom.window || window.location.href === this.url) return;
+    if (this.closed || this.retired || window !== this.dom.window || window.location.href === this.url) return;
     this.url = window.location.href; this.emit('withinDocument', { url: this.url, navigationType: 'fragment' });
   }
   close() { this.registry.detach(this.record.element); }
@@ -212,7 +214,7 @@ export function installFrames(page, window, { prepareWindow } = {}) {
   const existing = DOCUMENTS.get(implForWrapper(document));
   if (existing && !existing.registry.disposed) return existing.registry;
   const registry = new EventEmitter();
-  const records = new Map(), elements = new WeakMap(), contexts = new Map();
+  const records = new Map(), elements = new WeakMap(), contexts = new Map(), retired = new Set();
   const root = { id: rootId, parentId: undefined, window, document, page, generation: 0, root: true };
   records.set(rootId, root);
   registry.page = page; registry.disposed = false;
@@ -230,22 +232,37 @@ export function installFrames(page, window, { prepareWindow } = {}) {
   addContext(root); DOCUMENTS.set(implForWrapper(document), { registry, record: root });
   function children(record) { return [...records.values()].filter(child => child.parentId === record.id); }
   function destroyDocument(record) {
-    for (const child of children(record)) registry.detach(child.element);
+    for (const child of children(record)) registry.detach(child.element,{destroy:true});
     const old = record.page;
     if (!old || record.root || old.closed) return;
     old.closed = true; old.documentAbort.abort(); old.emit('close');
     DOCUMENTS.delete(implForWrapper(record.document)); contexts.delete(old.executionContextId);
-    registry.announce('frameContextDestroyed', { frameId: record.id, executionContextId: old.executionContextId,
+    // Closing the owning target detaches its session as one operation. The
+    // real contexts are cleaned up without extra per-context wire events.
+    if(!registry.page.closed)registry.announce('frameContextDestroyed', { frameId: record.id, executionContextId: old.executionContextId,
       executionContextUniqueId: old.executionContextUniqueId });
     record.page = undefined; registry.frames.delete(record.id);
   }
-  registry.detach = element => {
+  function retireDocument(record) {
+    const descendants=children(record),windows=new Map(descendants.map(child=>[child.element,child.page.dom.window]));
+    const indexed=domSymbolTree.treeToArray(implForWrapper(record.document),{filter:node=>windows.has(node)}).map(node=>windows.get(node));
+    for(const child of descendants)registry.detach(child.element,{announce:false});
+    // Closed Window.frames retains the actual original child Windows even
+    // though the owner iframe's active contentDocument slot is cleared.
+    for(let index=0;index<indexed.length;index++)Object.defineProperty(record.window,String(index),{configurable:true,enumerable:true,get:()=>indexed[index]});
+    const old=record.page;if(!old||old.closed)return;
+    old.retired=true;record.retired=true;retired.add(record);retireFrameActivity(record.window._globalProxy??record.window);
+    for(const request of old.resourceRequests)request?.abort?.();old.resourceRequests.clear();implForWrapper(record.document)._requestManager.close();
+    const document=implForWrapper(record.document);document._defaultView=null;record.element._contentDocument=null;DOCUMENTS.delete(document);registry.frames.delete(record.id);
+  }
+  registry.detach = (element,{destroy=false,announce=true}={}) => {
     const implementation = implForWrapper(element) ?? element;
     const record = elements.get(implementation);
     if (!record || !records.has(record.id)) return;
-    destroyDocument(record); records.delete(record.id); elements.delete(implementation);
-    record.window.close();
-    registry.announce('frameDetached', { frameId: record.id, reason: 'remove' });
+    if(destroy||registry.closing)destroyDocument(record);else retireDocument(record);
+    records.delete(record.id); elements.delete(implementation);
+    if(destroy||registry.closing)record.window.close();
+    if(announce)registry.announce('frameDetached', { frameId: record.id, reason: 'remove' });
   };
   function resourceLoader(framePage, inherited) {
     return Object.assign(Object.create(inherited), { fetch(url, options = {}) {
@@ -306,15 +323,16 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     registry.announce('frameNavigationStarted', { frameId: record.id, loaderId: framePage.loaderId, url: framePage.url });
     const closed = childWindow.close.bind(childWindow);
     childWindow.close = () => {
+      if(framePage.retired&&!registry.closing)return;
       if (record.page === framePage) destroyDocument(record);
-      return closeRetainingDocument(impl, closed);
+      return closeRetainingDocument(impl, closed, childWindow);
     };
     installListenerOwnership(childWindow._globalProxy).scope(() => {
     record.document.addEventListener('DOMContentLoaded', () => {
-      if (!framePage.closed) registry.announce('frameDOMContentLoaded', { frameId: record.id, loaderId: framePage.loaderId });
+      if (!framePage.closed && !framePage.retired) registry.announce('frameDOMContentLoaded', { frameId: record.id, loaderId: framePage.loaderId });
     });
     childWindow.addEventListener('load', () => {
-      if (!framePage.closed) registry.announce('frameLoad', { frameId: record.id, loaderId: framePage.loaderId });
+      if (!framePage.closed && !framePage.retired) registry.announce('frameLoad', { frameId: record.id, loaderId: framePage.loaderId });
     });
     childWindow.addEventListener('error', event => {
       if (!framePage.closed) framePage.emit('pageError', event.error ?? new Error(event.message));
@@ -366,6 +384,8 @@ export function installFrames(page, window, { prepareWindow } = {}) {
   };
   registry.findFrame = id => !registry.disposed ? registry.frames.get(id) : undefined;
   registry.findContext = id => !registry.disposed ? contexts.get(id) : undefined;
+  registry.executionPages = () => !registry.disposed ? [...new Set([...registry.frames.values(),...[...retired].map(record=>record.page).filter(Boolean)])].filter(value=>!value.closed) : [];
+  registry.findDocument = document => registry.executionPages().find(value=>value.dom.window.document===document);
   registry.getTree = () => {
     if (registry.disposed) throw stale();
     const tree = record => {
@@ -416,7 +436,9 @@ export function installFrames(page, window, { prepareWindow } = {}) {
   const originalClose = window.close.bind(window);
   registry.dispose = () => {
     if (registry.disposed) return;
-    for (const child of children(root)) registry.detach(child.element);
+    registry.closing=true;
+    for (const child of children(root)) registry.detach(child.element,{destroy:true});
+    for(const record of retired){destroyDocument(record);record.window.close();}retired.clear();
     for (let index = 0; index < window._length; index++) Reflect.deleteProperty(window, String(index));
     window._length = 0;
     registry.disposed = true; contexts.clear(); registry.frames.clear(); DOCUMENTS.delete(implForWrapper(document));

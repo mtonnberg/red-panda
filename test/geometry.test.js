@@ -123,12 +123,12 @@ test('CSS parser composes supported transforms and rejects malformed or unresolv
 
 test('geometry structured clone preserves subtypes, cycles, Map entries and buffer transfer', t => {
   const { window: w } = fixture(t), p = new w.DOMPoint(1, 2), ro = new w.DOMPointReadOnly(3, 4);
-  const value = { p, ro, matrix: new w.DOMMatrixReadOnly([1, 0, 0, 1, 5, 6]), quad: w.DOMQuad.fromRect({ width: 5 }),
+  const value = { p, ro, rect: new w.DOMRectReadOnly(1, 2, 5, 6), quad: w.DOMQuad.fromRect({ width: 5 }),
     map: new w.Map([[p, ro]]), bytes: new w.Uint8Array([8, 9]) };
   value.self = value; const clone = w.structuredClone(value, { transfer: [value.bytes.buffer] });
   assert.equal(clone.self, clone); assert.equal(value.bytes.byteLength, 0); assert.equal(clone.bytes instanceof w.Uint8Array, true);
   assert.ok(clone.p instanceof w.DOMPoint); assert.ok(clone.ro instanceof w.DOMPointReadOnly); assert.ok(!(clone.ro instanceof w.DOMPoint));
-  assert.equal(clone.map.get(clone.p), clone.ro); assert.ok(clone.matrix instanceof w.DOMMatrixReadOnly); assert.ok(!(clone.matrix instanceof w.DOMMatrix));
+  assert.equal(clone.map.get(clone.p), clone.ro); assert.ok(clone.rect instanceof w.DOMRectReadOnly); assert.ok(!(clone.rect instanceof w.DOMRect)); assert.equal(clone.rect.width, 5);
   clone.p.x = 100; assert.equal(p.x, 1); assert.equal(clone.quad.getBounds().width, 5);
   assert.equal(Object.getPrototypeOf(clone), w.Object.prototype);
 });
@@ -161,4 +161,14 @@ test('geometry installation is idempotent and methods enforce their brands', t =
   assert.throws(() => w.DOMPoint.prototype.toJSON.call({}), error => error instanceof w.TypeError);
   assert.throws(() => w.DOMMatrix.prototype.toJSON.call({}), error => error instanceof w.TypeError);
   assert.throws(() => w.DOMQuad.prototype.getBounds.call({}), error => error instanceof w.TypeError);
+});
+
+
+test('pinned native matrix clone rejection is atomic even for standalone geometry installation', t => {
+  const { window: w } = fixture(t);
+  for (const matrix of [new w.DOMMatrix(), new w.DOMMatrixReadOnly()]) {
+    const bytes = new w.Uint8Array([4,5]);
+    assert.throws(() => w.structuredClone({matrix,bytes},{transfer:[bytes.buffer]}), error => error.name === 'DataCloneError');
+    assert.equal(bytes.byteLength,2);
+  }
 });

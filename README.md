@@ -6,7 +6,7 @@ and Chrome DevTools Protocol (CDP) behavior. Puppeteer automation, the example,
 and integration assertions are written in PureScript.
 
 The independent runtime uses Node's V8 and **jsdom** for HTML, DOM and page
-scripts, plus a small owned C++ binding for `document.all`'s HTMLDDA behavior.
+scripts, plus owned C++ bindings for HTMLDDA, runtime entry and public V8 heap queries.
 It does not import Lightpanda's production engine or launch Chromium.
 Full independent replication is the goal; the [compatibility ledger](docs/COMPATIBILITY.md)
 records substantial remaining gaps. No engine or performance parity is claimed.
@@ -34,7 +34,7 @@ npm run build:automation
 npm test
 ```
 
-Build both collection and runtime bindings with the same Node executable used
+Build the collection, runtime and heap-query bindings with the same Node executable used
 to run Red Panda. Rebuild after changing Node/V8 or the native source; startup verifies the
 runtime versions and source/binary digests. See [native build instructions](native/README.md)
 for header discovery and overrides.
@@ -59,6 +59,10 @@ configuration, regenerate the lock with `spago build` in `automation/`.
 If the default npm cache is unwritable in your cloud environment, set
 `NPM_CONFIG_CACHE=/workspace/shared/npm-cache`. The automation wrapper defaults
 XDG cache/config/data locations to the ignored `.cache/` directory.
+
+When using a managed HTTP proxy, preserve its configuration and include
+`0.0.0.0,127.0.0.1,localhost` in `NO_PROXY` and `no_proxy` for the owned local
+test servers. Some cross-origin and insecure-context fixtures use `0.0.0.0`.
 
 Fetch a trusted document:
 
@@ -145,7 +149,9 @@ navigation, advanced shadow CSS, flattened shadow/frame pointer/Tab input and fu
 CSS behavior remain unfinished. Utility worlds have independent globals,
 constructors and DOM wrapper expandos, with actual observer/geometry/font
 producers for the supported workflow. Their CSS/XML/SVG/messaging decorators
-and retired-frame lifetime remain incomplete. Some configuration commands still
+remain incomplete. Removed frames retain actual VM/DOM objects and existing
+contexts until owning-page teardown; their active browsing authority is retired.
+Some configuration commands still
 only acknowledge requests. Markdown and structured metadata are subsets, not byte-identical
 Lightpanda output. `done` does not track every future timer. Documents are decoded
 as UTF-8. CDP storage/cookies are in memory; CLI cookies can be saved explicitly.
@@ -159,10 +165,14 @@ Initial loading/frame resets and synchronous written external scripts remain
 incomplete. Performance entries report observed transport/lifecycle data;
 unavailable DNS/TLS/header-phase/wire-byte fields remain zero or empty.
 
-`Runtime.queryObjects` remains unsupported: experimental heap implementations
-crashed during context lifecycle checks and are excluded from normal builds and
-tests. See the [evidence and limitations](docs/reference/runtime-query-contract.md).
-No speed or memory parity is claimed.
+`Runtime.queryObjects` uses the public V8 heap profiler and returns real public
+objects in an Array from the selected VM realm. It verifies actual realm and
+wrapper provenance and fails explicitly on resource limits. Collection is
+blocking; its deadline is cooperative. Exact heap counts and full wrapper
+coverage still differ from Lightpanda. Earlier inspector-based attempts and
+their crashes remain in the [historical evidence](docs/reference/runtime-query-contract.md);
+the [current backend](proposals/runtime-heap-worlds/README.md) uses a separate
+owned native binding. No speed or memory parity is claimed.
 
 ES modules use Node's experimental VM-module API in the actual page realm. The
 Linux CLI enables it by replacing its own process, preserving its PID. Embedding
@@ -185,10 +195,12 @@ passing an empty header list clears them. Configuration is per page and survives
 navigation. Automatic referrers use the full URL for the same origin, only the
 origin across origins, and are omitted on HTTPS-to-HTTP downgrades. Cross-origin
 redirects remove authorization. Custom referrer policies remain unfinished.
-Header overrides reach asynchronous XMLHttpRequest too, including cookies,
-redirects and CDP events. XHR enforces basic CORS/preflight rules and rejects
-synchronous use, redirects needing another preflight and opaque-origin redirect
-taint. Page `fetch` also enforces CORS and filters response headers; opaque
+Header overrides reach XMLHttpRequest too, including cookies, redirects and
+CDP events. Synchronous Window/frame XHR uses a real Browser-owned transport
+thread with cancellation across VM interruption. XHR enforces basic CORS/preflight
+rules and rejects redirects needing another preflight and opaque-origin redirect
+taint. Synchronous Blob URLs and utility-world XHR remain unsupported.
+Page `fetch` also enforces CORS and filters response headers; opaque
 responses hide status, headers and bodies. Progress is buffered; preflight
 caching, the browser HTTP cache and streaming uploads remain unsupported.
 Blob URLs resolve through the document/context registry. Invalid compression can fail before response headers become

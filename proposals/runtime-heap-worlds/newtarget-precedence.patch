@@ -1,0 +1,33 @@
+--- a/src/heap-registry.js
++++ b/src/heap-registry.js
+@@ -87,7 +87,7 @@
+   // Resolve only the exact global captured by a successful trusted factory.
+   // Never discover ownership from properties of a heap candidate or its impl.
+   const factoryGlobal=factoryGlobals.get(publicValue)?.deref();
+-  if(selectedGlobal&&factoryGlobal){const owner=windows.get(factoryGlobal),actual=owner?owner.global.deref():binding.creationGlobal(factoryGlobal);if(owner&&!actual||knownGlobals.has(actual)&&actual!==selectedGlobal){filtered++;continue}}
++  if(selectedGlobal&&!knownGlobals.has(creationGlobal)&&factoryGlobal){const owner=windows.get(factoryGlobal),actual=owner?owner.global.deref():binding.creationGlobal(factoryGlobal);if(owner&&!actual||knownGlobals.has(actual)&&actual!==selectedGlobal){filtered++;continue}}
+   // Only exact objects tagged private by their real host factory are omitted.
+   // Creation-context inference would drop legitimate foreign-prototype objects.
+   if(privateValues.has(publicValue)||(!registered&&privateValues.has(value))){filtered++;continue}
+--- a/test/heap-query-worlds.test.js
++++ b/test/heap-query-worlds.test.js
+@@ -2,6 +2,7 @@
+ import assert from 'node:assert/strict';
+ import {serve} from '../src/cdp.js';
+ import {queryHeapObjects} from '../src/heap-query.js';
++import {registerPlatformFactory} from '../src/platform-factories.js';
+ import {connect} from './cdp-client.js';
+ async function fixture(body){const service=await serve({port:0,loadResources:['iframe']}),client=await connect(`ws://127.0.0.1:${service.port}/`);try{const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId,{timeout:15000});await send('Runtime.enable');await send('Page.enable');await send('Page.navigate',{url:'data:text/html,<form id=f><input name=x></form><button id=b>button</button><iframe id=child srcdoc="<title>child</title>"></iframe>'});const page=service.browser.pages.get(targetId);const world=async(name,frameId=page.frameId)=>(await send('Page.createIsolatedWorld',{frameId,worldName:name})).executionContextId;const evaluate=(expression,contextId,options={})=>send('Runtime.evaluate',{expression,contextId,...options});const query=async(expression,contextId,group)=>{const prototype=await evaluate(expression,contextId,{objectGroup:'prototypes'});const result=await send('Runtime.queryObjects',{prototypeObjectId:prototype.result.objectId,objectGroup:group});return {prototype:prototype.result.objectId,array:result.objects.objectId}};const call=(objectId,functionDeclaration,options={})=>send('Runtime.callFunctionOn',{objectId,functionDeclaration,returnByValue:true,...options});await body({service,page,send,world,evaluate,query,call})}finally{await client.close();await service.close()}}
+ 
+@@ -32,3 +33,11 @@
+   const id=await world('heap-lifetime');page.dom.window.document.addEventListener('retain-heap',event=>{retained.push(event.detail)},{once:true});await evaluate('let heapLexical=1;globalThis.P={};globalThis.item=Object.create(P);document.dispatchEvent(new CustomEvent("retain-heap",{detail:{global:window,P,item}}))',id);const q=await query('P',id);assert.equal((await call(q.array,'function(){return this.length===1&&this[0]===item}')).result.value,true);assert.ok((await send('Runtime.globalLexicalScopeNames',{executionContextId:id})).names.includes('heapLexical'));await send('Page.navigate',{url:'data:text/html,<title>successor-'+cycle+'</title>'});await assert.rejects(send('Runtime.queryObjects',{prototypeObjectId:q.prototype}),e=>e.code===-32000);
+  }assert.equal(retained.length,3);
+ }));
++
++test('a trusted factory origin is a Host bridge fallback and cannot override actual registered object creation',async()=>fixture(async({page,world,evaluate,query,call})=>{
++ const id=await world('heap-actual-owner');let actual;page.dom.window.document.addEventListener('actual-owner',event=>{actual=event.detail},{once:true});await evaluate('globalThis.P={};globalThis.item=Object.create(P);document.dispatchEvent(new CustomEvent("actual-owner",{detail:item}))',id);
++ // A real host producer returns an existing foreign ScriptValue. Its own
++ // document is not authority to change that value's genuine VM identity.
++ const produce=()=>actual;const value=produce();registerPlatformFactory(value,{kind:'OwnedForeignFactoryResult',globalObject:page.dom.window});
++ const result=await query('P',id);assert.deepEqual((await call(result.array,'function(){return {length:this.length,same:this[0]===item,realm:Object.getPrototypeOf(this)===Array.prototype}}')).result.value,{length:1,same:true,realm:true});
++}));

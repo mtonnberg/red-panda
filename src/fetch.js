@@ -1,3 +1,4 @@
+import {registerHeapWrapper} from './heap-registry.js';
 import { randomBytes } from 'node:crypto';
 import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable, onReadableSettled, noteReadableOperation } from './request-stream-state.js';
 import { createRequire } from 'node:module';
@@ -24,7 +25,8 @@ const typedOffset = Object.getOwnPropertyDescriptor(typedPrototype, 'byteOffset'
 const viewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get;
 const viewLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
 const viewOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get;
-const INSTALLED = new WeakMap();
+const INSTALLED = new WeakMap(), RETIRE_REQUESTS = new WeakMap();
+export function retireFetchRequests(window) { RETIRE_REQUESTS.get(window)?.(); }
 const HEADER_STATE = new WeakMap(), REQUEST_STATE = new WeakMap(), RESPONSE_STATE = new WeakMap();
 const FORBIDDEN = new Set(['accept-charset', 'accept-encoding', 'access-control-request-headers',
   'access-control-request-method', 'connection', 'content-length', 'cookie', 'cookie2', 'date', 'dnt',
@@ -69,7 +71,7 @@ export function installFetch(page, window) {
   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
   const pending = new Set();
   const bodyCleanups = new Set();
-  let disposed = false;
+  let disposed = false, requestEpoch = 0;
   const active = () => !disposed && !page.closed && !!window.document && page.documentGeneration === generation && !documentSignal?.aborted;
   const documentOrigin = () => implForWrapper(window.document)?._origin ?? window.location.origin;
   function realmError(error) {
@@ -263,11 +265,11 @@ export function installFetch(page, window) {
   }
   function wrapHeaders(raw, guard) {
     const result = Object.create(Headers.prototype);
-    headersState.set(result, { raw, guard }); return result;
+    headersState.set(result, { raw, guard }); return registerHeapWrapper(result,window);
   }
   class Headers {
     constructor(init) {
-      try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); }
+      try { headersState.set(this, { raw: new NativeHeaders(init), guard: 'none' }); registerHeapWrapper(this,window); }
       catch (error) { throw headerError(error); }
     }
     append(name, value) { if (arguments.length < 2) throw new window.TypeError('append requires two arguments'); this._change('append', name, value); }
@@ -374,7 +376,7 @@ export function installFetch(page, window) {
     for (const name of [...raw.headers.keys()]) raw.headers.delete(name);
     for (const [name, value] of headers) raw.headers.set(name, value);
     requestState.set(request, { raw, publicSignal: signal, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(raw.headers, raw.mode === 'no-cors' ? 'request-no-cors' : 'request') });
-    return request;
+    return registerHeapWrapper(request,window);
   }
   class Request {
     constructor(input, init = {}) {
@@ -411,7 +413,7 @@ export function installFetch(page, window) {
         const wrapped = wrapRequest(new NativeRequest(source, prepared), bufferedBytes, publicSignal);
         const state = requestState.get(wrapped);
         if (streamBody) { state.streamBody = streamBody; state.streamUsed = false; if (streamBody === sourceState?.streamBody && sourceState.streamBytes) { state.streamBytes = sourceState.streamBytes; state.streamVersion = sourceState.streamVersion; } }
-        requestState.set(this, state);
+        requestState.set(this, state); registerHeapWrapper(this,window);
       } catch (error) { throw realmError(error); }
     }
     clone() {
@@ -435,7 +437,7 @@ export function installFetch(page, window) {
     const response = Object.create(Response.prototype);
     const { bufferedBytes, ...metadata } = view;
     responseState.set(response, { raw, ...metadata, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
-    return response;
+    return registerHeapWrapper(response,window);
   }
   function abortableBody(raw, signal) {
     if (!raw.body) return raw;
@@ -510,7 +512,7 @@ export function installFetch(page, window) {
         const prepared = bufferedInput(body);
         const streamBody = isReadableSource(prepared.value) ? prepared.value : undefined;
         const raw = new NativeResponse(streamBody ? new Uint8Array() : prepared.value, { status, statusText, headers: getHeaders(headers).raw });
-        responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') });
+        responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') }); registerHeapWrapper(this,window);
       } catch (error) { throw realmError(error); }
     }
     static error() { return wrapResponse(NativeResponse.error()); }
@@ -617,6 +619,7 @@ export function installFetch(page, window) {
       if (raw.keepalive && body?.byteLength > 65536) throw new window.TypeError('Keepalive request body exceeds 64 KiB');
       const unsafe = [...headers].filter(([name, value]) => !safeHeader(name, value)).map(([name]) => name).sort();
       const preflight = !SIMPLE_METHODS.has(raw.method) || unsafe.length > 0;
+      let redirectUnsafe = unsafe;
       const credentials = raw.credentials === 'include';
       if (raw.mode === 'cors' && cross(raw.url) && preflight) {
         const preflightHeaders = new NativeHeaders({ origin, 'access-control-request-method': raw.method });
@@ -645,7 +648,10 @@ export function installFetch(page, window) {
           if (raw.mode === 'same-origin' && cross(next)) throw new window.TypeError('Cross-origin redirect blocked by same-origin mode');
           if (raw.mode === 'cors') {
             if (cross(previous)) cors(response, origin, credentials);
-            if (cross(next) && preflight) throw new window.TypeError('Redirects requiring another CORS preflight are unsupported');
+            // Cross-origin transport strips authored Authorization before the next
+            // hop. It therefore stops contributing to that hop's preflight.
+            if (new URL(previous).origin !== new URL(next).origin) redirectUnsafe = redirectUnsafe.filter(name => name !== 'authorization');
+            if (cross(next) && (!SIMPLE_METHODS.has(raw.method) || redirectUnsafe.length > 0)) throw new window.TypeError('Redirects requiring another CORS preflight are unsupported');
             if (cross(previous) && new URL(previous).origin !== new URL(next).origin) throw new window.TypeError('Opaque-origin CORS redirects are unsupported');
           }
           if (cross(next)) redirectHeaders?.set('origin', origin);
@@ -674,6 +680,7 @@ export function installFetch(page, window) {
     } finally { pending.delete(controller); }
   }
   function fetch(input, init) {
+    const epoch = requestEpoch;
     return new window.Promise((resolve, reject) => {
       if (!active()) return;
       let request;
@@ -681,8 +688,8 @@ export function installFetch(page, window) {
         if (arguments.length === 0) throw new window.TypeError('fetch requires an input');
         request = new Request(input, init);
       } catch (error) { reject(error); return; }
-      perform(request).then(value => { if (active()) resolve(value); }, error => {
-        if (!active()) return;
+      perform(request).then(value => { if (active() && epoch === requestEpoch) resolve(value); }, error => {
+        if (!active() || epoch !== requestEpoch) return;
         const signal = getRequest(request).raw.signal;
         reject(signal.aborted ? signal.reason : realmError(error));
       });
@@ -693,10 +700,12 @@ export function installFetch(page, window) {
   }
   const previousClose = window.close;
   const close = function (...args) { dispose(); return previousClose.apply(this, args); };
+  const cancelPending = () => { requestEpoch++; for (const controller of pending) controller.abort(); pending.clear(); };
+  RETIRE_REQUESTS.set(window, cancelPending);
   const dispose = () => {
     if (disposed) return;
     disposed = true;
-    for (const controller of pending) controller.abort(); pending.clear();
+    cancelPending();
     for (const cleanup of bodyCleanups) cleanup();
     documentSignal?.removeEventListener('abort', dispose);
     if (window.close === close) window.close = previousClose;

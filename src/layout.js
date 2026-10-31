@@ -1,3 +1,4 @@
+import {registerHeapWrapper} from './heap-registry.js';
 import{installElementScroll}from './element-scroll.js';
 import {resolveFlowLength,nativeTextHeight} from './flow-metrics.js';
 import {createHorizontalLayout} from './horizontal-layout.js';
@@ -299,6 +300,7 @@ export function installLayout(page, window, options = {}) {
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
+    registerHeapWrapper(view,window,original);
     computedViews.set(original,view); return view;
   };
   page.layout = layout;

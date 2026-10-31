@@ -1,3 +1,4 @@
+import {runHeapQuery} from './heap-query.js';
 import {invocationBindingFor} from './invocation.js';
 import { Session as InspectorSession } from 'node:inspector';
 import { randomUUID } from 'node:crypto';
@@ -7,7 +8,7 @@ import { nameForVMContext, isOwnedVMContextName } from './context-names.js';
 import { withTimeout } from './browser.js';
 
 const methods = new Set([
-  'Runtime.awaitPromise', 'Runtime.compileScript', 'Runtime.runScript',
+  'Runtime.queryObjects', 'Runtime.awaitPromise', 'Runtime.compileScript', 'Runtime.runScript',
   'Runtime.globalLexicalScopeNames', 'Runtime.getHeapUsage', 'Runtime.getIsolateId',
   'Runtime.getExceptionDetails', 'Runtime.setMaxCallStackSizeToCapture',
 ]);
@@ -142,6 +143,7 @@ async function awaitInState(state, value) {
 export function supportsRuntime(method) { return methods.has(method); }
 
 export async function runRuntime(session, method, params = {}) {
+  if(method==='Runtime.queryObjects')return runHeapQuery(session,params);
   if (!supportsRuntime(method)) throw new RuntimeError(`Unsupported Runtime method: ${method}`, -32601);
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new RuntimeError('Parameters must be an object');
   prune(session);

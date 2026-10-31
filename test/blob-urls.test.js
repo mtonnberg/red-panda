@@ -112,7 +112,8 @@ test('inherited blank/srcdoc frames share tuple origins; cross-origin and sandbo
     const childURL = srcdoc.window.URL.createObjectURL(new srcdoc.window.Blob(['child-owned']));
     assert.equal(decoded(resolveBlobURL(root.page, childURL)), 'child-owned');
     const retained = resolveBlobURL(root.page, childURL); root.window.document.getElementById('srcdoc').remove();
-    denied(() => resolveBlobURL(root.page, childURL)); assert.equal(decoded(retained), 'child-owned');
+    assert.equal(decoded(resolveBlobURL(root.page, childURL)), 'child-owned'); assert.equal(decoded(retained), 'child-owned');
+    assert.equal(srcdoc.window.closed, true); assert.equal(srcdoc.window.document.defaultView, null);
   } finally { browser.close(); }
 });
 
@@ -126,6 +127,38 @@ test('blank child frames inherit opaque identity while independent opaque pages 
     const url = root.window.URL.createObjectURL(new root.window.Blob(['opaque inherited']));
     assert.equal(decoded(resolveBlobURL(page, url)), 'opaque inherited');
     const peer = await create(browser, 'data:text/html,<h1>Independent</h1>'); denied(() => resolveBlobURL(peer.page, url));
+  } finally { browser.close(); }
+});
+
+test('retired frames retain actual Blob URL creation/fetch/revocation until root disposal, preserving peer-owned URLs and retained bytes', async () => {
+  const browser = new Browser({ loadResources: ['iframe'] });
+  try {
+    const root = await create(browser, `${origin}/frames`), peer = await create(browser, `${origin}/peer`);
+    const iframe = root.window.document.getElementById('srcdoc'), child = iframe.contentWindow;
+    const childPage = [...root.page.frames.frames.values()].find(candidate => candidate.dom.window === child);
+    const before = child.URL.createObjectURL(new child.Blob(['before retirement'], { type: 'text/plain' }));
+    const retainedResponse = await root.window.fetch(before), retainedBlob = await (await root.window.fetch(before)).blob();
+    const peerURL = peer.window.URL.createObjectURL(new peer.window.Blob(['peer-owned']));
+    iframe.remove();
+    assert.equal(child.closed, true); assert.equal(child.document.defaultView, null);
+    assert.equal(root.page.frames.findFrame(childPage.frameId), undefined);
+    assert.ok(root.page.frames.executionPages().includes(childPage));
+    assert.equal(await (await root.window.fetch(before)).text(), 'before retirement');
+    assert.equal(await (await child.fetch(before)).text(), 'before retirement');
+    const after = child.URL.createObjectURL(new child.Blob(['after retirement'], { type: 'text/plain' }));
+    assert.equal(await (await child.fetch(after)).text(), 'after retirement');
+    assert.equal(await (await peer.window.fetch(after)).text(), 'after retirement');
+    child.URL.revokeObjectURL(before);
+    denied(() => resolveBlobURL(root.page, before));
+    await assert.rejects(child.fetch(before), error => error.name === 'TypeError');
+    assert.equal(await retainedResponse.text(), 'before retirement');
+    assert.equal(await retainedBlob.text(), 'before retirement');
+    const retained = resolveBlobURL(peer.page, after);
+    root.page.close();
+    denied(() => resolveBlobURL(peer.page, after));
+    assert.equal(decoded(retained), 'after retirement');
+    assert.equal(await retainedBlob.text(), 'before retirement');
+    assert.equal(decoded(resolveBlobURL(peer.page, peerURL)), 'peer-owned');
   } finally { browser.close(); }
 });
 

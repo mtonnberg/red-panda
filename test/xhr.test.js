@@ -250,9 +250,11 @@ test('cross-origin requests enforce preflight, credentials, response exposure an
   assert.equal(page.activeRequests.size, 0);
 }));
 
-test('upload event contracts, validation, forbidden headers and explicit sync rejection', async () => fixture(async ({ window, base }) => {
+test('upload event contracts, validation, forbidden headers and synchronous property guards', async () => fixture(async ({ window, base }) => {
   const xhr = new window.XMLHttpRequest();
-  assert.throws(() => xhr.open('GET', base, false), { name: 'NotSupportedError' });
+  xhr.open('GET', base, false);
+  assert.throws(() => { xhr.timeout = 1; }, { name: 'InvalidAccessError' });
+  xhr.abort();
   assert.throws(() => xhr.open('TRACE', base), { name: 'SecurityError' });
   assert.throws(() => xhr.open('GET invalid', base), { name: 'SyntaxError' });
   assert.throws(() => xhr.send(), { name: 'InvalidStateError' });

@@ -228,7 +228,7 @@ test('HTTP script failures report a page error while the document finishes loadi
   } finally { browser.close(); }
 });
 
-test('cross-origin redirects remove authorization and reduce automatic referrers to the origin', async () => {
+test('cross-origin redirects remove authored authorization and reduce automatic referrers to the origin', async () => {
   const destination = await createFixture();
   const received = [];
   destination.server.on('request', request => received.push(request.headers));
@@ -236,8 +236,9 @@ test('cross-origin redirects remove authorization and reduce automatic referrers
   try {
     const page = browser.createPage();
     await page.navigate(`${fixture.url}next?private=fixture-only`);
-    page.setExtraHTTPHeaders({ Authorization: 'fixture-authorization' });
-    const response = await page.fetch(`${fixture.url}redirect-to?url=${encodeURIComponent(`${destination.url}header-api`)}`);
+    const response = await page.fetch(`${fixture.url}redirect-to?url=${encodeURIComponent(`${destination.url}header-api`)}`, {
+      headers: { Authorization: 'fixture-authorization' },
+    });
     const data = await response.json();
     assert.equal(data.referer, fixture.url);
     assert.equal(received.length, 1);

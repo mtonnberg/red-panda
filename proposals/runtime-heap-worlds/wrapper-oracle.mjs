@@ -1,0 +1,31 @@
+import {writeFile} from 'node:fs/promises';
+import {serve} from '/tmp/red-panda-heap-worlds-9aiqjima/src/cdp.js';
+import {connect} from '../../test/cdp-client.js';
+import {startReference} from '../runtime-heap-query/implementation/reference-driver.mjs';
+const output={node:process.version,results:{}};
+for(const kind of ['native','candidate']){
+ const service=kind==='native'?await startReference('/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux'):await serve({port:0});let client;
+ try{
+  client=await connect(kind==='native'?service.endpoint:`ws://127.0.0.1:${service.port}/`);const{targetId}=await client.send('Target.createTarget',{url:'about:blank'});const{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(m,p={})=>client.send(m,p,sessionId,{timeout:10000});
+  await send('Runtime.enable');await send('Page.enable');await send('Page.navigate',{url:'data:text/html,<form id=f><input name=x></form><button id=b class=c data-value=x>button</button>'});const{frameTree}=await send('Page.getFrameTree');const ids={};for(const name of ['a','b'])ids[name]=(await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'heap-'+name})).executionContextId;
+  const result=output.results[kind]={worlds:{}};
+  for(const [world,contextId]of Object.entries({main:undefined,...ids})){
+   const evaluate=(expression,extra={})=>send('Runtime.evaluate',{expression,contextId,...extra});const rows=result.worlds[world]={};
+   await evaluate(`globalThis.P={};globalThis.item=Object.create(P);globalThis.refs={HTMLFormElement:document.getElementById('f'),HTMLFormControlsCollection:document.getElementById('f').elements,HTMLCollection:document.forms,NodeList:document.querySelectorAll('button'),NamedNodeMap:document.getElementById('b').attributes,DOMTokenList:document.getElementById('b').classList,DOMStringMap:document.getElementById('b').dataset,Event:new Event('x'),CustomEvent:new CustomEvent('x'),Blob:new Blob(['x']),File:new File(['x'],'x'),FormData:new FormData(),URL:new URL('http://example.test/'),URLSearchParams:new URLSearchParams('x=1')};refs.HTMLFormElement.expando=${JSON.stringify(world)};`);
+   for(const [name,expression]of Object.entries({ordinary:'P',Object:'Object.prototype',...Object.fromEntries(['HTMLFormElement','HTMLFormControlsCollection','HTMLCollection','NodeList','NamedNodeMap','DOMTokenList','DOMStringMap','Event','CustomEvent','Blob','File','FormData','URL','URLSearchParams'].map(name=>[name,name+'.prototype']))})){
+    try{const proto=await evaluate(expression);const query=await send('Runtime.queryObjects',{prototypeObjectId:proto.result.objectId,objectGroup:'query-'+world});const body=name==='ordinary'?'return {length:this.length,same:this.includes(item),realm:Object.getPrototypeOf(this)===Array.prototype}':name==='Object'?'return {length:this.length,form:this.includes(refs.HTMLFormElement),realm:Object.getPrototypeOf(this)===Array.prototype}':`return {length:this.length,same:this.includes(refs[${JSON.stringify(name)}]),realm:Object.getPrototypeOf(this)===Array.prototype,expando:refs.HTMLFormElement.expando}`;const actual=await send('Runtime.callFunctionOn',{objectId:query.objects.objectId,functionDeclaration:'function(){'+body+'}',returnByValue:true});rows[name]={status:'OBSERVED',...actual.result.value};}catch(error){rows[name]={status:'ERROR',code:error.code,message:error.message}}
+   }
+   rows.availability=(await evaluate(`Object.fromEntries(['Headers','Request','Response','ReadableStream','fetch','HTMLAllCollection'].map(name=>[name,typeof globalThis[name]]))`,{returnByValue:true})).result.value;
+  }
+  // Authored payload intentionally carries the actual main wrapper into utility.
+  await send('Runtime.evaluate',{expression:'globalThis.received=undefined;document.addEventListener("heap-detail",event=>{received=event.detail})',contextId:ids.a});
+  await send('Runtime.evaluate',{expression:'document.dispatchEvent(new CustomEvent("heap-detail",{detail:refs.HTMLFormElement}))'});
+  result.foreign=(await send('Runtime.evaluate',{expression:'({same:received===refs.HTMLFormElement,expando:received.expando,own:refs.HTMLFormElement.expando,mainProto:Object.getPrototypeOf(received)===Object.getPrototypeOf(refs.HTMLFormElement)})',contextId:ids.a,returnByValue:true})).result.value;
+  for(const [label,expression]of Object.entries({foreign:'Object.getPrototypeOf(received)',own:'HTMLFormElement.prototype'})){
+   try{const prototype=await send('Runtime.evaluate',{expression,contextId:ids.a});const query=await send('Runtime.queryObjects',{prototypeObjectId:prototype.result.objectId});const actual=await send('Runtime.callFunctionOn',{objectId:query.objects.objectId,functionDeclaration:'function(){return {length:this.length,foreign:this.includes(received),own:this.includes(refs.HTMLFormElement),realm:Object.getPrototypeOf(this)===Array.prototype}}',returnByValue:true});result['foreignQuery-'+label]={status:'OBSERVED',...actual.result.value}}catch(error){result['foreignQuery-'+label]={status:'ERROR',code:error.code,message:error.message}}
+  }
+  await send('Runtime.evaluate',{expression:'globalThis.fake=Object.create(Object.getPrototypeOf(received));globalThis.fakeChild=Object.create(fake);globalThis.getterHits=0;for(const key of Object.getOwnPropertySymbols(refs.HTMLFormElement))Object.defineProperty(fake,key,{get(){getterHits++;throw Error("authored getter")}})',contextId:ids.a});
+  const fp=await send('Runtime.evaluate',{expression:'Object.getPrototypeOf(received)',contextId:ids.a});const fq=await send('Runtime.queryObjects',{prototypeObjectId:fp.result.objectId});result.foreignFake=(await send('Runtime.callFunctionOn',{objectId:fq.objects.objectId,functionDeclaration:'function(){return {length:this.length,fake:this.includes(fake),child:this.includes(fakeChild),hits:getterHits}}',returnByValue:true})).result.value;
+ }catch(error){output.results[kind]={status:'UNOBSERVED',code:error.code,message:error.message}}finally{await client?.close();await service.close()}
+}
+await writeFile(`proposals/runtime-heap-worlds/wrapper-oracle-node${process.versions.node.split('.')[0]}.json`,JSON.stringify(output,null,2)+'\n');console.log(JSON.stringify(output));

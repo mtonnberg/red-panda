@@ -1,3 +1,6 @@
+import { SyncHTTP } from './sync-http.js';
+import {installFrameActivity} from './frame-activity.js';
+import {installHeapFactories,prepareHeapRealm} from './heap-registry.js';
 import {prepareUtilityPlatform} from './utility-platform.js';
 import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
 import {createInvocationTrampoline} from './invocation.js';
@@ -31,6 +34,7 @@ import { installModuleScripts } from './modules.js';
 import { installForms } from './forms.js';
 import { installInputControls } from './input-controls.js';
 import { installDocumentXML } from './document-xml.js';
+import { installCustomElements } from './custom-elements.js';
 import { installWorkers } from './workers.js';
 import { installXHR } from './xhr.js';
 import { dumpDocument } from './dump.js';
@@ -55,6 +59,7 @@ import { installMutations } from './mutations.js';
 
 // Name root and frame VM contexts before any Window is constructed.
 installVMContextNames();
+installHeapFactories();
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
 let defaultCollectionsBinding;
@@ -114,6 +119,7 @@ export class Browser extends EventEmitter {
   constructor(options = {}) {
     super();
     this.options = options;
+    this.syncHTTP = new SyncHTTP();
     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
@@ -139,7 +145,7 @@ export class Browser extends EventEmitter {
     for (const page of [...this.pages.values()]) if (page.context.id === id) page.close();
     this.contexts.delete(id);
   }
-  close() { for (const page of [...this.pages.values()]) page.close(); }
+  close() { for (const page of [...this.pages.values()]) page.close(); this.syncHTTP.close(); }
 }
 
 export class Page extends EventEmitter {
@@ -235,6 +241,7 @@ export class Page extends EventEmitter {
       installDialogs(this, window);
       installForms(this, window);
       installDocumentXML(this, window);
+      installCustomElements(this, window);
       this.moduleScripts = installModuleScripts(this, window);
       installClassicScripts(this, window);
       installInputControls(this, window);
@@ -254,6 +261,8 @@ export class Page extends EventEmitter {
       });
     });
     prepareUtilityPlatform(window);
+    installFrameActivity(this,window);
+    prepareHeapRealm(this,window);
     (this.registry?.page??this).emit('utilityWindowPrepared',{page:this,window});
     for (const { source,worldName } of this.newDocumentScripts.values()) {
       if(worldName)continue;
@@ -430,7 +439,7 @@ export class Page extends EventEmitter {
     const inputUrl = input instanceof Request ? input.url : String(input);
     let url = new URL(inputUrl, this.url).href;
     if (new URL(url).protocol === 'blob:') {
-      const owner = init.frameId ? this.frames?.findFrame(init.frameId) : this;
+      const owner = init.frameId ? (this.frames?.findFrame(init.frameId) ?? this.frames?.executionPages().find(candidate => candidate.frameId === init.frameId)) : this;
       if (!owner) throw new TypeError('Object URL frame is no longer available');
       // Snapshot before any await: revocation affects future reads, not this one.
       const snapshot = init.blobSnapshot ?? resolveBlobURL(owner, url);
@@ -458,9 +467,6 @@ export class Page extends EventEmitter {
     const headers = new Headers();
     if (input instanceof Request) input.headers.forEach((value, key) => headers.set(key, value));
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
-    // CDP defaults override conflicting page-supplied headers, as observed in
-    // the reference browser after Network.enable.
-    this.extraHTTPHeaders.forEach((value, key) => headers.set(key, value));
     headers.set('user-agent', this.userAgent);
     if (!headers.has('accept-language')) headers.set('accept-language', this.acceptLanguage);
     if (type === 'Fetch' && !init.skipDefaultReferrer && !headers.has('referer')) {
@@ -480,7 +486,11 @@ export class Page extends EventEmitter {
         const cookies = await this.context.cookies.getCookieString(url);
         if (cookies) headers.set('cookie', cookies); else headers.delete('cookie');
       } else headers.delete('cookie');
-      // CLI headers retain precedence over page headers and cookie defaults on every hop.
+      // Privileged CDP headers override request/default/jar values, including
+      // empty Cookie and credentials-omitted requests. Apply on every actual
+      // hop so configured auth remains distinct from stripped authored auth.
+      this.extraHTTPHeaders.forEach((value, name) => headers.set(name, value));
+      // CLI headers retain final precedence over CDP and cookie defaults.
       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
       const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId);
       try {

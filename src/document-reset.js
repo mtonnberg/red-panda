@@ -78,7 +78,7 @@ function patch() {
   DocumentImpl.prototype.open = function (...args) {
     const context = contexts.get(this);
     if (context && this._parsingMode === 'html' && !active(context)) return this;
-    if (eligible(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
+    if (context && active(context) && this._parsingMode === 'html' && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot open document during custom element construction', 'InvalidStateError');
     if (!eligible(context) || context.record.parserScriptDepth > 0 || this._parsingMode !== 'html' || this._throwOnDynamicMarkupInsertionCounter) return open.apply(this, args);
     return reset(context, args);
   };
@@ -98,7 +98,7 @@ function patch() {
   DocumentImpl.prototype.close = function (...args) {
     const context = contexts.get(this), cycle = context?.current;
     if (context && this._parsingMode === 'html' && !active(context)) return;
-    if (cycle && active(context) && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
+    if (context && active(context) && this._parsingMode === 'html' && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
     if (cycle && active(context)) {
       if (cycle.state.status === 'open') { context.record.closeRequested = args; cycle.close(); return; }
       if (cycle.state.status === 'complete') {

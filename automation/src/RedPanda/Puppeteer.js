@@ -74,6 +74,14 @@ export const evaluateStringImpl = page => expression => async(async () => {
   if (typeof result !== 'string') throw new TypeError('Expected a string from page.evaluate');
   return result;
 });
+export const evaluateHandleImpl = page => expression => async(() => page.evaluateHandle(expression), handle => handle.dispose());
+export const queryObjectsImpl = page => prototype => async(() => page.queryObjects(prototype), handle => handle.dispose());
+export const evaluateHandleStringImpl = handle => expression => async(async () => {
+  const result = await handle.evaluate((value, source) => (0, eval)(`(${source})`)(value), expression);
+  if (typeof result !== 'string') throw new TypeError('Expected a string from handle.evaluate');
+  return result;
+});
+export const disposeHandleImpl = handle => async(async () => { await handle.dispose(); });
 export const contentImpl = page => async(() => page.content());
 export const waitForSelectorImpl = page => selector => async(async () => {
   const handle = await page.waitForSelector(selector, { timeout: 5000 });

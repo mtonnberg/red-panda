@@ -1,0 +1,713 @@
+--- /dev/null
++++ b/src/clone-object-kind.js
+@@ -0,0 +1,23 @@
++// Captured built-in state checks and descriptor reads never invoke authored
++// implementation-symbol or toStringTag getters to identify a clone candidate.
++import { types } from 'node:util';
++import { platformFactoryRecord } from './platform-factories.js';
++import { knownPlatformFactoryKind } from './platform-factory-hooks.js';
++const descriptor = Object.getOwnPropertyDescriptor, prototype = Object.getPrototypeOf;
++const geometryKinds = new Set(['DOMPoint','DOMPointReadOnly','DOMRect','DOMRectReadOnly','DOMMatrix','DOMMatrixReadOnly','DOMQuad']);
++export function cloneObjectKind(value) {
++  if (Array.isArray(value)) return 'Array';
++  for (const [kind, test] of [['Map',types.isMap],['Set',types.isSet],['Error',types.isNativeError],['ArrayBuffer',types.isAnyArrayBuffer],['View',ArrayBuffer.isView],['Date',types.isDate],['RegExp',types.isRegExp]]) if (test(value)) return kind;
++  if (platformFactoryRecord(value)) return 'Platform';
++  if (types.isPromise(value)||types.isWeakMap(value)||types.isWeakSet(value)||types.isBoxedPrimitive(value)||types.isGeneratorObject(value)||types.isMapIterator(value)||types.isSetIterator(value)||types.isExternal(value)||types.isCryptoKey(value)||types.isKeyObject(value)) return 'Other';
++  for (let current=value;current!==null;current=prototype(current)) {
++    if (types.isProxy(current)) return 'Object';
++    const tag=descriptor(current,Symbol.toStringTag); if(!tag)continue;
++    if(current===value||!('value'in tag))return 'Object';
++    if(typeof tag.value!=='string'||tag.value==='Object'||knownPlatformFactoryKind(tag.value)||geometryKinds.has(tag.value)||/^SVG[A-Z]/.test(tag.value))return 'Object';
++    // Preserve the pre-existing unsupported exotic guard for unregistered
++    // inherited static tags (e.g. Intl/WeakRef). This is not platform branding.
++    return 'Other';
++  }
++  return 'Object';
++}
+--- /dev/null
++++ b/src/geometry-platform.js
+@@ -0,0 +1,41 @@
++import { cloneObjectKind } from './clone-object-kind.js';
++import 'jsdom';
++import { createRequire } from 'node:module';
++import { registerPlatformFactory, platformFactoryRecord, hasPlatformCloneRealm } from './platform-factories.js';
++import { installPlatformFactoryHooks } from './platform-factory-hooks.js';
++const require = createRequire(import.meta.url);
++const RectImpl = require('jsdom/lib/jsdom/living/geometry/DOMRectReadOnly-impl.js').implementation;
++const rectGetters = ['x', 'y', 'width', 'height'].map(key => Object.getOwnPropertyDescriptor(RectImpl.prototype, key).get);
++const receivers = new WeakMap();
++const arrayEvery = Array.prototype.every;
++const cloneable = new Set(['DOMPoint', 'DOMPointReadOnly', 'DOMRect', 'DOMRectReadOnly']);
++installPlatformFactoryHooks();
++export function geometryFactoryData(value) {
++  const record = platformFactoryRecord(value);
++  if (!record) return null;
++  if (record.kind === 'DOMMatrix' || record.kind === 'DOMMatrixReadOnly') return { kind: 'Geometry', interface: record.kind };
++  if (!cloneable.has(record.kind)) return null;
++  const values = record.read ? record.read() : rectGetters.map(get => get.call(record.implementation));
++  return { kind: 'Geometry', interface: record.kind, values };
++}
++export function validGeometryRecord(record) {
++  return record?.kind === 'Geometry' && cloneable.has(record.interface) && Array.isArray(record.values) && record.values.length === 4 && arrayEvery.call(record.values, value => typeof value === 'number');
++}
++export function registerGeometryRealm(realm, controller) {
++  const constructors = Object.freeze(Object.fromEntries([...cloneable].map(name => [name, controller[name]])));
++  receivers.set(realm, constructors);
++}
++export function deserializeGeometry(realm, record) {
++  const constructors = receivers.get(realm);
++  if (!constructors || !validGeometryRecord(record)) throw new Error('Invalid or unavailable geometry receiver');
++  return new constructors[record.interface](record.values[0],record.values[1],record.values[2],record.values[3]);
++}
++export function createGeometryBridge(realm) {
++  return {
++    nativeClone: hasPlatformCloneRealm(realm),
++    register(value, kind, read) { registerPlatformFactory(value, { kind, read, globalObject: realm }); },
++    serialize: geometryFactoryData,
++    classify: cloneObjectKind,
++    deserialize(record) { return deserializeGeometry(realm, record); },
++  };
++}
+--- a/src/geometry.js
++++ b/src/geometry.js
+@@ -1,11 +1,15 @@
++import { createGeometryBridge, registerGeometryRealm } from './geometry-platform.js';
++const installedGeometry = new WeakMap();
+ // Keep this factory self-contained: its source also runs inside worker VM realms.
+ // CSS transforms support numeric matrices, absolute lengths, angles and the
+ // elementary transform functions below. Relative lengths, percentages and calc()
+ // reject with SyntaxError instead of returning an invented matrix. Geometry
+ // classes use real 4x4 math; descriptor/WebIDL edge cases are not exhaustive.
+-function geometryFactory(g) {
+-  const installation = Symbol.for('red-panda.geometry');
+-  if (g[installation]) return g[installation];
++function geometryFactory(g, platform) {
++  const BaseWeakMap=g.WeakMap??globalThis.WeakMap,apply=(g.Reflect??globalThis.Reflect).apply,weakGet=BaseWeakMap.prototype.get,weakSet=BaseWeakMap.prototype.set,weakHas=BaseWeakMap.prototype.has,weakDelete=BaseWeakMap.prototype.delete;
++  class WeakMap extends BaseWeakMap { get(key){return apply(weakGet,this,[key]);} set(key,value){return apply(weakSet,this,[key,value]);} has(key){return apply(weakHas,this,[key]);} delete(key){return apply(weakDelete,this,[key]);} }
++  const mutablePoint = {}, mutableRect = {}, mutableMatrix = {};
++  const publish = (value, kind, read) => platform?.register(value, kind, read);
+   const points = new WeakMap(), matrices = new WeakMap(), quads = new WeakMap(), rects = new WeakMap();
+   const pointLinks = new WeakMap(), matrixLinks = new WeakMap();
+   const number = value => +value;
+@@ -16,7 +20,8 @@
+   };
+   const component = (value, key, fallback) => { const member = value[key]; return member === undefined ? fallback : number(member); };
+   const brand = (map, object) => { if (!map.has(object)) throw new TypeError('Invalid geometry receiver'); return map.get(object); };
+-  const error = (name, message) => typeof g.DOMException === 'function' ? new g.DOMException(message, name) : Object.assign(new Error(message), { name });
++  const Exception=g.DOMException,RealmError=g.Error;
++  const error = (name, message) => typeof Exception === 'function' ? new Exception(message, name) : Object.assign(new RealmError(message), { name });
+   const identity = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+   const names = Array.from({ length: 16 }, (_, i) => `m${Math.floor(i / 4) + 1}${i % 4 + 1}`);
+   const aliases = { a: 0, b: 1, c: 4, d: 5, e: 12, f: 13 };
+@@ -47,12 +52,13 @@
+   };
+ 
+   class DOMPointReadOnly {
+-    constructor(x = 0, y = 0, z = 0, w = 1) { points.set(this, [number(x), number(y), number(z), number(w)]); }
++    constructor(x = 0, y = 0, z = 0, w = 1) { points.set(this, [number(x), number(y), number(z), number(w)]); if (arguments[4] !== mutablePoint) publish(this, 'DOMPointReadOnly', () => { const values=points.get(this); return [values[0],values[1],values[2],values[3]]; }); }
+     static fromPoint(point = {}) { return new DOMPointReadOnly(...pointValues(point)); }
+     matrixTransform(matrix = {}) { return DOMMatrixReadOnly.fromMatrix(matrix).transformPoint(this); }
+     toJSON() { const [x, y, z, w] = brand(points, this); return { x, y, z, w }; }
+   }
+   class DOMPoint extends DOMPointReadOnly {
++    constructor(x = 0, y = 0, z = 0, w = 1) { super(x,y,z,w,mutablePoint); publish(this, 'DOMPoint', () => { const values=points.get(this); return [values[0],values[1],values[2],values[3]]; }); }
+     static fromPoint(point = {}) { return new DOMPoint(...pointValues(point)); }
+   }
+   for (const [index, key] of ['x', 'y', 'z', 'w'].entries()) {
+@@ -62,7 +68,7 @@
+   }
+ 
+   class DOMRectReadOnlyFallback {
+-    constructor(x = 0, y = 0, width = 0, height = 0) { rects.set(this, [number(x), number(y), number(width), number(height)]); }
++    constructor(x = 0, y = 0, width = 0, height = 0) { rects.set(this, [number(x), number(y), number(width), number(height)]); if (arguments[4] !== mutableRect) publish(this, 'DOMRectReadOnly', () => { const values=rects.get(this);return [values[0],values[1],values[2],values[3]]; }); }
+     static fromRect(rect = {}) { rect = dictionary(rect); return new DOMRectReadOnlyFallback(...['x', 'y', 'width', 'height'].map(key => component(rect, key, 0))); }
+     get top() { brand(rects, this); return Math.min(this.y, this.y + this.height); }
+     get right() { brand(rects, this); return Math.max(this.x, this.x + this.width); }
+@@ -71,6 +77,7 @@
+     toJSON() { brand(rects, this); return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; }
+   }
+   class DOMRectFallback extends DOMRectReadOnlyFallback {
++    constructor(x = 0, y = 0, width = 0, height = 0) { super(x,y,width,height,mutableRect); publish(this, 'DOMRect', () => { const values=rects.get(this);return [values[0],values[1],values[2],values[3]]; }); }
+     static fromRect(rect = {}) { rect = dictionary(rect); return new DOMRectFallback(...['x', 'y', 'width', 'height'].map(key => component(rect, key, 0))); }
+   }
+   Object.defineProperty(DOMRectReadOnlyFallback, 'name', { value: 'DOMRectReadOnly' });
+@@ -100,15 +107,15 @@
+ 
+   class DOMMatrixReadOnly {
+     constructor(init) {
+-      if (init === undefined) { matrices.set(this, { values: identity(), is2D: true }); return; }
++      if (init === undefined) { matrices.set(this, { values: identity(), is2D: true }); if(arguments[1]!==mutableMatrix)publish(this,'DOMMatrixReadOnly'); return; }
+       if (typeof init !== 'string' && init != null && typeof init[Symbol.iterator] === 'function') {
+         const sequence = Array.from(init, number);
+         if (![6, 16].includes(sequence.length)) throw new TypeError('A matrix sequence must contain 6 or 16 numbers');
+         const values = sequence.length === 16 ? sequence : identity();
+         if (sequence.length === 6) for (const [i, index] of [0, 1, 4, 5, 12, 13].entries()) values[index] = sequence[i];
+-        matrices.set(this, { values, is2D: sequence.length === 6 }); return;
++        matrices.set(this, { values, is2D: sequence.length === 6 }); if(arguments[1]!==mutableMatrix)publish(this,'DOMMatrixReadOnly'); return;
+       }
+-      matrices.set(this, parseTransform('' + init));
++      matrices.set(this, parseTransform('' + init)); if(arguments[1]!==mutableMatrix)publish(this,'DOMMatrixReadOnly');
+     }
+     static fromMatrix(other = {}) { const result = new DOMMatrixReadOnly(); matrices.set(result, matrixValues(other)); return result; }
+     static fromFloat32Array(array) { return floatMatrix(DOMMatrixReadOnly, array, 'Float32Array'); }
+@@ -150,6 +157,7 @@
+     return new Constructor(array);
+   }
+   class DOMMatrix extends DOMMatrixReadOnly {
++    constructor(init) { super(init,mutableMatrix); publish(this,'DOMMatrix'); }
+     static fromMatrix(other = {}) { const result = new DOMMatrix(); matrices.set(result, matrixValues(other)); return result; }
+     static fromFloat32Array(array) { return floatMatrix(DOMMatrix, array, 'Float32Array'); }
+     static fromFloat64Array(array) { return floatMatrix(DOMMatrix, array, 'Float64Array'); }
+@@ -266,7 +274,7 @@
+   Object.assign(g, { DOMPointReadOnly, DOMPoint, DOMQuad, DOMMatrixReadOnly, DOMMatrix });
+ 
+   const originalClone = g.structuredClone;
+-  if (typeof originalClone === 'function') {
++  if (typeof originalClone === 'function' && !platform?.nativeClone) {
+     g.structuredClone = function structuredCloneGeometry(value, options) {
+       const markers = new Map(), seen = new Map();
+       const put = (object, key, value) => Object.defineProperty(object, key, { value, enumerable: true, writable: true, configurable: true });
+@@ -278,17 +286,19 @@
+         if (input === null || typeof input !== 'object') return input;
+         if (seen.has(input)) return seen.get(input);
+         let type, data;
+-        if (points.has(input)) { type = input instanceof DOMPoint ? 'point' : 'point-ro'; data = [...points.get(input)]; }
+-        else if (matrices.has(input)) { type = input instanceof DOMMatrix ? 'matrix' : 'matrix-ro'; data = { values: [...matrices.get(input).values], is2D: input.is2D }; }
++        const registered = platform?.serialize(input);
++        if (registered) { if (registered.interface === 'DOMMatrix' || registered.interface === 'DOMMatrixReadOnly') throw error('DataCloneError','The object can not be cloned'); type='platform-geometry';data=registered; }
++        else if (points.has(input)) { type = input instanceof DOMPoint ? 'point' : 'point-ro'; data = [...points.get(input)]; }
++        else if (matrices.has(input)) { throw error('DataCloneError','The object can not be cloned'); }
+         else if (quads.has(input)) { type = 'quad'; data = input.toJSON(); }
+-        else if (input instanceof g.DOMRectReadOnly) { type = input instanceof g.DOMRect ? 'rect' : 'rect-ro'; data = [input.x, input.y, input.width, input.height]; }
++        else if (!platform && input instanceof g.DOMRectReadOnly) { type = input instanceof g.DOMRect ? 'rect' : 'rect-ro'; data = [input.x, input.y, input.width, input.height]; }
+         if (type) { const record = {}; seen.set(input, record); markers.set(record, { type, data }); return record; }
+-        let result;
++        let result; const inputKind=platform?.classify(input);
+         if (Array.isArray(input)) { result = new Array(input.length); seen.set(input, result); for (const key of Object.keys(input)) put(result, key, encode(input[key])); }
+-        else if (Object.prototype.toString.call(input) === '[object Map]') { result = new Map(); seen.set(input, result); for (const [key, value] of input) result.set(encode(key), encode(value)); }
+-        else if (Object.prototype.toString.call(input) === '[object Set]') { result = new Set(); seen.set(input, result); for (const value of input) result.add(encode(value)); }
+-        else if (Object.prototype.toString.call(input) === '[object Error]') { result = copyError(input); seen.set(input, result); if (Object.hasOwn(input, 'cause')) Object.defineProperty(result, 'cause', { value: encode(input.cause), writable: true, configurable: true }); }
+-        else if (Object.prototype.toString.call(input) === '[object Object]') { result = {}; seen.set(input, result); for (const key of Object.keys(input)) Object.defineProperty(result, key, { value: encode(input[key]), enumerable: true, configurable: true, writable: true }); }
++        else if (inputKind ? inputKind==='Map' : Object.prototype.toString.call(input) === '[object Map]') { result = new Map(); seen.set(input, result); for (const [key, value] of input) result.set(encode(key), encode(value)); }
++        else if (inputKind ? inputKind==='Set' : Object.prototype.toString.call(input) === '[object Set]') { result = new Set(); seen.set(input, result); for (const value of input) result.add(encode(value)); }
++        else if (inputKind ? inputKind==='Error' : Object.prototype.toString.call(input) === '[object Error]') { result = copyError(input); seen.set(input, result); if (Object.hasOwn(input, 'cause')) Object.defineProperty(result, 'cause', { value: encode(input.cause), writable: true, configurable: true }); }
++        else if (inputKind ? inputKind==='Object' : Object.prototype.toString.call(input) === '[object Object]') { result = {}; seen.set(input, result); for (const key of Object.keys(input)) Object.defineProperty(result, key, { value: encode(input[key]), enumerable: true, configurable: true, writable: true }); }
+         else return input;
+         return result;
+       }
+@@ -301,13 +311,14 @@
+         let result;
+         if (marker) {
+           const { type, data } = marker;
+-          if (type === 'point' || type === 'point-ro') result = new (type === 'point' ? DOMPoint : DOMPointReadOnly)(...data);
++          if (type === 'platform-geometry') result = platform.deserialize(data);
++          else if (type === 'point' || type === 'point-ro') result = new (type === 'point' ? DOMPoint : DOMPointReadOnly)(...data);
+           else if (type === 'rect' || type === 'rect-ro') result = new (type === 'rect' ? g.DOMRect : g.DOMRectReadOnly)(...data);
+           else if (type === 'quad') result = DOMQuad.fromQuad(data);
+           else { result = type === 'matrix' ? new DOMMatrix() : new DOMMatrixReadOnly(); matrices.set(result, { values: Array.from(data.values), is2D: data.is2D }); }
+         } else if (Array.isArray(input)) { result = new Array(input.length); copies.set(input, result); for (const key of Object.keys(input)) put(result, key, decode(input[key])); }
+         else {
+-          const tag = Object.prototype.toString.call(input);
++          const kind=platform?.classify(input),tag=kind?`[object ${kind}]`:Object.prototype.toString.call(input);
+           if (tag === '[object Map]') { result = new Map(); copies.set(input, result); for (const [key, value] of input) result.set(decode(key), decode(value)); }
+           else if (tag === '[object Set]') { result = new Set(); copies.set(input, result); for (const value of input) result.add(decode(value)); }
+           else if (tag === '[object ArrayBuffer]') { result = new ArrayBuffer(input.byteLength); new Uint8Array(result).set(new Uint8Array(input)); }
+@@ -349,14 +360,16 @@
+     isMutablePoint(object) { return points.has(object) && object instanceof DOMPoint; },
+     bindMatrix(object, link) { brand(matrices, object); if (!(object instanceof DOMMatrix)) throw new TypeError('invalid argument'); matrixLinks.set(object, link); },
+   };
+-  Object.defineProperty(g, installation, { value: controller }); return controller;
++  return controller;
+ }
+ 
+ export const GEOMETRY_SOURCE = `(${geometryFactory.toString()})(globalThis)`;
+ 
+ export function installGeometry(realm) {
+   if (typeof realm?.eval !== 'function') throw new TypeError('Geometry installation requires a realm eval function; workers can evaluate GEOMETRY_SOURCE in their VM context');
+-  return realm.eval(GEOMETRY_SOURCE);
++  if (installedGeometry.has(realm)) return installedGeometry.get(realm);
++  const controller = realm.eval(`(${geometryFactory.toString()})`)(realm, createGeometryBridge(realm));
++  registerGeometryRealm(realm, controller); installedGeometry.set(realm, controller); return controller;
+ }
+ 
+ // A host-private kernel reuses the independent 4x4 implementation without
+--- a/src/messaging.js
++++ b/src/messaging.js
+@@ -1,3 +1,5 @@
++import { cloneObjectKind } from './clone-object-kind.js';
++import { registerPlatformFactory, platformFactoryRecord, registerPlatformCloneRealm } from './platform-factories.js';
+ import { createPlatformCodec } from "./platform-codec.js";
+ import { MessageChannel as NativeChannel, MessagePort as NativePort } from 'node:worker_threads';
+ import { types } from 'node:util';
+@@ -70,14 +72,14 @@
+       if (live() && !state.detached && !state.closed) emit(port, 'messageerror', null, I.Object.freeze(new I.Array()));
+     };
+     state.close = () => { state.closed = true; release(state); };
+-    PORTS.set(port, state); wrapped.set(native, port); owned.add(state);
++    PORTS.set(port, state); registerPlatformFactory(port,{kind:'MessagePort',globalObject:realm}); wrapped.set(native, port); owned.add(state);
+     native.on('close', state.close); native.unref();
+     return port;
+   }
+   function encode(value, allowed, seen = new Map(), platforms) {
+     if (typeof value === 'function' || typeof value === 'symbol') throw cloneError('Value cannot be structured cloned');
+     if (value === null || typeof value !== 'object') return value;
+-    if (types.isProxy(value)) throw cloneError('Proxy objects cannot be structured cloned');
++    if (types.isProxy(value) && !platformFactoryRecord(value)) throw cloneError('Proxy objects cannot be structured cloned');
+     const port = PORTS.get(value);
+     if (port) {
+       if (port.detached || !allowed.has(value)) throw cloneError('MessagePort must be transferred and cannot be detached');
+@@ -105,9 +107,8 @@
+       const result = new Set(); seen.set(value, result);
+       for (const item of value) result.add(encode(item, allowed, seen, platforms)); return result;
+     }
+-    if (implForWrapper(value) || types.isPromise(value) || types.isWeakMap(value) || types.isWeakSet(value) ||
+-        !['[object Object]', '[object Array]'].includes(Object.prototype.toString.call(value))) {
+-      throw cloneError(`Unsupported structured clone type: ${Object.prototype.toString.call(value)}`);
++    if (platformFactoryRecord(value) || !['Object','Array'].includes(cloneObjectKind(value))) {
++      throw cloneError('Unsupported structured clone type');
+     }
+     const result = Array.isArray(value) ? new Array(value.length) : {};
+     seen.set(value, result);
+@@ -290,6 +291,7 @@
+     for (const work of pendingDeliveries) dropMessage(work.message); pendingDeliveries.clear();
+     for (const state of [...owned]) { state.closed = true; release(state); state.native.close(); }
+   }
++  registerPlatformCloneRealm(realm);
+   return { MessageChannel, MessagePort, prepare, receive, deliver, prepareBroadcast, broadcastBody: codec.broadcastBody, dispatchMessage, clone, discard, wrap,
+     unwrap(port) { const state = record(port); if (state.detached) throw cloneError('MessagePort is detached'); return state.native; },
+     isPort: value => PORTS.has(value), dispose, get size() { return owned.size; } };
+--- /dev/null
++++ b/src/native-platform-factories.js
+@@ -0,0 +1,67 @@
++// Successful Node allocation/producer callsites used by worker public APIs.
++// These records, not copied Node handle symbols or prototypes, confer brands.
++import { Blob as NativeBlob, File as NativeFile } from 'node:buffer';
++import { registerPlatformFactory, platformFactoryRecord } from './platform-factories.js';
++const apply=Reflect.apply,construct=Reflect.construct,define=Object.defineProperty,getPrototype=Object.getPrototypeOf,setPrototype=Object.setPrototypeOf;
++const size=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'size').get,type=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
++const name=Object.getOwnPropertyDescriptor(NativeFile.prototype,'name').get,modified=Object.getOwnPropertyDescriptor(NativeFile.prototype,'lastModified').get;
++const slice=NativeBlob.prototype.slice,then=Promise.prototype.then;
++const privateBlobPrototype=Object.create(getPrototype(NativeBlob.prototype),Object.getOwnPropertyDescriptors(NativeBlob.prototype));
++const nativeForm=globalThis.FormData,formEntries=nativeForm?.prototype.entries;
++const iteratorPrototype=formEntries?getPrototype(apply(formEntries,new nativeForm(),[])):null,iteratorNext=iteratorPrototype?.next;
++const formAppend=nativeForm?.prototype.append,formSet=nativeForm?.prototype.set;
++const readers=[globalThis.Request,globalThis.Response].filter(Boolean).map(C=>({prototype:C.prototype,blob:C.prototype.blob,formData:C.prototype.formData}));
++const installed=new WeakMap();
++let methodsInstalled=false;
++
++/** Call only at a trusted successful native factory/producer return. */
++export function registerNativeBlobFactory(value,{kind='Blob',globalObject=globalThis}={}){
++ if(platformFactoryRecord(value))return value;
++ const length=apply(size,value,[]),mime=apply(type,value,[]);
++ const immutable=apply(slice,value,[0,length,mime]);setPrototype(immutable,privateBlobPrototype);
++ const extra=kind==='File'?{name:apply(name,value,[]),lastModified:apply(modified,value,[])}:{};
++ registerPlatformFactory(value,{kind,globalObject,read:()=>({kind,blob:immutable,type:mime,...extra})});return value;
++}
++function formValues(value){
++ const values=new Set(),iterator=apply(formEntries,value,[]);
++ while(true){const step=apply(iteratorNext,iterator,[]);if(step.done)break;values.add(step.value[1]);}
++ return values;
++}
++function captureForm(value,realm,skip=new Set()){
++ registerPlatformFactory(value,{kind:'FormData',globalObject:realm});
++ const iterator=apply(formEntries,value,[]);
++ while(true){const step=apply(iteratorNext,iterator,[]);if(step.done)break;const file=step.value[1];if(typeof file==='object'&&file!==null&&!skip.has(file)&&!platformFactoryRecord(file))registerNativeBlobFactory(file,{kind:'File',globalObject:realm});}
++ return value;
++}
++export function installNativePlatformFactories(realm){
++ if(installed.has(realm))return installed.get(realm);
++ // DOM windows keep their actual generated constructors and setup hooks.
++ if(realm.Blob!==NativeBlob)return null;
++ const FunctionPrototype=realm.Function.prototype;
++ let Blob,File,Form;
++ const wrap=(Target,kind,parent)=>new Proxy(Target,{
++  construct(target,args,newTarget){const value=construct(target,args,newTarget);if(kind==='FormData')return captureForm(value,realm);return registerNativeBlobFactory(value,{kind,globalObject:realm});},
++  get(target,key,receiver){return key==='constructor'?realm.Function:Reflect.get(target,key,receiver);},
++  getPrototypeOf(target){return Object.isExtensible(target)?parent():getPrototype(target);},
++ });
++ Blob=wrap(NativeBlob,'Blob',()=>FunctionPrototype);File=wrap(NativeFile,'File',()=>Blob);
++ define(realm,'Blob',{value:Blob,configurable:true,writable:true});define(realm,'File',{value:File,configurable:true,writable:true});
++ define(NativeBlob.prototype,'constructor',{value:Blob,writable:true,configurable:true});define(NativeFile.prototype,'constructor',{value:File,writable:true,configurable:true});
++ if(nativeForm&&realm.FormData===nativeForm){Form=wrap(nativeForm,'FormData',()=>FunctionPrototype);define(realm,'FormData',{value:Form,configurable:true,writable:true});define(nativeForm.prototype,'constructor',{value:Form,writable:true,configurable:true});}
++ if(!methodsInstalled){
++  methodsInstalled=true;
++  define(NativeBlob.prototype,'slice',{configurable:true,writable:true,value:function(...args){return registerNativeBlobFactory(apply(slice,this,args),{globalObject:realm});}});
++  for(const {prototype,blob,formData}of readers){
++   if(blob)define(prototype,'blob',{configurable:true,writable:true,value:function(...args){return apply(then,apply(blob,this,args),[value=>registerNativeBlobFactory(value,{globalObject:realm})]);}});
++   if(formData)define(prototype,'formData',{configurable:true,writable:true,value:function(...args){return apply(then,apply(formData,this,args),[value=>captureForm(value,realm)]);}});
++  }
++  for(const[key,original]of[['append',formAppend],['set',formSet]])if(original)define(nativeForm.prototype,key,{configurable:true,writable:true,value:function(...args){
++   const existing=formValues(this);existing.add(args[1]);
++   const result=apply(original,this,args);
++   // Native normalization may return the same supplied File: that is not a
++   // fresh allocation and must not authenticate an unregistered lookalike.
++   captureForm(this,realm,existing);return result;
++  }});
++ }
++ const controller={Blob,File,FormData:Form};installed.set(realm,controller);return controller;
++}
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,17 +1,12 @@
+-import { Blob as NativeBlob, File as NativeFile } from 'node:buffer';
+-import { createRequire } from 'node:module';
++import { installNativePlatformFactories } from './native-platform-factories.js';
++import { platformFactoryRecord } from './platform-factories.js';
++import { geometryFactoryData, validGeometryRecord, deserializeGeometry } from './geometry-platform.js';
++import { Blob as NativeBlob } from 'node:buffer';
+ import { types } from 'node:util';
+ 
+-const require=createRequire(import.meta.url);
+-const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
+-const BlobImpl=require('jsdom/lib/jsdom/living/file-api/Blob-impl.js').implementation;
+-const FileImpl=require('jsdom/lib/jsdom/living/file-api/File-impl.js').implementation;
+ const nativeType=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
+ const nativeSize=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'size').get;
+-const nativeName=Object.getOwnPropertyDescriptor(NativeFile.prototype,'name').get;
+-const nativeModified=Object.getOwnPropertyDescriptor(NativeFile.prototype,'lastModified').get;
+ const nativeBytes=NativeBlob.prototype.arrayBuffer;
+-const hasInstance=Function.prototype[Symbol.hasInstance];
+ 
+ /** This codec never recognizes authored object tags or marker properties.
+  * A private envelope Map associates genuine source platform objects' fresh
+@@ -19,33 +14,35 @@
+  * payload aliases. NativeBlob carries immutable bytes across actual threads.
+  */
+ export function createPlatformCodec(realm){
++ installNativePlatformFactories(realm);
+  const Blob=realm.Blob,File=realm.File;
+  const probe=typeof Blob==='function'?new Blob([]):null;
+- const dom=probe&&implForWrapper(probe) instanceof BlobImpl;
+- const failure=message=>new realm.DOMException(message,'DataCloneError');
++ const dom=probe&&!!platformFactoryRecord(probe)?.implementation;
++ const isBytes=record=>record.kind==='Blob'||record.kind==='File';
++ const Exception=realm.DOMException;
++ const failure=message=>new Exception(message,'DataCloneError');
+  function serialize(value){
++  const provenance=platformFactoryRecord(value);
++  if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
++  const geometry=geometryFactoryData(value);
++  if(geometry){if(!validGeometryRecord(geometry))throw failure('The object can not be cloned');return geometry;}
+   if(!probe)return null;
+-  const implementation=implForWrapper(value);
+-  if(implementation instanceof BlobImpl){
+-   const bytes=new Uint8Array(implementation._buffer),isFile=implementation instanceof FileImpl;
++  if(provenance&&(provenance.kind==='Blob'||provenance.kind==='File')){
++   if(provenance.read)return provenance.read();
++   const implementation=provenance.implementation;
++   const bytes=new Uint8Array(implementation._buffer),isFile=provenance.kind==='File';
+    return{kind:isFile?'File':'Blob',blob:new NativeBlob([bytes],{type:implementation.type}),type:implementation.type,bytes,
+     ...(isFile?{name:implementation.name,lastModified:implementation.lastModified}:{})};
+   }
+-  if(hasInstance.call(NativeBlob,value)){
+-   // Captured intrinsic getters validate the actual Node platform state and
+-   // ignore authored own size/type/name overrides. No private symbols are read.
+-   const type=nativeType.call(value);nativeSize.call(value);
+-   const isFile=hasInstance.call(NativeFile,value);
+-   return{kind:isFile?'File':'Blob',blob:value,type,
+-    ...(isFile?{name:nativeName.call(value),lastModified:nativeModified.call(value)}:{})};
+-  }
++
+   return null;
+  }
+  function records(message){
+   if(message.platforms===undefined)return null;
+   if(!types.isMap(message.platforms))throw failure('Malformed platform graph');
+   for(const[placeholder,record]of message.platforms){
+-   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File'].includes(record.kind))throw failure('Malformed platform node');
++   if(!placeholder||typeof placeholder!=='object'||!record||!['Blob','File','Geometry'].includes(record.kind))throw failure('Malformed platform node');
++   if(record.kind==='Geometry'){if(!validGeometryRecord(record))throw failure('Malformed geometry node');continue;}
+    if(record.blob!==undefined){try{nativeSize.call(record.blob);nativeType.call(record.blob)}catch{throw failure('Platform node has no immutable Blob bytes')}}
+    else if(record.bytes===undefined||typeof record.type!=='string')throw failure('Platform node has no byte snapshot');
+    if(record.bytes!==undefined&&!ArrayBuffer.isView(record.bytes))throw failure('Invalid platform byte snapshot');
+@@ -54,20 +51,21 @@
+   return message.platforms;
+  }
+  function needsAsync(message){
+-  const map=records(message);return !!(dom&&map&&[...map.values()].some(record=>record.bytes===undefined));
++  const map=records(message);return !!(dom&&map&&[...map.values()].some(record=>isBytes(record)&&record.bytes===undefined));
+  }
+  async function hydrate(message){
+   const map=records(message);if(!dom||!map)return;
+-  await Promise.all([...map.values()].filter(record=>record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
++  await Promise.all([...map.values()].filter(record=>isBytes(record)&&record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
+  }
+- function needsBroadcastBytes(message){const map=records(message);return!!(map&&[...map.values()].some(record=>record.bytes===undefined))}
+- function stripNativeHandles(message){const map=records(message);if(map)for(const record of map.values()){if(record.bytes===undefined)throw failure('Broadcast bytes are not ready');delete record.blob}return message}
++ function needsBroadcastBytes(message){const map=records(message);return!!(map&&[...map.values()].some(record=>isBytes(record)&&record.bytes===undefined))}
++ function stripNativeHandles(message){const map=records(message);if(map)for(const record of map.values()){if(!isBytes(record))continue;if(record.bytes===undefined)throw failure('Broadcast bytes are not ready');delete record.blob}return message}
+  async function broadcastBody(message){
+   const map=records(message);
+-  if(map)await Promise.all([...map.values()].filter(record=>record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
++  if(map)await Promise.all([...map.values()].filter(record=>isBytes(record)&&record.bytes===undefined).map(async record=>{record.bytes=new Uint8Array(await nativeBytes.call(record.blob))}));
+   return stripNativeHandles(message);
+  }
+  function deserialize(record){
++  if(record.kind==='Geometry'){try{return deserializeGeometry(realm,record)}catch{throw failure('Invalid geometry receiver')}}
+   if(!probe)throw failure('Receiver realm does not support Blob');
+   if(record.kind==='File'&&typeof File!=='function')throw failure('Receiver realm does not support File');
+   const type=record.type??nativeType.call(record.blob);
+--- a/src/platform-factories.js
++++ b/src/platform-factories.js
+@@ -2,6 +2,7 @@
+ // No wrapper enumeration, authored marker reads or native heap dependency.
+ const factories = new WeakMap();
+ const subscribers = new Set();
++const cloneRealms = new WeakSet();
+ export function registerPlatformFactory(value, { kind, implementation, globalObject, read } = {}) {
+   if ((typeof value !== 'object' || value === null) && typeof value !== 'function') throw new TypeError('Platform factory must return an object');
+   if (typeof kind !== 'string') throw new TypeError('Platform factory kind is required');
+@@ -15,3 +16,7 @@
+   if (typeof callback !== 'function') throw new TypeError('Platform factory subscriber must be callable');
+   subscribers.add(callback); return () => subscribers.delete(callback);
+ }
++
++// Trusted messaging adapters register before geometry installs its classes.
++export function registerPlatformCloneRealm(realm) { cloneRealms.add(realm); }
++export function hasPlatformCloneRealm(realm) { return cloneRealms.has(realm); }
+--- a/src/platform-factory-hooks.js
++++ b/src/platform-factory-hooks.js
+@@ -5,6 +5,8 @@
+ import { registerPlatformFactory } from './platform-factories.js';
+ const require = createRequire(import.meta.url);
+ let installed = false;
++const knownKinds = new Set();
++export function knownPlatformFactoryKind(kind) { return knownKinds.has(kind); }
+ // Only successful trusted generated setup/new returns register an identity.
+ // Candidate classification never discovers brands from implementation symbols.
+ export function installPlatformFactoryHooks() {
+@@ -14,6 +16,7 @@
+   for (const kind of ['URL','URLSearchParams']) modules.push({ filename:require.resolve(`whatwg-url/lib/${kind}.js`), kind, utils:require('whatwg-url/lib/utils.js') });
+   for (const { filename, kind, utils } of modules) {
+     const factory = require(filename), setup = factory.setup, allocate = factory.new;
++    if(typeof setup==='function'||typeof allocate==='function')knownKinds.add(kind);
+     if (typeof setup === 'function') factory.setup = function (wrapper, globalObject, ...args) {
+       const value = setup.call(this, wrapper, globalObject, ...args);
+       const descriptor = Object.getOwnPropertyDescriptor(wrapper, utils.implSymbol);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -9,7 +9,7 @@
+ import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+ import { resolveBlobURL } from './blob-urls.js';
+-import { GEOMETRY_SOURCE } from './geometry.js';
++import { installGeometry } from './geometry.js';
+ import { installNavigator } from './navigator.js';
+ import { installStreams } from './streams.js';
+ 
+@@ -303,7 +303,7 @@
+   Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+-  vm.runInContext(GEOMETRY_SOURCE, context);
++  installGeometry(vm.runInContext('globalThis', context));
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+--- a/test/critical-relay-worker.mjs
++++ b/test/critical-relay-worker.mjs
+@@ -1,3 +1,4 @@
++import { registerNativeBlobFactory } from '../src/native-platform-factories.js';
+ // Actual thread control for the termination gap after a real native BC
+ // reservation, before the parent's ready message. No user message is fabricated.
+ import {parentPort,workerData} from 'node:worker_threads';
+@@ -13,5 +14,5 @@
+  parentPort.postMessage(message);
+ }});
+ const source=new broadcast.BroadcastChannel(workerData.name);
+-const file=new File(['survives physical thread termination'],'terminated.txt',{type:'text/plain',lastModified:654});
++const file=registerNativeBlobFactory(new File(['survives physical thread termination'],'terminated.txt',{type:'text/plain',lastModified:654}),{kind:'File'});
+ source.postMessage({file,again:file});
+--- /dev/null
++++ b/test/geometry-platform.test.js
+@@ -0,0 +1,103 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++import { Browser } from '../src/browser.js';
++import { platformFactoryRecord, subscribePlatformFactories } from '../src/platform-factories.js';
++
++async function fixture(t) { const browser = new Browser(); t.after(() => browser.close()); const page = browser.createPage(); await page.navigate('data:text/html,<body></body>'); return { browser, page, window: page.dom.window }; }
++const plain = value => JSON.parse(JSON.stringify(value));
++function deadline(promise) { return Promise.race([promise, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('Geometry transport timed out')), 8000); timer.unref(); })]); }
++
++test('all16 measured native ordinary/SVG producer clone outcomes match, including matrix rejection', async t => {
++  const { page } = await fixture(t);
++  const expression = await readFile(new URL('../docs/reference/svg-phase3-clone-native-expression.js', import.meta.url), 'utf8');
++  const control = JSON.parse(await readFile(new URL('../docs/reference/svg-phase3-clone-native-observation.json', import.meta.url), 'utf8')).observations;
++  // Source screenCTM offset is a separately retained layout diagnostic; this
++  // test compares every measured clone result/error and resulting coordinates.
++  const outcome = ({ before, ...clone }) => clone;
++  assert.deepEqual(plain(page.evaluate(expression)).map(outcome), control.map(outcome));
++});
++
++test('private factory brands preserve raw point/rect coordinates, readonly variants, graph aliases and captured constructors', async t => {
++  const { page } = await fixture(t);
++  const result = page.evaluate(`(()=>{const P=DOMPoint,R=DOMRect,PR=DOMPointReadOnly,RR=DOMRectReadOnly,p=new P(1,2,NaN,-0),r=new R(3,4,Infinity,-0),ro=new PR(5,6),rr=new RR(7,8,9,10);let reads=0;for(const value of[p,r]){Object.defineProperty(value,'x',{get(){reads++;throw Error('authored x')}});Object.defineProperty(value,Symbol.toStringTag,{get(){reads++;throw Error('authored tag')}})}const source={p,r,ro,rr,again:p,map:new Map([[p,r]]),set:new Set([ro])};source.self=source;globalThis.DOMPoint=globalThis.DOMRect=globalThis.DOMPointReadOnly=globalThis.DOMRectReadOnly=function Authored(){throw Error('authored constructor')};const copy=structuredClone(source);return{reads,cycle:copy.self===copy,aliases:copy.again===copy.p&&copy.map.get(copy.p)===copy.r&&copy.set.has(copy.ro),brands:copy.p instanceof P&&copy.r instanceof R&&copy.ro instanceof PR&&!(copy.ro instanceof P)&&copy.rr instanceof RR&&!(copy.rr instanceof R),values:[copy.p.x,copy.p.y,copy.r.x,copy.r.y,copy.rr.width],special:Number.isNaN(copy.p.z)&&Object.is(copy.p.w,-0)&&copy.r.width===Infinity&&Object.is(copy.r.height,-0),readonly:Reflect.set(copy.ro,'x',42)===false&&Reflect.set(copy.rr,'x',42)===false}})()`);
++  assert.deepEqual(plain(result), { reads:0, cycle:true, aliases:true, brands:true, values:[1,2,3,4,9], special:true, readonly:true });
++});
++
++test('authored implementation-symbol getters/copied data and DOM prototype lookalikes stay ordinary without getter calls', async t => {
++  const { page } = await fixture(t);
++  const result = page.evaluate(`(()=>{const blob=new Blob(['actual']),symbol=Object.getOwnPropertySymbols(blob).find(s=>s.description==='impl');let reads=0;const getter={user:3};Object.defineProperty(getter,symbol,{get(){reads++;throw Error('implementation getter')}});Object.defineProperty(getter,Symbol.toStringTag,{get(){reads++;throw Error('tag getter')}});const copied={user:4};Object.defineProperty(copied,symbol,{value:Object.getOwnPropertyDescriptor(blob,symbol).value});const values=[getter,copied,...[Blob,File,DOMPoint,DOMMatrix,DOMRect].map(C=>Object.assign(Object.create(C.prototype),{user:5}))];const copy=structuredClone(values);return{reads,users:copy.map(x=>x.user),plain:copy.every(x=>Object.getPrototypeOf(x)===Object.prototype),unbranded:copy.every(x=>!(x instanceof Blob)&&!(x instanceof DOMPoint)&&!(x instanceof DOMMatrix)&&!(x instanceof DOMRect))}})()`);
++  assert.deepEqual(plain(result), { reads:0, users:[3,4,5,5,5,5,5], plain:true, unbranded:true });
++});
++
++test('genuine generated DOM rectangles allocated before geometry consumers remain privately registered without changing constructors', async t => {
++  const { page, window } = await fixture(t);
++  const element = window.document.createElement('div'); element.style.width = '17px'; element.style.height = '9px'; window.document.body.append(element);
++  const box = element.getBoundingClientRect(), record = platformFactoryRecord(box);
++  assert.equal(record.kind, 'DOMRect'); assert.ok(record.implementation); assert.ok(record.globalRef.deref());
++  assert.ok(box instanceof window.DOMRect); const clone = window.structuredClone(box); assert.ok(clone instanceof window.DOMRect); assert.equal(clone.width, box.width);
++  assert.throws(() => window.structuredClone(element), { name:'DataCloneError' });
++  assert.equal(page.closed, false);
++});
++
++test('MessagePort carries geometry and immutable File bytes with actual aliases, ports and buffer detachment', async t => {
++  const { page } = await fixture(t);
++  const result = await deadline(page.evaluate(`new Promise(resolve=>{const pair=new MessageChannel(),inner=new MessageChannel(),buffer=new Uint8Array([2,3]),point=new DOMPoint(1,2),rect=new DOMRect(3,4,5,6),file=new File(['actual bytes'],'geometry.txt',{lastModified:123});const data={point,again:point,rect,file,port:inner.port2,buffer,map:new Map([[point,rect]])};data.self=data;pair.port2.onmessage=async event=>{resolve({brands:event.data.point instanceof DOMPoint&&event.data.rect instanceof DOMRect&&event.data.file instanceof File,values:[event.data.point.x,event.data.rect.width],aliases:event.data.again===event.data.point&&event.data.map.get(event.data.point)===event.data.rect&&event.data.self===event.data,text:await event.data.file.text(),file:event.data.file.name,port:event.ports[0]===event.data.port,detached:buffer.byteLength===0,bytes:[...event.data.buffer]});pair.port1.close();pair.port2.close();inner.port1.close();event.data.port.close()};pair.port1.postMessage(data,[inner.port2,buffer.buffer]);point.x=99})`));
++  assert.deepEqual(plain(result), { brands:true, values:[1,5], aliases:true, text:'actual bytes', file:'geometry.txt', port:true, detached:true, bytes:[2,3] });
++});
++
++test('BroadcastChannel creates independent branded geometry and File objects at each actual recipient', async t => {
++  const { page } = await fixture(t);
++  const result = await deadline(page.evaluate(`new Promise(resolve=>{const a=new BroadcastChannel('geometry'),b=new BroadcastChannel('geometry'),sender=new BroadcastChannel('geometry');const values=[],objects=[];for(const c of[a,b])c.onmessage=async event=>{objects.push(event.data.point);values.push({point:event.data.point instanceof DOMPoint,rect:event.data.rect instanceof DOMRect,file:event.data.file instanceof File,alias:event.data.again===event.data.point,x:event.data.point.x,text:await event.data.file.text()});event.data.point.x=80;if(values.length===2){resolve({values,distinct:objects[0]!==objects[1]});a.close();b.close();sender.close()}};const point=new DOMPoint(7,8);sender.postMessage({point,again:point,rect:new DOMRect(1,2,3,4),file:new File(['broadcast bytes'],'actual.txt')})})`));
++  assert.deepEqual(plain(result), { values:[0,1].map(() => ({ point:true, rect:true, file:true, alias:true, x:7, text:'broadcast bytes' })), distinct:true });
++});
++
++test('real workers clone points/rectangles both ways without losing Blob/File bytes or readonly subtype', async t => {
++  const { page } = await fixture(t);
++  const result = await deadline(page.evaluate(`new Promise(resolve=>{const worker=new Worker(URL.createObjectURL(new Blob(["onmessage=async e=>{const p=e.data.point,r=e.data.rect;const seen={point:p instanceof DOMPoint,rect:r instanceof DOMRectReadOnly,readonly:!(r instanceof DOMRect),text:await e.data.file.text(),x:p.x,width:r.width};const point=new DOMPoint(9,10),file=new File(['worker bytes'],'worker.txt');const local=structuredClone({point,rect:new DOMRectReadOnly(1,2,3,4)});seen.local=local.point instanceof DOMPoint&&local.rect instanceof DOMRectReadOnly;postMessage({point,again:point,rect:new DOMRectReadOnly(2,3,4,5),file,seen})}"],{type:'text/javascript'})));worker.onerror=e=>{e.preventDefault();resolve({error:e.message})};worker.onmessage=async e=>{resolve({point:e.data.point instanceof DOMPoint,rect:e.data.rect instanceof DOMRectReadOnly&&!(e.data.rect instanceof DOMRect),file:e.data.file instanceof File,text:await e.data.file.text(),alias:e.data.again===e.data.point,x:e.data.point.x,width:e.data.rect.width,seen:e.data.seen});worker.terminate()};worker.postMessage({point:new DOMPoint(5,6),rect:new DOMRectReadOnly(7,8,9,10),file:new File(['parent bytes'],'parent.txt')});})`));
++  assert.deepEqual(plain(result), { point:true, rect:true, file:true, text:'worker bytes', alias:true, x:9, width:4, seen:{ point:true, rect:true, readonly:true, text:'parent bytes', x:5, width:9, local:true } });
++});
++
++test('matrix clone errors are atomic for actual transfers and do not consume a retryable MessagePort', async t => {
++  const { page } = await fixture(t);
++  const result = page.evaluate(`(()=>{const a=new MessageChannel(),inner=new MessageChannel(),buffer=new ArrayBuffer(4);let matrix,readonly,retry=false;try{a.port1.postMessage({matrix:new DOMMatrix(),port:inner.port2,buffer},[inner.port2,buffer])}catch(e){matrix=e.name}try{structuredClone(new DOMMatrixReadOnly())}catch(e){readonly=e.name}try{a.port1.postMessage({port:inner.port2},[inner.port2]);retry=true}catch{}a.port1.close();a.port2.close();inner.port1.close();return{matrix,readonly,retry,bytes:buffer.byteLength}})()`);
++  assert.deepEqual(plain(result), { matrix:'DataCloneError', readonly:'DataCloneError', retry:true, bytes:4 });
++});
++
++test('factory subscriptions cannot make successful constructors fail or turn copied records into provenance', async t => {
++  const { window } = await fixture(t), seen = [];
++  const stopThrow = subscribePlatformFactories(() => { throw new Error('observer failure'); });
++  const stop = subscribePlatformFactories((value, record) => seen.push([value, record]));
++  try {
++    const point = new window.DOMPoint(1, 2), rect = new window.DOMRect(1, 2, 3, 4), blob = new window.Blob(['real']);
++    for (const [value, kind] of [[point, 'DOMPoint'], [rect, 'DOMRect'], [blob, 'Blob']]) {
++      const record = platformFactoryRecord(value); assert.equal(record.kind, kind); assert.ok(record.globalRef.deref()); assert.ok(seen.some(([object, metadata]) => object === value && metadata === record));
++      assert.equal(platformFactoryRecord({ ...record }), undefined);
++    }
++  } finally { stop(); stopThrow(); }
++});
++
++test('geometry clone reads captured private state despite authored WeakMap/Array prototype methods', async t => {
++  const { page } = await fixture(t);
++  const result = page.evaluate(`(()=>{const methods={get:WeakMap.prototype.get,set:WeakMap.prototype.set,has:WeakMap.prototype.has,iterator:Array.prototype[Symbol.iterator],every:Array.prototype.every};let reads=0;try{const fail=()=>{reads++;throw Error('authored private-state method')};WeakMap.prototype.get=WeakMap.prototype.set=WeakMap.prototype.has=fail;Array.prototype[Symbol.iterator]=Array.prototype.every=fail;const point=new DOMPoint(3,4),readonly=new DOMPointReadOnly(5,6),rect=new DOMRect(1,2,7,8),copy=structuredClone({point,readonly,rect});return{reads,x:copy.point.x,y:copy.readonly.y,width:copy.rect.width,point:copy.point instanceof DOMPoint,readonly:copy.readonly instanceof DOMPointReadOnly&&!(copy.readonly instanceof DOMPoint)}}finally{WeakMap.prototype.get=methods.get;WeakMap.prototype.set=methods.set;WeakMap.prototype.has=methods.has;Array.prototype[Symbol.iterator]=methods.iterator;Array.prototype.every=methods.every}})()`);
++  assert.deepEqual(plain(result), { reads:0, x:3, y:6, width:7, point:true, readonly:true });
++});
++
++test('worker copied Node Blob/File handles never confer brands or invoke hidden-symbol getters', async t => {
++  const { page } = await fixture(t);
++  const result = await deadline(page.evaluate(`new Promise(resolve=>{const worker=new Worker(URL.createObjectURL(new Blob(["const blob=new Blob(['real']),file=new File(['file'],'real.txt'),copies=[];let reads=0;for(const value of[blob,file]){const fake=Object.create(Object.getPrototypeOf(value));for(const key of Reflect.ownKeys(value))Object.defineProperty(fake,key,Object.getOwnPropertyDescriptor(value,key));fake.user='actual';copies.push(fake)}const tricky=Object.create(Blob.prototype);tricky.user='getter';Object.defineProperty(tricky,Object.getOwnPropertySymbols(blob)[0],{get(){reads++;throw Error('hidden getter')}});copies.push(tricky);const cloned=structuredClone(copies);postMessage({reads,users:cloned.map(x=>x.user),plain:cloned.every(x=>Object.getPrototypeOf(x)===Object.prototype),unbranded:cloned.every(x=>!(x instanceof Blob)&&!(x instanceof File)),real:structuredClone(blob)instanceof Blob});"],{type:'text/javascript'})));worker.onmessage=e=>{resolve(e.data);worker.terminate()};worker.onerror=e=>{e.preventDefault();resolve({error:e.message})}})`));
++  assert.deepEqual(plain(result), { reads:0, users:['actual','actual','getter'], plain:true, unbranded:true, real:true });
++});
++
++test('worker Blob slice, Request/Response readers and FormData normalization register their actual fresh results', async t => {
++  const { page } = await fixture(t);
++  const result = await deadline(page.evaluate(`new Promise(resolve=>{const worker=new Worker(URL.createObjectURL(new Blob(["(async()=>{class Derived extends Blob{};const source=new Derived(['source'],{type:'text/plain'}),slice=source.slice(1),response=await new Response('response').blob(),request=await new Request('https://example.test/',{method:'POST',body:'request'}).blob(),form=new FormData();form.append('file',new Blob(['form']),'actual.txt');const file=form.get('file'),parsed=await new Response(form).formData(),parsedFile=parsed.get('file');const copy=structuredClone({source,slice,response,request,file,parsedFile});postMessage({brands:copy.source instanceof Blob&&copy.slice instanceof Blob&&copy.response instanceof Blob&&copy.request instanceof Blob&&copy.file instanceof File&&copy.parsedFile instanceof File,plainBlob:!(copy.source instanceof Derived),texts:await Promise.all([copy.source.text(),copy.slice.text(),copy.response.text(),copy.request.text(),copy.file.text(),copy.parsedFile.text()]),names:[copy.file.name,copy.parsedFile.name]})})().catch(e=>postMessage({error:e.name,message:e.message}));"],{type:'text/javascript'})));worker.onmessage=e=>{resolve(e.data);worker.terminate()};worker.onerror=e=>{e.preventDefault();resolve({error:e.message})}})`));
++  assert.deepEqual(plain(result), { brands:true, plainBlob:true, texts:['source','ource','response','request','form','form'], names:['actual.txt','actual.txt'] });
++});
++
++
++test('worker FormData later mutations do not authenticate earlier forged File handles', async t => {
++ const {page}=await fixture(t);
++ const result=await deadline(page.evaluate(`new Promise(resolve=>{const worker=new Worker(URL.createObjectURL(new Blob(["const real=new File(['real'],'actual.txt'),fake=Object.create(File.prototype);for(const key of Reflect.ownKeys(real))Object.defineProperty(fake,key,Object.getOwnPropertyDescriptor(real,key));fake.user='ordinary';const form=new FormData();form.append('fake',fake);form.append('real',new Blob(['actual']),'fresh.txt');form.set('text','later');const clone=structuredClone(fake),fresh=structuredClone(form.get('real'));postMessage({plain:Object.getPrototypeOf(clone)===Object.prototype,user:clone.user,unbranded:!(clone instanceof Blob)&&!(clone instanceof File),fresh:fresh instanceof File,name:fresh.name});"],{type:'text/javascript'})));worker.onmessage=e=>{resolve(e.data);worker.terminate()};worker.onerror=e=>{e.preventDefault();resolve({error:e.message})}})`));
++ assert.deepEqual(plain(result),{plain:true,user:'ordinary',unbranded:true,fresh:true,name:'fresh.txt'});
++});
+--- a/test/geometry.test.js
++++ b/test/geometry.test.js
+@@ -123,12 +123,12 @@
+ 
+ test('geometry structured clone preserves subtypes, cycles, Map entries and buffer transfer', t => {
+   const { window: w } = fixture(t), p = new w.DOMPoint(1, 2), ro = new w.DOMPointReadOnly(3, 4);
+-  const value = { p, ro, matrix: new w.DOMMatrixReadOnly([1, 0, 0, 1, 5, 6]), quad: w.DOMQuad.fromRect({ width: 5 }),
++  const value = { p, ro, rect: new w.DOMRectReadOnly(1, 2, 5, 6), quad: w.DOMQuad.fromRect({ width: 5 }),
+     map: new w.Map([[p, ro]]), bytes: new w.Uint8Array([8, 9]) };
+   value.self = value; const clone = w.structuredClone(value, { transfer: [value.bytes.buffer] });
+   assert.equal(clone.self, clone); assert.equal(value.bytes.byteLength, 0); assert.equal(clone.bytes instanceof w.Uint8Array, true);
+   assert.ok(clone.p instanceof w.DOMPoint); assert.ok(clone.ro instanceof w.DOMPointReadOnly); assert.ok(!(clone.ro instanceof w.DOMPoint));
+-  assert.equal(clone.map.get(clone.p), clone.ro); assert.ok(clone.matrix instanceof w.DOMMatrixReadOnly); assert.ok(!(clone.matrix instanceof w.DOMMatrix));
++  assert.equal(clone.map.get(clone.p), clone.ro); assert.ok(clone.rect instanceof w.DOMRectReadOnly); assert.ok(!(clone.rect instanceof w.DOMRect)); assert.equal(clone.rect.width, 5);
+   clone.p.x = 100; assert.equal(p.x, 1); assert.equal(clone.quad.getBounds().width, 5);
+   assert.equal(Object.getPrototypeOf(clone), w.Object.prototype);
+ });
+@@ -162,3 +162,13 @@
+   assert.throws(() => w.DOMMatrix.prototype.toJSON.call({}), error => error instanceof w.TypeError);
+   assert.throws(() => w.DOMQuad.prototype.getBounds.call({}), error => error instanceof w.TypeError);
+ });
++
++
++test('pinned native matrix clone rejection is atomic even for standalone geometry installation', t => {
++  const { window: w } = fixture(t);
++  for (const matrix of [new w.DOMMatrix(), new w.DOMMatrixReadOnly()]) {
++    const bytes = new w.Uint8Array([4,5]);
++    assert.throws(() => w.structuredClone({matrix,bytes},{transfer:[bytes.buffer]}), error => error.name === 'DataCloneError');
++    assert.equal(bytes.byteLength,2);
++  }
++});
+--- a/test/platform-codec.test.js
++++ b/test/platform-codec.test.js
+@@ -1,3 +1,4 @@
++import { registerNativeBlobFactory } from '../src/native-platform-factories.js';
+ import {test} from 'node:test';
+ import assert from 'node:assert/strict';
+ import {Blob as NativeBlob,File as NativeFile} from 'node:buffer';
+@@ -51,12 +52,12 @@
+ });
+ 
+ test('native Blob/File hydration preserves ordered delivery and suppresses disposed targets without authored markers',async t=>{
+- const{page,window,bridge}=await fixture(t),native=new NativeFile(['host-native'],'native.txt',{lastModified:444,type:'text/plain'});
++ const{page,window,bridge}=await fixture(t),native=registerNativeBlobFactory(new NativeFile(['host-native'],'native.txt',{lastModified:444,type:'text/plain'}),{kind:'File'});
+  const encode=data=>{const prepared=bridge.prepare(data);const envelope=structuredClone(prepared.message,{transfer:prepared.transfer});prepared.commit();return envelope};
+  const received=[],target=new window.EventTarget();
+  const first=bridge.deliver(target,encode({file:native,again:native}),data=>received.push(data));bridge.deliver(target,encode('after'),data=>received.push(data));await first;await delay(0);
+  assert.equal(received.length,2);assert.ok(received[0].data.file instanceof window.File);assert.equal(received[0].data.file,received[0].data.again);assert.equal(received[0].data.file.name,'native.txt');assert.equal(await received[0].data.file.text(),'host-native');assert.equal(received[1].data,'after');
+- const pending=bridge.deliver(new window.EventTarget(),encode(new NativeBlob(['cancelled'])),()=>received.push('should not dispatch'));queueMicrotask(()=>page.documentAbort.abort());await pending;assert.equal(received.length,2);
++ const pending=bridge.deliver(new window.EventTarget(),encode(registerNativeBlobFactory(new NativeBlob(['cancelled']))),()=>received.push('should not dispatch'));queueMicrotask(()=>page.documentAbort.abort());await pending;assert.equal(received.length,2);
+ });
+ 
+ test('native BC reservation fixes recipient snapshots/FIFO while a real parent-port clone outlives sender close',async t=>{
+@@ -67,7 +68,7 @@
+  const sender=new sourceRealm.BroadcastChannel('reserved'),early=new window.BroadcastChannel('reserved'),closed=new window.BroadcastChannel('reserved'),events=[];let lateEvents=0,closedEvents=0;
+  const received=new Promise(resolve=>{early.onmessage=async event=>{events.push(event.data.kind);if(event.data.kind==='file')assert.equal(await event.data.file.text(),'reserved bytes');if(events.length===2)resolve()}});
+  closed.onmessage=()=>closedEvents++;
+- sender.postMessage({kind:'file',file:new NativeFile(['reserved bytes'],'reserved.txt')});sender.postMessage({kind:'after'});sender.close();
++ sender.postMessage({kind:'file',file:registerNativeBlobFactory(new NativeFile(['reserved bytes'],'reserved.txt'),{kind:'File'})});sender.postMessage({kind:'after'});sender.close();
+  const controller=installBroadcast(page,window);
+  for(let i=0;i<100&&(messages.length<2||controller.pending<2);i++)await delay(2);
+  assert.equal(messages.length,2);assert.equal(events.length,0);assert.ok(controller.pending>=2);
+@@ -96,6 +97,6 @@
+  const{page,window,bridge}=await fixture(t);
+  const value=page.evaluate(`(()=>{const carrier=new MessageChannel(),inner=new MessageChannel(),buffer=new ArrayBuffer(2),file=new File(['real'],'real.txt');let error;try{carrier.port1.postMessage({file,fn(){}},[inner.port2,buffer])}catch(e){error=e.name}const plain=structuredClone({kind:'File',name:'authored',lastModified:1,blob:{kind:'Blob'},bytes:[1,2]});let retry;try{carrier.port1.postMessage({port:inner.port2},[inner.port2]);retry=true}catch{retry=false}return{error,bufferBytes:buffer.byteLength,retry,plain:!(plain instanceof File)&&plain.kind==='File'&&!(plain.blob instanceof Blob)}})()`);
+  assert.deepEqual(result(value),{error:'DataCloneError',bufferBytes:2,retry:true,plain:true});
+- assert.throws(()=>bridge.clone(new NativeBlob(['async host backing in synchronous DOM clone'])),{name:'DataCloneError'});
++ assert.throws(()=>bridge.clone(registerNativeBlobFactory(new NativeBlob(['async host backing in synchronous DOM clone']))),{name:'DataCloneError'});
+  assert.throws(()=>window.structuredClone(new SharedArrayBuffer(1)),{name:'DataCloneError'});
+ });
+--- a/test/workers.test.js
++++ b/test/workers.test.js
+@@ -72,10 +72,11 @@
+   const f = fixture(t, { 'https://example.test/app/geometry.js': `
+     const matrix = new DOMMatrix().translate(5, 7).scale(2);
+     const point = new DOMPoint(3, 4).matrixTransform(matrix);
+-    const cloned = structuredClone({ point, matrix, rect: new DOMRect(1, 2, 3, 4) });
++    const cloned = structuredClone({ point, rect: new DOMRect(1, 2, 3, 4) });
++    let matrixError; try { structuredClone(matrix); } catch (error) { matrixError = error.name; }
+     postMessage({ point: cloned.point.toJSON(), rect: cloned.rect.toJSON(),
+-      ownRealm: [cloned.point instanceof DOMPoint, cloned.matrix instanceof DOMMatrix,
+-        cloned.rect instanceof DOMRect], matrix: Array.from(cloned.matrix.toFloat64Array()) });
++      ownRealm: [cloned.point instanceof DOMPoint, matrixError === 'DataCloneError',
++        cloned.rect instanceof DOMRect], matrix: Array.from(matrix.toFloat64Array()) });
+   ` });
+   const worker = new f.window.Worker('./geometry.js');
+   const data = await message(worker);
