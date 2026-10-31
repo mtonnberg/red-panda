@@ -1,0 +1,363 @@
+{
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "probeSHA256": "52b6f05e702ae67b1f7b1afd2aa75822a368b4e7c3012fb3cea2550c02647849",
+  "groups": [
+    {
+      "name": "inactive",
+      "steps": [
+        {
+          "label": "navigate",
+          "method": "Page.navigate",
+          "params": {
+            "url": "data:text/html,%3Cp%3EActual%20main%3C%2Fp%3E"
+          },
+          "result": {
+            "frameId": "FID-0000000001",
+            "loaderId": "LID-0000000001"
+          }
+        },
+        {
+          "label": "actual-construction",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "(()=>{globalThis.originDoc=document.implementation.createHTMLDocument('Actual detached');originDoc.body.innerHTML='<section id=scope><p id=styled style=\"display:none\">Inline hidden born inactive</p><p>Actual visible child</p></section>';globalThis.scope=originDoc.getElementById('scope');globalThis.actualDeclaration=originDoc.getElementById('styled').style;globalThis.effects={nodeReads:0,declarationReads:0};return{noWindow:originDoc.defaultView===null,own:scope.ownerDocument===originDoc}})()",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "value": {
+                "noWindow": true,
+                "own": true
+              }
+            }
+          }
+        },
+        {
+          "label": "actual-zero-task",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "new Promise(resolve=>setTimeout(()=>resolve(true),0))",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "boolean",
+              "value": true
+            }
+          }
+        },
+        {
+          "label": "actual-scope-object",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "scope"
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "subtype": "node",
+              "className": "HTMLElement",
+              "description": "",
+              "objectId": "2.2.1"
+            }
+          }
+        },
+        {
+          "label": "actual-scope-id",
+          "method": "DOM.describeNode",
+          "params": {
+            "objectId": "2.2.1"
+          },
+          "result": {
+            "node": {
+              "nodeId": 1,
+              "backendNodeId": 1,
+              "parentId": 2,
+              "attributes": [
+                "id",
+                "scope"
+              ],
+              "localName": "section",
+              "nodeType": 1,
+              "nodeName": "SECTION",
+              "nodeValue": "",
+              "documentURL": null,
+              "baseURL": null,
+              "xmlVersion": "",
+              "compatibilityMode": "NoQuirksMode",
+              "isScrollable": false,
+              "children": [
+                {
+                  "nodeId": 3,
+                  "backendNodeId": 3,
+                  "parentId": 1,
+                  "attributes": [
+                    "id",
+                    "styled",
+                    "style",
+                    "display:none"
+                  ],
+                  "localName": "p",
+                  "nodeType": 1,
+                  "nodeName": "P",
+                  "nodeValue": "",
+                  "childNodeCount": 1,
+                  "documentURL": null,
+                  "baseURL": null,
+                  "xmlVersion": "",
+                  "compatibilityMode": "NoQuirksMode",
+                  "isScrollable": false
+                },
+                {
+                  "nodeId": 4,
+                  "backendNodeId": 4,
+                  "parentId": 1,
+                  "localName": "p",
+                  "nodeType": 1,
+                  "nodeName": "P",
+                  "nodeValue": "",
+                  "childNodeCount": 1,
+                  "documentURL": null,
+                  "baseURL": null,
+                  "xmlVersion": "",
+                  "compatibilityMode": "NoQuirksMode",
+                  "isScrollable": false
+                }
+              ],
+              "childNodeCount": 2
+            }
+          }
+        },
+        {
+          "label": "poison-actual-fronts",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "(()=>{const saved=[];for(const[object,key,kind]of[[Node.prototype,'nodeType','nodeReads'],[Node.prototype,'childNodes','nodeReads'],[Node.prototype,'textContent','nodeReads'],[CharacterData.prototype,'data','nodeReads'],[Element.prototype,'localName','nodeReads'],[HTMLElement.prototype,'hidden','nodeReads'],[actualDeclaration,'_values','declarationReads'],[actualDeclaration,'getPropertyValue','declarationReads']]){const original=Object.getOwnPropertyDescriptor(object,key);if(key==='_values'){const value=new Proxy(new Map(),{get(){effects[kind]++;throw Error('authored declaration backing read')}});Object.defineProperty(object,key,original?{...original,value}:{value,writable:true,configurable:true})}else Object.defineProperty(object,key,{get(){effects[kind]++;throw Error('authored '+key)},configurable:true});saved.push([object,key,original])}globalThis.restoreActual=()=>{for(const[object,key,original]of saved)if(original)Object.defineProperty(object,key,original);else delete object[key]};return{...effects}})()",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "subtype": "error",
+              "className": "Error",
+              "description": "Error: authored declaration backing read\n    at Object.get (<anonymous>:1:559)\n    at Object.defineProperty (<anonymous>)\n    at <anonymous>:1:612\n    at <anonymous>:1:1022",
+              "objectId": "2.2.2"
+            },
+            "exceptionDetails": {
+              "exceptionId": 1,
+              "text": "Uncaught",
+              "lineNumber": 0,
+              "columnNumber": 552,
+              "scriptId": "7",
+              "exception": {
+                "type": "object",
+                "subtype": "error",
+                "className": "Error",
+                "description": "Error: authored declaration backing read\n    at Object.get (<anonymous>:1:559)\n    at Object.defineProperty (<anonymous>)\n    at <anonymous>:1:612\n    at <anonymous>:1:1022",
+                "objectId": "2.2.3"
+              }
+            }
+          }
+        }
+      ],
+      "completed": false,
+      "failure": {
+        "message": "Actual JavaScript setup failed poison-actual-fronts",
+        "stack": "Error: Actual JavaScript setup failed poison-actual-fronts\n    at evaluate (file:///workspace/shared/lp-private-author-style-recovery/evidence/inactive-adoption-poison-r2-probe.mjs:3:712)\n    at async file:///workspace/shared/lp-private-author-style-recovery/evidence/inactive-adoption-poison-r2-probe.mjs:4:1408"
+      }
+    },
+    {
+      "name": "adopted",
+      "steps": [
+        {
+          "label": "navigate",
+          "method": "Page.navigate",
+          "params": {
+            "url": "data:text/html,%3Cp%3EActual%20main%3C%2Fp%3E"
+          },
+          "result": {
+            "frameId": "FID-0000000002",
+            "loaderId": "LID-0000000002"
+          }
+        },
+        {
+          "label": "actual-construction",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "(()=>{globalThis.originDoc=document.implementation.createHTMLDocument('Actual detached');originDoc.body.innerHTML='<section id=scope><p id=styled style=\"display:none\">Inline hidden born inactive</p><p>Actual visible child</p></section>';globalThis.scope=originDoc.getElementById('scope');globalThis.actualDeclaration=originDoc.getElementById('styled').style;globalThis.effects={nodeReads:0,declarationReads:0};return{noWindow:originDoc.defaultView===null,own:scope.ownerDocument===originDoc}})()",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "value": {
+                "noWindow": true,
+                "own": true
+              }
+            }
+          }
+        },
+        {
+          "label": "actual-adoption",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "(()=>{const original=scope;document.body.appendChild(document.adoptNode(scope));return{same:scope===original,mainOwner:scope.ownerDocument===document,connected:scope.isConnected}})()",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "value": {
+                "same": true,
+                "mainOwner": true,
+                "connected": true
+              }
+            }
+          }
+        },
+        {
+          "label": "actual-zero-task",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "new Promise(resolve=>setTimeout(()=>resolve(true),0))",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "boolean",
+              "value": true
+            }
+          }
+        },
+        {
+          "label": "actual-scope-object",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "scope"
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "subtype": "node",
+              "className": "HTMLElement",
+              "description": "",
+              "objectId": "2.4.1"
+            }
+          }
+        },
+        {
+          "label": "actual-scope-id",
+          "method": "DOM.describeNode",
+          "params": {
+            "objectId": "2.4.1"
+          },
+          "result": {
+            "node": {
+              "nodeId": 5,
+              "backendNodeId": 5,
+              "parentId": 6,
+              "attributes": [
+                "id",
+                "scope"
+              ],
+              "localName": "section",
+              "nodeType": 1,
+              "nodeName": "SECTION",
+              "nodeValue": "",
+              "documentURL": null,
+              "baseURL": null,
+              "xmlVersion": "",
+              "compatibilityMode": "NoQuirksMode",
+              "isScrollable": false,
+              "children": [
+                {
+                  "nodeId": 7,
+                  "backendNodeId": 7,
+                  "parentId": 5,
+                  "attributes": [
+                    "id",
+                    "styled",
+                    "style",
+                    "display:none"
+                  ],
+                  "localName": "p",
+                  "nodeType": 1,
+                  "nodeName": "P",
+                  "nodeValue": "",
+                  "childNodeCount": 1,
+                  "documentURL": null,
+                  "baseURL": null,
+                  "xmlVersion": "",
+                  "compatibilityMode": "NoQuirksMode",
+                  "isScrollable": false
+                },
+                {
+                  "nodeId": 8,
+                  "backendNodeId": 8,
+                  "parentId": 5,
+                  "localName": "p",
+                  "nodeType": 1,
+                  "nodeName": "P",
+                  "nodeValue": "",
+                  "childNodeCount": 1,
+                  "documentURL": null,
+                  "baseURL": null,
+                  "xmlVersion": "",
+                  "compatibilityMode": "NoQuirksMode",
+                  "isScrollable": false
+                }
+              ],
+              "childNodeCount": 2
+            }
+          }
+        },
+        {
+          "label": "poison-actual-fronts",
+          "method": "Runtime.evaluate",
+          "params": {
+            "expression": "(()=>{const saved=[];for(const[object,key,kind]of[[Node.prototype,'nodeType','nodeReads'],[Node.prototype,'childNodes','nodeReads'],[Node.prototype,'textContent','nodeReads'],[CharacterData.prototype,'data','nodeReads'],[Element.prototype,'localName','nodeReads'],[HTMLElement.prototype,'hidden','nodeReads'],[actualDeclaration,'_values','declarationReads'],[actualDeclaration,'getPropertyValue','declarationReads']]){const original=Object.getOwnPropertyDescriptor(object,key);if(key==='_values'){const value=new Proxy(new Map(),{get(){effects[kind]++;throw Error('authored declaration backing read')}});Object.defineProperty(object,key,original?{...original,value}:{value,writable:true,configurable:true})}else Object.defineProperty(object,key,{get(){effects[kind]++;throw Error('authored '+key)},configurable:true});saved.push([object,key,original])}globalThis.restoreActual=()=>{for(const[object,key,original]of saved)if(original)Object.defineProperty(object,key,original);else delete object[key]};return{...effects}})()",
+            "returnByValue": true,
+            "awaitPromise": true
+          },
+          "result": {
+            "result": {
+              "type": "object",
+              "subtype": "error",
+              "className": "Error",
+              "description": "Error: authored declaration backing read\n    at Object.get (<anonymous>:1:559)\n    at Object.defineProperty (<anonymous>)\n    at <anonymous>:1:612\n    at <anonymous>:1:1022",
+              "objectId": "2.4.2"
+            },
+            "exceptionDetails": {
+              "exceptionId": 2,
+              "text": "Uncaught",
+              "lineNumber": 0,
+              "columnNumber": 552,
+              "scriptId": "12",
+              "exception": {
+                "type": "object",
+                "subtype": "error",
+                "className": "Error",
+                "description": "Error: authored declaration backing read\n    at Object.get (<anonymous>:1:559)\n    at Object.defineProperty (<anonymous>)\n    at <anonymous>:1:612\n    at <anonymous>:1:1022",
+                "objectId": "2.4.3"
+              }
+            }
+          }
+        }
+      ],
+      "completed": false,
+      "failure": {
+        "message": "Actual JavaScript setup failed poison-actual-fronts",
+        "stack": "Error: Actual JavaScript setup failed poison-actual-fronts\n    at evaluate (file:///workspace/shared/lp-private-author-style-recovery/evidence/inactive-adoption-poison-r2-probe.mjs:3:712)\n    at async file:///workspace/shared/lp-private-author-style-recovery/evidence/inactive-adoption-poison-r2-probe.mjs:4:1408"
+      }
+    }
+  ],
+  "pid": 662717
+}

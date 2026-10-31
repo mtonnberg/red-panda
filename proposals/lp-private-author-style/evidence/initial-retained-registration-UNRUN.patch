@@ -1,0 +1,591 @@
+--- a/src/canonical-selector.js
++++ b/src/canonical-selector.js
+@@ -0,0 +1,36 @@
++// Canonical matching accepts only actual Node implementations held by a style
++// owner. No public Node surface, selector callback or prototype supplies state.
++import{createRequire}from'node:module';
++import{canonicalSelectorProgram}from'./selectors.js';
++const require=createRequire(import.meta.url),{domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js'),Element=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const apply=Reflect.apply,attribute=Element.prototype.getAttribute,parent=domSymbolTree.parent,children=domSymbolTree.childrenIterator,iterator=domSymbolTree.treeIterator,disabled=require('jsdom/lib/jsdom/living/helpers/form-controls.js').isDisabled,HTML='http://www.w3.org/1999/xhtml';
++const programs=new WeakMap(),lower=value=>value.replace(/[A-Z]/g,c=>c.toLowerCase()),attr=(node,name)=>apply(attribute,node,[name]),up=node=>apply(parent,domSymbolTree,[node]),elements=node=>Array.from(apply(children,domSymbolTree,[node])).filter(item=>item.nodeType===1);
++const insensitive=new Set('accept accept-charset align alink axis bgcolor charset checked clear codetype color compact declare defer dir direction disabled enctype face frame hreflang http-equiv lang language link media method multiple nohref noresize noshade nowrap readonly rel rev rules scope scrolling selected shape target text type valign valuetype vlink'.split(' '));
++const sameType=(a,b)=>a._namespaceURI===b._namespaceURI&&a._localName===b._localName;
++function root(node){let current=node;while(up(current))current=up(current);return current}
++function siblingList(node,type=false){const owner=up(node);return owner?elements(owner).filter(value=>!type||sameType(value,node)):[]}
++function nth(argument,index){const text=argument.replace(/\s/g,'').toLowerCase();if(text==='even')return index%2===0;if(text==='odd')return index%2===1;if(!text.includes('n'))return index===Number(text);const match=/^([+-]?\d*)n([+-]\d+)?$/.exec(text);if(!match)return false;const a=match[1]===''||match[1]==='+'?1:match[1]==='-'?-1:Number(match[1]),b=Number(match[2]??0);return a===0?index===b:Number.isInteger((index-b)/a)&&(index-b)/a>=0}
++function unsupported(name){const error=Error('Canonical selector state is not supported: '+name);error.code='UnsupportedCanonicalSelector';throw error}
++function predicate(node,test,scope){
++ if(test.kind==='never')return false;
++ if(test.kind==='type'){if(test.namespace===''&&node._namespaceURI!==null)return false;const fold=(node._namespaceURI===HTML||node._namespaceURI==='http://www.w3.org/2000/svg')&&node._ownerDocument._parsingMode==='html';return test.name==='*'||(fold?lower(node._localName)===lower(test.name):node._localName===test.name)}
++ if(test.kind==='id'||test.kind==='class'){let actual=attr(node,test.kind==='id'?'id':'class');if(actual===null)return false;let expected=test.name;if(node._ownerDocument._mode==='quirks'){actual=lower(actual);expected=lower(expected)}return test.kind==='id'?actual===expected:actual.split(/[\t\n\r\f ]+/).includes(expected)}
++ if(test.kind==='attribute'){const actual=attr(node,test.name);if(actual===null)return false;if(!test.operator)return true;let a=actual,b=test.value;if(test.flag==='i'||test.flag!=='s'&&node._namespaceURI===HTML&&node._ownerDocument._parsingMode==='html'&&insensitive.has(lower(test.name))){a=lower(a);b=lower(b)}switch(test.operator){case'=':return a===b;case'^=':return b!==''&&a.startsWith(b);case'$=':return b!==''&&a.endsWith(b);case'*=':return b!==''&&a.includes(b);case'~=':return b!==''&&!/[\t\n\r\f ]/.test(b)&&a.split(/[\t\n\r\f ]+/).includes(b);case'|=':return a===b||a.startsWith(b+'-');default:return false}}
++ if(test.kind==='logical'){if(test.name==='has'){for(const value of apply(iterator,domSymbolTree,[root(node)]))if(value.nodeType===1&&matchesProgram(value,test.program,node))return true;return false}const matched=matchesProgram(node,test.program,scope);return test.name==='not'?!matched:matched}
++ const name=test.name;
++ if(name==='scope')return node===scope;
++ if(name==='root')return up(node)?.nodeType===9;
++ if(name==='empty'){for(const child of apply(children,domSymbolTree,[node]))if(child.nodeType===1||child.nodeType===3&&child._data.length)return false;return true}
++ if(['link','any-link','visited'].includes(name))return name!=='visited'&&['a','area','link'].includes(node._localName)&&attr(node,'href')!==null;
++ if(name==='checked')return node._localName==='option'?node._selectedness===true:node._checkedness===true;
++ if(name==='disabled'||name==='enabled'){if(node._namespaceURI!==HTML||!['button','fieldset','input','optgroup','option','select','textarea'].includes(node._localName))return false;return name==='disabled'?disabled(node):!disabled(node)}
++ if(name==='focus')return node._ownerDocument._lastFocusedElement===node;
++ if(name==='focus-within'){let current=node._ownerDocument._lastFocusedElement;while(current){if(current===node)return true;current=up(current)}return false}
++ if(name==='defined')return node._ceState==='custom'||!node._localName.includes('-');
++ if(name==='target')return attr(node,'id')===node._ownerDocument._URL?.fragment;
++ if(/^(?:first|last|only|nth|nth-last)-(?:child|of-type)$/.test(name)){let values=siblingList(node,name.endsWith('of-type'));const index=values.indexOf(node)+1;if(name.startsWith('first-'))return index===1;if(name.startsWith('last-'))return index===values.length;if(name.startsWith('only-'))return values.length===1;return nth(test.argument,name.startsWith('nth-last-')?values.length-index+1:index)}
++ return unsupported(name);
++}
++function matchesBranch(node,branch,scope,index=branch.compounds.length-1){if(index<0||!node||node.nodeType!==1)return false;if(!branch.compounds[index].every(test=>predicate(node,test,scope)))return false;if(index===0)return true;const relation=branch.relations[index-1];if(relation==='>')return matchesBranch(up(node),branch,scope,index-1);if(relation===' '){for(let current=up(node);current;current=up(current))if(matchesBranch(current,branch,scope,index-1))return true;return false}const siblings=siblingList(node),position=siblings.indexOf(node);if(relation==='+')return matchesBranch(siblings[position-1],branch,scope,index-1);if(relation==='~'){for(let i=position-1;i>=0;i--)if(matchesBranch(siblings[i],branch,scope,index-1))return true;return false}return false}
++function matchesProgram(node,program,scope){return program.some(branch=>matchesBranch(node,branch,scope))}
++export function matchCanonicalSelector(node,source,scope){const owner=scope?._ownerDocument??node._ownerDocument;let cache=programs.get(owner);if(!cache){cache=new Map();programs.set(owner,cache)}let program=cache.get(source);if(!program){program=canonicalSelectorProgram(source);cache.set(source,program)}return matchesProgram(node,program,scope??node._ownerDocument.documentElement)}
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -63,7 +63,7 @@
+   }
+   const root=id===undefined||id===null?page.dom.window.document:resolveNode(id);
+   if(!root)throw new ProtocolError('InvalidNodeId',-31998);
+-  return { markdown: dumpMarkdownNode(root) };
++  return { markdown: dumpMarkdownNode(root,{context:page.dom.window.document}) };
+ }
+ 
+ export function targetInfo(page) {
+--- a/src/cssom-private.js
++++ b/src/cssom-private.js
+@@ -0,0 +1,39 @@
++// Authoritative CSS producer state. This module never authenticates a public
++// shape or reads authored accessors while the renderer requests scalar facts.
++const declarations=new WeakMap(),rules=new WeakMap(),sheets=new WeakMap(),media=new WeakMap(),lists=new WeakMap(),authorities=new WeakMap();
++const descriptor=Object.getOwnPropertyDescriptor,define=Object.defineProperty,extensible=Object.isExtensible,apply=Reflect.apply,mapEntries=Map.prototype.entries,mapGet=Map.prototype.get;
++function fieldMethods(bridge){'use strict';const E=TypeError,S=String;const check=(value,kind)=>{if(!bridge.has(value,kind))throw new E('Illegal invocation')},text=value=>{if(typeof value==='symbol')throw new E('Cannot convert a Symbol value to a string');return S(value)};return{
++ selector:{get:Object.getOwnPropertyDescriptor({get selectorText(){check(this,'rule');return bridge.selector(this)}},'selectorText').get,set:Object.getOwnPropertyDescriptor({set selectorText(value){check(this,'rule');bridge.selector(this,text(value),true)}},'selectorText').set},
++ disabled:{get:Object.getOwnPropertyDescriptor({get disabled(){check(this,'sheet');return bridge.disabled(this)}},'disabled').get,set:Object.getOwnPropertyDescriptor({set disabled(value){check(this,'sheet');bridge.disabled(this,!!value,true)}},'disabled').set},
++ mediaText:{get:Object.getOwnPropertyDescriptor({get mediaText(){check(this,'media');return bridge.media(this)}},'mediaText').get,set:Object.getOwnPropertyDescriptor({set mediaText(value){check(this,'media');bridge.media(this,text(value),true)}},'mediaText').set},
++ appendMedium(medium){check(this,'media');bridge.append(this,text(medium))},deleteMedium(medium){check(this,'media');bridge.remove(this,text(medium))},
++ condition:{get:Object.getOwnPropertyDescriptor({get conditionText(){check(this,'media-rule');return bridge.condition(this)}},'conditionText').get,set:Object.getOwnPropertyDescriptor({set conditionText(value){check(this,'media-rule');bridge.condition(this,text(value),true)}},'conditionText').set},
++}}
++function reflectMedia(record){const list=record.list,write=(key,value)=>{const old=descriptor(list,key);if(old){if('value'in old&&old.writable)define(list,key,{...old,value})}else if(extensible(list))define(list,key,{value,writable:true,enumerable:true,configurable:true})};const previous=descriptor(list,'length');for(let i=record.values.length;i<(previous?.value??0);i++){const old=descriptor(list,String(i));if(old&&'value'in old&&old.configurable)delete list[i]}for(let i=0;i<record.values.length;i++)write(String(i),record.values[i]);write('length',record.values.length)}
++function replaceMedia(record,value){record.values=value.split(',').map(item=>item.trim());record.version++;reflectMedia(record)}
++export function createCSSReadAuthority(compile){
++ if(typeof compile!=='function')throw new TypeError('An actual CSS realm compiler is required');
++ const authority=Object.freeze(Object.create(null));const bridge={has:(value,kind)=>kind==='rule'?rules.get(value)?.type===1:kind==='sheet'?sheets.has(value):kind==='media'?media.has(value):kind==='media-rule'&&rules.get(value)?.type===4&&media.has(rules.get(value).media),
++ selector(value,next,set=false){const state=rules.get(value);if(set){state.selector=next;state.version++}return state.selector},
++ disabled(value,next,set=false){const state=sheets.get(value);if(set){state.disabled=next;state.version++}return state.disabled},
++ media(value,next,set=false){const state=media.get(value);if(set)replaceMedia(state,next);return state.values.join(', ')},
++ append(value,next){const state=media.get(value);if(!state.values.includes(next)){state.values.push(next);state.version++;reflectMedia(state)}},
++ remove(value,next){const state=media.get(value),index=state.values.indexOf(next);if(index>=0){state.values.splice(index,1);state.version++;reflectMedia(state)}},
++ condition(value,next,set=false){const state=rules.get(value),actual=media.get(state.media);if(set)replaceMedia(actual,next);return actual.values.join(', ')},
++ };
++ const fields=compile('return ('+fieldMethods.toString()+')(bridge)',['bridge'])(bridge);authorities.set(authority,fields);return authority;
++}
++export function registerCSSDeclaration(style){if(!declarations.has(style)){const values=style._values,priorities=style._priorities;apply(mapEntries,values,[]);apply(mapEntries,priorities,[]);declarations.set(style,{values,priorities})}return style}
++export function readCSSDeclaration(style){const state=declarations.get(style);if(!state)throw Error('A genuine CSS declaration producer is required');return Array.from(apply(mapEntries,state.values,[]),([name,value])=>({name,value,priority:apply(mapGet,state.priorities,[name])??''}))}
++export function registerCSSRuleList(list,read){if(!lists.has(list))lists.set(list,read)}
++export function readCSSRuleList(list){const read=lists.get(list);if(!read)throw Error('A genuine CSS rule list producer is required');return read().slice()}
++export function registerCSSMediaList(list,authority){if(media.has(list))return;const values=[];for(let i=0;i<list.length;i++)values.push(list[i]);media.set(list,{list,values,version:1});const fields=authorities.get(authority);if(fields){define(list,'mediaText',{...fields.mediaText,enumerable:true,configurable:true});for(const name of['appendMedium','deleteMedium'])define(list,name,{value:fields[name],writable:true,enumerable:true,configurable:true})}}
++export function readCSSMediaList(list){const state=media.get(list);if(!state)throw Error('A genuine CSS media producer is required');return state.values.join(', ')}
++export function registerCSSRule(rule,options={}){
++ const{authority,group}=options;
++ if(rules.has(rule))return;const fresh=(name,property=name)=>Object.hasOwn(options,name)?options[name]:rule[property],state={type:fresh('type'),selector:fresh('selector','selectorText'),style:fresh('style'),list:fresh('list','cssRules'),media:fresh('media'),group,version:1};rules.set(rule,state);if(state.style)registerCSSDeclaration(state.style);if(state.media)registerCSSMediaList(state.media,authority);const fields=authorities.get(authority);if(fields){if(state.type===1)define(rule,'selectorText',{...fields.selector,enumerable:true,configurable:true});if(state.type===4&&state.media)define(rule,'conditionText',{...fields.condition,enumerable:true,configurable:true})}
++}
++export function replaceCSSRuleData(rule,{selector,style,list}){const state=rules.get(rule);if(!state)return;if(selector!==undefined)state.selector=selector;if(style!==undefined){registerCSSDeclaration(style);state.style=style}if(list!==undefined)state.list=list;state.version++}
++export function readCSSRule(rule){const state=rules.get(rule);if(!state)throw Error('A genuine CSS rule producer is required');return state}
++export function registerCSSSheet(sheet,{authority,list,media:medium,disabled=false}){if(sheets.has(sheet))return;registerCSSMediaList(medium,authority);sheets.set(sheet,{sheet,list,media:medium,disabled:!!disabled,version:1});const fields=authorities.get(authority);if(fields)define(sheet,'disabled',{...fields.disabled,enumerable:true,configurable:true})}
++export function readCSSSheet(sheet){const state=sheets.get(sheet);if(!state)throw Error('A genuine CSS sheet producer is required');return state}
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -1,3 +1,4 @@
++import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
+ // Scoped CSSOM adaptation. Parsing is token based so strings, comments, URLs and
+ // balanced component values do not accidentally become declaration boundaries.
+ import { createRequire } from 'node:module';
+@@ -282,6 +283,7 @@
+ export function enhanceDeclaration(style, window) {
+   if(!DECLARATIONS.has(style)) {Object.setPrototypeOf(style,COMPAT);DECLARATIONS.add(style);}
+   if(window)style._global=window;
++  registerCSSDeclaration(style);
+   return style;
+ }
+ // Parsed scalar facts may be reused, never a public declaration or its maps.
+@@ -314,7 +316,7 @@
+       ownKeys(){return LISTS.get(list).map((_,i)=>String(i));},
+       getOwnPropertyDescriptor(target,key){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<LISTS.get(list).length)return{configurable:true,enumerable:true,value:materializeRule(LISTS.get(list)[Number(key)]),writable:false};return Reflect.getOwnPropertyDescriptor(target,key);},
+       set(){return false;},deleteProperty(){return false;},defineProperty(){return false;}});
+-    LISTS.set(list,[...rules]);return list;
++    LISTS.set(list,[...rules]);registerCSSRuleList(list,()=>LISTS.get(list));return list;
+   }
+   get length(){return LISTS.get(this).length;}
+   *[Symbol.iterator](){for(let i=0;i<this.length;i++)yield this[i];}
+@@ -327,14 +329,14 @@
+ // CSSOM objects are constructed once on demand, never replaced by summaries.
+ const DEFERRED_RULES=new WeakSet(),DEFERRED_LISTS=new WeakMap();
+ function declarationRevision(style){return style&&DECLARATIONS.has(style)?String(MUTATIONS.get(style)??0)+':'+(CHANGES.get(style)??0)+':'+style.length:style?.cssText;}
+-function deferredRules(entries,window){const state={window,sheet:null,parent:null,published:new Set(),styled:new Set(),version:1,groups:null};const definitions=entries.map(entry=>{const value={owner:state,selector:entry.prelude,body:entry.body,rule:null,style:null,styleVersion:null};DEFERRED_RULES.add(value);return value});const list=new CSSRuleList(definitions);state.list=list;DEFERRED_LISTS.set(list,state);return list;}
+-function deferredStyle(value){if(value.rule)return value.rule.style;if(!value.style){value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);}return value.style;}
+-function materializeRule(value){if(!value||!DEFERRED_RULES.has(value))return value;if(value.rule)return value.rule;const owner=value.owner,rule=new cssom.CSSStyleRule();rule.selectorText=value.selector;rule.style=deferredStyle(value);rule.cssRules=new CSSRuleList();rule.parentStyleSheet=owner.sheet;rule.parentRule=owner.parent;Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});Object.defineProperty(rule,'cssText',styleTextDescriptor(owner.window));value.rule=rule;value.style=rule.style;value.styleVersion=declarationRevision(rule.style);owner.published.add(value);owner.styled.add(value);return rule;}
++function deferredRules(entries,window,authority){const state={window,authority,sheet:null,parent:null,published:new Set(),styled:new Set(),version:1,groups:null};const definitions=entries.map(entry=>{const value={owner:state,selector:entry.prelude,body:entry.body,rule:null,style:null,styleVersion:null};DEFERRED_RULES.add(value);return value});const list=new CSSRuleList(definitions);state.list=list;DEFERRED_LISTS.set(list,state);return list;}
++function deferredStyle(value){if(value.rule)return readCSSRule(value.rule).style;if(!value.style){value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);}return value.style;}
++function materializeRule(value){if(!value||!DEFERRED_RULES.has(value))return value;if(value.rule)return value.rule;const owner=value.owner,rule=new cssom.CSSStyleRule();rule.selectorText=value.selector;rule.style=deferredStyle(value);rule.cssRules=new CSSRuleList();rule.parentStyleSheet=owner.sheet;rule.parentRule=owner.parent;Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});Object.defineProperty(rule,'cssText',styleTextDescriptor(owner.window,owner.authority));registerCSSRule(rule,{authority:owner.authority,type:1,selector:value.selector,style:value.style,list:rule.cssRules,media:null});value.rule=rule;value.style=rule.style;value.styleVersion=declarationRevision(rule.style);owner.published.add(value);owner.styled.add(value);return rule;}
+ export function bindDeferredRules(rules,sheet,parent,normalize){const state=DEFERRED_LISTS.get(rules);if(!state)return false;state.sheet=sheet;state.parent=parent;for(const value of LISTS.get(rules)){if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule)normalize(value.rule);}else normalize(value);}return true;}
+ export function hasStyleImports(rules){return [...(LISTS.get(rules)??rules)].some(value=>!DEFERRED_RULES.has(value)&&value.type===3);}
+ export function discardStyleImports(rules){const values=LISTS.get(rules);for(let i=values.length-1;i>=0;i--)if(!DEFERRED_RULES.has(values[i])&&values[i].type===3)values.splice(i,1);}
+ export function detachRuleEntries(rules){for(const value of LISTS.get(rules)??rules){if(DEFERRED_RULES.has(value)){if(value.rule){value.rule.parentStyleSheet=null;value.rule.parentRule=null;}}else{value.parentStyleSheet=null;value.parentRule=null;}}}
+-export function replaceRuleEntries(target,source,sheet,parent,window){detachRuleEntries(target);const values=LISTS.get(source)??source,copy=values.slice();LISTS.set(target,copy);let state=DEFERRED_LISTS.get(target);if(!state){state={window,sheet,parent,published:new Set(),styled:new Set(),version:1,groups:null,list:target};DEFERRED_LISTS.set(target,state);}else{state.published.clear();state.styled.clear();state.version++;state.groups=null;state.sheet=sheet;state.parent=parent;}
++export function replaceRuleEntries(target,source,sheet,parent,window,authority=DEFERRED_LISTS.get(source)?.authority){detachRuleEntries(target);const values=LISTS.get(source)??source,copy=values.slice();LISTS.set(target,copy);let state=DEFERRED_LISTS.get(target);if(!state){state={window,authority,sheet,parent,published:new Set(),styled:new Set(),version:1,groups:null,list:target};DEFERRED_LISTS.set(target,state);}else{state.published.clear();state.styled.clear();state.version++;state.groups=null;state.sheet=sheet;state.parent=parent;state.authority=authority??state.authority;}
+  for(const value of copy)if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule){state.published.add(value);value.rule.parentStyleSheet=sheet;value.rule.parentRule=parent;}if(value.style)state.styled.add(value);}return target;}
+ export function flatSheetState(sheet){const list=sheet.cssRules,state=DEFERRED_LISTS.get(list);if(!state)return null;const values=LISTS.get(list);for(const value of state.published){const rule=value.rule;if(rule.cssRules?.length)return null;if(value.selector!==rule.selectorText){value.selector=rule.selectorText;state.version++;state.groups=null;}if(value.style!==rule.style){value.style=rule.style;value.styleVersion=declarationRevision(rule.style);state.version++;} }
+  for(const value of state.styled){const version=declarationRevision(value.style);if(version!==value.styleVersion){value.styleVersion=version;state.version++;}}
+@@ -361,54 +363,58 @@
+ }
+ 
+ const STYLE_TEXT_FACTORIES=new WeakMap();let hostStyleText;
+-function styleTextDescriptor(window){
+-  if(window&&STYLE_TEXT_FACTORIES.has(window))return STYLE_TEXT_FACTORIES.get(window);
++function styleTextDescriptor(window,authority){
++  const owner=authority??window;
++  if(owner&&STYLE_TEXT_FACTORIES.has(owner))return STYLE_TEXT_FACTORIES.get(owner);
+   if(!window&&hostStyleText)return hostStyleText;
+-  const descriptor={configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}};
+-  if(window)STYLE_TEXT_FACTORIES.set(window,descriptor);else hostStyleText=descriptor;return descriptor;
++  const descriptor={configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window,authority}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});replaceCSSRuleData(this,{selector:parsed.selectorText,style:parsed.style,list:parsed.cssRules});}}};
++  if(owner)STYLE_TEXT_FACTORIES.set(owner,descriptor);else hostStyleText=descriptor;return descriptor;
+ }
+ const NESTED_GROUPS=new WeakMap();
+ export const nestedGroupContents=rule=>NESTED_GROUPS.get(rule);
+ 
+-export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
++export function parseStyleSheet(text,{window,authority,onUnsupported,nested=false}={}) {
+   const sheet=new cssom.CSSStyleSheet();const rules=[],blocks=parseRuleBlocks(text);
+-  if(!nested&&blocks.every(entry=>!entry.prelude.startsWith('@')&&entry.body!==null&&parseRuleBlocks(entry.body).length===0)) {sheet.cssRules=deferredRules(blocks,window);return sheet;}
++  if(!nested&&blocks.every(entry=>!entry.prelude.startsWith('@')&&entry.body!==null&&parseRuleBlocks(entry.body).length===0)) {sheet.cssRules=deferredRules(blocks,window,authority);return sheet;}
+   for(const entry of blocks) {
+-    const {prelude,body}=entry;let rule;
++    const {prelude,body}=entry;let rule,kind;
+     if(!prelude.startsWith('@') && body!==null) {
+-      rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules;
++      kind=1;rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,authority,onUnsupported,nested:true}).cssRules;
+     } else if(/^@(?:-webkit-)?keyframes\s+/i.test(prelude) && body!==null) {
+-      rule=new cssom.CSSKeyframesRule();rule.name=prelude.replace(/^@(?:-webkit-)?keyframes\s+/i,'');if(/^@-webkit-/i.test(prelude))rule._vendorPrefix='-webkit-';
++      kind=7;rule=new cssom.CSSKeyframesRule();rule.name=prelude.replace(/^@(?:-webkit-)?keyframes\s+/i,'');if(/^@-webkit-/i.test(prelude))rule._vendorPrefix='-webkit-';
+       rule.cssRules=new CSSRuleList(parseRuleBlocks(body).filter(item=>item.body!==null).map(item=>{const frame=new cssom.CSSKeyframeRule();frame.keyText=item.prelude;frame.style=createDeclaration(item.body,{window});return frame;}));
+     } else if(nested && /^@media\b/i.test(prelude) && body!==null) {
+-      rule=new cssom.CSSRule();rule.type=4;
++      kind=4;rule=new cssom.CSSRule();rule.type=4;
+       const media=prelude.replace(/^@media\s*/i,'');
+-      NESTED_GROUPS.set(rule,{kind:'media',media,style:createDeclaration(body,{nesting:true,window}),rules:parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules});
++      NESTED_GROUPS.set(rule,{kind:'media',media,style:createDeclaration(body,{nesting:true,window}),rules:parseStyleSheet(body,{window,authority,onUnsupported,nested:true}).cssRules});
+       Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+     } else if(/^@(?:media|supports)\b/i.test(prelude) && body!==null) {
+-      if(/^@media\b/i.test(prelude)){rule=new cssom.CSSMediaRule();rule.media.mediaText=prelude.replace(/^@media\s*/i,'');}
+-      else{rule=new cssom.CSSSupportsRule();rule.conditionText=prelude.replace(/^@supports\s*/i,'');}
+-      rule.cssRules=parseStyleSheet(body,{window,onUnsupported}).cssRules;
++      if(/^@media\b/i.test(prelude)){kind=4;rule=new cssom.CSSMediaRule();rule.media.mediaText=prelude.replace(/^@media\s*/i,'');}
++      else{kind=12;rule=new cssom.CSSSupportsRule();rule.conditionText=prelude.replace(/^@supports\s*/i,'');}
++      rule.cssRules=parseStyleSheet(body,{window,authority,onUnsupported}).cssRules;
+     } else if(/^@font-face\s*$/i.test(prelude)&&body!==null) {
+-      rule=new cssom.CSSFontFaceRule();rule.style=createDeclaration(body,{window});
++      kind=5;rule=new cssom.CSSFontFaceRule();rule.style=createDeclaration(body,{window});
+       // Descriptor grammars differ from ordinary element properties. Keep the
+       // parser's declaration boundaries, including src and font descriptors.
+       for(const item of parseDeclarations(body))if(!rule.style.getPropertyValue(item.property))rule.style._setProperty(item.property,item.value,item.priority);
+     } else if(/^@layer(?:\s|$)/i.test(prelude)) {
+-      rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
++      kind=0;rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+       const names=prelude.replace(/^@layer\s*/i,'').trim();
+-      NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
++      NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,authority,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
+     } else if(/^@charset(?:\s|$)/i.test(prelude)&&body===null) {
+-      rule=new cssom.CSSRule();rule.type=2;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
++      kind=2;rule=new cssom.CSSRule();rule.type=2;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+     } else if(/^@import\b/i.test(prelude)&&body===null) {
+-      try{rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
++      try{kind=3;rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
+     } else if(prelude.startsWith('@')) {
+-      rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});onUnsupported?.('Unknown at-rules are retained without cascade semantics');
++      kind=0;rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});onUnsupported?.('Unknown at-rules are retained without cascade semantics');
+     }
+     if(!rule)continue;
+     if(rule.style){Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});}
+-    if(rule.type===1)Object.defineProperty(rule,'cssText',styleTextDescriptor(window));
++    if(rule.type===1)Object.defineProperty(rule,'cssText',styleTextDescriptor(window,authority));
++    registerCSSRule(rule,{authority,type:kind,selector:kind===1?prelude:undefined,style:Object.getOwnPropertyDescriptor(rule,'style')?.value,list:Object.getOwnPropertyDescriptor(rule,'cssRules')?.value,media:Object.getOwnPropertyDescriptor(rule,'media')?.value,group:NESTED_GROUPS.get(rule)});
+     rules.push(rule);
+   }
+   sheet.cssRules=new CSSRuleList(rules);return sheet;
+ }
++
++export function canonicalCSSRuleList(list){return readCSSRuleList(list).map(value=>{if(!DEFERRED_RULES.has(value))return readCSSRule(value);if(value.rule)return readCSSRule(value.rule);return{type:1,selector:value.selector,style:deferredStyle(value),list:null,media:null,group:null,version:value.owner.version}})}
+--- a/src/dump.js
++++ b/src/dump.js
+@@ -86,13 +86,13 @@
+     firstRow:node=>node.rows[0], cells:node=>[...node.cells], hasHeader:node=>node?.querySelector('th'),
+   });
+ }
+-export function formatMarkdown(root, read) {
++export function formatMarkdown(root, read, {includeHiddenVisibility=false}={}) {
+   const render = (node, listIndex = 1) => {
+     if (read.type(node) === 3) return read.data(node).replace(/\s+/g, ' ');
+     if (read.type(node) === 9 || read.type(node) === 11) return read.children(node).map(child => render(child)).join('');
+     if (read.type(node) !== 1) return '';
+     const tag = read.tag(node), style = read.style(node);
+-    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || read.hidden(node) || read.attr(node, 'aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return '';
++    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || read.hidden(node) || read.attr(node, 'aria-hidden') === 'true' || style?.display === 'none' || !includeHiddenVisibility && style?.visibility === 'hidden') return '';
+     const content = read.children(node).map(child => render(child)).join('');
+     if (/^h[1-6]$/.test(tag)) return `\n${'#'.repeat(Number(tag[1]))} ${content.trim()}\n`;
+     if (tag === 'a') {
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -9,7 +9,7 @@
+ import {refreshMediaQueries} from './media.js';
+ // Independent surrogate geometry for a headless DOM. This intentionally models
+ // the reference's measured simple boxes; it is not a CSS layout renderer.
+-import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision, getSpecifiedStyle } from './styles.js';
++import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision, getSpecifiedStyle, bindCanonicalStyleLayout } from './styles.js';
+ import { createRequire } from 'node:module';
+ const require = createRequire(import.meta.url);
+ const RectFactory=require('jsdom/lib/jsdom/living/generated/DOMRect.js');
+@@ -252,6 +252,7 @@
+ export function installLayout(page, window, options = {}) {
+   const layout = createLayout(window, options);
+   LAYOUTS.set(implForWrapper(window.document),layout);
++  bindCanonicalStyleLayout(implForWrapper(window.document),layout);
+   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
+   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
+   installElementScroll(window,implementation=>LAYOUTS.get(implementation._ownerDocument));
+--- a/src/markdown-node.js
++++ b/src/markdown-node.js
+@@ -1,3 +1,4 @@
++import{createCanonicalStyleResolver}from'./styles.js';
+ // Host-only read adapter over actual authenticated DOM implementations. It
+ // allocates no DOM clones/fronts and invokes no authored Node accessors.
+ import{createRequire}from'node:module';
+@@ -6,22 +7,16 @@
+ const require=createRequire(import.meta.url),NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation,ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation,InputImpl=require('jsdom/lib/jsdom/living/nodes/HTMLInputElement-impl.js').implementation;
+ const{domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js'),childrenIterator=domSymbolTree.childrenIterator,parent=domSymbolTree.parent,treeIterator=domSymbolTree.treeIterator;
+ const descriptor=Object.getOwnPropertyDescriptor,apply=Reflect.apply,hasInstance=Function.prototype[Symbol.hasInstance],getAttribute=ElementImpl.prototype.getAttribute,hasAttribute=ElementImpl.prototype.hasAttribute,baseURI=descriptor(NodeImpl.prototype,'baseURI').get,textContent=descriptor(NodeImpl.prototype,'textContent').get,inputType=descriptor(InputImpl.prototype,'type').get,checked=descriptor(InputImpl.prototype,'checked').get;
+-const dependencyRequire=createRequire(require.resolve('jsdom/lib/jsdom/living/helpers/style-rules.js')),cssValue=dependencyRequire('cssstyle').CSSStyleDeclaration.prototype.getPropertyValue,URLConstructor=URL,HTML='http://www.w3.org/1999/xhtml';
++const URLConstructor=URL,HTML='http://www.w3.org/1999/xhtml';
+ const children=node=>Array.from(apply(childrenIterator,domSymbolTree,[node])),descendants=node=>Array.from(apply(treeIterator,domSymbolTree,[node])).slice(1),tag=node=>node?._localName;
+ const attr=(node,name)=>apply(getAttribute,node,[name]),isHTML=(node,name)=>node.nodeType===1&&node._namespaceURI===HTML&&node._localName===name;
+ function link(node,name){const raw=attr(node,name);if(raw===null)return'';try{return new URLConstructor(raw,apply(baseURI,node,[])).href}catch{return raw}}
+ function rows(node){const head=[],body=[],foot=[];for(const child of children(node)){if(isHTML(child,'tr'))body.push(child);else if(child._namespaceURI===HTML&&['thead','tbody','tfoot'].includes(tag(child))){const group=tag(child)==='thead'?head:tag(child)==='tfoot'?foot:body;for(const row of children(child))if(isHTML(row,'tr'))group.push(row)}}return[...head,...body,...foot]}
+-function inlineStyle(node){
+- // No public cascade fallback: it would run authored DOM getters. Active
+- // author sheets require a separate canonical private cascade bridge.
+- if(node._ownerDocument?._styleSheets?._list?.length)throw new DumpError('Author stylesheet visibility is not supported by the private markdown adapter','UnsupportedMarkdownStyle');
+- const value=name=>node._style?apply(cssValue,node._style,[name]):'';
+- return{display:value('display'),visibility:value('visibility')};
+-}
++
+ const read=Object.freeze({
+  type:node=>node.nodeType,data:node=>node._data,tag,children,
+  elements:node=>children(node).filter(child=>child.nodeType===1),
+- style:inlineStyle,hidden:node=>apply(hasAttribute,node,['hidden']),attr,
++ style:()=>{throw Error('An actual frame style resolver is required')},hidden:node=>apply(hasAttribute,node,['hidden']),attr,
+  hasAttr:(node,name)=>apply(hasAttribute,node,[name]),href:node=>link(node,'href'),src:node=>link(node,'src'),alt:node=>attr(node,'alt')??'',
+  parentTag:node=>{const value=apply(parent,domSymbolTree,[node]);return value?.nodeType===1?tag(value):undefined},
+  text:node=>apply(textContent,node,[]),inputType:node=>apply(inputType,node,[]),checked:node=>apply(checked,node,[]),
+@@ -29,8 +24,11 @@
+  rows,firstRow:node=>rows(node)[0],cells:node=>children(node).filter(value=>isHTML(value,'td')||isHTML(value,'th')),
+  hasHeader:node=>node?descendants(node).some(value=>isHTML(value,'th')):false,
+ });
+-export function dumpMarkdownNode(value){
++export function dumpMarkdownNode(value,{context}={}){
+  const node=platformFactoryRecord(value)?.implementation;
+  if(!node||!apply(hasInstance,NodeImpl,[node]))throw new DumpError('A genuine registered DOM node is required');
+- return formatMarkdown(node,read);
++ const renderDocument=context===undefined?node.nodeType===9?node:node._ownerDocument:platformFactoryRecord(context)?.implementation;
++ if(!renderDocument||renderDocument.nodeType!==9)throw new DumpError('A genuine render-frame document is required');
++ const style=createCanonicalStyleResolver(renderDocument),reader={...read,style,children:current=>current._shadowRoot?children(current._shadowRoot):current._localName==='slot'&&current._assignedNodes?.length?current._assignedNodes:children(current)};
++ return formatMarkdown(node,reader,{includeHiddenVisibility:true});
+ }
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -268,3 +268,27 @@
+ export function selectorSubjectTypes(source){
+  try{const parsed=parseSelector(source),types=[];for(const group of parsed.groups){const type=group.required.find(item=>item.kind==='type'&&item.name!=='*');if(!type)return null;types.push(type.name);}return types;}catch{return null;}
+ }
++
++// Private style readers consume the same grammar as public selectors, retaining
++// structural programs instead of routing genuine backend nodes through DOM fronts.
++export function canonicalSelectorProgram(source) {
++ parseSelector(source);
++ const build=(value,relative=false)=>splitGroups(value).map(part=>{
++  part=part.trim();const compounds=[],relations=[];let tests=[],pending=null,index=0;
++  const flush=()=>{if(tests.length){if(compounds.length)relations.push(pending??' ');compounds.push(tests);tests=[];pending=null}};
++  if(relative){compounds.push([{kind:'pseudo',name:'scope'}]);pending=' ';}
++  while(index<part.length){const c=part[index];
++   if(SPACE.test(c)){flush();index=skipSpace(part,index);if(!pending)pending=' ';continue}
++   if('>+~'.includes(c)){flush();pending=c;index++;continue}
++   if(c==='['){const item=attribute(part,index);tests.push(item.predicate);index=item.end;continue}
++   if(c==='.'||c==='#'){const item=readName(part,index+1);tests.push({kind:c==='#'?'id':'class',name:item.value});index=item.end;continue}
++   if(c===':'){const doubled=part[index+1]===':',item=readName(part,index+(doubled?2:1));let end=item.end,argument=null;if(part[end]==='('){const result=block(part,end);argument=result.body;end=result.end}const name=lower(item.value);
++    if(doubled||legacyElements.has(name))tests.push({kind:'never'});
++    else if(logical.has(name))tests.push({kind:'logical',name,program:argument?.trim()?build(argument,name==='has'):[]});
++    else tests.push({kind:'pseudo',name,argument});index=end;continue}
++   const item=typeSelector(part,index);tests.push(item.predicate);index=item.end;
++  }
++  flush();return{compounds,relations};
++ });
++ return build(preprocess(String(source)));
++}
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,3 +1,7 @@
++import vm from 'node:vm';
++import {createCSSReadAuthority,registerCSSSheet,readCSSSheet,registerCSSRule,readCSSRule,readCSSDeclaration,readCSSMediaList} from './cssom-private.js';
++import {canonicalCSSRuleList} from './cssom.js';
++import {matchCanonicalSelector} from './canonical-selector.js';
+ import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import {computedTransform,computedFontSize} from './computed-values.js';
+@@ -25,9 +29,13 @@
+ const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
+ const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\narea,base,datalist,head,link,meta,noscript,param,script,source,style,template,title,track { display: none; } details:not([open]) > :not(summary) { display: none; } [popover]:not(:popover-open):not(dialog[open]) { display:none; } dialog:popover-open {display:block;}\n');
+ const RECORDS = new WeakMap();
++const CANONICAL_RECORDS=new WeakMap();
+ const SHEETS = new WeakMap();
+ const ADOPTED = new WeakMap();
+ const STYLE_NODES = new WeakMap();
++const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js'),NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const privateParent=domSymbolTree.parent,privateTree=domSymbolTree.treeIterator,privateChildren=domSymbolTree.childrenIterator,privateText=Object.getOwnPropertyDescriptor(NodeImpl.prototype,'textContent').get,privateApply=Reflect.apply;
++function backendRoot(node){let parent;while(parent=privateApply(privateParent,domSymbolTree,[node]))node=parent;return node}
+ const SELECTOR_PARTS=new WeakMap();
+ function ruleSelectorParts(rule){let retained=SELECTOR_PARTS.get(rule);if(!retained||retained.text!==rule.selectorText){retained={text:rule.selectorText,parts:splitTopLevel(rule.selectorText)};SELECTOR_PARTS.set(rule,retained);}return retained.parts;}
+ const IDENTITIES = new WeakMap();
+@@ -125,23 +133,23 @@
+ 
+ const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
+ StyleElementImpl.prototype._updateAStyleBlock = function () {
+-  const record = recordFor(wrapperForImpl(this._ownerDocument));
++  const record = CANONICAL_RECORDS.get(this._ownerDocument)??recordFor(wrapperForImpl(this._ownerDocument));
+   if (!record) return updateStyleBlock.call(this);
+   if (this.sheet) removeStylesheet(this.sheet, this);
+-  if (!this.isConnected || !this._ownerDocument._defaultView) return;
++  if (!this.isConnected || !this._ownerDocument._defaultView) {if(!this._attached)record.frameStyleSources?.delete(this);return;}
+   const type = this.getAttributeNS(null, 'type');
+   if (type !== null && type !== '' && type.toLowerCase() !== 'text/css') return;
+   const element = wrapperForImpl(this);
+-  const parsed = parse(record, element.textContent);
++  const parsed = parse(record, privateApply(privateText,this,[]));
+   // Keep jsdom's existing import loader for parser-compatible imported sheets.
+   // Its requests, ownership and load/error events remain managed by the Page.
+   if (Array.from(parsed.cssRules).some(rule => rule.type === 3)) {
+     updateStyleBlock.call(this);
+-    if (this.sheet) { upgradeSheet(record, this.sheet); this.sheet.ownerNode = element; return; }
++    if (this.sheet) { upgradeSheet(record, this.sheet); this.sheet.ownerNode = element;registerFrameStyleSource(record,this,this.sheet); return; }
+     record.unsupported.add('Imports in stylesheets requiring CSS syntax recovery');
+   }
+   const sheet = upgradeSheet(record, parsed); sheet.ownerNode = element;
+-  this.sheet = sheet;
++  this.sheet = sheet;registerFrameStyleSource(record,this,sheet);
+   this._ownerDocument.styleSheets._add(sheet); invalidateStyleCache(this);
+ };
+ 
+@@ -192,11 +200,12 @@
+         });
+       }
+     }
++    registerCSSRule(rule,{authority:SHEETS.get(sheet)?.record?.cssAuthority,group:nestedGroupContents(rule)});
+   }
+ }
+ 
+ function parse(record, text) {
+-  return parseStyleSheet(String(text), { window: record.window, onUnsupported: value => record.unsupported.add(value) });
++  return parseStyleSheet(String(text), { window: record.window, authority:record.cssAuthority, onUnsupported: value => record.unsupported.add(value) });
+ }
+ 
+ const originalExternalCreate=stylesheetBackend.createStylesheet;
+@@ -204,18 +213,20 @@
+  const record=recordFor(wrapperForImpl(element._ownerDocument));
+  const index=element._ownerDocument.styleSheets._list.indexOf(sheet);
+  if(record&&element.localName==='link'&&element._attached)REPLACING_EXTERNAL.set(element,{record,sheet,index});
++ if(record&&!element._attached)record.frameStyleSources?.delete(element);
+  return removeStylesheet(sheet,element);
+ };
+ stylesheetBackend.createStylesheet=function(text,element,baseURL){
+  const record=recordFor(wrapperForImpl(element._ownerDocument));
+- if(!record||record.disposed||element.localName!=='link')return originalExternalCreate(text,element,baseURL);
++ if(!record||record.disposed)return originalExternalCreate(text,element,baseURL);
++ if(element._localName!=='link'){const result=originalExternalCreate(text,element,baseURL);if(element.sheet){const sheet=upgradeSheet(record,element.sheet);registerFrameStyleSource(record,element,sheet)}return result;}
+  const replacement=REPLACING_EXTERNAL.get(element);REPLACING_EXTERNAL.delete(element);
+  const parsed=parse(record,text);
+  // Keep the existing real import loader for its supported import path.
+  if(hasStyleImports(parsed.cssRules)){originalExternalCreate(text,element,baseURL);if(element.sheet){upgradeSheet(record,element.sheet);element.sheet.ownerNode=wrapperForImpl(element);element.sheet.href=whatwgURL.serializeURL(baseURL);}return;}
+  const retained=replacement?.record===record?replacement.sheet:null,sheet=retained?upgradeSheet(record,retained):upgradeSheet(record,parsed);
+- if(retained){normalizeRules(parsed.cssRules,sheet);replaceRuleEntries(sheet.cssRules,parsed.cssRules,sheet,null,record.window);}
+- sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;
++ if(retained){normalizeRules(parsed.cssRules,sheet);replaceRuleEntries(sheet.cssRules,parsed.cssRules,sheet,null,record.window,record.cssAuthority);}
++ sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;registerFrameStyleSource(record,element,sheet);
+  const list=element._ownerDocument.styleSheets._list,index=replacement?.index;
+  if(!list.includes(sheet)){if(index>=0)list.splice(Math.min(index,list.length),0,sheet);else list.push(sheet);}
+  invalidateStyleCache(element);
+@@ -239,6 +250,8 @@
+     if (sheet.disabled === undefined) sheet.disabled = false;
+     if (sheet.ownerNode === undefined) sheet.ownerNode = null;
+     if (sheet.href === undefined) sheet.href = null;
++    metadata.rules=sheet.cssRules;metadata.media=sheet.media;
++    registerCSSSheet(sheet,{authority:record.cssAuthority,list:metadata.rules,media:metadata.media,disabled:sheet.disabled});
+     Object.defineProperties(sheet, {
+       replaceSync: { configurable: true, writable: true, value(text) {
+         if (this !== sheet) return operation(record, this, 'replaceSync', arguments);
+@@ -263,11 +276,11 @@
+         index = Number(index) >>> 0;
+         // Native Lightpanda clamps insertion indexes (its documented CSS-in-JS
+         // compatibility workaround); deletion remains range checked.
+-        index = Math.min(index, sheet.cssRules.length);
++        index = Math.min(index, metadata.rules.length);
+         const rules = parse(record, text).cssRules;
+         if (rules.length !== 1) throw new record.window.DOMException('insertRule requires exactly one CSS rule', 'SyntaxError');
+         if (metadata.constructed && rules[0].type === 3) throw new record.window.DOMException('Constructed stylesheets cannot import other sheets', 'SyntaxError');
+-        normalizeRules(rules, sheet); spliceRules(sheet.cssRules, index, 0, rules[0]);
++        normalizeRules(rules, sheet); spliceRules(metadata.rules, index, 0, rules[0]);
+         return index;
+       } },
+       deleteRule: { configurable: true, writable: true, value(index) {
+@@ -275,8 +288,8 @@
+         if (!arguments.length) throw new record.window.TypeError('deleteRule requires an index');
+         if (metadata.locked) throw new record.window.DOMException('The stylesheet is being replaced', 'NotAllowedError');
+         index = Number(index) >>> 0;
+-        if (index >= sheet.cssRules.length) throw new record.window.DOMException('Rule index is outside the stylesheet', 'IndexSizeError');
+-        const removed = spliceRules(sheet.cssRules, index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;
++        if (index >= metadata.rules.length) throw new record.window.DOMException('Rule index is outside the stylesheet', 'IndexSizeError');
++        const removed = spliceRules(metadata.rules, index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;
+       } },
+     });
+     metadata.operations = Object.fromEntries(['replaceSync', 'replace', 'insertRule', 'deleteRule'].map(name => [name, sheet[name]]));
+@@ -287,7 +300,7 @@
+ 
+ function replaceRules(record, sheet, text) {
+   const rules = parse(record,text).cssRules;discardStyleImports(rules);
+-  normalizeRules(rules,sheet);replaceRuleEntries(sheet.cssRules,rules,sheet,null,record.window);
++  normalizeRules(rules,sheet);replaceRuleEntries(SHEETS.get(sheet)?.rules??sheet.cssRules,rules,sheet,null,record.window,record.cssAuthority);
+ }
+ 
+ function stateFor(root, record, fresh = false) {
+@@ -501,9 +514,10 @@
+ // Parsing one property in an empty declaration is independent of element,
+ // selector and cascade rank. Cache only that immutable expansion, never winners.
+ const EXPANDED_VALUES=new Map();
++const privateCSSSet=CSSStyleDeclaration.prototype.setProperty;
+ function expandedEntries(property,value){
+  const key=property+'\0'+value;if(EXPANDED_VALUES.has(key))return EXPANDED_VALUES.get(key);
+- const expanded=new CSSStyleDeclaration();expanded.setProperty(property,value);
++ const expanded=new CSSStyleDeclaration();privateApply(privateCSSSet,expanded,[property,value]);
+  let entries=property==='opacity'?[{name:property,entry:value}]:[...expanded._values].map(([name,entry])=>({name,entry}));
+  if(property==='overflow'){
+   const axes=overflowAxes(value);if(axes)entries.push({name:'overflow-x',entry:axes[0]},{name:'overflow-y',entry:axes[1]});
+@@ -539,17 +553,7 @@
+       const property = style[index];
+       if(origin===0&&property==='display'&&!elementDisplay)continue;
+       let value = style.getPropertyValue(property);
+-      if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
+-      if (property === 'position') { value = positionValue(value); if (value === null) continue; }
+-      const important = style.getPropertyPriority(property) === 'important';
+-      const entries=expandedEntries(property,value);if(!entries)continue;
+-      // cssstyle's pinned parsed value map includes genuine shorthand
+-      // expansions except overflow. Its independently expanded axes likewise
+-      // take part in source order, specificity and importance.
+-      for (const { name, entry, overflowPart } of entries) {
+-        const key = [important ? 1 : 0, important && origin === 0 ? 2 : origin, inline ? 1 : 0, important?-layer.rank:layer.rank, ...score, order++];
+-        const list = values.get(name) ?? []; list.push({ value: entry, key, origin, overflowPart }); values.set(name, list);
+-      }
++      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order);
+     }
+   };
+   const resolveNested=(selector,parent)=>{
+@@ -608,14 +612,7 @@
+   const root = rootOf(element);
+   for(const{sheet}of authorSheets){const flat=flatSheetState(sheet);if(flat)walkFlat(flat,1);else walk(sheet.cssRules,1);}
+   offer(implForWrapper(element)._style, [0, 0, 0], 1, true);
+-  const chosen = new Map();chosen.orderKeys=new Map();
+-  for (const [property, candidates] of values) {
+-    candidates.sort((a, b) => compare(b.key, a.key));
+-    let winner = candidates[0];
+-    if (winner.value.toLowerCase() === 'revert' || winner.value.toLowerCase() === 'revert-layer') winner = candidates.find(candidate => candidate.origin === 0);
+-    if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key);}
+-  }
+-  return chosen;
++  return cascadeWinners(values);
+ }
+ 
+ normalizeRules(UA.cssRules, UA);
+@@ -786,6 +783,9 @@
+   const record = { page, window, document, Array:window.Array, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
+     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
+   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
++  record.documentImpl=implForWrapper(document);const cssContext=record.documentImpl._globalObject;
++  if(!vm.isContext(cssContext)&&!(cssContext===window&&window.Object===Object))throw new TypeError('An actual CSS originating realm is required');
++  record.compileCSS=(source,parameters)=>vm.compileFunction(source,parameters,vm.isContext(cssContext)?{parsingContext:cssContext}:{});record.cssAuthority=createCSSReadAuthority(record.compileCSS);record.frameStyleSources=new Map();CANONICAL_RECORDS.set(record.documentImpl,record);
+   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
+   const member=captureDocumentMemberFactory(window);
+   const define = (prototype, property, descriptor) => {
+@@ -833,6 +833,7 @@
+   }
+   record.originalSheetPrototype=originalConstructor.prototype;record.sheetPrototype=CSSStyleSheet.prototype;
+   window.CSSStyleSheet = CSSStyleSheet;
++  for(const element of privateApply(privateTree,domSymbolTree,[record.documentImpl]))if(element.nodeType===1&&['style','link'].includes(element._localName)&&element.sheet){const sheet=upgradeSheet(record,element.sheet);registerFrameStyleSource(record,element,sheet);}
+   window.getComputedStyle = function getComputedStyle(element, pseudo = null) {
+     if (!ElementInterface.is(element)) throw new window.TypeError('getComputedStyle requires an Element');
+     let key = pseudo == null ? '' : String(pseudo).toLowerCase();
+@@ -894,3 +895,62 @@
+ 
+ // Shared real flat-tree parent for consumers of inherited SVG presentation values.
+ export { inheritanceParent as getStyleInheritanceParent };
++
++// These kernels are shared with the existing public cascade. Canonical reads
++// supply actual producer entries; rank/importance/shorthand/revert math is one
++// implementation rather than a renderer-specific table of CSS answers.
++function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order){
++ if(property==='text-transform'){value=textTransformValue(value);if(value===null)return order}
++ if(property==='position'){value=positionValue(value);if(value===null)return order}
++ const entries=expandedEntries(property,value);if(!entries)return order;
++ for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart});values.set(name,list)}return order;
++}
++function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer')winner=candidates.find(candidate=>candidate.origin===0);if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
++
++function registerFrameStyleSource(record,node,sheet){
++ if(backendRoot(node)!==record.documentImpl)return;
++ // Draft producer-registration policy: attached text changes publish a new
++ // CSSOM sheet while retaining the frame program. This is not yet calibrated
++ // for before-first-read and detach/reinsert; the separate cache probe is UNRUN.
++ if(!record.frameStyleSources.has(node))record.frameStyleSources.set(node,{sheet,media:node.getAttributeNS(null,'media')??''});
++}
++export function bindCanonicalStyleLayout(document,layout){const record=CANONICAL_RECORDS.get(document);if(record)record.canonicalLayout=layout}
++function canonicalStyleSources(record){const result=[];for(const node of privateApply(privateTree,domSymbolTree,[record.documentImpl])){const entry=record.frameStyleSources.get(node);if(entry)result.push(entry)}return result}
++function canonicalDefaultDisplay(node,active){
++ const namespace=node._namespaceURI,name=node._prefix?node._prefix+':'+node._localName:node._localName,html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';if(!active)return display;
++ if(node.hasAttributeNS(null,'hidden')||(html||svg)&&ACTIVE_NON_RENDERING.has(name))return'none';
++ if((html||svg)&&name==='dialog'&&!node.hasAttributeNS(null,'open'))return'none';
++ if((html||svg)&&name==='slot')display='contents';const parent=node.parentElement;
++ if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return'none';
++ if(node.hasAttributeNS(null,'popover'))throw Error('Canonical popover display requires the actual dialog-state reader');return display;
++}
++const CANONICAL_VISIBILITY_PROPERTIES=new Set(['display','visibility']);
++function canonicalCascade(record,node,frameSources){
++ const active=!!record.documentImpl._defaultView;if(!active)return new Map([['display',canonicalDefaultDisplay(node,false)]]);
++ const viewport=record.canonicalLayout?.viewport;if(!viewport)throw Error('Canonical style requires the actual owning viewport');
++ const media=text=>evaluateMedia(text,viewport,{emptyMatches:true}),values=new Map(),rootLayer={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();let order=0;
++ const register=(parent,name,key)=>{if(!name){const result={children:new Map()};parent.children.set(key,result);return result}if(!/^[\w-]+(?:\.[\w-]+)*$/.test(name))return null;for(const part of name.split('.')){if(!parent.children.has(part))parent.children.set(part,{children:new Map()});parent=parent.children.get(part)}return parent};
++ const sources=frameSources.map(entry=>({...entry,state:readCSSSheet(entry.sheet)})).filter(entry=>!entry.state.disabled&&media(entry.media)&&media(readCSSMediaList(entry.state.media)));
++ const snapshot=list=>canonicalCSSRuleList(list);
++ const collect=(entries,parent=rootLayer)=>{for(const entry of entries){const group=entry.group;if(group?.kind==='layerStatement'){for(const name of group.names)register(parent,name,entry)}else if(group?.kind==='layer'){const next=register(parent,group.name,entry);if(next){layerNodes.set(entry,next);collect(snapshot(group.rules),next)}}else if(group?.kind==='media'){if(media(group.media))collect(snapshot(group.rules),parent)}else if(entry.type===4&&entry.list&&media(readCSSMediaList(entry.media)))collect(snapshot(entry.list),parent);else if(entry.type===1&&entry.list)collect(snapshot(entry.list),parent)}};
++ const sheetEntries=sources.map(entry=>snapshot(entry.state.list));for(const entries of sheetEntries)collect(entries);let rank=0;const rankLayers=layer=>{for(const child of layer.children.values())rankLayers(child);if(layer!==rootLayer)layer.rank=++rank};rankLayers(rootLayer);
++ const relevant=(style,origin)=>readCSSDeclaration(style).some(entry=>(origin!==0||entry.name!=='display')&&(CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)||entry.name.startsWith('--')));
++ const offer=(style,score,origin,inline=false,layer=rootLayer,elementDisplay=false)=>{for(const entry of readCSSDeclaration(style)){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order)}};
++ const score=selectorText=>{let best=null;for(const selector of splitTopLevel(selectorText)){if(/:host|::slotted|::part/.test(selector))throw Error('Canonical shadow selector is not supported');if(matchCanonicalSelector(node,selector,record.documentImpl.documentElement)){const value=specificity(selector);if(!best||compare(value,best)>0)best=value}}return best};
++ const nested=(selector,parent)=>{if(!parent)return selector;let output='',quote=null,brackets=0,ampersand=false;for(let i=0;i<selector.length;i++){const c=selector[i];if(c==='\\'){output+=c+(selector[++i]??'');continue}if(quote){output+=c;if(c===quote)quote=null;continue}if(c==='"'||c==="'"){quote=c;output+=c;continue}if(c==='[')brackets++;if(c===']')brackets--;if(c==='&'&&!brackets){output+=':is('+parent+')';ampersand=true}else output+=c}return ampersand?output:':is('+parent+') '+output};
++ const walk=(entries,origin,parent=null,layer=rootLayer)=>{for(const entry of entries){const group=entry.group;if(entry.type===1&&entry.style){const selector=nested(entry.selector,parent);if(relevant(entry.style,origin)){const match=score(selector);if(match)offer(entry.style,match,origin,false,layer)}if(entry.list)walk(snapshot(entry.list),origin,selector,layer)}else if(group?.kind==='layer'){const child=layerNodes.get(entry);if(child){if(parent&&group.style&&relevant(group.style,origin)){const match=score(parent);if(match)offer(group.style,match,origin,false,child)}walk(snapshot(group.rules),origin,parent,child)}}else if(group?.kind==='media'){if(media(group.media)){if(parent&&group.style&&relevant(group.style,origin)){const match=score(parent);if(match)offer(group.style,match,origin,false,layer)}walk(snapshot(group.rules),origin,parent,layer)}}else if(entry.type===4&&entry.list&&media(readCSSMediaList(entry.media)))walk(snapshot(entry.list),origin,parent,layer)}};
++ // UA records were registered from the real immutable sheet at module setup.
++ walk(Array.from(UA.cssRules,rule=>readCSSRule(rule)),0);
++ const defaults=enhanceDeclaration(new CSSStyleDeclaration());defaults.setProperty('display',canonicalDefaultDisplay(node,true));offer(defaults,[0,0,0],0,false,rootLayer,true);
++ for(const entries of sheetEntries)walk(entries,1);if(node._style)offer(node._style,[0,0,0],1,true);return cascadeWinners(values);
++}
++export function createCanonicalStyleResolver(renderDocument){
++ const record=CANONICAL_RECORDS.get(renderDocument);if(!record)throw Error('An actual canonical render-frame style owner is required');
++ const computing=new Set(),retained=new Map(),frameSources=canonicalStyleSources(record);
++ const compute=current=>{if(retained.has(current))return retained.get(current);if(computing.has(current))throw Error('Cyclic canonical style ancestry');computing.add(current);const chosen=canonicalCascade(record,current,frameSources);let parent=current._assignedSlot??current.parentElement;if(!parent){const root=backendRoot(current);parent=root._host??null}const inherited=parent?compute(parent):null,variables=new Map(inherited?.variables??[]);for(const[name,value]of chosen)if(name.startsWith('--'))variables.set(name,value);
++ const resolving=new Set(),variable=name=>{if(resolving.has(name))return null;const value=variables.get(name);if(value===undefined)return null;resolving.add(name);const result=substitute(value,variable);resolving.delete(name);return result};
++ const property=(name,fallback,inherits)=>{let value=chosen.get(name);if(value===undefined)return fallback;value=substitute(value,variable);if(value===null)return inherits?inherited?.[name]??initial[name]:initial[name];value=value.toLowerCase();if(value==='inherit'||value==='unset'&&inherits)return inherited?.[name]??initial[name];if(value==='initial'||value==='unset')return initial[name];return value};
++ const result={display:property('display',canonicalDefaultDisplay(current,!!record.documentImpl._defaultView),false),visibility:property('visibility',inherited?.visibility??'visible',true),variables};retained.set(current,result);computing.delete(current);return result};
++ return node=>{const result=compute(node);return{display:result.display,visibility:result.visibility}};
++}
++export function canonicalStyleForNode(node,renderDocument){return createCanonicalStyleResolver(renderDocument)(node)}

@@ -4,11 +4,32 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current combined checkpoint passes **1,956 JavaScript tests, 117 PureScript
+The current combined checkpoint passes **1,992 JavaScript tests, 117 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds with zero warnings or errors. The
-[frozen validation](../proposals/phase25-full-accepted/README.md) records 9,995
-unchanged inputs and the exact 44 runtime/test/automation leaves.
+[frozen validation](../proposals/phase26-full-accepted/README.md) records 10,016
+unchanged inputs and the exact 27 runtime/test/reference leaves over 48380c5.
+
+Canonical Markdown now reads actual author-style producers and backend nodes,
+with source-document style ownership, main render-context URLs, measured slot
+and paragraph behavior, and genuine inactive/adopted documents. No DOM clone or
+authored getter supplies renderer state. All 98 selected checks pass on each
+prepared SDK; a separate candidate actor matches 13 retained Native detached
+results. Public stylesheet identity/text-mutation differences, complex selectors
+and broader shadow formatting remain explicit in the
+[handoff](../proposals/lp-private-author-style/README.md).
+
+Automatic animation completion now resolves the actual finished Promise, drains
+real V8 reactions inside the captured owning-VM task and directly delivers the
+trusted finish event. Explicit finish/cancel retain queued events. Seven whole
+Native producer/reaction objects and six causal timing projections match,
+including finish after actual frame removal. The 32 selected checks pass on each
+SDK, with the first SDK split into separate 4-case and 28-case runs. Actual
+200 ms infinite event and Promise reactions recover and leave future checkpoints
+usable. External and legacy Host init hooks still cause genuine Node async-stack
+failure for Promise interruption; those modes remain unsupported. The
+[composition evidence](../proposals/animation-promise-attribution-composition/README.md)
+preserves those negatives and the original poisoned-timer teardown failure.
 
 Promise rejection attribution now uses actual V8 creation-context equality
 instead of walking mutable public prototypes. Subclasses with null, foreign or
@@ -21,14 +42,16 @@ preserves the failed test-harness epochs and distinguishes these focused checks
 from the complete-suite checkpoint above. External and legacy Host async hooks,
 Native late-handler routing and reusable-global lifecycle parity remain gaps.
 
-This integration adds measured cookie actions and Unicode HTTP transport,
+The preceding [1,956-case checkpoint](../proposals/phase25-full-accepted/README.md)
+adds measured cookie actions and Unicode HTTP transport,
 JavaScript dialog state, actual thrown-object handles, Page close/stop controls,
 canonical Markdown aliases, permissions/geolocation and bounded binary/POST
 capture. Its 43 new feature cases passed separately on each of Node 24.19, 24.22
 and 26.13. The narrow animation scheduling fix also passes 28 affected checks on
 each SDK. It captures the actual private Window task queue and leaves the
-original finish/play/queued-event code intact. Finish after frame removal and
-complete Promise interruption remain unfinished.
+original finish/play/queued-event code intact. Its frame-removal finish gap is
+addressed by the later composition above; complete Promise interruption remains
+unfinished.
 
 The earlier [initial full run](../proposals/phase25-full-initial/README.md) remains
 failed: 1,951 of 1,954 JavaScript cases passed, with animation timing, a native
@@ -90,11 +113,12 @@ Inspector debugging, or TLS policy. [Configuration evidence](../proposals/cdp-co
 
 The new protocol/transport controls have bounded Native comparisons, with their
 remaining owner, parser and transport exclusions retained in each proposal.
-Functional work still includes full author-style Markdown, cache and actual
+Functional work still includes broader Markdown/CSSOM, cache and actual
 Fetch interception/downloads, trusted file input/semantic tools, broader media,
-and genuine reusable Window/module boundaries. Shared/default-queue Promise
-interruption remains a foundational gap; an animation checkpoint experiment that
-corrupted Node's async-hook stack is excluded from production. The
+and genuine reusable Window/module boundaries. Promise interruption with external
+or legacy Host init hooks remains a foundational gap. The earlier animation
+experiment that corrupted Node's async-hook stack remains rejected; the new
+ordinary-VM composition above requires genuine creation-context attribution. The
 [current static ledger](../proposals/phase25-remaining-static/README.md) separates
 historical fixture outcomes from today's measured graph. Source63/private104 and
 historical full455 results stay separate; no full browser/WPT/performance

@@ -1,0 +1,8 @@
+import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';
+import{serve}from'../src/cdp.js';import{connect}from'./cdp-client.js';
+const native=JSON.parse(await readFile(new URL('../docs/reference/lp-private-author-style/native-slot-scope.json',import.meta.url),'utf8'));
+assert.equal(native.groups.length,2);for(const group of native.groups)assert.equal(group.completed,true);
+for(const group of native.groups)test('LP actual slot-bearing node scopes and assigned-then-fallback traversal: '+group.name,{timeout:15000},async t=>{
+ let service,client;t.after(async()=>{await client?.close();await service?.close()});service=await serve({port:0});client=await connect('ws://127.0.0.1:'+service.port+'/');const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const results=new Map();
+ for(const row of group.steps){let params=row.params===undefined?undefined:structuredClone(row.params);if(row.method==='DOM.describeNode')params.objectId=results.get(row.label.replace('-id','-object')).result.objectId;if(row.method==='LP.getMarkdown'&&params?.nodeId)params.nodeId=results.get(row.label.replace('-markdown','-id')).node.nodeId;const value=await client.send(row.method,params,sessionId);results.set(row.label,value);if(row.method==='Runtime.evaluate')assert.equal(value.exceptionDetails,undefined,row.label);if(row.label==='actual-slot-setup')assert.deepEqual(value.result.value,row.result.result.value);if(row.method==='LP.getMarkdown')assert.deepEqual(value,row.result,row.label)}
+});

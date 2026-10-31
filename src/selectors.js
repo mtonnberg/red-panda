@@ -268,3 +268,27 @@ export function createScopedMatcher(document,scope=document.documentElement){con
 export function selectorSubjectTypes(source){
  try{const parsed=parseSelector(source),types=[];for(const group of parsed.groups){const type=group.required.find(item=>item.kind==='type'&&item.name!=='*');if(!type)return null;types.push(type.name);}return types;}catch{return null;}
 }
+
+// Private style readers consume the same grammar as public selectors, retaining
+// structural programs instead of routing genuine backend nodes through DOM fronts.
+export function canonicalSelectorProgram(source) {
+ parseSelector(source);
+ const build=(value,relative=false)=>splitGroups(value).map(part=>{
+  part=part.trim();const compounds=[],relations=[];let tests=[],pending=null,index=0;
+  const flush=()=>{if(tests.length){if(compounds.length)relations.push(pending??' ');compounds.push(tests);tests=[];pending=null}};
+  if(relative){compounds.push([{kind:'pseudo',name:'scope'}]);pending=' ';}
+  while(index<part.length){const c=part[index];
+   if(SPACE.test(c)){flush();index=skipSpace(part,index);if(!pending)pending=' ';continue}
+   if('>+~'.includes(c)){flush();pending=c;index++;continue}
+   if(c==='['){const item=attribute(part,index);tests.push(item.predicate);index=item.end;continue}
+   if(c==='.'||c==='#'){const item=readName(part,index+1);tests.push({kind:c==='#'?'id':'class',name:item.value});index=item.end;continue}
+   if(c===':'){const doubled=part[index+1]===':',item=readName(part,index+(doubled?2:1));let end=item.end,argument=null;if(part[end]==='('){const result=block(part,end);argument=result.body;end=result.end}const name=lower(item.value);
+    if(doubled||legacyElements.has(name))tests.push({kind:'never'});
+    else if(logical.has(name))tests.push({kind:'logical',name,program:argument?.trim()?build(argument,name==='has'):[]});
+    else tests.push({kind:'pseudo',name,argument});index=end;continue}
+   const item=typeSelector(part,index);tests.push(item.predicate);index=item.end;
+  }
+  flush();return{compounds,relations};
+ });
+ return build(preprocess(String(source)));
+}

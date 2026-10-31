@@ -1,3 +1,8 @@
+import vm from 'node:vm';
+import {subscribePlatformFactories} from './platform-factories.js';
+import {createCSSReadAuthority,registerCSSDeclaration,registerCSSSheet,readCSSSheet,registerCSSRule,readCSSRule,readCSSDeclaration,readCSSMediaList} from './cssom-private.js';
+import {canonicalCSSRuleList} from './cssom.js';
+import {matchCanonicalSelector} from './canonical-selector.js';
 import {captureDocumentMemberFactory} from './document-member-realms.js';
 import {registerHeapWrapper} from './heap-registry.js';
 import {computedTransform,computedFontSize} from './computed-values.js';
@@ -25,9 +30,16 @@ const REPLACING_EXTERNAL=new WeakMap();
 const { invalidateStyleCache } = require('jsdom/lib/jsdom/living/helpers/style-rules.js');
 const UA = cssom.parse(require('jsdom/lib/jsdom/browser/default-stylesheet.js') + '\narea,base,datalist,head,link,meta,noscript,param,script,source,style,template,title,track { display: none; } details:not([open]) > :not(summary) { display: none; } [popover]:not(:popover-open):not(dialog[open]) { display:none; } dialog:popover-open {display:block;}\n');
 const RECORDS = new WeakMap();
+const CANONICAL_RECORDS=new WeakMap(),CANONICAL_SHEET_SOURCES=new WeakMap(),CANONICAL_DOCUMENTS=new WeakSet(),CANONICAL_DOCUMENT_KINDS=new Set(['Document','XMLDocument','HTMLDocument']);
+// Only successful privileged Document factory observations authenticate an
+// inactive owner; absence of an installed Window record is not authority.
+subscribePlatformFactories((value,record)=>{if(CANONICAL_DOCUMENT_KINDS.has(record.kind)&&record.implementation)CANONICAL_DOCUMENTS.add(record.implementation)});
 const SHEETS = new WeakMap();
 const ADOPTED = new WeakMap();
 const STYLE_NODES = new WeakMap();
+const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js'),NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
+const privateParent=domSymbolTree.parent,privateTree=domSymbolTree.treeIterator,privateChildren=domSymbolTree.childrenIterator,privateText=Object.getOwnPropertyDescriptor(NodeImpl.prototype,'textContent').get,privateApply=Reflect.apply;
+function backendRoot(node){let parent;while(parent=privateApply(privateParent,domSymbolTree,[node]))node=parent;return node}
 const SELECTOR_PARTS=new WeakMap();
 function ruleSelectorParts(rule){let retained=SELECTOR_PARTS.get(rule);if(!retained||retained.text!==rule.selectorText){retained={text:rule.selectorText,parts:splitTopLevel(rule.selectorText)};SELECTOR_PARTS.set(rule,retained);}return retained.parts;}
 const IDENTITIES = new WeakMap();
@@ -92,6 +104,7 @@ for (const Interface of [HTMLElementImpl, SVGElementImpl]) {
   const initialize = Interface.prototype._initElementCSSInlineStyle;
   Interface.prototype._initElementCSSInlineStyle = function () {
     initialize.call(this);
+    registerCSSDeclaration(this._style);
     const record = recordFor(wrapperForImpl(this._ownerDocument));
     if (record) enhanceDeclaration(this._style, record.window);
   };
@@ -125,23 +138,23 @@ elementBackend.attachShadow=function(...args){const result=attachShadowBackend.a
 
 const updateStyleBlock = StyleElementImpl.prototype._updateAStyleBlock;
 StyleElementImpl.prototype._updateAStyleBlock = function () {
-  const record = recordFor(wrapperForImpl(this._ownerDocument));
+  const record = CANONICAL_RECORDS.get(this._ownerDocument)??recordFor(wrapperForImpl(this._ownerDocument));
   if (!record) return updateStyleBlock.call(this);
   if (this.sheet) removeStylesheet(this.sheet, this);
-  if (!this.isConnected || !this._ownerDocument._defaultView) return;
+  if (!this.isConnected || !this._ownerDocument._defaultView) {if(!this._attached)retireCanonicalStyleSource(record,this);return;}
   const type = this.getAttributeNS(null, 'type');
   if (type !== null && type !== '' && type.toLowerCase() !== 'text/css') return;
   const element = wrapperForImpl(this);
-  const parsed = parse(record, element.textContent);
+  const parsed = parse(record, privateApply(privateText,this,[]));
   // Keep jsdom's existing import loader for parser-compatible imported sheets.
   // Its requests, ownership and load/error events remain managed by the Page.
   if (Array.from(parsed.cssRules).some(rule => rule.type === 3)) {
     updateStyleBlock.call(this);
-    if (this.sheet) { upgradeSheet(record, this.sheet); this.sheet.ownerNode = element; return; }
+    if (this.sheet) { upgradeSheet(record, this.sheet); this.sheet.ownerNode = element;registerFrameStyleSource(record,this,this.sheet); return; }
     record.unsupported.add('Imports in stylesheets requiring CSS syntax recovery');
   }
   const sheet = upgradeSheet(record, parsed); sheet.ownerNode = element;
-  this.sheet = sheet;
+  this.sheet = sheet;registerFrameStyleSource(record,this,sheet);
   this._ownerDocument.styleSheets._add(sheet); invalidateStyleCache(this);
 };
 
@@ -192,11 +205,12 @@ function normalizeRules(rules, sheet, parent = null) {
         });
       }
     }
+    registerCSSRule(rule,{authority:SHEETS.get(sheet)?.record?.cssAuthority,group:nestedGroupContents(rule)});
   }
 }
 
 function parse(record, text) {
-  return parseStyleSheet(String(text), { window: record.window, onUnsupported: value => record.unsupported.add(value) });
+  return parseStyleSheet(String(text), { window: record.window, authority:record.cssAuthority, onUnsupported: value => record.unsupported.add(value) });
 }
 
 const originalExternalCreate=stylesheetBackend.createStylesheet;
@@ -204,18 +218,20 @@ stylesheetBackend.removeStylesheet=function(sheet,element){
  const record=recordFor(wrapperForImpl(element._ownerDocument));
  const index=element._ownerDocument.styleSheets._list.indexOf(sheet);
  if(record&&element.localName==='link'&&element._attached)REPLACING_EXTERNAL.set(element,{record,sheet,index});
+ if(record&&!element._attached)retireCanonicalStyleSource(record,element);
  return removeStylesheet(sheet,element);
 };
 stylesheetBackend.createStylesheet=function(text,element,baseURL){
  const record=recordFor(wrapperForImpl(element._ownerDocument));
- if(!record||record.disposed||element.localName!=='link')return originalExternalCreate(text,element,baseURL);
+ if(!record||record.disposed)return originalExternalCreate(text,element,baseURL);
+ if(element._localName!=='link'){const result=originalExternalCreate(text,element,baseURL);if(element.sheet){const sheet=upgradeSheet(record,element.sheet);registerFrameStyleSource(record,element,sheet)}return result;}
  const replacement=REPLACING_EXTERNAL.get(element);REPLACING_EXTERNAL.delete(element);
  const parsed=parse(record,text);
  // Keep the existing real import loader for its supported import path.
  if(hasStyleImports(parsed.cssRules)){originalExternalCreate(text,element,baseURL);if(element.sheet){upgradeSheet(record,element.sheet);element.sheet.ownerNode=wrapperForImpl(element);element.sheet.href=whatwgURL.serializeURL(baseURL);}return;}
  const retained=replacement?.record===record?replacement.sheet:null,sheet=retained?upgradeSheet(record,retained):upgradeSheet(record,parsed);
- if(retained){normalizeRules(parsed.cssRules,sheet);replaceRuleEntries(sheet.cssRules,parsed.cssRules,sheet,null,record.window);}
- sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;
+ if(retained){normalizeRules(parsed.cssRules,sheet);replaceRuleEntries(SHEETS.get(sheet).rules,parsed.cssRules,sheet,null,record.window,record.cssAuthority);}
+ sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;registerFrameStyleSource(record,element,sheet);
  const list=element._ownerDocument.styleSheets._list,index=replacement?.index;
  if(!list.includes(sheet)){if(index>=0)list.splice(Math.min(index,list.length),0,sheet);else list.push(sheet);}
  invalidateStyleCache(element);
@@ -239,6 +255,8 @@ function upgradeSheet(record, sheet, constructed = false) {
     if (sheet.disabled === undefined) sheet.disabled = false;
     if (sheet.ownerNode === undefined) sheet.ownerNode = null;
     if (sheet.href === undefined) sheet.href = null;
+    metadata.rules=sheet.cssRules;metadata.media=sheet.media;
+    registerCSSSheet(sheet,{authority:record.cssAuthority,list:metadata.rules,media:metadata.media,disabled:sheet.disabled,observe:()=>observeCanonicalSheetRules(sheet)});
     Object.defineProperties(sheet, {
       replaceSync: { configurable: true, writable: true, value(text) {
         if (this !== sheet) return operation(record, this, 'replaceSync', arguments);
@@ -263,11 +281,11 @@ function upgradeSheet(record, sheet, constructed = false) {
         index = Number(index) >>> 0;
         // Native Lightpanda clamps insertion indexes (its documented CSS-in-JS
         // compatibility workaround); deletion remains range checked.
-        index = Math.min(index, sheet.cssRules.length);
+        index = Math.min(index, metadata.rules.length);
         const rules = parse(record, text).cssRules;
         if (rules.length !== 1) throw new record.window.DOMException('insertRule requires exactly one CSS rule', 'SyntaxError');
         if (metadata.constructed && rules[0].type === 3) throw new record.window.DOMException('Constructed stylesheets cannot import other sheets', 'SyntaxError');
-        normalizeRules(rules, sheet); spliceRules(sheet.cssRules, index, 0, rules[0]);
+        normalizeRules(rules, sheet); spliceRules(metadata.rules, index, 0, rules[0]);canonicalSheetModified(sheet);
         return index;
       } },
       deleteRule: { configurable: true, writable: true, value(index) {
@@ -275,19 +293,19 @@ function upgradeSheet(record, sheet, constructed = false) {
         if (!arguments.length) throw new record.window.TypeError('deleteRule requires an index');
         if (metadata.locked) throw new record.window.DOMException('The stylesheet is being replaced', 'NotAllowedError');
         index = Number(index) >>> 0;
-        if (index >= sheet.cssRules.length) throw new record.window.DOMException('Rule index is outside the stylesheet', 'IndexSizeError');
-        const removed = spliceRules(sheet.cssRules, index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;
+        if (index >= metadata.rules.length) throw new record.window.DOMException('Rule index is outside the stylesheet', 'IndexSizeError');
+        const removed = spliceRules(metadata.rules, index, 1)[0]; removed.parentStyleSheet = null; removed.parentRule = null;canonicalSheetModified(sheet);
       } },
     });
     metadata.operations = Object.fromEntries(['replaceSync', 'replace', 'insertRule', 'deleteRule'].map(name => [name, sheet[name]]));
   }
-  if (fresh) normalizeRules(sheet.cssRules, sheet);
+  if (fresh) normalizeRules(metadata.rules, sheet);
   return sheet;
 }
 
 function replaceRules(record, sheet, text) {
   const rules = parse(record,text).cssRules;discardStyleImports(rules);
-  normalizeRules(rules,sheet);replaceRuleEntries(sheet.cssRules,rules,sheet,null,record.window);
+  normalizeRules(rules,sheet);replaceRuleEntries(SHEETS.get(sheet)?.rules??sheet.cssRules,rules,sheet,null,record.window,record.cssAuthority);canonicalSheetModified(sheet);
 }
 
 function stateFor(root, record, fresh = false) {
@@ -436,8 +454,8 @@ function scopeSheets(record, root) {
 }
 
 function sheetFingerprint(sheet) {
-  const flat=flatSheetState(sheet);if(flat)return[id(sheet),Boolean(sheet.disabled),sheet.media?.mediaText??'',flat.version];
-  return [id(sheet), Boolean(sheet.disabled), sheet.media?.mediaText ?? '', Array.from(sheet.cssRules, rule => rule.cssText)];
+  const flat=flatSheetState(sheet,SHEETS.get(sheet)?.rules);if(flat)return[id(sheet),Boolean(sheet.disabled),sheet.media?.mediaText??'',flat.version];
+  return [id(sheet), Boolean(sheet.disabled), sheet.media?.mediaText ?? '', Array.from(SHEETS.get(sheet)?.rules??sheet.cssRules, rule => rule.cssText)];
 }
 
 function inheritanceParent(element) {
@@ -501,9 +519,10 @@ function textTransformValue(value) {
 // Parsing one property in an empty declaration is independent of element,
 // selector and cascade rank. Cache only that immutable expansion, never winners.
 const EXPANDED_VALUES=new Map();
+const privateCSSSet=CSSStyleDeclaration.prototype.setProperty;
 function expandedEntries(property,value){
  const key=property+'\0'+value;if(EXPANDED_VALUES.has(key))return EXPANDED_VALUES.get(key);
- const expanded=new CSSStyleDeclaration();expanded.setProperty(property,value);
+ const expanded=new CSSStyleDeclaration();privateApply(privateCSSSet,expanded,[property,value]);
  let entries=property==='opacity'?[{name:property,entry:value}]:[...expanded._values].map(([name,entry])=>({name,entry}));
  if(property==='overflow'){
   const axes=overflowAxes(value);if(axes)entries.push({name:'overflow-x',entry:axes[0]},{name:'overflow-y',entry:axes[1]});
@@ -531,7 +550,7 @@ function cascade(record, element) {
     else if(rule.type===1&&rule.cssRules)collectLayers(rule.cssRules,parent,depth+(rule.type===4?1:0));
   }};
   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
-  for(const{sheet}of authorSheets)if(!flatSheetState(sheet))collectLayers(sheet.cssRules);
+  for(const{sheet}of authorSheets)if(!flatSheetState(sheet,SHEETS.get(sheet)?.rules))collectLayers(SHEETS.get(sheet)?.rules??sheet.cssRules);
   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
   const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false) => {
     style = declaration(style);
@@ -539,17 +558,7 @@ function cascade(record, element) {
       const property = style[index];
       if(origin===0&&property==='display'&&!elementDisplay)continue;
       let value = style.getPropertyValue(property);
-      if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
-      if (property === 'position') { value = positionValue(value); if (value === null) continue; }
-      const important = style.getPropertyPriority(property) === 'important';
-      const entries=expandedEntries(property,value);if(!entries)continue;
-      // cssstyle's pinned parsed value map includes genuine shorthand
-      // expansions except overflow. Its independently expanded axes likewise
-      // take part in source order, specificity and importance.
-      for (const { name, entry, overflowPart } of entries) {
-        const key = [important ? 1 : 0, important && origin === 0 ? 2 : origin, inline ? 1 : 0, important?-layer.rank:layer.rank, ...score, order++];
-        const list = values.get(name) ?? []; list.push({ value: entry, key, origin, overflowPart }); values.set(name, list);
-      }
+      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order);
     }
   };
   const resolveNested=(selector,parent)=>{
@@ -606,16 +615,9 @@ function cascade(record, element) {
     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
   }
   const root = rootOf(element);
-  for(const{sheet}of authorSheets){const flat=flatSheetState(sheet);if(flat)walkFlat(flat,1);else walk(sheet.cssRules,1);}
+  for(const{sheet}of authorSheets){const flat=flatSheetState(sheet,SHEETS.get(sheet)?.rules);if(flat)walkFlat(flat,1);else walk(SHEETS.get(sheet)?.rules??sheet.cssRules,1);}
   offer(implForWrapper(element)._style, [0, 0, 0], 1, true);
-  const chosen = new Map();chosen.orderKeys=new Map();
-  for (const [property, candidates] of values) {
-    candidates.sort((a, b) => compare(b.key, a.key));
-    let winner = candidates[0];
-    if (winner.value.toLowerCase() === 'revert' || winner.value.toLowerCase() === 'revert-layer') winner = candidates.find(candidate => candidate.origin === 0);
-    if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key);}
-  }
-  return chosen;
+  return cascadeWinners(values);
 }
 
 normalizeRules(UA.cssRules, UA);
@@ -786,6 +788,9 @@ export function installStyles(page, window) {
   const record = { page, window, document, Array:window.Array, originalGetComputedStyle: window.getComputedStyle, originalStyleSheetGetter: function () {
     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
+  record.documentImpl=implForWrapper(document);const cssContext=record.documentImpl._globalObject;
+  if(!vm.isContext(cssContext)&&!(cssContext===window&&window.Object===Object))throw new TypeError('An actual CSS originating realm is required');
+  record.compileCSS=(source,parameters)=>vm.compileFunction(source,parameters,vm.isContext(cssContext)?{parsingContext:cssContext}:{});record.cssAuthority=createCSSReadAuthority(record.compileCSS);record.frameStyleSources=new Map();record.canonicalProgram=null;record.canonicalDirty=true;CANONICAL_RECORDS.set(record.documentImpl,record);
   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
   const member=captureDocumentMemberFactory(window);
   const define = (prototype, property, descriptor) => {
@@ -833,12 +838,14 @@ export function installStyles(page, window) {
   }
   record.originalSheetPrototype=originalConstructor.prototype;record.sheetPrototype=CSSStyleSheet.prototype;
   window.CSSStyleSheet = CSSStyleSheet;
+  for(const element of privateApply(privateTree,domSymbolTree,[record.documentImpl]))if(element.nodeType===1&&['style','link'].includes(element._localName)&&element.sheet){const sheet=upgradeSheet(record,element.sheet);registerFrameStyleSource(record,element,sheet);}
   window.getComputedStyle = function getComputedStyle(element, pseudo = null) {
     if (!ElementInterface.is(element)) throw new window.TypeError('getComputedStyle requires an Element');
     let key = pseudo == null ? '' : String(pseudo).toLowerCase();
     if (!key.startsWith(':')) key = '';
     else key = key.replace(/^:(before|after|first-letter|first-line)$/, '::$1');
     const owner = recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument));
+    if(owner?.canonicalLayout)canonicalStyleProgram(owner);
     return owner?computedStyle(owner,element,key):!hasActiveStyleContext(element)?computedStyle(record,element,key):record.originalGetComputedStyle.call(window,element);
   };
   const dispose = () => {
@@ -894,3 +901,75 @@ export function getLayoutCacheRevision(window){return recordFor(window.document)
 
 // Shared real flat-tree parent for consumers of inherited SVG presentation values.
 export { inheritanceParent as getStyleInheritanceParent };
+
+// These kernels are shared with the existing public cascade. Canonical reads
+// supply actual producer entries; rank/importance/shorthand/revert math is one
+// implementation rather than a renderer-specific table of CSS answers.
+function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order){
+ if(property==='text-transform'){value=textTransformValue(value);if(value===null)return order}
+ if(property==='position'){value=positionValue(value);if(value===null)return order}
+ const entries=expandedEntries(property,value);if(!entries)return order;
+ for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart});values.set(name,list)}return order;
+}
+function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer')winner=candidates.find(candidate=>candidate.origin===0);if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
+
+function retireCanonicalStyleSource(record,node){if(record.frameStyleSources.delete(node))record.canonicalDirty=true}
+function registerFrameStyleSource(record,node,sheet){
+ if(backendRoot(node)!==record.documentImpl)return;
+ let source=record.frameStyleSources.get(node);
+ if(!source){source={record,node,sheet,materializedList:null};record.frameStyleSources.set(node,source);record.canonicalDirty=true}else{source.sheet=sheet;if(node._localName==='link')record.canonicalDirty=true}
+ CANONICAL_SHEET_SOURCES.set(sheet,source);
+}
+function observeCanonicalSheetRules(sheet){const source=CANONICAL_SHEET_SOURCES.get(sheet);if(source&&source.record.frameStyleSources.get(source.node)===source&&!source.materializedList)source.materializedList=readCSSSheet(sheet).list}
+function canonicalSheetModified(sheet){const source=CANONICAL_SHEET_SOURCES.get(sheet);if(source&&source.record.frameStyleSources.get(source.node)===source){source.materializedList=readCSSSheet(sheet).list;source.record.canonicalDirty=true}}
+export function bindCanonicalStyleLayout(document,layout){const record=CANONICAL_RECORDS.get(document);if(record)record.canonicalLayout=layout}
+function canonicalStyleSources(record){const result=[];for(const node of privateApply(privateTree,domSymbolTree,[record.documentImpl])){const entry=record.frameStyleSources.get(node);if(entry)result.push(entry)}return result}
+// A compiled frame program is a real snapshot of producer declarations and
+// selectors. Tree/attribute predicates remain live. Text/front declaration edits
+// do not publish a new compiled program; real source membership and stylesheet
+// operations do. CSSOM rule materialization is a separate source of rule data.
+function canonicalStyleProgram(record){
+ if(record.canonicalProgram&&!record.canonicalDirty)return record.canonicalProgram;
+ const viewport=record.canonicalLayout?.viewport;if(!viewport&&record.documentImpl._defaultView)throw Error('Canonical style requires the actual owning viewport');
+ const media=text=>viewport?evaluateMedia(text,viewport,{emptyMatches:true}):false;
+ const copy=entries=>entries.map(entry=>{const group=entry.group,actual={type:entry.type,selector:entry.selector,declarations:entry.style?readCSSDeclaration(entry.style):null,children:entry.list?copy(canonicalCSSRuleList(entry.list)):[],enabled:entry.type!==4||!!entry.media&&media(readCSSMediaList(entry.media)),group:null};if(group)actual.group={...group,declarations:group.style?readCSSDeclaration(group.style):null,children:group.rules?copy(canonicalCSSRuleList(group.rules)):[],enabled:group.kind!=='media'||media(group.media)};return actual});
+ const sheets=canonicalStyleSources(record).map(source=>copy(canonicalCSSRuleList(source.materializedList??readCSSSheet(source.sheet).list)));
+ const program={sheets,ua:copy(Array.from(UA.cssRules,rule=>readCSSRule(rule)))};record.canonicalProgram=program;record.canonicalDirty=false;return program;
+}
+function canonicalDefaultDisplay(node,active){
+ const namespace=node._namespaceURI,name=node._prefix?node._prefix+':'+node._localName:node._localName,html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';if(!active)return display;
+ if(node.hasAttributeNS(null,'hidden')||(html||svg)&&ACTIVE_NON_RENDERING.has(name))return'none';
+ if((html||svg)&&name==='dialog'&&!node.hasAttributeNS(null,'open'))return'none';
+ if((html||svg)&&name==='slot')display='contents';const parent=node.parentElement;
+ if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return'none';
+ if(node.hasAttributeNS(null,'popover'))throw Error('Canonical popover display requires the actual dialog-state reader');return display;
+}
+const CANONICAL_VISIBILITY_PROPERTIES=new Set(['display','visibility']);
+function canonicalCascade(record,node,program){
+ const active=!!record.documentImpl._defaultView;if(!active)return new Map([['display',canonicalDefaultDisplay(node,false)]]);
+ const values=new Map(),rootLayer={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();let order=0;
+ const register=(parent,name,key)=>{if(!name){const result={children:new Map()};parent.children.set(key,result);return result}if(!/^[\w-]+(?:\.[\w-]+)*$/.test(name))return null;for(const part of name.split('.')){if(!parent.children.has(part))parent.children.set(part,{children:new Map()});parent=parent.children.get(part)}return parent};
+ const collect=(entries,parent=rootLayer)=>{for(const entry of entries){const group=entry.group;if(group?.kind==='layerStatement'){for(const name of group.names)register(parent,name,entry)}else if(group?.kind==='layer'){const next=register(parent,group.name,entry);if(next){layerNodes.set(entry,next);collect(group.children,next)}}else if(group?.kind==='media'){if(group.enabled)collect(group.children,parent)}else if(entry.type===4&&entry.enabled)collect(entry.children,parent);else if(entry.type===1)collect(entry.children,parent)}};
+ for(const entries of program.sheets)collect(entries);let rank=0;const rankLayers=layer=>{for(const child of layer.children.values())rankLayers(child);if(layer!==rootLayer)layer.rank=++rank};rankLayers(rootLayer);
+ const relevant=(entries,origin)=>entries?.some(entry=>(origin!==0||entry.name!=='display')&&(CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)||entry.name.startsWith('--')));
+ const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order)}};
+ const score=selectorText=>{let best=null;for(const selector of splitTopLevel(selectorText)){if(/:host|::slotted|::part/.test(selector))throw Error('Canonical shadow selector is not supported');if(matchCanonicalSelector(node,selector,record.documentImpl.documentElement)){const value=specificity(selector);if(!best||compare(value,best)>0)best=value}}return best};
+ const nested=(selector,parent)=>{if(!parent)return selector;let output='',quote=null,brackets=0,ampersand=false;for(let i=0;i<selector.length;i++){const c=selector[i];if(c==='\\'){output+=c+(selector[++i]??'');continue}if(quote){output+=c;if(c===quote)quote=null;continue}if(c==='"'||c==="'"){quote=c;output+=c;continue}if(c==='[')brackets++;if(c===']')brackets--;if(c==='&'&&!brackets){output+=':is('+parent+')';ampersand=true}else output+=c}return ampersand?output:':is('+parent+') '+output};
+ const walk=(entries,origin,parent=null,layer=rootLayer)=>{for(const entry of entries){const group=entry.group;if(entry.type===1&&entry.declarations){const selector=nested(entry.selector,parent);if(relevant(entry.declarations,origin)){const match=score(selector);if(match)offer(entry.declarations,match,origin,false,layer)}walk(entry.children,origin,selector,layer)}else if(group?.kind==='layer'){const child=layerNodes.get(entry);if(child){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,child)}walk(group.children,origin,parent,child)}}else if(group?.kind==='media'){if(group.enabled){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,layer)}walk(group.children,origin,parent,layer)}}else if(entry.type===4&&entry.enabled)walk(entry.children,origin,parent,layer)}};
+ walk(program.ua,0);offer([{name:'display',value:canonicalDefaultDisplay(node,true),priority:''}],[0,0,0],0,false,rootLayer,true);
+ for(const entries of program.sheets)walk(entries,1);if(node._style)offer(readCSSDeclaration(node._style),[0,0,0],1,true);return cascadeWinners(values);
+}
+export function createCanonicalStyleResolver(renderDocument){
+ const record=CANONICAL_RECORDS.get(renderDocument);
+ // A genuine inactive Document has no style context to query. The renderer
+ // applies its measured no-context policy, without inventing a Window or CSS.
+ if((record||CANONICAL_DOCUMENTS.has(renderDocument))&&renderDocument._defaultView===null)return()=>({});
+ if(!record)throw Error('An actual canonical render-frame style owner is required');
+ const computing=new Set(),retained=new Map(),program=canonicalStyleProgram(record);
+ const compute=current=>{if(retained.has(current))return retained.get(current);if(computing.has(current))throw Error('Cyclic canonical style ancestry');computing.add(current);const chosen=canonicalCascade(record,current,program);let parent=current._assignedSlot??current.parentElement;if(!parent){const root=backendRoot(current);parent=root._host??null}const inherited=parent?compute(parent):null,variables=new Map(inherited?.variables??[]);for(const[name,value]of chosen)if(name.startsWith('--'))variables.set(name,value);
+ const resolving=new Set(),variable=name=>{if(resolving.has(name))return null;const value=variables.get(name);if(value===undefined)return null;resolving.add(name);const result=substitute(value,variable);resolving.delete(name);return result};
+ const property=(name,fallback,inherits)=>{let value=chosen.get(name);if(value===undefined)return fallback;value=substitute(value,variable);if(value===null)return inherits?inherited?.[name]??initial[name]:initial[name];value=value.toLowerCase();if(value==='inherit'||value==='unset'&&inherits)return inherited?.[name]??initial[name];if(value==='initial'||value==='unset')return initial[name];return value};
+ const result={display:property('display',canonicalDefaultDisplay(current,!!record.documentImpl._defaultView),false),visibility:property('visibility',inherited?.visibility??'visible',true),variables};retained.set(current,result);computing.delete(current);return result};
+ return node=>{const result=compute(node);return{display:result.display,visibility:result.visibility}};
+}
+export function canonicalStyleForNode(node,renderDocument){return createCanonicalStyleResolver(renderDocument)(node)}

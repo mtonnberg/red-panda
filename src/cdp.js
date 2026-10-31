@@ -65,7 +65,7 @@ function markdownAlias(page,params,resolveNode){
   }
   const root=id===undefined||id===null?page.dom.window.document:resolveNode(id);
   if(!root)throw new ProtocolError('InvalidNodeId',-31998);
-  return { markdown: dumpMarkdownNode(root) };
+  return { markdown: dumpMarkdownNode(root,{context:page.dom.window.document}) };
 }
 
 export function targetInfo(page) {

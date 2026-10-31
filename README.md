@@ -284,18 +284,26 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 100 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 117 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 1,906 JavaScript tests, 100 PureScript Puppeteer
+The current checkpoint passes 1,992 JavaScript tests, 117 PureScript Puppeteer
 checks and 13 native differential groups, plus syntax and strict/pedantic
-PureScript checks. [Validation](docs/reference/phase23-integration/validation.json)
-records all 13,487 unchanged monitored inputs and retains the earlier failed run.
+PureScript checks. [Validation](proposals/phase26-full-accepted/README.md)
+records all 10,016 unchanged monitored inputs. Earlier failed runs remain
+separate evidence.
 
-It adds genuine VM Node/Element/HTMLElement and Document public definitions,
+Canonical Markdown reads actual author styles and source-document ownership,
+including inactive documents, adoption, slots and render-context links. Automatic
+animation completion drains actual finished-Promise reactions before trusted
+finish delivery; ordinary 200 ms Promise interruption recovers. External and
+legacy Host Promise hooks retain a measured Node interruption failure. Public
+CSSOM identity and broader Markdown/animation behavior remain incomplete.
+
+The implementation includes genuine VM Node/Element/HTMLElement and Document public definitions,
 manual interface functions, real Attr adoption ownership, Native-calibrated CSS
 defaults and private focus/style ownership. Generated interface conversion arguments
 use private Host arrays while public functions and result arrays keep their actual

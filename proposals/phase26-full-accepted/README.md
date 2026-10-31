@@ -1,0 +1,9 @@
+# Combined Markdown and animation validation
+
+All1,992 JavaScript cases,117 PureScript Puppeteer checks,13 Native differential groups, syntax and strict/pedantic builds pass. Strict build reports0warnings/0errors. All10,016 monitored inputs stayed unchanged through five serial stages. Original API/test/assertion/heap limits were retained; administrative stage caps only own process cleanup. Exact commands, raw logs, resource snapshots and before/after input hashes are preserved here.
+
+The composition is over pushed48380c5, which already includes actual creation-context Promise attribution. The27 explicit leaves comprise10runtime leaves,6new test files,1owned child fixture and10Native reference/expression leaves. No native C++, Node flags or dependencies changed. The code manifest binds the actual tested working graph, including new untracked leaves, rather than implying HEAD alone identifies it.
+
+Canonical Markdown reads actual owner styles and backend nodes, retains inactive/adopted Document behavior, resolves URLs from the render context, and follows measured slots and spacing. The automatic animation producer resolves its actual finished Promise, performs a genuine owning-VM checkpoint and directly delivers finish. Explicit finish/cancel stay queued. Separate selected tests passed on each prepared SDK; this complete1,992-case run used Node24.22.1 only.
+
+Negative evidence stays separate: earlier full heap/CLI timeouts have no proven causal repair; rejected original animation/default-hook experiments and late poisoned-timer diagnostic retain their raw failures. This ordinary browser composition recovers actual200ms infinite Promise reactions, but external and explicit legacy Host hooks still cause real Node async-stack failure. Public CSSOM identity, complex selectors/shadow formatting and wider Window/module/platform/network parity remain incomplete. Current455/WPT/performance are unrun.

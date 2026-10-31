@@ -1,3 +1,4 @@
+import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
 // Scoped CSSOM adaptation. Parsing is token based so strings, comments, URLs and
 // balanced component values do not accidentally become declaration boundaries.
 import { createRequire } from 'node:module';
@@ -282,6 +283,7 @@ for(const spelling of ['-webkit-border-radius','webkitBorderRadius','WebkitBorde
 export function enhanceDeclaration(style, window) {
   if(!DECLARATIONS.has(style)) {Object.setPrototypeOf(style,COMPAT);DECLARATIONS.add(style);}
   if(window)style._global=window;
+  registerCSSDeclaration(style);
   return style;
 }
 // Parsed scalar facts may be reused, never a public declaration or its maps.
@@ -314,7 +316,7 @@ export class CSSRuleList {
       ownKeys(){return LISTS.get(list).map((_,i)=>String(i));},
       getOwnPropertyDescriptor(target,key){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<LISTS.get(list).length)return{configurable:true,enumerable:true,value:materializeRule(LISTS.get(list)[Number(key)]),writable:false};return Reflect.getOwnPropertyDescriptor(target,key);},
       set(){return false;},deleteProperty(){return false;},defineProperty(){return false;}});
-    LISTS.set(list,[...rules]);return list;
+    LISTS.set(list,[...rules]);registerCSSRuleList(list,()=>LISTS.get(list));return list;
   }
   get length(){return LISTS.get(this).length;}
   *[Symbol.iterator](){for(let i=0;i<this.length;i++)yield this[i];}
@@ -327,16 +329,16 @@ export function spliceRules(rules,...args){const removed=LISTS.get(rules).splice
 // CSSOM objects are constructed once on demand, never replaced by summaries.
 const DEFERRED_RULES=new WeakSet(),DEFERRED_LISTS=new WeakMap();
 function declarationRevision(style){return style&&DECLARATIONS.has(style)?String(MUTATIONS.get(style)??0)+':'+(CHANGES.get(style)??0)+':'+style.length:style?.cssText;}
-function deferredRules(entries,window){const state={window,sheet:null,parent:null,published:new Set(),styled:new Set(),version:1,groups:null};const definitions=entries.map(entry=>{const value={owner:state,selector:entry.prelude,body:entry.body,rule:null,style:null,styleVersion:null};DEFERRED_RULES.add(value);return value});const list=new CSSRuleList(definitions);state.list=list;DEFERRED_LISTS.set(list,state);return list;}
-function deferredStyle(value){if(value.rule)return value.rule.style;if(!value.style){value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);}return value.style;}
-function materializeRule(value){if(!value||!DEFERRED_RULES.has(value))return value;if(value.rule)return value.rule;const owner=value.owner,rule=new cssom.CSSStyleRule();rule.selectorText=value.selector;rule.style=deferredStyle(value);rule.cssRules=new CSSRuleList();rule.parentStyleSheet=owner.sheet;rule.parentRule=owner.parent;Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});Object.defineProperty(rule,'cssText',styleTextDescriptor(owner.window));value.rule=rule;value.style=rule.style;value.styleVersion=declarationRevision(rule.style);owner.published.add(value);owner.styled.add(value);return rule;}
+function deferredRules(entries,window,authority){const state={window,authority,sheet:null,parent:null,published:new Set(),styled:new Set(),version:1,groups:null};const definitions=entries.map(entry=>{const value={owner:state,selector:entry.prelude,body:entry.body,rule:null,style:null,styleVersion:null};DEFERRED_RULES.add(value);return value});const list=new CSSRuleList(definitions);state.list=list;DEFERRED_LISTS.set(list,state);return list;}
+function deferredStyle(value){if(value.rule)return readCSSRule(value.rule).style;if(!value.style){value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);}return value.style;}
+function materializeRule(value){if(!value||!DEFERRED_RULES.has(value))return value;if(value.rule)return value.rule;const owner=value.owner,rule=new cssom.CSSStyleRule();rule.selectorText=value.selector;rule.style=deferredStyle(value);rule.cssRules=new CSSRuleList();rule.parentStyleSheet=owner.sheet;rule.parentRule=owner.parent;Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});Object.defineProperty(rule,'cssText',styleTextDescriptor(owner.window,owner.authority));registerCSSRule(rule,{authority:owner.authority,type:1,selector:value.selector,style:value.style,list:rule.cssRules,media:null});value.rule=rule;value.style=rule.style;value.styleVersion=declarationRevision(rule.style);owner.published.add(value);owner.styled.add(value);return rule;}
 export function bindDeferredRules(rules,sheet,parent,normalize){const state=DEFERRED_LISTS.get(rules);if(!state)return false;state.sheet=sheet;state.parent=parent;for(const value of LISTS.get(rules)){if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule)normalize(value.rule);}else normalize(value);}return true;}
 export function hasStyleImports(rules){return [...(LISTS.get(rules)??rules)].some(value=>!DEFERRED_RULES.has(value)&&value.type===3);}
 export function discardStyleImports(rules){const values=LISTS.get(rules);for(let i=values.length-1;i>=0;i--)if(!DEFERRED_RULES.has(values[i])&&values[i].type===3)values.splice(i,1);}
 export function detachRuleEntries(rules){for(const value of LISTS.get(rules)??rules){if(DEFERRED_RULES.has(value)){if(value.rule){value.rule.parentStyleSheet=null;value.rule.parentRule=null;}}else{value.parentStyleSheet=null;value.parentRule=null;}}}
-export function replaceRuleEntries(target,source,sheet,parent,window){detachRuleEntries(target);const values=LISTS.get(source)??source,copy=values.slice();LISTS.set(target,copy);let state=DEFERRED_LISTS.get(target);if(!state){state={window,sheet,parent,published:new Set(),styled:new Set(),version:1,groups:null,list:target};DEFERRED_LISTS.set(target,state);}else{state.published.clear();state.styled.clear();state.version++;state.groups=null;state.sheet=sheet;state.parent=parent;}
+export function replaceRuleEntries(target,source,sheet,parent,window,authority=DEFERRED_LISTS.get(source)?.authority){detachRuleEntries(target);const values=LISTS.get(source)??source,copy=values.slice();LISTS.set(target,copy);let state=DEFERRED_LISTS.get(target);if(!state){state={window,authority,sheet,parent,published:new Set(),styled:new Set(),version:1,groups:null,list:target};DEFERRED_LISTS.set(target,state);}else{state.published.clear();state.styled.clear();state.version++;state.groups=null;state.sheet=sheet;state.parent=parent;state.authority=authority??state.authority;}
  for(const value of copy)if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule){state.published.add(value);value.rule.parentStyleSheet=sheet;value.rule.parentRule=parent;}if(value.style)state.styled.add(value);}return target;}
-export function flatSheetState(sheet){const list=sheet.cssRules,state=DEFERRED_LISTS.get(list);if(!state)return null;const values=LISTS.get(list);for(const value of state.published){const rule=value.rule;if(rule.cssRules?.length)return null;if(value.selector!==rule.selectorText){value.selector=rule.selectorText;state.version++;state.groups=null;}if(value.style!==rule.style){value.style=rule.style;value.styleVersion=declarationRevision(rule.style);state.version++;} }
+export function flatSheetState(sheet,list=sheet.cssRules){const state=DEFERRED_LISTS.get(list);if(!state)return null;const values=LISTS.get(list);for(const value of state.published){const rule=value.rule;if(rule.cssRules?.length)return null;if(value.selector!==rule.selectorText){value.selector=rule.selectorText;state.version++;state.groups=null;}if(value.style!==rule.style){value.style=rule.style;value.styleVersion=declarationRevision(rule.style);state.version++;} }
  for(const value of state.styled){const version=declarationRevision(value.style);if(version!==value.styleVersion){value.styleVersion=version;state.version++;}}
  if(!state.groups){const groups=new Map();for(let index=0;index<values.length;index++){const value=values[index];if(!DEFERRED_RULES.has(value))return null;if(!groups.has(value.selector))groups.set(value.selector,[]);groups.get(value.selector).push({value,index});}state.groups=groups;}return state;}
 export function deferredRuleStyle(value){return deferredStyle(value);}
@@ -361,54 +363,58 @@ function parseRuleBlocks(text) {
 }
 
 const STYLE_TEXT_FACTORIES=new WeakMap();let hostStyleText;
-function styleTextDescriptor(window){
-  if(window&&STYLE_TEXT_FACTORIES.has(window))return STYLE_TEXT_FACTORIES.get(window);
+function styleTextDescriptor(window,authority){
+  const owner=authority??window;
+  if(owner&&STYLE_TEXT_FACTORIES.has(owner))return STYLE_TEXT_FACTORIES.get(owner);
   if(!window&&hostStyleText)return hostStyleText;
-  const descriptor={configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}};
-  if(window)STYLE_TEXT_FACTORIES.set(window,descriptor);else hostStyleText=descriptor;return descriptor;
+  const descriptor={configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window,authority}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});replaceCSSRuleData(this,{selector:parsed.selectorText,style:parsed.style,list:parsed.cssRules});}}};
+  if(owner)STYLE_TEXT_FACTORIES.set(owner,descriptor);else hostStyleText=descriptor;return descriptor;
 }
 const NESTED_GROUPS=new WeakMap();
 export const nestedGroupContents=rule=>NESTED_GROUPS.get(rule);
 
-export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
+export function parseStyleSheet(text,{window,authority,onUnsupported,nested=false}={}) {
   const sheet=new cssom.CSSStyleSheet();const rules=[],blocks=parseRuleBlocks(text);
-  if(!nested&&blocks.every(entry=>!entry.prelude.startsWith('@')&&entry.body!==null&&parseRuleBlocks(entry.body).length===0)) {sheet.cssRules=deferredRules(blocks,window);return sheet;}
+  if(!nested&&blocks.every(entry=>!entry.prelude.startsWith('@')&&entry.body!==null&&parseRuleBlocks(entry.body).length===0)) {sheet.cssRules=deferredRules(blocks,window,authority);return sheet;}
   for(const entry of blocks) {
-    const {prelude,body}=entry;let rule;
+    const {prelude,body}=entry;let rule,kind;
     if(!prelude.startsWith('@') && body!==null) {
-      rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules;
+      kind=1;rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,authority,onUnsupported,nested:true}).cssRules;
     } else if(/^@(?:-webkit-)?keyframes\s+/i.test(prelude) && body!==null) {
-      rule=new cssom.CSSKeyframesRule();rule.name=prelude.replace(/^@(?:-webkit-)?keyframes\s+/i,'');if(/^@-webkit-/i.test(prelude))rule._vendorPrefix='-webkit-';
+      kind=7;rule=new cssom.CSSKeyframesRule();rule.name=prelude.replace(/^@(?:-webkit-)?keyframes\s+/i,'');if(/^@-webkit-/i.test(prelude))rule._vendorPrefix='-webkit-';
       rule.cssRules=new CSSRuleList(parseRuleBlocks(body).filter(item=>item.body!==null).map(item=>{const frame=new cssom.CSSKeyframeRule();frame.keyText=item.prelude;frame.style=createDeclaration(item.body,{window});return frame;}));
     } else if(nested && /^@media\b/i.test(prelude) && body!==null) {
-      rule=new cssom.CSSRule();rule.type=4;
+      kind=4;rule=new cssom.CSSRule();rule.type=4;
       const media=prelude.replace(/^@media\s*/i,'');
-      NESTED_GROUPS.set(rule,{kind:'media',media,style:createDeclaration(body,{nesting:true,window}),rules:parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules});
+      NESTED_GROUPS.set(rule,{kind:'media',media,style:createDeclaration(body,{nesting:true,window}),rules:parseStyleSheet(body,{window,authority,onUnsupported,nested:true}).cssRules});
       Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
     } else if(/^@(?:media|supports)\b/i.test(prelude) && body!==null) {
-      if(/^@media\b/i.test(prelude)){rule=new cssom.CSSMediaRule();rule.media.mediaText=prelude.replace(/^@media\s*/i,'');}
-      else{rule=new cssom.CSSSupportsRule();rule.conditionText=prelude.replace(/^@supports\s*/i,'');}
-      rule.cssRules=parseStyleSheet(body,{window,onUnsupported}).cssRules;
+      if(/^@media\b/i.test(prelude)){kind=4;rule=new cssom.CSSMediaRule();rule.media.mediaText=prelude.replace(/^@media\s*/i,'');}
+      else{kind=12;rule=new cssom.CSSSupportsRule();rule.conditionText=prelude.replace(/^@supports\s*/i,'');}
+      rule.cssRules=parseStyleSheet(body,{window,authority,onUnsupported}).cssRules;
     } else if(/^@font-face\s*$/i.test(prelude)&&body!==null) {
-      rule=new cssom.CSSFontFaceRule();rule.style=createDeclaration(body,{window});
+      kind=5;rule=new cssom.CSSFontFaceRule();rule.style=createDeclaration(body,{window});
       // Descriptor grammars differ from ordinary element properties. Keep the
       // parser's declaration boundaries, including src and font descriptors.
       for(const item of parseDeclarations(body))if(!rule.style.getPropertyValue(item.property))rule.style._setProperty(item.property,item.value,item.priority);
     } else if(/^@layer(?:\s|$)/i.test(prelude)) {
-      rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+      kind=0;rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
       const names=prelude.replace(/^@layer\s*/i,'').trim();
-      NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
+      NESTED_GROUPS.set(rule,body===null?{kind:'layerStatement',names:names.split(',').map(value=>value.trim())}:{kind:'layer',name:names,rules:parseStyleSheet(body,{window,authority,onUnsupported,nested}).cssRules,style:nested?createDeclaration(body,{nesting:true,window}):null});
     } else if(/^@charset(?:\s|$)/i.test(prelude)&&body===null) {
-      rule=new cssom.CSSRule();rule.type=2;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
+      kind=2;rule=new cssom.CSSRule();rule.type=2;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});
     } else if(/^@import\b/i.test(prelude)&&body===null) {
-      try{rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
+      try{kind=3;rule=cssom.parse(entry.text).cssRules[0];}catch{continue;}
     } else if(prelude.startsWith('@')) {
-      rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});onUnsupported?.('Unknown at-rules are retained without cascade semantics');
+      kind=0;rule=new cssom.CSSRule();rule.type=0;Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,value:entry.text});onUnsupported?.('Unknown at-rules are retained without cascade semantics');
     }
     if(!rule)continue;
     if(rule.style){Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});}
-    if(rule.type===1)Object.defineProperty(rule,'cssText',styleTextDescriptor(window));
+    if(rule.type===1)Object.defineProperty(rule,'cssText',styleTextDescriptor(window,authority));
+    registerCSSRule(rule,{authority,type:kind,selector:kind===1?prelude:undefined,style:Object.getOwnPropertyDescriptor(rule,'style')?.value,list:Object.getOwnPropertyDescriptor(rule,'cssRules')?.value,media:Object.getOwnPropertyDescriptor(rule,'media')?.value,group:NESTED_GROUPS.get(rule)});
     rules.push(rule);
   }
   sheet.cssRules=new CSSRuleList(rules);return sheet;
 }
+
+export function canonicalCSSRuleList(list){return readCSSRuleList(list).map(value=>{if(!DEFERRED_RULES.has(value))return readCSSRule(value);if(value.rule)return readCSSRule(value.rule);return{type:1,selector:value.selector,style:deferredStyle(value),list:null,media:null,group:null,version:value.owner.version}})}

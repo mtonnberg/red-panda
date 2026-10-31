@@ -9,7 +9,7 @@ import {createHorizontalLayout} from './horizontal-layout.js';
 import {refreshMediaQueries} from './media.js';
 // Independent surrogate geometry for a headless DOM. This intentionally models
 // the reference's measured simple boxes; it is not a CSS layout renderer.
-import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision, getSpecifiedStyle } from './styles.js';
+import { getStyleRevision, getLayoutStyle, getLayoutCacheRevision, getSpecifiedStyle, bindCanonicalStyleLayout } from './styles.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const RectFactory=require('jsdom/lib/jsdom/living/generated/DOMRect.js');
@@ -252,6 +252,7 @@ function clientRectList(ArrayConstructor,set,ErrorConstructor,values){const list
 export function installLayout(page, window, options = {}) {
   const layout = createLayout(window, options);
   LAYOUTS.set(implForWrapper(window.document),layout);
+  bindCanonicalStyleLayout(implForWrapper(window.document),layout);
   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
   installElementScroll(window,implementation=>LAYOUTS.get(implementation._ownerDocument));

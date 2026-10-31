@@ -86,14 +86,19 @@ function markdown(root, sources) {
     firstRow:node=>node.rows[0], cells:node=>[...node.cells], hasHeader:node=>node?.querySelector('th'),
   });
 }
-export function formatMarkdown(root, read) {
-  const render = (node, listIndex = 1) => {
-    if (read.type(node) === 3) return read.data(node).replace(/\s+/g, ' ');
+export function formatMarkdown(root, read, {includeHiddenVisibility=false,includeHiddenRoot=false,escapeText=value=>value,omitElement=()=>false,paragraphSpacing=false,containerSpacing=false,filterVisibility=()=>true}={}) {
+  // LP's paragraph writer needs the last real emitted fragment even when
+  // transparent containers/slots sit between two formatting nodes. Keep this
+  // private render state rather than inspecting or rewriting output literals.
+  let lastFragment='';
+  const render=(node,listIndex=1,literal=false)=>{const result=renderNode(node,listIndex,literal,lastFragment);if(result.trim())lastFragment=result;return result};
+  const renderNode = (node, listIndex = 1, literal = false, previous = '') => {
+    if (read.type(node) === 3) {const text=read.data(node).replace(/\s+/g, ' ');return literal?text:escapeText(text);}
     if (read.type(node) === 9 || read.type(node) === 11) return read.children(node).map(child => render(child)).join('');
-    if (read.type(node) !== 1) return '';
+    if (read.type(node) !== 1 || omitElement(node)) return '';
     const tag = read.tag(node), style = read.style(node);
-    if (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || read.hidden(node) || read.attr(node, 'aria-hidden') === 'true' || style?.display === 'none' || style?.visibility === 'hidden') return '';
-    const content = read.children(node).map(child => render(child)).join('');
+    if (!(includeHiddenRoot && node === root) && (['head', 'script', 'style', 'noscript', 'template'].includes(tag) || filterVisibility(node) && (read.hidden(node) || read.attr(node, 'aria-hidden') === 'true' || style?.display === 'none' || !includeHiddenVisibility && style?.visibility === 'hidden'))) return '';
+    const content = read.children(node).map(child => render(child,1,literal||tag==='code'||tag==='pre')).join('');
     if (/^h[1-6]$/.test(tag)) return `\n${'#'.repeat(Number(tag[1]))} ${content.trim()}\n`;
     if (tag === 'a') {
       const link = read.hasAttr(node, 'href') ? `[${content.trim()}](${read.href(node) || read.attr(node, 'href')})` : content;
@@ -117,7 +122,11 @@ export function formatMarkdown(root, read) {
       return `\n${rows.join('')}`;
     }
     if (tag === 'blockquote') return `\n${content.trim().split('\n').map(line => `> ${line}`).join('\n')}\n`;
-    if (['p', 'div', 'section', 'article', 'footer', 'header', 'aside', 'nav'].includes(tag)) return content.trim() ? `\n${content.trim()}\n` : '';
+    if (['p', 'div', 'section', 'article', 'footer', 'header', 'aside', 'nav'].includes(tag)) {
+      if(!content.trim())return '';
+      if(containerSpacing&&tag!=='p')return content.trimEnd()+'\n';
+      return `${paragraphSpacing && tag === 'p' && previous && !/\n\s*$/.test(previous) ? '\n' : ''}\n${content.trim()}\n`;
+    }
     return content;
   };
   let result = render(root).replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n');

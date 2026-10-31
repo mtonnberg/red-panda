@@ -1,0 +1,38 @@
+--- a/src/animations.js
++++ b/src/animations.js
+@@ -81,6 +81,7 @@
+  registerPlatformFactoryKind('Animation');registerPlatformFactoryKind('AnimationPlaybackEvent');
+  const Promise=realm.Promise,convertListener=EventListener.convert;
+  const taskOwner=captureWindowTaskOwner(page,realm);
++ const checkpoint=page.browser.runtimeBinding.checkpoint;
+  const runtime=hidden({realm,Promise,animationPrototype:null,playbackPrototype:null,playbackConstructor:null,disposed:false,automatic:new Set(),events:new Set()});
+  const task=(callback,automatic=false)=>{
+   if(runtime.disposed)return;
+@@ -94,15 +95,23 @@
+   const state=hidden({currentTime,timelineTime,implementation});playbackEvents.set(value,state);registerPlatformFactory(value,{kind:'AnimationPlaybackEvent',implementation:state,globalObject:realm});
+   return value;
+  }
+- runtime.emit=(state,type)=>task(()=>{
++ const dispatch=(state,type)=>{
+   // The captured ordinary VM constructor cannot be replaced by page globals;
+   // it allocates the real receiver that Event.setup initializes above.
+   const value=new runtime.playbackConstructor(type),implementation=playbackEvents.get(value).implementation;
+   implementation.isTrusted=true;apply(dispatchImpl,state.target,[implementation]);
+- });
++ };
++ runtime.emit=(state,type)=>task(()=>dispatch(state,type));
+  runtime.automaticTask=callback=>task(callback,true);
+- const finish=state=>{if(state.playState==='finished')return;state.playState='finished';state.finishedResolve?.(state.value);state.runtime.emit(state,'finish')};
+- const play=state=>{if(state.playState==='running')return;state.playState='running';state.runtime.automaticTask(()=>{if(state.playState==='running')finish(state)})};
++ const finish=(state,automatic=false)=>{
++  if(state.playState==='finished')return;state.playState='finished';const resolve=state.finishedResolve;resolve?.(state.value);
++  // The actual automatic producer resolves and drains real V8 reactions before
++  // direct event dispatch. It runs inside the captured Window's timed VM task.
++  // A reaction may cancel/replay or remove its frame: those measured mutations
++  // do not suppress the already-producing finish event after this checkpoint.
++  if(automatic){if(resolve)checkpoint();dispatch(state,'finish')}else state.runtime.emit(state,'finish');
++ };
++ const play=state=>{if(state.playState==='running')return;state.playState='running';state.runtime.automaticTask(()=>{if(state.playState==='running')finish(state,true)})};
+  const makePromise=(state,key)=>{
+   // First getter's actual VM owns this genuine Promise; state stays Host-only.
+   let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no});

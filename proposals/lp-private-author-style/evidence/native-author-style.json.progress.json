@@ -1,0 +1,518 @@
+{
+  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "probeSHA256": "83cbe2d3498995a0ef996bfca9fbc4e53b2b4b663f6a2990f17c7538f7f11e0b",
+  "rows": [
+    {
+      "label": "document",
+      "method": "Page.navigate",
+      "params": {
+        "url": "data:text/html,<!doctype html><head><style id=rules>.hide{display:none}.dim{visibility:hidden}</style></head><body><h1>Actual heading</h1><div id=group><p id=one class=hide>One</p><p id=two class=dim>Two</p><p id=three style=\"display:none\">Three</p></div><div id=host><p slot=named>Assigned light</p></div>"
+      },
+      "result": {
+        "frameId": "FID-0000000001",
+        "loaderId": "LID-0000000001"
+      }
+    },
+    {
+      "label": "actual-owner-setup",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{globalThis.__styleEffects={constructors:0,nodeReads:0,elementReads:0,sheetReads:0};customElements.define('x-style-side',class extends HTMLElement{constructor(){super();__styleEffects.constructors++}});document.body.append(document.createElement('x-style-side'));globalThis.__rules=document.getElementById('rules');globalThis.__one=document.getElementById('one');globalThis.__two=document.getElementById('two');globalThis.__host=document.getElementById('host');return{counts:{...__styleEffects},sheetCount:document.styleSheets.length}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "counts": {
+              "constructors": 1,
+              "nodeReads": 0,
+              "elementReads": 0,
+              "sheetReads": 0
+            },
+            "sheetCount": 1
+          }
+        }
+      }
+    },
+    {
+      "label": "stylesheet-basic",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nTwo\n"
+      }
+    },
+    {
+      "label": "class-change",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "__one.className='';__two.className='';'changed'",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "changed"
+        }
+      }
+    },
+    {
+      "label": "class-change-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "important-rule-insert",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const sheet=__rules.sheet;sheet.insertRule('#one{display:none!important}',sheet.cssRules.length);__one.style.display='block';return sheet.cssRules.length})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 3,
+          "description": "3"
+        }
+      }
+    },
+    {
+      "label": "important-rule-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nTwo\n"
+      }
+    },
+    {
+      "label": "actual-rule-delete",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const sheet=__rules.sheet;sheet.deleteRule(sheet.cssRules.length-1);return sheet.cssRules.length})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 2,
+          "description": "2"
+        }
+      }
+    },
+    {
+      "label": "rule-delete-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "structural-selector-sheet",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "__rules.textContent='#group > p:not(.keep){display:none} #group:has(.keep) > p.keep{visibility:hidden}';__two.className='keep';__one.style.cssText='';'changed'",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "changed"
+        }
+      }
+    },
+    {
+      "label": "structural-selector-markdown",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "media-sheet",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "__rules.textContent='@media (max-width:1000px){#one{display:none}}';'changed'",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "changed"
+        }
+      }
+    },
+    {
+      "label": "media-wide",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "real-viewport-shrink",
+      "method": "Emulation.setDeviceMetricsOverride",
+      "params": {
+        "width": 800,
+        "height": 600,
+        "deviceScaleFactor": 1,
+        "mobile": false
+      },
+      "result": {}
+    },
+    {
+      "label": "media-narrow",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "poison-public-width",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{globalThis.__widthDescriptor=Object.getOwnPropertyDescriptor(globalThis,'innerWidth');Object.defineProperty(globalThis,'innerWidth',{get(){__styleEffects.nodeReads++;return 3000},configurable:true});return {...__styleEffects}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0,
+            "sheetReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "media-poisoned-width",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "restore-public-width",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "Object.defineProperty(globalThis,'innerWidth',__widthDescriptor);({...__styleEffects})",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0,
+            "sheetReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "adopt-actual-sheet",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{__rules.textContent='';globalThis.__adopted=new CSSStyleSheet();__adopted.replaceSync('#two{display:none}');document.adoptedStyleSheets=[__adopted];return document.adoptedStyleSheets.length})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 1,
+          "description": "1"
+        }
+      }
+    },
+    {
+      "label": "adopted-sheet",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "mutate-actual-adopted-rule",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "__adopted.cssRules[0].style.display='block';'changed'",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "changed"
+        }
+      }
+    },
+    {
+      "label": "adopted-rule-change",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n"
+      }
+    },
+    {
+      "label": "build-real-shadow-root",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{globalThis.__shadow=__host.attachShadow({mode:'open'});__shadow.innerHTML='<style>.inside{display:none}</style><h2>Shadow heading</h2><slot name=named></slot><p class=inside>Inside hidden</p>';return{children:__shadow.childNodes.length,counts:{...__styleEffects}}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "children": 4,
+            "counts": {
+              "constructors": 1,
+              "nodeReads": 0,
+              "elementReads": 0,
+              "sheetReads": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "label": "shadow-author-sheet",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n\n## Shadow heading\n\nAssigned light\n\nInside hidden\n"
+      }
+    },
+    {
+      "label": "adopt-real-shadow-sheet",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const sheet=new CSSStyleSheet();sheet.replaceSync('h2{display:none}');__shadow.adoptedStyleSheets=[sheet];return __shadow.adoptedStyleSheets.length})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "number",
+          "value": 1,
+          "description": "1"
+        }
+      }
+    },
+    {
+      "label": "shadow-adopted-sheet",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n\n## Shadow heading\n\nAssigned light\n\nInside hidden\n"
+      }
+    },
+    {
+      "label": "real-child-frame",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(async()=>{const frame=document.createElement('iframe');frame.srcdoc='<style>p{display:none}</style><p id=child>Child hidden</p><h3>Child heading</h3>';const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));document.body.append(frame);await loaded;globalThis.__child=frame.contentDocument.querySelector('#child');return frame.contentDocument.readyState})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {}
+        },
+        "exceptionDetails": {
+          "exceptionId": 1,
+          "text": "Uncaught (in promise) TypeError: Cannot read properties of null (reading 'querySelector')",
+          "lineNumber": 0,
+          "columnNumber": 0,
+          "exception": {
+            "type": "object",
+            "subtype": "error",
+            "className": "TypeError",
+            "description": "TypeError: Cannot read properties of null (reading 'querySelector')\n    at <anonymous>:1:321",
+            "objectId": "2.2.1"
+          }
+        }
+      }
+    },
+    {
+      "label": "child-node-object",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "__child"
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "subtype": "error",
+          "className": "ReferenceError",
+          "description": "ReferenceError: __child is not defined\n    at <anonymous>:1:1",
+          "objectId": "2.2.2"
+        },
+        "exceptionDetails": {
+          "exceptionId": 2,
+          "text": "Uncaught",
+          "lineNumber": 0,
+          "columnNumber": 0,
+          "scriptId": "17",
+          "exception": {
+            "type": "object",
+            "subtype": "error",
+            "className": "ReferenceError",
+            "description": "ReferenceError: __child is not defined\n    at <anonymous>:1:1",
+            "objectId": "2.2.3"
+          }
+        }
+      }
+    },
+    {
+      "label": "child-node-id",
+      "method": "DOM.describeNode",
+      "params": {
+        "objectId": "2.2.2"
+      },
+      "error": {
+        "name": "Error",
+        "message": "ObjectIdIsNotANode",
+        "code": -31998
+      }
+    },
+    {
+      "label": "poison-node-element-fronts",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const saved=[];for(const[proto,key]of[[Node.prototype,'nodeType'],[Node.prototype,'childNodes'],[Node.prototype,'textContent'],[CharacterData.prototype,'data'],[Element.prototype,'localName'],[HTMLElement.prototype,'hidden']]){const original=Object.getOwnPropertyDescriptor(proto,key);saved.push([proto,key,original]);Object.defineProperty(proto,key,{get(){__styleEffects.nodeReads++;throw Error('authored node getter '+key)},configurable:true})}for(const[proto,key]of[[Element.prototype,'getAttribute'],[Element.prototype,'matches'],[Node.prototype,'getRootNode'],[Document.prototype,'querySelectorAll']]){const original=Object.getOwnPropertyDescriptor(proto,key);saved.push([proto,key,original]);Object.defineProperty(proto,key,{value(){__styleEffects.elementReads++;throw Error('authored method '+key)},writable:true,configurable:true})}globalThis.__restoreStyleFronts=()=>{for(const[proto,key,original]of saved)if(original)Object.defineProperty(proto,key,original);else delete proto[key]};return {...__styleEffects}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0,
+            "sheetReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "author-style-poisoned-node-fronts",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n\n## Shadow heading\n\nAssigned light\n\nInside hidden\n"
+      }
+    },
+    {
+      "label": "restore-node-element-fronts",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const counts={...__styleEffects};__restoreStyleFronts();return counts})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0,
+            "sheetReads": 0
+          }
+        }
+      }
+    },
+    {
+      "label": "poison-sheet-fronts",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const saved=[],attempts=[];for(const key of['cssRules','disabled','media']){const original=Object.getOwnPropertyDescriptor(__adopted,key);try{Object.defineProperty(__adopted,key,{get(){__styleEffects.sheetReads++;throw Error('authored sheet getter '+key)},configurable:true});saved.push([key,original]);attempts.push([key,'poisoned'])}catch(error){attempts.push([key,error.name,error.message])}}globalThis.__restoreSheetFronts=()=>{for(const[key,original]of saved)if(original)Object.defineProperty(__adopted,key,original);else delete __adopted[key]};return{attempts,counts:{...__styleEffects}}})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "attempts": [
+              [
+                "cssRules",
+                "poisoned"
+              ],
+              [
+                "disabled",
+                "poisoned"
+              ],
+              [
+                "media",
+                "poisoned"
+              ]
+            ],
+            "counts": {
+              "constructors": 1,
+              "nodeReads": 0,
+              "elementReads": 0,
+              "sheetReads": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "label": "author-style-poisoned-sheet-fronts",
+      "method": "LP.getMarkdown",
+      "params": {},
+      "result": {
+        "markdown": "\n# Actual heading\n\nOne\n\nTwo\n\n## Shadow heading\n\nAssigned light\n\nInside hidden\n"
+      }
+    },
+    {
+      "label": "restore-sheet-fronts",
+      "method": "Runtime.evaluate",
+      "params": {
+        "expression": "(()=>{const counts={...__styleEffects};__restoreSheetFronts();return counts})()",
+        "awaitPromise": true,
+        "returnByValue": true
+      },
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "constructors": 1,
+            "nodeReads": 0,
+            "elementReads": 0,
+            "sheetReads": 0
+          }
+        }
+      }
+    }
+  ],
+  "pid": 615312
+}
