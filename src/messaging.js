@@ -1,3 +1,5 @@
+import {createMessagingInterfaces} from './messaging-interfaces.js';
+import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import { isCanvasCloneRejected } from './canvas.js';
 import { cloneObjectKind } from './clone-object-kind.js';
 import { registerPlatformFactory, platformFactoryRecord, registerPlatformCloneRealm } from './platform-factories.js';
@@ -27,22 +29,24 @@ const VIEW_NAMES = ['DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 
  * Blob/File preserve their immutable bytes and private metadata through graph
  * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
  */
-export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false } = {}) {
+export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false, portCopiesArrayBuffers = false, mutableMessagePorts = false, initializeTarget } = {}) {
   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
   const codec = createPlatformCodec(realm);
   const deliveryQueues = new WeakMap(), pendingDeliveries = new Set();
-  const EventTarget = realm.EventTarget;
+  const EventTarget = realm.EventTarget,addPortListener=EventTarget.prototype.addEventListener,removePortListener=EventTarget.prototype.removeEventListener;
   const owned = new Set(), wrapped = new WeakMap(), channels = new WeakMap(), secret = {};
   let disposed = false;
   const live = () => !disposed && active();
-  const cloneError = message => new realm.DOMException(message, 'DataCloneError');
-  const typeError = message => new realm.TypeError(message);
-  const emit = dispatch ?? ((target, type, data, ports) => {
+  const Exception=realm.DOMException;
+  const cloneError = message => new Exception(message, 'DataCloneError');
+  const typeError = message => new I.TypeError(message);
+  const nativeEmit = dispatch ?? ((target, type, data, ports) => {
     const event = new realm.MessageEvent(type, { data, ports, origin: '', source: null });
     Object.defineProperty(event, 'isTrusted', { value: true });
     target.dispatchEvent(event);
   });
+  const emit=(target,type,data,ports)=>{if(PORTS.get(target)?.mutablePorts&&Object.isFrozen(ports)){const copy=new I.Array(ports.length);for(let i=0;i<ports.length;i++)I.Object.defineProperty(copy,i,{value:ports[i],writable:true,enumerable:true,configurable:true});ports=copy}return nativeEmit(target,type,data,ports)};
   function record(port) {
     const state = PORTS.get(port);
     if (!state) throw typeError('Illegal invocation');
@@ -54,13 +58,13 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     state.native.off('close', state.close);
     state.owner.delete(state);
   }
-  function wrap(native) {
+  function wrap(native,policy) {
     if (!(native instanceof NativePort)) throw typeError('Expected a native MessagePort');
     const cached = wrapped.get(native);
     if (cached) return cached;
     if (!live()) { native.close(); throw new realm.DOMException('The realm is disposed', 'InvalidStateError'); }
     const port = new MessagePort(secret);
-    const state = { native, owner: owned, port, detached: false, closed: false, started: false, handlers: new Map() };
+    const state = { native, owner: owned, port, detached: false, closed: false, started: false, handlers: new Map(), copiesArrayBuffers:policy?.copiesArrayBuffers??portCopiesArrayBuffers,mutablePorts:policy?.mutablePorts??mutableMessagePorts };
     state.message = message => {
       if (!live() || state.detached || state.closed) return;
       try { dispatchMessage(port, message); }
@@ -154,7 +158,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     if (value instanceof NativePort) { const result = wrap(value); seen.set(value, result); return result; }
     if (types.isSharedArrayBuffer(value)) throw cloneError('SharedArrayBuffer messaging is not implemented');
     if (types.isArrayBuffer(value)) {
-      Object.setPrototypeOf(value, I.ArrayBuffer.prototype); seen.set(value, value); return value;
+      const result=new I.ArrayBuffer(value.byteLength);new Uint8Array(result).set(new Uint8Array(value));seen.set(value,result);return result;
     }
     if (ArrayBuffer.isView(value)) {
       const buffer = adopt(value.buffer, seen, platforms), name = Object.prototype.toString.call(value).slice(8, -1);
@@ -162,14 +166,9 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       const result = name === 'DataView' ? new I.DataView(buffer, value.byteOffset, value.byteLength) : new I[name](buffer, value.byteOffset, value.length);
       seen.set(value, result); return result;
     }
-    if (types.isDate(value) || types.isRegExp(value)) {
-      Object.setPrototypeOf(value, (types.isDate(value) ? I.Date : I.RegExp).prototype); seen.set(value, value); return value;
-    }
-    if (types.isNativeError(value)) {
-      Object.setPrototypeOf(value, (I[value.name] ?? I.Error).prototype); seen.set(value, value);
-      if (Object.hasOwn(value, 'cause')) value.cause = adopt(value.cause, seen, platforms);
-      return value;
-    }
+    if (types.isDate(value)) {const result=new I.Date(Date.prototype.getTime.call(value));seen.set(value,result);return result;}
+    if(types.isRegExp(value)){const result=new I.RegExp(Object.getOwnPropertyDescriptor(RegExp.prototype,'source').get.call(value),Object.getOwnPropertyDescriptor(RegExp.prototype,'flags').get.call(value));seen.set(value,result);return result;}
+    if(types.isNativeError(value)){const result=new (I[value.name]??I.Error)(value.message);seen.set(value,result);if(value.stack!==undefined)I.Object.defineProperty(result,'stack',{value:value.stack,writable:true,configurable:true});if(Object.hasOwn(value,'cause'))I.Object.defineProperty(result,'cause',{value:adopt(value.cause,seen,platforms),writable:true,configurable:true});return result;}
     if (types.isMap(value)) {
       const result = new I.Map(); seen.set(value, result);
       for (const [key, item] of value) result.set(adopt(key, seen, platforms), adopt(item, seen, platforms)); return result;
@@ -193,7 +192,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     if (!message || !Array.isArray(message.ports) || message.ports.some(port => !(port instanceof NativePort))) throw cloneError('Malformed messaging envelope');
     const platforms = codec.records(message), seen = new Map(), ports = new I.Array(message.ports.length);
     for (let index = 0; index < message.ports.length; index++) Object.defineProperty(ports, index, {value: adopt(message.ports[index], seen, platforms), enumerable: true, configurable: true, writable: true});
-    return { data: adopt(message.data, seen, platforms), ports: Object.freeze(ports) };
+    return { data: adopt(message.data, seen, platforms), ports: mutableMessagePorts?ports:Object.freeze(ports) };
   }
   function dropMessage(message) { for (const port of message?.ports ?? []) if (port instanceof NativePort) port.close(); }
   function deliver(target, message, callback, guard = () => true) {
@@ -245,18 +244,18 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
       for (const port of dropped.ports) port.close();
     } catch (error) { if (error?.name === 'DataCloneError') throw cloneError(error.message); throw error; }
   }
-  class MessagePort extends EventTarget {
+  class PortBackendMethods extends EventTarget {
     constructor(token) { super(); if (token !== secret) throw typeError('Illegal constructor'); }
     postMessage(data, options) {
       if (!arguments.length) throw typeError('postMessage requires a message');
-      const state = record(this), prepared = prepare(data, options, this);
+      const state = record(this), prepared = prepare(data, options, this),transfer=state.copiesArrayBuffers?prepared.transfer.filter(value=>!types.isArrayBuffer(value)):prepared.transfer;
       try {
         if (state.closed || state.detached || !live()) {
           // Closed ports still serialize and detach transferables. A real native
           // clone performs the transfer; its orphaned destination ports close.
-          const dropped = nativeClone(prepared.message, { transfer: prepared.transfer }); prepared.commit();
+          const dropped = nativeClone(prepared.message, { transfer }); prepared.commit();
           for (const port of dropped.ports) port.close();
-        } else { state.native.postMessage(prepared.message, prepared.transfer); prepared.commit(); }
+        } else { state.native.postMessage(prepared.message, transfer); prepared.commit(); }
       } catch (error) { if (error?.name === 'DataCloneError') throw cloneError(error.message); throw error; }
     }
     start() {
@@ -267,26 +266,22 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
     close() { const state = record(this); state.closed = true; release(state); state.native.close(); }
     get [Symbol.toStringTag]() { return 'MessagePort'; }
   }
-  for (const type of ['message', 'messageerror']) Object.defineProperty(MessagePort.prototype, `on${type}`, {
+  for (const type of ['message', 'messageerror']) Object.defineProperty(PortBackendMethods.prototype, `on${type}`, {
     configurable: true, enumerable: true,
-    get() { return record(this).handlers.get(type) ?? null; },
+    get() { return record(this).handlers.get(type)?.callback ?? null; },
     set(value) {
-      const state = record(this), previous = state.handlers.get(type);
-      if (previous) this.removeEventListener(type, previous);
-      state.handlers.delete(type);
-      if (typeof value === 'function') { state.handlers.set(type, value); this.addEventListener(type, value); if (type === 'message') this.start(); }
+      const state=record(this),previous=state.handlers.get(type);value=typeof value==='function'?value:null;if(previous){if(value){previous.callback=value;return}Reflect.apply(removePortListener,this,[type,previous.relay]);state.handlers.delete(type);return}if(!value)return;const entry={callback:value,relay:null};entry.relay=event=>Reflect.apply(entry.callback,this,[event]);state.handlers.set(type,entry);Reflect.apply(addPortListener,this,[type,entry.relay]);if(type==='message')Reflect.apply(PortBackendMethods.prototype.start,this,[]);
     },
   });
-  class MessageChannel {
-    constructor() {
-      if (!live()) throw new realm.DOMException('The realm is disposed', 'InvalidStateError');
-      const native = new NativeChannel(); channels.set(this, { port1: wrap(native.port1), port2: wrap(native.port2) });
-    }
-    get port1() { const pair = channels.get(this); if (!pair) throw typeError('Illegal invocation'); return pair.port1; }
-    get port2() { const pair = channels.get(this); if (!pair) throw typeError('Illegal invocation'); return pair.port2; }
-    get [Symbol.toStringTag]() { return 'MessageChannel'; }
-  }
-  Object.setPrototypeOf(MessageChannel, realm.Function.prototype); Object.setPrototypeOf(MessageChannel.prototype, I.Object.prototype);
+  for(const kind of ['MessagePort','MessageChannel'])registerPlatformFactoryKind(kind);
+  const portMethods=PortBackendMethods.prototype,invoke=(key,value,args=[])=>Reflect.apply(Object.getOwnPropertyDescriptor(portMethods,key).value,value,args);
+  const {MessagePort,MessageChannel}=createMessagingInterfaces(realm,{
+    token:value=>value===secret,target:initializeTarget?value=>{initializeTarget(value);return value}:undefined,port:value=>PORTS.has(value),
+    post:(value,data,options)=>invoke('postMessage',value,[data,options]),start:value=>invoke('start',value),close:value=>invoke('close',value),
+    handler(value,type,callback,set){const d=Object.getOwnPropertyDescriptor(portMethods,'on'+type);return Reflect.apply(set?d.set:d.get,value,set?[callback]:[])},
+    channel(value){if(!live())throw new Exception('The realm is disposed','InvalidStateError');const native=new NativeChannel();channels.set(value,{port1:wrap(native.port1),port2:wrap(native.port2)});registerPlatformFactory(value,{kind:'MessageChannel',globalObject:realm})},
+    channelPort(value,number){const state=channels.get(value);if(!state)throw typeError('Illegal invocation');return state['port'+number]},
+  });
   function dispose() {
     if (disposed) return;
     disposed = true;
@@ -304,7 +299,7 @@ export function installMessaging(page, window) {
   if (INSTALLED.has(window)) return INSTALLED.get(window);
   const generation = page.documentGeneration, signal = page.documentAbort?.signal;
   const bridge = createMessagingRealm(window, {
-    cloneUnknownTransfers: !page.parentFrameId,
+    cloneUnknownTransfers: !page.parentFrameId,initializeTarget:value=>require('jsdom/lib/jsdom/living/generated/EventTarget.js').setup(value,window,[]),
     active: () => !page.closed && !!window.document && page.documentGeneration === generation && !signal?.aborted,
     dispatch: (target, type, data, ports) => fireAnEvent(type, implForWrapper(target), MessageEvent,
       { data, ports, origin: '', source: null, lastEventId: '', bubbles: false, cancelable: false }),

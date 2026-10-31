@@ -1,0 +1,152 @@
+{
+  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
+  "worker": "onconnect=e=>{const port=e.ports[0];port.onmessage=async m=>{try{const a=m.data;if(a.action==='types'){port.postMessage({types:[typeof EventSource,typeof WebSocket]});return}if(a.action==='echo'){const result=await new Promise((resolve,reject)=>{const s=new WebSocket(a.socket);s.onopen=()=>s.send('ping');s.onmessage=e=>{s.close();resolve([e.data,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('socket'))});port.postMessage({result});return}if(a.action==='stream'){const result=await new Promise((resolve,reject)=>{const s=new EventSource(a.events);s.onmessage=e=>{s.close();resolve([e.data,e.lastEventId,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('stream'))});port.postMessage({result});return}if(a.action==='park'){const s=new WebSocket(a.socket);await new Promise((resolve,reject)=>{s.onopen=resolve;s.onerror=reject});const e=new EventSource(a.events);await new Promise((resolve,reject)=>{e.onmessage=resolve;e.onerror=reject});port.postMessage({opened:true});setTimeout(()=>globalThis.close(),0)}}catch(e){port.postMessage({error:e.name,message:e.message})}}}",
+  "setup": "globalThis.actor=new SharedWorker(URL.createObjectURL(new Blob([\"onconnect=e=>{const port=e.ports[0];port.onmessage=async m=>{try{const a=m.data;if(a.action==='types'){port.postMessage({types:[typeof EventSource,typeof WebSocket]});return}if(a.action==='echo'){const result=await new Promise((resolve,reject)=>{const s=new WebSocket(a.socket);s.onopen=()=>s.send('ping');s.onmessage=e=>{s.close();resolve([e.data,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('socket'))});port.postMessage({result});return}if(a.action==='stream'){const result=await new Promise((resolve,reject)=>{const s=new EventSource(a.events);s.onmessage=e=>{s.close();resolve([e.data,e.lastEventId,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('stream'))});port.postMessage({result});return}if(a.action==='park'){const s=new WebSocket(a.socket);await new Promise((resolve,reject)=>{s.onopen=resolve;s.onerror=reject});const e=new EventSource(a.events);await new Promise((resolve,reject)=>{e.onmessage=resolve;e.onerror=reject});port.postMessage({opened:true});setTimeout(()=>globalThis.close(),0)}}catch(e){port.postMessage({error:e.name,message:e.message})}}}\"],{type:'text/javascript'})),'realtime');true",
+  "rows": [
+    {
+      "action": "types",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"types\",\"socket\":\"ws://127.0.0.1:45311/socket\",\"events\":\"http://127.0.0.1:45311/events?types\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"types\":[\"function\",\"function\"]}"
+        }
+      }
+    },
+    {
+      "action": "echo",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"echo\",\"socket\":\"ws://127.0.0.1:45311/socket\",\"events\":\"http://127.0.0.1:45311/events?echo\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"result\":[\"echo:ping\",true,true]}"
+        }
+      }
+    },
+    {
+      "action": "stream",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"stream\",\"socket\":\"ws://127.0.0.1:45311/socket\",\"events\":\"http://127.0.0.1:45311/events?stream\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"result\":[\"real-stream\",\"7\",true,true]}"
+        }
+      }
+    },
+    {
+      "action": "park",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"park\",\"socket\":\"ws://127.0.0.1:45311/socket\",\"events\":\"http://127.0.0.1:45311/events?park\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"opened\":true}"
+        }
+      }
+    }
+  ],
+  "wire": [
+    {
+      "url": "/doc",
+      "headers": {
+        "host": "127.0.0.1:45311",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "sec-fetch-site": "none",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-user": "?1",
+        "sec-fetch-dest": "document"
+      }
+    },
+    {
+      "url": "/events?stream",
+      "headers": {
+        "host": "127.0.0.1:45311",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "cookie": "transport=actual",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "accept": "text/event-stream",
+        "cache-control": "no-cache",
+        "referer": "http://127.0.0.1:45311/doc",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty"
+      }
+    },
+    {
+      "url": "/events?park",
+      "headers": {
+        "host": "127.0.0.1:45311",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "cookie": "transport=actual",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "accept": "text/event-stream",
+        "cache-control": "no-cache",
+        "referer": "http://127.0.0.1:45311/doc",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty"
+      }
+    }
+  ],
+  "streams": [
+    {
+      "url": "/events?stream",
+      "closed": true
+    },
+    {
+      "url": "/events?park",
+      "closed": false
+    }
+  ],
+  "sockets": [
+    {
+      "url": "/socket",
+      "headers": {
+        "host": "127.0.0.1:45311",
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "upgrade": "websocket",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "00bmd/s8hOUIYkXjqbTw0w==",
+        "cookie": "transport=actual",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "null",
+        "connection": "Upgrade"
+      },
+      "closed": true
+    },
+    {
+      "url": "/socket",
+      "headers": {
+        "host": "127.0.0.1:45311",
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip, br, zstd",
+        "upgrade": "websocket",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "lsKHFj4jej9L+l2hOAOTKA==",
+        "cookie": "transport=actual",
+        "user-agent": "Lightpanda/1.0",
+        "sec-ch-ua": "\"Lightpanda\";v=\"1\"",
+        "sec-ch-ua-full-version-list": "\"Lightpanda\";v=\"1.1.0-nightly.11326+948d77378\"",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "null",
+        "connection": "Upgrade"
+      },
+      "closed": false
+    }
+  ],
+  "stderr": "$time=1793447754568 $scope=note $level=note $msg=\"server running\" address=127.0.0.1:33643 max_connections=16120 max_browser_connections=16\n"
+}

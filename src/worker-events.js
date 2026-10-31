@@ -45,7 +45,7 @@ function factory(g,b){
 export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true}={}){
  if(installed.has(realm))return installed.get(realm);
  for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget'])registerPlatformFactoryKind(kind);
- const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,define=Object.defineProperty;let signalAdapter=value=>null,classes;
+ const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,ArrayType=realm.Array,define=Object.defineProperty;let signalAdapter=value=>null,classes;
  const receiver=state=>state.receiver??state.publicValue;
  function eventState(value){const state=eventStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
  function targetState(value){const state=targetStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
@@ -71,6 +71,8 @@ export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),r
  };
  const api={
   registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map()});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
+  portEvent(type,data,ports){const array=new ArrayType(ports.length);for(let i=0;i<ports.length;i++)Object.defineProperty(array,String(i),{value:ports[i],writable:true,enumerable:true,configurable:true});const event=new classes.MessageEvent(type,{data});eventState(event).extra.ports=array;return api.trust(event)},
+  connectEvent(ports){const event=api.portEvent('connect','',ports);eventState(event).extra.source=ports[0];return event},
   configureSignals(callback){signalAdapter=callback},nativeTarget:value=>targetState(value).backend,
   trust(value){const s=eventState(value);s.trusted=true;s.pendingTrust=true;return value},
   setReceiver(value,receiverValue){targetState(value).receiver=receiverValue},

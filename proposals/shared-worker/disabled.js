@@ -1,0 +1,1 @@
+(async()=>{const worker=new SharedWorker('/worker.js'),messages=[];worker.port.onmessage=e=>messages.push(e.data);worker.port.postMessage('queued');await new Promise(r=>setTimeout(r,60));return JSON.stringify({handle:worker instanceof SharedWorker,port:worker.port instanceof MessagePort,messages})})()

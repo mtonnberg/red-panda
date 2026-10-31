@@ -1,0 +1,102 @@
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -23,7 +23,8 @@
+ import vm from 'node:vm';
+ import { Worker as ThreadWorker, isMainThread, parentPort as workerThreadPort, workerData as workerThreadData } from 'node:worker_threads';
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+-import { resolveBlobURL } from './blob-urls.js';
++import { resolveBlobURL,createWorkerBlobURLs } from './blob-urls.js';
++import {completeWorkerBlobURL,installWorkerBlobURLs} from './worker-blob-urls.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
+ import { installVideoFrame } from './video-frame.js';
+ import { installAudioData } from './audio-data.js';
+@@ -69,6 +70,7 @@
+       // observed in native serve/fetch defaults; no script request is issued.
+       if (!enabled&&!service) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
++      const blobURLs=createWorkerBlobURLs(page,window);
+       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
+       this.#eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+       this.#socketTransports=createParentWorkerSockets(page,{origin:url.protocol==='data:'?'null':creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+@@ -76,7 +78,7 @@
+         // File-backed workers must not inherit an embedding CLI's --input-type
+         // or --eval flags. Only the VM-module capability is needed here.
+         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
+-        redPandaWorker: true, origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
++        redPandaWorker: true, blobURLs:Boolean(blobURLs), origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
+         navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
+           languages: [...window.navigator.languages], platform: window.navigator.platform },
+       } });
+@@ -108,6 +110,10 @@
+         } else if (message.kind === 'console') page.emit('console', { type: message.type, args: clone(message.args) });
+         else if (message.kind === 'close') this.terminate();
+         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
++        else if(message.kind==='blobURL'){
++          try{if(!blobURLs)throw new TypeError('Object URL authority is unavailable');const result=message.operation==='create'?await blobURLs.create(message.blob):blobURLs.revoke(message.value);completeWorkerBlobURL(message.sync,result);}
++          catch(error){completeWorkerBlobURL(message.sync,null,error);}
++        }
+         else if(message.kind==='socketPolicy'){
+           try{completeWorkerSocketPolicy(message.sync,message.protocols!==undefined?this.#socketTransports.create(message.url,message.protocols):await workerSocketPolicy(page,message.url));}
+           catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
+@@ -122,7 +128,7 @@
+               if (referrer) headers.set('referer', referrer);
+             }
+             const combined = AbortSignal.any([...(signal ? [signal] : []), this.#abort.signal, requestAbort.signal]);
+-            const blobSnapshot = message.script && message.url === url.href ? startupBlob : undefined;
++            const blobSnapshot = message.script && message.url === url.href && startupBlob ? startupBlob : new URL(message.url).protocol==='blob:' ? blobURLs?.resolve(message.url) : undefined;
+             if (blobSnapshot) startupBlob = undefined;
+             const transportInit = { ...message.init, headers, signal: combined,
+               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
+@@ -132,8 +138,10 @@
+             if (!message.script) withRequestMetadata(transportInit,{origin:creator.origin,mode:message.resourceType==='XHR'?'cors':message.init?.mode??'cors'});
+             const response = await page.fetch(message.url, transportInit, message.script ? 'Script' : message.resourceType ?? 'Fetch');
+             const bytes = new Uint8Array(await response.arrayBuffer());
++            const responseURL=response.url||message.url;
++            const basic=new URL(responseURL).protocol==='blob:'||new URL(responseURL).protocol==='data:'||new URL(responseURL).origin===creator.origin;
+             const result = { status: response.status, statusText: response.statusText,
+-              headers: [...response.headers], url: response.url || message.url, bytes };
++              headers: [...response.headers], url: responseURL, bytes,...(basic?{type:'basic'}:{}) };
+             if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);
+             else if (message.sync) {
+               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
+@@ -198,6 +206,7 @@
+ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData) {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+   let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient,connectShared;
++  let fetchTypeError;
+   let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+@@ -260,10 +269,14 @@
+       const headers = [...new Headers(init.headers ?? original.headers)];
+       const method = init.method ?? original.method;
+       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
+-      const result = await request(original.url, { method, headers, body, mode:original.mode, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
++      let result;
++      try { result = await request(original.url, { method, headers, body, mode:original.mode, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType); }
++      catch(error) { if((nativeSignal??original.signal)?.aborted)throw (nativeSignal??original.signal).reason; throw new fetchTypeError('fetch error'); }
+       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+       streams.adopt(response.body);
+-      Object.defineProperty(response, 'url', { value: result.url }); return response;
++      Object.defineProperty(response, 'url', { value: result.url });
++      if(result.type)Object.defineProperty(response,'type',{value:result.type});
++      return response;
+     },
+     structuredClone(value, options) { return messaging.clone(value, options); },
+     console(type, args) { parentPort.postMessage({ kind: 'console', type, args }); },
+@@ -274,6 +287,7 @@
+     atob, btoa };
+   context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
+   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
++  fetchTypeError=realm.TypeError;
+   installWorkerDOMException(realm,{evaluate});
+   eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
+   lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
+@@ -350,6 +364,7 @@
+   installEventSource(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),baseURL:()=>workerData.url,createTransport:eventSourceClient.create,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),active:()=>!closed,trustEvent:trustWorkerEvent});
+   socketClient=createWorkerSocketClient(parentPort,createSyncWorkerSocketPolicy(parentPort));
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketFactory:socketClient.create,origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
++  if(workerData.blobURLs&&!workerData.service&&!workerData.shared)installWorkerBlobURLs(realm,{evaluate,port:parentPort,active:()=>!closed});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+ 

@@ -1,0 +1,185 @@
+{
+  "binarySHA256": "812cd987921a9b184bb4961faebdc60206c22a96974e02836f4ba40f4c83d98e",
+  "worker": "onconnect=e=>{const port=e.ports[0];port.onmessage=async m=>{try{const a=m.data;if(a.action==='types'){port.postMessage({types:[typeof EventSource,typeof WebSocket]});return}if(a.action==='echo'){const result=await new Promise((resolve,reject)=>{const s=new WebSocket(a.socket);s.onopen=()=>s.send('ping');s.onmessage=e=>{s.close();resolve([e.data,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('socket'))});port.postMessage({result});return}if(a.action==='stream'){const result=await new Promise((resolve,reject)=>{const s=new EventSource(a.events);s.onmessage=e=>{s.close();resolve([e.data,e.lastEventId,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('stream'))});port.postMessage({result});return}if(a.action==='park'){const s=new WebSocket(a.socket);await new Promise((resolve,reject)=>{s.onopen=resolve;s.onerror=reject});const e=new EventSource(a.events);await new Promise((resolve,reject)=>{e.onmessage=resolve;e.onerror=reject});port.postMessage({opened:true});setTimeout(()=>globalThis.close(),0)}}catch(e){port.postMessage({error:e.name,message:e.message})}}}",
+  "setup": "globalThis.actor=new SharedWorker(URL.createObjectURL(new Blob([\"onconnect=e=>{const port=e.ports[0];port.onmessage=async m=>{try{const a=m.data;if(a.action==='types'){port.postMessage({types:[typeof EventSource,typeof WebSocket]});return}if(a.action==='echo'){const result=await new Promise((resolve,reject)=>{const s=new WebSocket(a.socket);s.onopen=()=>s.send('ping');s.onmessage=e=>{s.close();resolve([e.data,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('socket'))});port.postMessage({result});return}if(a.action==='stream'){const result=await new Promise((resolve,reject)=>{const s=new EventSource(a.events);s.onmessage=e=>{s.close();resolve([e.data,e.lastEventId,e.isTrusted,e.target===s])};s.onerror=()=>reject(Error('stream'))});port.postMessage({result});return}if(a.action==='park'){const s=new WebSocket(a.socket);await new Promise((resolve,reject)=>{s.onopen=resolve;s.onerror=reject});const e=new EventSource(a.events);await new Promise((resolve,reject)=>{e.onmessage=resolve;e.onerror=reject});port.postMessage({opened:true});setTimeout(()=>globalThis.close(),0)}}catch(e){port.postMessage({error:e.name,message:e.message})}}}\"],{type:'text/javascript'})),'realtime');true",
+  "rows": [
+    {
+      "action": "types",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"types\",\"socket\":\"ws://127.0.0.1:44895/socket\",\"events\":\"http://127.0.0.1:44895/events?types\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"types\":[\"function\",\"function\"]}"
+        }
+      }
+    },
+    {
+      "action": "echo",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"echo\",\"socket\":\"ws://127.0.0.1:44895/socket\",\"events\":\"http://127.0.0.1:44895/events?echo\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"result\":[\"echo:ping\",true,true]}"
+        }
+      }
+    },
+    {
+      "action": "stream",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"stream\",\"socket\":\"ws://127.0.0.1:44895/socket\",\"events\":\"http://127.0.0.1:44895/events?stream\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"result\":[\"real-stream\",\"7\",true,true]}"
+        }
+      }
+    },
+    {
+      "action": "park",
+      "expression": "new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('owned probe deadline')),4000);actor.port.onmessage=e=>{clearTimeout(timer);resolve(JSON.stringify(e.data))};actor.port.postMessage({\"action\":\"park\",\"socket\":\"ws://127.0.0.1:44895/socket\",\"events\":\"http://127.0.0.1:44895/events?park\"})})",
+      "result": {
+        "result": {
+          "type": "string",
+          "value": "{\"opened\":true}"
+        }
+      }
+    }
+  ],
+  "wire": [
+    {
+      "url": "/doc",
+      "headers": {
+        "host": "127.0.0.1:44895",
+        "connection": "keep-alive",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "accept": "*/*",
+        "sec-fetch-mode": "cors",
+        "accept-encoding": "gzip, deflate"
+      }
+    },
+    {
+      "url": "/events?stream",
+      "headers": {
+        "host": "127.0.0.1:44895",
+        "connection": "keep-alive",
+        "accept": "text/event-stream",
+        "cache-control": "no-cache",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "referer": "http://127.0.0.1:44895/doc",
+        "cookie": "transport=actual",
+        "sec-fetch-mode": "cors",
+        "accept-encoding": "gzip, deflate"
+      }
+    },
+    {
+      "url": "/events?park",
+      "headers": {
+        "host": "127.0.0.1:44895",
+        "connection": "keep-alive",
+        "accept": "text/event-stream",
+        "cache-control": "no-cache",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "referer": "http://127.0.0.1:44895/doc",
+        "cookie": "transport=actual",
+        "sec-fetch-mode": "cors",
+        "accept-encoding": "gzip, deflate"
+      }
+    }
+  ],
+  "beforeTargetClose": {
+    "streams": [
+      {
+        "url": "/events?stream",
+        "closed": true
+      },
+      {
+        "url": "/events?park",
+        "closed": false
+      }
+    ],
+    "sockets": [
+      {
+        "url": "/socket",
+        "headers": {
+          "accept": "*/*",
+          "user-agent": "RedPanda/0.1.0",
+          "accept-language": "en-US,en;q=0.9",
+          "cookie": "transport=actual",
+          "sec-websocket-version": "13",
+          "sec-websocket-key": "2ta3b48OFQ4NntORv7ipbQ==",
+          "connection": "Upgrade",
+          "upgrade": "websocket",
+          "origin": "null",
+          "host": "127.0.0.1:44895"
+        },
+        "closed": true
+      },
+      {
+        "url": "/socket",
+        "headers": {
+          "accept": "*/*",
+          "user-agent": "RedPanda/0.1.0",
+          "accept-language": "en-US,en;q=0.9",
+          "cookie": "transport=actual",
+          "sec-websocket-version": "13",
+          "sec-websocket-key": "AP+zwGTsgoGqBpsy1gx7sA==",
+          "connection": "Upgrade",
+          "upgrade": "websocket",
+          "origin": "null",
+          "host": "127.0.0.1:44895"
+        },
+        "closed": false
+      }
+    ]
+  },
+  "closeTarget": {
+    "success": true
+  },
+  "streams": [
+    {
+      "url": "/events?stream",
+      "closed": true
+    },
+    {
+      "url": "/events?park",
+      "closed": true
+    }
+  ],
+  "sockets": [
+    {
+      "url": "/socket",
+      "headers": {
+        "accept": "*/*",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "cookie": "transport=actual",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "2ta3b48OFQ4NntORv7ipbQ==",
+        "connection": "Upgrade",
+        "upgrade": "websocket",
+        "origin": "null",
+        "host": "127.0.0.1:44895"
+      },
+      "closed": true
+    },
+    {
+      "url": "/socket",
+      "headers": {
+        "accept": "*/*",
+        "user-agent": "RedPanda/0.1.0",
+        "accept-language": "en-US,en;q=0.9",
+        "cookie": "transport=actual",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "AP+zwGTsgoGqBpsy1gx7sA==",
+        "connection": "Upgrade",
+        "upgrade": "websocket",
+        "origin": "null",
+        "host": "127.0.0.1:44895"
+      },
+      "closed": true
+    }
+  ],
+  "stderr": "RedPanda/0.1.0 automation server listening on 127.0.0.1:45103\n(node:345724) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 close listeners added to [Page]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit\n(Use `node --trace-warnings ...` to show where the warning was created)\n"
+}

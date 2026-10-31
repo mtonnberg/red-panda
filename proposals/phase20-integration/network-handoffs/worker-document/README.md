@@ -1,0 +1,7 @@
+# Worker XHR document response getter
+
+Independent base8b10d2fada6aaa625e28bcdcad9c509373e4bf0c. runtime.patch changes one branch in src/worker-xhr.js; tests.patch adds one real Worker HTTP test. No WASM/Shared/SSE/WS/header dependency and no native rebuild. Root production/dependencies/source fixtures/registration remain unchanged.
+
+The existing worker responseXML getter already throws the actual selected-VM Error('NotSupportedInWorker') after DONE. The document response getter incorrectly cached null. It now throws the same genuine VM error once a successful document response actually reaches DONE; initial/open response remains null. Real async and synchronous worker requests both receive actual HTTP document bytes before this measured unsupported conversion error. No synthetic response/event/success is produced.
+
+Owned raw Native controls and original candidate failures are in worker-defects-{native,candidate-initial}.json. Candidate document-fixed report matches that row, while its unrelated basic-response/Blob URL defects remain visible and unclaimed. Focused one test passes on each exact Node24.19.0/24.22.1/26.1.0; it exercises both real async/sync HTTP paths. Unchanged pinned net/xhr_worker.html Native and final candidate each pass with originalsource2s +freshassert2s contract, exact registration map/header profiles. Historical three-fixture candidate failure remains network-baseline-candidate.json. Canonical9582/9584 were actually rebound/listened/closed and released after replay. No broad/PS/heavy suite ran.

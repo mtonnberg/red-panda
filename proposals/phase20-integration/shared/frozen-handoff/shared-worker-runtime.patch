@@ -1,0 +1,439 @@
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,6 @@
++import {getHeapBinding} from './native-heap.js';
++import {createSharedWorkerContext,installSharedWorkerGlobal} from './shared-worker-global.js';
++import {installSharedWorkers} from './shared-workers.js';
+ import { installWebCrypto } from './web-crypto.js';
+ import {installScheduler} from './scheduler.js';
+ import {installWorkerDOMException} from './worker-dom-exception.js';
+@@ -14,7 +17,7 @@
+ import { broadcastConfig } from "./broadcast-config.js";
+ import { createBroadcastRealm, createBroadcastRelay } from "./broadcast-realm.js";
+ import vm from 'node:vm';
+-import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
++import { Worker as ThreadWorker, isMainThread, parentPort as workerThreadPort, workerData as workerThreadData } from 'node:worker_threads';
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+ import { resolveBlobURL } from './blob-urls.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
+@@ -178,15 +181,13 @@
+   }
+   Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker' });
+   window.Worker = Worker;
+-  window.SharedWorker = class SharedWorker {
+-    constructor() { throw new window.DOMException('SharedWorker is not implemented', 'NotSupportedError'); }
+-  };
++  installSharedWorkers(page,window,{enabled});
+   return { dispose, createService(input,options,configuration){const token=Symbol();serviceRequests.set(token,configuration);return new Worker(input,options,token);}, get size() { return owned.size; } };
+ }
+ 
+-async function runWorker() {
++async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData) {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
++  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,connectShared;
+   let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+@@ -261,20 +262,22 @@
+     URL, URLSearchParams, TextEncoder, TextDecoder, Headers, Request, Response, FormData, Blob, File,
+     AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
+     atob, btoa };
+-  context = vm.createContext(sandbox);
++  context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
+   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
+   installWorkerDOMException(realm,{evaluate});
+   eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
+   lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
+   context.__eventPlatform=eventPlatform;
++  if(workerData.shared)eventPlatform.registerTarget(realm,new EventTarget());
++  context.__sharedWorker=Boolean(workerData.shared);
+   vm.runInContext(`(function () {
+-    const eventPlatform=__eventPlatform,bridge=__bridge;
++    'use strict';const eventPlatform=__eventPlatform,bridge=__bridge;
+     delete globalThis.__bridge;
+     const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
+     globalThis.self = globalThis; globalThis.name = __name;
+-    const target = new EventTarget(); eventPlatform.setReceiver(target,globalThis);
++    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);
+     for(const key of ['onmessage','onmessageerror','onerror']) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
+-    for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = target[name].bind(target);
++    for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = EventTarget.prototype[name].bind(target);
+     const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
+     globalThis.dispatchEvent = dispatchGlobal;
+     let reportingError = false;
+@@ -299,18 +302,24 @@
+     const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); eventPlatform.trust(event); return event; };
+     globalThis.__createTrustedMessage = createTrustedMessage;
+     globalThis.__emitMessage = (data, ports) => dispatchGlobal(createTrustedMessage('message', data, ports));
++    globalThis.__connectShared=event=>dispatchGlobal(event);
++    delete globalThis.__sharedWorker;
+   })();`, context);
+   delete context.__eventPlatform;
++  if(workerData.shared)installSharedWorkerGlobal(realm,{context,events:eventPlatform,name:workerData.name,close:bridge.close});
+   abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
+   installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
+   dispatchError=vm.runInContext('__dispatchError',context);
+-  delete context.__dispatchError;
++  vm.runInContext('delete globalThis.__dispatchError',context);
+   emit = vm.runInContext('__emitMessage', context);
+   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
+   const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
++  const dispatchShared=vm.runInContext('__connectShared',context);
++  vm.runInContext('delete globalThis.__connectShared',context);
++  connectShared=message=>{const {ports}=messaging.receive({data:null,ports:message.ports});dispatchShared(eventPlatform.connectEvent(ports))};
+   messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
+-    active: () => !closed,
+-    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,createTrustedMessage(type, data, ports)),
++    active: () => !closed,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),portCopiesArrayBuffers:Boolean(workerData.shared),mutableMessagePorts:Boolean(workerData.shared),
++    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,workerData.shared?eventPlatform.portEvent(type,data,ports):createTrustedMessage(type, data, ports)),
+     reportError: value => dispatchError(value),
+   });
+   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
+@@ -333,9 +342,10 @@
+ 
+   if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
+     call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
+-  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
++  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;delete globalThis.__url;delete globalThis.__name;delete globalThis.__navigator;', context);
+   parentPort.on('message', message => {
+     if (closed) return;
++    if(message.kind==='sharedConnect'){if(!ready)queued.push(message);else connectShared(message);return;}
+     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+     else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
+     else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+@@ -347,12 +357,15 @@
+       if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
+     }
+   });
+-  process.on('unhandledRejection', dispatchError);
++  const rejection=(value,promise)=>{if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value)};
++  process.on('unhandledRejection',rejection);
++  lifetime.signal.addEventListener('abort',()=>process.off('unhandledRejection',rejection),{once:true});
++  parentPort.on('close',()=>bridge.close());
+   try {
+     const result = await request(workerData.url, {}, true);
+     if (result.status < 200 || result.status >= 300) throw new Error(`Worker load failed (${result.status}): ${workerData.url}`);
+-    workerData.url = result.url;
+-    context.__resolvedURL = result.url;
++    if(!workerData.shared)workerData.url = result.url;
++    context.__resolvedURL = workerData.shared?workerData.url:result.url;
+     vm.runInContext('globalThis.location = new WorkerLocation(new URL(__resolvedURL)); delete globalThis.__resolvedURL;', context);
+     const source = new TextDecoder().decode(result.bytes);
+     {
+@@ -400,9 +413,10 @@
+     }
+     ready = true;
+     if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
+-    for (const message of queued) { if (!closed) { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
++    for (const message of queued) { if (!closed) { if(message.kind==='sharedConnect'){connectShared(message);continue;} messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
+     queued.length = 0;
+   } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else dispatchError(failure); }
+ }
+ 
+-if (!isMainThread && workerData?.redPandaWorker) void runWorker();
++if (!isMainThread && workerThreadData?.redPandaWorker) void runWorker();
++if(!isMainThread&&workerThreadData?.redPandaSharedHost)workerThreadPort.on('message',message=>{if(message.kind==='createSharedRuntime')void runWorker(message.control,message.data).catch(error=>{try{message.control.postMessage({kind:'error',error:{name:error.name,message:error.message,stack:error.stack}})}finally{message.control.close()}})});
+--- a/src/worker-events.js
++++ b/src/worker-events.js
+@@ -45,7 +45,7 @@
+ export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true}={}){
+  if(installed.has(realm))return installed.get(realm);
+  for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget'])registerPlatformFactoryKind(kind);
+- const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,define=Object.defineProperty;let signalAdapter=value=>null,classes;
++ const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,ArrayType=realm.Array,define=Object.defineProperty;let signalAdapter=value=>null,classes;
+  const receiver=state=>state.receiver??state.publicValue;
+  function eventState(value){const state=eventStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
+  function targetState(value){const state=targetStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
+@@ -71,6 +71,8 @@
+  };
+  const api={
+   registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map()});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
++  portEvent(type,data,ports){const array=new ArrayType(ports.length);for(let i=0;i<ports.length;i++)Object.defineProperty(array,String(i),{value:ports[i],writable:true,enumerable:true,configurable:true});const event=new classes.MessageEvent(type,{data});eventState(event).extra.ports=array;return api.trust(event)},
++  connectEvent(ports){const event=api.portEvent('connect','',ports);eventState(event).extra.source=ports[0];return event},
+   configureSignals(callback){signalAdapter=callback},nativeTarget:value=>targetState(value).backend,
+   trust(value){const s=eventState(value);s.trusted=true;s.pendingTrust=true;return value},
+   setReceiver(value,receiverValue){targetState(value).receiver=receiverValue},
+--- a/src/messaging.js
++++ b/src/messaging.js
+@@ -1,3 +1,5 @@
++import {createMessagingInterfaces} from './messaging-interfaces.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import { isCanvasCloneRejected } from './canvas.js';
+ import { cloneObjectKind } from './clone-object-kind.js';
+ import { registerPlatformFactory, platformFactoryRecord, registerPlatformCloneRealm } from './platform-factories.js';
+@@ -27,22 +29,24 @@
+  * Blob/File preserve their immutable bytes and private metadata through graph
+  * codecs. SharedArrayBuffer and other DOM platform objects reject explicitly.
+  */
+-export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false } = {}) {
++export function createMessagingRealm(realm, { active = () => true, dispatch, reportError = () => {}, cloneUnknownTransfers = false, portCopiesArrayBuffers = false, mutableMessagePorts = false, initializeTarget } = {}) {
+   const I = Object.fromEntries(['Object', 'Array', 'Map', 'Set', 'ArrayBuffer', 'Date', 'RegExp', ...ERROR_NAMES, ...VIEW_NAMES]
+     .filter(name => typeof realm[name] === 'function').map(name => [name, realm[name]]));
+   const codec = createPlatformCodec(realm);
+   const deliveryQueues = new WeakMap(), pendingDeliveries = new Set();
+-  const EventTarget = realm.EventTarget;
++  const EventTarget = realm.EventTarget,addPortListener=EventTarget.prototype.addEventListener,removePortListener=EventTarget.prototype.removeEventListener;
+   const owned = new Set(), wrapped = new WeakMap(), channels = new WeakMap(), secret = {};
+   let disposed = false;
+   const live = () => !disposed && active();
+-  const cloneError = message => new realm.DOMException(message, 'DataCloneError');
+-  const typeError = message => new realm.TypeError(message);
+-  const emit = dispatch ?? ((target, type, data, ports) => {
++  const Exception=realm.DOMException;
++  const cloneError = message => new Exception(message, 'DataCloneError');
++  const typeError = message => new I.TypeError(message);
++  const nativeEmit = dispatch ?? ((target, type, data, ports) => {
+     const event = new realm.MessageEvent(type, { data, ports, origin: '', source: null });
+     Object.defineProperty(event, 'isTrusted', { value: true });
+     target.dispatchEvent(event);
+   });
++  const emit=(target,type,data,ports)=>{if(PORTS.get(target)?.mutablePorts&&Object.isFrozen(ports)){const copy=new I.Array(ports.length);for(let i=0;i<ports.length;i++)I.Object.defineProperty(copy,i,{value:ports[i],writable:true,enumerable:true,configurable:true});ports=copy}return nativeEmit(target,type,data,ports)};
+   function record(port) {
+     const state = PORTS.get(port);
+     if (!state) throw typeError('Illegal invocation');
+@@ -54,13 +58,13 @@
+     state.native.off('close', state.close);
+     state.owner.delete(state);
+   }
+-  function wrap(native) {
++  function wrap(native,policy) {
+     if (!(native instanceof NativePort)) throw typeError('Expected a native MessagePort');
+     const cached = wrapped.get(native);
+     if (cached) return cached;
+     if (!live()) { native.close(); throw new realm.DOMException('The realm is disposed', 'InvalidStateError'); }
+     const port = new MessagePort(secret);
+-    const state = { native, owner: owned, port, detached: false, closed: false, started: false, handlers: new Map() };
++    const state = { native, owner: owned, port, detached: false, closed: false, started: false, handlers: new Map(), copiesArrayBuffers:policy?.copiesArrayBuffers??portCopiesArrayBuffers,mutablePorts:policy?.mutablePorts??mutableMessagePorts };
+     state.message = message => {
+       if (!live() || state.detached || state.closed) return;
+       try { dispatchMessage(port, message); }
+@@ -154,7 +158,7 @@
+     if (value instanceof NativePort) { const result = wrap(value); seen.set(value, result); return result; }
+     if (types.isSharedArrayBuffer(value)) throw cloneError('SharedArrayBuffer messaging is not implemented');
+     if (types.isArrayBuffer(value)) {
+-      Object.setPrototypeOf(value, I.ArrayBuffer.prototype); seen.set(value, value); return value;
++      const result=new I.ArrayBuffer(value.byteLength);new Uint8Array(result).set(new Uint8Array(value));seen.set(value,result);return result;
+     }
+     if (ArrayBuffer.isView(value)) {
+       const buffer = adopt(value.buffer, seen, platforms), name = Object.prototype.toString.call(value).slice(8, -1);
+@@ -162,14 +166,9 @@
+       const result = name === 'DataView' ? new I.DataView(buffer, value.byteOffset, value.byteLength) : new I[name](buffer, value.byteOffset, value.length);
+       seen.set(value, result); return result;
+     }
+-    if (types.isDate(value) || types.isRegExp(value)) {
+-      Object.setPrototypeOf(value, (types.isDate(value) ? I.Date : I.RegExp).prototype); seen.set(value, value); return value;
+-    }
+-    if (types.isNativeError(value)) {
+-      Object.setPrototypeOf(value, (I[value.name] ?? I.Error).prototype); seen.set(value, value);
+-      if (Object.hasOwn(value, 'cause')) value.cause = adopt(value.cause, seen, platforms);
+-      return value;
+-    }
++    if (types.isDate(value)) {const result=new I.Date(Date.prototype.getTime.call(value));seen.set(value,result);return result;}
++    if(types.isRegExp(value)){const result=new I.RegExp(Object.getOwnPropertyDescriptor(RegExp.prototype,'source').get.call(value),Object.getOwnPropertyDescriptor(RegExp.prototype,'flags').get.call(value));seen.set(value,result);return result;}
++    if(types.isNativeError(value)){const result=new (I[value.name]??I.Error)(value.message);seen.set(value,result);if(value.stack!==undefined)I.Object.defineProperty(result,'stack',{value:value.stack,writable:true,configurable:true});if(Object.hasOwn(value,'cause'))I.Object.defineProperty(result,'cause',{value:adopt(value.cause,seen,platforms),writable:true,configurable:true});return result;}
+     if (types.isMap(value)) {
+       const result = new I.Map(); seen.set(value, result);
+       for (const [key, item] of value) result.set(adopt(key, seen, platforms), adopt(item, seen, platforms)); return result;
+@@ -193,7 +192,7 @@
+     if (!message || !Array.isArray(message.ports) || message.ports.some(port => !(port instanceof NativePort))) throw cloneError('Malformed messaging envelope');
+     const platforms = codec.records(message), seen = new Map(), ports = new I.Array(message.ports.length);
+     for (let index = 0; index < message.ports.length; index++) Object.defineProperty(ports, index, {value: adopt(message.ports[index], seen, platforms), enumerable: true, configurable: true, writable: true});
+-    return { data: adopt(message.data, seen, platforms), ports: Object.freeze(ports) };
++    return { data: adopt(message.data, seen, platforms), ports: mutableMessagePorts?ports:Object.freeze(ports) };
+   }
+   function dropMessage(message) { for (const port of message?.ports ?? []) if (port instanceof NativePort) port.close(); }
+   function deliver(target, message, callback, guard = () => true) {
+@@ -245,18 +244,18 @@
+       for (const port of dropped.ports) port.close();
+     } catch (error) { if (error?.name === 'DataCloneError') throw cloneError(error.message); throw error; }
+   }
+-  class MessagePort extends EventTarget {
++  class PortBackendMethods extends EventTarget {
+     constructor(token) { super(); if (token !== secret) throw typeError('Illegal constructor'); }
+     postMessage(data, options) {
+       if (!arguments.length) throw typeError('postMessage requires a message');
+-      const state = record(this), prepared = prepare(data, options, this);
++      const state = record(this), prepared = prepare(data, options, this),transfer=state.copiesArrayBuffers?prepared.transfer.filter(value=>!types.isArrayBuffer(value)):prepared.transfer;
+       try {
+         if (state.closed || state.detached || !live()) {
+           // Closed ports still serialize and detach transferables. A real native
+           // clone performs the transfer; its orphaned destination ports close.
+-          const dropped = nativeClone(prepared.message, { transfer: prepared.transfer }); prepared.commit();
++          const dropped = nativeClone(prepared.message, { transfer }); prepared.commit();
+           for (const port of dropped.ports) port.close();
+-        } else { state.native.postMessage(prepared.message, prepared.transfer); prepared.commit(); }
++        } else { state.native.postMessage(prepared.message, transfer); prepared.commit(); }
+       } catch (error) { if (error?.name === 'DataCloneError') throw cloneError(error.message); throw error; }
+     }
+     start() {
+@@ -267,26 +266,22 @@
+     close() { const state = record(this); state.closed = true; release(state); state.native.close(); }
+     get [Symbol.toStringTag]() { return 'MessagePort'; }
+   }
+-  for (const type of ['message', 'messageerror']) Object.defineProperty(MessagePort.prototype, `on${type}`, {
++  for (const type of ['message', 'messageerror']) Object.defineProperty(PortBackendMethods.prototype, `on${type}`, {
+     configurable: true, enumerable: true,
+-    get() { return record(this).handlers.get(type) ?? null; },
++    get() { return record(this).handlers.get(type)?.callback ?? null; },
+     set(value) {
+-      const state = record(this), previous = state.handlers.get(type);
+-      if (previous) this.removeEventListener(type, previous);
+-      state.handlers.delete(type);
+-      if (typeof value === 'function') { state.handlers.set(type, value); this.addEventListener(type, value); if (type === 'message') this.start(); }
++      const state=record(this),previous=state.handlers.get(type);value=typeof value==='function'?value:null;if(previous){if(value){previous.callback=value;return}Reflect.apply(removePortListener,this,[type,previous.relay]);state.handlers.delete(type);return}if(!value)return;const entry={callback:value,relay:null};entry.relay=event=>Reflect.apply(entry.callback,this,[event]);state.handlers.set(type,entry);Reflect.apply(addPortListener,this,[type,entry.relay]);if(type==='message')Reflect.apply(PortBackendMethods.prototype.start,this,[]);
+     },
+   });
+-  class MessageChannel {
+-    constructor() {
+-      if (!live()) throw new realm.DOMException('The realm is disposed', 'InvalidStateError');
+-      const native = new NativeChannel(); channels.set(this, { port1: wrap(native.port1), port2: wrap(native.port2) });
+-    }
+-    get port1() { const pair = channels.get(this); if (!pair) throw typeError('Illegal invocation'); return pair.port1; }
+-    get port2() { const pair = channels.get(this); if (!pair) throw typeError('Illegal invocation'); return pair.port2; }
+-    get [Symbol.toStringTag]() { return 'MessageChannel'; }
+-  }
+-  Object.setPrototypeOf(MessageChannel, realm.Function.prototype); Object.setPrototypeOf(MessageChannel.prototype, I.Object.prototype);
++  for(const kind of ['MessagePort','MessageChannel'])registerPlatformFactoryKind(kind);
++  const portMethods=PortBackendMethods.prototype,invoke=(key,value,args=[])=>Reflect.apply(Object.getOwnPropertyDescriptor(portMethods,key).value,value,args);
++  const {MessagePort,MessageChannel}=createMessagingInterfaces(realm,{
++    token:value=>value===secret,target:initializeTarget?value=>{initializeTarget(value);return value}:undefined,port:value=>PORTS.has(value),
++    post:(value,data,options)=>invoke('postMessage',value,[data,options]),start:value=>invoke('start',value),close:value=>invoke('close',value),
++    handler(value,type,callback,set){const d=Object.getOwnPropertyDescriptor(portMethods,'on'+type);return Reflect.apply(set?d.set:d.get,value,set?[callback]:[])},
++    channel(value){if(!live())throw new Exception('The realm is disposed','InvalidStateError');const native=new NativeChannel();channels.set(value,{port1:wrap(native.port1),port2:wrap(native.port2)});registerPlatformFactory(value,{kind:'MessageChannel',globalObject:realm})},
++    channelPort(value,number){const state=channels.get(value);if(!state)throw typeError('Illegal invocation');return state['port'+number]},
++  });
+   function dispose() {
+     if (disposed) return;
+     disposed = true;
+@@ -304,7 +299,7 @@
+   if (INSTALLED.has(window)) return INSTALLED.get(window);
+   const generation = page.documentGeneration, signal = page.documentAbort?.signal;
+   const bridge = createMessagingRealm(window, {
+-    cloneUnknownTransfers: !page.parentFrameId,
++    cloneUnknownTransfers: !page.parentFrameId,initializeTarget:value=>require('jsdom/lib/jsdom/living/generated/EventTarget.js').setup(value,window,[]),
+     active: () => !page.closed && !!window.document && page.documentGeneration === generation && !signal?.aborted,
+     dispatch: (target, type, data, ports) => fireAnEvent(type, implForWrapper(target), MessageEvent,
+       { data, ports, origin: '', source: null, lastEventId: '', bubbles: false, cancelable: false }),
+--- /dev/null
++++ b/src/shared-workers.js
+@@ -0,0 +1,36 @@
++import vm from'node:vm';import{Worker as ThreadWorker,MessageChannel}from'node:worker_threads';import{createRequire}from'node:module';
++import{captureWorkerCreator}from'./worker-apis.js';import{installMessaging}from'./messaging.js';import{resolveBlobURL}from'./blob-urls.js';import{createSharedWorkerHTTP}from'./shared-worker-http.js';import{broadcastConfig}from'./broadcast-config.js';import{createBroadcastRelay}from'./broadcast-realm.js';import{cacheStoreFor}from'./cache.js';import{workerSocketPolicy}from'./worker-socket-policy.js';import{completeWorkerSyncResponse,completeWorkerSocketPolicy}from'./worker-sync-transport.js';
++import{registerPlatformFactory}from'./platform-factories.js';import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';import{registerProtocolPrototype}from'./protocol-classes.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),Target=require('jsdom/lib/jsdom/living/generated/EventTarget.js'),pools=new WeakMap(),states=new WeakMap(),installed=new WeakSet(),record=v=>Object.assign(Object.create(null),v);
++function rootFor(page){const seen=new Set();while(page.registry?.page&&page.registry.page!==page&&!seen.has(page)){seen.add(page);page=page.registry.page}return page}
++function poolFor(page){const root=rootFor(page);let host=pools.get(root);if(!host){host=record({actors:new Map(),thread:null});pools.set(root,host);root.once('close',()=>{for(const actor of host.actors.values())actor.dispose();host.actors.clear();void host.thread?.terminate();pools.delete(root)})}return{root,pool:host.actors,host}}
++function startHost(root,host){if(!host.thread){host.thread=new ThreadWorker(new URL('./workers.js',import.meta.url),{execArgv:typeof vm.SourceTextModule==='function'?['--experimental-vm-modules']:[],workerData:{redPandaSharedHost:true}});host.thread.on('error',error=>root.emit('sharedWorkerError',{error}));host.thread.unref()}return host.thread}
++
++function createActor(root,page,window,creator,url,name,type,enabled,messaging,onClosed,host){
++ let startupBlob;try{if(url.protocol==='blob:')startupBlob=resolveBlobURL(page,url.href)}catch{}
++ const blocked=!['http:','https:','blob:','data:'].includes(url.protocol)||url.protocol!=='data:'&&url.origin!==creator.origin||url.protocol==='blob:'&&!startupBlob,http=createSharedWorkerHTTP(root,page,{origin:creator.origin,url:url.href,blobSnapshot:startupBlob,blocked});
++ const requests=new Map(),pending=new Set(),relay=createBroadcastRelay(messaging,broadcastConfig(page,window));let thread,closed=false;
++ const actor=record({connect(port){if(closed){port.close();return}if(thread)thread.postMessage({kind:'sharedConnect',ports:[port]},[port]);else pending.add(port)},dispose(){if(closed)return;closed=true;onClosed?.();http.close();for(const controller of requests.values())controller.abort();requests.clear();for(const port of pending)port.close();pending.clear();relay.exit();thread?.close()}});
++ if(!enabled)return actor;
++ const controls=new MessageChannel();thread=controls.port1;
++ const data={redPandaWorker:true,shared:true,url:url.href,origin:creator.origin,cacheOrigin:creator.origin,secure:creator.secure,type,name,cacheEnabled:Boolean(page.browser?.options.experimentalFeatures?.serviceworker),broadcast:broadcastConfig(page,window),navigator:{userAgentMetadata:page.userAgentMetadata,userAgent:window.navigator.userAgent,language:window.navigator.language,languages:[...window.navigator.languages],platform:window.navigator.platform}};
++ startHost(root,host).postMessage({kind:'createSharedRuntime',control:controls.port2,data},[controls.port2]);
++ thread.on('message',async message=>{
++  if(closed){for(const port of message.ports??[])port.close();return}
++  if(message.kind==='broadcastRelay'){relay.accept(message);return}if(message.kind==='broadcastReady'){relay.ready(message.id);return}if(message.kind==='broadcastCancel'){relay.cancel(message.id);return}
++  if(message.kind==='close'){actor.dispose();return}if(message.kind==='cancel'){requests.get(message.id)?.abort();return}
++  if(message.kind==='error'){root.emit('sharedWorkerError',{url:url.href,error:message.error});return}if(message.kind==='console'){root.emit('console',{type:message.type,args:message.args});return}
++  if(message.kind==='socketPolicy'){try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(http,message.url))}catch(error){completeWorkerSocketPolicy(message.sync,null,error)}return}
++  if(message.kind==='cacheOperation'){try{const result=await cacheStoreFor(root).operate(creator.origin,message.operation,message.args);if(!closed)thread.postMessage({kind:'cacheResponse',id:message.id,result})}catch(error){if(!closed)thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}})}return}
++  if(message.kind==='request'){
++   const controller=new AbortController();requests.set(message.id,controller);try{const response=await http.fetch(message.url,{...message.init,signal:controller.signal},message.script),bytes=new Uint8Array(await response.arrayBuffer()),result={status:response.status,statusText:response.statusText,headers:[...response.headers],url:response.url||message.url,bytes};
++    if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);else if(message.sync){const view=new Int32Array(message.sync,0,2),out=new Uint8Array(message.sync,8),encoded=new TextEncoder().encode(JSON.stringify({...result,bytes:undefined,source:new TextDecoder().decode(bytes)}));if(encoded.length>out.length)throw new Error('SharedWorker importScripts exceeds buffer');out.set(encoded);Atomics.store(view,1,encoded.length);Atomics.store(view,0,1);Atomics.notify(view,0)}else if(!closed)thread.postMessage({kind:'response',id:message.id,result},[bytes.buffer]);
++   }catch(error){if(message.syncBinary)completeWorkerSyncResponse(message.sync,null,error);else if(message.sync){const view=new Int32Array(message.sync,0,2),out=new Uint8Array(message.sync,8),encoded=new TextEncoder().encode(JSON.stringify({error:error.message}));out.set(encoded.subarray(0,out.length));Atomics.store(view,1,Math.min(encoded.length,out.length));Atomics.store(view,0,1);Atomics.notify(view,0)}else if(!closed)thread.postMessage({kind:'response',id:message.id,error:error.message})}finally{requests.delete(message.id)}
++  }
++ });thread.on('error',error=>{if(!closed)root.emit('sharedWorkerError',{url:url.href,error})});thread.once('close',()=>actor.dispose());thread.unref();return actor;
++}
++function realmFactory(g,b){'use strict';const TypeError=g.TypeError,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,description=descriptor(g.Symbol.prototype,'description').get,String=g.String,wellFormed=g.String.prototype.toWellFormed;const invalid=()=>{throw new TypeError('invalid argument')},text=v=>apply(wellFormed,String(typeof v==='symbol'?apply(description,v,[]):v),[]);function SharedWorker(url){if(!new.target||!arguments.length)invalid();url=text(url);const init=arguments[1];let name='',type='classic';if(init!==null&&init!==undefined){if(typeof init==='object'||typeof init==='function'){const n=init.name;if(n!==undefined)name=text(n);const t=init.type;if(t!==undefined){if(t!=='classic'&&t!=='module')invalid();type=t}}else name=text(init)}b.create(this,url,name,type)}const p={get port(){if(!b.has(this))throw new TypeError('Illegal invocation');return b.port(this)}};define(p,'constructor',{value:SharedWorker,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:'SharedWorker',configurable:true});g.Object.setPrototypeOf(p,g.EventTarget.prototype);g.Object.setPrototypeOf(SharedWorker,g.EventTarget);define(SharedWorker,'prototype',{value:p,writable:false});define(g,'SharedWorker',{value:SharedWorker,writable:true,configurable:true});b.prototype(p)}
++export function installSharedWorkers(page,window,{enabled=true}={}){
++ if(installed.has(window))return;installed.add(window);registerPlatformFactoryKind('SharedWorker');const creator=captureWorkerCreator(page,window),messaging=installMessaging(page,window),context=utils.implForWrapper(window)._globalObject,TypeError=window.TypeError;
++ const bridge=record({has:v=>states.has(v),port:v=>states.get(v).port,prototype:p=>registerProtocolPrototype(p,'SharedWorker'),create(value,input,name,type){const snapshot=creator();let url;try{url=new URL(input,snapshot.baseURL)}catch{throw new TypeError('')}Target.setup(value,window,[]);const{root,pool,host}=poolFor(page),key=JSON.stringify([snapshot.origin,url.href,name]);let actor=pool.get(key);if(!actor){actor=createActor(root,page,window,snapshot,url,name,type,enabled,messaging,()=>{if(pool.get(key)===actor)pool.delete(key)},host);pool.set(key,actor)}const channel=new MessageChannel(),port=messaging.wrap(channel.port1,{copiesArrayBuffers:true,mutablePorts:true});states.set(value,record({port}));registerPlatformFactory(value,{kind:'SharedWorker',implementation:states.get(value),globalObject:window});actor.connect(channel.port2)}});vm.runInContext(`(${realmFactory.toString()})`,context)(window,bridge);
++}
+--- /dev/null
++++ b/src/shared-worker-http.js
+@@ -0,0 +1,24 @@
++// A genuine request owner for a SharedWorker, independent of the lifetime of
++// the creating Document. It owns real controllers/HTTP response byte streams.
++const fetchHTTP=globalThis.fetch,record=value=>Object.assign(Object.create(null),value);
++export function createSharedWorkerHTTP(root,page,{origin,url,blobSnapshot,blocked=false}){
++ const controllers=new Set(),context=page.context,userAgent=page.userAgent,language=page.acceptLanguage,extra=new Headers(page.extraHTTPHeaders),cli=new Headers(page.cliHTTPHeaders),timeout=page.timeout??5000;let closed=false,initialBlob=blobSnapshot;
++ const owner=record({context,userAgent,acceptLanguage:language,extraHTTPHeaders:extra,cliHTTPHeaders:cli,
++  close(){if(closed)return;closed=true;for(const controller of controllers)controller.abort();controllers.clear()},
++  async fetch(input,init={},script=false){
++   if(closed)throw new Error('SharedWorker request owner is closed');if(blocked)throw new Error('SharedWorker script is not permitted');let target=new URL(input,url);
++   if(target.protocol==='blob:'&&initialBlob&&input===url){const snapshot=initialBlob;initialBlob=null;const response=new Response(snapshot.bytes,{headers:{'content-type':snapshot.mimeType}});Object.defineProperty(response,'url',{value:url});return response}
++   if(!['http:','https:'].includes(target.protocol))throw new Error('Unsupported SharedWorker request protocol');
++   const controller=new AbortController();controllers.add(controller);const signals=[controller.signal,AbortSignal.timeout(timeout)];if(init.signal)signals.push(init.signal);const signal=AbortSignal.any(signals),headers=new Headers(init.headers);if(userAgent)headers.set('user-agent',userAgent);if(language&&!headers.has('accept-language'))headers.set('accept-language',language);
++   if(script){headers.set('sec-fetch-mode','same-origin');headers.set('sec-fetch-dest','worker');headers.set('sec-fetch-site','same-origin')}
++   let method=init.method??'GET',body=init.body;const credentials=init.credentials??'same-origin';
++   try{for(let redirects=0;redirects<=20;redirects++){
++    if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin)){const cookie=await context.cookies.getCookieString(target.href);if(cookie)headers.set('cookie',cookie);else headers.delete('cookie')}else headers.delete('cookie');extra.forEach((v,n)=>headers.set(n,v));cli.forEach((v,n)=>headers.set(n,v));
++    const response=await fetchHTTP(target,{...init,headers,method,body,signal,redirect:'manual'});if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin))for(const cookie of response.headers.getSetCookie())await context.cookies.setCookie(cookie,target.href,{ignoreError:true});
++    const location=response.headers.get('location');if(location&&[301,302,303,307,308].includes(response.status)){await response.body?.cancel();if(redirects===20)throw new Error('Too many SharedWorker redirects');const next=new URL(location,target);if(!['http:','https:'].includes(next.protocol))throw new Error('Unsupported SharedWorker redirect');if(next.origin!==target.origin){headers.delete('authorization');headers.delete('cookie')}if(response.status===303||[301,302].includes(response.status)&&method==='POST'){method='GET';body=undefined;headers.delete('content-type')}target=next;continue}
++    const chunks=[],reader=response.body?.getReader();let size=0;if(reader)for(;;){const{done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>16*1024*1024){await reader.cancel();throw new Error('SharedWorker response exceeds16MiB')}chunks.push(value)}
++    const buffered=new Response([204,205,304].includes(response.status)?null:Buffer.concat(chunks),{status:response.status,statusText:response.statusText,headers:response.headers});Object.defineProperty(buffered,'url',{value:target.href});return buffered;
++   }}finally{controllers.delete(controller)}
++  },
++ });return owner;
++}
+--- /dev/null
++++ b/src/shared-worker-global.js
+@@ -0,0 +1,34 @@
++import vm from'node:vm';
++import{registerPlatformFactory}from'./platform-factories.js';
++import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';
++// A raw actual VM global avoids Node Contextify's different receiver for
++// unqualified accessor assignments. No Host sandbox becomes the public global.
++export function createSharedWorkerContext(sandbox){const context=vm.createContext(vm.constants.DONT_CONTEXTIFY);Object.assign(context,sandbox);return context}
++function scopeFactory(g,b){
++ 'use strict';const TypeError=g.TypeError,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,setPrototype=g.Object.setPrototypeOf;
++ function WorkerGlobalScope(){throw new TypeError('Illegal Constructor')}
++ function SharedWorkerGlobalScope(){throw new TypeError('Illegal Constructor')}
++ const valid=value=>{if(value!==g)throw new TypeError('Illegal invocation')};
++ setPrototype(WorkerGlobalScope,g.EventTarget);setPrototype(WorkerGlobalScope.prototype,g.EventTarget.prototype);define(WorkerGlobalScope.prototype,g.Symbol.toStringTag,{value:'WorkerGlobalScope',configurable:true});define(WorkerGlobalScope,'prototype',{writable:false});setPrototype(SharedWorkerGlobalScope,WorkerGlobalScope);
++ const prototype={
++  get name(){valid(this);return b.name},
++  close(){if(this!==null&&this!==undefined)valid(this);b.close()},
++  get onconnect(){valid(this);return b.events.getHandler(g,'connect')},
++  set onconnect(value){valid(this);b.events.setHandler(g,'connect',value)},
++ };
++ define(prototype,'constructor',{value:SharedWorkerGlobalScope,writable:true,configurable:true});setPrototype(prototype,WorkerGlobalScope.prototype);define(prototype,g.Symbol.toStringTag,{value:'SharedWorkerGlobalScope',configurable:true});define(SharedWorkerGlobalScope,'prototype',{value:prototype,writable:false});
++ for(const key of['name','close','onconnect'])define(g,key,descriptor(prototype,key));
++ // Preserve the original engine global prototype. The raw Node global has an
++ // Object constructor rather than Native's distinct typed intrinsic one; the
++ // public Scope constructor supplies this independent interface's constructor.
++ const intrinsic=b.intrinsic,engineConstructor=descriptor(intrinsic,'constructor').value;setPrototype(intrinsic,prototype);
++ if(engineConstructor.prototype===intrinsic)define(engineConstructor,'name',{...descriptor(engineConstructor,'name'),value:'SharedWorkerGlobalScope'});else define(intrinsic,'constructor',{value:SharedWorkerGlobalScope,writable:true,configurable:true});setPrototype(g,intrinsic);
++ for(const key of['postMessage','onmessage','onmessageerror','Worker'])delete g[key];
++ define(g,'WorkerGlobalScope',{value:WorkerGlobalScope,writable:true,configurable:true});define(g,'SharedWorkerGlobalScope',{value:SharedWorkerGlobalScope,writable:true,configurable:true});
++}
++export function installSharedWorkerGlobal(realm,{context,events,name,close}){
++ for(const kind of['WorkerGlobalScope','SharedWorkerGlobalScope'])registerPlatformFactoryKind(kind);
++ const bridge=Object.assign(Object.create(null),{events,name,close,intrinsic:Object.getPrototypeOf(realm)});
++ vm.runInContext(`(${scopeFactory.toString()})`,context)(realm,bridge);
++ registerPlatformFactory(realm,{kind:'SharedWorkerGlobalScope',implementation:events.nativeTarget(realm),globalObject:realm});
++}
+--- /dev/null
++++ b/src/messaging-interfaces.js
+@@ -0,0 +1,16 @@
++// Genuine selected-VM public constructors, prototypes and methods. All native
++// endpoints and successful producer brands remain in the caller's Host maps.
++export function createMessagingInterfaces(realm,bridge){
++ const evaluate=realm.eval,apply=Reflect.apply;
++ return apply(evaluate,realm,[`(${factory.toString()})`])(realm,bridge);
++}
++function factory(g,b){
++ 'use strict';const TypeError=g.TypeError,define=g.Object.defineProperty,descriptor=g.Object.getOwnPropertyDescriptor,setPrototype=g.Object.setPrototypeOf,construct=g.Reflect.construct,Target=g.EventTarget;
++ const valid=value=>{if(!b.port(value))throw new TypeError('Illegal invocation')};
++ function MessagePort(){if(!new.target||!b.token(arguments[0]))throw new TypeError('Illegal Constructor');return b.target?b.target(this):construct(Target,[],new.target)}
++ const pp={postMessage(data){valid(this);if(!arguments.length)throw new TypeError('postMessage requires a message');return b.post(this,data,arguments[1])},start(){valid(this);return b.start(this)},close(){valid(this);return b.close(this)},get onmessage(){valid(this);return b.handler(this,'message')},set onmessage(value){valid(this);b.handler(this,'message',value,true)},get onmessageerror(){valid(this);return b.handler(this,'messageerror')},set onmessageerror(value){valid(this);b.handler(this,'messageerror',value,true)}};
++ define(pp,'constructor',{value:MessagePort,writable:true,configurable:true});define(pp,g.Symbol.toStringTag,{value:'MessagePort',configurable:true});setPrototype(pp,Target.prototype);setPrototype(MessagePort,Target);define(MessagePort,'prototype',{value:pp,writable:false});
++ function MessageChannel(){if(!new.target)throw new TypeError('invalid argument');b.channel(this)}
++ const cp={get port1(){return b.channelPort(this,1)},get port2(){return b.channelPort(this,2)}};define(cp,'constructor',{value:MessageChannel,writable:true,configurable:true});define(cp,g.Symbol.toStringTag,{value:'MessageChannel',configurable:true});define(MessageChannel,'prototype',{value:cp,writable:false});
++ return{MessagePort,MessageChannel};
++}

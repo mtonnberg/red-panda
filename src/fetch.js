@@ -1,10 +1,12 @@
 import {registerHeapWrapper} from './heap-registry.js';
+import {withRequestMetadata} from './request-metadata.js';
 import { randomBytes } from 'node:crypto';
 import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable, onReadableSettled, noteReadableOperation } from './request-stream-state.js';
 import { createRequire } from 'node:module';
 import { types } from 'node:util';
 import { installStreams } from './streams.js';
 import { installAbortSignals } from './abort-signals.js';
+import { installWasmStreaming, registerWasmResponse } from './wasm-streaming.js';
 
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
@@ -66,6 +68,7 @@ export function installFetch(page, window) {
   if (INSTALLED.has(window)) return INSTALLED.get(window);
   const streams = installStreams(page, window);
   const abortSignals = installAbortSignals(page, window);
+  installWasmStreaming(window);
   const generation = page.documentGeneration;
   const documentSignal = page.documentAbort?.signal;
   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
@@ -230,6 +233,27 @@ export function installFetch(page, window) {
       async cancel(reason) { if (finished) return; finished = true; cleanup(); try { const result = globalThis.ReadableStreamDefaultReader.prototype.cancel.call(reader, reason); noteReadableOperation('ReadableStreamDefaultReader', 'cancel', reader, [reason], result); await result; } finally { release(); } },
     }, { highWaterMark: 0 });
     s.raw = new NativeResponse(normalized, { status: s.raw.status, statusText: s.raw.statusText, headers: getHeaders(s.headers).raw });
+  }
+
+  function registerStreamingResponse(response, s) {
+    registerWasmResponse(response, TypeErrorClass => {
+      // Use the producing world's captured body algorithms even when the
+      // compiler belongs to a different world.
+      let essence;
+      try { essence = new MIMEType(getHeaders(s.headers).raw.get('content-type') ?? '').essence; } catch {}
+      if (essence !== 'application/wasm') throw new TypeErrorClass("Incorrect response MIME type. Expected 'application/wasm'.");
+      const status = s.status ?? s.raw.status;
+      if (status < 200 || status > 299) throw new TypeErrorClass('HTTP status code is not ok');
+      if (s.streamUsed || s.raw.bodyUsed) throw new TypeErrorClass('Body has already been read');
+      try { materializeResponseStream(s); lockBufferedBody(s); }
+      catch (error) { if (error instanceof window.TypeError) throw new TypeErrorClass(error.message); throw error; }
+      if (s.raw.body?.locked) throw new TypeErrorClass('Body is disturbed or locked');
+      // The engine requires the MIME essence, while the public response retains
+      // its original MIME parameters and casing. The actual stream is shared.
+      const headers = new NativeHeaders(getHeaders(s.headers).raw);
+      headers.set('content-type', 'application/wasm');
+      return new NativeResponse(s.raw.body, { status, statusText: s.raw.statusText, headers });
+    });
   }
 
   function streamChunkBytes(chunk) {
@@ -437,6 +461,7 @@ export function installFetch(page, window) {
     const response = Object.create(Response.prototype);
     const { bufferedBytes, ...metadata } = view;
     responseState.set(response, { raw, ...metadata, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
+    registerStreamingResponse(response, responseState.get(response));
     return registerHeapWrapper(response,window);
   }
   function abortableBody(raw, signal) {
@@ -513,6 +538,7 @@ export function installFetch(page, window) {
         const streamBody = isReadableSource(prepared.value) ? prepared.value : undefined;
         const raw = new NativeResponse(streamBody ? new Uint8Array() : prepared.value, { status, statusText, headers: getHeaders(headers).raw });
         responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') }); registerHeapWrapper(this,window);
+        registerStreamingResponse(this, responseState.get(this));
       } catch (error) { throw realmError(error); }
     }
     static error() { return wrapResponse(NativeResponse.error()); }
@@ -608,6 +634,7 @@ export function installFetch(page, window) {
     const s = getRequest(request), raw = s.raw;
     const origin = documentOrigin();
     const cross = url => ['http:', 'https:'].includes(new URL(url).protocol) && new URL(url).origin !== origin;
+    let crossOriginTainted = cross(raw.url);
     if (raw.mode === 'same-origin' && cross(raw.url)) throw new window.TypeError('Cross-origin request blocked by same-origin mode');
     if (raw.signal.aborted) throw raw.signal.reason;
     const controller = new AbortController(); pending.add(controller);
@@ -624,8 +651,8 @@ export function installFetch(page, window) {
       if (raw.mode === 'cors' && cross(raw.url) && preflight) {
         const preflightHeaders = new NativeHeaders({ origin, 'access-control-request-method': raw.method });
         if (unsafe.length) preflightHeaders.set('access-control-request-headers', unsafe.join(', '));
-        const response = await page.fetch(raw.url, { method: 'OPTIONS', headers: preflightHeaders,
-          credentials: 'omit', signal, redirect: 'error' }, 'Fetch');
+        const response = await page.fetch(raw.url, withRequestMetadata({ method: 'OPTIONS', headers: preflightHeaders,
+          credentials: 'omit', signal, redirect: 'error' }, {origin, mode: 'cors'}), 'Fetch');
         if (!response.ok) throw new window.TypeError('CORS preflight failed');
         cors(response, origin, credentials);
         const methods = (response.headers.get('access-control-allow-methods') ?? '').split(',').map(method => method.trim());
@@ -640,10 +667,11 @@ export function installFetch(page, window) {
       if (cross(raw.url) || !['GET', 'HEAD'].includes(raw.method)) headers.set('origin', origin);
       const referrer = referrerFor(raw, raw.url);
       if (referrer) headers.set('referer', referrer);
-      const response = await page.fetch(raw.url, { method: raw.method, headers, body, signal, mode: raw.mode,
+      const response = await page.fetch(raw.url, withRequestMetadata({ method: raw.method, headers, body, signal, mode: raw.mode,
         credentials: raw.credentials, credentialsOrigin: origin, redirect: raw.redirect, cache: raw.cache,
         integrity: raw.integrity, keepalive: raw.keepalive, skipDefaultReferrer: true,
         onRedirect(response, next, previous, redirectHeaders) {
+          if (cross(next)) crossOriginTainted = true;
           if (raw.redirect === 'error') throw new window.TypeError('Redirects are forbidden for this request');
           if (raw.mode === 'same-origin' && cross(next)) throw new window.TypeError('Cross-origin redirect blocked by same-origin mode');
           if (raw.mode === 'cors') {
@@ -658,7 +686,7 @@ export function installFetch(page, window) {
           const nextReferrer = referrerFor(raw, next);
           if (nextReferrer) redirectHeaders?.set('referer', nextReferrer); else redirectHeaders?.delete('referer');
         },
-      }, 'Fetch');
+      }, {origin, mode: raw.mode}), 'Fetch');
       const url = response.url || response.finalUrl || raw.url;
       const redirected = response.redirected ?? false;
       if (raw.redirect === 'error' && [301, 302, 303, 307, 308].includes(response.status)) {
@@ -668,7 +696,7 @@ export function installFetch(page, window) {
         await response.body?.cancel();
         return wrapResponse(NativeResponse.error(), { type: 'opaqueredirect', redirected: false });
       }
-      if (raw.mode === 'no-cors' && cross(url)) {
+      if (raw.mode === 'no-cors' && (crossOriginTainted || cross(url))) {
         await response.body?.cancel();
         return wrapResponse(NativeResponse.error(), { type: 'opaque', redirected: false });
       }

@@ -1,0 +1,220 @@
+--- /dev/null
++++ b/src/request-metadata.js
+@@ -0,0 +1,43 @@
++import {getDomain} from 'tldts';
++import {navigatorProfile} from './navigator.js';
++
++// Only captured browser API producers can attach context. Authored init fields
++// and mutable Window.origin/location metadata do not authenticate a principal.
++const contexts = new WeakMap();
++export function withRequestMetadata(init, {origin, mode = 'cors', destination = 'empty'}) {
++  contexts.set(init, {origin, mode, destination});
++  return init;
++}
++export function forwardRequestMetadata(source, destination) {
++  const context = contexts.get(source);
++  if (context) contexts.set(destination, context);
++  return destination;
++}
++function relation(origin, target) {
++  if (!origin || origin === 'null') return 'cross-site';
++  const source = new URL(origin);
++  if (source.origin === target.origin) return 'same-origin';
++  const site = url => getDomain(url.hostname, {allowPrivateDomains: true}) ?? url.hostname;
++  return source.protocol === target.protocol && site(source) === site(target) ? 'same-site' : 'cross-site';
++}
++const rank = {'same-origin': 0, 'same-site': 1, 'cross-site': 2};
++const quote = value => '"' + String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"') + '"';
++
++export function requestMetadataPolicy(init) {
++  const context = contexts.get(init);
++  let site = 'same-origin';
++  return (headers, input) => {
++    const target = new URL(input);
++    if (!['http:', 'https:'].includes(target.protocol)) return;
++    // Identity describes this actual independent engine. Privileged CDP/CLI
++    // headers are layered after these defaults on each actual transport hop.
++    headers.set('sec-ch-ua', quote(navigatorProfile.brand) + ';v=' + quote(navigatorProfile.version.split('.')[0]));
++    headers.set('sec-ch-ua-full-version-list', quote(navigatorProfile.brand) + ';v=' + quote(navigatorProfile.version));
++    if (!context) return;
++    const current = relation(context.origin, target);
++    if (rank[current] > rank[site]) site = current;
++    headers.set('sec-fetch-site', site);
++    headers.set('sec-fetch-mode', context.mode);
++    headers.set('sec-fetch-dest', context.destination);
++  };
++}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,4 +1,5 @@
+ import {installSelectControls} from './select-controls.js';
++import {requestMetadataPolicy} from './request-metadata.js';
+ import {installMediaElements} from './media-elements.js';
+ import {installPaymentRequest} from './payment-request.js';
+ import {installImages} from './images.js';
+@@ -502,6 +503,7 @@
+   }
+ 
+   async fetch(input, init = {}, type = 'Fetch') {
++    const metadata = requestMetadataPolicy(init);
+     const inputUrl = input instanceof Request ? input.url : String(input);
+     let url = new URL(inputUrl, this.url).href;
+     if (new URL(url).protocol === 'blob:') {
+@@ -555,6 +557,7 @@
+       // Privileged CDP headers override request/default/jar values, including
+       // empty Cookie and credentials-omitted requests. Apply on every actual
+       // hop so configured auth remains distinct from stripped authored auth.
++      metadata(headers, url);
+       this.extraHTTPHeaders.forEach((value, name) => headers.set(name, value));
+       // CLI headers retain final precedence over CDP and cookie defaults.
+       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,5 +1,6 @@
+ import { Worker } from 'node:worker_threads';
+ import { randomUUID } from 'node:crypto';
++import {requestMetadataPolicy} from './request-metadata.js';
+ const enqueue=queueMicrotask;
+ const clock=()=>performance.now()/1000;
+ /** One browser-owned real transport; the worker never owns document policy. */
+@@ -11,6 +12,7 @@
+  }
+  close(){if(this.closed)return;this.closed=true;for(const op of this.operations)op.cancel();void this.worker.terminate()}
+  fetch(page,input,init={}){
++  const metadata=requestMetadataPolicy(init);
+   if(this.closed||this.error)throw this.error??Error('Synchronous transport is closed');
+   const owned=new Set(),op={complete:false,canceled:false,cancel:()=>{
+    op.canceled=true;init.signal?.removeEventListener('abort',onAbort);
+@@ -31,6 +33,7 @@
+     checkpoint();
+     const useCookies=init.credentials!=='omit'&&(init.credentials!=='same-origin'||new URL(url).origin===init.credentialsOrigin);
+     const cookie=useCookies?page.context.cookies.getCookieStringSync(url):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
++    metadata(headers,url);
+     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
+     const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+     page.emit('request',{id,url,type:'XHR',method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -1,4 +1,5 @@
+ import {registerHeapWrapper} from './heap-registry.js';
++import {withRequestMetadata} from './request-metadata.js';
+ import { randomBytes } from 'node:crypto';
+ import { isReadableSource, readableWasDrained, readableVersion, readableLocked, drainReadableSource, lockDrainedReadable, onReadableSettled, noteReadableOperation } from './request-stream-state.js';
+ import { createRequire } from 'node:module';
+@@ -624,8 +625,8 @@
+       if (raw.mode === 'cors' && cross(raw.url) && preflight) {
+         const preflightHeaders = new NativeHeaders({ origin, 'access-control-request-method': raw.method });
+         if (unsafe.length) preflightHeaders.set('access-control-request-headers', unsafe.join(', '));
+-        const response = await page.fetch(raw.url, { method: 'OPTIONS', headers: preflightHeaders,
+-          credentials: 'omit', signal, redirect: 'error' }, 'Fetch');
++        const response = await page.fetch(raw.url, withRequestMetadata({ method: 'OPTIONS', headers: preflightHeaders,
++          credentials: 'omit', signal, redirect: 'error' }, {origin, mode: 'cors'}), 'Fetch');
+         if (!response.ok) throw new window.TypeError('CORS preflight failed');
+         cors(response, origin, credentials);
+         const methods = (response.headers.get('access-control-allow-methods') ?? '').split(',').map(method => method.trim());
+@@ -640,7 +641,7 @@
+       if (cross(raw.url) || !['GET', 'HEAD'].includes(raw.method)) headers.set('origin', origin);
+       const referrer = referrerFor(raw, raw.url);
+       if (referrer) headers.set('referer', referrer);
+-      const response = await page.fetch(raw.url, { method: raw.method, headers, body, signal, mode: raw.mode,
++      const response = await page.fetch(raw.url, withRequestMetadata({ method: raw.method, headers, body, signal, mode: raw.mode,
+         credentials: raw.credentials, credentialsOrigin: origin, redirect: raw.redirect, cache: raw.cache,
+         integrity: raw.integrity, keepalive: raw.keepalive, skipDefaultReferrer: true,
+         onRedirect(response, next, previous, redirectHeaders) {
+@@ -658,7 +659,7 @@
+           const nextReferrer = referrerFor(raw, next);
+           if (nextReferrer) redirectHeaders?.set('referer', nextReferrer); else redirectHeaders?.delete('referer');
+         },
+-      }, 'Fetch');
++      }, {origin, mode: raw.mode}), 'Fetch');
+       const url = response.url || response.finalUrl || raw.url;
+       const redirected = response.redirected ?? false;
+       if (raw.redirect === 'error' && [301, 302, 303, 307, 308].includes(response.status)) {
+--- a/src/xhr.js
++++ b/src/xhr.js
+@@ -1,4 +1,5 @@
+ import { platformFactoryRecord } from './platform-factories.js';
++import {withRequestMetadata} from './request-metadata.js';
+ import { types as nodeTypes } from 'node:util';
+ import { randomUUID } from 'node:crypto';
+ import { installBlobReads } from './blob.js';
+@@ -234,7 +235,7 @@
+       const cross=url=>['http:','https:'].includes(new URL(url).protocol)&&new URL(url).origin!==origin;
+       const unsafe=unsafeHeaders(headers),preflight=!SIMPLE_METHODS.has(s.method)||unsafe.length>0||op.uploadListeners;
+       const owner=page.registry?.page??page;
+-      const fetch=(url,init)=>page.browser.syncHTTP.fetch(owner,url,{...init,signal:op.controller.signal,frameId:page.frameId,loaderId:page.loaderId});
++      const fetch=(url,init)=>page.browser.syncHTTP.fetch(owner,url,withRequestMetadata({...init,signal:op.controller.signal,frameId:page.frameId,loaderId:page.loaderId},{origin,mode:'cors'}));
+       if(cross(s.url)&&preflight){
+         const preflightHeaders=new Headers({origin,'access-control-request-method':s.method});if(unsafe.length)preflightHeaders.set('access-control-request-headers',unsafe.join(', '));
+         const response=fetch(s.url,{method:'OPTIONS',headers:preflightHeaders,credentials:'omit',onRedirect(){throw domError('CORS preflight redirects are unsupported','NetworkError')}});
+@@ -276,14 +277,14 @@
+       const isCross = url => ['http:', 'https:'].includes(new URL(url).protocol) && new URL(url).origin !== origin;
+       const unsafe = unsafeHeaders(headers);
+       const preflight = !SIMPLE_METHODS.has(s.method) || unsafe.length > 0 || op.uploadListeners;
+-      const options = { method: s.method, headers, body, signal: op.controller.signal,
+-        credentials: credentials ? 'include' : 'same-origin', credentialsOrigin: origin };
++      const options = withRequestMetadata({ method: s.method, headers, body, signal: op.controller.signal,
++        credentials: credentials ? 'include' : 'same-origin', credentialsOrigin: origin }, {origin,mode:'cors'});
+       if (isCross(s.url) && preflight) {
+         const preflightHeaders = new Headers({ origin, 'access-control-request-method': s.method });
+         if (unsafe.length) preflightHeaders.set('access-control-request-headers', unsafe.join(', '));
+-        const response = await page.fetch(s.url, { method: 'OPTIONS', headers: preflightHeaders,
++        const response = await page.fetch(s.url, withRequestMetadata({ method: 'OPTIONS', headers: preflightHeaders,
+           credentials: 'omit', signal: op.controller.signal,
+-          onRedirect() { throw domError('CORS preflight redirects are unsupported', 'NetworkError'); } }, 'XHR');
++          onRedirect() { throw domError('CORS preflight redirects are unsupported', 'NetworkError'); } }, {origin,mode:'cors'}), 'XHR');
+         if (!same(s, op) || op.done) return;
+         if (!response.ok) throw domError('CORS preflight failed', 'NetworkError');
+         corsResponse(response, origin, credentials);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,4 +1,5 @@
+ import { installWebCrypto } from './web-crypto.js';
++import {withRequestMetadata} from './request-metadata.js';
+ import {installScheduler} from './scheduler.js';
+ import {installWorkerDOMException} from './worker-dom-exception.js';
+ import {installWorkerEvents} from './worker-events.js';
+@@ -113,11 +114,13 @@
+             const combined = AbortSignal.any([...(signal ? [signal] : []), this.#abort.signal, requestAbort.signal]);
+             const blobSnapshot = message.script && message.url === url.href ? startupBlob : undefined;
+             if (blobSnapshot) startupBlob = undefined;
+-            const response = await page.fetch(message.url, { ...message.init, headers, signal: combined,
++            const transportInit = { ...message.init, headers, signal: combined,
+               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
+               credentialsOrigin: url.origin,
+               ...(blobSnapshot ? { blobSnapshot } : {}),
+-            }, message.script ? 'Script' : message.resourceType ?? 'Fetch');
++            };
++            if (!message.script) withRequestMetadata(transportInit,{origin:creator.origin,mode:message.resourceType==='XHR'?'cors':message.init?.mode??'cors'});
++            const response = await page.fetch(message.url, transportInit, message.script ? 'Script' : message.resourceType ?? 'Fetch');
+             const bytes = new Uint8Array(await response.arrayBuffer());
+             const result = { status: response.status, statusText: response.statusText,
+               headers: [...response.headers], url: response.url || message.url, bytes };
+@@ -249,7 +252,7 @@
+       const headers = [...new Headers(init.headers ?? original.headers)];
+       const method = init.method ?? original.method;
+       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
+-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
++      const result = await request(original.url, { method, headers, body, mode:original.mode, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
+       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+       streams.adopt(response.body);
+       Object.defineProperty(response, 'url', { value: result.url }); return response;
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -1,4 +1,5 @@
+ import {disposeBrowsingWindow} from './popup-pages.js';
++import {forwardRequestMetadata} from './request-metadata.js';
+ import {retireFrameActivity} from './frame-activity.js';
+ import { completeInitialBlankFrame } from './document-reset.js';
+ import { createInvocationTrampoline } from './invocation.js';
+@@ -195,8 +196,8 @@
+     if (!init.skipDefaultReferrer && !headers.has('referer')) { const referrer = this.referrerFor(destination); if (referrer) headers.set('referer', referrer); }
+     const callerSignal = init.signal ?? (input instanceof Request ? input.signal : undefined);
+     const signal = callerSignal ? AbortSignal.any([this.documentAbort.signal, callerSignal]) : this.documentAbort.signal;
+-    return this.registry.page.fetch(request, { ...init, headers, signal, frameId: this.frameId, loaderId: this.loaderId,
+-      credentialsOrigin: init.credentialsOrigin ?? originOf(this.dom.window) }, type);
++    return this.registry.page.fetch(request, forwardRequestMetadata(init, { ...init, headers, signal, frameId: this.frameId, loaderId: this.loaderId,
++      credentialsOrigin: init.credentialsOrigin ?? originOf(this.dom.window) }), type);
+   }
+   async navigate(url, options = {}) {
+     this.current();

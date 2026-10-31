@@ -1,0 +1,12 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import {once} from 'node:events';
+import {Browser} from '../src/browser.js';
+test('real dedicated-worker document XHR response getters reject only completed successful document data',async t=>{
+ const source=`(async()=>{const results=[];for(const async of [true,false]){const x=new XMLHttpRequest(),rows=[];x.responseType='document';rows.push(['initial',x.response]);x.open('GET','/data',async);rows.push(['open',x.response]);if(async){const done=new Promise(resolve=>x.onload=resolve);x.send();await done}else x.send();for(const key of ['response','responseXML']){try{rows.push([key,x[key]])}catch(e){rows.push([key,{name:e.name,message:e.message,error:e instanceof Error,type:e instanceof TypeError}])}}results.push({async,status:x.status,rows})}postMessage(results)})()`;
+ const requests=[],server=http.createServer((q,s)=>{requests.push(q.url);if(q.url==='/worker.js'){s.setHeader('content-type','text/javascript');s.end(source)}else{s.setHeader('content-type','text/html');s.end('<!doctype html><p>Actual document bytes')}});server.listen(0,'127.0.0.1');await once(server,'listening');const browser=new Browser(),page=browser.createPage();let worker;
+ t.after(async()=>{worker?.terminate();browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});await page.navigate('http://127.0.0.1:'+server.address().port);worker=new page.dom.window.Worker('/worker.js');
+ const actual=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Actual worker XHR deadline')),5000);worker.onmessage=e=>{clearTimeout(timer);resolve(e.data)};worker.onerror=e=>{clearTimeout(timer);reject(e.error)}});
+ const error={name:'Error',message:'NotSupportedInWorker',error:true,type:false};assert.deepEqual(JSON.parse(JSON.stringify(actual)),[true,false].map(async=>({async,status:200,rows:[['initial',null],['open',null],['response',error],['responseXML',error]]})));assert.equal(requests.filter(x=>x==='/data').length,2);
+});

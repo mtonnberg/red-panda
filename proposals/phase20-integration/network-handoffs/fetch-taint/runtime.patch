@@ -1,0 +1,27 @@
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -608,6 +608,7 @@
+     const s = getRequest(request), raw = s.raw;
+     const origin = documentOrigin();
+     const cross = url => ['http:', 'https:'].includes(new URL(url).protocol) && new URL(url).origin !== origin;
++    let crossOriginTainted = cross(raw.url);
+     if (raw.mode === 'same-origin' && cross(raw.url)) throw new window.TypeError('Cross-origin request blocked by same-origin mode');
+     if (raw.signal.aborted) throw raw.signal.reason;
+     const controller = new AbortController(); pending.add(controller);
+@@ -644,6 +645,7 @@
+         credentials: raw.credentials, credentialsOrigin: origin, redirect: raw.redirect, cache: raw.cache,
+         integrity: raw.integrity, keepalive: raw.keepalive, skipDefaultReferrer: true,
+         onRedirect(response, next, previous, redirectHeaders) {
++          if (cross(next)) crossOriginTainted = true;
+           if (raw.redirect === 'error') throw new window.TypeError('Redirects are forbidden for this request');
+           if (raw.mode === 'same-origin' && cross(next)) throw new window.TypeError('Cross-origin redirect blocked by same-origin mode');
+           if (raw.mode === 'cors') {
+@@ -668,7 +670,7 @@
+         await response.body?.cancel();
+         return wrapResponse(NativeResponse.error(), { type: 'opaqueredirect', redirected: false });
+       }
+-      if (raw.mode === 'no-cors' && cross(url)) {
++      if (raw.mode === 'no-cors' && (crossOriginTainted || cross(url))) {
+         await response.body?.cancel();
+         return wrapResponse(NativeResponse.error(), { type: 'opaque', redirected: false });
+       }

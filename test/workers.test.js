@@ -215,9 +215,8 @@ test('worker close prevents later messages and terminates its timers', async t =
   assert.deepEqual(messages, ['before']);
 });
 
-test('unsupported workers, URL origins and non-transferable values fail explicitly', t => {
+test('dedicated worker URL origins and non-transferable values fail explicitly', t => {
   const f = fixture(t);
-  assert.throws(() => new f.window.SharedWorker('./shared.js'), error => error.name === 'NotSupportedError');
   assert.throws(() => new f.window.Worker('https://elsewhere.test/a.js'), error => error.name === 'SecurityError');
   assert.throws(() => new f.window.Worker('file:///not-a-worker.js'), error => error.name === 'NotSupportedError');
   assert.throws(() => new f.window.Worker('./x.js', { type: 'bad' }), /Worker type/);

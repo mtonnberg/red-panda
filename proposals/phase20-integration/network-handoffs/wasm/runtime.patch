@@ -1,0 +1,108 @@
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -5,6 +5,7 @@
+ import { types } from 'node:util';
+ import { installStreams } from './streams.js';
+ import { installAbortSignals } from './abort-signals.js';
++import { installWasmStreaming, registerWasmResponse } from './wasm-streaming.js';
+ 
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+@@ -66,6 +67,7 @@
+   if (INSTALLED.has(window)) return INSTALLED.get(window);
+   const streams = installStreams(page, window);
+   const abortSignals = installAbortSignals(page, window);
++  installWasmStreaming(window);
+   const generation = page.documentGeneration;
+   const documentSignal = page.documentAbort?.signal;
+   const headersState = HEADER_STATE, requestState = REQUEST_STATE, responseState = RESPONSE_STATE;
+@@ -230,6 +232,27 @@
+       async cancel(reason) { if (finished) return; finished = true; cleanup(); try { const result = globalThis.ReadableStreamDefaultReader.prototype.cancel.call(reader, reason); noteReadableOperation('ReadableStreamDefaultReader', 'cancel', reader, [reason], result); await result; } finally { release(); } },
+     }, { highWaterMark: 0 });
+     s.raw = new NativeResponse(normalized, { status: s.raw.status, statusText: s.raw.statusText, headers: getHeaders(s.headers).raw });
++  }
++
++  function registerStreamingResponse(response, s) {
++    registerWasmResponse(response, TypeErrorClass => {
++      // Use the producing world's captured body algorithms even when the
++      // compiler belongs to a different world.
++      let essence;
++      try { essence = new MIMEType(getHeaders(s.headers).raw.get('content-type') ?? '').essence; } catch {}
++      if (essence !== 'application/wasm') throw new TypeErrorClass("Incorrect response MIME type. Expected 'application/wasm'.");
++      const status = s.status ?? s.raw.status;
++      if (status < 200 || status > 299) throw new TypeErrorClass('HTTP status code is not ok');
++      if (s.streamUsed || s.raw.bodyUsed) throw new TypeErrorClass('Body has already been read');
++      try { materializeResponseStream(s); lockBufferedBody(s); }
++      catch (error) { if (error instanceof window.TypeError) throw new TypeErrorClass(error.message); throw error; }
++      if (s.raw.body?.locked) throw new TypeErrorClass('Body is disturbed or locked');
++      // The engine requires the MIME essence, while the public response retains
++      // its original MIME parameters and casing. The actual stream is shared.
++      const headers = new NativeHeaders(getHeaders(s.headers).raw);
++      headers.set('content-type', 'application/wasm');
++      return new NativeResponse(s.raw.body, { status, statusText: s.raw.statusText, headers });
++    });
+   }
+ 
+   function streamChunkBytes(chunk) {
+@@ -437,6 +460,7 @@
+     const response = Object.create(Response.prototype);
+     const { bufferedBytes, ...metadata } = view;
+     responseState.set(response, { raw, ...metadata, bufferedBody: bufferedRecord(bufferedBytes), headers: wrapHeaders(view.headers ?? raw.headers, view.guard ?? 'immutable') });
++    registerStreamingResponse(response, responseState.get(response));
+     return registerHeapWrapper(response,window);
+   }
+   function abortableBody(raw, signal) {
+@@ -513,6 +537,7 @@
+         const streamBody = isReadableSource(prepared.value) ? prepared.value : undefined;
+         const raw = new NativeResponse(streamBody ? new Uint8Array() : prepared.value, { status, statusText, headers: getHeaders(headers).raw });
+         responseState.set(this, { raw, streamBody, streamUsed: false, bufferedBody: bufferedRecord(prepared.bytes), headers: wrapHeaders(raw.headers, 'response') }); registerHeapWrapper(this,window);
++        registerStreamingResponse(this, responseState.get(this));
+       } catch (error) { throw realmError(error); }
+     }
+     static error() { return wrapResponse(NativeResponse.error()); }
+--- /dev/null
++++ b/src/wasm-streaming.js
+@@ -0,0 +1,43 @@
++// Translate genuine browser Response producers to Node's genuine streaming
++// compiler input. Neither public lookalikes nor authored Response properties
++// supply bytes, status, headers, or brands to this bridge.
++import {types} from 'node:util';
++const producers = new WeakMap(), installed = new WeakSet();
++const nativeErrors = ['CompileError', 'LinkError', 'RuntimeError'].map(name => [name, globalThis.WebAssembly[name]]);
++export function registerWasmResponse(value, producer) { producers.set(value, producer); }
++export function installWasmStreaming(realm) {
++  if (installed.has(realm) || !realm.WebAssembly) return;
++  const wasm = realm.WebAssembly;
++  const compile = wasm.compileStreaming, instantiate = wasm.instantiateStreaming;
++  const errors = nativeErrors.map(([name, Native]) => [Native.prototype, wasm[name]]);
++  if (typeof compile !== 'function' || typeof instantiate !== 'function') return;
++  const bridge = value => {
++    const producer = producers.get(value);
++    if (!producer) throw new realm.TypeError('Argument 0 must be a Response or a Promise resolving to a Response');
++    return producer(realm.TypeError);
++  };
++  const error = value => {
++    if (!types.isNativeError(value)) return value;
++    for (const [prototype, Constructor] of errors) {
++      if (Object.getPrototypeOf(value) === prototype) return new Constructor(value.message);
++    }
++    return value;
++  };
++  const methods = realm.Function('bridge', 'compile', 'instantiate', 'error', `
++    const resolve=Promise.resolve.bind(Promise), then=Promise.prototype.then;
++    function run(compiler,source,imports) {
++      let rejected=false;
++      const input=then.call(resolve(source),bridge,reason=>{rejected=true;throw reason});
++      return then.call(compiler(input,imports),undefined,reason=>{throw rejected?reason:error(reason)});
++    }
++    return {
++      compileStreaming(source) { return run(compile,source); },
++      instantiateStreaming(source, imports) { return run(instantiate,source,imports); }
++    };
++  `)(bridge, compile, instantiate, error);
++  Object.defineProperty(methods.instantiateStreaming, 'length', { value: 1 });
++  for (const name of ['compileStreaming', 'instantiateStreaming']) {
++    Object.defineProperty(wasm, name, { ...Object.getOwnPropertyDescriptor(wasm, name), value: methods[name] });
++  }
++  installed.add(realm);
++}

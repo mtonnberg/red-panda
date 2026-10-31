@@ -116,8 +116,8 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Surface | Supported |
 | --- | --- |
 | Fetch | Streaming EventSource with reconnect, IDs, cookies and CORS; HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
-| HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
-| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket/EventSource and FileReaderSync; Browser-wide WebSocket admission (default 8, `--ws-max-concurrent 0..255`) |
+| HTML / JS | Actual WebAssembly streaming compilation from genuine Response bytes; incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
+| Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket/EventSource and FileReaderSync, shared Worker actors and real ports; Browser-wide WebSocket admission (default 8, `--ws-max-concurrent 0..255`) |
 | Web APIs | Real HTMLDDA collections, CSS.escape/supports namespaces, Selection and Range geometry, actual Web Crypto keys/bytes, Cookie Store, Web Locks, Scheduler, form-associated custom elements, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
 | Canvas | Genuine context/Path2D state, measured transparent pixel reads and independently encoded PNG output; the target profile has no Canvas rasterizer |
 | Storage | UTF-8 value-byte quota, context/origin backing state and genuine shared frame wrappers; key order and legacy reflection remain incomplete |
@@ -228,7 +228,11 @@ available. These bounds apply to the implemented subset, not full network parity
 
 Dedicated workers use actual isolated threads and are terminated when their
 document is disposed. Blob worker URLs and transferred MessagePorts are supported;
-SharedWorker and nested workers remain unsupported. Blob/File message cloning is supported.
+SharedWorker uses real shared VM actors and entangled ports within a root Page;
+its state survives creator-frame removal. Incoming transferred values are allocated
+in the receiving VM. SharedWorker and MessageChannel/Port are still absent in
+isolated utility worlds; nested workers remain unsupported. Blob/File message
+cloning and creator-owned dedicated-worker Blob URLs are supported.
 Worker-owned SSE and WebSocket connections retain the measured transport lifetime
 after worker closure and close when their owning Page closes.
 Keyboard Tab traversal currently covers
@@ -272,18 +276,20 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 84 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 87 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 1,552 JavaScript tests, 84 PureScript Puppeteer
+The current checkpoint passes 1,588 JavaScript tests, 87 PureScript Puppeteer
 checks and 13 native differential groups, plus syntax and strict PureScript checks.
-[Source-bound validation](docs/reference/phase19-integration/validation.json)
-records all 9,275 unchanged inputs and paired native/candidate fixture replays:
-24/24 with their declared profiles, plus 2/2 with an explicit WebSocket limit of 50.
-Earlier failed epochs remain recorded. Full browser equivalence remains incomplete.
+[Source-bound validation](docs/reference/phase20-integration/validation.json)
+records all 9,382 unchanged inputs and paired native/candidate fixture replays:
+27/27 with their declared profiles, plus 2/2 with an explicit WebSocket limit of 50.
+The separate full-fetch fixture still fails its literal client-hint branding check;
+that failed report remains unchanged. Earlier failed epochs remain recorded.
+Full browser equivalence remains incomplete.
 
 ## REA investigation and comparison
 

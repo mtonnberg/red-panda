@@ -1,4 +1,5 @@
 import {disposeBrowsingWindow} from './popup-pages.js';
+import {forwardRequestMetadata} from './request-metadata.js';
 import {retireFrameActivity} from './frame-activity.js';
 import { completeInitialBlankFrame } from './document-reset.js';
 import { createInvocationTrampoline } from './invocation.js';
@@ -195,8 +196,8 @@ class FramePage extends EventEmitter {
     if (!init.skipDefaultReferrer && !headers.has('referer')) { const referrer = this.referrerFor(destination); if (referrer) headers.set('referer', referrer); }
     const callerSignal = init.signal ?? (input instanceof Request ? input.signal : undefined);
     const signal = callerSignal ? AbortSignal.any([this.documentAbort.signal, callerSignal]) : this.documentAbort.signal;
-    return this.registry.page.fetch(request, { ...init, headers, signal, frameId: this.frameId, loaderId: this.loaderId,
-      credentialsOrigin: init.credentialsOrigin ?? originOf(this.dom.window) }, type);
+    return this.registry.page.fetch(request, forwardRequestMetadata(init, { ...init, headers, signal, frameId: this.frameId, loaderId: this.loaderId,
+      credentialsOrigin: init.credentialsOrigin ?? originOf(this.dom.window) }), type);
   }
   async navigate(url, options = {}) {
     this.current();

@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
+import {requestMetadataPolicy} from './request-metadata.js';
 const enqueue=queueMicrotask;
 const clock=()=>performance.now()/1000;
 /** One browser-owned real transport; the worker never owns document policy. */
@@ -11,6 +12,7 @@ export class SyncHTTP {
  }
  close(){if(this.closed)return;this.closed=true;for(const op of this.operations)op.cancel();void this.worker.terminate()}
  fetch(page,input,init={}){
+  const metadata=requestMetadataPolicy(init);
   if(this.closed||this.error)throw this.error??Error('Synchronous transport is closed');
   const owned=new Set(),op={complete:false,canceled:false,cancel:()=>{
    op.canceled=true;init.signal?.removeEventListener('abort',onAbort);
@@ -31,6 +33,7 @@ export class SyncHTTP {
     checkpoint();
     const useCookies=init.credentials!=='omit'&&(init.credentials!=='same-origin'||new URL(url).origin===init.credentialsOrigin);
     const cookie=useCookies?page.context.cookies.getCookieStringSync(url):'';if(cookie)headers.set('cookie',cookie);else headers.delete('cookie');
+    metadata(headers,url);
     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
     const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
     page.emit('request',{id,url,type:'XHR',method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});

@@ -1,0 +1,190 @@
+--- a/src/blob-urls.js
++++ b/src/blob-urls.js
+@@ -1,5 +1,8 @@
+ import { randomUUID } from 'node:crypto';
+ import { createRequire } from 'node:module';
++import {Blob as NativeBlob} from 'node:buffer';
++const nativeBlobBytes=NativeBlob.prototype.arrayBuffer;
++const nativeBlobType=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
+ 
+ // Pinned jsdom26 exposes immutable Blob/File bytes through its branded impl.
+ // No Node object-URL store or host filesystem URLs are exposed to documents.
+@@ -135,7 +138,10 @@
+  * resolutions fail. Every call returns a fresh Uint8Array safe to transfer.
+  */
+ export function resolveBlobURL(page, input) {
+-  const owner = current.get(page), url = parsed(input);
++  return resolveForOwner(current.get(page), input);
++}
++function resolveForOwner(owner, input) {
++  const url = parsed(input);
+   if (!owner || !url || !active(owner)) throw new BlobURLFetchError();
+   refreshOrigin(owner);
+   const requestedURL = url.href;
+@@ -148,3 +154,31 @@
+   }
+   return { bytes: Uint8Array.from(record.bytes), mimeType: record.mimeType, url: requestedURL };
+ }
++
++/** Captured parent authority for one actual creator document. Worker private
++ * factory snapshots arrive through the genuine ThreadWorker cloning producer.
++ * Namespace ownership outlives the worker and ends with the actual document,
++ * matching retained frames and Native worker termination behavior.
++ */
++export function createWorkerBlobURLs(page, window) {
++  const owner=documents.get(window.document);
++  if(!owner)return null;
++  if(owner.page!==page||owner.context!==page.context)throw new TypeError('An actual creator object URL owner is required');
++  return {
++    async create(blob) {
++      if(!active(owner))throw new BlobURLFetchError();
++      const mimeType=Reflect.apply(nativeBlobType,blob,[]);
++      const bytes=Buffer.from(await Reflect.apply(nativeBlobBytes,blob,[]));
++      if(!active(owner))throw new BlobURLFetchError();
++      const origin=refreshOrigin(owner),url=`blob:${origin.serialized}/${randomUUID()}`;
++      owner.registry.set(url,{url,registry:owner.registry,owner,origin:origin.identity,bytes,mimeType});
++      owner.urls.add(url);return url;
++    },
++    revoke(value) {
++      const url=parsed(value);if(!url||!active(owner))return;
++      const origin=refreshOrigin(owner),record=owner.registry.get(url.href);
++      if(record&&record.origin===origin.identity)remove(record);
++    },
++    resolve(input){return resolveForOwner(owner,input);},
++  };
++}
+--- /dev/null
++++ b/src/worker-blob-urls.js
+@@ -0,0 +1,32 @@
++import {platformFactoryRecord} from './platform-factories.js';
++
++export function completeWorkerBlobURL(shared, result, error) {
++  const state=new Int32Array(shared,0,2),destination=new Uint8Array(shared,8);
++  const encoded=new TextEncoder().encode(JSON.stringify(error?{error:String(error.message??error)}:{result}));
++  destination.set(encoded.subarray(0,destination.length));Atomics.store(state,1,Math.min(encoded.length,destination.length));Atomics.store(state,0,1);Atomics.notify(state,0);
++}
++export function installWorkerBlobURLs(realm,{evaluate,port,active=()=>true,timeoutMs=5000}={}) {
++  const TypeErrorClass=realm.TypeError,Exception=realm.DOMException;
++  const call=(operation,value)=>{
++    if(!active())throw new Exception('The worker is disposed','InvalidStateError');
++    let blob;
++    if(operation==='create'){
++      const producer=platformFactoryRecord(value);
++      if(!producer||!['Blob','File'].includes(producer.kind)||typeof producer.read!=='function')throw new TypeErrorClass('invalid argument');
++      // Only immutable data returned by an authenticated allocation producer
++      // leaves the worker. Public Node Blob symbols and getters are ignored.
++      blob=producer.read().blob;
++    }
++    const shared=new SharedArrayBuffer(65536),state=new Int32Array(shared,0,2);
++    port.postMessage({kind:'blobURL',operation,...(operation==='create'?{blob}:{value}),sync:shared});
++    if(Atomics.wait(state,0,0,timeoutMs)==='timed-out'||Atomics.load(state,0)!==1)throw new Exception('Object URL operation did not complete','TimeoutError');
++    const response=JSON.parse(new TextDecoder().decode(new Uint8Array(shared,8,Atomics.load(state,1))));
++    if(response.error)throw new TypeErrorClass(response.error);
++    return response.result;
++  };
++  const methods=evaluate(`(call=>({
++    createObjectURL(value){if(!arguments.length)throw new TypeError('invalid argument');return call('create',value)},
++    revokeObjectURL(value){if(!arguments.length)throw new TypeError('invalid argument');call('revoke',String(value))}
++  }))`)(call);
++  for(const name of ['createObjectURL','revokeObjectURL'])Object.defineProperty(realm.URL,name,{value:methods[name],writable:true,enumerable:true,configurable:true});
++}
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -16,7 +16,8 @@
+ import vm from 'node:vm';
+ import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+ import { createMessagingRealm, installMessaging } from './messaging.js';
+-import { resolveBlobURL } from './blob-urls.js';
++import { resolveBlobURL,createWorkerBlobURLs } from './blob-urls.js';
++import {completeWorkerBlobURL,installWorkerBlobURLs} from './worker-blob-urls.js';
+ import { installWebCodecsProcessors } from './webcodecs-processors.js';
+ import { installVideoFrame } from './video-frame.js';
+ import { installAudioData } from './audio-data.js';
+@@ -62,12 +63,13 @@
+       // observed in native serve/fetch defaults; no script request is issued.
+       if (!enabled&&!service) return;
+       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
++      const blobURLs=createWorkerBlobURLs(page,window);
+       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
+       this.#thread = new ThreadWorker(new URL(import.meta.url), {
+         // File-backed workers must not inherit an embedding CLI's --input-type
+         // or --eval flags. Only the VM-module capability is needed here.
+         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
+-        redPandaWorker: true, origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
++        redPandaWorker: true, blobURLs:Boolean(blobURLs), origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
+         navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
+           languages: [...window.navigator.languages], platform: window.navigator.platform },
+       } });
+@@ -97,6 +99,10 @@
+         } else if (message.kind === 'console') page.emit('console', { type: message.type, args: clone(message.args) });
+         else if (message.kind === 'close') this.terminate();
+         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
++        else if(message.kind==='blobURL'){
++          try{if(!blobURLs)throw new TypeError('Object URL authority is unavailable');const result=message.operation==='create'?await blobURLs.create(message.blob):blobURLs.revoke(message.value);completeWorkerBlobURL(message.sync,result);}
++          catch(error){completeWorkerBlobURL(message.sync,null,error);}
++        }
+         else if(message.kind==='socketPolicy'){
+           try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(page,message.url));}
+           catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
+@@ -111,7 +117,7 @@
+               if (referrer) headers.set('referer', referrer);
+             }
+             const combined = AbortSignal.any([...(signal ? [signal] : []), this.#abort.signal, requestAbort.signal]);
+-            const blobSnapshot = message.script && message.url === url.href ? startupBlob : undefined;
++            const blobSnapshot = message.script && message.url === url.href && startupBlob ? startupBlob : new URL(message.url).protocol==='blob:' ? blobURLs?.resolve(message.url) : undefined;
+             if (blobSnapshot) startupBlob = undefined;
+             const response = await page.fetch(message.url, { ...message.init, headers, signal: combined,
+               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
+@@ -119,8 +125,10 @@
+               ...(blobSnapshot ? { blobSnapshot } : {}),
+             }, message.script ? 'Script' : message.resourceType ?? 'Fetch');
+             const bytes = new Uint8Array(await response.arrayBuffer());
++            const responseURL=response.url||message.url;
++            const basic=new URL(responseURL).protocol==='blob:'||new URL(responseURL).protocol==='data:'||new URL(responseURL).origin===creator.origin;
+             const result = { status: response.status, statusText: response.statusText,
+-              headers: [...response.headers], url: response.url || message.url, bytes };
++              headers: [...response.headers], url: responseURL, bytes,...(basic?{type:'basic'}:{}) };
+             if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);
+             else if (message.sync) {
+               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
+@@ -187,6 +195,7 @@
+ async function runWorker() {
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+   let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform;
++  let fetchTypeError;
+   let dispatchError = value => report(value);
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+@@ -249,10 +258,14 @@
+       const headers = [...new Headers(init.headers ?? original.headers)];
+       const method = init.method ?? original.method;
+       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
+-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
++      let result;
++      try { result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType); }
++      catch(error) { if((nativeSignal??original.signal)?.aborted)throw (nativeSignal??original.signal).reason; throw new fetchTypeError('fetch error'); }
+       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+       streams.adopt(response.body);
+-      Object.defineProperty(response, 'url', { value: result.url }); return response;
++      Object.defineProperty(response, 'url', { value: result.url });
++      if(result.type)Object.defineProperty(response,'type',{value:result.type});
++      return response;
+     },
+     structuredClone(value, options) { return messaging.clone(value, options); },
+     console(type, args) { parentPort.postMessage({ kind: 'console', type, args }); },
+@@ -263,6 +276,7 @@
+     atob, btoa };
+   context = vm.createContext(sandbox);
+   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
++  fetchTypeError=realm.TypeError;
+   installWorkerDOMException(realm,{evaluate});
+   eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
+   lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
+@@ -328,6 +342,7 @@
+   installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
+   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketPolicy:createSyncWorkerSocketPolicy(parentPort),origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
++  if(workerData.blobURLs&&!workerData.service&&!workerData.shared)installWorkerBlobURLs(realm,{evaluate,port:parentPort,active:()=>!closed});
+   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+ 

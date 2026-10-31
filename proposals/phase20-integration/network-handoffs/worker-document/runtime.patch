@@ -1,0 +1,11 @@
+--- a/src/worker-xhr.js
++++ b/src/worker-xhr.js
+@@ -136,7 +136,7 @@
+     get(object,key){const s=state(object);if(key==='responseText'){if(!['','text'].includes(s.responseType))throw error('responseType is not text');return s.readyState>=3?s.text:''}
+       if(key==='responseXML'){if(s.readyState===4&&['','document'].includes(s.responseType))throw new realm.Error('NotSupportedInWorker');return null}
+       if(key!=='response')return s[key];if(['','text'].includes(s.responseType))return s.readyState>=3?s.text:'';if(s.readyState!==4||!s.status)return null;if(s.cached!==undefined)return s.cached;
+-      if(s.responseType==='json'){try{s.cached=realm.JSON.parse(s.text)}catch{s.cached=null}}else if(s.responseType==='document')s.cached=null;else{const bytes=new realm.Uint8Array(s.bytes.length);bytes.set(s.bytes);s.cached=s.responseType==='blob'?new realm.Blob([bytes.buffer],{type:s.mime}):bytes.buffer}return s.cached;
++      if(s.responseType==='json'){try{s.cached=realm.JSON.parse(s.text)}catch{s.cached=null}}else if(s.responseType==='document')throw new realm.Error('NotSupportedInWorker');else{const bytes=new realm.Uint8Array(s.bytes.length);bytes.set(s.bytes);s.cached=s.responseType==='blob'?new realm.Blob([bytes.buffer],{type:s.mime}):bytes.buffer}return s.cached;
+     },
+     set(object,key,value){const s=state(object);if(key==='responseType'){value=String(value);if(!TYPES.has(value))return;if([3,4].includes(s.readyState))throw error('Cannot change responseType after loading starts');s.responseType=value}
+       else if(key==='withCredentials'){if(![0,1].includes(s.readyState)||s.sending)throw error('Cannot change credentials after sending');s.withCredentials=Boolean(value)}

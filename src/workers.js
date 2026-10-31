@@ -1,3 +1,7 @@
+import {withRequestMetadata} from './request-metadata.js';
+import {getHeapBinding} from './native-heap.js';
+import {createSharedWorkerContext,installSharedWorkerGlobal} from './shared-worker-global.js';
+import {installSharedWorkers} from './shared-workers.js';
 import {installEventSource} from './eventsource.js';
 import {createParentEventSources,createWorkerEventSourceClient} from './worker-eventsource.js';
 import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
@@ -17,9 +21,10 @@ import {installCache,cacheStoreFor} from './cache.js';
 import { broadcastConfig } from "./broadcast-config.js";
 import { createBroadcastRealm, createBroadcastRelay } from "./broadcast-realm.js";
 import vm from 'node:vm';
-import { Worker as ThreadWorker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { Worker as ThreadWorker, isMainThread, parentPort as workerThreadPort, workerData as workerThreadData } from 'node:worker_threads';
 import { createMessagingRealm, installMessaging } from './messaging.js';
-import { resolveBlobURL } from './blob-urls.js';
+import { resolveBlobURL,createWorkerBlobURLs } from './blob-urls.js';
+import {completeWorkerBlobURL,installWorkerBlobURLs} from './worker-blob-urls.js';
 import { installWebCodecsProcessors } from './webcodecs-processors.js';
 import { installVideoFrame } from './video-frame.js';
 import { installAudioData } from './audio-data.js';
@@ -65,6 +70,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
       // observed in native serve/fetch defaults; no script request is issued.
       if (!enabled&&!service) return;
       let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+      const blobURLs=createWorkerBlobURLs(page,window);
       this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
       this.#eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
       this.#socketTransports=createParentWorkerSockets(page,{origin:url.protocol==='data:'?'null':creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
@@ -72,7 +78,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
         // File-backed workers must not inherit an embedding CLI's --input-type
         // or --eval flags. Only the VM-module capability is needed here.
         execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
-        redPandaWorker: true, origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
+        redPandaWorker: true, blobURLs:Boolean(blobURLs), origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
         navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
           languages: [...window.navigator.languages], platform: window.navigator.platform },
       } });
@@ -104,6 +110,10 @@ export function installWorkers(page, window, { enabled = true } = {}) {
         } else if (message.kind === 'console') page.emit('console', { type: message.type, args: clone(message.args) });
         else if (message.kind === 'close') this.terminate();
         else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
+        else if(message.kind==='blobURL'){
+          try{if(!blobURLs)throw new TypeError('Object URL authority is unavailable');const result=message.operation==='create'?await blobURLs.create(message.blob):blobURLs.revoke(message.value);completeWorkerBlobURL(message.sync,result);}
+          catch(error){completeWorkerBlobURL(message.sync,null,error);}
+        }
         else if(message.kind==='socketPolicy'){
           try{completeWorkerSocketPolicy(message.sync,message.protocols!==undefined?this.#socketTransports.create(message.url,message.protocols):await workerSocketPolicy(page,message.url));}
           catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
@@ -118,16 +128,20 @@ export function installWorkers(page, window, { enabled = true } = {}) {
               if (referrer) headers.set('referer', referrer);
             }
             const combined = AbortSignal.any([...(signal ? [signal] : []), this.#abort.signal, requestAbort.signal]);
-            const blobSnapshot = message.script && message.url === url.href ? startupBlob : undefined;
+            const blobSnapshot = message.script && message.url === url.href && startupBlob ? startupBlob : new URL(message.url).protocol==='blob:' ? blobURLs?.resolve(message.url) : undefined;
             if (blobSnapshot) startupBlob = undefined;
-            const response = await page.fetch(message.url, { ...message.init, headers, signal: combined,
+            const transportInit = { ...message.init, headers, signal: combined,
               credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
               credentialsOrigin: url.origin,
               ...(blobSnapshot ? { blobSnapshot } : {}),
-            }, message.script ? 'Script' : message.resourceType ?? 'Fetch');
+            };
+            if (!message.script) withRequestMetadata(transportInit,{origin:creator.origin,mode:message.resourceType==='XHR'?'cors':message.init?.mode??'cors'});
+            const response = await page.fetch(message.url, transportInit, message.script ? 'Script' : message.resourceType ?? 'Fetch');
             const bytes = new Uint8Array(await response.arrayBuffer());
+            const responseURL=response.url||message.url;
+            const basic=new URL(responseURL).protocol==='blob:'||new URL(responseURL).protocol==='data:'||new URL(responseURL).origin===creator.origin;
             const result = { status: response.status, statusText: response.statusText,
-              headers: [...response.headers], url: response.url || message.url, bytes };
+              headers: [...response.headers], url: responseURL, bytes,...(basic?{type:'basic'}:{}) };
             if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);
             else if (message.sync) {
               const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
@@ -185,15 +199,14 @@ export function installWorkers(page, window, { enabled = true } = {}) {
   }
   Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker' });
   window.Worker = Worker;
-  window.SharedWorker = class SharedWorker {
-    constructor() { throw new window.DOMException('SharedWorker is not implemented', 'NotSupportedError'); }
-  };
+  installSharedWorkers(page,window,{enabled});
   return { dispose, createService(input,options,configuration){const token=Symbol();serviceRequests.set(token,configuration);return new Worker(input,options,token);}, get size() { return owned.size; } };
 }
 
-async function runWorker() {
+async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData) {
   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
-  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient;
+  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient,connectShared;
+  let fetchTypeError;
   let dispatchError = value => report(value);
   const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
@@ -256,10 +269,14 @@ async function runWorker() {
       const headers = [...new Headers(init.headers ?? original.headers)];
       const method = init.method ?? original.method;
       const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
-      const result = await request(original.url, { method, headers, body, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType);
+      let result;
+      try { result = await request(original.url, { method, headers, body, mode:original.mode, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType); }
+      catch(error) { if((nativeSignal??original.signal)?.aborted)throw (nativeSignal??original.signal).reason; throw new fetchTypeError('fetch error'); }
       const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
       streams.adopt(response.body);
-      Object.defineProperty(response, 'url', { value: result.url }); return response;
+      Object.defineProperty(response, 'url', { value: result.url });
+      if(result.type)Object.defineProperty(response,'type',{value:result.type});
+      return response;
     },
     structuredClone(value, options) { return messaging.clone(value, options); },
     console(type, args) { parentPort.postMessage({ kind: 'console', type, args }); },
@@ -268,20 +285,23 @@ async function runWorker() {
     URL, URLSearchParams, TextEncoder, TextDecoder, Headers, Request, Response, FormData, Blob, File,
     AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
     atob, btoa };
-  context = vm.createContext(sandbox);
+  context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
+  fetchTypeError=realm.TypeError;
   installWorkerDOMException(realm,{evaluate});
   eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
   lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
   context.__eventPlatform=eventPlatform;
+  if(workerData.shared)eventPlatform.registerTarget(realm,new EventTarget());
+  context.__sharedWorker=Boolean(workerData.shared);
   vm.runInContext(`(function () {
-    const eventPlatform=__eventPlatform,bridge=__bridge;
+    'use strict';const eventPlatform=__eventPlatform,bridge=__bridge;
     delete globalThis.__bridge;
     const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
     globalThis.self = globalThis; globalThis.name = __name;
-    const target = new EventTarget(); eventPlatform.setReceiver(target,globalThis);
+    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);
     for(const key of ['onmessage','onmessageerror','onerror']) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
-    for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = target[name].bind(target);
+    for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = EventTarget.prototype[name].bind(target);
     const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
     globalThis.dispatchEvent = dispatchGlobal;
     let reportingError = false;
@@ -306,18 +326,24 @@ async function runWorker() {
     const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); eventPlatform.trust(event); return event; };
     globalThis.__createTrustedMessage = createTrustedMessage;
     globalThis.__emitMessage = (data, ports) => dispatchGlobal(createTrustedMessage('message', data, ports));
+    globalThis.__connectShared=event=>dispatchGlobal(event);
+    delete globalThis.__sharedWorker;
   })();`, context);
   delete context.__eventPlatform;
+  if(workerData.shared)installSharedWorkerGlobal(realm,{context,events:eventPlatform,name:workerData.name,close:bridge.close});
   abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
   installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
   dispatchError=vm.runInContext('__dispatchError',context);
-  delete context.__dispatchError;
+  vm.runInContext('delete globalThis.__dispatchError',context);
   emit = vm.runInContext('__emitMessage', context);
   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
   const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
+  const dispatchShared=vm.runInContext('__connectShared',context);
+  vm.runInContext('delete globalThis.__connectShared',context);
+  connectShared=message=>{const {ports}=messaging.receive({data:null,ports:message.ports});dispatchShared(eventPlatform.connectEvent(ports))};
   messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
-    active: () => !closed,
-    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,createTrustedMessage(type, data, ports)),
+    active: () => !closed,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),portCopiesArrayBuffers:Boolean(workerData.shared),mutableMessagePorts:Boolean(workerData.shared),
+    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,workerData.shared?eventPlatform.portEvent(type,data,ports):createTrustedMessage(type, data, ports)),
     reportError: value => dispatchError(value),
   });
   Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
@@ -338,14 +364,16 @@ async function runWorker() {
   installEventSource(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),baseURL:()=>workerData.url,createTransport:eventSourceClient.create,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),active:()=>!closed,trustEvent:trustWorkerEvent});
   socketClient=createWorkerSocketClient(parentPort,createSyncWorkerSocketPolicy(parentPort));
   installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketFactory:socketClient.create,origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+  if(workerData.blobURLs&&!workerData.service&&!workerData.shared)installWorkerBlobURLs(realm,{evaluate,port:parentPort,active:()=>!closed});
   installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
     store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
 
   if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
     call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
-  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;', context);
+  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;delete globalThis.__url;delete globalThis.__name;delete globalThis.__navigator;', context);
   parentPort.on('message', message => {
     if (closed) return;
+    if(message.kind==='sharedConnect'){if(!ready)queued.push(message);else connectShared(message);return;}
     if(message.kind==='eventSourceEvent'){eventSourceClient.handle(message);return;}
     if(message.kind==='socketEvent'||message.kind==='socketSent'){socketClient.handle(message);return;}
     if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
@@ -359,12 +387,15 @@ async function runWorker() {
       if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
     }
   });
-  process.on('unhandledRejection', dispatchError);
+  const rejection=(value,promise)=>{if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value)};
+  process.on('unhandledRejection',rejection);
+  lifetime.signal.addEventListener('abort',()=>process.off('unhandledRejection',rejection),{once:true});
+  parentPort.on('close',()=>bridge.close());
   try {
     const result = await request(workerData.url, {}, true);
     if (result.status < 200 || result.status >= 300) throw new Error(`Worker load failed (${result.status}): ${workerData.url}`);
-    workerData.url = result.url;
-    context.__resolvedURL = result.url;
+    if(!workerData.shared)workerData.url = result.url;
+    context.__resolvedURL = workerData.shared?workerData.url:result.url;
     vm.runInContext('globalThis.location = new WorkerLocation(new URL(__resolvedURL)); delete globalThis.__resolvedURL;', context);
     const source = new TextDecoder().decode(result.bytes);
     {
@@ -412,9 +443,10 @@ async function runWorker() {
     }
     ready = true;
     if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
-    for (const message of queued) { if (!closed) { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
+    for (const message of queued) { if (!closed) { if(message.kind==='sharedConnect'){connectShared(message);continue;} messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
     queued.length = 0;
   } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else dispatchError(failure); }
 }
 
-if (!isMainThread && workerData?.redPandaWorker) void runWorker();
+if (!isMainThread && workerThreadData?.redPandaWorker) void runWorker();
+if(!isMainThread&&workerThreadData?.redPandaSharedHost)workerThreadPort.on('message',message=>{if(message.kind==='createSharedRuntime')void runWorker(message.control,message.data).catch(error=>{try{message.control.postMessage({kind:'error',error:{name:error.name,message:error.message,stack:error.stack}})}finally{message.control.close()}})});

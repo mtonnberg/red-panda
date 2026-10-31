@@ -1,4 +1,5 @@
 import { platformFactoryRecord } from './platform-factories.js';
+import {withRequestMetadata} from './request-metadata.js';
 import { types as nodeTypes } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { installBlobReads } from './blob.js';
@@ -234,7 +235,7 @@ export function installXHR(page, window) {
       const cross=url=>['http:','https:'].includes(new URL(url).protocol)&&new URL(url).origin!==origin;
       const unsafe=unsafeHeaders(headers),preflight=!SIMPLE_METHODS.has(s.method)||unsafe.length>0||op.uploadListeners;
       const owner=page.registry?.page??page;
-      const fetch=(url,init)=>page.browser.syncHTTP.fetch(owner,url,{...init,signal:op.controller.signal,frameId:page.frameId,loaderId:page.loaderId});
+      const fetch=(url,init)=>page.browser.syncHTTP.fetch(owner,url,withRequestMetadata({...init,signal:op.controller.signal,frameId:page.frameId,loaderId:page.loaderId},{origin,mode:'cors'}));
       if(cross(s.url)&&preflight){
         const preflightHeaders=new Headers({origin,'access-control-request-method':s.method});if(unsafe.length)preflightHeaders.set('access-control-request-headers',unsafe.join(', '));
         const response=fetch(s.url,{method:'OPTIONS',headers:preflightHeaders,credentials:'omit',onRedirect(){throw domError('CORS preflight redirects are unsupported','NetworkError')}});
@@ -276,14 +277,14 @@ export function installXHR(page, window) {
       const isCross = url => ['http:', 'https:'].includes(new URL(url).protocol) && new URL(url).origin !== origin;
       const unsafe = unsafeHeaders(headers);
       const preflight = !SIMPLE_METHODS.has(s.method) || unsafe.length > 0 || op.uploadListeners;
-      const options = { method: s.method, headers, body, signal: op.controller.signal,
-        credentials: credentials ? 'include' : 'same-origin', credentialsOrigin: origin };
+      const options = withRequestMetadata({ method: s.method, headers, body, signal: op.controller.signal,
+        credentials: credentials ? 'include' : 'same-origin', credentialsOrigin: origin }, {origin,mode:'cors'});
       if (isCross(s.url) && preflight) {
         const preflightHeaders = new Headers({ origin, 'access-control-request-method': s.method });
         if (unsafe.length) preflightHeaders.set('access-control-request-headers', unsafe.join(', '));
-        const response = await page.fetch(s.url, { method: 'OPTIONS', headers: preflightHeaders,
+        const response = await page.fetch(s.url, withRequestMetadata({ method: 'OPTIONS', headers: preflightHeaders,
           credentials: 'omit', signal: op.controller.signal,
-          onRedirect() { throw domError('CORS preflight redirects are unsupported', 'NetworkError'); } }, 'XHR');
+          onRedirect() { throw domError('CORS preflight redirects are unsupported', 'NetworkError'); } }, {origin,mode:'cors'}), 'XHR');
         if (!same(s, op) || op.done) return;
         if (!response.ok) throw domError('CORS preflight failed', 'NetworkError');
         corsResponse(response, origin, credentials);

@@ -1,0 +1,34 @@
+--- a/src/shared-workers.js
++++ b/src/shared-workers.js
+@@ -1,3 +1,5 @@
++import{createParentWorkerSockets}from'./worker-socket-transports.js';
++import{createParentEventSources}from'./worker-eventsource.js';
+ import vm from'node:vm';import{Worker as ThreadWorker,MessageChannel}from'node:worker_threads';import{createRequire}from'node:module';
+ import{captureWorkerCreator}from'./worker-apis.js';import{installMessaging}from'./messaging.js';import{resolveBlobURL}from'./blob-urls.js';import{createSharedWorkerHTTP}from'./shared-worker-http.js';import{broadcastConfig}from'./broadcast-config.js';import{createBroadcastRelay}from'./broadcast-realm.js';import{cacheStoreFor}from'./cache.js';import{workerSocketPolicy}from'./worker-socket-policy.js';import{completeWorkerSyncResponse,completeWorkerSocketPolicy}from'./worker-sync-transport.js';
+ import{registerPlatformFactory}from'./platform-factories.js';import{registerPlatformFactoryKind}from'./platform-factory-hooks.js';import{registerProtocolPrototype}from'./protocol-classes.js';
+@@ -9,18 +11,22 @@
+ function createActor(root,page,window,creator,url,name,type,enabled,messaging,onClosed,host){
+  let startupBlob;try{if(url.protocol==='blob:')startupBlob=resolveBlobURL(page,url.href)}catch{}
+  const blocked=!['http:','https:','blob:','data:'].includes(url.protocol)||url.protocol!=='data:'&&url.origin!==creator.origin||url.protocol==='blob:'&&!startupBlob,http=createSharedWorkerHTTP(root,page,{origin:creator.origin,url:url.href,blobSnapshot:startupBlob,blocked});
+- const requests=new Map(),pending=new Set(),relay=createBroadcastRelay(messaging,broadcastConfig(page,window));let thread,closed=false;
+- const actor=record({connect(port){if(closed){port.close();return}if(thread)thread.postMessage({kind:'sharedConnect',ports:[port]},[port]);else pending.add(port)},dispose(){if(closed)return;closed=true;onClosed?.();http.close();for(const controller of requests.values())controller.abort();requests.clear();for(const port of pending)port.close();pending.clear();relay.exit();thread?.close()}});
++ const requests=new Map(),pending=new Set(),relay=createBroadcastRelay(messaging,broadcastConfig(page,window));let thread,closed=false,socketTransports,eventSources;
++ const actor=record({connect(port){if(closed){port.close();return}if(thread)thread.postMessage({kind:'sharedConnect',ports:[port]},[port]);else pending.add(port)},dispose(){if(closed)return;closed=true;socketTransports?.detach();eventSources?.detach();onClosed?.();http.close();for(const controller of requests.values())controller.abort();requests.clear();for(const port of pending)port.close();pending.clear();relay.exit();thread?.close()}});
+  if(!enabled)return actor;
+  const controls=new MessageChannel();thread=controls.port1;
++ socketTransports=createParentWorkerSockets(page,{origin:'null',active:()=>!closed,send:message=>thread.postMessage(message)});
++ eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!closed,send:message=>thread.postMessage(message)});
+  const data={redPandaWorker:true,shared:true,url:url.href,origin:creator.origin,cacheOrigin:creator.origin,secure:creator.secure,type,name,cacheEnabled:Boolean(page.browser?.options.experimentalFeatures?.serviceworker),broadcast:broadcastConfig(page,window),navigator:{userAgentMetadata:page.userAgentMetadata,userAgent:window.navigator.userAgent,language:window.navigator.language,languages:[...window.navigator.languages],platform:window.navigator.platform}};
+  startHost(root,host).postMessage({kind:'createSharedRuntime',control:controls.port2,data},[controls.port2]);
+  thread.on('message',async message=>{
+   if(closed){for(const port of message.ports??[])port.close();return}
++  if(message.kind==='eventSourceOpen'||message.kind==='eventSourceClose'){eventSources.handle(message);return}
++  if(message.kind==='socketStart'||message.kind==='socketSend'||message.kind==='socketClose'||message.kind==='socketCloseDispatched'){socketTransports.handle(message);return}
+   if(message.kind==='broadcastRelay'){relay.accept(message);return}if(message.kind==='broadcastReady'){relay.ready(message.id);return}if(message.kind==='broadcastCancel'){relay.cancel(message.id);return}
+   if(message.kind==='close'){actor.dispose();return}if(message.kind==='cancel'){requests.get(message.id)?.abort();return}
+   if(message.kind==='error'){root.emit('sharedWorkerError',{url:url.href,error:message.error});return}if(message.kind==='console'){root.emit('console',{type:message.type,args:message.args});return}
+-  if(message.kind==='socketPolicy'){try{completeWorkerSocketPolicy(message.sync,await workerSocketPolicy(http,message.url))}catch(error){completeWorkerSocketPolicy(message.sync,null,error)}return}
++  if(message.kind==='socketPolicy'){try{completeWorkerSocketPolicy(message.sync,message.protocols!==undefined?socketTransports.create(message.url,message.protocols):await workerSocketPolicy(http,message.url))}catch(error){completeWorkerSocketPolicy(message.sync,null,error)}return}
+   if(message.kind==='cacheOperation'){try{const result=await cacheStoreFor(root).operate(creator.origin,message.operation,message.args);if(!closed)thread.postMessage({kind:'cacheResponse',id:message.id,result})}catch(error){if(!closed)thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}})}return}
+   if(message.kind==='request'){
+    const controller=new AbortController();requests.set(message.id,controller);try{const response=await http.fetch(message.url,{...message.init,signal:controller.signal},message.script),bytes=new Uint8Array(await response.arrayBuffer()),result={status:response.status,statusText:response.statusText,headers:[...response.headers],url:response.url||message.url,bytes};

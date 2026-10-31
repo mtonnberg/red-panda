@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import {Blob as NativeBlob} from 'node:buffer';
+const nativeBlobBytes=NativeBlob.prototype.arrayBuffer;
+const nativeBlobType=Object.getOwnPropertyDescriptor(NativeBlob.prototype,'type').get;
 
 // Pinned jsdom26 exposes immutable Blob/File bytes through its branded impl.
 // No Node object-URL store or host filesystem URLs are exposed to documents.
@@ -135,7 +138,10 @@ export function installBlobURLs(page, window) {
  * resolutions fail. Every call returns a fresh Uint8Array safe to transfer.
  */
 export function resolveBlobURL(page, input) {
-  const owner = current.get(page), url = parsed(input);
+  return resolveForOwner(current.get(page), input);
+}
+function resolveForOwner(owner, input) {
+  const url = parsed(input);
   if (!owner || !url || !active(owner)) throw new BlobURLFetchError();
   refreshOrigin(owner);
   const requestedURL = url.href;
@@ -147,4 +153,32 @@ export function resolveBlobURL(page, input) {
     throw new BlobURLFetchError();
   }
   return { bytes: Uint8Array.from(record.bytes), mimeType: record.mimeType, url: requestedURL };
+}
+
+/** Captured parent authority for one actual creator document. Worker private
+ * factory snapshots arrive through the genuine ThreadWorker cloning producer.
+ * Namespace ownership outlives the worker and ends with the actual document,
+ * matching retained frames and Native worker termination behavior.
+ */
+export function createWorkerBlobURLs(page, window) {
+  const owner=documents.get(window.document);
+  if(!owner)return null;
+  if(owner.page!==page||owner.context!==page.context)throw new TypeError('An actual creator object URL owner is required');
+  return {
+    async create(blob) {
+      if(!active(owner))throw new BlobURLFetchError();
+      const mimeType=Reflect.apply(nativeBlobType,blob,[]);
+      const bytes=Buffer.from(await Reflect.apply(nativeBlobBytes,blob,[]));
+      if(!active(owner))throw new BlobURLFetchError();
+      const origin=refreshOrigin(owner),url=`blob:${origin.serialized}/${randomUUID()}`;
+      owner.registry.set(url,{url,registry:owner.registry,owner,origin:origin.identity,bytes,mimeType});
+      owner.urls.add(url);return url;
+    },
+    revoke(value) {
+      const url=parsed(value);if(!url||!active(owner))return;
+      const origin=refreshOrigin(owner),record=owner.registry.get(url.href);
+      if(record&&record.origin===origin.identity)remove(record);
+    },
+    resolve(input){return resolveForOwner(owner,input);},
+  };
 }

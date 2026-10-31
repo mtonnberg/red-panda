@@ -1,3 +1,4 @@
+import {requestMetadataPolicy} from './request-metadata.js';
 import {installWindowEventSource} from './eventsource.js';
 import {installSelectControls} from './select-controls.js';
 import {installWindowWebSocket} from './window-websocket.js';
@@ -509,6 +510,7 @@ export class Page extends EventEmitter {
   }
 
   async fetch(input, init = {}, type = 'Fetch') {
+    const metadata = requestMetadataPolicy(init);
     const inputUrl = input instanceof Request ? input.url : String(input);
     let url = new URL(inputUrl, this.url).href;
     if (new URL(url).protocol === 'blob:') {
@@ -562,6 +564,7 @@ export class Page extends EventEmitter {
       // Privileged CDP headers override request/default/jar values, including
       // empty Cookie and credentials-omitted requests. Apply on every actual
       // hop so configured auth remains distinct from stripped authored auth.
+      metadata(headers, url);
       this.extraHTTPHeaders.forEach((value, name) => headers.set(name, value));
       // CLI headers retain final precedence over CDP and cookie defaults.
       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));

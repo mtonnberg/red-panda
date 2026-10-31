@@ -92,36 +92,43 @@ network/SameSite/permissions and real media processing remain bounded gaps.
 Frozen proposals and negative-before/positive-after allocation controls preserve
 actual observed differences. Presence of a proposal is not production support.
 
-The current checkpoint adds actual VM Event constructors, prototypes and functions;
-streamed EventSource parsing/reconnection, UTF-8 IDs, CORS and private worker
-transport control; and real Browser-wide WebSocket admission with parent-owned
-worker sockets. The default WebSocket limit is 8; `--ws-max-concurrent` accepts
-0..255. It also matches measured offline audio curve quantum and computed scalar
-state while reducing actual rendering cost. These build on the previous audio,
-image, IndexedDB, popup, Sanitizer, animation, Storage, select and DOM lifecycle work.
+The current checkpoint adds real SharedWorker VM actors and receiving-VM port/value
+allocation, private Shared SSE/WebSocket brokers and actual parked transport
+cleanup; genuine Response-backed WebAssembly streaming compilation; completed
+Worker document-XHR errors; generic request metadata, no-cors redirect taint and
+creator-owned dedicated Worker Blob URLs. It preserves the previous public Event
+realms, SSE, WebSocket admission, audio, image, IndexedDB, popup, Sanitizer,
+animation, Storage, select and DOM lifecycle work. No native C++ or dependency
+source changed in this batch.
 
-All 1,552 JavaScript tests, 84 PureScript Puppeteer checks, 13 native differential
+All 1,588 JavaScript tests, 87 PureScript Puppeteer checks, 13 native differential
 groups, syntax checks and strict/pedantic PureScript builds pass.
-[Validation](reference/phase19-integration/validation.json) records 9,275 unchanged
-declared inputs: 1,967 indexed source/reference inputs, 18 native build artifacts,
+[Validation](reference/phase20-integration/validation.json) records 9,382 unchanged
+declared inputs: 2,074 indexed source/reference inputs, 18 native build artifacts,
 6,579 Node dependency files, 689 cached reference inputs, one controller and 21
 unchanged preexisting reference files excluded from this commit.
-Paired native/candidate replays pass 24/24 with the declared profiles, and a
-separate 2/2 WebSocket replay passes with both binaries explicitly configured for
-50 concurrent connections. All use the original separate 2000ms load and
-2000/8000ms assertion budgets; 9,247 inputs remain unchanged. The 193 affected
-checks pass, and the 45 key feature checks pass across Node 24.19.0, 24.22.1 and
-26.13.0. These are bounded compatibility checks, not a performance benchmark.
+Paired native/candidate replays pass 27/27 with the declared profiles, plus a
+separate 2/2 WebSocket replay with both binaries explicitly configured for 50.
+The original 2000ms load and fresh 2000/8000ms assertion budgets remain separate;
+9,345 inputs are unchanged. The full-fetch replay remains NativePASS/candidateFAIL
+in module23 fetch_header_layers: real RedPanda client hints fail a literal
+Lightpanda identity expectation. Its two actual Runtime exceptions are retained.
+Absence of the older module25 diagnostic is not whole-fixture success.
 
-Earlier failed full epochs remain in
-[phase18 evidence](reference/phase18-integration/validation.json). The phase19
-preparation retains a real asynchronous test setup/cleanup race, corrected by
-awaiting owned fixture setup, plus a controller syntax error before tests ran.
-Neither is relabeled as a runtime pass. Public composedPath realm behavior and
-EventSource's inherited EventTarget symbol discrepancy remain explicit gaps.
-SharedWorker, broader networking/WASM/Blob, namespaces/Event parity,
-history/Navigation, editing, form and viewport proposals remain separate work.
-Presence of a proposal is not production support.
+The combined isolated 127 checks pass; the Root strict/87 Puppeteer pipeline and
+36 key checks each on Node 24.19.0 and 26.13.0 pass with 8,653 inputs unchanged.
+A separate Shared composition passes 17 checks on all three SDKs. These bounded
+controls do not establish full SharedWorker, network or performance equivalence.
+
+An additional actual utility-world comparison is a retained negative: Native
+exposes SharedWorker/MessageChannel/MessagePort and delivers a trusted shared
+worker reply, while this candidate exposes all three as undefined. Shared global
+constructor, symbols, cross-port ordering and API propagation remain partial.
+Worker Response/Blob/URL realms and broader CORS/cookie/referrer/transport profiles
+also remain incomplete. Public composedPath and EventTarget symbol differences
+remain. Later namespace/Event parity, history/Navigation, editing, form, viewport
+and owned-window proposals are separate work. Presence of a proposal is not
+production support. Earlier failed epochs remain in the phase18/19 evidence.
 
 The separate complete frozen candidate matrix at ee39586 records338 verified
 passes,98 assertion failures,18 source-load timeouts and one image-option startup
