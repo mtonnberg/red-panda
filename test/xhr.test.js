@@ -19,6 +19,7 @@ async function fixture(action, options = {}) {
       if (url.pathname === '/') return void res.end('<!doctype html><title>XHR fixture</title>');
       if (url.pathname === '/held-response') {
         const entry = requests[requests.length - 1];
+        entry.release = () => res.end('completed response');
         res.once('close', () => { entry.closedBeforeEnd = !res.writableEnded; });
         res.writeHead(200, { 'content-type': 'text/plain' }); res.write('actual pending bytes'); return;
       }
@@ -124,7 +125,25 @@ test('text, URLSearchParams, typed views, Blob, FormData and Document bodies pre
   const form = await echo(data); assert.match(form.headers['content-type'], /^multipart\/form-data; boundary=/);
   assert.match(form.body, /name="field"\r\n\r\nvalue/); assert.match(form.body, /filename="sample.txt"/); assert.match(form.body, /file body/);
   const doc = new window.DOMParser().parseFromString('<catalog><item/></catalog>', 'application/xml');
-  const xml = await echo(doc); assert.equal(xml.body, '<catalog><item/></catalog>'); assert.match(xml.headers['content-type'], /^application\/xml/);
+  const xml = await echo(doc); assert.equal(xml.body, '[object XMLDocument]'); assert.match(xml.headers['content-type'], /^text\/plain;charset=UTF-8$/i);
+}));
+
+test('Document bodies use Native string conversion without consulting XMLSerializer or contentType', async () => fixture(async ({ window, base }) => {
+  const xml = new window.DOMParser().parseFromString('<catalog><item/></catalog>', 'application/xml');
+  const html = new window.DOMParser().parseFromString('<p>body</p>', 'text/html');
+  assert.equal(new window.XMLSerializer().serializeToString(xml), '<catalog><item></item></catalog>');
+  let serializerReads = 0, contentTypeReads = 0, stringCalls = 0;
+  Object.defineProperty(window, 'XMLSerializer', { configurable: true, get() { serializerReads++; throw new Error('authored serializer'); } });
+  for (const doc of [xml, html]) Object.defineProperty(doc, 'contentType', { configurable: true, get() { contentTypeReads++; throw new Error('authored content type'); } });
+  const echo = async (body, expected) => {
+    const { xhr, outcome } = await send(window, `${base}/echo`, { method: 'POST', body, type: 'json' });
+    assert.equal(outcome, 'load'); assert.equal(xhr.response.body, expected);
+    assert.match(xhr.response.headers['content-type'], /^text\/plain;charset=UTF-8$/i);
+  };
+  await echo(xml, '[object XMLDocument]'); await echo(html, '[object HTMLDocument]');
+  xml.toString = () => { stringCalls++; return 'authored-document-body'; };
+  await echo(xml, 'authored-document-body');
+  assert.equal(serializerReads, 0); assert.equal(contentTypeReads, 0); assert.equal(stringCalls, 1);
 }));
 
 test('response values belong to the page realm, cache correctly, and remain usable after reopen', async () => fixture(async ({ browser, page, window, base }) => {
@@ -235,9 +254,22 @@ test('navigation and owned Page closure dispose XHR while main Window.close pres
   const pending = new nextWindow.XMLHttpRequest(); pending.onload = () => callbacks++; pending.onerror = () => callbacks++;
   pending.open('GET', `${base}/slow`); pending.timeout = 30; pending.send(); page.close(); await delay(150); assert.equal(callbacks, 0);
   const thirdPage = browser.createPage(); await thirdPage.navigate(base); const third = thirdPage.dom.window; installXHR(thirdPage, third);
-  const closedWindow = new third.XMLHttpRequest(); closedWindow.onload = () => callbacks++; closedWindow.onerror = () => callbacks++;
+  const completed = Promise.withResolvers();
+  const closedWindow = new third.XMLHttpRequest();
+  closedWindow.onload = closedWindow.onerror = () => { callbacks++; completed.resolve(); };
   const originalDocument = third.document;
-  closedWindow.open('GET', `${base}/slow`); closedWindow.send(); third.close(); await delay(150);
+  closedWindow.open('GET', `${base}/held-response`); closedWindow.send();
+  const arrivalDeadline = Date.now() + thirdPage.timeout;
+  while (requests.filter(entry => entry.path === '/held-response').length < 2 && Date.now() < arrivalDeadline) await delay(2);
+  const held = requests.filter(entry => entry.path === '/held-response'); assert.equal(held.length, 2);
+  third.close(); assert.equal(callbacks, 0);
+  held[1].release();
+  let completionTimer;
+  try {
+    await Promise.race([completed.promise, new Promise((_, reject) => {
+      completionTimer = setTimeout(() => reject(new Error('Window.close request did not complete')), thirdPage.timeout);
+    })]);
+  } finally { clearTimeout(completionTimer); }
   assert.equal(callbacks, 1); assert.equal(third.closed, false); assert.strictEqual(third.document, originalDocument);
   assert.equal(closedWindow.readyState, 4); assert.equal(closedWindow.status, 200);
 }));

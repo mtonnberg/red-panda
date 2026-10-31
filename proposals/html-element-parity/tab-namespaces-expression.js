@@ -1,0 +1,1 @@
+(()=>{const rows=[];for(const ns of[null,'urn:custom','http://www.w3.org/1999/xhtml'])for(const tag of['a','button','iframe','div']){const d=document.implementation.createDocument(ns,tag,null),e=d.documentElement;rows.push({ns,tag,value:e.tabIndex,HTMLElement:e instanceof HTMLElement})}return JSON.stringify(rows)})()

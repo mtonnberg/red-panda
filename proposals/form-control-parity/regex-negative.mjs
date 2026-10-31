@@ -1,0 +1,3 @@
+import{Browser}from'/workspace/shared/form-control-parity-20261031/src/browser.js';
+const browser=new Browser(),page=browser.createPage();
+try{await page.navigate('data:text/html,<body>Owned regex control');const input=page.dom.window.document.createElement('input');input.pattern='(a+)+';input.value='a'.repeat(40)+'b';console.log(JSON.stringify({phase:'entered-real-pattern-getter',pattern:input.pattern,value:input.value}));const start=performance.now(),mismatch=input.validity.patternMismatch;console.log(JSON.stringify({phase:'returned-real-pattern-getter',mismatch,ms:performance.now()-start}));}finally{browser.close();}

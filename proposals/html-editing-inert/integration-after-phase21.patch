@@ -1,0 +1,188 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installHTMLElementState} from './html-element-state.js';
+ import{readStylesheetResource}from'./stylesheet-decoder.js';
+ import {installHTMLReflections} from './html-reflections.js';
+ import {installFormControlParity} from './form-control-parity.js';
+@@ -263,6 +264,7 @@
+       installMutations(this, window);
+       if (main) implForWrapper(window.document).contentType = this.mimeType;
+       installCollections(window, { binding: this.browser.collectionsBinding });
++      installHTMLElementState(this,window);
+       installInput(window);
+       installShadowDOM(this, window);
+       installSerialization(this, window);
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installHTMLElementState} from './html-element-state.js';
+ import {installHTMLReflections} from './html-reflections.js';
+ import {installUtilityFormControlParity} from './form-control-parity.js';
+ import {installUtilityDocumentEditing} from './document-editing.js';
+@@ -47,7 +48,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLReflections(record.global,{context:record.context});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLElementState(page,record.global,{context:record.context,mainWindow:window});installHTMLReflections(record.global,{context:record.context});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/focus.js
++++ b/src/focus.js
+@@ -1,4 +1,5 @@
+ import {commitCommandControlEdit} from './document-editing-state.js';
++import {editingState,effectiveInert,setInertFocusUpdate} from './html-element-state.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -14,14 +15,7 @@
+ const originalFocusable = focusing.isFocusableAreaElement;
+ let patched = false;
+ 
+-function editing(element) {
+-  for (let current = element; current; current = current.parentElement) {
+-    const value = current.getAttribute('contenteditable')?.toLowerCase();
+-    if (value === 'false') return false;
+-    if (value === '' || value === 'true' || value === 'plaintext-only') return true;
+-  }
+-  return element?.ownerDocument?.designMode?.toLowerCase() === 'on';
+-}
++function editing(element) { return editingState(implForWrapper(element)); }
+ 
+ function editingHost(element) {
+   return editing(element) && !editing(element.parentElement);
+@@ -38,11 +32,12 @@
+   const window = element.ownerDocument?.defaultView;
+   if (!window || !element.isConnected) return false;
+   for (let current = element; current;) {
+-    if (current.hasAttribute('inert') || window.getComputedStyle(current).display === 'none') return false;
++    if (window.getComputedStyle(current).display === 'none') return false;
+     // A shadow host can hide or make its descendants inert even though it is
+     // outside their parentElement chain.
+     current = current.parentElement ?? current.getRootNode()?.host ?? null;
+   }
++  if (effectiveInert(implForWrapper(element))) return false;
+   return !isDisabled(implForWrapper(element)) && !(element.localName === 'input' && element.type === 'hidden');
+ }
+ 
+@@ -137,6 +132,7 @@
+     previous.leaf._ownerDocument.getSelection().empty();
+   }
+ }
++
+ 
+ function installProperties(window) {
+   const prototype = window.HTMLElement.prototype;
+@@ -164,6 +160,7 @@
+     configurable: true, enumerable: true, get() { return editing(this); },
+   });
+ }
++
+ 
+ export function installFocus(window) {
+   if (!window?.document) throw new TypeError('Focus requires a document window');
+@@ -224,6 +221,7 @@
+   }
+   DOCUMENTS.add(implForWrapper(window.document));
+   installProperties(window);
++  setInertFocusUpdate(implForWrapper(window.document),()=>{const focused=focusedChain(topDocument(implForWrapper(window.document))).leaf;if(focused&&effectiveInert(focused))blurElement(focused);});
+ }
+ 
+ function sequentialIndex(element) {
+--- a/src/selection.js
++++ b/src/selection.js
+@@ -1,3 +1,4 @@
++import {selectionInertText} from './html-element-state.js';
+ import 'jsdom';
+ import {createRequire} from 'node:module';
+ import {types} from 'node:util';
+@@ -29,6 +30,7 @@
+    return result;
+   };
+  }
++ const stringify=proto.toString;proto.toString=function(){return recordFor(this)?selectionInertText(this._range):stringify.call(this)};
+  const contains=proto.containsNode;
+  proto.containsNode=function(node,partial){
+   if(!recordFor(this)||!partial)return contains.call(this,node,partial);
+--- /dev/null
++++ b/src/html-element-state.js
+@@ -0,0 +1,63 @@
++// Host-owned HTML editing/inert state over canonical DOM implementations.
++import{createInvocationTrampoline}from'./invocation.js';
++import vm from'node:vm';import{createRequire}from'node:module';import{platformFactoryRecord}from'./platform-factories.js';import{captureDOMExceptionFactory}from'./worker-dom-exception.js';import{onFrameRetirement}from'./frame-activity.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),{domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation,HTMLElementImpl=require('jsdom/lib/jsdom/living/nodes/HTMLElement-impl.js').implementation;
++const Unknown=require('jsdom/lib/jsdom/living/generated/HTMLUnknownElement.js'),HTMLElement=require('jsdom/lib/jsdom/living/generated/HTMLElement.js');
++const HTML='http://www.w3.org/1999/xhtml',SVG='http://www.w3.org/2000/svg',realms=new WeakSet(),exceptions=new WeakMap(),documents=new WeakMap(),installed=new WeakSet(),apply=Reflect.apply;
++const description=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,lower=value=>value.replace(/[A-Z]/g,c=>c.toLowerCase());let patched=false;
++function owned(document){return realms.has(document?._globalObject)}
++export function editingState(element){
++ for(let current=element;current;current=tree.parent(current)){
++  if(current.nodeType!==1||current._namespaceURI===SVG)continue;const value=current.getAttributeNS(null,'contenteditable');if(value===null)continue;const state=lower(value);if(state==='false')return false;if(state===''||state==='true'||state==='plaintext-only')return true;
++ }
++ return false;
++}
++function flatParent(node){return node._assignedSlot??tree.parent(node)??node.host??null}
++export function effectiveInert(node){
++ for(let current=node;current;current=flatParent(current))if(current.nodeType===1&&current._namespaceURI===HTML&&current.hasAttributeNS(null,'inert'))return true;
++ return false;
++}
++export function setInertFocusUpdate(document,update){const record=documents.get(document);if(record)record.update=update}
++function schedule(document){const record=documents.get(document);if(!record||!record.active||record.frame!==null||!document._lastFocusedElement)return;record.frame=apply(record.request,record.window,[()=>{record.frame=null;if(record.active&&record.update)try{record.invocation.invoke(record.update,undefined,[],record.options)}catch(error){record.page?.emit('pageError',error)}}])}
++function patch(){
++ if(patched)return;patched=true;
++ // Select the actual generated interface before allocating any wrapper or Impl.
++ // All parser/clone/import/direct creation paths use this same factory.
++ const create=Unknown.createImpl;Unknown.createImpl=function(globalObject,args,data){if(owned(data?.ownerDocument)&&data.namespace===HTML&&data.localName==='search'&&data.ceState!=='failed')return HTMLElement.createImpl(globalObject,args,data);return apply(create,this,arguments)};
++ const modified=ElementImpl.prototype._attrModified;ElementImpl.prototype._attrModified=function(name,value,oldValue){const result=apply(modified,this,arguments);if(name==='inert'&&this._namespaceURI===HTML&&value!==oldValue)schedule(this._ownerDocument);return result};
++}
++export function installHTMLElementState(page,window,{context,mainWindow=window}={}){
++ context??=utils.implForWrapper(window.document)._globalObject;if(installed.has(context))return;installed.add(context);patch();
++ const document=utils.implForWrapper(mainWindow.document);realms.add(document._globalObject);realms.add(context);realms.add(window);
++ if(!documents.has(document)){
++  const record={page,invocation:createInvocationTrampoline(context),options:{timeout:Math.min(page?.timeout??10000,2000),displayErrors:false},window:mainWindow,request:mainWindow.requestAnimationFrame,cancel:mainWindow.cancelAnimationFrame,frame:null,active:true,update:null};documents.set(document,record);
++  const dispose=()=>{if(!record.active)return;record.active=false;if(record.frame!==null)apply(record.cancel,mainWindow,[record.frame]);record.frame=null};page?.documentAbort?.signal.addEventListener('abort',dispose,{once:true});onFrameRetirement(mainWindow,dispose);
++ }
++ const TypeError=vm.runInContext('TypeError',context),set=window.Element.prototype.setAttributeNS,remove=window.Element.prototype.removeAttributeNS;
++ const exception=captureDOMExceptionFactory(window),syntax=()=>exception('The string did not match the expected pattern','SyntaxError');exceptions.set(context,syntax);exceptions.set(window,syntax);
++ const state=value=>{const impl=platformFactoryRecord(value)?.implementation;if(!(impl instanceof HTMLElementImpl))throw new TypeError('Illegal invocation');return impl};
++ const bridge={
++  check(value){state(value)},symbol(value){return String(apply(description,value,[]))},
++  get(value,name){const impl=state(value);if(name==='inert')return impl.hasAttributeNS(null,'inert');if(name==='isContentEditable')return editingState(impl);const raw=impl.getAttributeNS(null,'contenteditable'),normalized=raw===null?'inherit':lower(raw);return normalized===''?'true':['true','false','plaintext-only'].includes(normalized)?normalized:'inherit'},
++  set(value,name,converted){const element=state(value);if(name==='inert'){if(converted)apply(set,value,[null,'inert','']);else apply(remove,value,[null,'inert']);return}const normalized=lower(converted);if(!['true','false','plaintext-only','inherit'].includes(normalized)){throw (exceptions.get(element._ownerDocument._globalObject)??syntax)()}if(normalized==='inherit')apply(remove,value,[null,'contenteditable']);else apply(set,value,[null,'contenteditable',normalized])},
++ };
++ for(const property of ['contentEditable','isContentEditable','inert']){
++  const setter=property==='isContentEditable'?'':`set ${property}(value){bridge.check(this);const converted=${property==='inert'?'!!value':"typeof value==='symbol'?bridge.symbol(value):`${value}`"};bridge.set(this,${JSON.stringify(property)},converted)}`;
++  const descriptor=vm.compileFunction(`return Object.getOwnPropertyDescriptor({get ${property}(){return bridge.get(this,${JSON.stringify(property)})},${setter}},${JSON.stringify(property)});`,['bridge'],{parsingContext:context})(bridge);
++  Object.defineProperty(window.HTMLElement.prototype,property,{...descriptor,configurable:true,enumerable:true});
++ }
++}
++export function selectionInertText(range){
++ if(!range)return '';const start=range._start,end=range._end;if(start.node===end.node&&start.node.nodeType===3)return effectiveInert(start.node)?'':start.node.data.slice(start.offset,end.offset);
++ let text='';for(const node of tree.treeIterator(range.commonAncestorContainer)){
++  if(node.nodeType!==3||effectiveInert(node))continue;
++  // Real selected boundaries, including partial UTF-16 text, determine the
++  // contribution; neither the live Range nor the DOM is cloned or modified.
++  if(node===start.node){text+=node.data.slice(start.offset);continue}if(node===end.node){text+=node.data.slice(0,end.offset);continue}
++  const parent=tree.parent(node),offset=tree.index(node);if(!parent)continue;
++  if(compareBoundary({node:parent,offset},start)>=0&&compareBoundary({node:parent,offset:offset+1},end)<=0)text+=node.data;
++ }
++ return text;
++}
++const{compareBoundaryPointsPosition:compareBoundary}=require('jsdom/lib/jsdom/living/range/boundary-point.js');
+--- /dev/null
++++ b/test/html-element-state.test.js
+@@ -0,0 +1,11 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{installHTMLElementState}from'../src/html-element-state.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++async function fixture(t,html='<body>'){const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,'+encodeURIComponent(html));t.after(()=>browser.close());return{browser,page,w:page.dom.window,d:page.dom.window.document}}
++const tick=w=>new Promise(resolve=>w.requestAnimationFrame(resolve));
++test('editing writes remove inherit, normalize actual attributes and preserve real reactions/Attr identity',async t=>{const{w,d}=await fixture(t);const calls=[];class Editor extends w.HTMLElement{static observedAttributes=['contenteditable'];attributeChangedCallback(...args){calls.push(args)}}w.customElements.define('owned-editor',Editor);const e=d.createElement('owned-editor'),records=[];new w.MutationObserver(batch=>records.push(...batch)).observe(e,{attributes:true,attributeOldValue:true});e.contentEditable='TRUE';const held=e.getAttributeNode('contenteditable');assert.equal(held.value,'true');e.contentEditable='FALSE';assert.equal(e.getAttributeNode('contenteditable'),held);assert.equal(held.value,'false');e.contentEditable='INHERIT';assert.equal(e.getAttributeNode('contenteditable'),null);assert.equal(held.ownerElement,null);assert.deepEqual(calls,[['contenteditable',null,'true',null],['contenteditable','true','false',null],['contenteditable','false',null,null]]);assert.equal(records.length,0);await Promise.resolve();assert.deepEqual(records.map(r=>r.oldValue),[null,'true','false']);e.contentEditable=Symbol('plaintext-only');assert.equal(e.contentEditable,'plaintext-only');for(const value of['',null,undefined,' true '])assert.throws(()=>e.contentEditable=value,error=>error instanceof w.DOMException&&error.name==='SyntaxError'&&error.message==='The string did not match the expected pattern');assert.equal(e.getAttribute('contenteditable'),'plaintext-only');assert.throws(()=>e.contentEditable=Object(Symbol('true')),e=>e instanceof w.TypeError);const constructor=Object.getOwnPropertyDescriptor(w.DOMException.prototype,'constructor');let invoked=0;try{Object.defineProperty(w.DOMException.prototype,'constructor',{get(){invoked++;throw Error('authored constructor')},configurable:true});assert.throws(()=>e.contentEditable='',error=>error instanceof w.DOMException&&error instanceof w.Error&&error.name==='SyntaxError'&&!Object.hasOwn(error,'stack'));assert.equal(invoked,0)}finally{Object.defineProperty(w.DOMException.prototype,'constructor',constructor)}});
++test('editing inherits actual DOM parents, ignores SVG state, stops at shadow boundaries and ignores designMode expandos',async t=>{const{w,d}=await fixture(t),outer=d.createElement('div'),svg=d.createElementNS('http://www.w3.org/2000/svg','svg'),child=d.createElement('span');svg.setAttribute('contenteditable','true');svg.append(child);outer.append(svg);d.body.append(outer);assert.equal(child.isContentEditable,false);outer.contentEditable='true';assert.equal(child.isContentEditable,true);outer.contentEditable='false';assert.equal(child.isContentEditable,false);const host=d.createElement('div');host.contentEditable='true';d.body.append(host);const shadow=host.attachShadow({mode:'open'}),inside=d.createElement('span'),slot=d.createElement('slot'),light=d.createElement('span');shadow.append(inside,slot);slot.contentEditable='false';host.append(light);assert.equal(inside.isContentEditable,false);assert.equal(light.isContentEditable,true);d.designMode='on';assert.equal(d.body.isContentEditable,false);assert.equal(d.createElement('div').isContentEditable,false);assert.equal(d.designMode,'on')});
++test('public state accessors reject copied/inherited/proxy receivers before conversion and survive genuine null prototypes',async t=>{const{w,d}=await fixture(t),e=d.createElement('div');for(const name of['contentEditable','isContentEditable','inert']){const desc=Object.getOwnPropertyDescriptor(w.HTMLElement.prototype,name);assert.equal(desc.get.name,'get '+name);assert.equal(desc.get.length,0);assert.ok(desc.get instanceof w.Function);let converted=0;for(const fake of[{},Object.create(e),Object.defineProperties({},Object.getOwnPropertyDescriptors(e)),new Proxy(e,{get(){throw Error('authored trap')}})]){assert.throws(()=>desc.get.call(fake),error=>error instanceof w.TypeError);if(desc.set)assert.throws(()=>desc.set.call(fake,{toString(){converted++;return 'true'}}),error=>error instanceof w.TypeError)}assert.equal(converted,0);const proto=Object.getPrototypeOf(e);try{Object.setPrototypeOf(e,null);if(desc.set)desc.set.call(e,name==='inert'?true:'true');assert.equal(desc.get.call(e),name==='contentEditable'?'true':true)}finally{Object.setPrototypeOf(e,proto)}}});
++test('search is allocated as a genuine HTMLElement through direct/parser/clone/import factories with unowned controls unchanged',async t=>{const{w,d}=await fixture(t,'<body><search id="parsed"></search>');const holder=d.createElement('div');holder.innerHTML='<search></search>';const xml=new w.DOMParser().parseFromString('<search xmlns="http://www.w3.org/1999/xhtml"/>','application/xml');for(const e of[d.createElement('SEARCH'),d.createElementNS('http://www.w3.org/1999/xhtml','search'),d.getElementById('parsed'),holder.firstChild,holder.firstChild.cloneNode(),xml.documentElement,d.importNode(xml.documentElement)]){assert.equal(e.constructor,w.HTMLElement);assert.equal(e instanceof w.HTMLUnknownElement,false);assert.equal(platformFactoryRecord(e).kind,'HTMLElement');assert.equal(e.localName,'search')}const plain=new JSDOM('<search></search>',{runScripts:'dangerously'});t.after(()=>plain.window.close());assert.equal(plain.window.document.createElement('search').constructor,plain.window.HTMLUnknownElement);assert.equal(plain.window.document.querySelector('search').constructor,plain.window.HTMLUnknownElement);assert.equal('inert' in plain.window.HTMLElement.prototype,false)});
++test('inert uses actual rendering callbacks, preserves prior-rAF order and emits genuine blur/focusout only if still inert',async t=>{const{w,d}=await fixture(t,'<body><button id="b">B</button>'),button=d.getElementById('b'),events=[];button.focus();for(const type of['blur','focusout'])button.addEventListener(type,event=>events.push([type,event.isTrusted,event.bubbles,event.relatedTarget]));let prior;w.requestAnimationFrame(()=>{prior=d.activeElement});button.setAttribute('inert','');assert.equal(d.activeElement,button);await Promise.resolve();assert.equal(d.activeElement,button);await tick(w);assert.equal(prior,button);assert.equal(d.activeElement,d.body);assert.deepEqual(events,[['blur',true,false,null],['focusout',true,true,null]]);button.inert=false;button.focus();events.length=0;button.inert=true;button.inert=false;await tick(w);assert.equal(d.activeElement,button);assert.equal(events.length,0)});
++test('inert focus and selected text use genuine flat slot/shadow ancestry while Range strings preserve selected UTF16 text',async t=>{const{w,d}=await fixture(t),host=d.createElement('div'),button=d.createElement('button');button.textContent='A😀BC';host.append(button);d.body.append(host);const shadow=host.attachShadow({mode:'open'}),slot=d.createElement('slot'),other=d.createElement('button');shadow.append(slot,other);slot.inert=true;button.focus();assert.equal(d.activeElement,d.body);const range=d.createRange();range.setStart(button.firstChild,1);range.setEnd(button.firstChild,4);const selection=w.getSelection();selection.addRange(range);assert.equal(String(range),'😀B');assert.equal(String(selection),'');slot.inert=false;assert.equal(String(selection),'😀B');other.focus();assert.equal(d.activeElement,host);assert.equal(shadow.activeElement,other);host.inert=true;await tick(w);assert.equal(d.activeElement,d.body);assert.equal(shadow.activeElement,null);selection.removeAllRanges();const wrapper=d.createElement('div');wrapper.innerHTML='<span>A</span><span inert>B</span><math inert><mi>C</mi></math><span>D</span>';d.body.append(wrapper);selection.selectAllChildren(wrapper);assert.equal(String(selection),'ACD');assert.equal(String(selection.getRangeAt(0)),'ABCD');assert.equal(wrapper.textContent,'ABCD')});
++test('utility accessors mutate canonical state using selected functions and real SyntaxError DOMExceptions',async t=>{const{page,w,d}=await fixture(t),world=createIsolatedWorld(w,{name:'editing-inert-state',signal:page.documentAbort.signal});t.after(()=>world.dispose());installHTMLElementState(page,world.global,{context:world.context,mainWindow:w});const node=world.evaluate('globalThis.node=document.createElement("search");node.contentEditable="TRUE";node.inert=true;node');assert.equal(canonicalUtilityValue(node).constructor,w.HTMLElement);assert.equal(canonicalUtilityValue(node).getAttribute('contenteditable'),'true');assert.equal(canonicalUtilityValue(node).getAttribute('inert'),'');assert.equal(world.evaluate('Object.getOwnPropertyDescriptor(HTMLElement.prototype,"contentEditable").get instanceof Function'),true);const error=world.evaluate('(()=>{try{node.contentEditable=""}catch(e){return e}})()');assert.ok(error instanceof w.DOMException);assert.equal(error.name,'SyntaxError');world.evaluate('node.contentEditable="inherit";node.inert=false');assert.equal(canonicalUtilityValue(node).hasAttribute('contenteditable'),false);assert.equal(canonicalUtilityValue(node).hasAttribute('inert'),false)});
++test('real interrupted string conversion leaves state unchanged and later inert scheduling and page disposal work',async t=>{const browser=new Browser({timeout:200}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><button id="b">B</button>');page.evaluate('globalThis.button=document.getElementById("b");button.contentEditable="false";button.focus()');assert.throws(()=>page.evaluate('button.contentEditable={toString(){try{while(true){}}finally{globalThis.badFinally=true}}}'),error=>error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT');assert.equal(page.evaluate('button.getAttribute("contenteditable")'),'false');assert.equal(page.evaluate('globalThis.badFinally'),undefined);page.evaluate('button.inert=true');await tick(page.dom.window);assert.equal(page.dom.window.document.activeElement,page.dom.window.document.body);page.evaluate('button.inert=false;button.contentEditable="true"');assert.equal(page.evaluate('button.contentEditable'),'true');page.close();assert.equal(page.closed,true)});

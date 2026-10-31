@@ -14,6 +14,7 @@ export class SyncHTTP {
  fetch(page,input,init={}){
   const metadata=requestMetadataPolicy(init);
   if(this.closed||this.error)throw this.error??Error('Synchronous transport is closed');
+  const resourceType=init.resourceType??'XHR',maxBodyBytes=init.maxBodyBytes??16*1024*1024;if(typeof resourceType!=='string'||!Number.isSafeInteger(maxBodyBytes)||maxBodyBytes<1||maxBodyBytes>16*1024*1024)throw TypeError('Invalid synchronous resource options');
   const owned=new Set(),op={complete:false,canceled:false,cancel:()=>{
    op.canceled=true;init.signal?.removeEventListener('abort',onAbort);
    for(const id of owned){page.activeRequests.delete(id);this.worker.postMessage({cancel:id})}
@@ -36,10 +37,10 @@ export class SyncHTTP {
     metadata(headers,url);
     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
     const id=randomUUID();owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
-    page.emit('request',{id,url,type:'XHR',method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+    page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
     checkpoint();
     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
-    this.worker.postMessage({id,url,init:{method,headers:[...headers],body},shared});
+    this.worker.postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
     const remaining=deadline-Date.now();
     if(remaining<=0||Atomics.wait(state,0,0,remaining)==='timed-out')throw Error('Synchronous HTTP request timed out');
     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
@@ -63,7 +64,7 @@ export class SyncHTTP {
     // Remove the captured id before entering arbitrary event callbacks. The
     // operation itself remains owned until those callbacks return normally.
     page.activeRequests.delete(id);
-    page.requestFinished(id,url,response.status,bytes.length,Object.fromEntries(response.headers),'XHR',init.frameId,init.loaderId);
+    page.requestFinished(id,url,response.status,bytes.length,Object.fromEntries(response.headers),resourceType,init.frameId,init.loaderId);
     owned.delete(id);op.complete=true;init.signal?.removeEventListener('abort',onAbort);this.operations.delete(op);return response;
    }
   }catch(error){

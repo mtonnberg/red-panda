@@ -1,0 +1,39 @@
+# External stylesheet source-load liveness
+
+This is an independent, unintegrated next-slice proposal against current Root. `integration-current.patch` changes seven runtime files and twelve test/helper files; `candidate/` contains the exact proposed leaves, `patch-base.json` pins their current Root bases, and `source-freeze.json` pins the executed composed scratch, native addons, Node, reference binary, dependencies, fixture and supporting inputs. `git apply --check` passed against Root without changing Root.
+
+## Actual defect and implementation
+
+The preserved original source-load timeout is CPU work after the real HTTP response, not an invented deadlock: diagnostic trace records 2,621,455 response bytes at 1833ms, followed by 4080.87ms parsing and construction of 104,858 rules. A partial scalar-cache optimization still timed out. Diagnostic wrappers (`trace-bootstrap.mjs` in the source manifest) only record genuine queue/parser/document transitions and are absent from the production launcher.
+
+The implementation retains every lexical rule and its real source index. Flat qualified-rule sheets keep private parsed records and instantiate each genuine mutable CSSStyleRule/CSSStyleDeclaration/CSSRuleList on demand, once per record. Matching uses actual selector results, mutable declaration revisions and source order; selector groups do not remove repeated rules. Public rule/list identity, mutation, deletion, insertion, replacement, parent pointers and retained computed declarations remain real. Bounded scalar declaration/lexical caches hold at most 256 keys each, keys at most 4096 code units, total keys at most 524288 code units per cache. Public mutable declarations and rules are never shared by these caches. Nested/at-rule or publicly inserted mixed sheets use the existing general path. Creating a nested child list on a published rule also returns to that path, which can still be expensive.
+
+Native controls establish that actual stylesheet append completes HTTP and parsing synchronously before append returns, while trusted load/error completion remains queued after authored microtasks. The Browser path therefore uses the existing genuine guarded SyncHTTP worker transport, with actual Stylesheet request types and a 4 MiB decompressed HTTP source-byte bound. This is before charset/UTF-8 normalization: invalid UTF-8 substitution and Latin-1 expansion above 4 MiB of normalized output still load; raw BOM overhead and UTF-16 wire bytes count toward the source bound. Original charset/BOM semantics remain, with a proof-equivalent redundant-decode fast path. Real data and owned Blob resources use their actual bytes and bookkeeping.
+
+Queue completion remains on the real document resource loader, with no forced readyState/load, module serialization barrier, endpoint-specific async choice, skipped body or fake response. An owned Host checkpoint restores nested queue/loader overlays and request state if V8 termination skips Host finally blocks. The real infinite-VM test verifies finally was skipped, overlays are restored exactly, transport operations/active IDs reach zero, unrelated timer execution survives, and a later real CSS request and page disposal succeed.
+
+## Evidence and epochs
+
+* `candidate-canonical-composed-{1,2,3}.json`: final current-Root-composed source, unchanged pinned upstream fixture/Native harness branch/default upstream profile, real source budgets 2000ms load plus 2000ms assertions. All pass; measured loads **726/689/597ms**, assertion phases **4/3/3ms**, no diagnostics or runtime exceptions. Canonical ports were released after real bind/listen/close checks.
+* Earlier exact production epoch `candidate-canonical-final-{1,2,3}.json` also passes at **652/629/542ms**. Preserve the contrary `candidate-canonical-final.json` source-load timeout (2492ms), original canonical timeout, intermediate trace timeouts, ephemeral origin mismatch, and pre-sync sheet-count mismatch. These are historical results, not final successes.
+* `native-size-rules.json` and `candidate-size-rules-composed.json`: all six actual value records match, including below/exact/above 4 MiB, chunked/gzip over-bound failures, all **104,858** real rules, independent mutable styles, stable rule/child identities and real computed display.
+* `native-encoding-caps.json` and `candidate-encoding-caps.json`: all four invalid-UTF8/Latin1/BOM/UTF16 physical byte controls match. This corrects the earlier unmeasured assumption that a normalized UTF-8 expansion should determine the cap.
+* `native-dependencies.json`, `native-dependencies-v2.json`, and candidate dependency reports preserve actual classic/module/microtask/DCL/load ordering and unrelated top-level-await independence. Same href really refetches; failed href retains the existing sheet and switching back retains sheet identity. No speculative URL cache is added.
+* `focused-full-slice-v1.log`: **126/128** at the old prerequisite epoch. The two old non-CSS failures were main Window.close cancellation and inactive frame cleanup. Current Root already fixed those using measured Native ordinary-window close semantics and owned navigation disposal; this proposal does not include those fixes.
+* `focused-rebased-v1.log`: **5/5**, including both formerly failing cases on current Root prerequisites, real synchronous HTTP, V8 interruption and declaration recovery. `focused-six-composed.log`: **6/6** new domain tests on the final composed graph. Earlier seven stylesheet-loading assertions passed unchanged with actual HTTP in an owned server thread. No broad/heap/PureScript suite was run for this slice; Root owns final composed validation.
+
+## Test profiles and bounds
+
+Full Browser stylesheet fixture servers must run outside the Browser's blocking JS thread. Existing seven stylesheet-loading tests and parser-write resources now use actual worker-owned HTTP servers. Document-reset and retained-frame CSS tests were changed to assert Native-measured synchronous sheet visibility and retained real sheet data; `native-retired-style.json` proves old-document sheet count remains one with no late load/error. Assertions about parser tail ordering, resource cancellation, live identities and later operations remain meaningful. Direct JSDOM embedding/unit profiles without a Browser/SyncHTTP backend retain the existing asynchronous resource loader and are explicitly documented. No production origin/endpoint string selects a fake async route.
+
+This is a bounded CSS loading/flat-sheet performance change, not renderer or broad performance parity. General complex/nested sheets still use the existing implementation. Existing CSSOM public creation-context/reflection differences are not solved here. Browser requests to an HTTP server on the same blocked JS thread cannot make progress by design; production and full Browser tests require a real independently serviced endpoint. Broad media, rendering and other source-load timeout causes are outside this patch. The source-load timings above are measurements on this machine, not a universal deadline guarantee.
+
+## Reproduction
+
+Use the prepared Node recorded in `source-freeze.json`; native addons require the pinned matching Node version. Run in the frozen scratch:
+
+```sh
+/workspace/shared/rea-tools/node_modules/node/bin/node --experimental-vm-modules --test --test-concurrency=1 test/css-source-liveness.test.js
+```
+
+Canonical scripts `run-canonical-final.py` and `run-canonical-composed.py` record the exact source-load commands; reserve 9582/9584 before replay. Native/control drivers take binary and a new output JSON path, refuse overwriting existing evidence, and own their HTTP/browser processes. `dependencies-probe-v1.mjs` is retained because its driver epoch predates the later cache control. Final source checks and value/order comparisons are recorded in `final-verification.json`.

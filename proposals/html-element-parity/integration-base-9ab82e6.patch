@@ -1,0 +1,123 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installHTMLReflections} from './html-reflections.js';
+ import {installWindowEventSource} from './eventsource.js';
+ import {installSelectControls} from './select-controls.js';
+ import {installWindowWebSocket} from './window-websocket.js';
+@@ -293,6 +294,7 @@
+       installDialogs(this, window);
+       installForms(this, window);
+       installDocumentXML(this, window);
++      installHTMLReflections(window);
+       installConsole(window,{emit:(type,args)=>this.emit('console',{type,args})});
+       installCustomElements(this, window);
+       this.moduleScripts = installModuleScripts(this, window);
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installHTMLReflections} from './html-reflections.js';
+ import {installWindowEventSource} from './eventsource.js';
+ import {installWindowWebSocket} from './window-websocket.js';
+ import {installPaymentRequest} from './payment-request.js';
+@@ -42,7 +43,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installHTMLReflections(record.global,{context:record.context});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- /dev/null
++++ b/src/html-reflections.js
+@@ -0,0 +1,50 @@
++// Native-profile HTML IDL reflection over real attributes. State and policy
++// stay in Host records; only the actual public accessors live in the VM.
++import vm from'node:vm';import{createRequire}from'node:module';import{platformFactoryRecord}from'./platform-factories.js';import{implementationForWrapper}from'./dom-event-state.js';
++const require=createRequire(import.meta.url),installed=new WeakSet(),apply=Reflect.apply;
++const implementation=name=>require('jsdom/lib/jsdom/living/nodes/'+name+'-impl.js').implementation;
++const HTML='http://www.w3.org/1999/xhtml',defaultTabTags=new Set(['a','area','button','input','select','textarea','iframe']);
++const symbolDescription=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,wellFormed=String.prototype.toWellFormed;
++const lower=value=>value.replace(/[A-Z]/g,c=>c.toLowerCase());
++function integer(raw,fallback,signed){
++ if(raw===null)return fallback;let i=0;while(i<raw.length){const code=raw.charCodeAt(i);if(code!==9&&code!==10&&code!==12&&code!==13&&code!==32)break;i++;}
++ let negative=false;if(raw[i]==='+'||raw[i]==='-')negative=raw[i++]==='-';const start=i,limit=signed&&negative?2147483648:2147483647;let value=0;
++ for(;i<raw.length;i++){const digit=raw.charCodeAt(i)-48;if(digit<0||digit>9)break;if(value>(limit-digit)/10)return fallback;value=value*10+digit;}
++ if(i===start||!signed&&negative&&value!==0)return fallback;
++ return value===0?0:negative?-value:value;
++}
++function uint32(value){if(!Number.isFinite(value)||value===0)return 0;const residue=Math.trunc(value)%4294967296;return residue<0?residue+4294967296:residue;}
++function number(value,signed,fallback){const unsigned=uint32(value);return signed?(unsigned>=2147483648?unsigned-4294967296:unsigned):unsigned<=2147483647?unsigned:fallback;}
++const specifications=[
++ ['HTMLElement','tabIndex','tabindex','signed',null],
++ ['HTMLOListElement','start','start','signed',1],
++ ['HTMLOListElement','type','type','string','1'],
++ ['HTMLSourceElement','width','width','unsigned',0],
++ ['HTMLSourceElement','height','height','unsigned',0],
++ ['HTMLMarqueeElement','hspace','hspace','unsigned',0],
++ ['HTMLMarqueeElement','vspace','vspace','unsigned',0],
++ ['HTMLMarqueeElement','scrollAmount','scrollamount','unsigned',6],
++ ['HTMLMarqueeElement','scrollDelay','scrolldelay','unsigned',85],
++ ['HTMLMarqueeElement','behavior','behavior','enum','scroll',new Set(['scroll','slide','alternate'])],
++ ['HTMLMarqueeElement','direction','direction','enum','left',new Set(['left','right','up','down'])],
++ ['HTMLAreaElement','download','download','string',''],
++ ['HTMLAreaElement','referrerPolicy','referrerpolicy','enum','',new Set(['','no-referrer','no-referrer-when-downgrade','origin','origin-when-cross-origin','same-origin','strict-origin','strict-origin-when-cross-origin','unsafe-url'])],
++];
++export function installHTMLReflections(window,{context}={}){
++ context??=implementationForWrapper(window.document)._globalObject;if(installed.has(context))return;installed.add(context);
++ const TypeError=vm.runInContext('TypeError',context),setAttributeNS=window.Element.prototype.setAttributeNS;
++ for(const[kind,property,attribute,type,defaultValue,keywords]of specifications){
++  const Impl=implementation(kind),fallback=element=>defaultValue===null?(element._namespaceURI===HTML&&defaultTabTags.has(element._localName)?0:-1):defaultValue;
++  const state=value=>{const element=platformFactoryRecord(value)?.implementation;if(!(element instanceof Impl))throw new TypeError('Illegal invocation');return element;};
++  const bridge={
++   check(value){state(value)},
++   get(value){const element=state(value),raw=element.getAttributeNS(null,attribute),missing=fallback(element);if(type==='signed'||type==='unsigned')return integer(raw,missing,type==='signed');if(type==='string')return raw===null?missing:raw;const normalized=raw===null?'':lower(raw);return keywords.has(normalized)?normalized:missing;},
++   bigint(value){const converted=BigInt.asUintN(64,value);if(converted>4294967295n)throw new TypeError('BigInt does not fit an unsigned long');return Number(converted)},
++   symbol(value){return String(apply(symbolDescription,value,[]))},
++   set(value,converted){const element=state(value),text=type==='signed'||type==='unsigned'?String(number(converted,type==='signed',fallback(element))):apply(wellFormed,converted,[]);return apply(setAttributeNS,value,[null,attribute,text]);},
++  };
++  const convert=type==='signed'?'+value':type==='unsigned'?"typeof value==='bigint'?bridge.bigint(value):+value":"typeof value==='symbol'?bridge.symbol(value):`${value}`";
++  const descriptor=vm.compileFunction(`return Object.getOwnPropertyDescriptor({get ${property}(){return bridge.get(this)},set ${property}(value){bridge.check(this);const converted=${convert};bridge.set(this,converted)}},${JSON.stringify(property)});`,['bridge'],{parsingContext:context})(bridge);
++  Object.defineProperty(window[kind].prototype,property,{...descriptor,enumerable:true,configurable:true});
++ }
++}
+--- /dev/null
++++ b/test/html-reflections.test.js
+@@ -0,0 +1,36 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';import{installHTMLReflections}from'../src/html-reflections.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';
++function fixture(t){const dom=new JSDOM('<!doctype html><body>',{runScripts:'dangerously',beforeParse:w=>installHTMLReflections(w)});t.after(()=>dom.window.close());return dom.window;}
++test('integer getters parse actual attribute prefixes with ASCII whitespace, int32 bounds and element defaults',t=>{
++ const w=fixture(t),d=w.document;
++ for(const[tag,property,attribute,fallback]of[['div','tabIndex','tabindex',-1],['input','tabIndex','tabindex',0],['ol','start','start',1],['source','width','width',0],['marquee','scrollAmount','scrollamount',6],['marquee','scrollDelay','scrolldelay',85]]){const e=d.createElement(tag);assert.equal(e[property],fallback);assert.equal(e.hasAttribute(attribute),false);for(const value of['','foo','\v7','\u00a07','2147483648']){e.setAttribute(attribute,value);assert.equal(e[property],fallback);assert.equal(e.getAttribute(attribute),value)}for(const[value,expected]of[[' \t7px',7],['1.5',1],['1e3',1],['0x10',0],['+4',4],['-0',0],['2147483647',2147483647]]){e.setAttribute(attribute,value);assert.equal(e[property],expected)}}
++ const ol=d.createElement('ol');ol.setAttribute('start','-2147483648x');assert.equal(ol.start,-2147483648);ol.setAttribute('start','-2147483649');assert.equal(ol.start,1);for(const tag of['frame','object','summary'])assert.equal(d.createElement(tag).tabIndex,-1);const details=d.createElement('details'),summary=details.appendChild(d.createElement('summary'));assert.equal(summary.tabIndex,-1);
++});
++test('numeric IDL writes use actual uint32 wrapping, measured defaults and primitive BigInt uint64 conversion',t=>{
++ const w=fixture(t),d=w.document,s=d.createElement('source'),m=d.createElement('marquee');for(const[e,property,attribute,fallback]of[[s,'width','width',0],[s,'height','height',0],[m,'hspace','hspace',0],[m,'vspace','vspace',0],[m,'scrollAmount','scrollamount',6],[m,'scrollDelay','scrolldelay',85]]){
++  for(const[value,expected]of[[-1,fallback],[1.5,1],[2147483648,fallback],[4294967296,0],[NaN,0],[Infinity,0],[1n,1],[1n<<64n,0],[(1n<<64n)+7n,7],[-(1n<<65n)+7n,7]]){e[property]=value;assert.equal(e[property],expected);assert.equal(e.getAttribute(attribute),String(expected))}
++  e.setAttribute(attribute,'41');for(const value of[-1n,4294967296n,(1n<<64n)-1n,Object(1n),{valueOf(){return 1n}},Symbol('7')]){assert.throws(()=>e[property]=value,error=>error instanceof w.TypeError);assert.equal(e.getAttribute(attribute),'41')}
++ }
++ const e=d.createElement('div');e.tabIndex=4294967295;assert.equal(e.tabIndex,-1);assert.equal(e.getAttribute('tabindex'),'-1');assert.throws(()=>e.tabIndex=1n,error=>error instanceof w.TypeError);
++});
++test('string and enum reflection preserves real raw Attr identity while computing live canonical values',t=>{
++ const w=fixture(t),d=w.document,m=d.createElement('marquee'),ol=d.createElement('ol'),a=d.createElement('area');assert.equal(ol.type,'1');ol.type='';assert.equal(ol.type,'');ol.type='unexpected';assert.equal(ol.type,'unexpected');ol.type=Symbol('A');assert.equal(ol.getAttribute('type'),'A');
++ m.direction='UP';const held=m.getAttributeNode('direction');assert.equal(held.value,'UP');assert.equal(m.direction,'up');held.value='sideways';assert.equal(m.direction,'left');m.direction='RIGHT';assert.equal(m.getAttributeNode('direction'),held);assert.equal(m.direction,'right');assert.equal(held.value,'RIGHT');m.behavior='ALTERNATE';assert.equal(m.behavior,'alternate');assert.equal(m.getAttribute('behavior'),'ALTERNATE');m.behavior=null;assert.equal(m.behavior,'scroll');assert.equal(m.getAttribute('behavior'),'null');
++ assert.equal(a.download,'');assert.equal(a.hasAttribute('download'),false);a.setAttribute('download','pic');assert.equal(a.download,'pic');a.download='file.png';assert.equal(a.getAttribute('download'),'file.png');a.download=Symbol('name');assert.equal(a.getAttribute('download'),'name');a.referrerPolicy='ORIGIN';assert.equal(a.referrerPolicy,'origin');assert.equal(a.getAttribute('referrerpolicy'),'ORIGIN');a.setAttribute('referrerpolicy','bad');assert.equal(a.referrerPolicy,'');a.referrerPolicy=Symbol();assert.equal(a.getAttribute('referrerpolicy'),'undefined');assert.throws(()=>a.referrerPolicy=Object(Symbol('up')),error=>error instanceof w.TypeError);
++});
++test('real descriptor brands reject copied and inherited nodes before authored conversion and preserve access after null prototype',t=>{
++ const w=fixture(t),s=w.document.createElement('source'),descriptor=Object.getOwnPropertyDescriptor(w.HTMLSourceElement.prototype,'width');assert.equal(descriptor.get.name,'get width');assert.equal(descriptor.set.name,'set width');assert.equal(descriptor.get.length,0);assert.equal(descriptor.set.length,1);assert.equal(descriptor.enumerable,true);assert.equal(descriptor.configurable,true);assert.ok(descriptor.get instanceof w.Function);assert.ok(descriptor.set instanceof w.Function);let reads=0;const value={valueOf(){reads++;return 7}};
++ for(const fake of[{},Object.create(s),Object.defineProperties({},Object.getOwnPropertyDescriptors(s))]){assert.throws(()=>descriptor.get.call(fake),error=>error instanceof w.TypeError);assert.throws(()=>descriptor.set.call(fake,value),error=>error instanceof w.TypeError)}assert.equal(reads,0);
++ const prototype=Object.getPrototypeOf(s);try{Object.setPrototypeOf(s,null);descriptor.set.call(s,value);assert.equal(descriptor.get.call(s),7)}finally{Object.setPrototypeOf(s,prototype)}assert.equal(reads,1);assert.equal(s.getAttribute('width'),'7');
++});
++test('native reflection writes preserve actual synchronous custom-element reactions and deferred MutationObserver records',async t=>{
++ const w=fixture(t),d=w.document,calls=[];class Reflected extends w.HTMLElement{static observedAttributes=['tabindex'];attributeChangedCallback(name,oldValue,newValue){calls.push([name,oldValue,newValue])}}w.customElements.define('reflection-owner',Reflected);const e=d.createElement('reflection-owner'),records=[];new w.MutationObserver(batch=>records.push(...batch)).observe(e,{attributes:true,attributeOldValue:true});e.tabIndex=7;const held=e.getAttributeNode('tabindex');assert.deepEqual(calls,[['tabindex',null,'7']]);assert.equal(records.length,0);e.tabIndex=-2;assert.equal(held.value,'-2');assert.equal(e.getAttributeNode('tabindex'),held);assert.deepEqual(calls,[['tabindex',null,'7'],['tabindex','7','-2']]);await Promise.resolve();assert.deepEqual(records.map(r=>[r.attributeName,r.oldValue]),[['tabindex',null],['tabindex','7']]);
++});
++test('plain unowned jsdom preserves its original reflection paths and missing properties',t=>{
++ const dom=new JSDOM('<body>',{runScripts:'dangerously'});t.after(()=>dom.window.close());const d=dom.window.document,e=d.createElement('div');e.setAttribute('tabindex','7px');assert.equal(e.tabIndex,0);assert.equal(d.createElement('source').width,undefined);assert.equal(d.createElement('marquee').scrollAmount,0);assert.equal(d.createElement('ol').type,'');assert.equal(d.createElement('area').referrerPolicy,undefined);
++});
++test('utility accessors retain their actual VM functions while mutating canonical shared DOM state',async t=>{
++ const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<body>');const world=createIsolatedWorld(page.dom.window,{name:'html-reflection-control',signal:page.documentAbort.signal});installHTMLReflections(world.global,{context:world.context});t.after(()=>{world.dispose();browser.close()});const source=world.evaluate('globalThis.source=document.createElement("source");source.width=7n;source');assert.equal(canonicalUtilityValue(source).getAttribute('width'),'7');assert.equal(world.evaluate('source.width'),7);assert.equal(world.evaluate('Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype,"width").get instanceof Function'),true);assert.equal(world.evaluate('(()=>{try{Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype,"width").set.call({},1)}catch(e){return e instanceof TypeError}})()'),true);
++});
++test('actual VM interruption during numeric conversion leaves the attribute unchanged and permits later real operations',async t=>{
++ const browser=new Browser({timeout:250}),page=browser.createPage();await page.navigate('data:text/html,<body>');t.after(()=>browser.close());page.evaluate('globalThis.source=document.createElement("source");source.width=41;setTimeout(()=>{globalThis.reflectionTimer=1},20)');assert.throws(()=>page.evaluate('source.width={valueOf(){try{while(true){}}finally{globalThis.reflectionFinally=true}}}'),error=>error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT');await new Promise(resolve=>setTimeout(resolve,30));assert.equal(page.evaluate('source.getAttribute("width")'),'41');assert.equal(page.evaluate('globalThis.reflectionFinally'),undefined);assert.equal(page.evaluate('reflectionTimer'),1);assert.equal(page.evaluate('source.width=7;source.width'),7);assert.equal(page.evaluate('source.getAttribute("width")'),'7');page.close();assert.equal(page.closed,true);
++});

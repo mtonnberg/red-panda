@@ -1,0 +1,104 @@
+--- /dev/null
++++ b/src/control-interface-realms.js
+@@ -0,0 +1,51 @@
++// Execute only the original public generated interface installation in its
++// owning Node VM. Canonical factories, setup, conversions and backends remain
++// the original Host graph; no VM factory/controller is retained.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {createHash} from 'node:crypto';
++import {readFileSync} from 'node:fs';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const fingerprints=Object.freeze({HTMLInputElement:'3cc1581ce8543184fb3f611b3f731e43571f1fb3dd0be5565190af74ac141d85',ValidityState:'e51af4b3331c3dba269f595d3f075621dcda0ee1a9ed607543bac927cc0e1933'});
++const bindings=Object.freeze({
++ HTMLInputElement:['exports','conversions','utils','HTMLConstructor_helpers_html_constructor','SelectionMode','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','FileList','parseNonNegativeInteger_helpers_strings','create_DOMException','serializeURLwhatwg_url','implSymbol','ctorRegistrySymbol','HTMLElement','interfaceName','exposed','Impl'],
++ ValidityState:['exports','conversions','utils','implSymbol','ctorRegistrySymbol','interfaceName','exposed','Impl']
++});
++export function assertControlInterfaceSource(source,kind){
++ if(require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(source).digest('hex')!==fingerprints[kind])throw new Error('Pinned generated control interface source changed: '+kind);
++}
++export function installControlInterface(globalObject,globalNames,original,body,names,values,filename){
++ const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
++ // A genuine non-scriptable JSDOM belongs to Host. Its original installer is
++ // correct, and no new context is synthesized for that case.
++ if(!context||!vm.isContext(context))return Reflect.apply(original,undefined,[globalObject,globalNames]);
++ // The entry is temporary. Only the actual public class/prototype/members
++ // created by the unchanged body survive; dependency records stay Host-owned.
++ return vm.compileFunction('"use strict";\n'+body,['globalObject','globalNames',...names],{parsingContext:context,filename})(globalObject,globalNames,...values);
++}
++function installationParts(source,kind){
++ const names=bindings[kind];if(!names)throw new Error('Unsupported generated control interface: '+kind);
++ const signature='exports.install = (globalObject, globalNames) => {\n',start=source.indexOf(signature),footer='};\n\nconst Impl = require(',end=source.lastIndexOf(footer);
++ if(start<0||source.split(signature).length!==2||end<start||!source.slice(end).trimEnd().endsWith(');'))throw new Error('Unexpected generated control interface installation: '+kind);
++ return {names,body:source.slice(start+signature.length,end),footer:source.slice(end+4)};
++}
++function adapterExpression(body,names){
++ return '(globalObject, globalNames) => installControlInterface(globalObject, globalNames, originalControlInterfaceInstall, '+JSON.stringify(body)+', '+JSON.stringify(names)+', ['+names.join(', ')+'], __filename)';
++}
++export function transformControlInterfaceInstall(source,kind){
++ const {names,body}=installationParts(source,kind);
++ // Appended after Impl initializes: no changed module cycle or TDZ access.
++ return source+'\nconst originalControlInterfaceInstall = exports.install;\nexports.install = '+adapterExpression(body,names)+';\n';
++}
++let installed=false;
++export function installValidityStateInterfaceRealm(){
++ if(installed)return;installed=true;
++ const filename=require.resolve('jsdom/lib/jsdom/living/generated/ValidityState.js'),factory=require(filename),source=readFileSync(filename,'utf8');
++ assertControlInterfaceSource(source,'ValidityState');
++ const {names,body,footer}=installationParts(source,'ValidityState'),headerEnd=source.indexOf('exports.is = '),exposure='const exposed = new Set(["Window"]);';
++ if(headerEnd<0||source.split(exposure).length!==2)throw new Error('Unexpected generated ValidityState lexical dependencies');
++ // Compile only the original lexical declarations and installer adapter in
++ // Host. All existing canonical setup/new/create/is functions stay identical.
++ const adapter=source.slice(0,headerEnd)+exposure+'\n'+footer+'\nreturn '+adapterExpression(body,names)+';';
++ factory.install=vm.compileFunction(adapter,['exports','require','__filename','installControlInterface','originalControlInterfaceInstall'],{filename})(factory,createRequire(filename),filename,installControlInterface,factory.install);
++}
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {assertControlInterfaceSource,installControlInterface,transformControlInterfaceInstall,installValidityStateInterfaceRealm} from './control-interface-realms.js';
+ import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+ import {transformPrivateEventSource} from './dom-event-state.js';
+ import {registerDOMAllocationKind,registerDOMAllocationRealm,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
+@@ -95,6 +96,7 @@
+    if(source.split(expression).length!==2)throw new Error('Unexpected generated form.elements getter');
+    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
+   }
++  if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
+   if(event)source=transformPrivateEventSource(source,kind);
+   if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
+   candidates.push({factory,kind,full,originalSource,source});
+@@ -103,9 +105,10 @@
+  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
+  for(const {factory,kind,full,source} of candidates){
+   const module={exports:factory};
+-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm);
++  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm','installControlInterface'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm,installControlInterface);
+   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
+   const setup=factory.setup;
+   factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};
+  }
++ installValidityStateInterfaceRealm();
+ }
+--- /dev/null
++++ b/test/control-interface-realms.test.js
+@@ -0,0 +1,20 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {createRequire} from 'node:module';
++import {readFileSync} from 'node:fs';
++import {JSDOM} from 'jsdom';
++import {Browser} from '../src/browser.js';
++import {getHeapBinding} from '../src/native-heap.js';
++import {createIsolatedWorld,canonicalUtilityValue} from '../src/isolated-world.js';
++import {installUtilityFormControlParity} from '../src/form-control-parity.js';
++import {platformFactoryRecord} from '../src/platform-factories.js';
++import {assertControlInterfaceSource} from '../src/control-interface-realms.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),binding=getHeapBinding();
++function actualRealm(value,anchor,expected=true){const old=Object.getPrototypeOf(value);try{for(let n=0;n<2;n++){assert.equal(binding.sameRealm(value,anchor),expected);assert.equal(binding.sameRealm(value,[]),!expected);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><input id=i value=actual required><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('canonical public Input and ValidityState interfaces are created in their original owning VM',async t=>{const factory=require('jsdom/lib/jsdom/living/generated/HTMLInputElement.js'),stateFactory=require('jsdom/lib/jsdom/living/generated/ValidityState.js'),setup=factory.setup,stateSetup=stateFactory.setup;const{w}=await fixture(t),a=w.eval('[]');assert.equal(factory.setup,setup);assert.equal(stateFactory.setup,stateSetup);for(const value of[w.HTMLInputElement,w.HTMLInputElement.prototype,w.HTMLInputElement.prototype.stepUp,Object.getOwnPropertyDescriptor(w.HTMLInputElement.prototype,'files').get,w.ValidityState,w.ValidityState.prototype,Object.getOwnPropertyDescriptor(w.ValidityState.prototype,'valid').get])actualRealm(value,a);assert.equal(w.HTMLInputElement.prototype.constructor,w.HTMLInputElement);assert.equal(w.ValidityState.prototype.constructor,w.ValidityState);assert.equal(w.HTMLInputElement.prototype.stepUp.name,'stepUp');assert.equal(w.HTMLInputElement.prototype.stepUp.length,0);for(const C of[w.HTMLInputElement,w.ValidityState])assert.throws(()=>C(),e=>e instanceof w.TypeError);});
++test('real setup/backend and cached live ValidityState identity survive cloning and frame adoption',async t=>{const{w}=await fixture(t),i=w.document.getElementById('i'),state=i.validity,impl=utils.implForWrapper(i),child=w.document.querySelector('iframe').contentWindow;assert.equal(state,i.validity);assert.equal(state.valid,true);i.value='';assert.equal(state.valueMissing,true);assert.equal(platformFactoryRecord(i).implementation,impl);assert.equal(utils.wrapperForImpl(impl),i);assert.equal(w.document.adoptNode(child.document.createElement('input')).ownerDocument,w.document);assert.equal(child.document.adoptNode(i),i);assert.equal(i.ownerDocument,child.document);assert.equal(utils.implForWrapper(i),impl);assert.equal(i.validity,state);assert.equal(Object.getPrototypeOf(i),w.HTMLInputElement.prototype);actualRealm(i,w.eval('[]'));actualRealm(state,w.eval('[]'));const clone=i.cloneNode();assert.notEqual(clone,i);assert.equal(clone.value,'');assert.notEqual(clone.validity,state);const result=w.eval(`(()=>{let calls=0;class Actual extends HTMLInputElement{constructor(){super();calls++;this.actual='owned'}}customElements.define('owned-control-input',Actual,{extends:'input'});const created=document.createElement('input',{is:'owned-control-input'});created.value='abc';created.setSelectionRange(1,2);created.setRangeText('X');let direct;try{new Actual();direct={accepted:true}}catch(e){direct={accepted:false,error:e.name,message:e.message}}return JSON.stringify({calls,createdPrototype:Object.getPrototypeOf(created)===Actual.prototype,actual:created.actual,value:created.value,cached:created.validity===created.validity,direct})})()`);assert.deepEqual(JSON.parse(result),{calls:1,createdPrototype:true,actual:'owned',value:'aXc',cached:true,direct:{accepted:false,error:'TypeError',message:''}});});
++test('frame and utility public interfaces use actual distinct VMs while shared backends stay canonical',async t=>{const{w,page}=await fixture(t),child=w.document.querySelector('iframe').contentWindow;for(const value of[child.HTMLInputElement.prototype,child.HTMLInputElement.prototype.stepUp,child.ValidityState.prototype]){actualRealm(value,child.eval('[]'));assert.equal(binding.sameRealm(value,w.eval('[]')),false)}const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());installUtilityFormControlParity(world,w);for(const value of[world.global.HTMLInputElement.prototype,world.global.ValidityState.prototype])actualRealm(value,world.evaluate('[]'));const main=w.document.getElementById('i'),front=world.evaluate('document.getElementById("i")');assert.equal(canonicalUtilityValue(front),main);assert.equal(platformFactoryRecord(front).implementation,platformFactoryRecord(main).implementation);assert.equal(platformFactoryRecord(front.validity).implementation,platformFactoryRecord(main.validity).implementation);assert.notEqual(front.validity,main.validity);});
++test('existing strong form methods reject copied and Proxy receivers without observing traps',async t=>{const{w,page}=await fixture(t);assert.deepEqual(JSON.parse(JSON.stringify(page.evaluate(`(()=>{const i=document.getElementById('i'),s=i.validity,get=Object.getOwnPropertyDescriptor(ValidityState.prototype,'valid').get;let traps=0,conversions=0;const errors=[];for(const x of[{},Object.create(Object.getPrototypeOf(i),Object.getOwnPropertyDescriptors(i)),new Proxy(i,{get(){traps++;throw Error('trap')}})])try{HTMLInputElement.prototype.setRangeText.call(x,{toString(){conversions++;return'x'}})}catch(e){errors.push(e instanceof TypeError)}for(const x of[Object.create(Object.getPrototypeOf(s),Object.getOwnPropertyDescriptors(s)),new Proxy(s,{get(){traps++;throw Error('trap')}})])try{get.call(x)}catch(e){errors.push(e instanceof TypeError)}return{traps,conversions,errors}})()`))),{traps:0,conversions:0,errors:[true,true,true,true,true]});});
++test('genuine no-runScripts Host windows keep original Host interfaces and functional state',()=>{const dom=new JSDOM('<input value=host required>');try{const w=dom.window,i=w.document.querySelector('input');for(const value of[w.HTMLInputElement,w.HTMLInputElement.prototype,w.ValidityState,w.ValidityState.prototype])assert.equal(binding.sameRealm(value,[]),true);assert.equal(i.value,'host');assert.equal(i.validity,i.validity);i.value='';assert.equal(i.validity.valueMissing,true)}finally{dom.window.close()}});
++test('exact independent generated source fingerprints reject altered Input and ValidityState templates',()=>{for(const kind of['HTMLInputElement','ValidityState']){const source=readFileSync(require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),'utf8');assert.doesNotThrow(()=>assertControlInterfaceSource(source,kind));assert.throws(()=>assertControlInterfaceSource(source+'\n',kind),/Pinned generated control interface source changed/)}});

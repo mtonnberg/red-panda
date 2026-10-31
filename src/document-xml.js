@@ -1,3 +1,6 @@
+import {installAttributeNames} from './attribute-names.js';
+import {installNamespaceSerialization} from './namespace-serialization.js';
+import {installSerialization} from './serialization.js';
 import {callDOMFactory} from './dom-factory-scope.js';
 import {atomicFormMove} from './element-internals.js';
 // Independent proposal. Existing jsdom DOM/parser/XPath components are reused;
@@ -86,7 +89,6 @@ function realmMetadata(g,bridge){
   set(value){brand(this);value=''+value;const current=domainValues.has(this)?domainValues.get(this):bridge.hostname(this);const normalized=bridge.validateDomain(current,value);if(normalized===null)throw new g.DOMException('The operation is insecure','SecurityError');domainValues.set(this,normalized);}});
  const cookie=Object.getOwnPropertyDescriptor(Document.prototype,'cookie');
  Object.defineProperty(Document.prototype,'cookie',{...cookie,set(value){brand(this);value=''+value;if(/[\x00-\x1f\x7f-\uffff]/.test(value))return;cookie.set.call(this,value);}});
- Object.defineProperty(Document.prototype,'createAttribute',{configurable:true,enumerable:true,writable:true,value:function(name){brand(this);if(!arguments.length)throw new g.TypeError('An attribute name is required');name=''+name;if(!name||/[\x00-\x20\"'/>=]/.test(name))throw new g.DOMException('Invalid attribute name','InvalidCharacterError');return bridge.attribute(this,name);}});
  const create=g.DOMImplementation.prototype.createHTMLDocument;
  g.DOMImplementation.prototype.createHTMLDocument=function(...args){return adopt(create.apply(this,args));};
  const parse=g.DOMParser.prototype.parseFromString;
@@ -128,13 +130,14 @@ function moveFactory(g,bridge){
 }
 
 export function installDocumentXML(page,window){
+ installAttributeNames(window);
+ installNamespaceSerialization(window);installSerialization(page,window);
  patchXMLFactories();
  if(installed.has(window))return installed.get(window);
  const document=window.document;
  const docBrand=value=>DocumentInterface.is(value);
  const metadata=window.eval(`(${realmMetadata.toString()})`)(window,{
   normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,
-  attribute(doc,name){const impl=implForWrapper(doc);if(impl._parsingMode==='html')name=name.replace(/[A-Z]/g,letter=>letter.toLowerCase());return wrapperForImpl(callDOMFactory(window,impl,'_createAttribute',[{localName:name}]));},
   html(doc){const impl=implForWrapper(doc);impl._parsingMode='html';impl.contentType='text/html';},
   hostname(doc){const origin=implForWrapper(doc)._origin;try{return new URL(origin).hostname;}catch{}try{return window.location.hostname;}catch{return'';}},
   validateDomain(current,value){

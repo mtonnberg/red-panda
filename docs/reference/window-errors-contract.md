@@ -33,9 +33,11 @@ same VM context, including persistent global lexical declarations. Closed,
 aborted or explicitly disposed documents suppress pending callback execution.
 
 A shared async hook records Promises created with registered document-realm
-prototypes using weak ownership maps. Unhandled owned rejections dispatch trusted
-cancelable `unhandledrejection` events; a late catch produces `rejectionhandled`
-with the same Promise and reason. An uncanceled rejection forwards one safe
+prototypes using weak ownership maps. Unhandled owned rejections dispatch
+untrusted, cancelable `unhandledrejection` events with the original Promise and
+reason, including undefined. A late catch produces an untrusted, noncancelable
+`rejectionhandled` event with the same Promise and a null reason. These details
+match the pinned Native producer controls in `event-api-parity/`. An uncanceled rejection forwards one safe
 VirtualConsole error without dispatching an additional Window error event.
 Disposed document rejections are ignored. The process listeners remain installed
 to recognize already-created promises after disposal; unrelated host rejections

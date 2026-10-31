@@ -1,30 +1,11 @@
+import{staticResourceServer}from'./static-resource-server.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
-import { once } from 'node:events';
 import { parserResetCases } from '../docs/reference/parser-reset-cases.mjs';
 import { Browser } from '../src/browser.js';
 
 const plain = value => JSON.parse(JSON.stringify(value));
-async function fixture(t, html, routes = {}) {
-  const timers = new Set(), server = http.createServer((request, response) => {
-    const pathname = new URL(request.url, 'http://fixture.test').pathname;
-    if (pathname === '/page.html') { response.writeHead(200, { 'content-type': 'text/html' }); response.end(html); return; }
-    const route = routes[pathname];
-    if (!route) { response.writeHead(404); response.end('missing'); return; }
-    const send = () => { if (!response.destroyed) { response.writeHead(200, { 'content-type': route.type ?? 'text/javascript' }); response.end(route.body); } };
-    if (route.delay) { const timer = setTimeout(() => { timers.delete(timer); send(); }, route.delay); timers.add(timer); } else send();
-  });
-  server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const browser = new Browser({ timeout: 5000 }), page = browser.createPage(), errors = [];
-  page.on('pageError', error => errors.push(error.message));
-  t.after(async () => {
-    browser.close(); for (const timer of timers) clearTimeout(timer);
-    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
-  });
-  await page.navigate(`http://127.0.0.1:${server.address().port}/page.html`);
-  return { page, errors };
-}
+async function fixture(t,html,routes={}){const{origin}=await staticResourceServer(t,{html,routes});const browser=new Browser({timeout:5000}),page=browser.createPage(),errors=[];page.on('pageError',error=>errors.push(error.message));t.after(()=>browser.close());await page.navigate(origin+'/page.html');return{page,errors};}
 
 test('successive external writes preserve observed native DOM call order and currentScript restoration', async t => {
   const scenario = parserResetCases[0]; const { page, errors } = await fixture(t, scenario.html, scenario.routes);

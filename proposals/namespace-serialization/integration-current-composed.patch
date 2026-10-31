@@ -1,0 +1,540 @@
+--- /dev/null
++++ b/src/namespace-state.js
+@@ -0,0 +1,6 @@
++// Ownership is captured from genuine installed documents, never public names.
++const globals=new WeakSet(),creators=new WeakMap();
++export function ownNamespaceGlobal(globalObject,creator){globals.add(globalObject);if(creator)creators.set(globalObject,creator);}
++export function namespaceCreator(globalObject){return creators.get(globalObject);}
++export function namespaceDocument(node){return node?.nodeType===9?node:node?._ownerDocument;}
++export function ownsNamespaceNode(node){const document=namespaceDocument(node);return !!document&&globals.has(document._globalObject);}
+--- /dev/null
++++ b/src/namespace-serialization.js
+@@ -0,0 +1,85 @@
++import{createRequire}from'node:module';
++import{implementationForWrapper}from'./dom-event-state.js';
++import{serializeHTML}from'./serialization.js';
++import{ownNamespaceGlobal,ownsNamespaceNode,namespaceCreator}from'./namespace-state.js';
++const require=createRequire(import.meta.url),ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation,NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const attributes=require('jsdom/lib/jsdom/living/attributes.js'),xmlParser=require('jsdom/lib/jsdom/browser/parser/xml.js'),htmlParser=require('jsdom/lib/jsdom/browser/parser/html.js');
++const DOMParserImpl=require('jsdom/lib/jsdom/living/domparsing/DOMParser-impl.js').implementation,Document=require('jsdom/lib/jsdom/living/generated/Document.js'),parser=require('jsdom/lib/jsdom/browser/parser/index.js');
++const Element=require('jsdom/lib/jsdom/living/generated/Element.js'),UnknownElement=require('jsdom/lib/jsdom/living/generated/HTMLUnknownElement.js');
++const{getHTMLElementInterface}=require('jsdom/lib/jsdom/living/helpers/create-element.js');
++const{HTML_NS,SVG_NS,MATHML_NS,XML_NS,XMLNS_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
++const depth=new WeakMap(),checkpoint=queueMicrotask,apply=Reflect.apply;
++let patched=false;
++const lower=value=>value.replace(/[A-Z]/g,c=>c.toLowerCase());
++const upper=value=>value.replace(/[a-z]/g,c=>c.toUpperCase());
++function contextElement(node){switch(node.nodeType){case 1:return node;case 9:return node.documentElement;case 2:return node._element;case 10:case 11:return null;default:return node.parentElement;}}
++function namespace(element,prefix){
++ if(!element)return null;
++ if(prefix==='xml')return XML_NS;if(prefix==='xmlns')return XMLNS_NS;
++ for(let current=element;current;current=current.parentElement){
++  if(current._namespaceURI!==null&&current._prefix===prefix)return current._namespaceURI;
++  const name=prefix===null?'xmlns':'xmlns:'+prefix,attr=attributes.getAttributeByName(current,name);
++  if(attr)return attr._value||null;
++ }
++ return null;
++}
++function prefix(element,uri){
++ if(!uri)return null;
++ for(let current=element;current;current=current.parentElement){
++  if(current._namespaceURI===uri&&current._prefix!==null&&namespace(element,current._prefix)===uri)return current._prefix;
++  for(const attr of current._attributeList){const name=attr._qualifiedName;if(name.startsWith('xmlns:')&&attr._value===uri){const candidate=name.slice(6);if(namespace(element,candidate)===uri)return candidate;}}
++ }
++ return null;
++}
++function withXMLDocument(document,call){
++ let state=depth.get(document);if(!state){state={count:0,queued:false};depth.set(document,state);}state.count++;
++ // Parsing can enter authored custom-element work. Recover only an abandoned
++ // owned scope if VM interruption bypasses this Host finally.
++ if(!state.queued){state.queued=true;checkpoint(()=>{state.queued=false;state.count=0;});}
++ try{return call()}finally{state.count--;}
++}
++function fragmentContext(element){
++ if([HTML_NS,SVG_NS,MATHML_NS].includes(element._namespaceURI))return element;
++ // Native uses an HTML fragment context for null/custom XML namespaces. A
++ // genuine inert typed context has the same tag/document without CE upgrade.
++ return getHTMLElementInterface(element._localName).createImpl(element._globalObject,[],{ownerDocument:element._ownerDocument,localName:element._localName,namespace:HTML_NS,prefix:null,ceState:'uncustomized',ceDefinition:null,isValue:null});
++}
++function patch(){
++ if(patched)return;patched=true;
++ const createElement=Element.createImpl;Element.createImpl=function(globalObject,args,privateData){
++  const document=privateData?.ownerDocument,namespace=privateData?.namespace;
++  if(ownsNamespaceNode(document)&&(depth.get(document)?.count??0)>0&&namespace!==HTML_NS&&namespace!==SVG_NS)return UnknownElement.createImpl(globalObject,args,privateData);
++  return apply(createElement,this,arguments);
++ };
++ const createDocument=DOMParserImpl.prototype.createScriptingDisabledDocument;DOMParserImpl.prototype.createScriptingDisabledDocument=function(parsingMode,contentType,string){
++  const creator=namespaceCreator(this._globalObject);if(!creator)return apply(createDocument,this,arguments);
++  const options={parsingMode,encoding:'UTF-8',contentType,readyState:'complete',scriptingDisabled:true,url:creator.document.URL};
++  const document=creator.createDocument?creator.createDocument(options):Document.createImpl(this._globalObject,[],{options});
++  if(string!==undefined)parser.parseIntoDocument(string,document);return document;
++ };
++ const set=attributes.setAttributeValue;
++ attributes.setAttributeValue=function(element,localName,value,prefix=null,namespace=null){
++  if(ownsNamespaceNode(element)){
++   if(namespace===XMLNS_NS&&(depth.get(element._ownerDocument)?.count??0)>0)return;
++   localName=prefix===null?localName:prefix+':'+localName;prefix=null;namespace=null;
++   if(element._namespaceURI===HTML_NS)localName=lower(localName);
++  }
++  return apply(set,this,[element,localName,value,prefix,namespace]);
++ };
++ for(const name of['getAttributeByName','hasAttributeByName']){const original=attributes[name];attributes[name]=function(element,name){return apply(original,this,[element,ownsNamespaceNode(element)&&element._namespaceURI===HTML_NS?lower(name):name]);};}
++ const parseDocument=xmlParser.parseIntoDocument;xmlParser.parseIntoDocument=function(markup,document){return ownsNamespaceNode(document)?withXMLDocument(document,()=>apply(parseDocument,this,[markup,document])):apply(parseDocument,this,arguments);};
++ const parseFragment=xmlParser.parseFragment;xmlParser.parseFragment=function(markup,element){return ownsNamespaceNode(element)?htmlParser.parseFragment(markup,fragmentContext(element)):apply(parseFragment,this,arguments);};
++ for(const name of['lookupNamespaceURI','lookupPrefix','isDefaultNamespace']){const original=NodeImpl.prototype[name];NodeImpl.prototype[name]=function(value){
++  if(!ownsNamespaceNode(this))return apply(original,this,arguments);const element=contextElement(this);
++  if(name==='lookupPrefix')return prefix(element,value);
++  if(name==='lookupNamespaceURI')return namespace(element,value===''?null:value);
++  return namespace(element,null)===(value===''?null:value);
++ };}
++ const tagName=Object.getOwnPropertyDescriptor(ElementImpl.prototype,'tagName');Object.defineProperty(ElementImpl.prototype,'tagName',{...tagName,get(){return ownsNamespaceNode(this)&&this._namespaceURI===HTML_NS?upper(this._qualifiedName):apply(tagName.get,this,[]);}});
++ for(const[name,outer]of[['outerHTML',true],['innerHTML',false]]){const descriptor=Object.getOwnPropertyDescriptor(ElementImpl.prototype,name);Object.defineProperty(ElementImpl.prototype,name,{...descriptor,get(){return ownsNamespaceNode(this)&&this._ownerDocument._parsingMode==='xml'?serializeHTML(this,{outer}):apply(descriptor.get,this,[]);}});}
++}
++export function installNamespaceSerialization(window,{context,createDocument}={}){
++ const document=implementationForWrapper(window.document),creator={document,createDocument};
++ ownNamespaceGlobal(document._globalObject);ownNamespaceGlobal(window,creator);if(context)ownNamespaceGlobal(context,creator);
++ if(!context)ownNamespaceGlobal(document._globalObject,creator);patch();
++}
+--- a/src/serialization.js
++++ b/src/serialization.js
+@@ -1,6 +1,7 @@
+ // Independent HTML emission from real nodes. XML-mode serialization stays with
+ // its existing namespace-aware serializer; no finished markup is rewritten.
+ import { createRequire } from 'node:module';
++import {ownsNamespaceNode} from './namespace-state.js';
+ const require = createRequire(import.meta.url);
+ const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+ const adapter = require('jsdom/lib/jsdom/living/domparsing/parse5-adapter-serialization.js');
+@@ -49,7 +50,8 @@
+     return parent?.namespace === HTML && (rawText.has(parent.tag) || parent.tag === 'noscript' && scriptingEnabled) ? contents : escapeText(contents);
+   };
+   const emit = (current, parent) => {
+-    if (treeAdapter.isTextNode(current)) return text(current, parent);
++    if (treeAdapter.isTextNode(current) || current.nodeType === 4) return text(current, parent);
++    if (current.nodeType === 7) return `<?${current.target} ${current.data}?>`;
+     if (treeAdapter.isCommentNode(current)) return `<!--${treeAdapter.getCommentNodeContent(current)}-->`;
+     if (treeAdapter.isDocumentTypeNode(current)) {
+       const name = treeAdapter.getDocumentTypeNodeName(current), publicId = treeAdapter.getDocumentTypeNodePublicId(current), systemId = treeAdapter.getDocumentTypeNodeSystemId(current);
+@@ -81,7 +83,10 @@
+   }
+   const original = XMLSerializerImpl.prototype.serializeToString;
+   XMLSerializerImpl.prototype.serializeToString = function (root) {
+-    if (owner(root) && [1, 3, 8, 9, 10, 11].includes(root.nodeType)) return serializeHTML(root);
++    if ((owner(root) || ownsNamespaceNode(root)) && [1, 2, 3, 4, 7, 8, 9, 10, 11].includes(root.nodeType)) {
++      const implied = ownsNamespaceNode(root) && root.nodeType === 9 && root._parsingMode === 'html' && !root.doctype;
++      return (implied ? '<!DOCTYPE html>' : '') + serializeHTML(root);
++    }
+     return original.call(this, root);
+   };
+ }
+--- /dev/null
++++ b/src/attribute-names.js
+@@ -0,0 +1,123 @@
++// Native-profile attribute names over the genuine DOM attribute graph. The
++// generated WebIDL methods still own brands, argument counts and conversions.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {platformFactoryRecord} from './platform-factories.js';
++import {installPlatformFactoryHooks} from './platform-factory-hooks.js';
++import {implementationForWrapper} from './dom-event-state.js';
++installPlatformFactoryHooks();
++const require=createRequire(import.meta.url);
++const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const NamedNodeMapImpl=require('jsdom/lib/jsdom/living/attributes/NamedNodeMap-impl.js').implementation;
++const AttrImpl=require('jsdom/lib/jsdom/living/attributes/Attr-impl.js').implementation;
++const NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const attributes=require('jsdom/lib/jsdom/living/attributes.js');
++const DOMException=require('jsdom/lib/jsdom/living/generated/DOMException.js');
++const {HTML_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
++const ownedGlobals=new WeakSet(),installed=new WeakSet(),declaredNames=new WeakMap();
++const apply=Reflect.apply,wellFormed=String.prototype.toWellFormed,symbolDescription=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get;
++const namespacePrefixes=new Map([['http://www.w3.org/1999/xlink','xlink'],['http://www.w3.org/XML/1998/namespace','xml'],['http://www.w3.org/2000/xmlns/','xmlns']]);
++let patched=false;
++const owns=document=>!!document&&ownedGlobals.has(document._globalObject);
++const text=value=>apply(wellFormed,String(value),[]);
++const lower=value=>value.replace(/[A-Z]/g,c=>c.toLowerCase());
++const attributeName=(element,name)=>element._namespaceURI===HTML_NS?lower(name):name;
++function invalid(globalObject){throw DOMException.create(globalObject,['Invalid attribute name','InvalidCharacterError']);}
++function validate(globalObject,name){if(!name.length||/[\0\t\n\f\r />=]/.test(name))invalid(globalObject);return name;}
++function set(element,name,value){
++ name=attributeName(element,validate(element._globalObject,text(name)));value=text(value);
++ const old=attributes.getAttributeByName(element,name);
++ if(old)attributes.changeAttribute(element,old,value);
++ else attributes.appendAttribute(element,element._ownerDocument._createAttribute({localName:name,value}));
++}
++function find(element,namespace,localName){
++ localName=text(localName);const prefix=namespacePrefixes.get(namespace);
++ return(prefix?attributes.getAttributeByName(element,prefix+':'+localName):null)??attributes.getAttributeByName(element,localName);
++}
++function attach(element,attr){
++ if(attr._element!==null&&attr._element!==element)throw DOMException.create(element._globalObject,['Attribute is already in use','InUseAttributeError']);
++ if(attr._element===element)return attr;
++ // Native retains the Attr's immutable declared name while the actual HTML
++ // element index and serialized name use the normalized spelling.
++ const declared=declaredNames.get(attr)??attr._localName,physical=attributeName(element,declared);
++ if(physical!==declared)declaredNames.set(attr,declared);
++ attr._localName=physical;
++ if(attr._ownerDocument!==element._ownerDocument)element._ownerDocument._adoptNode(attr);
++ return attributes.setAttribute(element,attr);
++}
++function patch(){
++ if(patched)return;patched=true;
++ const element=ElementImpl.prototype,document=DocumentImpl.prototype,map=NamedNodeMapImpl.prototype;
++ for(const name of ['getAttribute','getAttributeNode','hasAttribute','removeAttribute']){
++  const original=element[name];element[name]=function(name){return apply(original,this,[owns(this._ownerDocument)?text(name):name]);};
++ }
++ const setAttribute=element.setAttribute; element.setAttribute=function(name,value){if(!owns(this._ownerDocument))return apply(setAttribute,this,arguments);set(this,name,value);};
++ const toggle=element.toggleAttribute;element.toggleAttribute=function(name,force){
++  if(!owns(this._ownerDocument))return apply(toggle,this,arguments);
++  name=attributeName(this,validate(this._globalObject,text(name)));const old=attributes.getAttributeByName(this,name);
++  if(old){if(force===undefined||force===false){attributes.removeAttribute(this,old);return false}return true}
++  if(force===false)return false;attributes.appendAttribute(this,this._ownerDocument._createAttribute({localName:name,value:''}));return true;
++ };
++ const setNS=element.setAttributeNS;element.setAttributeNS=function(namespace,name,value){
++  if(!owns(this._ownerDocument))return apply(setNS,this,arguments);
++  name=text(name);const parts=name.split(':');if(parts.length>2||parts.some(part=>!part.length))invalid(this._globalObject);
++  validate(this._globalObject,name);set(this,namespace===null?parts.at(-1):name,value);
++ };
++ for(const name of ['getAttributeNS','getAttributeNodeNS','hasAttributeNS','removeAttributeNS']){
++  const original=element[name];element[name]=function(namespace,localName){
++   if(!owns(this._ownerDocument))return apply(original,this,arguments);
++   const attr=find(this,namespace===null?null:text(namespace),localName);
++   if(name==='getAttributeNS')return attr?attr._value:null;
++   if(name==='getAttributeNodeNS')return attr;
++   if(name==='hasAttributeNS')return attr!==null;
++   if(attr)attributes.removeAttribute(this,attr);
++  };
++ }
++ const create=document.createAttribute;document.createAttribute=function(name){if(!owns(this))return apply(create,this,arguments);name=validate(this._globalObject,text(name));return this._createAttribute({localName:name});};
++ const createNS=document.createAttributeNS;document.createAttributeNS=function(namespace,name){if(!owns(this))return apply(createNS,this,arguments);name=validate(this._globalObject,text(name));return this._createAttribute({localName:name});};
++ for(const name of ['setAttributeNode','setAttributeNodeNS']){const original=element[name];element[name]=function(attr){return owns(this._ownerDocument)?attach(this,attr):apply(original,this,arguments);};}
++ for(const name of ['setNamedItem','setNamedItemNS']){const original=map[name];map[name]=function(attr){return owns(this._element._ownerDocument)?attach(this._element,attr):apply(original,this,arguments);};}
++ for(const name of ['name','localName','nodeName']){const descriptor=Object.getOwnPropertyDescriptor(AttrImpl.prototype,name);Object.defineProperty(AttrImpl.prototype,name,{...descriptor,get(){return declaredNames.get(this)??apply(descriptor.get,this,[]);}});}
++ const clone=NodeImpl.prototype.cloneNode;NodeImpl.prototype.cloneNode=function(...args){const copy=apply(clone,this,args);if(this instanceof AttrImpl&&owns(this._ownerDocument)&&declaredNames.has(this))copy._localName=declaredNames.get(this);return copy;};
++ const importNode=document.importNode;document.importNode=function(node,...args){const copy=apply(importNode,this,[node,...args]);if(owns(this)&&node instanceof AttrImpl&&declaredNames.has(node))copy._localName=declaredNames.get(node);return copy;};
++ for(const name of ['getNamedItem','removeNamedItem']){const original=map[name];map[name]=function(name){return apply(original,this,[owns(this._element._ownerDocument)?text(name):name]);};}
++ for(const name of ['getNamedItemNS','removeNamedItemNS']){
++  const original=map[name];map[name]=function(namespace,localName){
++   if(!owns(this._element._ownerDocument))return apply(original,this,arguments);
++   const attr=find(this._element,namespace===null?null:text(namespace),localName);
++   if(name==='getNamedItemNS')return attr;
++   if(!attr)throw DOMException.create(this._globalObject,['Attribute was not found','NotFoundError']);
++   attributes.removeAttribute(this._element,attr);return attr;
++  };
++ }
++}
++function forward(window,context,prototype,name,stringIndices,attrArgument=false){
++ const descriptor=Object.getOwnPropertyDescriptor(prototype,name),original=descriptor.value,TypeError=vm.runInContext('TypeError',context);
++ const invoke=(receiver,args)=>{
++  const implementation=platformFactoryRecord(receiver)?.implementation;
++  if(!implementation)throw new TypeError('Illegal invocation');
++  const document=implementation instanceof DocumentImpl?implementation:implementation._ownerDocument??implementation._element?._ownerDocument;
++  if(!owns(document))return apply(original,receiver,args);
++  if(attrArgument&&args.length&&platformFactoryRecord(args[0])?.kind!=='Attr')throw new TypeError('Expected a genuine Attr');
++  // Only primitive Symbols have Native's description shortcut. All authored
++  // object coercion remains inside the original generated WebIDL operation.
++  const values=Array.from(args);for(const index of stringIndices)if(index<values.length&&typeof values[index]==='symbol')values[index]=String(apply(symbolDescription,values[index],[]));
++  return apply(original,receiver,values);
++ };
++ const parameters=Array.from({length:original.length},(_,index)=>'a'+index).join(',');
++ const method=vm.compileFunction(`return ({${name}(${parameters}){return invoke(this,arguments)}}).${name};`,['invoke'],{parsingContext:context})(invoke);
++ Object.defineProperty(prototype,name,{...descriptor,value:method});
++}
++export function installAttributeNames(window,{context}={}){
++ context??=implementationForWrapper(window.document)._globalObject;
++ if(installed.has(context))return;installed.add(context);patch();ownedGlobals.add(context);ownedGlobals.add(implementationForWrapper(window.document)._globalObject);
++ for(const[name,indices]of [['setAttribute',[0,1]],['toggleAttribute',[0]],['getAttribute',[0]],['getAttributeNode',[0]],['hasAttribute',[0]],['removeAttribute',[0]],['setAttributeNS',[0,1,2]],['getAttributeNS',[0,1]],['getAttributeNodeNS',[0,1]],['hasAttributeNS',[0,1]],['removeAttributeNS',[0,1]]])forward(window,context,window.Element.prototype,name,indices);
++ for(const[name,indices]of [['createAttribute',[0]],['createAttributeNS',[0,1]]])forward(window,context,window.Document.prototype,name,indices);
++ for(const[name,indices]of [['getNamedItem',[0]],['removeNamedItem',[0]],['getNamedItemNS',[0,1]],['removeNamedItemNS',[0,1]]])forward(window,context,window.NamedNodeMap.prototype,name,indices);
++ for(const name of ['setAttributeNode','setAttributeNodeNS'])forward(window,context,window.Element.prototype,name,[],true);
++ for(const name of ['setNamedItem','setNamedItemNS'])forward(window,context,window.NamedNodeMap.prototype,name,[],true);
++ // This member is absent from the measured Native Attr interface. Its real
++ // backend prefix remains private and available to the DOM implementation.
++ delete window.Attr.prototype.prefix;
++}
+--- a/src/document-xml.js
++++ b/src/document-xml.js
+@@ -1,3 +1,6 @@
++import {installAttributeNames} from './attribute-names.js';
++import {installNamespaceSerialization} from './namespace-serialization.js';
++import {installSerialization} from './serialization.js';
+ import {callDOMFactory} from './dom-factory-scope.js';
+ import {atomicFormMove} from './element-internals.js';
+ // Independent proposal. Existing jsdom DOM/parser/XPath components are reused;
+@@ -86,7 +89,6 @@
+   set(value){brand(this);value=''+value;const current=domainValues.has(this)?domainValues.get(this):bridge.hostname(this);const normalized=bridge.validateDomain(current,value);if(normalized===null)throw new g.DOMException('The operation is insecure','SecurityError');domainValues.set(this,normalized);}});
+  const cookie=Object.getOwnPropertyDescriptor(Document.prototype,'cookie');
+  Object.defineProperty(Document.prototype,'cookie',{...cookie,set(value){brand(this);value=''+value;if(/[\x00-\x1f\x7f-\uffff]/.test(value))return;cookie.set.call(this,value);}});
+- Object.defineProperty(Document.prototype,'createAttribute',{configurable:true,enumerable:true,writable:true,value:function(name){brand(this);if(!arguments.length)throw new g.TypeError('An attribute name is required');name=''+name;if(!name||/[\x00-\x20\"'/>=]/.test(name))throw new g.DOMException('Invalid attribute name','InvalidCharacterError');return bridge.attribute(this,name);}});
+  const create=g.DOMImplementation.prototype.createHTMLDocument;
+  g.DOMImplementation.prototype.createHTMLDocument=function(...args){return adopt(create.apply(this,args));};
+  const parse=g.DOMParser.prototype.parseFromString;
+@@ -128,13 +130,14 @@
+ }
+ 
+ export function installDocumentXML(page,window){
++ installAttributeNames(window);
++ installNamespaceSerialization(window);installSerialization(page,window);
+  patchXMLFactories();
+  if(installed.has(window))return installed.get(window);
+  const document=window.document;
+  const docBrand=value=>DocumentInterface.is(value);
+  const metadata=window.eval(`(${realmMetadata.toString()})`)(window,{
+   normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,
+-  attribute(doc,name){const impl=implForWrapper(doc);if(impl._parsingMode==='html')name=name.replace(/[A-Z]/g,letter=>letter.toLowerCase());return wrapperForImpl(callDOMFactory(window,impl,'_createAttribute',[{localName:name}]));},
+   html(doc){const impl=implForWrapper(doc);impl._parsingMode='html';impl.contentType='text/html';},
+   hostname(doc){const origin=implForWrapper(doc)._origin;try{return new URL(origin).hostname;}catch{}try{return window.location.hostname;}catch{return'';}},
+   validateDomain(current,value){
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,5 @@
++import {installNamespaceSerialization} from './namespace-serialization.js';
++import {installAttributeNames} from './attribute-names.js';
+ import {installWindowEventSource} from './eventsource.js';
+ import {installWindowWebSocket} from './window-websocket.js';
+ import {installPaymentRequest} from './payment-request.js';
+@@ -42,7 +44,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,4 +1,5 @@
+ import {installPrivateEventUtils,transformPrivateEventSource,isPrivateEventKind,eventImplementation,bindEventImplementation} from './dom-event-state.js';
++import {captureDOMWrapperRealm} from './dom-wrapper-realms.js';
+ import {restoreWindowGlobalInheritance} from './window-global.js';
+ import {installConsole,consoleProtocolType} from './console.js';
+ import {registerPlatformFactory} from './platform-factories.js';
+@@ -24,7 +25,7 @@
+ export function utilityNodeIdentity(value){const record=utilityWrapperRecord(value);if(!record)return undefined;const type=own(record.impl,'nodeType')?.value;if(!Number.isInteger(type)||type<1||type>12)return undefined;const document=type===9?record.impl:own(record.impl,'_ownerDocument')?.value;return {nodeType:type,ownerDocument:hostUtils.wrapperForImpl(document),className:record.interfaceName};}
+ 
+ export function createIsolatedWorld(mainWindow,{name='independent-utility-world',timeout=1000,signal,isWindowClosed,onError,resolveWindow,resolveImplementation,onConsole,onRealm,onWrapper}={}) {
+- const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
++ const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);captureDOMWrapperRealm(global,context);
+  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
+  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+@@ -43,7 +44,7 @@
+   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
+   const cached=wrappers.get(impl);if(cached)return cached;
+   const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
+-  const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
++  const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+   if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
+@@ -104,5 +105,5 @@
+  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
+  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
+  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
+- return {context,global,realmFunction,setupEventTarget(value){return load(join(generatedRoot,'EventTarget.js')).setup(value,global,[]);},createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
++ return {context,global,realmFunction,setupEventTarget(value){return load(join(generatedRoot,'EventTarget.js')).setup(value,global,[]);},createDocument(options){return load(join(generatedRoot,options.parsingMode==='xml'?'XMLDocument.js':'Document.js')).createImpl(global,[],{options});},createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
+ }
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -17,16 +17,26 @@
+ const realms=new WeakMap(),observers=new Map(),setPrototype=Object.setPrototypeOf,HostProxy=Proxy,hostCreate=Object.create;
+ let installed=false;
+ function realm(globalObject){
++ const captured=realms.get(globalObject);if(captured)return captured;
+  const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
+  if(!context||!vm.isContext(context))return null;
+  let record=realms.get(context);
+  if(!record){
+   // Object.create(HostIDLPrototype) can select its Host V8 context. Genuine
+   // construction by the captured VM Object retains the selected context.
+-  record=Object.assign(Object.create(null),{Object:vm.runInContext('Object',context),Proxy:vm.runInContext('Proxy',context)});
++  record=Object.assign(Object.create(null),{context,Object:vm.runInContext('Object',context),Proxy:vm.runInContext('Proxy',context)});
+   realms.set(context,record);
+  }
+  return record;
++}
++// Called only by trusted creation of a fresh, non-retargeted utility VM. The
++// Window implementation can belong to the shared main tree; it is not the
++// allocation context of the actual utility global and its generated values.
++export function captureDOMWrapperRealm(globalObject,context){
++ if(!vm.isContext(context))throw new TypeError('An actual DOM wrapper VM is required');
++ const record=realm(context),previous=realms.get(globalObject);
++ if(previous&&previous!==record)throw new TypeError('DOM wrapper realm identity cannot be retargeted');
++ realms.set(globalObject,record);
+ }
+ export function createDOMWrapperShell(globalObject,prototype,kind){
+  const selection=selectDOMWrapperAllocation(globalObject,prototype,kind),record=realm(selection.globalObject);
+@@ -53,13 +63,13 @@
+   const full=join(directory,filename),factory=require(full),kind=basename(filename,'.js');
+   if(typeof factory.setup!=='function'||interfaces.getInterfaceWrapper(kind)!==factory)continue;
+   let Implementation;
+-  for(const folder of kind==='Attr'?['attributes']:['nodes','events']){
++  for(const folder of (kind==='Attr'||kind==='NamedNodeMap')?['attributes']:['nodes','events']){
+    try{Implementation=require('jsdom/lib/jsdom/living/'+folder+'/'+kind+'-impl.js').implementation;break;}catch(error){if(error.code!=='MODULE_NOT_FOUND')throw error;}
+   }
+   if(!Implementation)continue;
+   const node=Implementation===NodeImpl||Implementation.prototype instanceof NodeImpl,event=Implementation===EventImpl||Implementation.prototype instanceof EventImpl;
+-  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
+-  if(node||kind==='HTMLFormControlsCollection')registerDOMAllocationKind(kind);
++  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&kind!=='NamedNodeMap'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
++  if(node||kind==='HTMLFormControlsCollection'||kind==='NamedNodeMap')registerDOMAllocationKind(kind);
+   // Recompile the pinned independent generated source before any Window is
+   // installed. The same CommonJS exports object and Host implementations stay
+   // canonical. Only the three initial wrapper allocation expressions change.
+@@ -89,7 +99,7 @@
+   candidates.push({factory,kind,full,originalSource,source});
+  }
+  const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
+- if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='868d8b79e5309539b7018606ffa46ffd40b56f6295878521854592092211fc1c')throw new Error('Pinned jsdom DOM allocation source changed');
++ if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
+  for(const {factory,kind,full,source} of candidates){
+   const module={exports:factory};
+   vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm);
+--- /dev/null
++++ b/test/namespace-serialization.test.js
+@@ -0,0 +1,53 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{EventEmitter}from'node:events';import{createRequire}from'node:module';
++import{Browser}from'../src/browser.js';import{installDocumentXML}from'../src/document-xml.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{installAttributeNames}from'../src/attribute-names.js';import{installNamespaceSerialization}from'../src/namespace-serialization.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),HTML='http://www.w3.org/1999/xhtml',SVG='http://www.w3.org/2000/svg',XLINK='http://www.w3.org/1999/xlink',XMLNS='http://www.w3.org/2000/xmlns/';
++function fixture(t){const page=Object.assign(new EventEmitter(),{closed:false,documentAbort:new AbortController()}),dom=new JSDOM('<!doctype html><body>',{runScripts:'dangerously',beforeParse(window){installDocumentXML(page,window)}});t.after(()=>{page.closed=true;page.documentAbort.abort();dom.window.close()});return dom.window;}
++const plain=value=>JSON.parse(JSON.stringify(value));
++test('XML parsing resolves genuine Element namespaces while omitting declarations and creating flat Attr nodes',t=>{
++ const w=fixture(t),d=new w.DOMParser().parseFromString('<r xmlns="urn:default" xmlns:p="urn:one" p:value="one"><p:C xmlns:q="urn:two" q:value="two"><n xmlns=""/></p:C></r>','application/xml'),r=d.documentElement,c=r.firstChild,n=c.firstChild;
++ assert.equal(r.namespaceURI,'urn:default');assert.equal(c.namespaceURI,'urn:one');assert.equal(c.prefix,'p');assert.equal(c.localName,'C');assert.equal(n.namespaceURI,null);assert.deepEqual([...r.getAttributeNames()],['p:value']);assert.deepEqual([...c.getAttributeNames()],['q:value']);assert.equal(r.attributes[0].namespaceURI,null);assert.equal(r.attributes[0].localName,'p:value');assert.equal(r.attributes[0].ownerDocument,d);
++ assert.ok(r instanceof w.HTMLUnknownElement);assert.ok(c instanceof w.HTMLUnknownElement);assert.equal(typeof r.style,'object');r.style.color='red';assert.equal(r.getAttribute('style'),'color: red;');r.removeAttribute('style');
++ assert.equal(r.lookupNamespaceURI('p'),null);assert.equal(c.lookupNamespaceURI('p'),'urn:one');assert.equal(c.lookupPrefix('urn:one'),'p');assert.equal(n.lookupNamespaceURI(null),'urn:default');assert.equal(r.getAttributeNS('urn:one','value'),null);assert.equal(r.getAttribute('p:value'),'one');assert.equal(r.outerHTML,'<r p:value="one"><p:C q:value="two"><n></n></p:C></r>');
++});
++test('HTML foreign parsing retains real flat declaration attributes and namespace lookup follows live attribute values',t=>{
++ const w=fixture(t),d=new w.DOMParser().parseFromString('<svg xmlns="'+SVG+'" xmlns:xlink="'+XLINK+'"><use xlink:href="#x"/></svg>','text/html'),svg=d.querySelector('svg'),use=d.querySelector('use'),a=use.attributes[0];
++ assert.equal(a.localName,'xlink:href');assert.equal(a.namespaceURI,null);assert.equal(svg.getAttributeNode('xmlns:xlink').namespaceURI,null);assert.equal(use.getAttributeNS(XLINK,'href'),'#x');assert.equal(use.lookupNamespaceURI('xlink'),XLINK);assert.equal(use.lookupPrefix(XLINK),'xlink');assert.equal(use.lookupNamespaceURI('xml'),'http://www.w3.org/XML/1998/namespace');assert.equal(use.lookupPrefix('http://www.w3.org/XML/1998/namespace'),null);
++ svg.getAttributeNode('xmlns:xlink').value='urn:changed';assert.equal(use.lookupNamespaceURI('xlink'),'urn:changed');assert.equal(use.lookupPrefix(XLINK),null);svg.removeAttribute('xmlns:xlink');assert.equal(use.lookupNamespaceURI('xlink'),null);
++});
++test('XML serializers emit actual prefixes, tokens, CDATA text and boolean attributes without generated declarations',t=>{
++ const w=fixture(t),d=new w.DOMParser().parseFromString('<?start data?><!DOCTYPE r><r checked="" empty=""><input/><br/><svg xmlns="'+SVG+'"><path/></svg><![CDATA[a<&b]]><!--comment--><?inside data?>&lt;&gt;&amp;&#160;</r>','application/xml'),r=d.documentElement,serializer=new w.XMLSerializer(),expected='<?start data?><!DOCTYPE r>\n<r checked empty=""><input></input><br></br><svg><path></path></svg>a&lt;&amp;b<!--comment--><?inside data?>&lt;&gt;&amp;&nbsp;</r>';
++ const before=[...r.childNodes];assert.equal(serializer.serializeToString(d),expected);assert.equal(r.innerHTML,'<input></input><br></br><svg><path></path></svg>a&lt;&amp;b<!--comment--><?inside data?>&lt;&gt;&amp;&nbsp;');assert.deepEqual([...r.childNodes],before);assert.equal(serializer.serializeToString(r.attributes[0]),'');assert.equal(serializer.serializeToString(d.createProcessingInstruction('p','')),'<?p ?>');
++ const created=w.document.implementation.createDocument('urn:root','p:Root',null),child=created.createElementNS('urn:child','q:Child');child.setAttributeNS('urn:attributes','a:value','v');created.documentElement.append(child,created.createCDATASection('c<&d'));assert.equal(serializer.serializeToString(created),'<p:Root><q:Child a:value="v"></q:Child>c&lt;&amp;d</p:Root>');
++ child.firstChild?.remove();child.setAttribute('changed','live');assert.equal(created.documentElement.outerHTML,'<p:Root><q:Child a:value="v" changed="live"></q:Child>c&lt;&amp;d</p:Root>');
++});
++test('HTML XMLSerializer implied doctype is emission policy and leaves the actual parsed document unchanged',t=>{
++ const w=fixture(t),d=new w.DOMParser().parseFromString('<p>text</p>','text/html'),serializer=new w.XMLSerializer();assert.equal(d.doctype,null);assert.equal(serializer.serializeToString(d),'<!DOCTYPE html><html><head></head><body><p>text</p></body></html>');assert.equal(d.doctype,null);assert.equal(d.childNodes.length,1);assert.equal(d.documentElement.outerHTML,'<html><head></head><body><p>text</p></body></html>');
++});
++test('owned XML fragment mutation uses real HTML parsing, table contexts and foreign namespace rules',t=>{
++ const w=fixture(t),d=new w.DOMParser().parseFromString('<r><target/></r>','application/xml'),target=d.documentElement.firstChild;target.innerHTML='<a> &nbsp; &amp;';assert.equal(target.firstChild.namespaceURI,HTML);assert.equal(target.firstChild.nodeName,'A');assert.equal(target.innerHTML,'<a> &nbsp; &amp;</a>');target.firstChild.outerHTML='<input checked=""/>';assert.equal(target.innerHTML,'<input checked>');target.insertAdjacentHTML('beforeend','<A A="B"/>');assert.equal(target.lastChild.namespaceURI,HTML);assert.equal(target.lastChild.getAttribute('A'),'B');
++ const table=d.createElement('table');table.innerHTML='<tr><td>X</td></tr>';assert.equal(table.firstChild.nodeName,'TBODY');assert.equal(table.firstChild.namespaceURI,HTML);assert.equal(table.innerHTML,'<tbody><tr><td>X</td></tr></tbody>');const svg=d.createElementNS(SVG,'svg');svg.innerHTML='<circle viewBox="x"/>';assert.equal(svg.firstChild.namespaceURI,SVG);assert.equal(svg.firstChild.getAttributeNames()[0],'viewBox');
++ const html=d.createElementNS(HTML,'div');html.setAttribute('DATA-UP','v');assert.equal(html.nodeName,'DIV');assert.equal(html.getAttribute('data-up'),'v');assert.equal(html.hasAttribute('DATA-UP'),true);assert.equal(html.removeAttribute('DATA-UP'),undefined);assert.equal(html.attributes.length,0);
++});
++test('parsed Attr mutation, clone, import, adoption and later serialization preserve genuine ownership and identity',t=>{
++ const w=fixture(t),d=new w.DOMParser().parseFromString('<r xmlns:p="urn:p" p:value="one"><p:C/></r>','application/xml'),r=d.documentElement,a=r.attributes[0];r.setAttribute('p:value','two');assert.equal(r.attributes[0],a);assert.equal(a.value,'two');const clone=r.cloneNode(true),imported=w.document.importNode(r,true);assert.equal(clone.outerHTML,'<r p:value="two"><p:C></p:C></r>');assert.equal(imported.outerHTML,clone.outerHTML);assert.equal(imported.attributes[0].ownerDocument,w.document);assert.equal(clone.firstChild.namespaceURI,'urn:p');
++ r.removeAttributeNode(a);assert.equal(a.ownerElement,null);const host=w.document.createElement('div');host.setAttributeNode(a);assert.equal(a.ownerDocument,w.document);assert.equal(a.ownerElement,host);assert.equal(host.getAttribute('p:value'),'two');assert.equal(new w.XMLSerializer().serializeToString(r),'<r><p:C></p:C></r>');
++});
++test('unowned jsdom keeps XML declaration attributes, namespace metadata, strict fragments and XML serialization',t=>{
++ const dom=new JSDOM('<body>',{runScripts:'dangerously'});t.after(()=>dom.window.close());const w=dom.window,d=new w.DOMParser().parseFromString('<p:r xmlns:p="urn:p" p:a="v"/>','application/xml'),r=d.documentElement;assert.equal(r.getAttributeNS(XMLNS,'p'),'urn:p');assert.equal(r.getAttributeNodeNS('urn:p','a').localName,'a');assert.equal(r.getAttributeNodeNS('urn:p','a').prefix,'p');assert.equal(new w.XMLSerializer().serializeToString(d),'<p:r xmlns:p="urn:p" p:a="v"/>');assert.throws(()=>r.innerHTML='<a>',{name:'SyntaxError'});
++});
++test('genuine utility values share the corrected tree while keeping actual utility wrappers and serializers',async t=>{
++ const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<body>');const world=createIsolatedWorld(page.dom.window,{name:'namespace-serialization',signal:page.documentAbort.signal});installAttributeNames(world.global,{context:world.context});installNamespaceSerialization(world.global,{context:world.context,createDocument:world.createDocument});t.after(()=>{world.dispose();browser.close()});
++ const value=world.evaluate(`(()=>{const d=new DOMParser().parseFromString('<r xmlns:p="urn:p" p:a="v"><p:C/></r>','application/xml');globalThis.root=d.documentElement;return{documentClass:d.constructor.name,unknown:root instanceof HTMLUnknownElement,attr:root.attributes[0] instanceof Attr,owner:root.attributes[0].ownerDocument===d,local:root.attributes[0].localName,namespace:root.attributes[0].namespaceURI,prefix:root.firstChild.prefix,outer:root.outerHTML,serialized:new XMLSerializer().serializeToString(d)}})()`);assert.deepEqual(plain(value),{documentClass:'XMLDocument',unknown:true,attr:true,owner:true,local:'p:a',namespace:null,prefix:'p',outer:'<r p:a="v"><p:C></p:C></r>',serialized:'<r p:a="v"><p:C></p:C></r>'});assert.equal(canonicalUtilityValue(world.evaluate('root')).namespaceURI,null);
++});
++test('actual nested XML parse VM interruption releases private scope before subsequent real fragments and parsing',async t=>{
++ const browser=new Browser({timeout:250}),page=browser.createPage();await page.navigate('data:text/html,<body>');t.after(()=>browser.close());const attributes=require('jsdom/lib/jsdom/living/attributes.js'),xml=require('jsdom/lib/jsdom/browser/parser/xml.js'),original=attributes.setAttributeValue,infinite=page.evaluate('(function(){try{while(true){}}finally{globalThis.namespaceFinally=true}})');let documentImpl,level=0;
++ page.evaluate('setTimeout(()=>{globalThis.namespaceTimer=1},20)');attributes.setAttributeValue=function(element,...args){documentImpl=element._ownerDocument;if(level++===0)return xml.parseIntoDocument('<inner a="v"/>',documentImpl);return Reflect.apply(infinite,undefined,[])};
++ try{assert.throws(()=>page.evaluate(`new DOMParser().parseFromString('<outer a="v"/>','application/xml')`),error=>error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT')}finally{attributes.setAttributeValue=original}
++ await new Promise(resolve=>setImmediate(resolve));assert.equal(page.evaluate('globalThis.namespaceFinally'),undefined);const d=utils.wrapperForImpl(documentImpl),r=d.createElement('r');d.append(r);r.innerHTML='<svg xmlns:xlink="'+XLINK+'"><use xlink:href="#x"/></svg>';assert.equal(r.firstChild.getAttribute('xmlns:xlink'),XLINK);assert.equal(r.firstChild.firstChild.getAttributeNS(XLINK,'href'),'#x');const next=new page.dom.window.DOMParser().parseFromString('<r xmlns:p="urn:p" p:a="live"/>','application/xml');assert.deepEqual([...next.documentElement.getAttributeNames()],['p:a']);assert.equal(next.documentElement.outerHTML,'<r p:a="live"></r>');await new Promise(resolve=>setTimeout(resolve,25));assert.equal(page.evaluate('namespaceTimer'),1);page.close();assert.equal(page.closed,true);
++});
++test('ordinary nested VM entry during actual XML insertion preserves the still-active parser scope',async t=>{
++ const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<body>');t.after(()=>browser.close());const attributes=require('jsdom/lib/jsdom/living/attributes.js'),original=attributes.setAttributeValue;let entered=false;
++ attributes.setAttributeValue=function(...args){if(!entered){entered=true;assert.equal(page.evaluate('1+1'),2)}return Reflect.apply(original,this,args)};let parsed;
++ try{parsed=page.evaluate(`new DOMParser().parseFromString('<r xmlns:p="urn:p" p:a="v"/>','application/xml')`)}finally{attributes.setAttributeValue=original}
++ assert.equal(entered,true);assert.deepEqual([...parsed.documentElement.getAttributeNames()],['p:a']);assert.equal(parsed.documentElement.outerHTML,'<r p:a="v"></r>');
++});
+--- /dev/null
++++ b/test/attribute-names.test.js
+@@ -0,0 +1,76 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{EventEmitter}from'node:events';
++import{installDocumentXML}from'../src/document-xml.js';import{Browser}from'../src/browser.js';
++import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{installAttributeNames}from'../src/attribute-names.js';
++function fixture(t){const dom=new JSDOM('<!doctype html><body>',{url:'http://owned.test/',runScripts:'dangerously',beforeParse(window){installDocumentXML(new EventEmitter(),window)}});t.after(()=>dom.window.close());return dom.window;}
++const XLINK='http://www.w3.org/1999/xlink',XML='http://www.w3.org/XML/1998/namespace',XMLNS='http://www.w3.org/2000/xmlns/';
++test('owned HTML and XML attribute names accept measured non-XML names and reject only actual invalid delimiters',t=>{
++ const w=fixture(t),xml=new w.DOMParser().parseFromString('<r/>','application/xml');
++ for(const d of[w.document,xml]){
++  for(const name of['0abc','123','-invalid','.foo','my@attr','attr!','~','<x','::x','a\vb','é','a"b',"a'b",'a`b','a\\b','a\u0001b','a\u0008b','a\u001fb','a\u007fb','a\u0085b','a\u00a0b','a\u2028b','a\u2029b','a\uffffb']){
++   const e=d.createElement('r');e.setAttribute(name,'value');assert.equal(e.getAttribute(name),'value');assert.equal(e.getAttributeNode(name).ownerElement,e);
++   const a=d.createAttribute(name);assert.equal(a.name,name);assert.equal(a.ownerDocument,d);a.value='attr';assert.equal(e.setAttributeNode(a).value,'value');assert.equal(e.getAttributeNode(name),a);assert.equal(e.getAttribute(name),'attr');
++   assert.equal(e.toggleAttribute(name),false);assert.equal(a.ownerElement,null);assert.equal(a.value,'attr');assert.equal(e.toggleAttribute(name),true);assert.notEqual(e.getAttributeNode(name),a);
++  }
++  for(const name of['','a b','a\tb','a\nb','a\fb','a\rb','a\0b','a=b','a/b','a>b'])for(const op of[()=>d.createAttribute(name),()=>d.createElement('r').setAttribute(name,'v'),()=>d.createElement('r').toggleAttribute(name)])assert.throws(op,error=>error instanceof w.DOMException&&error.name==='InvalidCharacterError'&&error.code===5);
++  assert.equal(d.createAttribute('UPPER').name,'UPPER');
++ }
++ assert.equal(Object.getOwnPropertyDescriptor(w.Attr.prototype,'prefix'),undefined);
++});
++test('namespace methods mutate and select actual flat qualified attributes with measured known-prefix fallback',t=>{
++ const w=fixture(t);for(const d of[w.document,new w.DOMParser().parseFromString('<r/>','application/xml')]){
++  const e=d.createElement('r');e.setAttributeNS(null,'p:name','stripped');assert.equal(e.getAttribute('name'),'stripped');assert.equal(e.getAttribute('p:name'),null);
++  for(const ns of['','urn:unknown',XLINK,XML,XMLNS]){e.setAttributeNS(ns,'p:name','literal');assert.equal(e.getAttribute('p:name'),'literal');assert.equal(e.getAttributeNode('p:name').namespaceURI,null);const a=d.createAttributeNS(ns,'a:b:c');assert.equal(a.name,'a:b:c');assert.equal(a.localName,'a:b:c');assert.equal(a.namespaceURI,null);}
++  for(const name of[':a','a:','a:b:c'])assert.throws(()=>e.setAttributeNS('urn:any',name,'v'),{name:'InvalidCharacterError'});
++  for(const[ns,prefix,local]of[[XLINK,'xlink','href'],[XML,'xml','lang'],[XMLNS,'xmlns','p']]){
++   const qualified=prefix+':'+local;e.setAttribute(local,'plain');e.setAttribute(qualified,'qualified');const held=e.getAttributeNode(qualified);
++   assert.equal(e.getAttributeNS(ns,local),'qualified');assert.equal(e.getAttributeNodeNS(ns,local),held);assert.equal(e.attributes.getNamedItemNS(ns,local),held);
++   assert.equal(e.attributes.removeNamedItemNS(ns,local),held);assert.equal(held.ownerElement,null);assert.equal(e.getAttributeNS(ns,local),'plain');e.removeAttributeNS(ns,local);assert.equal(e.hasAttribute(local),false);
++   e.setAttribute(qualified,'again');e.removeAttributeNS(ns,local);assert.equal(e.hasAttribute(qualified),false);
++  }
++  e.setAttribute('other','fallback');assert.equal(e.getAttributeNS('urn:unknown','other'),'fallback');assert.equal(e.getAttributeNS(XLINK,'other'),'fallback');assert.equal(e.getAttributeNodeNS(null,'nope'),null);assert.throws(()=>e.attributes.removeNamedItemNS(XML,'nope'),error=>error instanceof w.DOMException&&error.name==='NotFoundError'&&error.code===8);
++ }
++});
++test('original generated conversion order and argument requirements survive Native primitive Symbol descriptions',t=>{
++ const w=fixture(t),d=w.document,e=d.createElement('div'),trace=[],arg=(name,value,throws=false)=>({toString(){trace.push(name);if(throws)throw new w.Error(name);return value}});
++ e.setAttribute(arg('name','valid'),arg('value','data'));assert.deepEqual(trace,['name','value']);trace.length=0;
++ assert.throws(()=>e.setAttributeNS(arg('namespace','urn:any'),arg('name','a b'),arg('value','v')),error=>error instanceof w.DOMException);assert.deepEqual(trace,['namespace','name','value']);trace.length=0;
++ assert.throws(()=>e.setAttribute(arg('name','bad',true),arg('value','data')),error=>error instanceof w.Error&&error.message==='name');assert.deepEqual(trace,['name']);
++ for(const[receiver,method,args]of[[e,'setAttribute',[]],[e,'setAttribute',['x']],[e,'toggleAttribute',[]],[e,'setAttributeNS',[null,'x']],[d,'createAttribute',[]],[d,'createAttributeNS',[null]]])assert.throws(()=>receiver[method](...args),error=>error instanceof w.TypeError);
++ e.setAttribute(Symbol('name'),Symbol('value'));assert.equal(e.getAttribute(Symbol('name')),'value');assert.equal(e.hasAttribute(Symbol('name')),true);e.removeAttribute(Symbol('name'));assert.equal(e.hasAttribute('name'),false);
++ assert.equal(d.createAttribute(Symbol()).name,'undefined');assert.equal(d.createAttributeNS(Symbol('ns'),Symbol('NAME')).name,'NAME');assert.equal(e.toggleAttribute(Symbol('toggle')),true);
++ for(const value of[Object(w.Symbol('x')),{[w.Symbol.toPrimitive](){return w.Symbol('x')}}])assert.throws(()=>e.setAttribute(value,'v'),error=>error instanceof w.TypeError);
++ e.setAttribute('a\ud800b','v\ud800x');assert.equal(e.getAttribute('a\ufffdb'),'v\ufffdx');assert.equal(e.getAttribute('a\ud800b'),'v\ufffdx');
++});
++test('real Attr identity, owner changes, reflection, selectors and mutation records follow backend mutations',async t=>{
++ const w=fixture(t),d=w.document,e=d.createElement('p');d.body.append(e);const changes=[];new w.MutationObserver(batch=>changes.push(...batch)).observe(e,{attributes:true,attributeOldValue:true});
++ const a=d.createAttribute('data-value');a.value='one';e.setAttributeNode(a);e.setAttribute('data-value','two');assert.equal(e.getAttributeNode('data-value'),a);assert.equal(a.value,'two');
++ const b=d.createAttribute('data-value');b.value='three';assert.equal(e.setAttributeNode(b),a);assert.equal(a.ownerElement,null);assert.equal(a.value,'two');assert.equal(e.getAttributeNode('data-value'),b);
++ e.id='identified';const id=e.getAttributeNode('id');e.setAttribute('id','updated');assert.equal(d.getElementById('updated'),e);assert.equal(id.value,'updated');assert.equal(d.querySelector('[data-value="three"]'),e);e.removeAttribute('data-value');assert.equal(b.ownerElement,null);assert.equal(b.value,'three');
++ await Promise.resolve();assert.deepEqual(changes.map(x=>[x.attributeName,x.attributeNamespace,x.oldValue]),[['data-value',null,null],['data-value',null,'one'],['data-value',null,'two'],['id',null,null],['id',null,'identified'],['data-value',null,'three']]);
++ const other=d.createElement('b');other.setAttribute('occupied','x');assert.throws(()=>e.setAttributeNode(other.getAttributeNode('occupied')),error=>error instanceof w.DOMException&&error.name==='InUseAttributeError');
++});
++test('uppercase Attr declarations retain their name while HTML attachment, adoption and clones use actual document state',t=>{
++ const w=fixture(t),d=w.document,xml=new w.DOMParser().parseFromString('<r/>','application/xml'),e=d.createElement('p'),x=xml.createElement('r'),a=xml.createAttribute('UPPER');a.value='one';
++ e.setAttributeNode(a);assert.equal(a.ownerDocument,d);assert.equal(a.name,'UPPER');assert.equal(a.localName,'UPPER');assert.equal(a.nodeName,'UPPER');assert.deepEqual([...e.getAttributeNames()],['upper']);assert.equal(e.getAttributeNode('upper'),a);assert.equal(e.getAttribute('UPPER'),'one');e.setAttribute('upper','two');assert.equal(a.value,'two');
++ const clone=a.cloneNode();assert.equal(clone.name,'UPPER');assert.equal(clone.ownerElement,null);assert.equal(clone.ownerDocument,d);assert.equal(clone.value,'two');const copied=e.cloneNode();assert.equal(copied.attributes[0].name,'upper');assert.deepEqual([...copied.getAttributeNames()],['upper']);
++ const imported=xml.importNode(a);assert.equal(imported.name,'UPPER');assert.equal(imported.ownerDocument,xml);assert.equal(imported.ownerElement,null);
++ e.removeAttribute('upper');x.setAttributeNode(a);assert.equal(a.ownerDocument,xml);assert.deepEqual([...x.getAttributeNames()],['UPPER']);assert.equal(x.getAttribute('UPPER'),'two');assert.equal(x.getAttribute('upper'),null);x.removeAttributeNode(a);e.attributes.setNamedItem(a);assert.equal(a.ownerDocument,d);assert.equal(e.getAttributeNode('upper'),a);
++});
++test('owned methods reject copied and inherited implementation lookalikes before authored coercion',t=>{
++ const w=fixture(t),d=w.document,e=d.createElement('p');let reads=0;const value={toString(){reads++;return'value'}};
++ for(const fake of[{},Object.create(e),Object.defineProperties({},Object.getOwnPropertyDescriptors(e))])assert.throws(()=>w.Element.prototype.setAttribute.call(fake,value,value),error=>error instanceof w.TypeError);
++ for(const fake of[{},Object.create(d),Object.defineProperties({},Object.getOwnPropertyDescriptors(d))])assert.throws(()=>w.Document.prototype.createAttribute.call(fake,value),error=>error instanceof w.TypeError);
++ assert.equal(reads,0);assert.equal(e.attributes.length,0);
++});
++test('unowned jsdom retains its original XML validation, namespace graph and public Attr prefix',t=>{
++ const plain=new JSDOM('<body>',{runScripts:'dangerously'});t.after(()=>plain.window.close());const d=plain.window.document,e=d.createElement('p');assert.throws(()=>e.setAttribute('0abc','v'),{name:'InvalidCharacterError'});assert.throws(()=>d.createAttribute('0abc'),{name:'InvalidCharacterError'});assert.equal(d.createAttribute('UPPER').name,'upper');
++ e.setAttributeNS('urn:plain','p:x','value');const a=e.getAttributeNodeNS('urn:plain','x');assert.equal(a.namespaceURI,'urn:plain');assert.equal(a.prefix,'p');assert.equal(e.getAttributeNS(null,'x'),null);assert.throws(()=>e.setAttribute(Symbol('x'),'v'),{name:'TypeError'});
++});
++test('real Browser documents and retained documents keep actual Attr owner identity after navigation',async t=>{
++ const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>old');const old=page.dom.window.document,Attr=page.dom.window.Attr;await page.navigate('data:text/html,<body>new');const a=old.createAttribute('0ABC');assert.equal(a.ownerDocument,old);assert.ok(a instanceof Attr);const e=old.createElement('div');a.value='retained';e.setAttributeNode(a);assert.equal(e.getAttribute('0ABC'),'retained');assert.equal(page.dom.window.document.contains(e),false);
++});
++test('genuine utility methods mutate the canonical DOM and return utility Attr identities without accepting lookalikes',async t=>{
++ const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<body><p id="shared"></p>');const world=createIsolatedWorld(page.dom.window,{name:'attribute-names',signal:page.documentAbort.signal});installAttributeNames(world.global,{context:world.context});t.after(()=>{world.dispose();browser.close()});
++ const value=world.evaluate(`(()=>{const e=document.getElementById('shared');e.setAttribute(Symbol('0abc'),Symbol('value'));const a=document.createAttribute('a\\vb');a.value='utility';e.setAttributeNode(a);globalThis.held=a;return{name:a.name,owner:a.ownerDocument===document,element:a.ownerElement===e,attr:a instanceof Attr,method:Element.prototype.setAttribute instanceof Function,value:e.getAttribute('0abc'),prefix:typeof a.prefix}})()`);
++ assert.deepEqual(JSON.parse(JSON.stringify(value)),{name:'a\vb',owner:true,element:true,attr:true,method:true,value:'value',prefix:'undefined'});assert.equal(page.dom.window.document.getElementById('shared').getAttribute('a\vb'),'utility');assert.equal(canonicalUtilityValue(world.evaluate('held')),page.dom.window.document.getElementById('shared').getAttributeNode('a\vb'));assert.equal(world.evaluate('(()=>{try{Element.prototype.setAttribute.call({},"x","y")}catch(e){return e instanceof TypeError}})()'),true);
++});
+--- a/test/document-xml.test.js
++++ b/test/document-xml.test.js
+@@ -22,7 +22,7 @@
+  const root=d.createElement('div'),left=root.appendChild(d.createElement('div')),node=root.appendChild(d.createTextNode('kept'));left.moveBefore(node,null);assert.equal(node.parentNode,left);});
+ test('connectedMoveCallback replaces only the real connected/disconnected move reactions',t=>{const{window:w,document:d}=fixture(t);const calls=[];class Aware extends w.HTMLElement{connectedCallback(){calls.push('connect')}disconnectedCallback(){calls.push('disconnect')}connectedMoveCallback(){calls.push('move')}}w.customElements.define('move-aware-test',Aware);const node=d.createElement('move-aware-test');d.getElementById('a').append(node);calls.length=0;d.getElementById('b').moveBefore(node,null);assert.deepEqual(calls,['move']);node.remove();assert.deepEqual(calls,['move','disconnect']);});
+ 
+-test('createAttribute creates real relaxed-name Attr nodes with attachment and current owner identity',t=>{const{window:w,document:d}=fixture(t);const element=d.createElement('div');for(const name of['.over','0','-x',':a','a:b:c']){const attr=d.createAttribute(name);assert.ok(attr instanceof w.Attr);assert.equal(attr.ownerDocument,d);attr.value='value';element.setAttributeNode(attr);assert.equal(element.getAttribute(name),'value');assert.equal(attr.ownerElement,element);}for(const name of['','a=b','a/b','a>b','a b'])assert.throws(()=>d.createAttribute(name),{name:'InvalidCharacterError'});assert.equal(d.createAttribute('UPPER').name,'upper');assert.throws(()=>Object.getOwnPropertyDescriptor(w.Document.prototype,'cookie').set.call({},'bad=é'),{name:'TypeError'});});
++test('createAttribute creates real relaxed-name Attr nodes with attachment and current owner identity',t=>{const{window:w,document:d}=fixture(t);const element=d.createElement('div');for(const name of['.over','0','-x',':a','a:b:c']){const attr=d.createAttribute(name);assert.ok(attr instanceof w.Attr);assert.equal(attr.ownerDocument,d);attr.value='value';element.setAttributeNode(attr);assert.equal(element.getAttribute(name),'value');assert.equal(attr.ownerElement,element);}for(const name of['','a=b','a/b','a>b','a b'])assert.throws(()=>d.createAttribute(name),{name:'InvalidCharacterError'});assert.equal(d.createAttribute('UPPER').name,'UPPER');assert.throws(()=>Object.getOwnPropertyDescriptor(w.Document.prototype,'cookie').set.call({},'bad=é'),{name:'TypeError'});});
+ 
+ test('throwing move callback property cannot corrupt node attachment or disconnect behavior',t=>{const{window:w,document:d}=fixture(t);let disconnected=0;class Throwing extends w.HTMLElement{get connectedMoveCallback(){throw new w.Error('callback getter');}disconnectedCallback(){disconnected++;}}w.customElements.define('throwing-move-test',Throwing);const el=d.createElement('throwing-move-test');d.getElementById('a').append(el);assert.throws(()=>d.getElementById('b').moveBefore(el,null),/callback getter/);assert.equal(el.parentNode.id,'a');el.remove();assert.equal(el.isConnected,false);assert.equal(disconnected,1);});
+ 

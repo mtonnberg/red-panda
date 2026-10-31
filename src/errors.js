@@ -1,3 +1,4 @@
+import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-parity.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
 import { createHook } from 'node:async_hooks';
@@ -70,8 +71,8 @@ function owner(promise) {
 }
 
 function rejectionEvent(record, type, promise, reason) {
-  const event = new record.PromiseRejectionEvent(type, { promise, reason, cancelable: type === 'unhandledrejection' });
-  const impl = implForWrapper(event); impl.isTrusted = true;
+  const event = createPromiseRejectionEvent(record.window, type, promise, reason);
+  const impl = implForWrapper(event);
   implForWrapper(record.window)._dispatch(impl);
   return event;
 }
@@ -144,23 +145,7 @@ export function installErrors(page, window) {
   records.set(window, record);
   records.set(implForWrapper(window)._globalObject, record);
   promiseRealms.set(window.Promise.prototype, record);
-  const Event = window.Event;
-  const Promise = window.Promise;
-  class PromiseRejectionEvent extends Event {
-    constructor(type, options = {}) {
-      if (arguments.length < 1) throw new window.TypeError('An event type is required.');
-      if (!('promise' in options)) throw new window.TypeError('PromiseRejectionEvent requires promise.');
-      super(type, options);
-      Object.defineProperties(this, {
-        promise: { value: Promise.resolve(options.promise), enumerable: true },
-        reason: { value: options.reason, enumerable: true },
-      });
-    }
-  }
-  record.PromiseRejectionEvent = PromiseRejectionEvent;
-  if (!window.PromiseRejectionEvent) Object.defineProperty(window, 'PromiseRejectionEvent', {
-    value: PromiseRejectionEvent, configurable: true, writable: true,
-  });
+  installEventAPIParity(window);
   Object.defineProperty(window, 'reportError', { configurable: true, writable: true, enumerable: true,
     value: function reportError(value) {
       if (!arguments.length) throw new window.TypeError('reportError requires an argument.');

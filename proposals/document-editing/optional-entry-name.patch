@@ -1,0 +1,20 @@
+--- a/native/runtime.cc
++++ b/native/runtime.cc
+@@ -49,7 +49,7 @@
+ 
+ void CreateEntry(const FunctionCallbackInfo<Value>& info) {
+   auto isolate = info.GetIsolate();
+-  if (info.Length() != 2 || !info[0]->IsFunction() || !info[1]->IsObject()) {
++  if ((info.Length() != 2 && info.Length() != 3) || !info[0]->IsFunction() || !info[1]->IsObject() || (info.Length() == 3 && !info[2]->IsString())) {
+     isolate->ThrowException(Exception::TypeError(String::NewFromUtf8Literal(isolate, "A callback and realm anchor are required")));
+     return;
+   }
+@@ -57,7 +57,7 @@
+   if (!info[1].As<Object>()->GetCreationContext().ToLocal(&realm)) return;
+   Local<Function> entry;
+   if (!Function::New(realm, Entry, info[0], 1, ConstructorBehavior::kThrow).ToLocal(&entry)) return;
+-  entry->SetName(String::NewFromUtf8Literal(isolate, "postMessage"));
++  entry->SetName(info.Length() == 3 ? info[2].As<String>() : String::NewFromUtf8Literal(isolate, "postMessage"));
+   info.GetReturnValue().Set(entry);
+ }
+ 

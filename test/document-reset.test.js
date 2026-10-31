@@ -1,3 +1,4 @@
+import{staticResourceServer}from'./static-resource-server.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -92,13 +93,12 @@ test('ordinary pending fetch survives reset and write-created parser can be supe
   assert.deepEqual(f.errors, []);
 });
 
-test('written stylesheet blockers use the replacement queues before inline script and EOF resume', async t => {
-  let release;
-  const f = await fixture(t, undefined, { '/slow.css': (request,response) => { release = () => { response.writeHead(200, {'content-type':'text/css'}); response.end('b {color:red}'); }; } });
-  f.page.evaluate(`document.open();document.write('<link rel="stylesheet" href="/slow.css"><script>window.sheets=document.styleSheets.length;document.write("<b id=written>written</b>");<\/script><p id="tail">tail</p>');document.close();`);
-  await until(() => release); assert.equal(f.window.sheets, undefined); assert.equal(f.document.getElementById('tail'), null);
-  release(); await until(() => f.document.readyState === 'complete');
-  assert.equal(f.window.sheets, 1); assert.equal(f.document.getElementById('written').textContent, 'written'); assert.ok(f.document.getElementById('tail')); assert.deepEqual(f.errors, []);
+test('written synchronous stylesheets finish real bytes before inline script and replacement EOF lifecycle', async t => {
+  const remote=await staticResourceServer(t,{routes:{'/slow.css':{delay:40,type:'text/css',body:'b {color:red}'}}});
+  const f=await fixture(t),source='<link rel="stylesheet" href="'+remote.origin+'/slow.css"><script>window.sheets=document.styleSheets.length;window.tailDuringScript=!!document.getElementById("tail");document.write("<b id=written>written</b>");<\/script><p id="tail">tail</p>';
+  f.page.evaluate('document.open();document.write('+JSON.stringify(source)+');document.close();');
+  await until(()=>f.document.readyState==='complete');
+  assert.equal(f.window.sheets,1);assert.equal(f.window.tailDuringScript,false);assert.equal(f.document.getElementById('written').textContent,'written');assert.ok(f.document.getElementById('tail'));assert.deepEqual(f.errors,[]);
 });
 
 test('an already-running dynamic module continues while the new cycle has independent readiness', async t => {

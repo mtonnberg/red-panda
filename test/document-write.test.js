@@ -1,3 +1,4 @@
+import{staticResourceServer}from'./static-resource-server.js';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -30,13 +31,13 @@ test('inactive frame trees retain identity while timers stop and public mutation
  assert.deepEqual(plain(page.evaluate(`(()=>{oldDoc.writeln('ignored');oldDoc.open();oldDoc.write('ignored');oldDoc.close();return {body:oldDoc.body===oldBody,node:oldDoc.getElementById('keep')===oldNode,html:oldBody.innerHTML,view:oldDoc.defaultView,connected:oldNode.isConnected,mutations:mutations.slice()};})()`)),{body:true,node:true,html:'<p id="keep">keep</p><script>window.ticks=0;setInterval(()=>ticks++,2)</script>',view:null,connected:true,mutations:[]});
  page.evaluate(`oldBody.replaceChildren(oldDoc.createElement('b'))`);await tick();assert.equal(page.dom.window.oldBody.innerHTML,'<b></b>');assert.deepEqual([...page.dom.window.mutations],['childList']);assert.deepEqual(errors,[]);
 });
-test('queued fetched stylesheets do not deliver into a discarded frame',async t=>{
- let held,cssSent=false,aborted=false;
- const{page,errors}=await fixture(t,'<body><iframe src="/old.html"></iframe>',{'/old.html':{type:'text/html',body:'<body>old'},'/new.html':{type:'text/html',body:'<body>new'},'/held.js':(request,response)=>{held=response;response.on('close',()=>{aborted=!response.writableEnded;});},'/ready.css':(request,response)=>{response.setHeader('content-type','text/css');response.end('body{color:red}');cssSent=true;}});
- page.evaluate(`window.frame=document.querySelector('iframe');window.oldDoc=frame.contentDocument;window.events=[];const script=oldDoc.createElement('script');script.async=false;script.src='/held.js';script.onload=()=>events.push('script-load');script.onerror=()=>events.push('script-error');oldDoc.body.append(script);const link=oldDoc.createElement('link');link.rel='stylesheet';link.href='/ready.css';link.onload=()=>events.push('style-load');link.onerror=()=>events.push('style-error');oldDoc.head.append(link);`);
- await until(()=>held&&cssSent);await tick();assert.equal(page.dom.window.oldDoc.styleSheets.length,0);
+test('queued stylesheet completion is canceled on frame retirement while real synchronous sheet data remains',async t=>{
+ let held,aborted=false;const css=await staticResourceServer(t,{routes:{'/ready.css':{type:'text/css',body:'body{color:red}'}}});
+ const{page,errors}=await fixture(t,'<body><iframe src="/old.html"></iframe>',{'/old.html':{type:'text/html',body:'<body>old'},'/new.html':{type:'text/html',body:'<body>new'},'/held.js':(request,response)=>{held=response;response.on('close',()=>{aborted=!response.writableEnded;});}});
+ page.evaluate(`window.frame=document.querySelector('iframe');window.oldDoc=frame.contentDocument;window.events=[];const script=oldDoc.createElement('script');script.async=false;script.src='/held.js';script.onload=()=>events.push('script-load');script.onerror=()=>events.push('script-error');oldDoc.body.append(script);const link=oldDoc.createElement('link');link.rel='stylesheet';link.href=${JSON.stringify(css.origin+'/ready.css')};link.onload=()=>events.push('style-load');link.onerror=()=>events.push('style-error');oldDoc.head.append(link);`);
+ await until(()=>held&&css.requests.includes('/ready.css'));await tick();assert.equal(page.dom.window.oldDoc.styleSheets.length,1);
  page.evaluate(`frame.src='/new.html'`);await until(()=>page.dom.window.frame.contentDocument?.body?.textContent==='new');await until(()=>aborted);await tick();await tick();
- assert.equal(page.dom.window.oldDoc.styleSheets.length,0);assert.deepEqual([...page.dom.window.events],[]);assert.deepEqual(errors,[]);
+ assert.equal(page.dom.window.oldDoc.styleSheets.length,1);assert.deepEqual([...page.dom.window.events],[]);assert.deepEqual(errors,[]);
 });
 test('written scripts run once in the detached fragment and clones preserve already-started state',async t=>{
  const html=`<body><script>window.runs=[];document.write('<div id="written"><script>runs.push({connected:document.currentScript.isConnected,id:document.currentScript.parentNode.id});<\/scr'+'ipt></div>');const clone=document.querySelector('#written script').cloneNode(true);document.body.append(clone);window.probeResult=runs;</script>`;

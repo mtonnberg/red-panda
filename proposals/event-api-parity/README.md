@@ -1,0 +1,25 @@
+# Event API parity handoff
+
+Two immutable, alternative patches are supplied. Neither changes Root directly.
+
+- `integration.patch` (standalone) applies to Root's public-Event-IDL d9e prerequisite plus its existing SSE `setupEventTarget` helper. Its exact base/target file hashes are in `source-manifest.json`.
+- `integration-after-namespace.patch` applies after the frozen namespace package (`integration-current-composed.patch` SHA256 `7a273601e561f329431ae82156158f013f4a56689d922bb62bbf57fce9cfcbe4`). It preserves its actual utility Proxy/NamedNodeMap allocation and adds factory registration inside its existing `captureDOMWrapperRealm`. That single startup entry validates the actual Context/global pair and updates both Host caches. Do not apply both alternatives.
+
+The patches add real CompositionEvent/InputEvent factories, genuine BeforeUnloadEvent backing and illegal constructor, SecurityPolicyViolationEvent fields, and actual PromiseRejectionEvent values. They correct Mouse coordinate/which/layer and Keyboard/Mouse modifier conversion. Document.createEvent checks private genuine Document authority before conversion, converts once, and allocates in its method's realm using the existing real factory scope. Custom events share the original EventImpl and actual dispatch algorithms. All extension state and controller/constructor tables remain Host-private; public functions, prototypes, getters and values are genuine selected-VM objects. No CXX changes, new dependencies, native engine imports, replayed results, key/prototype/heap/protocol filtering or source-string masking are used.
+
+Actual automatic Promise rejection controls also correct the previous producer contract: both events are untrusted; unhandledrejection preserves the actual reason including undefined, while rejectionhandled has null reason. Promise identity, actual async-hook ownership, cancellation, reporting and teardown remain real. The old test expecting trusted events and the old documented contract are explicitly updated against the new raw Native controls.
+
+Validation:
+
+- Pinned Native binary SHA256 `9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f`.
+- Seven unchanged fixtures: Native 7/7; original Root8b+d9e baseline 0/7; final standalone and namespace-composed candidate each 7/7. Original registered 2000ms load + 2000ms assertion budgets, actual Native harness branch, no altered source/assertions/deadlines, ephemeral ports only. Paths: event/composition.html, event/input.html, events.html, event/security_policy_violation.html, event/keyboard.html, event/mouse.html, event/promise_rejection.html.
+- 220 Native observations match in 14 new focused tests on Node 24.19.0, 24.22.1 and 26.13.0, in both variants. Includes real main/utility dispatch, forged/copied-symbol/proxy receiver rejection, dictionaries and readonly state, cloning, reinit, actual rejection producers and borrowed factories.
+- 102 direct public-V8 creation-context rows pass on all three runtimes in both variants, before/after null prototypes. Event receivers passed to canonical setup are the same actual object. No heap enumeration is used.
+- Standalone focused predecessor run: 48/48. Final namespace-composed, with all current Root non-owned phase19 dependencies restored: 58/58 (the same 48 plus 10 namespace tests). Exact final test names/commands and source graphs are recorded in `validation.json` and the evidence archive.
+- Both patches apply to independently reconstructed exact bases and all applied leaf hashes match. Read-only current Root standalone apply check passed. See `apply-check.json`.
+
+All raw failures are retained. Early parity implementation failures were fixed (missing captured String/Number conversion intrinsics; real utility canonical wrapper/Context allocation). A test's authored-global mutation initially broke test teardown and was fixed by restoring globals in its finally block; the actual construction assertions were not weakened. The first namespace CLI replay failed before browser readiness because the 8b scratch lacked phase19 eventsource.js imported by the newer namespace world-sessions leaf. Restoring current Root non-owned dependencies fixed setup; the final seven fixtures and final 58 tests pass on that exact composed graph. Initial borrowed realm/duplicate conversion and the contrary old producer behavior are retained in the raw evidence.
+
+This is a bounded Window/frame/utility value/factory slice. SecurityPolicyViolationEvent presence does not implement CSP enforcement. Worker exposure and remaining Event APIs are not claimed. The existing prerequisite's standalone EventTarget composedPath content boundary and genuine JavaScript function source remain explicit. Existing generic Window/Node/EventTarget conversions outside the new private Event/Document paths are not a full new brand foundation.
+
+No processes or ports remain owned by this handoff. Earlier audio cost/quantum packages and the namespace owner's frozen artifacts remain unchanged.

@@ -1,4 +1,6 @@
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+import{randomUUID}from'node:crypto';
+import{resolveBlobURL}from'./blob-urls.js';
 import{stylesheetParserBytes}from'./stylesheet-decoder.js';
 import { parseDocumentWriteFragment } from './shadow.js';
 import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
@@ -15,10 +17,10 @@ const ResourceLoader = require('jsdom/lib/jsdom/browser/resources/per-document-r
 const DocumentImpl = require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
 const jsdomRequire = createRequire(require.resolve('jsdom/lib/jsdom/browser/parser/html.js'));
 const parse5 = jsdomRequire('parse5');
-
 const documents = new WeakMap(), flags = new WeakMap();
 const hintKeys = new WeakMap();
-const stylesheetRequests=new WeakMap(),stylesheetDeliveries=new WeakMap();
+const stylesheetRequests=new WeakMap(),stylesheetDeliveries=new WeakMap(),loaderFrames=new WeakMap();
+const hostCheckpoint=queueMicrotask;
 let patched = false;
 const scriptTypes = new Set(['application/ecmascript', 'application/javascript', 'application/x-ecmascript',
   'application/x-javascript', 'text/ecmascript', 'text/javascript', 'text/javascript1.0', 'text/javascript1.1',
@@ -149,29 +151,61 @@ function makeParser(record, options) {
 // Queue ownership remains with the real loader. Drop only delivery into an
 // inactive Document; completed bytes/error cleanup still drain the retired
 // queue without dispatching late events or invoking its DOM callbacks.
+function loaderOverlay(loader,overlays,invoke){
+ let state=loaderFrames.get(loader);if(!state){state={frames:[],queued:false};loaderFrames.set(loader,state);}
+ const frame={previous:Object.fromEntries(Object.keys(overlays).map(name=>[name,loader[name]])),overlays};state.frames.push(frame);
+ if(!state.queued){state.queued=true;hostCheckpoint(()=>{state.queued=false;for(const pending of [...state.frames].reverse())for(const[name,value]of Object.entries(pending.overlays))if(loader[name]===value)loader[name]=pending.previous[name];state.frames.length=0;});}
+ for(const[name,value]of Object.entries(overlays))loader[name]=value;
+ try{return invoke()}finally{for(const[name,value]of Object.entries(overlays))if(loader[name]===value)loader[name]=frame.previous[name];const index=state.frames.indexOf(frame);if(index>=0)state.frames.splice(index,1);}
+}
 function fetchOwnedResource(record, loader, fetch, url, options, delivery) {
-  const names = ['_queue', '_deferQueue', '_asyncQueue'];
-  const previous = names.map(name => loader[name]);
-  for (let index = 0; index < names.length; index++) {
-    const queue = previous[index];
-    loader[names[index]] = Object.create(queue, { push: { value(request, loaded, failed, ...args) {
-      const guard = callback => typeof callback === 'function'
-        ? (...values) => {
-          if (active(record) && (!delivery||delivery.current())) {
-            if(!delivery)return callback(...values);
-            stylesheetDeliveries.set(delivery.element,delivery);
-            let result;try{result=callback(...values)}catch(error){if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);throw error}
-            return Promise.resolve(result).finally(()=>{if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element)});
-          }
-          loader._requestManager.remove(request);
-          return Promise.resolve();
-        }
-        : callback;
-      return queue.push(request, guard(loaded), guard(failed), ...args);
-    } } });
+ const overlays={};
+ for(const name of ['_queue','_deferQueue','_asyncQueue']){
+  const queue=loader[name];overlays[name]=Object.create(queue,{push:{value(request,loaded,failed,...args){
+   const guard=callback=>typeof callback==='function'?(...values)=>{
+    if(active(record)&&(!delivery||delivery.current())){
+     if(!delivery)return callback(...values);
+     stylesheetDeliveries.set(delivery.element,delivery);let result;
+     try{result=callback(...values)}catch(error){if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);throw error;}
+     return Promise.resolve(result).finally(()=>{if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);});
+    }
+    loader._requestManager.remove(request);return Promise.resolve();
+   }:callback;
+   return queue.push(request,guard(loaded),guard(failed),...args);
+  }}});
+ }
+ return loaderOverlay(loader,overlays,()=>fetch.call(loader,url,options));
+}
+function synchronousStylesheet(record,loader,fetch,url,options,delivery){
+ const page=record.page,owner=page.registry?.page??page,op={complete:false,request:null,local:null};
+ const cancel=()=>{delivery.canceled=true;if(stylesheetRequests.get(delivery.element)===delivery){stylesheetRequests.delete(delivery.element);record.styles.delete(delivery.element);}if(op.request)loader._requestManager.remove(op.request);if(op.local){owner.activeRequests.delete(op.local);op.local=null;}};
+ // A V8 interruption can abandon the Host stack before any finally executes.
+ hostCheckpoint(()=>{if(!op.complete)cancel();});
+ let response,error;
+ try{
+  const protocol=new URL(url).protocol;
+  if(protocol==='blob:'||protocol==='data:'){
+   let snapshot;if(protocol==='blob:')snapshot=resolveBlobURL(page,url);else{const parsed=require('data-urls')(url);if(!parsed)throw Error('Invalid data URL');snapshot={bytes:parsed.body,mimeType:parsed.mimeType.toString(),url};}
+   const id=randomUUID();op.local=id;owner.activeRequests.add(id);owner.lastActivity=Date.now();owner.emit('request',{id,url,type:'Stylesheet',method:'GET',headers:{},timestamp:performance.now()/1000,frameId:page.frameId,loaderId:page.loaderId});
+   if(!delivery.current())throw Error('Synchronous stylesheet canceled');
+   if(snapshot.bytes.byteLength>4*1024*1024)throw Error('Stylesheet exceeds 4 MiB limit');
+   response={status:200,statusText:'OK',headers:new Headers(snapshot.mimeType?{'content-type':snapshot.mimeType}:{}),bytes:Buffer.from(snapshot.bytes),url:snapshot.url};owner.responseBodies??=new Map();if(owner.responseBodies.size>=100)owner.responseBodies.delete(owner.responseBodies.keys().next().value);owner.responseBodies.set(id,response.bytes.toString('utf8'));
+   owner.activeRequests.delete(id);owner.requestFinished(id,url,200,response.bytes.length,Object.fromEntries(response.headers),'Stylesheet',page.frameId,page.loaderId);op.local=null;
+  }else{
+   const headers=new Headers(),referrer=page.referrerFor?.(url,record.window.document.URL);if(referrer)headers.set('referer',referrer);
+   response=owner.browser.syncHTTP.fetch(owner,url,{headers,signal:record.signal,frameId:page.frameId,loaderId:page.loaderId,resourceType:'Stylesheet',maxBodyBytes:4*1024*1024});
   }
-  try { return fetch.call(loader, url, options); }
-  finally { for (let index = 0; index < names.length; index++) loader[names[index]] = previous[index]; }
+  if(!delivery.current())throw Error('Synchronous stylesheet canceled');
+  if(response.status<200||response.status>299)throw Error('Resource was not loaded. Status: '+response.status);
+  const metadata={headers:Object.fromEntries(response.headers)};options.onLoad?.(stylesheetParserBytes(response.bytes,metadata,delivery.element));
+ }catch(cause){error=cause;if(op.local){const id=op.local;op.local=null;owner.activeRequests.delete(id);owner.requestFailed(id,cause);}}
+ const request=error?Promise.reject(error):Promise.resolve(response.bytes);request.catch(()=>{});op.request=request;
+ const headers=response?Object.fromEntries(response.headers):{};delete headers['set-cookie'];request.response={statusCode:response?.status??0,headers};request.href=response?.url??url;request.abort=cancel;request.getHeader=()=>undefined;
+ if(!delivery.current()){cancel();op.complete=true;return request;}
+ const overlay=Object.create(loader._resourceLoader);overlay.fetch=()=>request;
+ record.styles.delete(delivery.element);
+ const queued=loaderOverlay(loader,{_resourceLoader:overlay},()=>fetchOwnedResource(record,loader,fetch,url,{...options,onLoad(){},onError:options.onError},delivery));
+ op.complete=true;return queued;
 }
 
 function patch() {
@@ -329,8 +363,10 @@ function patch() {
     const record = documents.get(this._document), element = options.element;
     if (!record) return fetchResource.call(this, url, options);
     if (element.localName === 'link' && (element.getAttributeNS(null, 'rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet')) {
-      const delivery={element,current:()=>active(record)&&element._attached&&stylesheetRequests.get(element)===delivery};
+      if(!active(record))return null;
+      const delivery={element,canceled:false,current:()=>!delivery.canceled&&active(record)&&element._attached&&stylesheetRequests.get(element)===delivery};
       stylesheetRequests.set(element,delivery);
+      if(record.page.browser?.syncHTTP)return synchronousStylesheet(record,this,fetchResource,url,options,delivery);
       const request = fetchOwnedResource(record, this, fetchResource, url, {...options,onLoad(data){return options.onLoad?.(stylesheetParserBytes(data,request.response,element));}},delivery);
       if (request?.then) record.styles.add(element);
       return request;

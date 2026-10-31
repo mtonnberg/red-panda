@@ -2,7 +2,7 @@ import {registerHeapWrapper} from './heap-registry.js';
 import {computedTransform,computedFontSize} from './computed-values.js';
 import {evaluateMedia} from './media.js';
 import { selectorForSpecificity, getSelectorStateRevision, matchesInScope, createScopedMatcher, selectorSubjectTypes } from './selectors.js';
-import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList } from './cssom.js';
+import { enhanceDeclaration, parseStyleSheet, nestedGroupContents, asRuleList, spliceRules, CSSRuleList,bindDeferredRules,hasStyleImports,discardStyleImports,detachRuleEntries,replaceRuleEntries,flatSheetState,deferredRuleStyle } from './cssom.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -135,6 +135,7 @@ function declaration(style) {
 }
 
 function normalizeRules(rules, sheet, parent = null) {
+  if(bindDeferredRules(rules,sheet,parent,rule=>normalizeRules([rule],sheet,parent)))return;
   for (const rule of rules) {
     rule.parentStyleSheet = rule.type===2?null:sheet; rule.parentRule = parent;
     if (rule.style) {
@@ -185,9 +186,9 @@ stylesheetBackend.createStylesheet=function(text,element,baseURL){
  const replacement=REPLACING_EXTERNAL.get(element);REPLACING_EXTERNAL.delete(element);
  const parsed=parse(record,text);
  // Keep the existing real import loader for its supported import path.
- if([...parsed.cssRules].some(rule=>rule.type===3)){originalExternalCreate(text,element,baseURL);if(element.sheet){upgradeSheet(record,element.sheet);element.sheet.ownerNode=wrapperForImpl(element);element.sheet.href=whatwgURL.serializeURL(baseURL);}return;}
+ if(hasStyleImports(parsed.cssRules)){originalExternalCreate(text,element,baseURL);if(element.sheet){upgradeSheet(record,element.sheet);element.sheet.ownerNode=wrapperForImpl(element);element.sheet.href=whatwgURL.serializeURL(baseURL);}return;}
  const retained=replacement?.record===record?replacement.sheet:null,sheet=retained?upgradeSheet(record,retained):upgradeSheet(record,parsed);
- if(retained){for(const rule of sheet.cssRules){rule.parentStyleSheet=null;rule.parentRule=null;}normalizeRules(parsed.cssRules,sheet);spliceRules(sheet.cssRules,0,sheet.cssRules.length,...parsed.cssRules);}
+ if(retained){normalizeRules(parsed.cssRules,sheet);replaceRuleEntries(sheet.cssRules,parsed.cssRules,sheet,null,record.window);}
  sheet.ownerNode=wrapperForImpl(element);sheet.href=whatwgURL.serializeURL(baseURL);element.sheet=sheet;
  const list=element._ownerDocument.styleSheets._list,index=replacement?.index;
  if(!list.includes(sheet)){if(index>=0)list.splice(Math.min(index,list.length),0,sheet);else list.push(sheet);}
@@ -259,10 +260,8 @@ function upgradeSheet(record, sheet, constructed = false) {
 }
 
 function replaceRules(record, sheet, text) {
-  const rules = Array.from(parse(record, text).cssRules).filter(rule => rule.type !== 3);
-  normalizeRules(rules, sheet);
-  for (const old of sheet.cssRules) old.parentStyleSheet = null;
-  spliceRules(sheet.cssRules, 0, sheet.cssRules.length, ...rules);
+  const rules = parse(record,text).cssRules;discardStyleImports(rules);
+  normalizeRules(rules,sheet);replaceRuleEntries(sheet.cssRules,rules,sheet,null,record.window);
 }
 
 function stateFor(root, record, fresh = false) {
@@ -411,6 +410,7 @@ function scopeSheets(record, root) {
 }
 
 function sheetFingerprint(sheet) {
+  const flat=flatSheetState(sheet);if(flat)return[id(sheet),Boolean(sheet.disabled),sheet.media?.mediaText??'',flat.version];
   return [id(sheet), Boolean(sheet.disabled), sheet.media?.mediaText ?? '', Array.from(sheet.cssRules, rule => rule.cssText)];
 }
 
@@ -503,7 +503,7 @@ function cascade(record, element) {
     else if(rule.type===1&&rule.cssRules)collectLayers(rule.cssRules,parent,depth+(rule.type===4?1:0));
   }};
   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
-  for(const{sheet}of authorSheets)collectLayers(sheet.cssRules);
+  for(const{sheet}of authorSheets)if(!flatSheetState(sheet))collectLayers(sheet.cssRules);
   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
   const offer = (style, score, origin, inline = false, layer=layerRoot) => {
     style = declaration(style);
@@ -535,7 +535,12 @@ function cascade(record, element) {
     }
     return ampersand?result:`:is(${parent}) ${result}`;
   };
-  const offerSelector=(selectorText,style,origin,layer=layerRoot)=>{
+  const matchResults=new Map(),documentImpl=implForWrapper(record.document);
+  let matchTree,matchState,matchDialogs,matchFocus,matchFragment;
+  const selectorScore=selectorText=>{
+    const tree=documentImpl._version,state=record.stateRevision,dialogs=getSelectorStateRevision(record.window),focus=documentImpl._lastFocusedElement,fragment=documentImpl._URL?.fragment;
+    if(tree!==matchTree||state!==matchState||dialogs!==matchDialogs||focus!==matchFocus||fragment!==matchFragment){matchResults.clear();matchTree=tree;matchState=state;matchDialogs=dialogs;matchFocus=focus;matchFragment=fragment;}
+    if(matchResults.has(selectorText))return matchResults.get(selectorText);
     let highest=null;
     record.selectorParts??=new Map();let parts=record.selectorParts.get(selectorText);if(!parts){parts=splitTopLevel(selectorText);record.selectorParts.set(selectorText,parts);}
     for(const selector of parts) {
@@ -544,8 +549,12 @@ function cascade(record, element) {
       try{if(matchSelector(selector,element)){const score=specificity(selector);if(!highest||compare(score,highest)>0)highest=score;}}
       catch(error){if(error?.name==='SyntaxError')record.badStyleSelectors.add(selector);record.unsupported.add('Selectors unsupported by the pinned DOM selector engine');}
     }
-    if(highest)offer(style,highest,origin,false,layer);
+    matchResults.set(selectorText,highest);
+    return highest;
   };
+  const offerSelector=(selectorText,style,origin,layer=layerRoot)=>{const highest=selectorScore(selectorText);if(highest)offer(style,highest,origin,false,layer);};
+  const walkFlat=(state,origin)=>{const matches=[];for(const[selector,entries]of state.groups){if(!selector)continue;const score=selectorScore(selector);if(score)for(const entry of entries)matches.push({...entry,score});}matches.sort((a,b)=>a.index-b.index);for(const{value,score}of matches){const style=deferredRuleStyle(value);if(style)offer(style,score,origin,false,layerRoot);}};
+
   const walk = (rules, origin, parent=null, layer=layerRoot, depth=0) => {
     if(depth>32)return;
     for (const rule of rules) {
@@ -567,7 +576,7 @@ function cascade(record, element) {
     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
   }
   const root = rootOf(element);
-  for(const{sheet}of authorSheets)walk(sheet.cssRules,1);
+  for(const{sheet}of authorSheets){const flat=flatSheetState(sheet);if(flat)walkFlat(flat,1);else walk(sheet.cssRules,1);}
   offer(element.style, [0, 0, 0], 1, true);
   const chosen = new Map();chosen.orderKeys=new Map();
   for (const [property, candidates] of values) {

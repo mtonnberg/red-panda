@@ -1,0 +1,14 @@
+--- a/src/sanitizer.js
++++ b/src/sanitizer.js
+@@ -15,8 +15,9 @@
+ function blockedURL(element,attr){
+  if(attr.namespaceURI!==null&&attr.namespaceURI!==XLINK)return false;
+  if(element.namespaceURI===HTML)return attr.namespaceURI===null&&htmlURLs.get(element.localName)?.includes(attr.localName)&&javascript(attr.value);
+- if(element.namespaceURI===SVG){if(['animate','set','animateTransform'].includes(element.localName)&&attr.namespaceURI===null&&attr.localName==='attributeName'&&['href','xlink:href'].includes(attr.value))return true;return element.localName==='a'&&attr.localName==='href'&&javascript(attr.value);}
+- return element.namespaceURI===MATH&&attr.localName==='href'&&javascript(attr.value);
++ const href=attr.localName==='href'||attr.namespaceURI===null&&attr.localName==='xlink:href';
++ if(element.namespaceURI===SVG){if(['animate','set','animateTransform'].includes(element.localName)&&attr.namespaceURI===null&&attr.localName==='attributeName'&&['href','xlink:href'].includes(attr.value))return true;return element.localName==='a'&&href&&javascript(attr.value);}
++ return element.namespaceURI===MATH&&href&&javascript(attr.value);
+ }
+ function mergeAt(parent){let previous=null;for(const node of tree.childrenToArray(parent)){if(previous?.nodeType===3&&node.nodeType===3){previous.replaceData(previous.length,0,node.data);parent._remove(node);}else previous=node;}}
+ function filterTree(root,config){

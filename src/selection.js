@@ -1,3 +1,4 @@
+import {selectionInertText} from './html-element-state.js';
 import 'jsdom';
 import {createRequire} from 'node:module';
 import {types} from 'node:util';
@@ -29,6 +30,7 @@ function patch(){
    return result;
   };
  }
+ const stringify=proto.toString;proto.toString=function(){return recordFor(this)?selectionInertText(this._range):stringify.call(this)};
  const contains=proto.containsNode;
  proto.containsNode=function(node,partial){
   if(!recordFor(this)||!partial)return contains.call(this,node,partial);

@@ -1,0 +1,12 @@
+// Actual constant-time V8 creation-context metadata; no heap enumeration/GC.
+import{readFile,writeFile}from'node:fs/promises';import{pathToFileURL}from'node:url';import{join}from'node:path';import{createHash}from'node:crypto';
+const[scratch,output]=process.argv.slice(2),load=name=>import(pathToFileURL(join(scratch,'src',name+'.js'))),{Browser}=await load('browser'),{createIsolatedWorld}=await load('isolated-world'),{installHTMLElementState}=await load('html-element-state'),{getHeapBinding}=await load('native-heap'),sha=x=>createHash('sha256').update(x).digest('hex');
+const browser=new Browser(),page=browser.createPage();let world;
+try{await page.navigate('data:text/html,<body>');const main=page.dom.window;world=createIsolatedWorld(main,{name:'html-editing-creation',signal:page.documentAbort.signal});installHTMLElementState(page,world.global,{context:world.context,mainWindow:main});const binding=getHeapBinding(),rows=[],mainAnchor=main.eval('[]');
+ for(const[name,g,anchor]of[['main',main,main.eval('[]')],['utility',world.global,world.evaluate('[]')]]){
+  const same=value=>({selected:binding.sameRealm(value,anchor),host:binding.sameRealm(value,[])}),node=g.document.createElement('search');
+  for(const property of ['contentEditable','isContentEditable','inert']){const descriptor=Object.getOwnPropertyDescriptor(g.HTMLElement.prototype,property),proto=Object.getPrototypeOf(descriptor.get),getter={before:same(descriptor.get)};try{Object.setPrototypeOf(descriptor.get,null);getter.afterNull=same(descriptor.get)}finally{Object.setPrototypeOf(descriptor.get,proto)}let receiverError,syntaxError;try{Reflect.apply(descriptor.get,{},[])}catch(e){receiverError={name:e.name,realm:same(e)}}if(property==='contentEditable')try{Reflect.apply(descriptor.set,node,[''])}catch(e){syntaxError={name:e.name,selectedDOMException:e instanceof g.DOMException,ownerDOMException:e instanceof main.DOMException,realm:same(e),ownerRealm:binding.sameRealm(e,mainAnchor)}}rows.push({name,property,getter,setter:descriptor.set?same(descriptor.set):null,receiverError,syntaxError})}
+  const proto=Object.getPrototypeOf(node),before=same(node);try{Object.setPrototypeOf(node,null);rows.push({name,kind:'search-node',before,afterNull:same(node)})}finally{Object.setPrototypeOf(node,proto)}
+ }
+ await writeFile(output,JSON.stringify({driverSHA256:sha(await readFile(new URL(import.meta.url))),operation:'constant-time SameRealm metadata only; no enumeration/GC',rows},null,2)+'\n',{flag:'wx'});
+}finally{world?.dispose();browser.close()}

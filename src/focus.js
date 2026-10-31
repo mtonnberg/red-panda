@@ -1,3 +1,5 @@
+import {commitCommandControlEdit} from './document-editing-state.js';
+import {editingState,effectiveInert,setInertFocusUpdate} from './html-element-state.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -13,14 +15,7 @@ const HTML = 'http://www.w3.org/1999/xhtml';
 const originalFocusable = focusing.isFocusableAreaElement;
 let patched = false;
 
-function editing(element) {
-  for (let current = element; current; current = current.parentElement) {
-    const value = current.getAttribute('contenteditable')?.toLowerCase();
-    if (value === 'false') return false;
-    if (value === '' || value === 'true' || value === 'plaintext-only') return true;
-  }
-  return element?.ownerDocument?.designMode?.toLowerCase() === 'on';
-}
+function editing(element) { return editingState(implForWrapper(element)); }
 
 function editingHost(element) {
   return editing(element) && !editing(element.parentElement);
@@ -37,11 +32,12 @@ function renderedAndInteractive(element) {
   const window = element.ownerDocument?.defaultView;
   if (!window || !element.isConnected) return false;
   for (let current = element; current;) {
-    if (current.hasAttribute('inert') || window.getComputedStyle(current).display === 'none') return false;
+    if (window.getComputedStyle(current).display === 'none') return false;
     // A shadow host can hide or make its descendants inert even though it is
     // outside their parentElement chain.
     current = current.parentElement ?? current.getRootNode()?.host ?? null;
   }
+  if (effectiveInert(implForWrapper(element))) return false;
   return !isDisabled(implForWrapper(element)) && !(element.localName === 'input' && element.type === 'hidden');
 }
 
@@ -95,6 +91,7 @@ function clearEntries(entries) {
 }
 
 function focusEvents(element, entering, related) {
+  if (!entering) commitCommandControlEdit(element);
   focusing.fireFocusEventWithTargetAdjustment(entering ? 'focus' : 'blur', element, related);
   focusing.fireFocusEventWithTargetAdjustment(entering ? 'focusin' : 'focusout', element, related, { bubbles: true });
 }
@@ -136,6 +133,7 @@ function blurElement(element) {
   }
 }
 
+
 function installProperties(window) {
   const prototype = window.HTMLElement.prototype;
   if (!('inert' in prototype)) Object.defineProperty(prototype, 'inert', {
@@ -162,6 +160,7 @@ function installProperties(window) {
     configurable: true, enumerable: true, get() { return editing(this); },
   });
 }
+
 
 export function installFocus(window) {
   if (!window?.document) throw new TypeError('Focus requires a document window');
@@ -222,6 +221,7 @@ export function installFocus(window) {
   }
   DOCUMENTS.add(implForWrapper(window.document));
   installProperties(window);
+  setInertFocusUpdate(implForWrapper(window.document),()=>{const focused=focusedChain(topDocument(implForWrapper(window.document))).leaf;if(focused&&effectiveInert(focused))blurElement(focused);});
 }
 
 function sequentialIndex(element) {

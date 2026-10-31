@@ -1,0 +1,1 @@
+(()=>{const rows=[];class Editor extends HTMLElement{static observedAttributes=['contenteditable'];attributeChangedCallback(...args){rows.push(args)}}customElements.define('parity-editor',Editor);const node=document.createElement('parity-editor');node.contentEditable='TRUE';node.contentEditable='FALSE';node.contentEditable='INHERIT';return JSON.stringify(rows)})()

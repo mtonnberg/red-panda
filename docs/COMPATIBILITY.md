@@ -4,7 +4,33 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current integration adds real classic-script microtask checkpoints, loading
+The latest integrated checkpoint passes **1,669 JavaScript tests, 93 PureScript
+Puppeteer checks and 13 native differential groups**, syntax and strict/pedantic
+PureScript builds. [Validation](reference/phase21-integration/validation.json)
+records 10,355 unchanged guarded inputs. The earlier failed full run and two
+focused epochs remain separate records; final input/beacon/XHR checks pass on
+Node 24.19.0,24.22.1 and 26.13.0 with 8,325 inputs unchanged.
+
+It adds parser/XML namespace and Attr behavior, independent serialization,
+Native-calibrated Event extensions, form state/reflections, original VM
+Input/ValidityState public definitions, real document editing, and guarded inert
+focus/selection. Stylesheets retain real declarations beyond the former eager
+limit while enforcing the decompressed source-byte bound. Trusted CDP pointer
+motion retains fractions; XHR Document bodies follow the observed Native string
+conversion independently of public XMLSerializer. All three native bindings were
+rebuilt for each prepared Node SDK after the optional native entry-name change.
+
+The paired 48/48 reference result belongs to the earlier isolated 73-leaf graph,
+with 8,901 unchanged inputs and original 2s load then fresh 2/8s assertion budgets.
+It is not relabeled as a run on the final 77-leaf Root graph. Its first Sanitizer
+assertion and XHR load timeout remain preserved. The complete 455-case candidate
+matrix is still historical; curated positives do not establish full replication.
+Utility messaging/Fetch, history/Navigation, viewport, Option aliases, timer
+behavior and further realm work remain separate unaccepted proposals.
+
+The sections below retain earlier checkpoint evidence and its original limits.
+
+An earlier integration added real classic-script microtask checkpoints, loading
 and retained-frame document writes, DOM serialization, Request/Response producer
 streams, cross-realm Blob/File messaging, SVG values, CSS media/computed values,
 and experimental Cache/service-worker lifecycle plus dedicated-worker blocking
@@ -92,7 +118,7 @@ network/SameSite/permissions and real media processing remain bounded gaps.
 Frozen proposals and negative-before/positive-after allocation controls preserve
 actual observed differences. Presence of a proposal is not production support.
 
-The current checkpoint adds real SharedWorker VM actors and receiving-VM port/value
+The preceding checkpoint added real SharedWorker VM actors and receiving-VM port/value
 allocation, private Shared SSE/WebSocket brokers and actual parked transport
 cleanup; genuine Response-backed WebAssembly streaming compilation; completed
 Worker document-XHR errors; generic request metadata, no-cors redirect taint and
@@ -101,7 +127,7 @@ realms, SSE, WebSocket admission, audio, image, IndexedDB, popup, Sanitizer,
 animation, Storage, select and DOM lifecycle work. No native C++ or dependency
 source changed in this batch.
 
-All 1,588 JavaScript tests, 87 PureScript Puppeteer checks, 13 native differential
+At that preceding checkpoint, all 1,588 JavaScript tests, 87 PureScript Puppeteer checks, 13 native differential
 groups, syntax checks and strict/pedantic PureScript builds pass.
 [Validation](reference/phase20-integration/validation.json) records 9,382 unchanged
 declared inputs: 2,074 indexed source/reference inputs, 18 native build artifacts,
@@ -748,7 +774,7 @@ matches its pinned native public control exactly and passes both unchanged
 encoding fixtures. It corrects encodeInto's required-argument/method shape,
 conversion order, private receiver validation and result/error realm handling
 while retaining genuine UTF-8 bytes.42 focused checks pass, including4 new checks
-also run on Node24.22.1 and26.13.0. This closes one observed case from the older
+also run on Node 24.22.1 and 26.13.0. This closes one observed case from the older
 48-case report without rewriting that frozen report or claiming a new full-suite
 pass rate.
 

@@ -1,6 +1,7 @@
+import {assertControlInterfaceSource,installControlInterface,transformControlInterfaceInstall,installValidityStateInterfaceRealm} from './control-interface-realms.js';
 import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
 import {transformPrivateEventSource} from './dom-event-state.js';
-import {registerDOMAllocationKind,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
+import {registerDOMAllocationKind,registerDOMAllocationRealm,domWrapperGlobal,recordDOMWrapperGlobal,selectDOMWrapperAllocation,noteDOMWrapperShell,finishDOMWrapperSetup,callDOMFactory} from './dom-factory-scope.js';
 // Fresh Node/Event wrappers are allocated in their actual document VM. Generated
 // setup/new retain their real implementation graph, brands and proxy traps.
 import 'jsdom';
@@ -17,16 +18,27 @@ const EventTargetImpl=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js
 const realms=new WeakMap(),observers=new Map(),setPrototype=Object.setPrototypeOf,HostProxy=Proxy,hostCreate=Object.create;
 let installed=false;
 function realm(globalObject){
+ const captured=realms.get(globalObject);if(captured)return captured;
  const context=vm.isContext(globalObject)?globalObject:utils.implForWrapper(globalObject)?._globalObject;
  if(!context||!vm.isContext(context))return null;
  let record=realms.get(context);
  if(!record){
   // Object.create(HostIDLPrototype) can select its Host V8 context. Genuine
   // construction by the captured VM Object retains the selected context.
-  record=Object.assign(Object.create(null),{Object:vm.runInContext('Object',context),Proxy:vm.runInContext('Proxy',context)});
+  record=Object.assign(Object.create(null),{context,Object:vm.runInContext('Object',context),Proxy:vm.runInContext('Proxy',context)});
   realms.set(context,record);
  }
  return record;
+}
+// Called only by trusted creation of a fresh, non-retargeted utility VM. The
+// Window implementation can belong to the shared main tree; it is not the
+// allocation context of the actual utility global and its generated values.
+export function captureDOMWrapperRealm(globalObject,context){
+ registerDOMAllocationRealm(context,globalObject);
+ if(!vm.isContext(context))throw new TypeError('An actual DOM wrapper VM is required');
+ const record=realm(context),previous=realms.get(globalObject);
+ if(previous&&previous!==record)throw new TypeError('DOM wrapper realm identity cannot be retargeted');
+ realms.set(globalObject,record);
 }
 export function createDOMWrapperShell(globalObject,prototype,kind){
  const selection=selectDOMWrapperAllocation(globalObject,prototype,kind),record=realm(selection.globalObject);
@@ -53,13 +65,13 @@ export function installDOMWrapperRealms(){
   const full=join(directory,filename),factory=require(full),kind=basename(filename,'.js');
   if(typeof factory.setup!=='function'||interfaces.getInterfaceWrapper(kind)!==factory)continue;
   let Implementation;
-  for(const folder of kind==='Attr'?['attributes']:['nodes','events']){
+  for(const folder of (kind==='Attr'||kind==='NamedNodeMap')?['attributes']:['nodes','events']){
    try{Implementation=require('jsdom/lib/jsdom/living/'+folder+'/'+kind+'-impl.js').implementation;break;}catch(error){if(error.code!=='MODULE_NOT_FOUND')throw error;}
   }
   if(!Implementation)continue;
   const node=Implementation===NodeImpl||Implementation.prototype instanceof NodeImpl,event=Implementation===EventImpl||Implementation.prototype instanceof EventImpl;
-  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
-  if(node||kind==='HTMLFormControlsCollection')registerDOMAllocationKind(kind);
+  if(kind!=='HTMLOptionsCollection'&&kind!=='HTMLFormControlsCollection'&&kind!=='NamedNodeMap'&&!node&&!event&&Implementation!==EventTargetImpl)continue;
+  if(node||kind==='HTMLFormControlsCollection'||kind==='NamedNodeMap')registerDOMAllocationKind(kind);
   // Recompile the pinned independent generated source before any Window is
   // installed. The same CommonJS exports object and Host implementations stay
   // canonical. Only the three initial wrapper allocation expressions change.
@@ -84,17 +96,19 @@ export function installDOMWrapperRealms(){
    if(source.split(expression).length!==2)throw new Error('Unexpected generated form.elements getter');
    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
   }
+  if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
   if(event)source=transformPrivateEventSource(source,kind);
   if(event||Implementation===EventTargetImpl)source=transformEventIDLInstall(source,kind);
   candidates.push({factory,kind,full,originalSource,source});
  }
  const fingerprint=createHash('sha256').update(candidates.map(({kind,originalSource})=>kind+'\0'+createHash('sha256').update(originalSource).digest('hex')).join('\n')).digest('hex');
- if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='868d8b79e5309539b7018606ffa46ffd40b56f6295878521854592092211fc1c')throw new Error('Pinned jsdom DOM allocation source changed');
+ if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
  for(const {factory,kind,full,source} of candidates){
   const module={exports:factory};
-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm);
+  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm','installControlInterface'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm,installControlInterface);
   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
   const setup=factory.setup;
   factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};
  }
+ installValidityStateInterfaceRealm();
 }

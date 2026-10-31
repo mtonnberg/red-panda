@@ -1,3 +1,5 @@
+// This focused unit fixture embeds asynchronous jsdom without Browser/SyncHTTP.
+// Production blocking CSS is covered by owned external-thread Browser fixtures.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

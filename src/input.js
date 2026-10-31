@@ -370,12 +370,20 @@ function mouseInit(params, button, buttons, detail, precise = false) {
 }
 
 function pointerEvent(window, target, type, params, button, buttons, { detail = 0, precise = true } = {}) {
-  return dispatchDriverEvent(target, new window.PointerEvent(type, {
+  const event = new window.PointerEvent(type, {
     ...mouseInit(params, button, buttons, detail, precise), pointerId: 1, isPrimary: true,
     pointerType: params.pointerType ?? 'mouse', pressure: params.force ?? (buttons ? 0.5 : 0),
     tangentialPressure: params.tangentialPressure ?? 0, tiltX: params.tiltX ?? 0,
     tiltY: params.tiltY ?? 0, twist: params.twist ?? 0,
-  }));
+  });
+  // CDP pointer motion and presses retain device precision independently of
+  // MouseEvent's public dictionary conversion. Clicks keep integer coordinates.
+  if (precise) {
+    const implementation = implForWrapper(event);
+    implementation.clientX = implementation.screenX = params.x;
+    implementation.clientY = implementation.screenY = params.y;
+  }
+  return dispatchDriverEvent(target, event);
 }
 
 function mouseEvent(window, target, type, params, button, buttons, detail = 0) {

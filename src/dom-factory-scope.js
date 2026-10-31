@@ -6,16 +6,23 @@ import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
 const {lookupCEDefinition}=require('jsdom/lib/jsdom/living/helpers/custom-elements.js');
 const {HTML_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
-const scopes=[],kinds=new Set(),globals=new WeakMap(),primaryScopes=new WeakMap();
+const scopes=[],kinds=new Set(),globals=new WeakMap(),primaryScopes=new WeakMap(),realmGlobals=new WeakMap();
 const nil=()=>Object.create(null);
 function context(value){return vm.isContext(value)?value:utils.implForWrapper(value)?._globalObject;}
+// Plain vm.Context sandboxes and their genuine JS globals can be distinct
+// objects. The allocation authority is a validated real Context/global pair,
+// never an authored _globalObject or reflected prototype.
+export function registerDOMAllocationRealm(context,globalObject){
+ if(!vm.isContext(context)||vm.runInContext('globalThis',context)!==globalObject)throw new TypeError('An actual allocation Context/global pair is required');
+ realmGlobals.set(context,globalObject);
+}
 export function registerDOMAllocationKind(kind){kinds.add(kind);}
 export function domWrapperGlobal(value,fallback){return globals.get(value)??fallback;}
 export function recordDOMWrapperGlobal(value,globalObject){globals.set(value,globalObject);return value;}
 export function selectDOMWrapperAllocation(globalObject,prototype,kind){
  const scope=scopes.at(-1);
  if(!scope?.active||!kinds.has(kind)||context(globalObject)!==scope.source)return Object.assign(nil(),{globalObject,prototype});
- const selected=scope.target,Constructor=selected[utils.ctorRegistrySymbol]?.[kind];
+ const selected=scope.target,Constructor=(realmGlobals.get(selected)??selected)[utils.ctorRegistrySymbol]?.[kind];
  if(!Constructor)return Object.assign(nil(),{globalObject,prototype});
  return Object.assign(nil(),{globalObject:selected,prototype:Constructor.prototype,scope});
 }

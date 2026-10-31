@@ -1,0 +1,38 @@
+[
+  [
+    "extendedEventValues",
+    "(()=>{const c=new CompositionEvent('compositionupdate',{data:'red'}),i=document.createEvent('InputEvent'),s=new SecurityPolicyViolationEvent('securitypolicyviolation',{documentURI:'https://example.test/'});return JSON.stringify([c.data,i instanceof InputEvent,s.documentURI])})()",
+    "PureScript Puppeteer observes actual composed, input and policy Event interfaces",
+    "[\"red\",true,\"https://example.test/\"]"
+  ],
+  [
+    "commandEditingValues",
+    "(()=>{const input=document.createElement('input');input.value='abc';document.body.append(input);input.focus();input.setSelectionRange(1,2);const events=[];input.oninput=e=>events.push([e.inputType,e.data,e.isTrusted]);const ok=document.execCommand('insertText',false,'X'),result=JSON.stringify([ok,input.value,input.selectionStart,events]);input.remove();return result})()",
+    "PureScript Puppeteer edits actual focused input state and receives the trusted command event",
+    "[true,\"aXc\",2,[[\"insertText\",\"X\",true]]]"
+  ],
+  [
+    "controlInterfaceValues",
+    "(()=>{const input=document.createElement('input');return JSON.stringify([Object.getPrototypeOf(HTMLInputElement.prototype.stepUp)===Function.prototype,Object.getPrototypeOf(ValidityState.prototype)===Object.prototype,input.validity===input.validity,input.validity instanceof ValidityState])})()",
+    "PureScript Puppeteer observes actual VM control interfaces and canonical cached validity",
+    "[true,true,true,true]"
+  ],
+  [
+    "attributeNameValues",
+    "(()=>{const element=document.createElement('div');element.setAttributeNS('urn:actual','a:b','value');const a=element.getAttributeNode('a:b');return JSON.stringify([a.name,a.localName,a.namespaceURI,a.ownerElement===element,element.getAttribute('a:b')])})()",
+    "PureScript Puppeteer mutates actual qualified attribute names and preserves owner identity",
+    "[\"a:b\",\"a:b\",null,true,\"value\"]"
+  ],
+  [
+    "editableInheritanceValues",
+    "(()=>{const host=document.createElement('div'),child=document.createElement('span');host.contentEditable='true';host.append(child);document.body.append(host);const row=[child.isContentEditable,host.getAttribute('contenteditable')];host.contentEditable='inherit';row.push(host.getAttribute('contenteditable'),child.isContentEditable);host.remove();return JSON.stringify(row)})()",
+    "PureScript Puppeteer follows actual editable inheritance and inherit attribute removal",
+    "[true,\"true\",null,false]"
+  ],
+  [
+    "inertSelectedTextValues",
+    "(()=>{const host=document.createElement('div');host.innerHTML='<span>A</span><span inert>B</span><span>C</span>';document.body.append(host);const range=document.createRange(),selection=getSelection();range.selectNodeContents(host);selection.removeAllRanges();selection.addRange(range);const result=JSON.stringify([selection.toString(),range.toString()]);selection.removeAllRanges();host.remove();return result})()",
+    "PureScript Puppeteer filters real inert selected text while retaining raw Range text",
+    "[\"AC\",\"ABC\"]"
+  ]
+]

@@ -1,0 +1,3163 @@
+--- /dev/null
++++ b/src/event-api-parity.js
+@@ -0,0 +1,151 @@
++// Independent Event extensions over the canonical private Event implementation.
++// Public functions and receivers are created in the actual selected VM; all
++// extension state and trusted allocation/dispatch authority remain Host-private.
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {types} from 'node:util';
++import {eventImplementation,implementationForWrapper,bindEventImplementation,preparePrivateEvent} from './dom-event-state.js';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {callDOMFactory,registerDOMAllocationKind,finishDOMWrapperSetup,domWrapperGlobal} from './dom-factory-scope.js';
++import {registerPlatformFactoryKind,installPlatformFactoryHooks} from './platform-factory-hooks.js';
++import {createDOMWrapperShell} from './dom-wrapper-realms.js';
++installPlatformFactoryHooks();
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const DOMExceptionIDL=require('jsdom/lib/jsdom/living/generated/DOMException.js');
++const EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js');
++const CompositionIDL=require('jsdom/lib/jsdom/living/generated/CompositionEvent.js'),InputIDL=require('jsdom/lib/jsdom/living/generated/InputEvent.js');
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const MouseImpl=require('jsdom/lib/jsdom/living/events/MouseEvent-impl.js').implementation;
++const KeyboardImpl=require('jsdom/lib/jsdom/living/events/KeyboardEvent-impl.js').implementation;
++const UIImpl=require('jsdom/lib/jsdom/living/events/UIEvent-impl.js').implementation;
++const conversions=require('webidl-conversions');
++const records=new WeakMap(),extensions=new WeakMap(),errorTypes=new WeakMap();
++const define=Object.defineProperty,apply=Reflect.apply,floor=Math.floor;
++const member=(object,key)=>object!=null&&key in object?object[key]:undefined;
++const hasObject=v=>v!==null&&(typeof v==='object'||typeof v==='function');
++const kinds=['BeforeUnloadEvent','SecurityPolicyViolationEvent','PromiseRejectionEvent'];
++for(const kind of kinds)registerPlatformFactoryKind(kind);
++for(const kind of ['Event','CustomEvent','ErrorEvent','FocusEvent','HashChangeEvent','KeyboardEvent','MessageEvent','MouseEvent','PopStateEvent','ProgressEvent','TouchEvent','UIEvent','CompositionEvent','InputEvent','BeforeUnloadEvent'])registerDOMAllocationKind(kind);
++function convert(globalObject,type,value){return conversions[type](value,{globals:errorTypes.get(globalObject)??globalObject})}
++function eventInit(globalObject,obj,ret){for(const key of ['bubbles','cancelable','composed'])ret[key]=!!member(obj,key)}
++function uiInit(globalObject,obj,ret){eventInit(globalObject,obj,ret);const detail=member(obj,'detail');ret.detail=detail===undefined?0:convert(globalObject,'long',detail);const view=member(obj,'view');ret.view=view==null?null:utils.tryImplForWrapper(view);ret.which=0}
++function mouseInit(globalObject,obj,ret){
++ uiInit(globalObject,obj,ret);
++ for(const key of ['altKey','button','buttons','clientX','clientY','ctrlKey','metaKey','relatedTarget','screenX','screenY','shiftKey']){
++  const value=member(obj,key);
++  if(key.endsWith('Key'))ret[key]=!!value;
++  else if(key==='relatedTarget')ret[key]=value==null?null:require('jsdom/lib/jsdom/living/generated/EventTarget.js').convert(globalObject,value);
++  else if(key==='button'||key==='buttons')ret[key]=value===undefined?0:convert(globalObject,key==='button'?'short':'unsigned short',value);
++  // Native constructors use unrestricted double, rounded toward -Infinity;
++  // legacy initMouseEvent retains its independent WebIDL long conversion.
++  else ret[key]=value===undefined?0:floor(convert(globalObject,'unrestricted double',value));
++ }
++}
++function keyboardInit(globalObject,obj,ret){
++ uiInit(globalObject,obj,ret);
++ for(const key of ['altKey','charCode','code','ctrlKey','isComposing','key','keyCode','location','metaKey','repeat','shiftKey']){
++  const value=member(obj,key);
++  if(['code','key'].includes(key))ret[key]=value===undefined?'':convert(globalObject,'DOMString',value);
++  else if(['charCode','keyCode','location'].includes(key))ret[key]=value===undefined?0:convert(globalObject,'unsigned long',value);
++  else ret[key]=!!value;
++ }
++}
++// Canonical generated constructors keep their original dictionary validation,
++// setup, wrapper identity and brands. The same conversion is also installed in
++// the separately compiled utility generated-module graph.
++export function configureEventDictionary(kind,module){
++ if(kind==='MouseEventInit')module._convertInherit=mouseInit;
++ if(kind==='KeyboardEventInit')module._convertInherit=keyboardInit;
++}
++for(const kind of ['MouseEventInit','KeyboardEventInit'])configureEventDictionary(kind,require('jsdom/lib/jsdom/living/generated/'+kind+'.js'));
++function modifierState(key){
++ switch(key){case'Control':return !!this.ctrlKey;case'Alt':case'AltGraph':return !!this.altKey;case'Shift':return !!this.shiftKey;case'Meta':return !!this.metaKey;case'Accel':return !!(this.ctrlKey||this.metaKey);default:return false}
++}
++MouseImpl.prototype.getModifierState=modifierState;KeyboardImpl.prototype.getModifierState=modifierState;
++const originalCreateEvent=DocumentImpl.prototype.createEvent;
++DocumentImpl.prototype.createEvent=function(type){
++ const lower=type.toLowerCase(),globalObject=this._globalObject;
++ if(lower==='compositionevent'||lower==='inputevent'){
++  const implementation=(lower==='compositionevent'?CompositionIDL:InputIDL).createImpl(globalObject,['']);implementation._initializedFlag=false;return implementation;
++ }
++ if(lower==='beforeunloadevent'){
++  const record=records.get(globalObject);if(!record)return apply(originalCreateEvent,this,[type]);
++  const value=record.createBefore(),implementation=eventImplementation(value);implementation._initializedFlag=false;return implementation;
++ }
++ try{return apply(originalCreateEvent,this,[type])}catch(error){if(DOMExceptionIDL.is(error)&&implementationForWrapper(error).name==='NotSupportedError')throw DOMExceptionIDL.create(globalObject,['The operation is not supported','NotSupportedError']);throw error}
++};
++function dictionary(record,value){if(value==null)return null;if(!hasObject(value))throw new record.TypeError('invalid argument');return value}
++function domString(record,value){return conversions.DOMString(value,{globals:record})}
++function createExtension(record,receiver,kind,type,options){
++ type=domString(record,type);options=dictionary(record,options);
++ const init=Object.create(null);eventInit(record,options,init);
++ const slot=Object.create(null);slot.kind=kind;
++ if(kind==='PromiseRejectionEvent'){
++  const promise=member(options,'promise');if(promise!=null&&!types.isPromise(promise))throw new record.TypeError('invalid argument');slot.promise=promise??null;
++  slot.reason=member(options,'reason')??null;
++ }else if(kind==='SecurityPolicyViolationEvent'){
++  // Inherited EventInit is converted first, but Native uses these fixed initial
++  // propagation flags. Subsequent initEvent follows the real Event algorithm.
++  init.bubbles=true;init.cancelable=false;init.composed=true;
++  for(const key of ['blockedURI','columnNumber','disposition','documentURI','effectiveDirective','lineNumber','originalPolicy','referrer','sample','sourceFile','statusCode','violatedDirective']){
++   const value=member(options,key);
++   if(key==='disposition'){const disposition=value===undefined?'enforce':domString(record,value);if(disposition!=='enforce'&&disposition!=='report')throw new record.TypeError('invalid argument');slot[key]=disposition}
++   else if(['columnNumber','lineNumber','statusCode'].includes(key)){
++    const number=value===undefined?0:conversions['unsigned long'](value,{globals:record});if(key==='statusCode'&&number>65535)throw new record.TypeError('invalid argument');slot[key]=number;
++   }else slot[key]=value===undefined?'':domString(record,value);
++  }
++ }else slot.returnValue='';
++ EventIDL.setup(receiver,record.globalObject,[type,init]);
++ const implementation=eventImplementation(receiver)??implementationForWrapper(receiver);extensions.set(implementation,slot);
++ registerPlatformFactory(receiver,{kind,implementation,globalObject:domWrapperGlobal(receiver,record.globalObject)});record.onConstruct?.(receiver,implementation,kind);return receiver;
++}
++function publicDefinitions(bridge,Event,TypeError){
++ 'use strict';
++ const define=Object.defineProperty,setPrototype=Object.setPrototypeOf;
++ function BeforeUnloadEvent(){throw new TypeError('Illegal Constructor')}
++ function SecurityPolicyViolationEvent(type){if(!new.target||arguments.length<1)throw new TypeError('invalid argument');return bridge.construct(this,'SecurityPolicyViolationEvent',type,arguments[1])}
++ function PromiseRejectionEvent(type){if(!new.target||arguments.length<1)throw new TypeError('invalid argument');return bridge.construct(this,'PromiseRejectionEvent',type,arguments[1])}
++ const constructors={BeforeUnloadEvent,SecurityPolicyViolationEvent,PromiseRejectionEvent};
++ for(const [kind,C]of Object.entries(constructors)){
++  setPrototype(C,Event);setPrototype(C.prototype,Event.prototype);delete C.prototype.constructor;
++  const keys=kind==='BeforeUnloadEvent'?['returnValue']:kind==='PromiseRejectionEvent'?['reason','promise']:['documentURI','referrer','blockedURI','violatedDirective','effectiveDirective','originalPolicy','sourceFile','sample','disposition','statusCode','lineNumber','columnNumber'];
++  for(const key of keys){const get=Object.getOwnPropertyDescriptor({get [key](){return bridge.read(this,kind,key)}},key).get,property={get,enumerable:true,configurable:true};if(kind==='BeforeUnloadEvent')property.set=Object.getOwnPropertyDescriptor({set returnValue(value){bridge.write(this,value)}},'returnValue').set;define(C.prototype,key,property)}
++  define(C.prototype,'constructor',{value:C,writable:true,configurable:true});define(C.prototype,Symbol.toStringTag,{value:kind,configurable:true});define(C,'prototype',{writable:false});
++ }
++ const which=Object.getOwnPropertyDescriptor({get which(){return bridge.which(this)}},'which').get;
++ const layerX=Object.getOwnPropertyDescriptor({get layerX(){return bridge.layer(this,'clientX')}},'layerX').get;
++ const layerY=Object.getOwnPropertyDescriptor({get layerY(){return bridge.layer(this,'clientY')}},'layerY').get;
++ return[BeforeUnloadEvent,SecurityPolicyViolationEvent,PromiseRejectionEvent,which,layerX,layerY,({createEvent(type){return bridge.createEvent(this,arguments)}}).createEvent];
++}
++export function customEventInterface(implementation){return extensions.get(implementation)?.kind}
++export function wrapCustomEvent(globalObject,implementation){
++ const record=records.get(globalObject),slot=extensions.get(implementation);if(!record||!slot)return undefined;
++ const value=createDOMWrapperShell(record.context??globalObject,record.constructors[slot.kind].prototype,slot.kind);preparePrivateEvent(value,globalObject);bindEventImplementation(value,implementation);registerPlatformFactory(value,{kind:slot.kind,implementation,globalObject});return value;
++}
++export function installEventAPIParity(globalObject,{context,Event=globalObject.Event,onConstruct,onFactoryConstruct}={}){
++ let prior=records.get(globalObject);if(prior)return prior;
++ context??=vm.isContext(globalObject)?globalObject:implementationForWrapper(globalObject)?._globalObject;
++ const record=Object.assign(Object.create(null),{globalObject,context,TypeError:globalObject.TypeError,String:globalObject.String,Number:globalObject.Number,onConstruct,onFactoryConstruct});records.set(globalObject,record);errorTypes.set(globalObject,record);if(context){records.set(context,record);errorTypes.set(context,record)}
++ const brand=(value,kind)=>{const implementation=eventImplementation(value),slot=implementation&&extensions.get(implementation);if(!slot||slot.kind!==kind)throw new record.TypeError('Illegal invocation');return slot};
++ const bridge={createEvent:(receiver,args)=>createDocumentEvent(globalObject,receiver,eventFactoryType(globalObject,receiver,args)),construct:(receiver,kind,type,options)=>createExtension(record,receiver,kind,type,options),read:(value,kind,key)=>brand(value,kind)[key],write(value,next){const slot=brand(value,'BeforeUnloadEvent');slot.returnValue=domString(record,next)},which(value){const implementation=eventImplementation(value);if(!(implementation instanceof UIImpl))throw new record.TypeError('Illegal invocation');return implementation instanceof MouseImpl?implementation.button+1:implementation instanceof KeyboardImpl?implementation.keyCode:implementation.which},layer(value,key){const implementation=eventImplementation(value);if(!(implementation instanceof MouseImpl))throw new record.TypeError('Illegal invocation');return implementation[key]}};
++ const result=vm.compileFunction('return ('+publicDefinitions.toString()+')(bridge,Event,TypeError)',['bridge','Event','TypeError'],vm.isContext(context)?{parsingContext:context}:{})(bridge,Event,record.TypeError);
++ record.constructors=Object.create(null);for(let index=0;index<kinds.length;index++)record.constructors[kinds[index]]=result[index];[record.which,record.layerX,record.layerY,record.createEvent]=[result[3],result[4],result[5],result[6]];record.createBefore=()=>{const value=createDOMWrapperShell(globalObject,record.constructors.BeforeUnloadEvent.prototype,'BeforeUnloadEvent');try{return createExtension(record,value,'BeforeUnloadEvent','',undefined)}finally{finishDOMWrapperSetup(value)}};const registry=utils.initCtorRegistry(globalObject);
++ for(const kind of kinds){const value=record.constructors[kind];define(globalObject,kind,{value,writable:true,configurable:true,enumerable:false});registry[kind]=value}
++ define(globalObject.Document.prototype,'createEvent',{value:record.createEvent,writable:true,enumerable:true,configurable:true});
++ define(globalObject.UIEvent.prototype,'which',{get:record.which,enumerable:true,configurable:true});
++ for(const key of ['layerX','layerY'])define(globalObject.MouseEvent.prototype,key,{get:record[key],enumerable:true,configurable:true});
++ return record;
++}
++
++// Actual engine-owned rejection delivery differs from authored dictionary
++// defaults: preserve the unhandled reason verbatim, then clear the late-event
++// reason. This seam is Host-only and never marks an authored dispatch trusted.
++export function createPromiseRejectionEvent(globalObject,type,promise,reason){
++ const record=records.get(globalObject);if(!record)throw new TypeError('Event realm is not installed');
++ const event=Reflect.construct(record.constructors.PromiseRejectionEvent,[type,{promise,cancelable:type==='unhandledrejection'}]);
++ extensions.get(eventImplementation(event)).reason=type==='unhandledrejection'?reason:null;return event;
++}
++
++function documentBacking(record,value){const factory=platformFactoryRecord(value);if(!(factory?.implementation instanceof DocumentImpl))throw new record.TypeError('Illegal invocation');return factory.implementation}
++export function eventFactoryType(globalObject,receiver,args){const record=records.get(globalObject);documentBacking(record,receiver);if(!args.length)throw new record.TypeError('invalid argument');return domString(record,args[0]).toLowerCase()}
++export function createDocumentEvent(globalObject,receiver,type){const record=records.get(globalObject),implementation=documentBacking(record,receiver),event=callDOMFactory(record.context??globalObject,implementation,'createEvent',[type]),value=utils.wrapperForImpl(event);return record.onFactoryConstruct?.(value,event)??value}
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,3 +1,4 @@
++import {installEventAPIParity,createPromiseRejectionEvent} from './event-api-parity.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ import { createHook } from 'node:async_hooks';
+@@ -70,8 +71,8 @@
+ }
+ 
+ function rejectionEvent(record, type, promise, reason) {
+-  const event = new record.PromiseRejectionEvent(type, { promise, reason, cancelable: type === 'unhandledrejection' });
+-  const impl = implForWrapper(event); impl.isTrusted = true;
++  const event = createPromiseRejectionEvent(record.window, type, promise, reason);
++  const impl = implForWrapper(event);
+   implForWrapper(record.window)._dispatch(impl);
+   return event;
+ }
+@@ -144,23 +145,7 @@
+   records.set(window, record);
+   records.set(implForWrapper(window)._globalObject, record);
+   promiseRealms.set(window.Promise.prototype, record);
+-  const Event = window.Event;
+-  const Promise = window.Promise;
+-  class PromiseRejectionEvent extends Event {
+-    constructor(type, options = {}) {
+-      if (arguments.length < 1) throw new window.TypeError('An event type is required.');
+-      if (!('promise' in options)) throw new window.TypeError('PromiseRejectionEvent requires promise.');
+-      super(type, options);
+-      Object.defineProperties(this, {
+-        promise: { value: Promise.resolve(options.promise), enumerable: true },
+-        reason: { value: options.reason, enumerable: true },
+-      });
+-    }
+-  }
+-  record.PromiseRejectionEvent = PromiseRejectionEvent;
+-  if (!window.PromiseRejectionEvent) Object.defineProperty(window, 'PromiseRejectionEvent', {
+-    value: PromiseRejectionEvent, configurable: true, writable: true,
+-  });
++  installEventAPIParity(window);
+   Object.defineProperty(window, 'reportError', { configurable: true, writable: true, enumerable: true,
+     value: function reportError(value) {
+       if (!arguments.length) throw new window.TypeError('reportError requires an argument.');
+--- a/src/dom-events.js
++++ b/src/dom-events.js
+@@ -1,3 +1,4 @@
++import {installEventAPIParity,eventFactoryType,createDocumentEvent} from './event-api-parity.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import 'jsdom';
+ import { createRequire } from 'node:module';
+@@ -42,8 +43,8 @@
+  tag(DragEvent,'DragEvent');
+  class TextEvent extends g.UIEvent{constructor(){illegal();}get data(){const s=brand(events,this);if(s.kind!=='text')throw error();return s.data;}initTextEvent(type,bubbles=false,cancelable=false,view=null,data='undefined'){const s=brand(events,this);if(s.kind!=='text')throw error();if(!arguments.length)throw error();if(bridge.dispatching(this))return;g.UIEvent.prototype.initUIEvent.call(this,type,bubbles,cancelable,view,0);s.data=data==null?'undefined':string(data);}}
+  tag(TextEvent,'TextEvent');
+- const createEvent=g.Document.prototype.createEvent;
+- Object.defineProperty(g.Document.prototype,'createEvent',{configurable:true,enumerable:true,writable:true,value:function(type){if(!arguments.length)throw error();const name=string(type).toLowerCase();if(!['textevent','dragevent','touchevent'].includes(name))return createEvent.call(this,type);const event=createEvent.call(this,name==='dragevent'?'MouseEvent':'UIEvent');if(name==='textevent'){Object.setPrototypeOf(event,TextEvent.prototype);events.set(event,{kind:'text',data:''});}else if(name==='dragevent'){Object.setPrototypeOf(event,DragEvent.prototype);events.set(event,{kind:'drag',dataTransfer:null});}else{Object.setPrototypeOf(event,TouchEvent.prototype);events.set(event,{kind:'touch',altKey:false,ctrlKey:false,metaKey:false,shiftKey:false,touches:touchList(),targetTouches:touchList(),changedTouches:touchList()});}return event;}});
++ const createEvent=function(type){return bridge.createEvent(this,type)};
++ Object.defineProperty(g.Document.prototype,'createEvent',{configurable:true,enumerable:true,writable:true,value:function(type){const name=bridge.eventType(this,arguments);if(!['textevent','dragevent','touchevent'].includes(name))return createEvent.call(this,name);const event=createEvent.call(this,name==='dragevent'?'MouseEvent':'UIEvent');if(name==='textevent'){Object.setPrototypeOf(event,TextEvent.prototype);events.set(event,{kind:'text',data:''});}else if(name==='dragevent'){Object.setPrototypeOf(event,DragEvent.prototype);events.set(event,{kind:'drag',dataTransfer:null});}else{Object.setPrototypeOf(event,TouchEvent.prototype);events.set(event,{kind:'touch',altKey:false,ctrlKey:false,metaKey:false,shiftKey:false,touches:touchList(),targetTouches:touchList(),changedTouches:touchList()});}return event;}});
+  class Touch{constructor(init){if(!arguments.length)throw error();init=dictionary(init);const state={};for(const key of['clientX','clientY','force','identifier','pageX','pageY','radiusX','radiusY','rotationAngle','screenX','screenY','target']){const value=init[key];if(key==='identifier'){if(value===undefined)throw error();state[key]=number(value)|0;}else if(key==='target'){if(!bridge.isEventTarget(value))throw error();state[key]=value;}else state[key]=value===undefined?0:restricted(value,['radiusX','radiusY','rotationAngle','force'].includes(key));}touches.set(this,state);}}
+  tag(Touch,'Touch');for(const key of['identifier','target','clientX','clientY','pageX','pageY','screenX','screenY','radiusX','radiusY','rotationAngle','force'])Object.defineProperty(Touch.prototype,key,{configurable:true,enumerable:true,get(){return brand(touches,this)[key];}});
+  class TouchList{constructor(){illegal();}get length(){return brand(touchLists,this).length;}item(at){if(!arguments.length)throw error();const value=number(at);if(!Number.isFinite(value)||value<0)throw error();return brand(touchLists,this)[Math.floor(value)]??null;}}
+@@ -54,4 +55,4 @@
+  for(const Constructor of[DataTransferItem,DataTransferItemList,DataTransfer,DragEvent,TextEvent,TouchList])for(const key of Object.getOwnPropertyNames(Constructor.prototype)){if(key==='constructor')continue;const descriptor=Object.getOwnPropertyDescriptor(Constructor.prototype,key);Object.defineProperty(Constructor.prototype,key,{...descriptor,enumerable:true});}
+  for(const[name,value]of Object.entries({DataTransferItem,DataTransferItemList,DataTransfer,DragEvent,TextEvent,Touch,TouchList,TouchEvent}))Object.defineProperty(g,name,{value,writable:true,configurable:true,enumerable:false});return{DataTransfer,DragEvent,TextEvent,Touch,TouchEvent};
+ }
+-export function installDOMEvents(page,window){if(installed.has(window))return installed.get(window);const controller=window.eval(`(${factory.toString()})`)(window,{shared,isFile:File.is,isElement:Element.is,isEventTarget:EventTarget.is,fileType:file=>implForWrapper(file).type,fileList:()=>FileList.create(window,[],{}),files(list,values){const impl=implForWrapper(list);impl.length=0;for(const value of values)impl.push(implForWrapper(value));},coordinate(event,key,value){implForWrapper(event)[key]=value;},dispatching:event=>implForWrapper(event)._dispatchFlag});installed.set(window,controller);return controller;}
++export function installDOMEvents(page,window){installEventAPIParity(window);if(installed.has(window))return installed.get(window);const controller=window.eval(`(${factory.toString()})`)(window,{shared,eventType:(receiver,args)=>eventFactoryType(window,receiver,args),createEvent:(receiver,type)=>createDocumentEvent(window,receiver,type),isFile:File.is,isElement:Element.is,isEventTarget:EventTarget.is,fileType:file=>implForWrapper(file).type,fileList:()=>FileList.create(window,[],{}),files(list,values){const impl=implForWrapper(list);impl.length=0;for(const value of values)impl.push(implForWrapper(value));},coordinate(event,key,value){implForWrapper(event)[key]=value;},dispatching:event=>implForWrapper(event)._dispatchFlag});installed.set(window,controller);return controller;}
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,5 @@
++import {registerDOMAllocationRealm} from './dom-factory-scope.js';
++import {installEventAPIParity,configureEventDictionary,customEventInterface,wrapCustomEvent} from './event-api-parity.js';
+ import {installPrivateEventUtils,transformPrivateEventSource,isPrivateEventKind,eventImplementation,bindEventImplementation} from './dom-event-state.js';
+ import {restoreWindowGlobalInheritance} from './window-global.js';
+ import {installConsole,consoleProtocolType} from './console.js';
+@@ -24,7 +26,7 @@
+ export function utilityNodeIdentity(value){const record=utilityWrapperRecord(value);if(!record)return undefined;const type=own(record.impl,'nodeType')?.value;if(!Number.isInteger(type)||type<1||type>12)return undefined;const document=type===9?record.impl:own(record.impl,'_ownerDocument')?.value;return {nodeType:type,ownerDocument:hostUtils.wrapperForImpl(document),className:record.interfaceName};}
+ 
+ export function createIsolatedWorld(mainWindow,{name='independent-utility-world',timeout=1000,signal,isWindowClosed,onError,resolveWindow,resolveImplementation,onConsole,onRealm,onWrapper}={}) {
+- const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
++ const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);registerDOMAllocationRealm(context,global);
+  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
+  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
+  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
+@@ -43,6 +45,7 @@
+   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
+   const cached=wrappers.get(impl);if(cached)return cached;
+   const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
++  const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
+   const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
+   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
+   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
+@@ -76,6 +79,7 @@
+  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
+   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
+   let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
++  configureEventDictionary(interfaceName,module.exports);
+   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
+    // Measured native producer quirk: MO arguments are real main-world values,
+    // while the authored callback itself continues in its genuine utility realm.
+@@ -85,6 +89,7 @@
+  }
+  Object.defineProperties(global,{window:{value:global,writable:false},self:{value:global,writable:false},top:{get:realmFunction(()=>resolveWindow?.(mainWindow.top)??global)},parent:{get:realmFunction(()=>resolveWindow?.(mainWindow.parent)??global)},closed:{get:realmFunction(()=>Boolean(isWindowClosed?.()??signal?.aborted))},frames:{value:global}});
+  load(interfacesPath).installInterfaces(global,['Window']);
++ installEventAPIParity(global,{context,onFactoryConstruct(wrapper,impl){const kind=customEventInterface(impl);if(!kind)return canonicalizeNew(interfaceFor(impl),wrapper);wrappers.set(impl,wrapper);const canonical=wrapCustomEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,kind);return wrapper},onConstruct(wrapper,impl,kind){wrappers.set(impl,wrapper);const canonical=wrapCustomEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,kind);}});
+  for(const[name,constructor]of Object.entries(global[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)utilityPrototypes.set(constructor.prototype,name);
+  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
+  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
+--- a/src/dom-factory-scope.js
++++ b/src/dom-factory-scope.js
+@@ -6,16 +6,23 @@
+ const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
+ const {lookupCEDefinition}=require('jsdom/lib/jsdom/living/helpers/custom-elements.js');
+ const {HTML_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
+-const scopes=[],kinds=new Set(),globals=new WeakMap(),primaryScopes=new WeakMap();
++const scopes=[],kinds=new Set(),globals=new WeakMap(),primaryScopes=new WeakMap(),realmGlobals=new WeakMap();
+ const nil=()=>Object.create(null);
+ function context(value){return vm.isContext(value)?value:utils.implForWrapper(value)?._globalObject;}
++// Plain vm.Context sandboxes and their genuine JS globals can be distinct
++// objects. The allocation authority is a validated real Context/global pair,
++// never an authored _globalObject or reflected prototype.
++export function registerDOMAllocationRealm(context,globalObject){
++ if(!vm.isContext(context)||vm.runInContext('globalThis',context)!==globalObject)throw new TypeError('An actual allocation Context/global pair is required');
++ realmGlobals.set(context,globalObject);
++}
+ export function registerDOMAllocationKind(kind){kinds.add(kind);}
+ export function domWrapperGlobal(value,fallback){return globals.get(value)??fallback;}
+ export function recordDOMWrapperGlobal(value,globalObject){globals.set(value,globalObject);return value;}
+ export function selectDOMWrapperAllocation(globalObject,prototype,kind){
+  const scope=scopes.at(-1);
+  if(!scope?.active||!kinds.has(kind)||context(globalObject)!==scope.source)return Object.assign(nil(),{globalObject,prototype});
+- const selected=scope.target,Constructor=selected[utils.ctorRegistrySymbol]?.[kind];
++ const selected=scope.target,Constructor=(realmGlobals.get(selected)??selected)[utils.ctorRegistrySymbol]?.[kind];
+  if(!Constructor)return Object.assign(nil(),{globalObject,prototype});
+  return Object.assign(nil(),{globalObject:selected,prototype:Constructor.prototype,scope});
+ }
+--- /dev/null
++++ b/test/event-api-parity.test.js
+@@ -0,0 +1,15 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{createHash}from'node:crypto';import{createRequire}from'node:module';
++import{Browser}from'../src/browser.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{getHeapBinding}from'../src/native-heap.js';import{eventImplementation}from'../src/dom-event-state.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),EventIDL=require('jsdom/lib/jsdom/living/generated/Event.js'),heap=getHeapBinding(),plain=v=>JSON.parse(JSON.stringify(v));
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<button id=button>actual</button>');return{page,w:page.dom.window}}
++for(const name of['first','details','conversion','has','shape','brands-dispatch','factory'])test('Event parity matches all measured Native '+name+' controls',async t=>{const{page}=await fixture(t),expression=await readFile(new URL('../docs/reference/event-api-parity/'+name+'-expression.js',import.meta.url),'utf8'),record=JSON.parse(await readFile(new URL('../docs/reference/event-api-parity/'+name+'-native.json',import.meta.url),'utf8'));assert.equal(createHash('sha256').update(expression).digest('hex'),record.expressionSHA256);assert.deepEqual(plain(await page.evaluate(expression)),record.observations)});
++// Real unhandled rejections run in a child process, outside node:test's own
++// unhandled-rejection observer, exactly like the browser CLI's process.
++import{execFileSync}from'node:child_process';
++for(const name of['rejection-undefined','rejection-producers'])test('actual owned Promise delivery matches Native '+name,async()=>{const record=JSON.parse(await readFile(new URL('../docs/reference/event-api-parity/'+name+'-native.json',import.meta.url),'utf8')),expression=await readFile(new URL('../docs/reference/event-api-parity/'+name+'-expression.js',import.meta.url),'utf8');assert.equal(createHash('sha256').update(expression).digest('hex'),record.expressionSHA256);const source=`import{Browser}from'./src/browser.js';import{readFile}from'node:fs/promises';const b=new Browser(),p=b.createPage();try{await p.navigate('data:text/html,<body>Promise');const expression=await readFile('docs/reference/event-api-parity/${name}-expression.js','utf8');console.log(JSON.stringify(await p.evaluate(expression)))}finally{b.close()}`;const value=execFileSync(process.execPath,['--input-type=module','-e',source],{cwd:new URL('..',import.meta.url),encoding:'utf8',timeout:10000});assert.deepEqual(JSON.parse(value),record.observations)});
++function realm(value,anchor){const p=Object.getPrototypeOf(value);try{for(let n=0;n<2;n++){assert.equal(heap.sameRealm(value,anchor),true);assert.equal(heap.sameRealm(value,{}),false);assert.equal(heap.creationGlobal(value),heap.creationGlobal(anchor));Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,p)}}
++test('Event extensions, accessors and actual setup receivers belong to the selected VM before/after null prototypes',async t=>{const{w,page}=await fixture(t),frame=w.document.createElement('iframe');w.document.body.append(frame);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());for(const g of[w,frame.contentWindow,world.global]){for(const name of['BeforeUnloadEvent','SecurityPolicyViolationEvent','PromiseRejectionEvent']){const C=g[name];realm(C,g.Object.prototype);realm(C.prototype,g.Object.prototype);for(const key of Reflect.ownKeys(C.prototype)){const d=Object.getOwnPropertyDescriptor(C.prototype,key);for(const field of['value','get','set'])if(typeof d[field]==='function')realm(d[field],g.Object.prototype)}const value=name==='BeforeUnloadEvent'?g.document.createEvent(name):new C('actual');realm(value,g.Object.prototype);realm(Object.getOwnPropertyDescriptor(value,'isTrusted').get,g.Object.prototype);assert.deepEqual(Reflect.ownKeys(value),['isTrusted']);assert.ok(eventImplementation(value))}for(const [C,key]of[[g.UIEvent,'which'],[g.MouseEvent,'layerX'],[g.MouseEvent,'layerY']])realm(Object.getOwnPropertyDescriptor(C.prototype,key).get,g.Object.prototype)}const original=EventIDL.setup;let input;EventIDL.setup=function(value,...args){input=value;return Reflect.apply(original,this,[value,...args])};let value;try{value=Reflect.construct(w.SecurityPolicyViolationEvent,['actual'],frame.contentWindow.Event)}finally{EventIDL.setup=original}assert.equal(value,input);assert.equal(Object.getPrototypeOf(value),frame.contentWindow.Event.prototype);realm(value,w.Object.prototype)});
++test('custom Event getters and setters reject copied symbols, inherited values and proxies without authored reads',async t=>{const{w}=await fixture(t);for(const [name,key]of[['BeforeUnloadEvent','returnValue'],['SecurityPolicyViolationEvent','documentURI'],['PromiseRejectionEvent','reason']]){const value=name==='BeforeUnloadEvent'?w.document.createEvent(name):new w[name]('x'),get=Object.getOwnPropertyDescriptor(w[name].prototype,key).get,backend=eventImplementation(value),fake=Object.create(w[name].prototype);Object.defineProperty(fake,utils.implSymbol,{value:backend});let traps=0;const proxy=new Proxy(value,{get(){traps++;throw 1},getOwnPropertyDescriptor(){traps++;throw 2}});for(const invalid of[fake,Object.create(value),proxy])assert.throws(()=>get.call(invalid),e=>e instanceof w.TypeError);assert.equal(traps,0);assert.equal(utils.implForWrapper(fake),null);if(name==='BeforeUnloadEvent'){const setter=Object.getOwnPropertyDescriptor(w[name].prototype,key).set;assert.throws(()=>setter.call(fake,{toString(){throw Error('must not convert')}}),e=>e instanceof w.TypeError)}}});
++test('real custom Events cross utility dispatch in both directions with canonical realm wrappers and genuine targets',async t=>{const{page,w}=await fixture(t),world=createIsolatedWorld(w,{signal:page.documentAbort.signal});const actual={main:[]};w.document.getElementById('button').addEventListener('probe',function(e){actual.main.push([e.constructor.name,e instanceof w.Event,e instanceof w[e.constructor.name],e.target===this,e.isTrusted,e.reason??e.documentURI??e.returnValue,Object.getOwnPropertySymbols(e).length])});world.evaluate(`globalThis.rows=[];document.getElementById('button').addEventListener('probe',function(e){rows.push([e.constructor.name,e instanceof Event,e instanceof globalThis[e.constructor.name],e.target===this,e.isTrusted,e.reason??e.documentURI??e.returnValue,Object.getOwnPropertySymbols(e).length])})`);for(const[name,options]of[['PromiseRejectionEvent',{reason:'main'}],['SecurityPolicyViolationEvent',{documentURI:'main'}]])w.document.getElementById('button').dispatchEvent(new w[name]('probe',options));const before=w.document.createEvent('BeforeUnloadEvent');before.initEvent('probe');before.returnValue='main';w.document.getElementById('button').dispatchEvent(before);world.evaluate(`for(const[name,options]of[['PromiseRejectionEvent',{reason:'utility'}],['SecurityPolicyViolationEvent',{documentURI:'utility'}]])document.getElementById('button').dispatchEvent(new globalThis[name]('probe',options));const before=document.createEvent('BeforeUnloadEvent');before.initEvent('probe');before.returnValue='utility';document.getElementById('button').dispatchEvent(before)`);actual.utility=plain(world.evaluate('rows'));const expected=JSON.parse(await readFile(new URL('../docs/reference/event-api-parity/utility-native.json',import.meta.url),'utf8'));assert.deepEqual(actual,expected.observations)});
++test('Event extension construction retains captured VM intrinsics after authored globals change',async t=>{const{page}=await fixture(t);assert.deepEqual(plain(await page.evaluate(`(()=>{const C=SecurityPolicyViolationEvent,P=PromiseRejectionEvent,E=TypeError,get=Object.getOwnPropertyDescriptor(C.prototype,'documentURI').get,why={actual:true},promise=Promise.resolve();const keys=['Object','String','Number','TypeError','Event','SecurityPolicyViolationEvent','PromiseRejectionEvent'],originals=keys.map(key=>globalThis[key]);try{for(const key of keys)globalThis[key]=function(){throw Error('authored '+key)};const e=new C('x',{documentURI:42,statusCode:3}),p=new P('x',{promise,reason:why});let fake=false;try{get.call({})}catch(x){fake=x instanceof E}return[e.documentURI,e.statusCode,p.promise===promise,p.reason===why,fake]}finally{keys.forEach((key,i)=>globalThis[key]=originals[i])}})()`)),['42',3,true,true,true])});
++test('Event factories use genuine private Document authority and selected factory context',async t=>{const{w,page}=await fixture(t),backend=utils.implForWrapper(w.document),fake=Object.create(w.Document.prototype),convert={toString(){throw Error('must reject before conversion')}};Object.defineProperty(fake,utils.implSymbol,{value:backend});assert.throws(()=>w.Document.prototype.createEvent.call(fake,convert),e=>e instanceof w.TypeError);let traps=0;const proxy=new Proxy(w.document,{get(){traps++;throw 1},getOwnPropertyDescriptor(){traps++;throw 2}});assert.throws(()=>w.Document.prototype.createEvent.call(proxy,convert),e=>e instanceof w.TypeError);assert.equal(traps,0);const frame=w.document.createElement('iframe');w.document.body.append(frame);const descriptor=Object.getOwnPropertyDescriptor(w.document,utils.implSymbol);try{Object.defineProperty(w.document,utils.implSymbol,{value:utils.implForWrapper(frame.contentWindow.document),configurable:true});const event=w.Document.prototype.createEvent.call(w.document,'CompositionEvent');assert.ok(event instanceof w.CompositionEvent);realm(event,w.Object.prototype);assert.equal(eventImplementation(event)._globalObject,backend._globalObject)}finally{Object.defineProperty(w.document,utils.implSymbol,descriptor)}const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});for(const name of['CompositionEvent','InputEvent','BeforeUnloadEvent']){const event=world.global.Document.prototype.createEvent.call(w.document,name);assert.ok(event instanceof world.global[name]);realm(event,world.global.Object.prototype)}});
+--- a/test/errors.test.js
++++ b/test/errors.test.js
+@@ -162,19 +162,19 @@
+   });
+ }
+ 
+-test('owned page Promise rejection events are trusted, cancelable and paired with late rejectionhandled', async () => {
++test('owned page Promise rejection events match Native untrusted delivery and late null reason', async () => {
+   const result = await child(`
+     window.eval(\`globalThis.events=[];
+       addEventListener('unhandledrejection', e=>{events.push([e.type,e.isTrusted,e.cancelable,e.reason.message,e.promise===pending,e instanceof PromiseRejectionEvent]);e.preventDefault();});
+-      addEventListener('rejectionhandled', e=>events.push([e.type,e.isTrusted,e.cancelable,e.reason.message,e.promise===pending]));
++      addEventListener('rejectionhandled', e=>events.push([e.type,e.isTrusted,e.cancelable,e.reason,e.promise===pending]));
+       globalThis.pending=Promise.reject(new Error('page failure'));
+       setTimeout(()=>pending.catch(()=>{}),20);\`);
+     setTimeout(()=>{console.log(JSON.stringify({events:Array.from(window.events),errors}));dom.window.close()},80);
+   `);
+   assert.equal(result.code, 0, result.stderr);
+   assert.deepEqual(JSON.parse(result.stdout), { events: [
+-    ['unhandledrejection', true, true, 'page failure', true, true],
+-    ['rejectionhandled', true, false, 'page failure', true],
++    ['unhandledrejection', false, true, 'page failure', true, true],
++    ['rejectionhandled', false, false, null, true],
+   ], errors: [] });
+ });
+ 
+--- a/docs/reference/window-errors-contract.md
++++ b/docs/reference/window-errors-contract.md
+@@ -33,9 +33,11 @@
+ aborted or explicitly disposed documents suppress pending callback execution.
+ 
+ A shared async hook records Promises created with registered document-realm
+-prototypes using weak ownership maps. Unhandled owned rejections dispatch trusted
+-cancelable `unhandledrejection` events; a late catch produces `rejectionhandled`
+-with the same Promise and reason. An uncanceled rejection forwards one safe
++prototypes using weak ownership maps. Unhandled owned rejections dispatch
++untrusted, cancelable `unhandledrejection` events with the original Promise and
++reason, including undefined. A late catch produces an untrusted, noncancelable
++`rejectionhandled` event with the same Promise and a null reason. These details
++match the pinned Native producer controls in `event-api-parity/`. An uncanceled rejection forwards one safe
+ VirtualConsole error without dispatching an additional Window error event.
+ Disposed document rejections are ignored. The process listeners remain installed
+ to recognize already-created promises after disposal; unrelated host rejections
+--- /dev/null
++++ b/docs/reference/event-api-parity-contract.md
+@@ -0,0 +1,47 @@
++# Measured Event API parity
++
++The pinned Native binary is SHA256
++`9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f`.
++The accompanying expressions and raw records contain 220 observations, including
++12 main/utility dispatch rows. They measure constructor exposure and descriptors,
++dictionary has/get order, conversion and readonly fields, authentic Promise
++identity, modifier state, fractional/nonfinite coordinates, real dispatch,
++reinitialization, private brands, cloning, and borrowed factory allocation.
++
++CompositionEvent and InputEvent factories use their canonical generated
++implementations. BeforeUnloadEvent is exposed with an illegal constructor;
++createEvent allocates an uninitialized genuine Event with a private string
++returnValue, which persists through initEvent. SecurityPolicyViolationEvent has
++private readonly scalar fields and the observed initial propagation flags.
++This event value interface does not implement Content Security Policy enforcement.
++
++PromiseRejectionEvent retains a genuine Promise and the original reason object.
++Missing/undefined authored fields default to null. Actual owned promise delivery
++preserves the unhandled reason including undefined; both automatic events are
++untrusted, and rejectionhandled has a null reason. The existing real async hook,
++Promise ownership, cancellation and document retirement remain authoritative.
++
++Mouse constructor coordinates are unrestricted doubles rounded toward negative
++infinity, preserving nonfinite values and negative zero. Legacy initMouseEvent
++retains its separate long conversions. AltGraph reflects altKey and Accel reflects
++ctrlKey or metaKey; unsupported modifier state is false. Mouse which derives from
++button, Keyboard which from keyCode, and layer coordinates reflect client values.
++
++New values use the same actual Event wrapper and canonical EventImpl dispatch
++backend, with Host-private extension slots and exact receiver identity. Reflected
++symbols, inherited prototypes and proxies cannot authenticate. Public functions,
++prototypes, getters and values have actual selected-VM creation contexts, verified
++through public V8 before and after nulling prototypes. Controller records and
++constructor tables remain Host objects; private state is not compiled into VM
++CJS tables or returned by scalar public bridges.
++
++Document.createEvent checks the private genuine Document factory record before
++conversion, converts once, and uses the existing scoped real factory allocation
++in the method's realm. Context/global registration is validated against the actual
++VM global. The namespace-composed variant uses one startup capture helper for
++both wrapper allocation and factory registry lookup.
++
++This is a bounded Window/frame/utility slice. It retains the prerequisite's
++explicit standalone EventTarget composedPath contents difference and genuine JS
++function source; it adds no toString, prototype, key, protocol or heap masks.
++Worker exposure and other Event APIs are not claimed by these controls.
+--- /dev/null
++++ b/docs/reference/event-api-parity/brands-dispatch-expression.js
+@@ -0,0 +1,12 @@
++(async()=>{const out=[],row=(name,fn)=>{try{out.push([name,fn()])}catch(e){out.push([name,{error:e.name,message:e.message}])}},fields=['reason','promise','documentURI','returnValue'];
++const cases=[['PromiseRejectionEvent','reason',new PromiseRejectionEvent('x',{reason:{real:true},promise:Promise.resolve(3)})],['SecurityPolicyViolationEvent','documentURI',new SecurityPolicyViolationEvent('x',{documentURI:'real'})],['BeforeUnloadEvent','returnValue',document.createEvent('BeforeUnloadEvent')]];
++for(const [kind,key,event] of cases){const C=globalThis[kind],get=Object.getOwnPropertyDescriptor(C.prototype,key).get;
++ row(kind+':authentic',()=>[event instanceof C,event instanceof Event,Reflect.ownKeys(event).map(String),Reflect.set(event,key,'authored'),get.call(event)===event[key],Object.getOwnPropertyDescriptor(event,'isTrusted').get.call(event)]);
++ row(kind+':forged',()=>{let traps=0;const proxy=new Proxy(event,{get(){traps++;throw 1},getOwnPropertyDescriptor(){traps++;throw 2}});const result=[{},Object.create(C.prototype),Object.create(event),proxy].map(value=>{try{get.call(value);return false}catch(e){return e instanceof TypeError}});return[result,traps]});
++ row(kind+':dispatchReinit',()=>{event.initEvent('actual',true,true);let actual;const target=document.createElement('button');document.body.append(target);target.addEventListener('actual',function(e){e.initEvent('ignored');e.preventDefault();actual=[e===event,e.target===this,e.currentTarget===this,e.isTrusted,e.type,e.defaultPrevented]});const result=target.dispatchEvent(event);const before=event[key];event.initEvent('after',false,false);target.remove();return [actual,result,event.type,event.defaultPrevented,event[key]===before]});
++ row(kind+':clone',()=>{try{structuredClone(event);return'cloned'}catch(e){return e.name}});
++ row(kind+':fakeClone',()=>{try{const fake=Object.create(C.prototype);fake.x=3;const c=structuredClone(fake);return [c.x,Object.getPrototypeOf(c)===Object.prototype]}catch(e){return e.name}});
++}
++const frame=document.createElement('iframe');document.body.append(frame);const w=frame.contentWindow;await new Promise(r=>setTimeout(r,10));for(const name of ['PromiseRejectionEvent','SecurityPolicyViolationEvent'])row(name+':foreignNewTarget',()=>{const get=Object.getOwnPropertyDescriptor(globalThis[name].prototype,name==='PromiseRejectionEvent'?'reason':'documentURI').get;const event=Reflect.construct(globalThis[name],['x',{}],w.Event);return[Object.getPrototypeOf(event)===w.Event.prototype,get.call(event),Object.getOwnPropertyDescriptor(Event.prototype,'type').get.call(event)]});
++row('beforeUnloadBrandEventValue',()=>{const e=document.createEvent('BeforeUnloadEvent');const get=Object.getOwnPropertyDescriptor(BeforeUnloadEvent.prototype,'returnValue').get,set=Object.getOwnPropertyDescriptor(BeforeUnloadEvent.prototype,'returnValue').set;e.initEvent('x',true,true);set.call(e,'saved');Object.getOwnPropertyDescriptor(Event.prototype,'returnValue').set.call(e,false);return[get.call(e),e.defaultPrevented,Object.getOwnPropertyDescriptor(Event.prototype,'returnValue').get.call(e)]});
++frame.remove();return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/brands-dispatch-native.json
+@@ -0,0 +1,191 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "8d9b16990bace7fd3b76f17bf2082496bfa6b1c339e847ae643c565920d92e66",
++  "observations": [
++    [
++      "PromiseRejectionEvent:authentic",
++      [
++        true,
++        true,
++        [
++          "isTrusted"
++        ],
++        false,
++        true,
++        false
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:forged",
++      [
++        [
++          true,
++          true,
++          true,
++          true
++        ],
++        0
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:dispatchReinit",
++      [
++        [
++          true,
++          true,
++          true,
++          false,
++          "actual",
++          true
++        ],
++        false,
++        "after",
++        false,
++        true
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:clone",
++      "DataCloneError"
++    ],
++    [
++      "PromiseRejectionEvent:fakeClone",
++      [
++        3,
++        true
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:authentic",
++      [
++        true,
++        true,
++        [
++          "isTrusted"
++        ],
++        false,
++        true,
++        false
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:forged",
++      [
++        [
++          true,
++          true,
++          true,
++          true
++        ],
++        0
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:dispatchReinit",
++      [
++        [
++          true,
++          true,
++          true,
++          false,
++          "actual",
++          true
++        ],
++        false,
++        "after",
++        false,
++        true
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:clone",
++      "DataCloneError"
++    ],
++    [
++      "SecurityPolicyViolationEvent:fakeClone",
++      [
++        3,
++        true
++      ]
++    ],
++    [
++      "BeforeUnloadEvent:authentic",
++      [
++        true,
++        true,
++        [
++          "isTrusted"
++        ],
++        true,
++        true,
++        false
++      ]
++    ],
++    [
++      "BeforeUnloadEvent:forged",
++      [
++        [
++          true,
++          true,
++          true,
++          true
++        ],
++        0
++      ]
++    ],
++    [
++      "BeforeUnloadEvent:dispatchReinit",
++      [
++        [
++          true,
++          true,
++          true,
++          false,
++          "actual",
++          true
++        ],
++        false,
++        "after",
++        false,
++        true
++      ]
++    ],
++    [
++      "BeforeUnloadEvent:clone",
++      "DataCloneError"
++    ],
++    [
++      "BeforeUnloadEvent:fakeClone",
++      [
++        3,
++        true
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:foreignNewTarget",
++      [
++        true,
++        null,
++        "x"
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:foreignNewTarget",
++      [
++        true,
++        "",
++        "x"
++      ]
++    ],
++    [
++      "beforeUnloadBrandEventValue",
++      [
++        "saved",
++        true,
++        false
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/conversion-expression.js
+@@ -0,0 +1,7 @@
++(()=>{const out=[],row=(k,fn)=>{try{out.push([k,fn()])}catch(e){out.push([k,e.name+':'+e.message])}};
++for(const n of ['SecurityPolicyViolationEvent','PromiseRejectionEvent','MouseEvent']){for(const mode of ['own','inherited','getters','proxy'])row(n+':'+mode,()=>{const calls=[],values={bubbles:true,cancelable:true,composed:true,documentURI:'doc',disposition:'report',clientX:2.8,reason:'why',promise:null};let options;if(mode==='own')options=values;else if(mode==='inherited')options=Object.create(values);else if(mode==='proxy')options=new Proxy(values,{get(t,k,r){calls.push('get:'+String(k));return Reflect.get(t,k,r)},getOwnPropertyDescriptor(t,k){calls.push('descriptor:'+String(k));return Reflect.getOwnPropertyDescriptor(t,k)}});else{options={};for(const k of Object.keys(values))Object.defineProperty(options,k,{get(){calls.push(k);return values[k]}})}const e=new globalThis[n]('x',options);return{calls,flags:[e.bubbles,e.cancelable,e.composed],documentURI:e.documentURI,disposition:e.disposition,clientX:e.clientX,reason:e.reason,promise:e.promise}})}
++for(const v of [null,undefined,Symbol('x'),{x:1}])row('reason:'+String(v),()=>{const e=new PromiseRejectionEvent('x',{reason:v});return[e.reason===v,e.reason===null]});
++row('securityOrder',()=>{const calls=[],o={};for(const k of ['bubbles','cancelable','composed','documentURI','referrer','blockedURI','violatedDirective','effectiveDirective','originalPolicy','sourceFile','sample','disposition','statusCode','lineNumber','columnNumber'])Object.defineProperty(o,k,{get(){calls.push(k);return undefined}});new SecurityPolicyViolationEvent('x',o);return calls});
++row('promiseOrder',()=>{const calls=[],o={};for(const k of ['bubbles','cancelable','composed','reason','promise'])Object.defineProperty(o,k,{get(){calls.push(k);return undefined}});new PromiseRejectionEvent('x',o);return calls});
++row('mouseOrder',()=>{const calls=[],o={};for(const k of ['bubbles','cancelable','composed','view','detail','screenX','screenY','clientX','clientY','ctrlKey','altKey','shiftKey','metaKey','button','buttons','relatedTarget','movementX','movementY','modifierAltGraph'])Object.defineProperty(o,k,{get(){calls.push(k);return undefined}});new MouseEvent('x',o);return calls});
++return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/conversion-native.json
+@@ -0,0 +1,273 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "d2e0071e04cdbe7f880580a718b15ec51b02e6ba8c1bb5c1a83e593759c0cc57",
++  "observations": [
++    [
++      "SecurityPolicyViolationEvent:own",
++      {
++        "calls": [],
++        "flags": [
++          true,
++          false,
++          true
++        ],
++        "documentURI": "doc",
++        "disposition": "report"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:inherited",
++      {
++        "calls": [],
++        "flags": [
++          true,
++          false,
++          true
++        ],
++        "documentURI": "doc",
++        "disposition": "report"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:getters",
++      {
++        "calls": [
++          "bubbles",
++          "cancelable",
++          "composed",
++          "disposition",
++          "documentURI"
++        ],
++        "flags": [
++          true,
++          false,
++          true
++        ],
++        "documentURI": "doc",
++        "disposition": "report"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:proxy",
++      {
++        "calls": [
++          "get:bubbles",
++          "get:cancelable",
++          "get:composed",
++          "get:disposition",
++          "get:documentURI"
++        ],
++        "flags": [
++          true,
++          false,
++          true
++        ],
++        "documentURI": "doc",
++        "disposition": "report"
++      }
++    ],
++    [
++      "PromiseRejectionEvent:own",
++      {
++        "calls": [],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "reason": "why",
++        "promise": null
++      }
++    ],
++    [
++      "PromiseRejectionEvent:inherited",
++      {
++        "calls": [],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "reason": "why",
++        "promise": null
++      }
++    ],
++    [
++      "PromiseRejectionEvent:getters",
++      {
++        "calls": [
++          "bubbles",
++          "cancelable",
++          "composed",
++          "promise",
++          "reason"
++        ],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "reason": "why",
++        "promise": null
++      }
++    ],
++    [
++      "PromiseRejectionEvent:proxy",
++      {
++        "calls": [
++          "get:bubbles",
++          "get:cancelable",
++          "get:composed",
++          "get:promise",
++          "get:reason"
++        ],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "reason": "why",
++        "promise": null
++      }
++    ],
++    [
++      "MouseEvent:own",
++      {
++        "calls": [],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "clientX": 2
++      }
++    ],
++    [
++      "MouseEvent:inherited",
++      {
++        "calls": [],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "clientX": 2
++      }
++    ],
++    [
++      "MouseEvent:getters",
++      {
++        "calls": [
++          "bubbles",
++          "cancelable",
++          "composed",
++          "clientX"
++        ],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "clientX": 2
++      }
++    ],
++    [
++      "MouseEvent:proxy",
++      {
++        "calls": [
++          "get:bubbles",
++          "get:cancelable",
++          "get:composed",
++          "get:clientX"
++        ],
++        "flags": [
++          true,
++          true,
++          true
++        ],
++        "clientX": 2
++      }
++    ],
++    [
++      "reason:null",
++      [
++        true,
++        true
++      ]
++    ],
++    [
++      "reason:undefined",
++      [
++        false,
++        true
++      ]
++    ],
++    [
++      "reason:Symbol(x)",
++      [
++        true,
++        false
++      ]
++    ],
++    [
++      "reason:[object Object]",
++      [
++        true,
++        false
++      ]
++    ],
++    [
++      "securityOrder",
++      [
++        "bubbles",
++        "cancelable",
++        "composed",
++        "blockedURI",
++        "columnNumber",
++        "disposition",
++        "documentURI",
++        "effectiveDirective",
++        "lineNumber",
++        "originalPolicy",
++        "referrer",
++        "sample",
++        "sourceFile",
++        "statusCode",
++        "violatedDirective"
++      ]
++    ],
++    [
++      "promiseOrder",
++      [
++        "bubbles",
++        "cancelable",
++        "composed",
++        "promise",
++        "reason"
++      ]
++    ],
++    [
++      "mouseOrder",
++      [
++        "bubbles",
++        "cancelable",
++        "composed",
++        "detail",
++        "view",
++        "altKey",
++        "button",
++        "buttons",
++        "clientX",
++        "clientY",
++        "ctrlKey",
++        "metaKey",
++        "relatedTarget",
++        "screenX",
++        "screenY",
++        "shiftKey"
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/details-expression.js
+@@ -0,0 +1,16 @@
++(()=>{const out=[],row=(name,fn)=>{try{out.push([name,fn()])}catch(e){out.push([name,{error:e.name,message:e.message}])}},read=e=>[e.type,e.bubbles,e.cancelable,e.composed,e.defaultPrevented,e.returnValue];
++for(const k of ['statusCode','lineNumber','columnNumber'])for(const v of [-1,1.8,65535,65536,4294967295,4294967296,NaN,Infinity,'4',null])row(k+':'+String(v),()=>new SecurityPolicyViolationEvent('x',{[k]:v})[k]);
++for(const n of ['SecurityPolicyViolationEvent','PromiseRejectionEvent']){
++ row(n+':conversionOrder',()=>{const calls=[];let options=new Proxy({}, {get(t,k){calls.push(String(k));return undefined}});new globalThis[n]({toString(){calls.push('type');return 'x'}},options);return calls});
++ for(const v of [undefined,null,3,'x',true,Symbol('x')])row(n+':dictionary:'+String(v),()=>{const e=new globalThis[n]('x',v);return read(e)});
++ row(n+':newTarget',()=>{let calls=[];const nt=new Proxy(function(){},{get(t,k,r){if(k==='prototype')calls.push('prototype');return Reflect.get(t,k,r)}});const e=Reflect.construct(globalThis[n],[{toString(){calls.push('type');return 'x'}},{}],nt);return [calls,Object.getPrototypeOf(e)===nt.prototype]});
++ row(n+':readonly',()=>{const e=new globalThis[n]('x'),p=Object.getPrototypeOf(e);return Reflect.ownKeys(p).map(k=>{const d=Object.getOwnPropertyDescriptor(p,k);return[String(k),d.enumerable,d.configurable,d.writable,typeof d.get,typeof d.set]})});
++}
++for(const v of [null,undefined,Promise.resolve(1),Object.create(Promise.prototype),new Proxy(Promise.resolve(1),{}),{then(){}},0])row('promiseValue:'+String(v),()=>{const e=new PromiseRejectionEvent('x',{promise:v,reason:undefined});return[e.promise===v,e.promise===null,e.reason===null,e.reason===undefined]});
++row('reasonUndefined',()=>{const e=new PromiseRejectionEvent('x',{reason:undefined});return [e.reason===null,e.reason===undefined]});
++for(const v of [NaN,Infinity,-Infinity,-0,1.2,-1.2])row('mouseInit:'+String(v),()=>{const e=document.createEvent('MouseEvent');e.initMouseEvent('x',true,true,window,0,v,v,v,v);return[e.clientX,e.clientY,e.screenX,e.screenY,Object.is(e.clientX,-0),Number.isNaN(e.clientX)]});
++for(const v of [-1,0,1,2,3,4,7,65535,65536])row('which:'+v,()=>new MouseEvent('x',{button:v}).which);
++row('coordinatesConversionOrder',()=>{const calls=[];new MouseEvent('x',new Proxy({}, {get(t,k){calls.push(String(k));return undefined}}));return calls});
++row('beforeUnloadConversion',()=>{const e=document.createEvent('BeforeUnloadEvent');let calls=[];Object.getOwnPropertyDescriptor(BeforeUnloadEvent.prototype,'returnValue').set.call(e,{toString(){calls.push('string');return 'x'}});e.preventDefault();return [calls,read(e)]});
++row('factoryOwner',()=>{const other=document.implementation.createHTMLDocument('x');const e=Document.prototype.createEvent.call(other,'CompositionEvent');e.initCompositionEvent('x');return [e instanceof CompositionEvent,e.view,e.data]});
++return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/details-native.json
+@@ -0,0 +1,617 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "c03635204872d958a40529c49095beb42255970873a2dcf4fdc5a653a60d8b61",
++  "observations": [
++    [
++      "statusCode:-1",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "statusCode:1.8",
++      1
++    ],
++    [
++      "statusCode:65535",
++      65535
++    ],
++    [
++      "statusCode:65536",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "statusCode:4294967295",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "statusCode:4294967296",
++      0
++    ],
++    [
++      "statusCode:NaN",
++      0
++    ],
++    [
++      "statusCode:Infinity",
++      0
++    ],
++    [
++      "statusCode:4",
++      4
++    ],
++    [
++      "statusCode:null",
++      0
++    ],
++    [
++      "lineNumber:-1",
++      4294967295
++    ],
++    [
++      "lineNumber:1.8",
++      1
++    ],
++    [
++      "lineNumber:65535",
++      65535
++    ],
++    [
++      "lineNumber:65536",
++      65536
++    ],
++    [
++      "lineNumber:4294967295",
++      4294967295
++    ],
++    [
++      "lineNumber:4294967296",
++      0
++    ],
++    [
++      "lineNumber:NaN",
++      0
++    ],
++    [
++      "lineNumber:Infinity",
++      0
++    ],
++    [
++      "lineNumber:4",
++      4
++    ],
++    [
++      "lineNumber:null",
++      0
++    ],
++    [
++      "columnNumber:-1",
++      4294967295
++    ],
++    [
++      "columnNumber:1.8",
++      1
++    ],
++    [
++      "columnNumber:65535",
++      65535
++    ],
++    [
++      "columnNumber:65536",
++      65536
++    ],
++    [
++      "columnNumber:4294967295",
++      4294967295
++    ],
++    [
++      "columnNumber:4294967296",
++      0
++    ],
++    [
++      "columnNumber:NaN",
++      0
++    ],
++    [
++      "columnNumber:Infinity",
++      0
++    ],
++    [
++      "columnNumber:4",
++      4
++    ],
++    [
++      "columnNumber:null",
++      0
++    ],
++    [
++      "SecurityPolicyViolationEvent:conversionOrder",
++      [
++        "type"
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:dictionary:undefined",
++      [
++        "x",
++        true,
++        false,
++        true,
++        false,
++        true
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:dictionary:null",
++      [
++        "x",
++        true,
++        false,
++        true,
++        false,
++        true
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:dictionary:3",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:dictionary:x",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:dictionary:true",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:dictionary:Symbol(x)",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "SecurityPolicyViolationEvent:newTarget",
++      [
++        [
++          "prototype",
++          "type",
++          "prototype"
++        ],
++        true
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:readonly",
++      [
++        [
++          "documentURI",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "referrer",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "blockedURI",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "violatedDirective",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "effectiveDirective",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "originalPolicy",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "sourceFile",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "sample",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "disposition",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "statusCode",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "lineNumber",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "columnNumber",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "constructor",
++          false,
++          true,
++          true,
++          "undefined",
++          "undefined"
++        ],
++        [
++          "Symbol(Symbol.toStringTag)",
++          false,
++          true,
++          false,
++          "undefined",
++          "undefined"
++        ]
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:conversionOrder",
++      [
++        "type"
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:dictionary:undefined",
++      [
++        "x",
++        false,
++        false,
++        false,
++        false,
++        true
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:dictionary:null",
++      [
++        "x",
++        false,
++        false,
++        false,
++        false,
++        true
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:dictionary:3",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "PromiseRejectionEvent:dictionary:x",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "PromiseRejectionEvent:dictionary:true",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "PromiseRejectionEvent:dictionary:Symbol(x)",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "PromiseRejectionEvent:newTarget",
++      [
++        [
++          "prototype",
++          "type",
++          "prototype"
++        ],
++        true
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:readonly",
++      [
++        [
++          "reason",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "promise",
++          true,
++          true,
++          null,
++          "function",
++          "undefined"
++        ],
++        [
++          "constructor",
++          false,
++          true,
++          true,
++          "undefined",
++          "undefined"
++        ],
++        [
++          "Symbol(Symbol.toStringTag)",
++          false,
++          true,
++          false,
++          "undefined",
++          "undefined"
++        ]
++      ]
++    ],
++    [
++      "promiseValue:null",
++      [
++        true,
++        true,
++        true,
++        false
++      ]
++    ],
++    [
++      "promiseValue:undefined",
++      [
++        false,
++        true,
++        true,
++        false
++      ]
++    ],
++    [
++      "promiseValue:[object Promise]",
++      [
++        true,
++        false,
++        true,
++        false
++      ]
++    ],
++    [
++      "promiseValue:[object Promise]",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "promiseValue:[object Promise]",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "promiseValue:[object Object]",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "promiseValue:0",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "reasonUndefined",
++      [
++        true,
++        false
++      ]
++    ],
++    [
++      "mouseInit:NaN",
++      [
++        0,
++        0,
++        0,
++        0,
++        false,
++        false
++      ]
++    ],
++    [
++      "mouseInit:Infinity",
++      [
++        0,
++        0,
++        0,
++        0,
++        false,
++        false
++      ]
++    ],
++    [
++      "mouseInit:-Infinity",
++      [
++        0,
++        0,
++        0,
++        0,
++        false,
++        false
++      ]
++    ],
++    [
++      "mouseInit:0",
++      [
++        0,
++        0,
++        0,
++        0,
++        false,
++        false
++      ]
++    ],
++    [
++      "mouseInit:1.2",
++      [
++        1,
++        1,
++        1,
++        1,
++        false,
++        false
++      ]
++    ],
++    [
++      "mouseInit:-1.2",
++      [
++        -1,
++        -1,
++        -1,
++        -1,
++        false,
++        false
++      ]
++    ],
++    [
++      "which:-1",
++      0
++    ],
++    [
++      "which:0",
++      1
++    ],
++    [
++      "which:1",
++      2
++    ],
++    [
++      "which:2",
++      3
++    ],
++    [
++      "which:3",
++      4
++    ],
++    [
++      "which:4",
++      5
++    ],
++    [
++      "which:7",
++      8
++    ],
++    [
++      "which:65535",
++      0
++    ],
++    [
++      "which:65536",
++      1
++    ],
++    [
++      "coordinatesConversionOrder",
++      []
++    ],
++    [
++      "beforeUnloadConversion",
++      [
++        [
++          "string"
++        ],
++        [
++          "",
++          false,
++          false,
++          false,
++          false,
++          "x"
++        ]
++      ]
++    ],
++    [
++      "factoryOwner",
++      [
++        true,
++        null,
++        ""
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/factory-expression.js
+@@ -0,0 +1 @@
++(async()=>{const out=[],row=(name,fn)=>{try{out.push([name,fn()])}catch(e){out.push([name,{error:e.name,message:e.message}])}};for(const name of ['CompositionEvent','InputEvent','BeforeUnloadEvent','MouseEvent','NotSupported'])row('conversion:'+name,()=>{let calls=0;try{const e=document.createEvent({toString(){calls++;return name}});return[calls,e.constructor.name,e.type]}catch(e){return[calls,e.name]}});row('borrowedInvalid',()=>{const calls=[];try{Document.prototype.createEvent.call({}, {toString(){calls.push('convert');return'CompositionEvent'}})}catch(e){return[calls,e instanceof TypeError]}});const frame=document.createElement('iframe');document.body.append(frame);await new Promise(r=>setTimeout(r,5));const w=frame.contentWindow;for(const name of ['CompositionEvent','InputEvent','BeforeUnloadEvent'])row('borrowedRealm:'+name,()=>{const a=Document.prototype.createEvent.call(w.document,name),b=w.Document.prototype.createEvent.call(document,name);return[a instanceof globalThis[name],a instanceof w[name],b instanceof globalThis[name],b instanceof w[name]]});frame.remove();return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/factory-native.json
+@@ -0,0 +1,81 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "94f278d748fe495a18e287ae3a8849519c9c42ca5076e44232eb9592019e9c59",
++  "observations": [
++    [
++      "conversion:CompositionEvent",
++      [
++        1,
++        "CompositionEvent",
++        ""
++      ]
++    ],
++    [
++      "conversion:InputEvent",
++      [
++        1,
++        "InputEvent",
++        ""
++      ]
++    ],
++    [
++      "conversion:BeforeUnloadEvent",
++      [
++        1,
++        "BeforeUnloadEvent",
++        ""
++      ]
++    ],
++    [
++      "conversion:MouseEvent",
++      [
++        1,
++        "MouseEvent",
++        ""
++      ]
++    ],
++    [
++      "conversion:NotSupported",
++      [
++        1,
++        "NotSupportedError"
++      ]
++    ],
++    [
++      "borrowedInvalid",
++      [
++        [],
++        true
++      ]
++    ],
++    [
++      "borrowedRealm:CompositionEvent",
++      [
++        true,
++        false,
++        false,
++        true
++      ]
++    ],
++    [
++      "borrowedRealm:InputEvent",
++      [
++        true,
++        false,
++        false,
++        true
++      ]
++    ],
++    [
++      "borrowedRealm:BeforeUnloadEvent",
++      [
++        true,
++        false,
++        false,
++        true
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/first-expression.js
+@@ -0,0 +1,9 @@
++(()=>{const out=[],row=(name,fn)=>{try{out.push([name,fn()])}catch(e){out.push([name,{error:e.name,message:e.message}])}},keys=e=>Reflect.ownKeys(e).map(String),shape=e=>({tag:Object.prototype.toString.call(e),constructor:e.constructor.name,keys:keys(e),type:e.type,bubbles:e.bubbles,cancelable:e.cancelable,composed:e.composed,trusted:e.isTrusted,returnValue:e.returnValue});
++for(const n of ['Event','CompositionEvent','InputEvent','BeforeUnloadEvent','SecurityPolicyViolationEvent','PromiseRejectionEvent'])row('exposure:'+n,()=>typeof globalThis[n]);
++for(const n of ['CompositionEvent','compositionevent','CompositionEvents','InputEvent','BeforeUnloadEvent','SecurityPolicyViolationEvent','PromiseRejectionEvent'])row('factory:'+n,()=>{const e=document.createEvent(n);const r=shape(e);try{document.dispatchEvent(e);r.dispatch='ok'}catch(x){r.dispatch=x.name}e.initEvent('again',true,true);r.after=shape(e);return r});
++row('beforeUnload',()=>{const e=document.createEvent('BeforeUnloadEvent'),p=Object.getPrototypeOf(e);e.returnValue=42;let first=e.returnValue;e.initEvent('again',true,true);return{first,after:e.returnValue,protoKeys:keys(p),ctorKeys:keys(p.constructor),ctorGlobal:p.constructor===globalThis.BeforeUnloadEvent,descriptor:(()=>{const d=Object.getOwnPropertyDescriptor(p,'returnValue');return {get:typeof d.get,set:typeof d.set,enumerable:d.enumerable,configurable:d.configurable}})(),construct:(()=>{try{return shape(new p.constructor('x'))}catch(x){return x.name+':'+x.message}})()}});
++for(const n of ['KeyboardEvent','MouseEvent'])for(let bits=0;bits<16;bits++)row(n+':mods:'+bits,()=>{const e=new globalThis[n]('x',{ctrlKey:!!(bits&1),altKey:!!(bits&2),shiftKey:!!(bits&4),metaKey:!!(bits&8),modifierAltGraph:true,modifierCapsLock:true});return ['Control','Alt','Shift','Meta','AltGraph','Accel','CapsLock','NumLock'].map(k=>e.getModifierState(k))});
++for(const value of [47.5,-47.5,NaN,Infinity,-0,4294967297])row('mouse:'+String(value),()=>{const e=new MouseEvent('x',{clientX:value,screenY:value,button:1});return{clientX:e.clientX,screenY:e.screenY,x:e.x,pageX:e.pageX,layerX:e.layerX,which:e.which}});
++for(const opt of [undefined,null,{}, {reason:['tea']},{promise:3},{promise:{x:1},reason:undefined}])row('promise:'+JSON.stringify(opt),()=>{const e=new PromiseRejectionEvent('x',opt);return{...shape(e),promise:e.promise,reason:e.reason,protoKeys:keys(Object.getPrototypeOf(e))}});
++for(const opt of [undefined,{}, {bubbles:false,cancelable:true,composed:false},{disposition:'report',statusCode:65537,lineNumber:-1,columnNumber:4294967297},{disposition:'bad'}])row('security:'+JSON.stringify(opt),()=>{const e=new SecurityPolicyViolationEvent('x',opt);const r=shape(e);for(const k of ['documentURI','referrer','blockedURI','violatedDirective','effectiveDirective','originalPolicy','sourceFile','sample','disposition','statusCode','lineNumber','columnNumber'])r[k]=e[k];e.initEvent('again',false,true);r.after=shape(e);r.protoKeys=keys(Object.getPrototypeOf(e));return r});
++return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/first-native.json
+@@ -0,0 +1,977 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "77dcc2b5b65ed4c2eb61b93bff00eb0f710d8b8193a52aed431519eac74aa7e5",
++  "observations": [
++    [
++      "exposure:Event",
++      "function"
++    ],
++    [
++      "exposure:CompositionEvent",
++      "function"
++    ],
++    [
++      "exposure:InputEvent",
++      "function"
++    ],
++    [
++      "exposure:BeforeUnloadEvent",
++      "function"
++    ],
++    [
++      "exposure:SecurityPolicyViolationEvent",
++      "function"
++    ],
++    [
++      "exposure:PromiseRejectionEvent",
++      "function"
++    ],
++    [
++      "factory:CompositionEvent",
++      {
++        "tag": "[object CompositionEvent]",
++        "constructor": "CompositionEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "dispatch": "InvalidStateError",
++        "after": {
++          "tag": "[object CompositionEvent]",
++          "constructor": "CompositionEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": true,
++          "cancelable": true,
++          "composed": false,
++          "trusted": false,
++          "returnValue": true
++        }
++      }
++    ],
++    [
++      "factory:compositionevent",
++      {
++        "tag": "[object CompositionEvent]",
++        "constructor": "CompositionEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "dispatch": "InvalidStateError",
++        "after": {
++          "tag": "[object CompositionEvent]",
++          "constructor": "CompositionEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": true,
++          "cancelable": true,
++          "composed": false,
++          "trusted": false,
++          "returnValue": true
++        }
++      }
++    ],
++    [
++      "factory:CompositionEvents",
++      {
++        "error": "NotSupportedError",
++        "message": "The operation is not supported"
++      }
++    ],
++    [
++      "factory:InputEvent",
++      {
++        "tag": "[object InputEvent]",
++        "constructor": "InputEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "dispatch": "InvalidStateError",
++        "after": {
++          "tag": "[object InputEvent]",
++          "constructor": "InputEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": true,
++          "cancelable": true,
++          "composed": false,
++          "trusted": false,
++          "returnValue": true
++        }
++      }
++    ],
++    [
++      "factory:BeforeUnloadEvent",
++      {
++        "tag": "[object BeforeUnloadEvent]",
++        "constructor": "BeforeUnloadEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": "",
++        "dispatch": "InvalidStateError",
++        "after": {
++          "tag": "[object BeforeUnloadEvent]",
++          "constructor": "BeforeUnloadEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": true,
++          "cancelable": true,
++          "composed": false,
++          "trusted": false,
++          "returnValue": ""
++        }
++      }
++    ],
++    [
++      "factory:SecurityPolicyViolationEvent",
++      {
++        "error": "NotSupportedError",
++        "message": "The operation is not supported"
++      }
++    ],
++    [
++      "factory:PromiseRejectionEvent",
++      {
++        "error": "NotSupportedError",
++        "message": "The operation is not supported"
++      }
++    ],
++    [
++      "beforeUnload",
++      {
++        "first": "42",
++        "after": "42",
++        "protoKeys": [
++          "returnValue",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ],
++        "ctorKeys": [
++          "length",
++          "name",
++          "prototype"
++        ],
++        "ctorGlobal": true,
++        "descriptor": {
++          "get": "function",
++          "set": "function",
++          "enumerable": true,
++          "configurable": true
++        },
++        "construct": "TypeError:Illegal Constructor"
++      }
++    ],
++    [
++      "KeyboardEvent:mods:0",
++      [
++        false,
++        false,
++        false,
++        false,
++        false,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:1",
++      [
++        true,
++        false,
++        false,
++        false,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:2",
++      [
++        false,
++        true,
++        false,
++        false,
++        true,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:3",
++      [
++        true,
++        true,
++        false,
++        false,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:4",
++      [
++        false,
++        false,
++        true,
++        false,
++        false,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:5",
++      [
++        true,
++        false,
++        true,
++        false,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:6",
++      [
++        false,
++        true,
++        true,
++        false,
++        true,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:7",
++      [
++        true,
++        true,
++        true,
++        false,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:8",
++      [
++        false,
++        false,
++        false,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:9",
++      [
++        true,
++        false,
++        false,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:10",
++      [
++        false,
++        true,
++        false,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:11",
++      [
++        true,
++        true,
++        false,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:12",
++      [
++        false,
++        false,
++        true,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:13",
++      [
++        true,
++        false,
++        true,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:14",
++      [
++        false,
++        true,
++        true,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "KeyboardEvent:mods:15",
++      [
++        true,
++        true,
++        true,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:0",
++      [
++        false,
++        false,
++        false,
++        false,
++        false,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:1",
++      [
++        true,
++        false,
++        false,
++        false,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:2",
++      [
++        false,
++        true,
++        false,
++        false,
++        true,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:3",
++      [
++        true,
++        true,
++        false,
++        false,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:4",
++      [
++        false,
++        false,
++        true,
++        false,
++        false,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:5",
++      [
++        true,
++        false,
++        true,
++        false,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:6",
++      [
++        false,
++        true,
++        true,
++        false,
++        true,
++        false,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:7",
++      [
++        true,
++        true,
++        true,
++        false,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:8",
++      [
++        false,
++        false,
++        false,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:9",
++      [
++        true,
++        false,
++        false,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:10",
++      [
++        false,
++        true,
++        false,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:11",
++      [
++        true,
++        true,
++        false,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:12",
++      [
++        false,
++        false,
++        true,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:13",
++      [
++        true,
++        false,
++        true,
++        true,
++        false,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:14",
++      [
++        false,
++        true,
++        true,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "MouseEvent:mods:15",
++      [
++        true,
++        true,
++        true,
++        true,
++        true,
++        true,
++        false,
++        false
++      ]
++    ],
++    [
++      "mouse:47.5",
++      {
++        "clientX": 47,
++        "screenY": 47,
++        "x": 47,
++        "pageX": 47,
++        "layerX": 47,
++        "which": 2
++      }
++    ],
++    [
++      "mouse:-47.5",
++      {
++        "clientX": -48,
++        "screenY": -48,
++        "x": -48,
++        "pageX": -48,
++        "layerX": -48,
++        "which": 2
++      }
++    ],
++    [
++      "mouse:NaN",
++      {
++        "clientX": null,
++        "screenY": null,
++        "x": null,
++        "pageX": null,
++        "layerX": null,
++        "which": 2
++      }
++    ],
++    [
++      "mouse:Infinity",
++      {
++        "clientX": null,
++        "screenY": null,
++        "x": null,
++        "pageX": null,
++        "layerX": null,
++        "which": 2
++      }
++    ],
++    [
++      "mouse:0",
++      {
++        "clientX": 0,
++        "screenY": 0,
++        "x": 0,
++        "pageX": 0,
++        "layerX": 0,
++        "which": 2
++      }
++    ],
++    [
++      "mouse:4294967297",
++      {
++        "clientX": 4294967297,
++        "screenY": 4294967297,
++        "x": 4294967297,
++        "pageX": 4294967297,
++        "layerX": 4294967297,
++        "which": 2
++      }
++    ],
++    [
++      "promise:undefined",
++      {
++        "tag": "[object PromiseRejectionEvent]",
++        "constructor": "PromiseRejectionEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "promise": null,
++        "reason": null,
++        "protoKeys": [
++          "reason",
++          "promise",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "promise:null",
++      {
++        "tag": "[object PromiseRejectionEvent]",
++        "constructor": "PromiseRejectionEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "promise": null,
++        "reason": null,
++        "protoKeys": [
++          "reason",
++          "promise",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "promise:{}",
++      {
++        "tag": "[object PromiseRejectionEvent]",
++        "constructor": "PromiseRejectionEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "promise": null,
++        "reason": null,
++        "protoKeys": [
++          "reason",
++          "promise",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "promise:{\"reason\":[\"tea\"]}",
++      {
++        "tag": "[object PromiseRejectionEvent]",
++        "constructor": "PromiseRejectionEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": false,
++        "cancelable": false,
++        "composed": false,
++        "trusted": false,
++        "returnValue": true,
++        "promise": null,
++        "reason": [
++          "tea"
++        ],
++        "protoKeys": [
++          "reason",
++          "promise",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "promise:{\"promise\":3}",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "promise:{\"promise\":{\"x\":1}}",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "security:undefined",
++      {
++        "tag": "[object SecurityPolicyViolationEvent]",
++        "constructor": "SecurityPolicyViolationEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": true,
++        "cancelable": false,
++        "composed": true,
++        "trusted": false,
++        "returnValue": true,
++        "documentURI": "",
++        "referrer": "",
++        "blockedURI": "",
++        "violatedDirective": "",
++        "effectiveDirective": "",
++        "originalPolicy": "",
++        "sourceFile": "",
++        "sample": "",
++        "disposition": "enforce",
++        "statusCode": 0,
++        "lineNumber": 0,
++        "columnNumber": 0,
++        "after": {
++          "tag": "[object SecurityPolicyViolationEvent]",
++          "constructor": "SecurityPolicyViolationEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": false,
++          "cancelable": true,
++          "composed": true,
++          "trusted": false,
++          "returnValue": true
++        },
++        "protoKeys": [
++          "documentURI",
++          "referrer",
++          "blockedURI",
++          "violatedDirective",
++          "effectiveDirective",
++          "originalPolicy",
++          "sourceFile",
++          "sample",
++          "disposition",
++          "statusCode",
++          "lineNumber",
++          "columnNumber",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "security:{}",
++      {
++        "tag": "[object SecurityPolicyViolationEvent]",
++        "constructor": "SecurityPolicyViolationEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": true,
++        "cancelable": false,
++        "composed": true,
++        "trusted": false,
++        "returnValue": true,
++        "documentURI": "",
++        "referrer": "",
++        "blockedURI": "",
++        "violatedDirective": "",
++        "effectiveDirective": "",
++        "originalPolicy": "",
++        "sourceFile": "",
++        "sample": "",
++        "disposition": "enforce",
++        "statusCode": 0,
++        "lineNumber": 0,
++        "columnNumber": 0,
++        "after": {
++          "tag": "[object SecurityPolicyViolationEvent]",
++          "constructor": "SecurityPolicyViolationEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": false,
++          "cancelable": true,
++          "composed": true,
++          "trusted": false,
++          "returnValue": true
++        },
++        "protoKeys": [
++          "documentURI",
++          "referrer",
++          "blockedURI",
++          "violatedDirective",
++          "effectiveDirective",
++          "originalPolicy",
++          "sourceFile",
++          "sample",
++          "disposition",
++          "statusCode",
++          "lineNumber",
++          "columnNumber",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "security:{\"bubbles\":false,\"cancelable\":true,\"composed\":false}",
++      {
++        "tag": "[object SecurityPolicyViolationEvent]",
++        "constructor": "SecurityPolicyViolationEvent",
++        "keys": [
++          "isTrusted"
++        ],
++        "type": "x",
++        "bubbles": true,
++        "cancelable": false,
++        "composed": true,
++        "trusted": false,
++        "returnValue": true,
++        "documentURI": "",
++        "referrer": "",
++        "blockedURI": "",
++        "violatedDirective": "",
++        "effectiveDirective": "",
++        "originalPolicy": "",
++        "sourceFile": "",
++        "sample": "",
++        "disposition": "enforce",
++        "statusCode": 0,
++        "lineNumber": 0,
++        "columnNumber": 0,
++        "after": {
++          "tag": "[object SecurityPolicyViolationEvent]",
++          "constructor": "SecurityPolicyViolationEvent",
++          "keys": [
++            "isTrusted"
++          ],
++          "type": "again",
++          "bubbles": false,
++          "cancelable": true,
++          "composed": true,
++          "trusted": false,
++          "returnValue": true
++        },
++        "protoKeys": [
++          "documentURI",
++          "referrer",
++          "blockedURI",
++          "violatedDirective",
++          "effectiveDirective",
++          "originalPolicy",
++          "sourceFile",
++          "sample",
++          "disposition",
++          "statusCode",
++          "lineNumber",
++          "columnNumber",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    ],
++    [
++      "security:{\"disposition\":\"report\",\"statusCode\":65537,\"lineNumber\":-1,\"columnNumber\":4294967297}",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ],
++    [
++      "security:{\"disposition\":\"bad\"}",
++      {
++        "error": "TypeError",
++        "message": "invalid argument"
++      }
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/has-expression.js
+@@ -0,0 +1 @@
++(()=>{const out=[];for(const name of ['SecurityPolicyViolationEvent','PromiseRejectionEvent','MouseEvent','KeyboardEvent']){const calls=[],options=new Proxy({clientX:1,reason:'x'},{has(t,k){calls.push('has:'+String(k));return Reflect.has(t,k)},get(t,k,r){calls.push('get:'+String(k));return Reflect.get(t,k,r)}});new globalThis[name]('x',options);out.push([name,calls])}return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/has-native.json
+@@ -0,0 +1,82 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "7bbfa91e57f11edb7c52e1d30245d403154dfa43a76a0fbf90279fd90d3f119a",
++  "observations": [
++    [
++      "SecurityPolicyViolationEvent",
++      [
++        "has:bubbles",
++        "has:cancelable",
++        "has:composed",
++        "has:blockedURI",
++        "has:columnNumber",
++        "has:disposition",
++        "has:documentURI",
++        "has:effectiveDirective",
++        "has:lineNumber",
++        "has:originalPolicy",
++        "has:referrer",
++        "has:sample",
++        "has:sourceFile",
++        "has:statusCode",
++        "has:violatedDirective"
++      ]
++    ],
++    [
++      "PromiseRejectionEvent",
++      [
++        "has:bubbles",
++        "has:cancelable",
++        "has:composed",
++        "has:promise",
++        "has:reason",
++        "get:reason"
++      ]
++    ],
++    [
++      "MouseEvent",
++      [
++        "has:bubbles",
++        "has:cancelable",
++        "has:composed",
++        "has:detail",
++        "has:view",
++        "has:altKey",
++        "has:button",
++        "has:buttons",
++        "has:clientX",
++        "get:clientX",
++        "has:clientY",
++        "has:ctrlKey",
++        "has:metaKey",
++        "has:relatedTarget",
++        "has:screenX",
++        "has:screenY",
++        "has:shiftKey"
++      ]
++    ],
++    [
++      "KeyboardEvent",
++      [
++        "has:bubbles",
++        "has:cancelable",
++        "has:composed",
++        "has:detail",
++        "has:view",
++        "has:altKey",
++        "has:charCode",
++        "has:code",
++        "has:ctrlKey",
++        "has:isComposing",
++        "has:key",
++        "has:keyCode",
++        "has:location",
++        "has:metaKey",
++        "has:repeat",
++        "has:shiftKey"
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/rejection-producers-expression.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[],promises=[],reasons=[undefined,null,'text',{actual:true},new Error('actual')];const reason=v=>v===undefined?'undefined':v===null?'null':typeof v==='string'?v:v.actual?'object':v.message;addEventListener('unhandledrejection',e=>{const i=promises.indexOf(e.promise);rows.push(['unhandled',i,e.isTrusted,e.bubbles,e.cancelable,e.composed,reason(e.reason),e.reason===reasons[i],e.target===window,e.currentTarget===window]);e.preventDefault();rows[rows.length-1].push(e.defaultPrevented)});addEventListener('rejectionhandled',e=>{const i=promises.indexOf(e.promise);rows.push(['handled',i,e.isTrusted,e.bubbles,e.cancelable,e.composed,reason(e.reason),e.reason===reasons[i],e.target===window,e.currentTarget===window])});for(const value of reasons)promises.push(Promise.reject(value));await new Promise(r=>setTimeout(r,35));for(const p of promises)p.catch(()=>{});await new Promise(r=>setTimeout(r,35));return rows})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/rejection-producers-native.json
+@@ -0,0 +1,133 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "b269432d54d4f81b558eb15533aa15daa9cc42d121f89d405cfb994861cf10e9",
++  "observations": [
++    [
++      "unhandled",
++      0,
++      false,
++      false,
++      true,
++      false,
++      "undefined",
++      true,
++      true,
++      true,
++      true
++    ],
++    [
++      "unhandled",
++      1,
++      false,
++      false,
++      true,
++      false,
++      "null",
++      true,
++      true,
++      true,
++      true
++    ],
++    [
++      "unhandled",
++      2,
++      false,
++      false,
++      true,
++      false,
++      "text",
++      true,
++      true,
++      true,
++      true
++    ],
++    [
++      "unhandled",
++      3,
++      false,
++      false,
++      true,
++      false,
++      "object",
++      true,
++      true,
++      true,
++      true
++    ],
++    [
++      "unhandled",
++      4,
++      false,
++      false,
++      true,
++      false,
++      "actual",
++      true,
++      true,
++      true,
++      true
++    ],
++    [
++      "handled",
++      0,
++      false,
++      false,
++      false,
++      false,
++      "null",
++      false,
++      true,
++      true
++    ],
++    [
++      "handled",
++      1,
++      false,
++      false,
++      false,
++      false,
++      "null",
++      true,
++      true,
++      true
++    ],
++    [
++      "handled",
++      2,
++      false,
++      false,
++      false,
++      false,
++      "null",
++      false,
++      true,
++      true
++    ],
++    [
++      "handled",
++      3,
++      false,
++      false,
++      false,
++      false,
++      "null",
++      false,
++      true,
++      true
++    ],
++    [
++      "handled",
++      4,
++      false,
++      false,
++      false,
++      false,
++      "null",
++      false,
++      true,
++      true
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/rejection-undefined-expression.js
+@@ -0,0 +1 @@
++(async()=>{const rows=[];addEventListener('unhandledrejection',e=>{e.preventDefault();rows.push(['unhandled',e.isTrusted,e instanceof PromiseRejectionEvent,e.reason===undefined,e.reason===null,e.promise===globalThis.rejected,Reflect.ownKeys(e).map(String)])});addEventListener('rejectionhandled',e=>rows.push(['handled',e.isTrusted,e instanceof PromiseRejectionEvent,e.reason===undefined,e.reason===null,e.promise===globalThis.rejected]));globalThis.rejected=Promise.reject(undefined);await new Promise(r=>setTimeout(r,35));rejected.catch(()=>{});await new Promise(r=>setTimeout(r,35));return rows})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/rejection-undefined-native.json
+@@ -0,0 +1,27 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "f9e1f08742f745dd1b58d1f0124bd0c83279e33efcc7eeedb96a9e825f9736a2",
++  "observations": [
++    [
++      "unhandled",
++      false,
++      true,
++      true,
++      false,
++      true,
++      [
++        "isTrusted"
++      ]
++    ],
++    [
++      "handled",
++      false,
++      true,
++      false,
++      true,
++      true
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/shape-expression.js
+@@ -0,0 +1,8 @@
++(()=>{const out=[],row=(k,fn)=>{try{out.push([k,fn()])}catch(e){out.push([k,{error:e.name,message:e.message}])}};for(const n of ['BeforeUnloadEvent','SecurityPolicyViolationEvent','PromiseRejectionEvent'])row(n+':shape',()=>{const C=globalThis[n];return[C.length,C.name,Object.getPrototypeOf(C)===Event,Object.getPrototypeOf(C.prototype)===Event.prototype,(()=>{const d=Object.getOwnPropertyDescriptor(globalThis,n);return {value:typeof d.value,writable:d.writable,enumerable:d.enumerable,configurable:d.configurable}})()]});
++row('keyboardOrder',()=>{const calls=[],o={};for(const k of ['bubbles','cancelable','composed','detail','view','altKey','charCode','code','ctrlKey','isComposing','key','keyCode','location','metaKey','repeat','shiftKey','modifierAltGraph','modifierCapsLock'])Object.defineProperty(o,k,{get(){calls.push(k);return undefined}});new KeyboardEvent('x',o);return calls});
++row('keyboardIgnoredCodes',()=>{const e=new KeyboardEvent('x',{charCode:99,keyCode:88,which:77,code:'KeyA',key:'a'});return [e.charCode,e.keyCode,e.which,e.code,e.key]});
++row('mouseNonfinite',()=>[NaN,Infinity,-Infinity,-0].map(v=>{const e=new MouseEvent('x',{clientX:v});return [Number.isNaN(e.clientX),e.clientX===Infinity,e.clientX===-Infinity,Object.is(e.clientX,-0)]}));
++row('beforeUnloadInitReset',()=>{const e=document.createEvent('BeforeUnloadEvent');e.returnValue='x';e.initEvent('x',true,true);e.preventDefault();const a=[e.returnValue,e.defaultPrevented];e.initEvent('y');return [a,e.returnValue,e.defaultPrevented]});
++row('constructorNoArgs',()=>['SecurityPolicyViolationEvent','PromiseRejectionEvent','BeforeUnloadEvent'].map(k=>{try{new globalThis[k]();return'ok'}catch(e){return[e.name,e.message]}}));
++row('securityString',()=>{const e=new SecurityPolicyViolationEvent('x',{documentURI:null,sourceFile:1,sample:undefined});return[e.documentURI,e.sourceFile,e.sample]});
++return out})()
+--- /dev/null
++++ b/docs/reference/event-api-parity/shape-native.json
+@@ -0,0 +1,149 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "094f93b5bac13389e326c8bd24702a472ff9a1306b60c29db49b266f423b8fe2",
++  "observations": [
++    [
++      "BeforeUnloadEvent:shape",
++      [
++        0,
++        "BeforeUnloadEvent",
++        true,
++        true,
++        {
++          "value": "function",
++          "writable": true,
++          "enumerable": false,
++          "configurable": true
++        }
++      ]
++    ],
++    [
++      "SecurityPolicyViolationEvent:shape",
++      [
++        1,
++        "SecurityPolicyViolationEvent",
++        true,
++        true,
++        {
++          "value": "function",
++          "writable": true,
++          "enumerable": false,
++          "configurable": true
++        }
++      ]
++    ],
++    [
++      "PromiseRejectionEvent:shape",
++      [
++        1,
++        "PromiseRejectionEvent",
++        true,
++        true,
++        {
++          "value": "function",
++          "writable": true,
++          "enumerable": false,
++          "configurable": true
++        }
++      ]
++    ],
++    [
++      "keyboardOrder",
++      [
++        "bubbles",
++        "cancelable",
++        "composed",
++        "detail",
++        "view",
++        "altKey",
++        "charCode",
++        "code",
++        "ctrlKey",
++        "isComposing",
++        "key",
++        "keyCode",
++        "location",
++        "metaKey",
++        "repeat",
++        "shiftKey"
++      ]
++    ],
++    [
++      "keyboardIgnoredCodes",
++      [
++        99,
++        88,
++        88,
++        "KeyA",
++        "a"
++      ]
++    ],
++    [
++      "mouseNonfinite",
++      [
++        [
++          true,
++          false,
++          false,
++          false
++        ],
++        [
++          false,
++          true,
++          false,
++          false
++        ],
++        [
++          false,
++          false,
++          true,
++          false
++        ],
++        [
++          false,
++          false,
++          false,
++          true
++        ]
++      ]
++    ],
++    [
++      "beforeUnloadInitReset",
++      [
++        [
++          "x",
++          true
++        ],
++        "x",
++        false
++      ]
++    ],
++    [
++      "constructorNoArgs",
++      [
++        [
++          "TypeError",
++          "invalid argument"
++        ],
++        [
++          "TypeError",
++          "invalid argument"
++        ],
++        [
++          "TypeError",
++          "Illegal Constructor"
++        ]
++      ]
++    ],
++    [
++      "securityString",
++      [
++        "null",
++        "1",
++        ""
++      ]
++    ]
++  ]
++}
+--- /dev/null
++++ b/docs/reference/event-api-parity/utility-native.json
+@@ -0,0 +1,119 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "7c4acf00d2275675e9aa1431361e2f65c4dcf4cbce3fb5783764d6642d59702f",
++  "observations": {
++    "main": [
++      [
++        "PromiseRejectionEvent",
++        true,
++        true,
++        true,
++        false,
++        "main",
++        0
++      ],
++      [
++        "SecurityPolicyViolationEvent",
++        true,
++        true,
++        true,
++        false,
++        "main",
++        0
++      ],
++      [
++        "BeforeUnloadEvent",
++        true,
++        true,
++        true,
++        false,
++        "main",
++        0
++      ],
++      [
++        "PromiseRejectionEvent",
++        true,
++        true,
++        true,
++        false,
++        "utility",
++        0
++      ],
++      [
++        "SecurityPolicyViolationEvent",
++        true,
++        true,
++        true,
++        false,
++        "utility",
++        0
++      ],
++      [
++        "BeforeUnloadEvent",
++        true,
++        true,
++        true,
++        false,
++        "utility",
++        0
++      ]
++    ],
++    "utility": [
++      [
++        "PromiseRejectionEvent",
++        true,
++        true,
++        true,
++        false,
++        "main",
++        0
++      ],
++      [
++        "SecurityPolicyViolationEvent",
++        true,
++        true,
++        true,
++        false,
++        "main",
++        0
++      ],
++      [
++        "BeforeUnloadEvent",
++        true,
++        true,
++        true,
++        false,
++        "main",
++        0
++      ],
++      [
++        "PromiseRejectionEvent",
++        true,
++        true,
++        true,
++        false,
++        "utility",
++        0
++      ],
++      [
++        "SecurityPolicyViolationEvent",
++        true,
++        true,
++        true,
++        false,
++        "utility",
++        0
++      ],
++      [
++        "BeforeUnloadEvent",
++        true,
++        true,
++        true,
++        false,
++        "utility",
++        0
++      ]
++    ]
++  }
++}

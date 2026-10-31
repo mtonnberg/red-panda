@@ -1,0 +1,8 @@
+(async()=>{
+ const out={editing:[],focus:[],selection:[]},tick=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+ for(const namespace of ['http://www.w3.org/1998/Math/MathML','urn:custom',null]){const p=document.createElementNS(namespace,'container'),c=document.createElement('span');p.setAttribute('contenteditable','true');p.append(c);document.body.append(p);out.editing.push({namespace,value:c.isContentEditable});p.remove()}
+ for(const name of ['off','on','ON','inherit','']){document.designMode=name;out.editing.push({designMode:name,read:document.designMode,body:document.body.isContentEditable,div:document.createElement('div').isContentEditable})}
+ {const e=document.createElement('button');document.body.append(e);e.focus();const events=[];requestAnimationFrame(()=>events.push({when:'already-queued',active:document.activeElement===e}));e.inert=true;await tick();out.focus.push({kind:'priorRAF',events,active:document.activeElement===e});e.remove()}
+ for(const kind of ['plain','slot','unassigned']){const host=document.createElement('div'),text=document.createElement('span');text.textContent='ABCDE';host.append(text);document.body.append(host);if(kind!=='plain'){const shadow=host.attachShadow({mode:'open'});if(kind==='slot'){const slot=document.createElement('slot');slot.inert=true;shadow.append(slot)}}const sel=getSelection(),range=document.createRange();range.setStart(text.firstChild,1);range.setEnd(text.firstChild,4);sel.addRange(range);out.selection.push({kind,initial:String(sel),range:String(range)});host.inert=true;out.selection.push({kind,inert:String(sel),range:String(range)});sel.removeAllRanges();host.remove()}
+ return JSON.stringify(out)
+})()

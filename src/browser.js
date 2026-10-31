@@ -1,3 +1,8 @@
+import {installHTMLElementState} from './html-element-state.js';
+import{readStylesheetResource}from'./stylesheet-decoder.js';
+import {installHTMLReflections} from './html-reflections.js';
+import {installFormControlParity} from './form-control-parity.js';
+import {installDocumentEditing} from './document-editing.js';
 import {requestMetadataPolicy} from './request-metadata.js';
 import {installWindowEventSource} from './eventsource.js';
 import {installSelectControls} from './select-controls.js';
@@ -138,7 +143,7 @@ class PageResources extends ResourceLoader {
       // Set-Cookie headers. Avoid jsdom re-importing their combined header value.
       delete request.response.headers['set-cookie'];
       if (!response.ok) throw new Error(`Resource was not loaded. Status: ${response.status}`);
-      return Buffer.from(await response.arrayBuffer());
+      return kind==='stylesheet'?readStylesheetResource(response):Buffer.from(await response.arrayBuffer());
     });
     request.abort = () => abort.abort();
     request.getHeader = name => headers.get(name) ?? this.page.extraHTTPHeaders.get(name);
@@ -259,6 +264,7 @@ export class Page extends EventEmitter {
       installMutations(this, window);
       if (main) implForWrapper(window.document).contentType = this.mimeType;
       installCollections(window, { binding: this.browser.collectionsBinding });
+      installHTMLElementState(this,window);
       installInput(window);
       installShadowDOM(this, window);
       installSerialization(this, window);
@@ -294,11 +300,13 @@ export class Page extends EventEmitter {
       installDialogs(this, window);
       installForms(this, window);
       installDocumentXML(this, window);
+      installHTMLReflections(window);
       installConsole(window,{emit:(type,args)=>this.emit('console',{type,args})});
       installCustomElements(this, window);
       this.moduleScripts = installModuleScripts(this, window);
       installClassicScripts(this, window);
       installInputControls(this, window);
+      installFormControlParity(this, window);
       installSelectControls(this,window);
       const workers=installWorkers(this, window, { enabled: this.browser.options.loadResources === undefined || this.browser.options.loadResources.includes('worker') });
       installServiceWorkers(this,window,{enabled:Boolean(this.browser.options.experimentalFeatures?.serviceworker),secure,spawn:workers.createService});
@@ -322,6 +330,7 @@ export class Page extends EventEmitter {
       installDOMLifecycle(this, window);
       installSanitizer(this,window);
       installSelection(this, window);
+      installDocumentEditing(this, window);
       installMedia(this, window);
       installTextTracks(this, window);
       installMediaElements(this,window);

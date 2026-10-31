@@ -162,19 +162,19 @@ async function child(source) {
   });
 }
 
-test('owned page Promise rejection events are trusted, cancelable and paired with late rejectionhandled', async () => {
+test('owned page Promise rejection events match Native untrusted delivery and late null reason', async () => {
   const result = await child(`
     window.eval(\`globalThis.events=[];
       addEventListener('unhandledrejection', e=>{events.push([e.type,e.isTrusted,e.cancelable,e.reason.message,e.promise===pending,e instanceof PromiseRejectionEvent]);e.preventDefault();});
-      addEventListener('rejectionhandled', e=>events.push([e.type,e.isTrusted,e.cancelable,e.reason.message,e.promise===pending]));
+      addEventListener('rejectionhandled', e=>events.push([e.type,e.isTrusted,e.cancelable,e.reason,e.promise===pending]));
       globalThis.pending=Promise.reject(new Error('page failure'));
       setTimeout(()=>pending.catch(()=>{}),20);\`);
     setTimeout(()=>{console.log(JSON.stringify({events:Array.from(window.events),errors}));dom.window.close()},80);
   `);
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { events: [
-    ['unhandledrejection', true, true, 'page failure', true, true],
-    ['rejectionhandled', true, false, 'page failure', true],
+    ['unhandledrejection', false, true, 'page failure', true, true],
+    ['rejectionhandled', false, false, null, true],
   ], errors: [] });
 });
 

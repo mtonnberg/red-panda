@@ -1,0 +1,328 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {installDocumentEditing} from './document-editing.js';
+ import {installSelectControls} from './select-controls.js';
+ import {installMediaElements} from './media-elements.js';
+ import {installPaymentRequest} from './payment-request.js';
+@@ -314,6 +315,7 @@
+       installDOMLifecycle(this, window);
+       installSanitizer(this,window);
+       installSelection(this, window);
++      installDocumentEditing(this, window);
+       installMedia(this, window);
+       installTextTracks(this, window);
+       installMediaElements(this,window);
+--- a/src/focus.js
++++ b/src/focus.js
+@@ -1,3 +1,4 @@
++import {commitCommandControlEdit} from './document-editing-state.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -95,6 +96,7 @@
+ }
+ 
+ function focusEvents(element, entering, related) {
++  if (!entering) commitCommandControlEdit(element);
+   focusing.fireFocusEventWithTargetAdjustment(entering ? 'focus' : 'blur', element, related);
+   focusing.fireFocusEventWithTargetAdjustment(entering ? 'focusin' : 'focusout', element, related, { bubbles: true });
+ }
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {installUtilityDocumentEditing} from './document-editing.js';
+ import {installPaymentRequest} from './payment-request.js';
+ import {captureWorkerCreator} from './worker-apis.js';
+ import { installWebCrypto } from './web-crypto.js';
+@@ -40,7 +41,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- installUtilitySelection(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ installUtilitySelection(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- /dev/null
++++ b/src/document-editing.js
+@@ -0,0 +1,188 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {types} from 'node:util';
++import {setImmediate as schedule,clearImmediate as cancel} from 'node:timers';
++import {platformFactoryRecord} from './platform-factories.js';
++import {getRuntimeBinding} from './native-runtime.js';
++import {captureDOMExceptionFactory,domExceptionRecord} from './worker-dom-exception.js';
++import {beginCommandControlEdit} from './document-editing-state.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const InputEvent=require('jsdom/lib/jsdom/living/generated/InputEvent.js');
++const {isDisabled}=require('jsdom/lib/jsdom/living/helpers/form-controls.js');
++const {domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const {compareBoundaryPointsPosition:compare}=require('jsdom/lib/jsdom/living/range/boundary-point.js');
++const documents=new WeakMap(),realms=new WeakMap(),installed=new WeakSet();
++const methods=['execCommand','queryCommandSupported','queryCommandEnabled','queryCommandState','queryCommandIndeterm','queryCommandValue'];
++const supported=new Set(['inserttext','delete','forwarddelete']);
++const blocks=new Set(['address','article','aside','blockquote','div','dl','dt','dd','fieldset','figcaption','figure','footer','form','h1','h2','h3','h4','h5','h6','header','hr','li','main','nav','ol','p','pre','section','table','tbody','td','th','tr','ul']);
++const atoms=new Set(['br','img','hr','input','select','textarea','iframe','object','embed']);
++const selectionTypes=new Set(['text','search','tel','url','password']);
++const floor=(text,offset)=>offset>0&&offset<text.length&&text.charCodeAt(offset)>=0xDC00&&text.charCodeAt(offset)<=0xDFFF&&text.charCodeAt(offset-1)>=0xD800&&text.charCodeAt(offset-1)<=0xDBFF?offset-1:offset;
++const backward=(text,offset)=>floor(text,Math.max(0,offset-1));
++const forward=(text,offset)=>Math.min(text.length,offset+(text.codePointAt(offset)>0xFFFF?2:1));
++function string(value,Error){
++ const direct=typeof value==='symbol';
++ if(value!==null&&(typeof value==='object'||typeof value==='function')){
++  const exotic=value[Symbol.toPrimitive];
++  if(exotic!=null){if(typeof exotic!=='function')throw new Error('invalid argument');value=Reflect.apply(exotic,value,['string']);if(value!==null&&(typeof value==='object'||typeof value==='function'))throw new Error('invalid argument');}
++  else{let done=false;for(const key of['toString','valueOf']){const method=value[key];if(typeof method==='function'){const next=Reflect.apply(method,value,[]);if(next===null||(typeof next!=='object'&&typeof next!=='function')){value=next;done=true;break;}}}if(!done)throw new Error('invalid argument');}
++ }
++ if(typeof value==='symbol'){if(!direct)throw new Error('invalid argument');return String(Reflect.apply(Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,value,[]));}
++ return String(value);
++}
++function editable(node){
++ for(let current=node?.nodeType===1?node:tree.parent(node);current;current=tree.parent(current)){
++  if(current.nodeType!==1)continue;const value=current.getAttributeNS(null,'contenteditable')?.toLowerCase();
++  if(value==='false')return null;
++  if(value===''||value==='true'||value==='plaintext-only'){
++   let host=current;for(let parent=tree.parent(current);parent?.nodeType===1;parent=tree.parent(parent)){
++    const next=parent.getAttributeNS(null,'contenteditable')?.toLowerCase();if(next==='false')break;if(next===''||next==='true'||next==='plaintext-only')host=parent;
++   }return host;
++  }
++ }return null;
++}
++function targetFor(document){
++ const active=document._lastFocusedElement;
++ if(active&&['input','textarea'].includes(active._localName)){
++  if(active.hasAttributeNS(null,'readonly')||isDisabled(active)||['checkbox','radio','hidden'].includes(active.type))return null;
++  return{control:active};
++ }
++ const selection=document.getSelection(),range=selection?._range;if(!range)return null;
++ const host=editable(range._start.node);if(!host||host._ownerDocument!==document||!host.isConnected||editable(range._end.node)!==host)return null;
++ for(const boundary of[range._start,range._end])for(let node=boundary.node;node&&node!==host;node=tree.parent(node))if(['select','option'].includes(node._localName))return null;
++ return{host,selection,range};
++}
++function input(target,type,data){target._dispatch(InputEvent.createImpl(target._ownerDocument._globalObject,['input',{bubbles:true,cancelable:false,composed:true,inputType:type,data}],{isTrusted:true}));}
++function controlEdit(control,command,value){
++ const textual=control._localName==='textarea'||selectionTypes.has(control.type),old=control.value;
++ let start=floor(old,textual?control._selectionStart:old.length),end=floor(old,textual?control._selectionEnd:old.length);
++ const type=command==='inserttext'?'insertText':command==='delete'?'deleteContentBackward':'deleteContentForward';
++ if(command!=='inserttext'){
++  if(start===end){if(command==='delete')start=backward(old,start);else end=forward(old,end);}
++  if(start===end)return true;value='';
++ }
++ if(!value&&start===end)return true;
++ let begun=false;
++ function assign(next){
++  try{control.value=next;}catch(error){
++   // Preserve the real backend failure, with Native's measured generic message
++   // and a genuine DOMException allocated in the actual control owner's VM.
++   if(control.type==='file'&&domExceptionRecord(error)?.name==='InvalidStateError')throw documents.get(control._ownerDocument).exception('The object is in an invalid state','InvalidStateError');
++   throw error;
++  }
++ }
++ function replace(text,data){
++  const before=control.value,next=before.slice(0,start)+text+before.slice(end);
++  // The actual backend owns value sanitization and file-input exceptions.
++  if(!begun){const baseline=before;assign(next);beginCommandControlEdit(control,baseline);begun=true;}else assign(next);
++  start=Math.min(start+text.length,control.value.length);end=start;
++  if(textual){control._selectionStart=control._selectionEnd=start;control._selectionDirection='none';}
++  input(control,type,data);
++ }
++ if(command!=='inserttext')replace('',null);
++ else if(control._localName==='textarea'){
++  const chunks=value.split('\n');for(let i=0;i<chunks.length;i++){if(chunks[i]||i===0&&start!==end)replace(chunks[i],chunks[i]);if(i<chunks.length-1)replace('\n',null);}
++ }else{value=value.replaceAll('\n',' ');replace(value,value);}
++ return true;
++}
++function block(node,host){for(let current=node.nodeType===1?node:tree.parent(node);current&&current!==host;current=tree.parent(current))if(blocks.has(current._localName))return current;return host;}
++function contained(root,node){return node===root||tree.ancestorsToArray(node).includes(root);}
++function textNodes(root){return[...tree.treeIterator(root)].filter(node=>node.nodeType===3);}
++function canonical(boundary,host,preferLeft=true){
++ const node=boundary.node;if(node.nodeType===3)return{node,offset:floor(node.data,Math.min(boundary.offset,node.data.length))};
++ const children=tree.childrenToArray(node),left=children[boundary.offset-1],right=children[boundary.offset];
++ const last=left&&textNodes(left).at(-1),first=right&&textNodes(right)[0];
++ if(preferLeft&&last)return{node:last,offset:last.data.length};if(first)return{node:first,offset:0};if(last)return{node:last,offset:last.data.length};return{node,offset:boundary.offset};
++}
++function ceEdit(target,command,value){
++ const{host,range,selection}=target;if(command==='inserttext'&&value.includes('\n'))return false;
++ const initialStart={...range._start};
++ let start=canonical(range._start,host),end=canonical(range._end,host);
++ const startBlock=block(start.node,host),endBlock=block(end.node,host);if(startBlock!==endBlock)return false;
++ let changed=start.node!==end.node||start.offset!==end.offset;
++ const type=command==='inserttext'?'insertText':command==='delete'?'deleteContentBackward':'deleteContentForward';
++ const original={...start},wasCollapsed=!changed;
++ if(wasCollapsed&&command==='delete'&&range._start.node===host&&range._start.offset===0)return true;
++ if(wasCollapsed&&command!=='inserttext'&&range._start.node.nodeType===1&&startBlock!==block(range._start.node,host))return false;
++ if(!changed&&command!=='inserttext'){
++  const text=textNodes(host),index=text.indexOf(start.node);let candidate=start;
++  if(start.node.nodeType===3&&(command==='delete'?start.offset>0:start.offset<start.node.data.length)){
++   if(command==='delete')start={node:start.node,offset:backward(start.node.data,start.offset)};else end={node:start.node,offset:forward(start.node.data,start.offset)};
++  }else{
++   const adjacent=command==='delete'?text[index-1]:text[index+1];
++   if(!adjacent)return true;
++   if(block(adjacent,host)!==startBlock)return false;
++   candidate=command==='delete'?{node:adjacent,offset:adjacent.data.length}:{node:adjacent,offset:0};
++   if(command==='delete')start={node:adjacent,offset:backward(adjacent.data,candidate.offset)},end=candidate;
++   else start=candidate,end={node:adjacent,offset:forward(adjacent.data,0)};
++  }
++  changed=start.node!==end.node||start.offset!==end.offset;
++ }
++ if(!changed&&!value)return true;
++ for(const node of tree.treeIterator(host))if(atoms.has(node._localName)){
++  const parent=tree.parent(node),index=tree.index(node),before={node:parent,offset:index},after={node:parent,offset:index+1};
++  const spanStart=wasCollapsed&&compare(original,start)<0?original:start,spanEnd=wasCollapsed&&compare(original,end)>0?original:end;
++  if(compare(spanStart,after)<0&&compare(spanEnd,before)>0)return false;
++  if(command!=='inserttext'&&!changed)return false;
++ }
++ const touched=new Set();for(const point of[start,end])for(let node=tree.parent(point.node);node&&node!==host;node=tree.parent(node))touched.add(node);
++ range.setStart(start.node,start.offset);range.setEnd(end.node,end.offset);
++ if(changed)range.deleteContents();
++ let caret={node:range._start.node,offset:range._start.offset};
++ if(command==='inserttext'&&value){
++  caret=canonical(caret,host);
++  if(caret.node.nodeType===3){caret.node.insertData(caret.offset,value);caret.offset+=value.length;}
++  else{const text=host._ownerDocument.createTextNode(value),next=tree.childrenToArray(caret.node)[caret.offset]??null;caret.node._insert(text,next);caret={node:text,offset:value.length};}
++ }
++ // Delete removes exhausted inline structure; insertText retains its actual
++ // text endpoint even when an empty replacement leaves that Text empty.
++ if(command!=='inserttext'){
++  for(const node of[...tree.treeIterator(host)].reverse()){
++   if(node.nodeType===3&&node.data===''&&(node===start.node||node===end.node))tree.parent(node)._remove(node);
++   else if(touched.has(node)&&!blocks.has(node._localName)&&!tree.hasChildren(node))tree.parent(node)._remove(node);
++  }
++  caret=canonical(range._start,host);
++  if(!textNodes(startBlock).some(node=>node.data)&&!tree.childrenToArray(startBlock).some(node=>node.nodeType===1)){
++   if(blocks.has(startBlock._localName)){startBlock._append(host._ownerDocument.createElement('br'));caret={node:startBlock,offset:0};}
++   else caret={node:startBlock,offset:0};
++  }
++  if(command==='forwarddelete'&&original.node!==start.node&&contained(host,original.node))caret=original;
++ }
++ if(caret.node!==initialStart.node||caret.offset!==initialStart.offset)selection.collapse(caret.node,caret.offset);
++ else{range.setStart(caret.node,caret.offset);range.setEnd(caret.node,caret.offset);}
++ input(host,type,command==='inserttext'?value:null);return true;
++}
++function setupRealm(global,anchor,record){
++ if(installed.has(global))return;installed.add(global);
++ const Error=global.TypeError,realm={Error};realms.set(global,realm);realms.set(anchor,realm);
++ const binding=getRuntimeBinding();
++ for(const method of methods){
++  const fn=binding.createEntry((caller,receiver,args)=>{
++   const Error=realms.get(caller)?.Error??realm.Error;
++   const document=!types.isProxy(receiver)&&platformFactoryRecord(receiver)?.implementation;
++   if(!(document instanceof DocumentImpl))throw new Error('Illegal invocation');
++   if(args.length<1)throw new Error('invalid argument');
++   const command=string(args[0],Error).toLowerCase();
++   const value=method==='execCommand'?(args[2]==null?'':string(args[2],Error)):'';
++   const owner=documents.get(document),live=owner&&!owner.disposed&&document._defaultView&&utils.implForWrapper(document._defaultView.document)===document;
++   const available=Boolean(live&&supported.has(command));
++   if(method==='queryCommandSupported')return available;
++   if(method==='queryCommandState'||method==='queryCommandIndeterm')return false;
++   if(method==='queryCommandValue')return'';
++   const target=available?targetFor(document):null;
++   if(method==='queryCommandEnabled')return Boolean(target);
++   if(!target||owner.busy)return false;
++   owner.busy=true;const recovery=schedule(()=>{owner.busy=false;owner.recovery=undefined});owner.recovery=recovery;
++   try{return target.control?controlEdit(target.control,command,value):ceEdit(target,command,value);}
++   finally{cancel(recovery);owner.recovery=undefined;owner.busy=false;}
++  },global,method);
++  Object.defineProperty(global.Document.prototype,method,{value:fn,writable:true,enumerable:true,configurable:true});
++ }
++}
++export function installDocumentEditing(page,window){
++ const document=utils.implForWrapper(window.document),record={disposed:false,busy:false,recovery:undefined,exception:captureDOMExceptionFactory(window)};documents.set(document,record);
++ setupRealm(window,document._globalObject,record);
++ page.documentAbort?.signal.addEventListener('abort',()=>{record.disposed=true;record.busy=false;if(record.recovery!==undefined)cancel(record.recovery);},{once:true});
++}
++export function installUtilityDocumentEditing(controller,mainWindow){const document=utils.implForWrapper(mainWindow.document);setupRealm(controller.global,controller.context,documents.get(document));}
+--- /dev/null
++++ b/src/document-editing-state.js
+@@ -0,0 +1,10 @@
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url),Event=require('jsdom/lib/jsdom/living/generated/Event.js');
++// Actual control edit commits are Host-private and survive intervening value
++// setters; a blur compares against the value before the first command edit.
++const pending=new WeakMap();
++export function beginCommandControlEdit(control,baseline=control.value){if(!pending.has(control))pending.set(control,baseline);}
++export function commitCommandControlEdit(control){
++ if(!pending.has(control))return;const before=pending.get(control);pending.delete(control);
++ if(control.value!==before)control._dispatch(Event.createImpl(control._ownerDocument._globalObject,['change',{bubbles:true,cancelable:false,composed:false}],{isTrusted:true}));
++}
+--- /dev/null
++++ b/test/document-editing.test.js
+@@ -0,0 +1,55 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {setImmediate as checkpoint} from 'node:timers/promises';
++import {Browser} from '../src/browser.js';
++import {createIsolatedWorld} from '../src/isolated-world.js';
++import {installUtilitySelection} from '../src/selection.js';
++import {installUtilityDocumentEditing} from '../src/document-editing.js';
++async function fixture(t){const browser=new Browser({timeout:2000,loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><div id=h contenteditable>abc</div><input id=i value=hello><textarea id=a>abc</textarea>');const w=page.dom.window,d=w.document;return{browser,page,w,d,h:d.getElementById('h'),i:d.getElementById('i'),a:d.getElementById('a')};}
++const plain=x=>JSON.parse(JSON.stringify(x));
++test('Document commands use actual named native realm entries and reject forged receivers before authored conversion',async t=>{
++ const{w,d,page}=await fixture(t);
++ const names=['execCommand','queryCommandSupported','queryCommandEnabled','queryCommandState','queryCommandIndeterm','queryCommandValue'];
++ for(const name of names){const f=w.Document.prototype[name];assert.equal(f.length,1);assert.equal(f.name,name);assert.equal(Object.getPrototypeOf(f),w.Function.prototype);assert.equal(Function.prototype.toString.call(f),`function ${name}() { [native code] }`);assert.equal(Object.hasOwn(f,'prototype'),false);assert.throws(()=>new f(),e=>e.name==='TypeError');}
++ const result=page.evaluate(`(()=>{let traps=0,conversions=0;const forged=Object.create(Object.getPrototypeOf(document),Object.getOwnPropertyDescriptors(document)),proxy=new Proxy(document,{get(){traps++;throw Error('trap')}}),errors=[];for(const value of[{},forged,proxy,null])try{Document.prototype.execCommand.call(value,{toString(){conversions++;return 'insertText'}})}catch(e){errors.push([e instanceof TypeError,e.message])}const f=document.body.appendChild(document.createElement('iframe')),child=f.contentWindow;let error;try{child.Document.prototype.execCommand.call(document)}catch(e){error=[e instanceof TypeError,e instanceof child.TypeError,e.message]}return{traps,conversions,errors,error}})()`);
++ assert.deepEqual(plain(result),{traps:0,conversions:0,errors:Array.from({length:4},()=>[true,'Illegal invocation']),error:[true,false,'invalid argument']});
++ assert.equal(d.queryCommandSupported('INSERTTEXT'),true);assert.equal(d.queryCommandSupported('bold'),false);assert.equal(d.execCommand('copy'),false);
++ const detached=d.implementation.createHTMLDocument();assert.equal(detached.queryCommandSupported('insertText'),false);
++});
++test('control commands mutate actual sanitized values, selections and trusted noncancelable input, committing one real change before blur',async t=>{
++ const{i,w,d}=await fixture(t),events=[];i.focus();i.setSelectionRange(1,3);
++ for(const type of['beforeinput','textInput','input','change','blur','focusout'])i.addEventListener(type,e=>{events.push([type,e.isTrusted,e.cancelable,e.composed,e.data,e.inputType,i.value]);e.preventDefault();});
++ assert.equal(d.execCommand('insertText',false,'XY'),true);assert.equal(i.value,'hXYlo');assert.deepEqual([i.selectionStart,i.selectionEnd],[3,3]);assert.equal(events.length,1);assert.deepEqual(events[0],['input',true,false,true,'XY','insertText','hXYlo']);i.blur();assert.deepEqual(events.map(e=>e[0]),['input','change','blur','focusout']);assert.equal(events[1][3],false);
++ i.value='abc';i.focus();i.setSelectionRange(0,3);d.execCommand('insertText',false,'XYZ');i.value='abc';const before=events.filter(e=>e[0]==='change').length;i.blur();assert.equal(events.filter(e=>e[0]==='change').length,before);
++ i.focus();i.disabled=true;assert.equal(d.queryCommandEnabled('insertText'),false);assert.equal(d.execCommand('insertText',false,'Z'),false);i.disabled=false;i.readOnly=true;assert.equal(d.execCommand('delete'),false);
++ const file=d.createElement('input');file.type='file';d.body.append(file);file.focus();assert.equal(d.queryCommandEnabled('insertText'),true);assert.throws(()=>d.execCommand('insertText',false,'X'),e=>e instanceof w.DOMException&&e.name==='InvalidStateError'&&e.message==='The object is in an invalid state');
++});
++test('textarea streams genuine LF operations while preserving CR normalization and captured target across handler mutations',async t=>{
++ const{a,d,i}=await fixture(t);a.value='ab';a.focus();a.setSelectionRange(1,1);const events=[];a.oninput=e=>events.push([e.data,a.value,a.selectionStart]);d.execCommand('insertText',false,'x\r\ny\rz\n');assert.equal(a.value,'ax\n\ny\nz\nb');assert.deepEqual(events,[['x\r','ax\nb',3],[null,'ax\n\nb',4],['y\rz','ax\n\ny\nzb',7],[null,'ax\n\ny\nz\nb',8]]);
++ a.value='';a.focus();const data=[];a.oninput=e=>{data.push(e.data);if(data.length===1){a.readOnly=true;a.remove();i.focus();}};assert.equal(d.execCommand('insertText',false,'A\nB'),true);assert.equal(a.value,'A\nB');assert.deepEqual(data,['A',null,'B']);
++});
++test('UTF16 selection flooring and codepoint deletion preserve actual controls and reject nested command execution',async t=>{
++ const{d,i}=await fixture(t);i.focus();i.value='a😀b';i.setSelectionRange(2,2);d.execCommand('delete');assert.equal(i.value,'😀b');assert.equal(i.selectionStart,0);i.value='a😀b';i.setSelectionRange(1,2);d.execCommand('insertText',false,'X');assert.equal(i.value,'aX😀b');assert.equal(i.selectionStart,2);
++ i.value='';let nested,enabled;i.oninput=()=>{nested=d.execCommand('insertText',false,'N');enabled=d.queryCommandEnabled('insertText');};assert.equal(d.execCommand('insertText',false,'A'),true);assert.equal(nested,false);assert.equal(enabled,true);assert.equal(i.value,'A');i.oninput=null;
++ let inner;assert.equal(d.execCommand('insertText',false,{toString(){inner=d.execCommand('insertText',false,'B');return'C'}}),true);assert.equal(inner,true);assert.equal(i.value,'ABC');
++});
++test('contenteditable commands preserve real Text/Range identities, inline traversal and measured selection association events',async t=>{
++ const{d,h,w}=await fixture(t),s=w.getSelection();const original=h.firstChild;s.collapse(original,1);const old=s.getRangeAt(0),events=[];d.addEventListener('selectionchange',()=>events.push('selection'));h.oninput=e=>events.push(e.inputType);d.execCommand('insertText',false,'X');assert.equal(h.firstChild,original);assert.equal(original.data,'aXbc');assert.notEqual(s.getRangeAt(0),old);assert.deepEqual(events,['selection','insertText']);
++ events.length=0;const same=s.getRangeAt(0);d.execCommand('forwardDelete');assert.equal(original.data,'aXc');assert.equal(s.getRangeAt(0),same);assert.deepEqual(events,['deleteContentForward']);
++ h.innerHTML='ab<b>cd</b>ef';const a=h.firstChild,b=h.children[0].firstChild,last=h.lastChild;s.setBaseAndExtent(a,1,b,1);d.execCommand('delete');assert.equal(h.innerHTML,'a<b>d</b>ef');assert.equal(h.firstChild,a);assert.equal(h.lastChild,last);assert.equal(s.anchorNode,a);assert.equal(s.anchorOffset,1);
++ h.textContent='abc';const retained=h.firstChild;s.selectAllChildren(h);d.execCommand('insertText',false,'');assert.equal(h.innerHTML,'');assert.equal(h.firstChild,retained);assert.equal(s.anchorNode,retained);
++});
++test('deletion removes exhausted inline nodes, creates real block placeholders and refuses atoms or block merging atomically',async t=>{
++ const{d,h,w}=await fixture(t),s=w.getSelection();h.innerHTML='ab<b>c</b>ef';const a=h.firstChild,last=h.lastChild;s.collapse(h.children[0].firstChild,1);d.execCommand('delete');assert.equal(h.innerHTML,'abef');assert.equal(h.firstChild,a);assert.equal(h.lastChild,last);assert.equal(h.childNodes.length,2);assert.equal(s.anchorNode,a);assert.equal(s.anchorOffset,2);
++ h.textContent='x';s.collapse(h.firstChild,1);d.execCommand('delete');assert.equal(h.innerHTML,'<br>');assert.equal(s.anchorNode,h);assert.equal(s.anchorOffset,0);
++ for(const [html,node,offset,command]of[['a<br>b','last',0,'delete'],['a<img>b','first',1,'forwardDelete'],['<p>ab</p><p>cd</p>','lastp',0,'delete']]){h.innerHTML=html;const n=node==='last'?h.lastChild:node==='first'?h.firstChild:h.lastChild.firstChild;s.collapse(n,offset);let count=0;h.oninput=()=>count++;assert.equal(d.execCommand(command),false);assert.equal(h.innerHTML,html);assert.equal(count,0);}
++ h.textContent='abc';s.collapse(h.firstChild,1);assert.equal(d.execCommand('insertText',false,'a\nb'),false);assert.equal(h.textContent,'abc');
++});
++test('utility and frame document entries retain actual owner documents, shared selection/control backends and caller error realms',async t=>{
++ const{page,w,d,i}=await fixture(t),world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());installUtilitySelection(world,w);installUtilityDocumentEditing(world,w);i.focus();i.setSelectionRange(1,3);
++ const value=world.evaluate(`JSON.stringify((()=>{const input=document.getElementById('i'),events=[];input.addEventListener('input',e=>events.push([e.target===input,e instanceof InputEvent,e.isTrusted]));return{realm:Object.getPrototypeOf(document.execCommand)===Function.prototype,result:document.execCommand('insertText',false,'U'),value:input.value,events}})())`);assert.deepEqual(JSON.parse(value),{realm:true,result:true,value:'hUlo',events:[[true,true,true]]});assert.equal(i.value,'hUlo');
++ const frame=d.body.appendChild(d.createElement('iframe')),child=frame.contentWindow,c=child.document.body.appendChild(child.document.createElement('input'));c.value='frame';c.focus();c.setSelectionRange(0,5);let event;c.oninput=e=>event=e;assert.equal(d.execCommand.call(child.document,'insertText',false,'F'),true);assert.equal(c.value,'F');assert.equal(c.ownerDocument,child.document);assert.equal(event instanceof child.InputEvent,true);assert.equal(event instanceof w.InputEvent,false);
++});
++test('abandoned listener execution recovers its actual busy guard after the owned deadline and old documents become inactive',async t=>{
++ const{page,i,d}=await fixture(t);i.focus();i.value='';page.timeout=35;assert.throws(()=>page.evaluate(`document.getElementById('i').addEventListener('input',()=>{while(true){}},{once:true});document.execCommand('insertText',false,'A')`),e=>/timed out/.test(e.message));await checkpoint();assert.equal(d.execCommand('insertText',false,'B'),true);assert.equal(i.value,'AB');page.timeout=2000;await page.navigate('data:text/html,<body>new');assert.equal(d.queryCommandSupported('insertText'),false);assert.equal(d.execCommand('insertText',false,'late'),false);assert.equal(i.value,'AB');
++});
+--- a/native/runtime.cc
++++ b/native/runtime.cc
+@@ -49,7 +49,7 @@
+ 
+ void CreateEntry(const FunctionCallbackInfo<Value>& info) {
+   auto isolate = info.GetIsolate();
+-  if (info.Length() != 2 || !info[0]->IsFunction() || !info[1]->IsObject()) {
++  if ((info.Length() != 2 && info.Length() != 3) || !info[0]->IsFunction() || !info[1]->IsObject() || (info.Length() == 3 && !info[2]->IsString())) {
+     isolate->ThrowException(Exception::TypeError(String::NewFromUtf8Literal(isolate, "A callback and realm anchor are required")));
+     return;
+   }
+@@ -57,7 +57,7 @@
+   if (!info[1].As<Object>()->GetCreationContext().ToLocal(&realm)) return;
+   Local<Function> entry;
+   if (!Function::New(realm, Entry, info[0], 1, ConstructorBehavior::kThrow).ToLocal(&entry)) return;
+-  entry->SetName(String::NewFromUtf8Literal(isolate, "postMessage"));
++  entry->SetName(info.Length() == 3 ? info[2].As<String>() : String::NewFromUtf8Literal(isolate, "postMessage"));
+   info.GetReturnValue().Set(entry);
+ }
+ 

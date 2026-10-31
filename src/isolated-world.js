@@ -1,4 +1,6 @@
+import {installEventAPIParity,configureEventDictionary,customEventInterface,wrapCustomEvent} from './event-api-parity.js';
 import {installPrivateEventUtils,transformPrivateEventSource,isPrivateEventKind,eventImplementation,bindEventImplementation} from './dom-event-state.js';
+import {captureDOMWrapperRealm} from './dom-wrapper-realms.js';
 import {restoreWindowGlobalInheritance} from './window-global.js';
 import {installConsole,consoleProtocolType} from './console.js';
 import {registerPlatformFactory} from './platform-factories.js';
@@ -24,7 +26,7 @@ export function canonicalUtilityValue(value){const record=utilityWrapperRecord(v
 export function utilityNodeIdentity(value){const record=utilityWrapperRecord(value);if(!record)return undefined;const type=own(record.impl,'nodeType')?.value;if(!Number.isInteger(type)||type<1||type>12)return undefined;const document=type===9?record.impl:own(record.impl,'_ownerDocument')?.value;return {nodeType:type,ownerDocument:hostUtils.wrapperForImpl(document),className:record.interfaceName};}
 
 export function createIsolatedWorld(mainWindow,{name='independent-utility-world',timeout=1000,signal,isWindowClosed,onError,resolveWindow,resolveImplementation,onConsole,onRealm,onWrapper}={}) {
- const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);
+ const context=vm.createContext({}, {name}),originalGlobalPrototype=Object.getPrototypeOf(vm.runInContext('this',context));const invocation=createInvocationTrampoline(context);const global=vm.runInContext('globalThis',context);captureDOMWrapperRealm(global,context);
  const symbolMap=new Map(Object.values(hostUtils).filter(value=>typeof value==='symbol').map(value=>[value.description,value]));
  const sharedSymbol=description=>symbolMap.get(description)??global.Symbol(description);for(const key of Reflect.ownKeys(global.Symbol))if(!['length','name','prototype'].includes(key))Object.defineProperty(sharedSymbol,key,Object.getOwnPropertyDescriptor(global.Symbol,key));
  const utilsModule={exports:{}};new vm.Script('(function(module,exports,Symbol){'+readFileSync(join(generatedRoot,'utils.js'),'utf8')+'\n})',{filename:join(generatedRoot,'utils.js')}).runInContext(context)(utilsModule,utilsModule.exports,sharedSymbol);
@@ -43,7 +45,8 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   const redirected=resolveImplementation?.(impl);if(redirected)return redirected;
   const cached=wrappers.get(impl);if(cached)return cached;
   const canonical=own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;
-  const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical)))return canonicalizeNew(name,canonical);const generated=load(join(generatedRoot,name+'.js'));
+  const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
+  const name=interfaceFor(impl);if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
   const transient=generated.new(global),wrapper=transient[hostUtils.wrapperSymbol];
   if(eventImplementation(wrapper))bindEventImplementation(wrapper,impl);else Object.defineProperty(wrapper,hostUtils.implSymbol,{value:impl,configurable:true});
@@ -76,6 +79,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  function load(filename){filename=resolve(filename);if(filename===join(generatedRoot,'utils.js'))return localUtils;if(modules.has(filename))return modules.get(filename).exports;
   const module={exports:{}};modules.set(filename,module);const hostRequire=createRequire(filename);const localRequire=specifier=>{const target=hostRequire.resolve(specifier);return target.startsWith(generatedRoot+'/')||target===interfacesPath?load(target):hostRequire(specifier);};
   let source=readFileSync(filename,'utf8');const interfaceName=filename.startsWith(generatedRoot+'/')?filename.slice(generatedRoot.length+1,-3):null;if(isPrivateEventKind(interfaceName))source=transformPrivateEventSource(source,interfaceName);const factory=new vm.Script('(function(require,module,exports,__filename,__dirname){'+source+'\n})',{filename}).runInContext(context);factory(localRequire,module,module.exports,filename,dirname(filename));
+  configureEventDictionary(interfaceName,module.exports);
   if(filename.startsWith(generatedRoot+'/')){const name=filename.slice(generatedRoot.length+1,-3),original=module.exports.setup;if(typeof original==='function')module.exports.setup=function(...args){if(name==='Range'){const privateData={...args[3]};if(privateData.start===undefined)privateData.start={node:mainDocument,offset:0};if(privateData.end===undefined)privateData.end={node:mainDocument,offset:0};args[3]=privateData;}return canonicalizeNew(name,original(...args));};
    // Measured native producer quirk: MO arguments are real main-world values,
    // while the authored callback itself continues in its genuine utility realm.
@@ -85,6 +89,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  }
  Object.defineProperties(global,{window:{value:global,writable:false},self:{value:global,writable:false},top:{get:realmFunction(()=>resolveWindow?.(mainWindow.top)??global)},parent:{get:realmFunction(()=>resolveWindow?.(mainWindow.parent)??global)},closed:{get:realmFunction(()=>Boolean(isWindowClosed?.()??signal?.aborted))},frames:{value:global}});
  load(interfacesPath).installInterfaces(global,['Window']);
+ installEventAPIParity(global,{context,onFactoryConstruct(wrapper,impl){const kind=customEventInterface(impl);if(!kind)return canonicalizeNew(interfaceFor(impl),wrapper);wrappers.set(impl,wrapper);const canonical=wrapCustomEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,kind);return wrapper},onConstruct(wrapper,impl,kind){wrappers.set(impl,wrapper);const canonical=wrapCustomEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,kind);}});
  for(const[name,constructor]of Object.entries(global[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)utilityPrototypes.set(constructor.prototype,name);
  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
@@ -104,5 +109,5 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  const dispose=()=>{if(disposed)return;disposed=true;metadata.disposed=true;invocation.dispose();for(const record of listeners){const impl=record.impl.deref(),entry=record.entry.deref();if(impl&&entry)Reflect.apply(removeImpl,impl,[record.type,entry.callback,{capture:entry.options.capture}]);}listeners.length=0;for(const reference of observerImpls)reference.deref()?.disconnect();observerImpls.clear();for(const id of timers)clearTimer(id);timers.clear();pendingFactories.length=0;signal?.removeEventListener('abort',dispose);};
  if(signal?.aborted){dispose();throw new Error('Cannot create isolated world for destroyed document');}signal?.addEventListener('abort',dispose,{once:true});
  onRealm?.(global,context,{signal,mainWindow});factoryReady=true;for(const[wrapper,entry]of pendingFactories)onWrapper?.(wrapper,global,entry);pendingFactories.length=0;
- return {context,global,realmFunction,setupEventTarget(value){return load(join(generatedRoot,'EventTarget.js')).setup(value,global,[]);},createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
+ return {context,global,realmFunction,setupEventTarget(value){return load(join(generatedRoot,'EventTarget.js')).setup(value,global,[]);},createDocument(options){return load(join(generatedRoot,options.parsingMode==='xml'?'XMLDocument.js':'Document.js')).createImpl(global,[],{options});},createDOMRect(value){return load(join(generatedRoot,'DOMRect.js')).create(global,[value.x,value.y,value.width,value.height]);},evaluate(source){requireLive();return vm.runInContext(source,context,{timeout});},callFunction(declaration,thisArg,args=[]){requireLive();return invocation.invokeDeclaration(declaration,thisArg,args,{timeout,displayErrors:false});},wrap,implementationFor(value){return wrapperImpls.get(value);},dispose,get disposed(){return disposed;}};
 }

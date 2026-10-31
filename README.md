@@ -276,20 +276,26 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 87 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 93 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 1,588 JavaScript tests, 87 PureScript Puppeteer
-checks and 13 native differential groups, plus syntax and strict PureScript checks.
-[Source-bound validation](docs/reference/phase20-integration/validation.json)
-records all 9,382 unchanged inputs and paired native/candidate fixture replays:
-27/27 with their declared profiles, plus 2/2 with an explicit WebSocket limit of 50.
-The separate full-fetch fixture still fails its literal client-hint branding check;
-that failed report remains unchanged. Earlier failed epochs remain recorded.
-Full browser equivalence remains incomplete.
+The current checkpoint passes 1,669 JavaScript tests, 93 PureScript Puppeteer
+checks and 13 native differential groups, plus syntax and strict/pedantic
+PureScript checks. [Validation](docs/reference/phase21-integration/validation.json)
+records all 10,355 unchanged guarded inputs and the three earlier full-run
+failures. The corrected input, beacon and XHR checks also pass on all three
+prepared Node versions. An earlier isolated composition passes 48/48 paired
+native/candidate fixtures with the original load and assertion budgets; that
+report identifies its exact graph separately from the final corrections.
+
+This checkpoint adds namespace/attribute and Event behavior, form state and
+reflections, original VM Input/ValidityState definitions, actual document editing,
+guarded inert focus/selection and real stylesheet source parsing. The separate
+full-fetch fixture still fails its literal client-hint branding check. Historical
+failures remain recorded, and full browser equivalence remains incomplete.
 
 ## REA investigation and comparison
 

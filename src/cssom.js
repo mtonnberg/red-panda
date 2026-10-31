@@ -9,12 +9,14 @@ const BASE = CSSStyleDeclaration.prototype;
 const DECLARATIONS = new WeakSet();
 const LISTS = new WeakMap();
 const MUTATIONS = new WeakMap();
+const CHANGES=new WeakMap();
 const LENGTHS = /^(?:(?:min-|max-)?(?:width|height|inline-size|block-size)|top|right|bottom|left|inset(?:-.+)?|margin(?:-.+)?|padding(?:-.+)?|scroll-(?:margin|padding)(?:-.+)?|border(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?-width|column-(?:width|gap|rule-width)|outline(?:-width|-offset)?|shape-margin|perspective|text-indent|letter-spacing|word-spacing|flex-basis)$/;
 const BASELINE = new Set(['align-items','align-content','align-self','justify-items','justify-content','justify-self','place-items','place-content','place-self']);
 const PAIRS = new Set(['place-items','place-content','place-self','gap','overflow','overscroll-behavior','scroll-snap-align']);
 const camelToDashed = name => name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
 
 function withoutComments(text) {
+  if(!text.includes('/*'))return text;
   let output = '', quote = null;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
@@ -178,7 +180,7 @@ function change(style, callback, { explicit = false } = {}) {
   try{return callback();}finally{
     style._setInProgress=setting;style._onChange=onChange;
     const current=style.cssText;
-    if(!setting&&(explicit||previous!==current))onChange?.call(style,current);
+    if(!setting&&(explicit||previous!==current)){CHANGES.set(style,(CHANGES.get(style)??0)+1);onChange?.call(style,current);}
   }
 }
 
@@ -282,21 +284,35 @@ export function enhanceDeclaration(style, window) {
   if(window)style._global=window;
   return style;
 }
+// Parsed scalar facts may be reused, never a public declaration or its maps.
+// Bounds apply to both each key and the complete Host-only cache.
+const DECLARATION_FACTS=new Map();let declarationFactBytes=0;
 export function createDeclaration(text='', options={}) {
-  const style=enhanceDeclaration(new CSSStyleDeclaration(),options.window);
-  for(const item of parseDeclarations(text,options)) {
+  const source=String(text),key=(options.nesting?'n':'d')+'\0'+source,style=enhanceDeclaration(new CSSStyleDeclaration(),options.window),facts=DECLARATION_FACTS.get(key);
+  if(facts){
+    for(const[name,value]of facts.values)style._values.set(name,value);for(const[name,value]of facts.priorities)style._priorities.set(name,value);style._length=facts.names.length;
+    for(let i=0;i<facts.names.length;i++)Object.defineProperty(style,i,{value:facts.names[i],writable:true,enumerable:true,configurable:true});
+    return style;
+  }
+  for(const item of parseDeclarations(source,options)) {
     if(style.getPropertyPriority(item.property)==='important'&&item.priority!=='important')continue;
     style.setProperty(item.property,item.value,item.priority);
+  }
+  const values=[...style._values],priorities=[...style._priorities];
+  if(source.length<=4096&&values.every(([name,value])=>typeof name==='string'&&typeof value==='string')&&priorities.every(([name,value])=>typeof name==='string'&&typeof value==='string')){
+    const names=Array.from({length:style.length},(_,i)=>style[i]);
+    while(DECLARATION_FACTS.size>=256||declarationFactBytes+key.length>524288){const oldest=DECLARATION_FACTS.keys().next().value;if(oldest===undefined)break;declarationFactBytes-=oldest.length;DECLARATION_FACTS.delete(oldest);}
+    DECLARATION_FACTS.set(key,{names,values,priorities});declarationFactBytes+=key.length;
   }
   return style;
 }
 
 export class CSSRuleList {
   constructor(rules=[]) {
-    const list=new Proxy(this,{get(target,key,receiver){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key))return LISTS.get(receiver)[Number(key)];return Reflect.get(target,key,receiver);},
+    const list=new Proxy(this,{get(target,key,receiver){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key))return materializeRule(LISTS.get(receiver)[Number(key)]);return Reflect.get(target,key,receiver);},
       has(target,key){return typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)?Number(key)<LISTS.get(list).length:Reflect.has(target,key);},
       ownKeys(){return LISTS.get(list).map((_,i)=>String(i));},
-      getOwnPropertyDescriptor(target,key){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<LISTS.get(list).length)return{configurable:true,enumerable:true,value:LISTS.get(list)[Number(key)],writable:false};return Reflect.getOwnPropertyDescriptor(target,key);},
+      getOwnPropertyDescriptor(target,key){if(typeof key==='string'&&/^(?:0|[1-9]\d*)$/.test(key)&&Number(key)<LISTS.get(list).length)return{configurable:true,enumerable:true,value:materializeRule(LISTS.get(list)[Number(key)]),writable:false};return Reflect.getOwnPropertyDescriptor(target,key);},
       set(){return false;},deleteProperty(){return false;},defineProperty(){return false;}});
     LISTS.set(list,[...rules]);return list;
   }
@@ -305,10 +321,31 @@ export class CSSRuleList {
   get [Symbol.toStringTag](){return 'CSSRuleList';}
 }
 export function asRuleList(rules) {return LISTS.has(rules)?rules:new CSSRuleList(rules);}
-export function spliceRules(rules,...args){return LISTS.get(rules).splice(...args);}
+export function spliceRules(rules,...args){const removed=LISTS.get(rules).splice(...args),publicValues=removed.map(materializeRule),state=DEFERRED_LISTS.get(rules);if(state){for(const value of removed)if(DEFERRED_RULES.has(value)){state.published.delete(value);state.styled.delete(value);}state.version++;state.groups=null;}return publicValues;}
 
+// A flat stylesheet has a real parsed backend for every rule. Its public
+// CSSOM objects are constructed once on demand, never replaced by summaries.
+const DEFERRED_RULES=new WeakSet(),DEFERRED_LISTS=new WeakMap();
+function declarationRevision(style){return style&&DECLARATIONS.has(style)?String(MUTATIONS.get(style)??0)+':'+(CHANGES.get(style)??0)+':'+style.length:style?.cssText;}
+function deferredRules(entries,window){const state={window,sheet:null,parent:null,published:new Set(),styled:new Set(),version:1,groups:null};const definitions=entries.map(entry=>{const value={owner:state,selector:entry.prelude,body:entry.body,rule:null,style:null,styleVersion:null};DEFERRED_RULES.add(value);return value});const list=new CSSRuleList(definitions);state.list=list;DEFERRED_LISTS.set(list,state);return list;}
+function deferredStyle(value){if(value.rule)return value.rule.style;if(!value.style){value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);}return value.style;}
+function materializeRule(value){if(!value||!DEFERRED_RULES.has(value))return value;if(value.rule)return value.rule;const owner=value.owner,rule=new cssom.CSSStyleRule();rule.selectorText=value.selector;rule.style=deferredStyle(value);rule.cssRules=new CSSRuleList();rule.parentStyleSheet=owner.sheet;rule.parentRule=owner.parent;Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});Object.defineProperty(rule,'cssText',styleTextDescriptor(owner.window));value.rule=rule;value.style=rule.style;value.styleVersion=declarationRevision(rule.style);owner.published.add(value);owner.styled.add(value);return rule;}
+export function bindDeferredRules(rules,sheet,parent,normalize){const state=DEFERRED_LISTS.get(rules);if(!state)return false;state.sheet=sheet;state.parent=parent;for(const value of LISTS.get(rules)){if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule)normalize(value.rule);}else normalize(value);}return true;}
+export function hasStyleImports(rules){return [...(LISTS.get(rules)??rules)].some(value=>!DEFERRED_RULES.has(value)&&value.type===3);}
+export function discardStyleImports(rules){const values=LISTS.get(rules);for(let i=values.length-1;i>=0;i--)if(!DEFERRED_RULES.has(values[i])&&values[i].type===3)values.splice(i,1);}
+export function detachRuleEntries(rules){for(const value of LISTS.get(rules)??rules){if(DEFERRED_RULES.has(value)){if(value.rule){value.rule.parentStyleSheet=null;value.rule.parentRule=null;}}else{value.parentStyleSheet=null;value.parentRule=null;}}}
+export function replaceRuleEntries(target,source,sheet,parent,window){detachRuleEntries(target);const values=LISTS.get(source)??source,copy=values.slice();LISTS.set(target,copy);let state=DEFERRED_LISTS.get(target);if(!state){state={window,sheet,parent,published:new Set(),styled:new Set(),version:1,groups:null,list:target};DEFERRED_LISTS.set(target,state);}else{state.published.clear();state.styled.clear();state.version++;state.groups=null;state.sheet=sheet;state.parent=parent;}
+ for(const value of copy)if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule){state.published.add(value);value.rule.parentStyleSheet=sheet;value.rule.parentRule=parent;}if(value.style)state.styled.add(value);}return target;}
+export function flatSheetState(sheet){const list=sheet.cssRules,state=DEFERRED_LISTS.get(list);if(!state)return null;const values=LISTS.get(list);for(const value of state.published){const rule=value.rule;if(rule.cssRules?.length)return null;if(value.selector!==rule.selectorText){value.selector=rule.selectorText;state.version++;state.groups=null;}if(value.style!==rule.style){value.style=rule.style;value.styleVersion=declarationRevision(rule.style);state.version++;} }
+ for(const value of state.styled){const version=declarationRevision(value.style);if(version!==value.styleVersion){value.styleVersion=version;state.version++;}}
+ if(!state.groups){const groups=new Map();for(let index=0;index<values.length;index++){const value=values[index];if(!DEFERRED_RULES.has(value))return null;if(!groups.has(value.selector))groups.set(value.selector,[]);groups.get(value.selector).push({value,index});}state.groups=groups;}return state;}
+export function deferredRuleStyle(value){return deferredStyle(value);}
+
+
+const RULE_BLOCK_FACTS=new Map();let ruleBlockFactBytes=0;
 function parseRuleBlocks(text) {
-  const result=[]; text=withoutComments(String(text));let start=0;
+  const source=String(text),known=RULE_BLOCK_FACTS.get(source);if(known)return known;
+  const result=[]; text=withoutComments(source);let start=0;
   for(let i=0;i<text.length;i++) {
     const c=text[i];if(c==='\\'){i++;continue;}
     if(c==='"'||c==="'"){let end=i+1;for(;end<text.length;end++){if(text[end]==='\\')end++;else if(text[end]===c)break;}i=end;continue;}
@@ -316,15 +353,27 @@ function parseRuleBlocks(text) {
     if(c===';'){const prelude=text.slice(start,i).trim();if(prelude.startsWith('@'))result.push({prelude,body:null,text:prelude+';'});start=i+1;}
     else if(c==='{'){const end=balancedEnd(text,i),prelude=text.slice(start,i).trim();if(prelude)result.push({prelude,body:text.slice(i+1,end),text:text.slice(start,Math.min(end+1,text.length)).trim()});i=end;start=i+1;}
   }
+  if(source.length<=4096){
+    while(RULE_BLOCK_FACTS.size>=256||ruleBlockFactBytes+source.length>524288){const oldest=RULE_BLOCK_FACTS.keys().next().value;if(oldest===undefined)break;ruleBlockFactBytes-=oldest.length;RULE_BLOCK_FACTS.delete(oldest);}
+    for(const entry of result)Object.freeze(entry);Object.freeze(result);RULE_BLOCK_FACTS.set(source,result);ruleBlockFactBytes+=source.length;
+  }
   return result;
 }
 
+const STYLE_TEXT_FACTORIES=new WeakMap();let hostStyleText;
+function styleTextDescriptor(window){
+  if(window&&STYLE_TEXT_FACTORIES.has(window))return STYLE_TEXT_FACTORIES.get(window);
+  if(!window&&hostStyleText)return hostStyleText;
+  const descriptor={configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}};
+  if(window)STYLE_TEXT_FACTORIES.set(window,descriptor);else hostStyleText=descriptor;return descriptor;
+}
 const NESTED_GROUPS=new WeakMap();
 export const nestedGroupContents=rule=>NESTED_GROUPS.get(rule);
 
 export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
-  const sheet=new cssom.CSSStyleSheet();const rules=[];
-  for(const entry of parseRuleBlocks(text)) {
+  const sheet=new cssom.CSSStyleSheet();const rules=[],blocks=parseRuleBlocks(text);
+  if(!nested&&blocks.every(entry=>!entry.prelude.startsWith('@')&&entry.body!==null&&parseRuleBlocks(entry.body).length===0)) {sheet.cssRules=deferredRules(blocks,window);return sheet;}
+  for(const entry of blocks) {
     const {prelude,body}=entry;let rule;
     if(!prelude.startsWith('@') && body!==null) {
       rule=new cssom.CSSStyleRule();rule.selectorText=prelude;rule.style=createDeclaration(body,{nesting:true,window});rule.cssRules=parseStyleSheet(body,{window,onUnsupported,nested:true}).cssRules;
@@ -358,7 +407,7 @@ export function parseStyleSheet(text,{window,onUnsupported,nested=false}={}) {
     }
     if(!rule)continue;
     if(rule.style){Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});}
-    if(rule.type===1)Object.defineProperty(rule,'cssText',{configurable:true,enumerable:true,get(){const children=[...this.cssRules].map(rule=>rule.cssText).join(' ');const body=[this.style.cssText,children].filter(Boolean).join(' ');return `${this.selectorText} {${body?' '+body+' ':' '}}`;},set(value){const parsed=parseStyleSheet(value,{window}).cssRules[0];if(parsed?.type===1){this.selectorText=parsed.selectorText;this.style=parsed.style;this.cssRules=parsed.cssRules;Object.defineProperty(this.style,'parentRule',{configurable:true,value:this});}}});
+    if(rule.type===1)Object.defineProperty(rule,'cssText',styleTextDescriptor(window));
     rules.push(rule);
   }
   sheet.cssRules=new CSSRuleList(rules);return sheet;

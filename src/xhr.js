@@ -161,10 +161,6 @@ export function installXHR(page, window) {
   }
   async function requestBody(body, headers) {
     if (body === null || body === undefined) return undefined;
-    if (body instanceof window.Document) {
-      if (!headers.has('content-type')) headers.set('content-type', `${body.contentType};charset=UTF-8`);
-      return new window.XMLSerializer().serializeToString(body);
-    }
     if (body instanceof window.FormData) {
       const converted = new FormData();
       for (const [name, value] of body) {

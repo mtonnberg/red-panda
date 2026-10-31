@@ -1,0 +1,15 @@
+// Owned diagnostic ONLY. Never imported by production. Adds observers, does not
+// change assertions, deadlines, server behavior or returned fetch promises.
+import {appendFileSync} from 'node:fs';
+import {Browser,Page} from '../src/browser.js';
+import {installBeacon} from '../src/beacon.js';
+const path=process.env.BEACON_DIAG_FILE,started=performance.now(),pages=[];
+function error(e){return{name:e?.name,message:e?.message,code:e?.code,cause:e?.cause?{name:e.cause.name,message:e.cause.message,code:e.cause.code}:undefined}}
+function resources(){return{active:process.getActiveResourcesInfo(),handles:process._getActiveHandles().map(h=>({kind:h.constructor?.name,listening:h.listening,destroyed:h.destroyed,connecting:h.connecting,localPort:h.localPort,remotePort:h.remotePort,readable:h.readable,writable:h.writable,hasRef:h._handle?.hasRef?.()}))}}
+function log(type,detail={}){if(path)appendFileSync(path,JSON.stringify({pid:process.pid,t:performance.now()-started,type,...detail})+'\n')}
+function controllers(){return pages.flatMap(r=>{const p=r.page.deref(),c=r.controller.deref();return p&&c?[{page:p.id,closed:p.closed,generation:p.documentGeneration,pending:c.pending,bytes:c.inflightBytes,errors:c.errors.map(error),activeRequests:p.activeRequests.size}]:[]})}
+const prepare=Page.prototype.prepareWindow;Page.prototype.prepareWindow=function(...args){const result=Reflect.apply(prepare,this,args);const controller=installBeacon(this,args[0]);pages.push({page:new WeakRef(this),controller:new WeakRef(controller)});log('window-prepared',{page:this.id,...resources()});return result};
+const fetch=Page.prototype.fetch;Page.prototype.fetch=function(input,init={},type){const url=String(input),at=performance.now();log('fetch-start',{page:this.id,url,type,timeout:this.timeout,bytes:init.body?.byteLength,aborted:init.signal?.aborted});let result;try{result=Reflect.apply(fetch,this,[input,init,type])}catch(e){log('fetch-throw',{page:this.id,url,error:error(e)});throw e}result.then(r=>log('fetch-success',{page:this.id,url,type,status:r.status,elapsed:performance.now()-at}),e=>log('fetch-failure',{page:this.id,url,type,error:error(e),elapsed:performance.now()-at}));return result};
+const close=Browser.prototype.close;Browser.prototype.close=function(...args){log('browser-close-start',{controllers:controllers(),...resources()});try{const result=Reflect.apply(close,this,args);log('browser-close-finished',{syncClosed:this.syncHTTP.closed,controllers:controllers(),...resources()});return result}catch(e){log('browser-close-threw',{error:error(e),...resources()});throw e}};
+const interval=setInterval(()=>log('periodic',{controllers:controllers(),...resources()}),1000);interval.unref();
+process.on('beforeExit',code=>log('beforeExit',{code,controllers:controllers(),...resources()}));process.on('exit',code=>log('exit',{code,controllers:controllers(),...resources()}));process.on('uncaughtExceptionMonitor',e=>log('uncaught-exception',{error:error(e),...resources()}));log('preload',{context:process.env.NODE_TEST_CONTEXT,argv:process.argv,...resources()});

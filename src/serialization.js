@@ -1,6 +1,7 @@
 // Independent HTML emission from real nodes. XML-mode serialization stays with
 // its existing namespace-aware serializer; no finished markup is rewritten.
 import { createRequire } from 'node:module';
+import {ownsNamespaceNode} from './namespace-state.js';
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const adapter = require('jsdom/lib/jsdom/living/domparsing/parse5-adapter-serialization.js');
@@ -49,7 +50,8 @@ export function serializeHTML(node, { outer = true, treeAdapter = adapter, scrip
     return parent?.namespace === HTML && (rawText.has(parent.tag) || parent.tag === 'noscript' && scriptingEnabled) ? contents : escapeText(contents);
   };
   const emit = (current, parent) => {
-    if (treeAdapter.isTextNode(current)) return text(current, parent);
+    if (treeAdapter.isTextNode(current) || current.nodeType === 4) return text(current, parent);
+    if (current.nodeType === 7) return `<?${current.target} ${current.data}?>`;
     if (treeAdapter.isCommentNode(current)) return `<!--${treeAdapter.getCommentNodeContent(current)}-->`;
     if (treeAdapter.isDocumentTypeNode(current)) {
       const name = treeAdapter.getDocumentTypeNodeName(current), publicId = treeAdapter.getDocumentTypeNodePublicId(current), systemId = treeAdapter.getDocumentTypeNodeSystemId(current);
@@ -81,7 +83,10 @@ function patch() {
   }
   const original = XMLSerializerImpl.prototype.serializeToString;
   XMLSerializerImpl.prototype.serializeToString = function (root) {
-    if (owner(root) && [1, 3, 8, 9, 10, 11].includes(root.nodeType)) return serializeHTML(root);
+    if ((owner(root) || ownsNamespaceNode(root)) && [1, 2, 3, 4, 7, 8, 9, 10, 11].includes(root.nodeType)) {
+      const implied = ownsNamespaceNode(root) && root.nodeType === 9 && root._parsingMode === 'html' && !root.doctype;
+      return (implied ? '<!DOCTYPE html>' : '') + serializeHTML(root);
+    }
     return original.call(this, root);
   };
 }
