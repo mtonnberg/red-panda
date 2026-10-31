@@ -1,0 +1,32 @@
+diff --git a/src/cdp.js b/src/cdp.js
+index 528bc41..75725ef 100644
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -25,6 +25,9 @@ const protocolErrors = new WeakSet();
+ // a wire method as a supported domain command.
+ const SESSION_ENABLE_METHODS = new Set(['Page.enable','Runtime.enable','Network.enable','Log.enable','Performance.enable','Audits.enable']);
+ const SESSION_DISABLE_METHODS = new Set(['Page.disable','Runtime.disable','Network.disable','Log.disable','Performance.disable','Audits.disable']);
++// These reference commands acknowledge configuration without requiring a
++// loaded target or changing CSS, Inspector, or TLS state.
++const CONFIGURATION_ACK_METHODS = new Set(['CSS.enable','Inspector.enable','Inspector.disable','Security.enable','Security.disable']);
+ class ProtocolError extends Error {
+   constructor(message, code = -32602) { super(message); this.code = code; protocolErrors.add(this); }
+ }
+@@ -538,13 +541,14 @@ class Connection {
+     try {
+       message = JSON.parse(raw);
+       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+-          (message.params !== undefined && (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
++          (message.params !== undefined && !(message.params === null && CONFIGURATION_ACK_METHODS.has(message.method)) &&
++            (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
+         throw new ProtocolError('Invalid CDP request', -32600);
+       }
+       const { method, params = {}, sessionId } = message;
+       const session = this.sessions.get(sessionId ?? '');
+-      if (sessionId && !session) throw new ProtocolError('Unknown session');
+-      const result = session && !method.startsWith('Browser.') && !method.startsWith('Target.')
++      if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
++      const result = CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+       this.send({ id: message.id, result, ...(sessionId ? { sessionId } : {}) });
+     } catch (error) {
