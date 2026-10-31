@@ -1,0 +1,47 @@
+--- a/src/attribute-names.js
++++ b/src/attribute-names.js
+@@ -5,6 +5,7 @@
+ import {platformFactoryRecord} from './platform-factories.js';
+ import {installPlatformFactoryHooks} from './platform-factory-hooks.js';
+ import {implementationForWrapper} from './dom-event-state.js';
++import {registerAttributeAdoptionRealm} from './attribute-adoption.js';
+ installPlatformFactoryHooks();
+ const require=createRequire(import.meta.url);
+ const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
+@@ -112,6 +113,7 @@
+ export function installAttributeNames(window,{context}={}){
+  context??=implementationForWrapper(window.document)._globalObject;
+  if(installed.has(context))return;installed.add(context);patch();ownedGlobals.add(context);ownedGlobals.add(implementationForWrapper(window.document)._globalObject);
++ registerAttributeAdoptionRealm(window);registerAttributeAdoptionRealm(context);registerAttributeAdoptionRealm(implementationForWrapper(window.document)._globalObject);
+  for(const[name,indices]of [['setAttribute',[0,1]],['toggleAttribute',[0]],['getAttribute',[0]],['getAttributeNode',[0]],['hasAttribute',[0]],['removeAttribute',[0]],['setAttributeNS',[0,1,2]],['getAttributeNS',[0,1]],['getAttributeNodeNS',[0,1]],['hasAttributeNS',[0,1]],['removeAttributeNS',[0,1]]])forward(window,context,window.Element.prototype,name,indices);
+  for(const[name,indices]of [['createAttribute',[0]],['createAttributeNS',[0,1]]])forward(window,context,window.Document.prototype,name,indices);
+  for(const[name,indices]of [['getNamedItem',[0]],['removeNamedItem',[0]],['getNamedItemNS',[0,1]],['removeNamedItemNS',[0,1]]])forward(window,context,window.NamedNodeMap.prototype,name,indices);
+--- /dev/null
++++ b/src/attribute-adoption.js
+@@ -0,0 +1,26 @@
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url);
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const {shadowIncludingInclusiveDescendantsIterator}=require('jsdom/lib/jsdom/living/helpers/shadow-dom.js');
++const globals=new WeakSet(),apply=Reflect.apply,adopt=DocumentImpl.prototype._adoptNode;
++
++// Called only by the trusted attribute-interface installer. Ownership follows
++// the actual immutable Document registry; adopting never retargets a wrapper's
++// prototype, creation realm or _globalObject.
++export function registerAttributeAdoptionRealm(globalObject){globals.add(globalObject);}
++
++DocumentImpl.prototype._adoptNode=function(node){
++ if(!globals.has(this._globalObject)||node._ownerDocument===this)return apply(adopt,this,arguments);
++ try{return apply(adopt,this,arguments);}
++ finally{
++  // The canonical backend performs removal, real shadow-inclusive adoption,
++  // custom-element reaction enqueueing and template-content adoption. Complete
++  // each live attribute's document ownership before generated CE post-steps
++  // invoke authored adoptedCallback methods. No public DOM getters are used.
++  for(const element of shadowIncludingInclusiveDescendantsIterator(node)){
++   if(element.nodeType!==1)continue;
++   const attributes=element._attributeList;
++   for(let index=0;index<attributes.length;index++)attributes[index]._ownerDocument=element._ownerDocument;
++  }
++ }
++};

@@ -1,0 +1,9 @@
+# Computed text-decoration defaults
+
+When no declaration supplied text-decoration-line or text-decoration, the computed initial-property model omitted them and exposed empty strings. The measured Native values are none. This patch adds exactly those two initial entries; actual cascade, inheritance/reset, owner-document context and live mutation remain unchanged.
+
+The independent75-observation Native control establishes important target behavior: arbitrary explicit longhand tokens, case and invalid/duplicate lists stay verbatim; shorthand stores/computes independently and does not expand the line. The runtime adds no grammar validation, normalization or shorthand expansion. Actual active→inactive→active adoption preserves declarations/Attr identity and resolves the held computed value from its real document context.
+
+Apply integration.patch and tests.patch after the frozen CSS+Attr+focus packet. Base styles SHA247cfa607318b42108e91ec762217d212e8affcb5835ddbc900e2113a3aac048; all485 copied base inputs were verified against that packet's final source map. Three new actual mutation/inheritance/readonly/adoption tests and six prior tests pass9/9. Full Native75 differences decrease139→0. The unchanged320-expression matrix drops239→65 differing fields, removing all174 previous textDecorationLine differences with zero newly differing paths.991 captured inputs remain unchanged. The original15s predictive budget was sufficient (9.30s); no Native/API/assertion budget changed.
+
+All65 remaining fields stay raw: active typography/margins36, slot initial2, immediate dynamic author sheets20 and computed interface7. The existing computed length mismatch increases90→92 after two properties are populated; this path was already mismatched against Native0 and public computed-interface work remains separate. No actual renderer/performance, full/all-SDK/source-deadline or heap parity claim is made.

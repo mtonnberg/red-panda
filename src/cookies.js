@@ -16,7 +16,7 @@ export function cookieToCDP(cookie) {
   };
 }
 
-export async function setCookie(jar, cookie, fallback = 'about:blank') {
+export function prepareCookie(cookie, fallback = 'about:blank') {
   if (!cookie || typeof cookie.name !== 'string' || !cookie.name || typeof cookie.value !== 'string' ||
       /[;\r\n]/.test(cookie.name + cookie.value)) throw new Error('Invalid cookie name or value');
   for (const key of ['domain', 'path', 'sameSite']) {
@@ -38,6 +38,11 @@ export async function setCookie(jar, cookie, fallback = 'about:blank') {
   if (cookie.httpOnly) text += '; HttpOnly';
   if (cookie.sameSite) text += `; SameSite=${cookie.sameSite}`;
   if (cookie.expires !== undefined && cookie.expires >= 0) text += `; Expires=${new Date(cookie.expires * 1000).toUTCString()}`;
+  return Object.assign(Object.create(null), { text, url });
+}
+
+export async function setCookie(jar, cookie, fallback = 'about:blank') {
+  const { text, url } = prepareCookie(cookie, fallback);
   await jar.setCookie(text, url.href);
 }
 

@@ -1,0 +1,9 @@
+# Display defaults and actual document style context
+
+The four pending Native controls ran together after explicit Root lease:162 inactive display rows,17 active UA-state rows,4 dynamic stylesheet rows and one computed-interface object. Raw CDP messages, source/binary/driver hashes, requests, lifecycle and4s watchdog budget remain in native-four.json. It finished550ms internally/749ms external with no exception; all owned resources were closed.
+
+An UNEXECUTED isolated styles.js candidate now separates actual element display defaults from CSS initial inline. Defaults follow actual namespace and qualified name; active hidden/dialog/slot/details/popover state uses real attributes and existing selector state. Existing UA display contributions are replaced by this origin-zero candidate, so authored inline, important and revert rules still use the real cascade. Other active UA declarations are deliberately retained; unmeasured general typography is outside this patch.
+
+An actual DocumentImpl with no _defaultView supplies its base element defaults without inline/author cascade. The original declarations and nodes remain untouched. A retained computed view reads the actual owner document and its active record on each invalidation; actual owner-document identity/context joins its cache key. Thus real adoption can switch style context and later resume live inline state. Ordinary unowned jsdom prototypes are unchanged.
+
+No candidate tests/runtime ran after the Native4 lease. display-context-static.patch is reviewable preparation, not a frozen validated handoff. Explicit remaining bounds are retained in native-four-summary.json. In particular dynamic author CSS was unexpectedly ignored immediately by Native in this single control; the candidate does not extrapolate that to all author sheets. Public computed CSSStyleProperties branding/creation realm is a separate existing gap.

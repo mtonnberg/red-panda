@@ -1,0 +1,7 @@
+# Final metadata composition gate
+
+Both exact sealed metadata patches c2c62f04… and af81dc3d… were applied cleanly to a fresh real copy of shapeV3, /workspace/shared/phase23-composed-final-metadata-20261031. The141-file metadata handoff and base CDP hash were verified. c58's adapter and all other prior inputs remain unchanged. No old source overlay or context adaptation was used.
+
+Actual Node24.22.1 gate:30/30 pass, comprising Cookie seven, metadata five and18 canonical Document/utility/private Target/Location cases. The portable metadata cases compare three complete Native profiles without normalizing payload fields. A separate actual CDP Browser.getVersion assertion confirms both product and userAgent remain RedPanda. All12357 Root/shapeV3/final/dependency/controller inputs stayed unchanged. The serial gate completed20.13s with original API/assertion budgets. Root remained unapplied and every owned helper/fixture closed.
+
+This final graph has48 new cases (former43 plus metadata five), projecting1902 total Root cases. Earlier190-per-SDK and targeted Cookie seven/metadata21-per-SDK epochs remain separately identified; no broad190 matrix or full workflow was rerun after the isolated metadata overlay. The previously observed Cookie priority field difference is corrected by CDP-only metadata output; generic cookie exports/HTTP/CLI/CookieStore remain preserved. Generic params-array disconnect behavior, custom stores, unmeasured lifecycle variants and65 CSS fields remain explicit bounds. No full/browser/renderer/performance/privacy parity claim is made.

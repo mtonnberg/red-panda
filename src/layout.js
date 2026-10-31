@@ -1,3 +1,5 @@
+import {captureDocumentMemberFactory} from './document-member-realms.js';
+import {captureIDLMemberFactory} from './public-idl-member.js';
 import{installWindowViewport}from'./window-viewport.js';
 import{installScrollEvents}from'./scroll-events.js';
 import {registerHeapWrapper} from './heap-registry.js';
@@ -256,7 +258,15 @@ export function installLayout(page, window, options = {}) {
   layout.setScrollObserver(installScrollEvents(page,window).windowScroll);
   const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
   const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
-  const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
+  const member=captureIDLMemberFactory(window),documentMember=captureDocumentMemberFactory(window);
+  const define = (target, name, descriptor) => {
+    if(target===window.Document.prototype){
+      descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=documentMember(name,slot,descriptor[slot]);
+    }else if(target===window.Element.prototype||target===window.HTMLElement.prototype){
+      descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(name,slot,descriptor[slot]);
+    }
+    return Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
+  };
   define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
   define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(ArrayConstructor,set,ErrorConstructor,ownedLayout(this).rects(this).map(domRect)); } });
   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {

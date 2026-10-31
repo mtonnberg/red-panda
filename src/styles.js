@@ -1,3 +1,4 @@
+import {captureDocumentMemberFactory} from './document-member-realms.js';
 import {registerHeapWrapper} from './heap-registry.js';
 import {computedTransform,computedFontSize} from './computed-values.js';
 import {evaluateMedia} from './media.js';
@@ -43,6 +44,7 @@ const initial = {
   'box-sizing': 'content-box', isolation: 'auto', transform: 'none', '-webkit-transform': 'none',
   'font-family': 'serif', 'font-size': '16px', 'font-style': 'normal', 'font-weight': '400', 'font-variant': 'normal',
   'line-height': 'normal', 'text-align': 'start', 'text-transform': 'none', 'text-indent': '0px', 'white-space': 'normal',
+  'text-decoration': 'none', 'text-decoration-line': 'none',
   'word-spacing': '0px', 'letter-spacing': 'normal', 'word-wrap': 'normal', 'overflow-wrap': 'normal', cursor: 'auto',
   direction: 'ltr', 'writing-mode': 'horizontal-tb', 'list-style-type': 'disc', 'list-style-position': 'outside',
   'list-style-image': 'none', 'border-collapse': 'separate', 'border-spacing': '0px', quotes: 'auto',
@@ -56,8 +58,32 @@ for (const side of ['top', 'right', 'bottom', 'left']) {
 
 function recordFor(document) { return RECORDS.get(document); }
 function rootOf(element) { return element.getRootNode(); }
-function ownerDocument(root) { return root.nodeType === 9 ? root : root.ownerDocument; }
+function ownerDocument(root) { const implementation=implForWrapper(root);return wrapperForImpl(implementation.nodeType===9?implementation:implementation._ownerDocument); }
 function notSupported(record, message) { return new record.window.DOMException(message, 'NotSupportedError'); }
+
+// Element defaults are independent of CSS's initial display value. Qualified
+// names matter here: prefixed and case-distinct unknown interfaces keep their
+// generic default rather than acquiring a typed HTML element's default.
+const GENERIC_INLINE=new Set('abbr b bdi bdo cite code dfn em i kbd mark q s samp small span strong sub sup time u var wbr'.split(' '));
+const HTML_INLINE=new Set([...GENERIC_INLINE,...'a blockquote br del font ins label'.split(' ')]);
+const ACTIVE_NON_RENDERING=new Set('area base datalist head link meta noscript rp script source style template title track'.split(' '));
+function hasActiveStyleContext(element){return !!implForWrapper(element)._ownerDocument._defaultView;}
+function elementDefaultDisplay(element,active=hasActiveStyleContext(element)){
+ const implementation=implForWrapper(element),namespace=implementation._namespaceURI,name=implementation._prefix?implementation._prefix+':'+implementation._localName:implementation._localName;
+ const html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';
+ let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';
+ if(!active)return display;
+ if(implementation.hasAttributeNS(null,'hidden'))return 'none';
+ if((html||svg)&&ACTIVE_NON_RENDERING.has(name))return 'none';
+ const popover=implementation.hasAttributeNS(null,'popover'),popoverOpen=popover&&matchesInScope(element,':popover-open');
+ if((html||svg)&&name==='dialog'&&!implementation.hasAttributeNS(null,'open')&&!popoverOpen)return 'none';
+ if((html||svg)&&name==='dialog'&&popoverOpen)display='block';
+ if((html||svg)&&name==='slot')display='contents';
+ const parent=implementation.parentElement;
+ if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return 'none';
+ if(popover&&!popoverOpen&&!(html&&name==='dialog'&&implementation.hasAttributeNS(null,'open')))return 'none';
+ return display;
+}
 
 // jsdom creates inline declarations before applying parsed attributes. Adapt the
 // owned declaration at creation so setAttribute and parser-created style values
@@ -425,7 +451,8 @@ function inheritanceParent(element) {
 }
 
 function localToken(record, element) {
-  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+  const actualDocument=implForWrapper(element)._ownerDocument;
+  const tokens = [id(actualDocument),Boolean(actualDocument._defaultView),getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
   const roots = new Set();
   for (let current = element; current; current = inheritanceParent(current)) {
     const root = rootOf(current); roots.add(root);
@@ -433,7 +460,7 @@ function localToken(record, element) {
   }
   for (const root of roots) {
     tokens.push(id(root), implForWrapper(root)._version);
-    for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
+    if(actualDocument._defaultView)for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
   }
   return JSON.stringify(tokens);
 }
@@ -487,6 +514,7 @@ function expandedEntries(property,value){
 }
 
 function cascade(record, element) {
+  if(!hasActiveStyleContext(element)){const defaults=new Map([['display',elementDefaultDisplay(element,false)]]);defaults.orderKeys=new Map();return defaults;}
   const values = new Map(); let order = 0;
   const matchSelector=createScopedMatcher(record.document,record.document.documentElement);record.badStyleSelectors??=new Set();
   const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
@@ -505,10 +533,11 @@ function cascade(record, element) {
   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
   for(const{sheet}of authorSheets)if(!flatSheetState(sheet))collectLayers(sheet.cssRules);
   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
-  const offer = (style, score, origin, inline = false, layer=layerRoot) => {
+  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false) => {
     style = declaration(style);
     for (let index = 0; index < style.length; index++) {
       const property = style[index];
+      if(origin===0&&property==='display'&&!elementDisplay)continue;
       let value = style.getPropertyValue(property);
       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
       if (property === 'position') { value = positionValue(value); if (value === null) continue; }
@@ -572,6 +601,7 @@ function cascade(record, element) {
     }
   };
   walk(uaRulesFor(element), 0);
+  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true);
   if (element.localName === 'a' && element.hasAttribute('href')) {
     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
   }
@@ -670,8 +700,8 @@ function compute(record, element, memo = (record.computedMemo ??= new WeakMap())
     let value = resolve(property);
     if (property === 'transform' || property === '-webkit-transform') value = computedTransform(value);
     if (property === 'font-size') {
-      const rootElement = record.document.documentElement;
-      const rootSize = element === rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
+      const rootElement = wrapperForImpl(implForWrapper(element)._ownerDocument).documentElement;
+      const rootSize = element === rootElement || !rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
       value = computedFontSize(value,parentStyle?.fontSize,rootSize,{isRoot:element===rootElement});
     }
     if (['display','visibility','position','pointer-events','overflow','overflow-x','overflow-y','content-visibility'].includes(property)&&typeof value==='string')value=value.toLowerCase();
@@ -709,8 +739,8 @@ function computedStyle(record, element, pseudo = '') {
   if (views.has(pseudo)) return views.get(pseudo);
   let token, cached;
   const current = () => {
-    const next = localToken(record, element);
-    if (token !== next) { cached = compute(record, element, undefined, next); token = next; }
+    const actualRecord=recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument))??record,next = localToken(actualRecord, element);
+    if (token !== next) { cached = compute(actualRecord, element, undefined, next); token = next; }
     return cached;
   };
   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
@@ -757,7 +787,11 @@ export function installStyles(page, window) {
     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
-  const define = (prototype, property, descriptor) => Object.defineProperty(prototype, property, descriptor);
+  const member=captureDocumentMemberFactory(window);
+  const define = (prototype, property, descriptor) => {
+    if(prototype===window.Document.prototype){descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(property,slot,descriptor[slot]);}
+    return Object.defineProperty(prototype, property, descriptor);
+  };
   const adoption = { configurable: true, enumerable: true,
     get() {
       if (!DocumentInterface.is(this) && !ShadowInterface.is(this)) throw new window.TypeError('Illegal invocation');
@@ -804,8 +838,8 @@ export function installStyles(page, window) {
     let key = pseudo == null ? '' : String(pseudo).toLowerCase();
     if (!key.startsWith(':')) key = '';
     else key = key.replace(/^:(before|after|first-letter|first-line)$/, '::$1');
-    const owner = recordFor(element.ownerDocument);
-    return owner ? computedStyle(owner, element, key) : record.originalGetComputedStyle.call(window, element);
+    const owner = recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument));
+    return owner?computedStyle(owner,element,key):!hasActiveStyleContext(element)?computedStyle(record,element,key):record.originalGetComputedStyle.call(window,element);
   };
   const dispose = () => {
     if (record.disposed) return;

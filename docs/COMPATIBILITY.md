@@ -4,39 +4,47 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The latest integrated checkpoint passes **1,854 JavaScript tests, 100 PureScript
+The latest integrated checkpoint passes **1,906 JavaScript tests, 100 PureScript
 Puppeteer checks and 13 native differential groups**, syntax and strict/pedantic
-PureScript builds. [Validation](reference/phase22-integration/validation.json)
-records 12,423 unchanged monitored inputs. All rejected Root epochs remain
-separate: missing reference transfers, media/retirement corrections, an
-unreproduced audio assertion, CLI deadline and reproduced scroll ordering.
+PureScript builds. [Validation](reference/phase23-integration/validation.json)
+records 13,487 unchanged monitored inputs. Its first1902-case full run had1899
+passes and three genuine private-argument Array-poison failures; all raw errors,
+source guards and corrected evidence remain separate.
 
-The independent implementation now includes actual viewport/scroll state and
-queued trusted events, Worker and utility Fetch/messaging, private EventTarget
-backing, joint history/Navigation/form targets, reload/cancellation, genuine
-Location creation and navigation, additional VM form definitions and Option
-aliases. Load readiness remains independent of top-level await; PureScript
-explicitly waits for its result. Positive Window timers and internal scroll
-delivery share a cancellable task checkpoint. Synchronous HTTP allocates its real
-transport on first dispatch. CLI enables VM modules before loading the browser
-graph, avoiding a measured duplicate bootstrap.
+Public Node/Element/HTMLElement and Document definitions, manual element and
+Document functions now have genuine VM creation contexts. A fresh117-value probe
+changed87 Host-created slots to the selected VM while retaining30 already-VM
+slots; all117 remain genuine after their same values' prototypes are nulled.
+Private generated conversion argument arrays stay in Host ownership at71 guarded
+allocation sites. Actual public result arrays still execute authored numeric
+setters, preserve holes and map errors exactly as the unchanged Range tests require.
+All94 focused recovery tests plus9 direct controls pass on each prepared SDK.
 
-Focused recovery checks pass on all three prepared Node versions: 39 for
-viewport/stream retirement, 54 for Window task/messaging behavior and 60 for the
-scroll checkpoint and consumers. The original private 104-leaf composition passes
-264 focused checks on each SDK and 63/63 paired unchanged source fixtures, with
-9,993 and 9,129 inputs respectively unchanged. Source fixtures retain the original
-2s load and fresh 2/8s assertion budgets. These source results are not relabeled
-as execution on the final 112-leaf graph. The complete 455-case candidate matrix
-remains historical; curated positives do not establish full replication.
+Attr ownership follows real subtree/shadow/template adoption before callbacks.
+Computed defaults and live style/focus selection use canonical owner state. The75
+text-decoration controls match Native fully; the unchanged320-field matrix retains
+65 known differences with no new paths. Three authored owner controls match whole
+Native values. These are bounded comparisons, not complete CSS/layout equivalence.
 
-Native MQL timing/private viewport state, zero-delay task ordering, literal
-client-hint branding, genuine Window/Document/module boundaries and broader
-network/layout/media behavior still differ. The exact earlier audio/CLI failure
-causes remain unproved despite the final full pass. Later CSS, cookie and genuine
-interface-definition compositions are still isolated and unrun. Their presence in
-proposals does not establish production support. The current native C++ runtime
-is unchanged at cb235f73; future owned-context/module work is not integrated.
+Cookie CDP validation, missing-address errors, empty names, negative/session and
+zero/deletion expiry, atomic schema/sanitization checks and policy-skipped batch
+members follow measured Native behavior. HTTP response policy preserves its actual
+Cookie objects and observed SameSite handling. Full cookie metadata now matches43
+actual Native payload rows without comparison filtering: site insertion and
+path/creation order, context creation/close/dispose, Network.getAllCookies and
+attached-session Storage getters. Real store callbacks/Promises and generic/CLI
+exports remain intact. The earlier190-case each-SDK matrix and Cookie/metadata
+focused epochs describe their exact prior graphs, not a fabricated final39 run.
+
+Red Panda branding is explicit user policy. The source fixture's literal
+Lightpanda-name expectation is intentionally different; its remaining unexecuted
+assertions are not automatically verified. Functional work still includes exact
+CDP dispatch, complete cookie delete/clear/attached-write scope, Page/dialog and
+permission controls, binary response/post-data capture and real limits, cache,
+Fetch/downloads, trusted input/semantic tools, broader media and genuine Window/
+module boundaries. Source63/private104 and historical full455 results stay
+separate; no full browser/WPT/performance equivalence is claimed. Native C++ remains
+cb235f73; optional owned-context/module designs are not production.
 
 The sections below retain earlier checkpoint evidence and its original limits.
 

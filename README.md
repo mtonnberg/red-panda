@@ -282,27 +282,30 @@ the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 1,854 JavaScript tests, 100 PureScript Puppeteer
+The current checkpoint passes 1,906 JavaScript tests, 100 PureScript Puppeteer
 checks and 13 native differential groups, plus syntax and strict/pedantic
-PureScript checks. [Validation](docs/reference/phase22-integration/validation.json)
-records all 12,423 unchanged monitored inputs and retains the rejected runs.
-Focused viewport, retirement and task-order checks also pass on all three
-prepared Node versions.
+PureScript checks. [Validation](docs/reference/phase23-integration/validation.json)
+records all 13,487 unchanged monitored inputs and retains the earlier failed run.
 
-It adds real viewport/scroll state, private EventTarget backing, Worker and
-utility Fetch/messaging, joint history and Navigation, form targets, cancellation,
-Location construction and navigation, genuine form interfaces and Option aliases.
-Document load completes independently of suspended module evaluation; PureScript
-waits explicitly for the module result. Internal scroll tasks share the cancellable
-Window timer checkpoint. Synchronous HTTP starts its transport on first use,
-and CLI activates VM modules before importing the browser graph.
+It adds genuine VM Node/Element/HTMLElement and Document public definitions,
+manual interface functions, real Attr adoption ownership, Native-calibrated CSS
+defaults and private focus/style ownership. Generated interface conversion arguments
+use private Host arrays while public functions and result arrays keep their actual
+VM behavior. The original authored-array geometry assertions remain unchanged.
 
-An earlier original 104-leaf composition passes 63/63 paired unchanged source
-fixtures with the original load/assertion budgets. That report remains separate
-from the final 112-leaf graph. The historical full candidate matrix, literal
-client-hint branding check, scheduling and realm boundaries, and broader browser
-coverage remain incomplete. Earlier intermittent audio and CLI failures remain
-recorded; this successful full run does not establish their exact causes.
+CDP cookie writes use observed validation, atomic batch prevalidation and real
+CookieJar mutations. Cookie metadata follows real site/path/creation order and
+loaded-context lifetimes; Network.getAllCookies and attached Storage getters use
+those real backends. Generic cookie imports/exports and CLI behavior remain intact.
+Focused interface, cookie and metadata checks pass on all three prepared Node
+versions; their scoped graphs and counts are recorded separately.
+
+Red Panda branding is retained by explicit user choice. An upstream assertion
+requiring the literal Lightpanda name remains intentionally different; unexecuted
+later assertions are not claimed passing. Full functional replication remains
+incomplete, including 65 known CSS matrix differences, broader CDP/network/media
+coverage and owned Window/module boundaries. Earlier source63/private104 and full
+455-case reports retain their original graphs and limits.
 
 ## REA investigation and comparison
 

@@ -5,6 +5,7 @@ import {createRequire} from 'node:module';
 import {platformFactoryRecord} from './platform-factories.js';
 import {installPlatformFactoryHooks} from './platform-factory-hooks.js';
 import {implementationForWrapper} from './dom-event-state.js';
+import {registerAttributeAdoptionRealm} from './attribute-adoption.js';
 installPlatformFactoryHooks();
 const require=createRequire(import.meta.url);
 const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
@@ -112,6 +113,7 @@ function forward(window,context,prototype,name,stringIndices,attrArgument=false)
 export function installAttributeNames(window,{context}={}){
  context??=implementationForWrapper(window.document)._globalObject;
  if(installed.has(context))return;installed.add(context);patch();ownedGlobals.add(context);ownedGlobals.add(implementationForWrapper(window.document)._globalObject);
+ registerAttributeAdoptionRealm(window);registerAttributeAdoptionRealm(context);registerAttributeAdoptionRealm(implementationForWrapper(window.document)._globalObject);
  for(const[name,indices]of [['setAttribute',[0,1]],['toggleAttribute',[0]],['getAttribute',[0]],['getAttributeNode',[0]],['hasAttribute',[0]],['removeAttribute',[0]],['setAttributeNS',[0,1,2]],['getAttributeNS',[0,1]],['getAttributeNodeNS',[0,1]],['hasAttributeNS',[0,1]],['removeAttributeNS',[0,1]]])forward(window,context,window.Element.prototype,name,indices);
  for(const[name,indices]of [['createAttribute',[0]],['createAttributeNS',[0,1]]])forward(window,context,window.Document.prototype,name,indices);
  for(const[name,indices]of [['getNamedItem',[0]],['removeNamedItem',[0]],['getNamedItemNS',[0,1]],['removeNamedItemNS',[0,1]]])forward(window,context,window.NamedNodeMap.prototype,name,indices);

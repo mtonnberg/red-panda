@@ -1,3 +1,5 @@
+import {isDocumentInterface,transformDocumentInterface} from './document-interface-realms.js';
+import {isFoundationalInterface,transformFoundationalInterface} from './foundational-interface-realms.js';
 import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
 import {transformPrivateWebSocketSource} from './dom-websocket-state.js';
 import {transformPrivateEventTargetSource} from './dom-event-target-state.js';
@@ -101,6 +103,8 @@ export function installDOMWrapperRealms(){
   }
   if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
   if(isAdditionalControlInterface(kind))source=transformAdditionalControlInterface(source,kind,originalSource);
+  if(isFoundationalInterface(kind))source=transformFoundationalInterface(source,kind,originalSource);
+  if(isDocumentInterface(kind))source=transformDocumentInterface(source,kind,originalSource);
   if(event)source=transformPrivateEventSource(source,kind);
   if(Implementation===EventTargetImpl)source=transformPrivateEventTargetSource(source);
   if(event||Implementation===EventTargetImpl||kind==='WebSocket')source=transformEventIDLInstall(source,kind);

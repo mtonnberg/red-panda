@@ -1,0 +1,224 @@
+--- /dev/null
++++ b/src/attribute-adoption.js
+@@ -0,0 +1,26 @@
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url);
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const {shadowIncludingInclusiveDescendantsIterator}=require('jsdom/lib/jsdom/living/helpers/shadow-dom.js');
++const globals=new WeakSet(),apply=Reflect.apply,adopt=DocumentImpl.prototype._adoptNode;
++
++// Called only by the trusted attribute-interface installer. Ownership follows
++// the actual immutable Document registry; adopting never retargets a wrapper's
++// prototype, creation realm or _globalObject.
++export function registerAttributeAdoptionRealm(globalObject){globals.add(globalObject);}
++
++DocumentImpl.prototype._adoptNode=function(node){
++ if(!globals.has(this._globalObject)||node._ownerDocument===this)return apply(adopt,this,arguments);
++ try{return apply(adopt,this,arguments);}
++ finally{
++  // The canonical backend performs removal, real shadow-inclusive adoption,
++  // custom-element reaction enqueueing and template-content adoption. Complete
++  // each live attribute's document ownership before generated CE post-steps
++  // invoke authored adoptedCallback methods. No public DOM getters are used.
++  for(const element of shadowIncludingInclusiveDescendantsIterator(node)){
++   if(element.nodeType!==1)continue;
++   const attributes=element._attributeList;
++   for(let index=0;index<attributes.length;index++)attributes[index]._ownerDocument=element._ownerDocument;
++  }
++ }
++};
+--- a/src/attribute-names.js
++++ b/src/attribute-names.js
+@@ -5,6 +5,7 @@
+ import {platformFactoryRecord} from './platform-factories.js';
+ import {installPlatformFactoryHooks} from './platform-factory-hooks.js';
+ import {implementationForWrapper} from './dom-event-state.js';
++import {registerAttributeAdoptionRealm} from './attribute-adoption.js';
+ installPlatformFactoryHooks();
+ const require=createRequire(import.meta.url);
+ const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
+@@ -112,6 +113,7 @@
+ export function installAttributeNames(window,{context}={}){
+  context??=implementationForWrapper(window.document)._globalObject;
+  if(installed.has(context))return;installed.add(context);patch();ownedGlobals.add(context);ownedGlobals.add(implementationForWrapper(window.document)._globalObject);
++ registerAttributeAdoptionRealm(window);registerAttributeAdoptionRealm(context);registerAttributeAdoptionRealm(implementationForWrapper(window.document)._globalObject);
+  for(const[name,indices]of [['setAttribute',[0,1]],['toggleAttribute',[0]],['getAttribute',[0]],['getAttributeNode',[0]],['hasAttribute',[0]],['removeAttribute',[0]],['setAttributeNS',[0,1,2]],['getAttributeNS',[0,1]],['getAttributeNodeNS',[0,1]],['hasAttributeNS',[0,1]],['removeAttributeNS',[0,1]]])forward(window,context,window.Element.prototype,name,indices);
+  for(const[name,indices]of [['createAttribute',[0]],['createAttributeNS',[0,1]]])forward(window,context,window.Document.prototype,name,indices);
+  for(const[name,indices]of [['getNamedItem',[0]],['removeNamedItem',[0]],['getNamedItemNS',[0,1]],['removeNamedItemNS',[0,1]]])forward(window,context,window.NamedNodeMap.prototype,name,indices);
+--- a/src/focus.js
++++ b/src/focus.js
+@@ -29,7 +29,7 @@
+ }
+ 
+ function renderedAndInteractive(element) {
+-  const window = element.ownerDocument?.defaultView;
++  const window = implForWrapper(element)?._ownerDocument?._defaultView;
+   if (!window || !element.isConnected) return false;
+   for (let current = element; current;) {
+     if (window.getComputedStyle(current).display === 'none') return false;
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -198,6 +198,10 @@
+ function matcher(record){
+  if(record.matcher){record.matcher.Snapshot.root=wrapperForImpl(record.documentImpl.documentElement);return record.matcher;}
+  const engine=nwsapi({document:record.document,DOMException:record.window.DOMException});engine.configure({LOGERRORS:false,VERBOSITY:true,IDS_DUPES:true,MIXEDCASE:true,FORGIVING:false});
++ // Preserve the matcher's focus predicate over canonical backend state. Its
++ // ordinary DOM property reads must not invoke authored wrapper getters while
++ // the private cascade evaluates UA/author :focus selectors.
++ engine.Snapshot.isFocusable=element=>{const implementation=implForWrapper(element);if(!implementation)return false;const document=implementation._ownerDocument;if(implementation.contentDocument&&implementation.localName==='iframe')return false;if(document.hasFocus()&&implementation===document.activeElement&&(implementation.type||implementation.href||typeof implementation.tabIndex==='number'))return element;return false;};
+  engine.Snapshot.rpPredicate=(element,index)=>predicate(record,element,record.predicates[index]);
+  engine.registerSelector(internal,new RegExp('^:'+internal+'\\((\\d+)\\)(.*)'),(match,source)=>({source:`if(s.rpPredicate(e,${Number(match[1])})){${source}}`,status:true}));
+  const has=engine.Snapshot.has;engine.Snapshot.has=(...args)=>{const from=engine.Snapshot.from;try{return has(...args);}finally{engine.Snapshot.from=from;}};
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -43,6 +43,7 @@
+   'box-sizing': 'content-box', isolation: 'auto', transform: 'none', '-webkit-transform': 'none',
+   'font-family': 'serif', 'font-size': '16px', 'font-style': 'normal', 'font-weight': '400', 'font-variant': 'normal',
+   'line-height': 'normal', 'text-align': 'start', 'text-transform': 'none', 'text-indent': '0px', 'white-space': 'normal',
++  'text-decoration': 'none', 'text-decoration-line': 'none',
+   'word-spacing': '0px', 'letter-spacing': 'normal', 'word-wrap': 'normal', 'overflow-wrap': 'normal', cursor: 'auto',
+   direction: 'ltr', 'writing-mode': 'horizontal-tb', 'list-style-type': 'disc', 'list-style-position': 'outside',
+   'list-style-image': 'none', 'border-collapse': 'separate', 'border-spacing': '0px', quotes: 'auto',
+@@ -56,9 +57,33 @@
+ 
+ function recordFor(document) { return RECORDS.get(document); }
+ function rootOf(element) { return element.getRootNode(); }
+-function ownerDocument(root) { return root.nodeType === 9 ? root : root.ownerDocument; }
++function ownerDocument(root) { const implementation=implForWrapper(root);return wrapperForImpl(implementation.nodeType===9?implementation:implementation._ownerDocument); }
+ function notSupported(record, message) { return new record.window.DOMException(message, 'NotSupportedError'); }
+ 
++// Element defaults are independent of CSS's initial display value. Qualified
++// names matter here: prefixed and case-distinct unknown interfaces keep their
++// generic default rather than acquiring a typed HTML element's default.
++const GENERIC_INLINE=new Set('abbr b bdi bdo cite code dfn em i kbd mark q s samp small span strong sub sup time u var wbr'.split(' '));
++const HTML_INLINE=new Set([...GENERIC_INLINE,...'a blockquote br del font ins label'.split(' ')]);
++const ACTIVE_NON_RENDERING=new Set('area base datalist head link meta noscript rp script source style template title track'.split(' '));
++function hasActiveStyleContext(element){return !!implForWrapper(element)._ownerDocument._defaultView;}
++function elementDefaultDisplay(element,active=hasActiveStyleContext(element)){
++ const implementation=implForWrapper(element),namespace=implementation._namespaceURI,name=implementation._prefix?implementation._prefix+':'+implementation._localName:implementation._localName;
++ const html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';
++ let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';
++ if(!active)return display;
++ if(implementation.hasAttributeNS(null,'hidden'))return 'none';
++ if((html||svg)&&ACTIVE_NON_RENDERING.has(name))return 'none';
++ const popover=implementation.hasAttributeNS(null,'popover'),popoverOpen=popover&&matchesInScope(element,':popover-open');
++ if((html||svg)&&name==='dialog'&&!implementation.hasAttributeNS(null,'open')&&!popoverOpen)return 'none';
++ if((html||svg)&&name==='dialog'&&popoverOpen)display='block';
++ if((html||svg)&&name==='slot')display='contents';
++ const parent=implementation.parentElement;
++ if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return 'none';
++ if(popover&&!popoverOpen&&!(html&&name==='dialog'&&implementation.hasAttributeNS(null,'open')))return 'none';
++ return display;
++}
++
+ // jsdom creates inline declarations before applying parsed attributes. Adapt the
+ // owned declaration at creation so setAttribute and parser-created style values
+ // follow exactly the same tokenization as later JS cssText assignments.
+@@ -425,7 +450,8 @@
+ }
+ 
+ function localToken(record, element) {
+-  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
++  const actualDocument=implForWrapper(element)._ownerDocument;
++  const tokens = [id(actualDocument),Boolean(actualDocument._defaultView),getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+   const roots = new Set();
+   for (let current = element; current; current = inheritanceParent(current)) {
+     const root = rootOf(current); roots.add(root);
+@@ -433,7 +459,7 @@
+   }
+   for (const root of roots) {
+     tokens.push(id(root), implForWrapper(root)._version);
+-    for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
++    if(actualDocument._defaultView)for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
+   }
+   return JSON.stringify(tokens);
+ }
+@@ -487,6 +513,7 @@
+ }
+ 
+ function cascade(record, element) {
++  if(!hasActiveStyleContext(element)){const defaults=new Map([['display',elementDefaultDisplay(element,false)]]);defaults.orderKeys=new Map();return defaults;}
+   const values = new Map(); let order = 0;
+   const matchSelector=createScopedMatcher(record.document,record.document.documentElement);record.badStyleSelectors??=new Set();
+   const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
+@@ -505,10 +532,11 @@
+   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
+   for(const{sheet}of authorSheets)if(!flatSheetState(sheet))collectLayers(sheet.cssRules);
+   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
+-  const offer = (style, score, origin, inline = false, layer=layerRoot) => {
++  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false) => {
+     style = declaration(style);
+     for (let index = 0; index < style.length; index++) {
+       const property = style[index];
++      if(origin===0&&property==='display'&&!elementDisplay)continue;
+       let value = style.getPropertyValue(property);
+       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
+       if (property === 'position') { value = positionValue(value); if (value === null) continue; }
+@@ -572,6 +600,7 @@
+     }
+   };
+   walk(uaRulesFor(element), 0);
++  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true);
+   if (element.localName === 'a' && element.hasAttribute('href')) {
+     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
+   }
+@@ -670,8 +699,8 @@
+     let value = resolve(property);
+     if (property === 'transform' || property === '-webkit-transform') value = computedTransform(value);
+     if (property === 'font-size') {
+-      const rootElement = record.document.documentElement;
+-      const rootSize = element === rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
++      const rootElement = wrapperForImpl(implForWrapper(element)._ownerDocument).documentElement;
++      const rootSize = element === rootElement || !rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
+       value = computedFontSize(value,parentStyle?.fontSize,rootSize,{isRoot:element===rootElement});
+     }
+     if (['display','visibility','position','pointer-events','overflow','overflow-x','overflow-y','content-visibility'].includes(property)&&typeof value==='string')value=value.toLowerCase();
+@@ -709,8 +738,8 @@
+   if (views.has(pseudo)) return views.get(pseudo);
+   let token, cached;
+   const current = () => {
+-    const next = localToken(record, element);
+-    if (token !== next) { cached = compute(record, element, undefined, next); token = next; }
++    const actualRecord=recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument))??record,next = localToken(actualRecord, element);
++    if (token !== next) { cached = compute(actualRecord, element, undefined, next); token = next; }
+     return cached;
+   };
+   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
+@@ -804,8 +833,8 @@
+     let key = pseudo == null ? '' : String(pseudo).toLowerCase();
+     if (!key.startsWith(':')) key = '';
+     else key = key.replace(/^:(before|after|first-letter|first-line)$/, '::$1');
+-    const owner = recordFor(element.ownerDocument);
+-    return owner ? computedStyle(owner, element, key) : record.originalGetComputedStyle.call(window, element);
++    const owner = recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument));
++    return owner?computedStyle(owner,element,key):!hasActiveStyleContext(element)?computedStyle(record,element,key):record.originalGetComputedStyle.call(window,element);
+   };
+   const dispose = () => {
+     if (record.disposed) return;
+--- /dev/null
++++ b/test/attribute-adoption.test.js
+@@ -0,0 +1,5 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{installAttributeNames}from'../src/attribute-names.js';import{installNamespaceSerialization}from'../src/namespace-serialization.js';
++async function fixture(t){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>');return{w:page.dom.window,d:page.dom.window.document,page};}
++test('actual subtree and shadow adoption moves held Attr ownership while preserving live attributes and identities',async t=>{const{d}=await fixture(t),to=d.implementation.createHTMLDocument('to'),xml=d.implementation.createDocument(null,'r'),root=d.createElement('section'),child=d.createElement('span'),host=d.createElement('div');root.setAttribute('data-a','one');root.setAttributeNS('urn:p','p:a','two');child.setAttribute('data-child','three');root.append(child,host);const shadow=host.attachShadow({mode:'open'}),inside=d.createElement('b');inside.setAttribute('data-shadow','four');shadow.append(inside);const nodes=[root,child,host,inside],attrs=nodes.map(e=>[...e.attributes]),prototypes=attrs.map(list=>list.map(a=>Object.getPrototypeOf(a)));for(const doc of[to,xml,d]){if(doc===xml)xml.documentElement.append(root);else assert.equal(doc.adoptNode(root),root);for(let i=0;i<nodes.length;i++){assert.equal(nodes[i].ownerDocument,doc);for(let j=0;j<attrs[i].length;j++){const a=attrs[i][j];assert.equal(a.ownerDocument,doc);assert.equal(a.ownerElement,nodes[i]);assert.equal(nodes[i].getAttributeNode(a.name),a);assert.equal(Object.getPrototypeOf(a),prototypes[i][j])}}}attrs[0][0].value='live';assert.equal(root.getAttribute('data-a'),'live');const template=d.createElement('template');template.innerHTML='<span a="v">x</span>';const content=template.content.firstChild,a=content.attributes[0];to.adoptNode(template);assert.equal(a.ownerDocument,content.ownerDocument);assert.equal(content.attributes[0],a)});
++test('genuine utility Attr wrappers retain their creation definitions over actual cross-document adoption',async t=>{const{w,page}=await fixture(t),world=createIsolatedWorld(w,{name:'attribute-adoption',signal:page.documentAbort.signal});t.after(()=>world.dispose());installAttributeNames(world.global,{context:world.context});installNamespaceSerialization(world.global,{context:world.context,createDocument:world.createDocument});const value=world.evaluate(`(()=>{const from=new DOMParser().parseFromString('<r a="v"><c b="w"/></r>','application/xml'),to=document.implementation.createHTMLDocument('to'),root=from.documentElement,child=root.firstChild,a=root.attributes[0],b=child.attributes[0],ap=Object.getPrototypeOf(a),bp=Object.getPrototypeOf(b);to.adoptNode(root);a.value='changed';return{owners:a.ownerDocument===to&&b.ownerDocument===to,nodes:root.ownerDocument===to&&child.ownerDocument===to,identities:root.attributes[0]===a&&child.attributes[0]===b,prototypes:Object.getPrototypeOf(a)===ap&&Object.getPrototypeOf(b)===bp,brands:a instanceof Attr&&b instanceof Attr,value:root.getAttribute('a')}})()`);assert.deepEqual(JSON.parse(JSON.stringify(value)),{owners:true,nodes:true,identities:true,prototypes:true,brands:true,value:'changed'})});
++test('ordinary unowned jsdom keeps its original adoption behavior and backend ownership policy',t=>{const dom=new JSDOM('<body>',{runScripts:'dangerously'});t.after(()=>dom.window.close());const d=dom.window.document,to=d.implementation.createHTMLDocument('to'),e=d.createElement('div');e.setAttribute('a','v');const a=e.attributes[0];to.adoptNode(e);assert.equal(e.ownerDocument,to);assert.equal(a.ownerDocument,d);assert.equal(a.ownerElement,e)});
+--- /dev/null
++++ b/test/computed-style-defaults.test.js
+@@ -0,0 +1,8 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';
++async function fixture(t){const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<body>');t.after(()=>browser.close());return{w:page.dom.window,d:page.dom.window.document}}
++test('genuine inactive documents retain inline state while computed styles use their non-active context defaults',async t=>{const{w,d}=await fixture(t);for(const doc of[d.implementation.createHTMLDocument('x'),d.implementation.createDocument(null,'root')])for(const ns of['http://www.w3.org/1999/xhtml','urn:q','http://www.w3.org/2000/svg']){const e=doc.createElementNS(ns,'div');e.setAttribute('style','display:none;color:rgb(9,8,7);font-size:29px;font-weight:100;font-style:italic;position:fixed;visibility:hidden;line-height:3');const c=w.getComputedStyle(e);assert.equal(e.style.color,'rgb(9, 8, 7)');assert.equal(e.style.fontSize,'29px');assert.equal(c.color,'rgb(0, 0, 0)');assert.equal(c.fontSize,'16px');assert.equal(c.fontWeight,'400');assert.equal(c.fontStyle,'normal');assert.equal(c.position,'static');assert.equal(c.visibility,'visible');assert.equal(c.lineHeight,'normal');assert.equal(c.display,ns==='http://www.w3.org/2000/svg'?'inline':'block');assert.equal(e.ownerDocument,doc)}});
++test('retained computed views follow actual ownerDocument adoption and later real declaration changes',async t=>{const{w,d}=await fixture(t),inactive=d.implementation.createHTMLDocument('x'),e=d.createElement('div');e.setAttribute('style','color:rgb(1,2,3);font-size:23px;display:flex');const held=w.getComputedStyle(e),attr=e.getAttributeNode('style');assert.equal(held.color,'rgb(1, 2, 3)');assert.equal(held.display,'flex');inactive.adoptNode(e);assert.equal(e.ownerDocument,inactive);assert.equal(e.getAttributeNode('style'),attr);assert.equal(e.style.color,'rgb(1, 2, 3)');assert.equal(held.color,'rgb(0, 0, 0)');assert.equal(held.fontSize,'16px');assert.equal(held.display,'block');e.style.color='rgb(4,5,6)';d.adoptNode(e);assert.equal(e.ownerDocument,d);assert.equal(held.color,'rgb(4, 5, 6)');assert.equal(held.fontSize,'23px');assert.equal(held.display,'flex')});
++test('element display defaults remain distinct from explicit CSS initial and revert semantics',async t=>{const{w,d}=await fixture(t);for(const ns of[null,'urn:q','http://www.w3.org/1998/Math/MathML']){const e=d.createElementNS(ns,'item');assert.equal(w.getComputedStyle(e).display,'block');e.style.display='initial';assert.equal(w.getComputedStyle(e).display,'inline');e.style.display='unset';assert.equal(w.getComputedStyle(e).display,'inline');e.style.display='revert';assert.equal(w.getComputedStyle(e).display,'block');e.style.display='table';assert.equal(w.getComputedStyle(e).display,'table');e.style.removeProperty('display');assert.equal(w.getComputedStyle(e).display,'block');const span=d.createElementNS(ns,'span');assert.equal(w.getComputedStyle(span).display,'inline')}});
++test('qualified interface defaults and real active attributes produce live display candidates below authored declarations',async t=>{const{w,d}=await fixture(t),H='http://www.w3.org/1999/xhtml',S='http://www.w3.org/2000/svg';for(const[ns,name,expected]of[[H,'span','inline'],[H,'SPAN','block'],[H,'p:span','block'],[H,'blockquote','inline'],['urn:q','blockquote','block'],['urn:q','span','inline'],['urn:q','p:span','block'],[S,'SPAN','inline'],[H,'table','block'],[S,'table','inline']]){const e=d.createElementNS(ns,name);assert.equal(w.getComputedStyle(e).display,expected,ns+':'+name)}for(const ns of[H,'urn:q',S]){const e=d.createElementNS(ns,'dialog'),computed=w.getComputedStyle(e),base=ns===H?'block':ns===S?'inline':'block';assert.equal(computed.display,ns==='urn:q'?'block':'none');e.setAttribute('open','');assert.equal(computed.display,base);e.setAttribute('hidden','');assert.equal(computed.display,'none');e.style.display='block';assert.equal(computed.display,'block');e.style.display='revert';assert.equal(computed.display,'none');e.removeAttribute('hidden');assert.equal(computed.display,base);e.removeAttribute('open');assert.equal(computed.display,ns==='urn:q'?'block':'none')}});
++test('actual adoption context ignores authored ownerDocument getters for both retained and fresh computed views',async t=>{const{w,d}=await fixture(t),inactive=d.implementation.createHTMLDocument('x'),e=d.createElement('div');e.setAttribute('style','color:rgb(1,2,3);display:flex');const held=w.getComputedStyle(e),attr=e.getAttributeNode('style');let reads=0;Object.defineProperty(e,'ownerDocument',{configurable:true,get(){reads++;throw Error('authored owner document')}});assert.equal(held.color,'rgb(1, 2, 3)');assert.equal(w.getComputedStyle(e),held);assert.equal(inactive.adoptNode(e),e);assert.equal(attr.ownerDocument,inactive);assert.equal(held.color,'rgb(0, 0, 0)');assert.equal(held.display,'block');assert.equal(w.getComputedStyle(e).color,'rgb(0, 0, 0)');e.style.color='rgb(4,5,6)';assert.equal(d.adoptNode(e),e);assert.equal(attr.ownerDocument,d);assert.equal(held.color,'rgb(4, 5, 6)');assert.equal(w.getComputedStyle(e),held);assert.equal(reads,0)});
++test('private focus matching preserves actual focus/blur and positive author stylesheet cascade without authored owner reads',async t=>{const{w,d}=await fixture(t),style=d.createElement('style'),e=d.createElement('div');style.textContent='.focus-target{color:rgb(1,2,3)}.focus-target:focus{color:rgb(4,5,6)}';d.head.append(style);e.className='focus-target';e.tabIndex=0;d.body.append(e);const held=w.getComputedStyle(e);assert.equal(e.matches(':focus'),false);assert.equal(held.color,'rgb(1, 2, 3)');let reads=0;Object.defineProperty(e,'ownerDocument',{configurable:true,get(){reads++;throw Error('authored focus owner')}});e.focus();assert.equal(d.activeElement,e);assert.equal(e.matches(':focus'),true);assert.equal(held.color,'rgb(4, 5, 6)');e.blur();assert.equal(e.matches(':focus'),false);assert.equal(held.color,'rgb(1, 2, 3)');assert.equal(reads,0)});
+--- /dev/null
++++ b/test/computed-text-decoration.test.js
+@@ -0,0 +1,5 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';
++async function fixture(t){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>');return{w:page.dom.window,d:page.dom.window.document};}
++test('text decoration defaults leave declarations untouched and reset a non-inherited line through the real cascade',async t=>{const{w,d}=await fixture(t),parent=d.createElement('div'),child=d.createElement('span');parent.style.textDecorationLine='overline';parent.append(child);d.body.append(parent);const held=w.getComputedStyle(child);assert.equal(w.getComputedStyle(parent).textDecorationLine,'overline');assert.equal(child.style.textDecorationLine,'');assert.equal(child.hasAttribute('style'),false);assert.equal(held.textDecorationLine,'none');assert.equal(held.textDecoration,'none');assert.equal(held.getPropertyValue('text-decoration-line'),'none');for(const[value,expected]of[['inherit','overline'],['initial','none'],['unset','none'],['revert','none']]){child.style.textDecorationLine=value;assert.equal(held.textDecorationLine,expected);assert.equal(child.style.textDecorationLine,value)}child.style.removeProperty('text-decoration-line');assert.equal(held.textDecorationLine,'none');assert.equal(w.getComputedStyle(parent).textDecorationLine,'overline')});
++test('actual inline mutation keeps Native verbatim longhand tokens and shorthand does not synthesize a line declaration',async t=>{const{w,d}=await fixture(t),e=d.createElement('span');d.body.append(e);const held=w.getComputedStyle(e);for(const value of['UNDERLINE','bogus','underline underline','none underline','overline underline']){e.style.setProperty('text-decoration-line',value);assert.equal(e.style.textDecorationLine,value);assert.equal(held.textDecorationLine,value);assert.equal(held.getPropertyValue('text-decoration-line'),value)}e.removeAttribute('style');for(const value of['underline','red wavy underline','underline 2px blue','bogus']){e.setAttribute('style','text-decoration:'+value);assert.equal(e.style.textDecoration,value);assert.equal(e.style.textDecorationLine,'');assert.equal(held.textDecoration,value);assert.equal(held.textDecorationLine,'none')}assert.throws(()=>held.setProperty('text-decoration-line','underline'),{name:'NoModificationAllowedError'});assert.equal(held.textDecorationLine,'none')});
++test('retained decoration values follow actual inactive adoption and later author changes without replacing the Attr',async t=>{const{w,d}=await fixture(t),inactive=d.implementation.createHTMLDocument('inactive'),e=d.createElement('span');e.style.textDecorationLine='underline';d.body.append(e);const held=w.getComputedStyle(e),a=e.getAttributeNode('style');assert.equal(held.textDecorationLine,'underline');inactive.adoptNode(e);assert.equal(e.getAttributeNode('style'),a);assert.equal(a.ownerDocument,inactive);assert.equal(e.style.textDecorationLine,'underline');assert.equal(held.textDecorationLine,'none');e.style.textDecorationLine='line-through';assert.equal(held.textDecorationLine,'none');d.body.append(e);assert.equal(e.getAttributeNode('style'),a);assert.equal(a.ownerDocument,d);assert.equal(held.textDecorationLine,'line-through')});

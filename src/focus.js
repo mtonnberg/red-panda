@@ -29,7 +29,7 @@ function nativeKind(element) {
 }
 
 function renderedAndInteractive(element) {
-  const window = element.ownerDocument?.defaultView;
+  const window = implForWrapper(element)?._ownerDocument?._defaultView;
   if (!window || !element.isConnected) return false;
   for (let current = element; current;) {
     if (window.getComputedStyle(current).display === 'none') return false;

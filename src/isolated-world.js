@@ -1,3 +1,4 @@
+import {installDocumentXPathEntries} from './document-member-realms.js';
 import {canonicalLocation,locationImplementation,installPrivateLocationUtils,prepareLocationContext,installLocationInterface,transformUtilityLocationInterfaces,createLocationAlias,installLocationWindowAlias} from './location-factory.js';
 import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
 import {installPrivateWebSocketUtils,transformPrivateWebSocketSource,webSocketImplementation,bindWebSocketImplementation} from './dom-websocket-state.js';
@@ -109,6 +110,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
  Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
+ installDocumentXPathEntries(global);
  installLocationWindowAlias(global,()=>wrapImpl(mainDocument._location));
  const windowImpl=hostUtils.implForWrapper(mainWindow);bindEventTargetImplementation(global,windowImpl);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
  global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);restoreWindowGlobalInheritance(global,context,originalGlobalPrototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});

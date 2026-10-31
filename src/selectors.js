@@ -198,6 +198,10 @@ function compiled(record,source) {
 function matcher(record){
  if(record.matcher){record.matcher.Snapshot.root=wrapperForImpl(record.documentImpl.documentElement);return record.matcher;}
  const engine=nwsapi({document:record.document,DOMException:record.window.DOMException});engine.configure({LOGERRORS:false,VERBOSITY:true,IDS_DUPES:true,MIXEDCASE:true,FORGIVING:false});
+ // Preserve the matcher's focus predicate over canonical backend state. Its
+ // ordinary DOM property reads must not invoke authored wrapper getters while
+ // the private cascade evaluates UA/author :focus selectors.
+ engine.Snapshot.isFocusable=element=>{const implementation=implForWrapper(element);if(!implementation)return false;const document=implementation._ownerDocument;if(implementation.contentDocument&&implementation.localName==='iframe')return false;if(document.hasFocus()&&implementation===document.activeElement&&(implementation.type||implementation.href||typeof implementation.tabIndex==='number'))return element;return false;};
  engine.Snapshot.rpPredicate=(element,index)=>predicate(record,element,record.predicates[index]);
  engine.registerSelector(internal,new RegExp('^:'+internal+'\\((\\d+)\\)(.*)'),(match,source)=>({source:`if(s.rpPredicate(e,${Number(match[1])})){${source}}`,status:true}));
  const has=engine.Snapshot.has;engine.Snapshot.has=(...args)=>{const from=engine.Snapshot.from;try{return has(...args);}finally{engine.Snapshot.from=from;}};

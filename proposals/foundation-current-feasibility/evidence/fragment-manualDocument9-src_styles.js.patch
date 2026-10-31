@@ -1,0 +1,20 @@
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,3 +1,4 @@
++import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import {computedTransform,computedFontSize} from './computed-values.js';
+ import {evaluateMedia} from './media.js';
+@@ -757,7 +758,11 @@
+     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
+   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
+   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
+-  const define = (prototype, property, descriptor) => Object.defineProperty(prototype, property, descriptor);
++  const member=captureDocumentMemberFactory(window);
++  const define = (prototype, property, descriptor) => {
++    if(prototype===window.Document.prototype){descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(property,slot,descriptor[slot]);}
++    return Object.defineProperty(prototype, property, descriptor);
++  };
+   const adoption = { configurable: true, enumerable: true,
+     get() {
+       if (!DocumentInterface.is(this) && !ShadowInterface.is(this)) throw new window.TypeError('Illegal invocation');

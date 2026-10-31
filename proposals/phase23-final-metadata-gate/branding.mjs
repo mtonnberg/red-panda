@@ -1,0 +1,3 @@
+import{pathToFileURL}from'node:url';import{resolve}from'node:path';import{writeFile}from'node:fs/promises';import assert from'node:assert/strict';
+const[sourceRoot,output]=process.argv.slice(2),{serve}=await import(pathToFileURL(resolve(sourceRoot,'src/cdp.js'))),{connect}=await import(pathToFileURL(resolve(sourceRoot,'test/cdp-client.js')));const service=await serve({port:0});let client,value;
+try{client=await connect('ws://127.0.0.1:'+service.port+'/');value=await client.send('Browser.getVersion');assert.match(value.product,/^RedPanda\//);assert.match(value.userAgent,/^RedPanda\//);}finally{await client?.close();await service.close();await writeFile(output,JSON.stringify(value,null,2)+'\n',{flag:'wx'});}

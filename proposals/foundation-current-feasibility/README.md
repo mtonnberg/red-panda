@@ -1,0 +1,47 @@
+# Current factory composition feasibility — static, unexecuted
+
+This packet adapts the frozen foundations → manual Element members → Document → manual Document members chain to the current Root source without replacing any current file wholesale. No JavaScript, browser, native build, heap traversal, GC, network control or test ran in this epoch. Root diagnostic full31518 owns runtime. Earlier frozen Native and three-SDK successes establish the original packets' evidence only; they do not establish this composition's behavior.
+
+The smallest coherent first tranche is `evidence/incremental-1-foundations.patch`: three paths, consisting of the exact frozen new foundational module and six tests, plus two import/dispatch additions in current `dom-wrapper-realms.js`. It does not require the manual publishers, Document migration or a native build. Start with its current-baseline physical controls, then its six tests and the two existing utility Node regressions. Do not integrate the full chain based only on these static checks.
+
+`base/` is a real 1,846-file copy of current Root, including all current changes present at the snapshot; it is not the old frozen source. Root HEAD was `9df839235be651d9408d3eea2b3ee7c3286ab914` with the full dirty/untracked state recorded in `evidence/root-git-state.json`. Base and candidate contain all source, tests, native sources and available outputs, scripts, automation, package records and reference documents selected in `evidence/root-before.json`. `node_modules` is a link to current Root dependencies, so a future runtime epoch must recheck dependency and binary identity rather than treating that link as a frozen dependency copy. `evidence/root-after-static.json` proves all 1,846 original Root file contents were unchanged by this work. The PureScript changes in the snapshot are preserved byte for byte; no automation source is changed by the candidate.
+
+## Exact conflicts and adaptations
+
+The four old patches were independently checked against the exact current base; raw nonzero results are preserved in `evidence/raw-patch-checks-current-base.json`. An old patch rejection is a context failure, not evidence of runtime failure.
+
+| Frozen packet | Current rejection | Narrow adaptation |
+| --- | --- | --- |
+| foundations `8acf1a5c…` | `dom-wrapper-realms.js` first import context changed | Add only the foundational import and dispatch next to current Additional, private WebSocket and private EventTarget hooks. Keep current predicates, allocation and setup intact. |
+| manual21 `c0a12b25…` | layout import context changed; scrolling implementation was replaced | Rebase only the layout publication helper; retain exact applicable dialogs/shadow fragments. Omit the old scrolling fragment entirely. This is now **manual19**, with two existing selected-VM scroll setters retained. |
+| Document `b57b0fbf…` | central import context changed and prior tranche dependency absent | Add only the Document import and dispatch to the current central factory. Exact generated body guard still accepts precisely the existing same-shell constructor and seven method-realm factory substitutions. |
+| manualDocument9 `9df773db…` | layout and isolated-world first import contexts changed | Rebase only the Document publication branch and two utility XPath lines; retain the exact applicable collections/document-xml/styles fragments. Keep all Location and private Target binding paths. |
+
+The rebase also changes the new Document publisher's two implementation predicates from dispatching `instanceof` to a captured ordinary `Function.prototype[Symbol.hasInstance]`, consistent with current Root's private Target/scroll/viewport policy. It continues to require the actual successful `platformFactoryRecord` and real Document implementation. This is an explicit new leaf adaptation; the frozen original packet remains unchanged. It is statically checked, not yet behaviorally verified.
+
+The adapted manual-member test still checks physical realm and metadata for all 21 observed entries. It requires native function source only for the 19 newly created native entries. Root's two current genuine-VM scroll setters keep their actual JavaScript source and identity; their source must not be disguised or wrapped merely to satisfy the old test. The old test description was updated accordingly. Original assertions about scroll behavior remain in place, pending execution against current behavior.
+
+## Preserved current boundaries
+
+`evidence/static-composition-checks.json` records all protected hashes and checks. The full candidate changes only these eight existing files: collections, dialogs, document-xml, dom-wrapper-realms, isolated-world, layout, shadow and styles. It adds four modules and four test files. All changes to existing files are narrow unified-diff hunks.
+
+- The exact current Node predicate remains `Implementation===NodeImpl||Implementation.prototype instanceof NodeImpl`. The canonical factory CommonJS exports identity check, original setup/backend graph, same-object `finishDOMWrapperSetup`, sole original Proxy and selected-VM shell allocation remain intact.
+- Dedicated WebSocket source/private-state transformation, WebSocket exclusion from the existing 116-factory fingerprint, and private EventTarget transformation remain intact. No legacy public implementation symbols are restored to direct private targets.
+- `dom-factory-scope.js`, lightweight `dom-wrapper-globals.js`, private Event and EventTarget modules, event-IDL definitions, demand-loaded platform hooks and worker guards remain byte-identical.
+- Utility XPath publication is inserted only after the actual utility Document is defined and before the existing Location window alias. Both `directEventTargetImplementation`-only decisions remain exactly unchanged. Broadening those checks would incorrectly treat inherited real Nodes as direct private targets and suppress their required canonical generated storage. Existing `utility-node-target-binding.test.js` is mandatory regression coverage.
+- Actual Location allocation/interface preparation still precedes utility interface loading; canonical Location, aliases, private state and all Location code remain byte-identical. This composition does not migrate or modify own Document `location` accessors.
+- Current Input/ValidityState, additional TextArea/Select/Option, and Option alias source hashes match their frozen packets exactly and remain byte-identical. Select's original Proxy/cache/backend and Option's same automatic receiver are preserved.
+- Current `element-scroll.js`, `window-viewport.js` and `scroll-events.js` remain byte-identical. Layout's current metrics, viewport observer and scroll bridge remain unchanged except for publication of the 19 other measured functions. No layout producer or event-queue behavior is replaced with old code.
+- Root already contains the optional real V8 entry-name C++ implementation (`cb235f73…`) and matching runtime addons. Native source and outputs remain unchanged; no C++ patch or rebuild is proposed.
+
+The five exact original jsdom generated source/body checks still match the frozen pins. The Document original body has exactly one same-shell constructor substitution and seven existing method-realm substitutions; XMLDocument and the foundational original public bodies have no other proposed body modifications. This is a static source comparison. It does not prove successful compilation or allocation in the composed graph.
+
+A conservative source-only ESM reachability audit reports no newly reachable module from `workers.js`, `shared-worker-global.js` or `service-workers.js`. The audit is a regex graph over static imports. Existing guarded/dynamic require paths were not executed or treated as proof of worker performance. A future targeted worker bootstrap check must retain the current demand-loading and first-allocation boundary.
+
+## Patch usage and verification boundary
+
+`evidence/incremental-1…4` apply in order. `evidence/tranche-1…4` are cumulative alternatives, each against the **unchanged base**; do not stack cumulative patches. `evidence/stage-checks.json` records successful `git apply --check` for all four cumulative patches and all four incremental patches, successful materialization in owned minimal stage directories, and equality of the final composed 16 changed paths with `candidate/`. `evidence/adaptations.json` records every exact original/new string or applied frozen fragment; `evidence/compose.py` documents how the candidate was constructed. Neither script is a production bootstrap step.
+
+The next runtime epoch must first verify that current Root still matches this base (or explicitly rebase narrow hunks), record real dependency/addon hashes, then execute only the authorized bounded phase in `FOCUSED-VALIDATION.md`. In particular, an actual current before/after public-V8 creation proof is required. No claim that current Root still has all historical Host-realm gaps is made from static inspection alone.
+
+The construction/context evidence and guarded reader followup are entirely separate. No URL/origin/baseURI/context policy, Window retargeting, inactive-document behavior or constructor semantics change is included here. Old Native contraries (utility HTML alias, constructor URL/newTarget order, borrowed hit-test ownership, error wording and generated function source) remain open where previously documented. No heap/privacy non-retention claim is made by these creation checks.

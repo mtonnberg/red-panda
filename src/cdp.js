@@ -10,7 +10,8 @@ import { types } from 'node:util';
 import { protocolValue } from './realm-values.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Browser, VERSION, withTimeout } from './browser.js';
-import { cookieToCDP, setCookie, exportCookies } from './cookies.js';
+import {initializeCDPCookieMetadata,markCDPCookieContext,selectCDPCookieContext,listCDPCookies} from './cdp-cookie-metadata.js';
+import {setCDPCookie,setCDPCookies} from './cdp-cookies.js';
 import { supportsDOM, runDOM, resetDOM } from './dom.js';
 import { supportsInput, runInput } from './input.js';
 import { createWebDriver } from './webdriver.js';
@@ -392,12 +393,12 @@ class Session {
       case 'Runtime.runIfWaitingForDebugger': return {};
       case 'Network.getCookies': {
         const urls = params.urls ?? [page.url];
-        const cookies = (await Promise.all(urls.map(url => page.context.cookies.getCookies(url)))).flat();
-        const unique = new Map(cookies.map(cookie => [`${cookie.domain}|${cookie.path}|${cookie.key}`, cookie]));
-        return { cookies: [...unique.values()].map(cookieToCDP) };
+        return { cookies: await listCDPCookies(page.context.cookies, urls.map(value=>value)) };
       }
-      case 'Network.setCookie': await setCookie(page.context.cookies, params, page.url); return { success: true };
-      case 'Network.setCookies': for (const cookie of params.cookies) await setCookie(page.context.cookies, cookie, page.url); return {};
+      case 'Storage.getCookies': return this.connection.run(method,params,this);
+      case 'Network.getAllCookies': return { cookies: await listCDPCookies(page.context.cookies) };
+      case 'Network.setCookie': return { success: await setCDPCookie(page.context.cookies, params, page.url) };
+      case 'Network.setCookies': await setCDPCookies(page.context.cookies, params.cookies, page.url); return {};
       case 'Network.clearBrowserCookies': await page.context.cookies.removeAllCookies(); return {};
       case 'Network.getResponseBody': {
         if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
@@ -562,7 +563,7 @@ class Connection {
         return {};
       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
-      case 'Target.createBrowserContext': return { browserContextId: browser.createContext() };
+      case 'Target.createBrowserContext': {const id=browser.createContext();markCDPCookieContext(browser,browser.contexts.get(id));return {browserContextId:id};}
       case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId); return {};
       case 'Target.createTarget': {
         const page = browser.createPage(params.browserContextId);
@@ -587,14 +588,14 @@ class Connection {
       }
       case 'Browser.close': browser.close(); return {};
       case 'Storage.getCookies': {
-        const context = browser.contexts.get(params.browserContextId ?? 'default');
-        if (!context) throw new ProtocolError('Unknown browser context');
-        return { cookies: await exportCookies(context.cookies) };
+        const context = params.browserContextId===undefined&&parent?parent.page.context:selectCDPCookieContext(browser,params.browserContextId);
+        if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
+        return { cookies: await listCDPCookies(context.cookies) };
       }
       case 'Storage.setCookies': {
-        const context = browser.contexts.get(params.browserContextId ?? 'default');
-        if (!context) throw new ProtocolError('Unknown browser context');
-        for (const cookie of params.cookies) await setCookie(context.cookies, cookie, 'about:blank');
+        const context = selectCDPCookieContext(browser,params.browserContextId);
+        if (!context) throw new ProtocolError(params.browserContextId===undefined?'BrowserContextNotLoaded':'Unknown browser context',params.browserContextId===undefined?-31998:-32602);
+        await setCDPCookies(context.cookies, params.cookies, 'about:blank');
         return {};
       }
       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
@@ -613,6 +614,7 @@ export async function serve({ host = '127.0.0.1', port = 9222, ...options } = {}
   if (!protocols.size || [...protocols].some(protocol => !['cdp', 'webdriver'].includes(protocol))) throw new Error('Unsupported automation protocol');
   const allowedOrigins = new Set(options.allowedOrigins ?? []);
   const browser = new Browser(options);
+  initializeCDPCookieMetadata(browser);
   const connections = new Set();
   const authority = () => `${host.includes(':') ? `[${host}]` : host}:${server.address().port}`;
   const driver = protocols.has('webdriver') ? createWebDriver(browser, {

@@ -1,0 +1,60 @@
+--- a/src/cdp-cookies.js
++++ b/src/cdp-cookies.js
+@@ -1,6 +1,7 @@
+ import {prepareCookie} from './cookies.js';
+ const record=value=>Object.assign(Object.create(null),value);
+-const missing=()=>{throw Error('MissingField')},unexpected=()=>{throw Error('UnexpectedToken')};
++function failure(message,code){const error=Error(message);Object.defineProperty(error,'code',{value:code});throw error;}
++const missing=()=>failure('MissingField',-31998),unexpected=()=>failure('UnexpectedToken',-31998);
+ function optional(value,type){if(value===null||value===undefined)return undefined;if(typeof value!==type)unexpected();return value;}
+ function decode(value){
+  if(value===null||typeof value!=='object')unexpected();
+@@ -13,11 +14,17 @@
+  return input;
+ }
+ function prepare(input,fallback){
+- if(!input.name||/[;\r\n]/.test(input.name+input.value))throw Error('Sanitizing cookie failed');
++ if(input.url===undefined&&!input.domain)failure('At least one of the url or domain needs to be specified',-32602);
++ if(/[;\r\n]/.test(input.name+input.value))failure('Sanitizing cookie failed',-31998);
+  if(!['None','Lax','Strict'].includes(input.sameSite))delete input.sameSite;
++ let url;try{url=new URL(input.url??`${input.secure?'https':'http'}://${input.domain.replace(/^\./,'')}${input.path??'/'}`)}catch{return null;}
++ if(url.protocol!=='http:'&&url.protocol!=='https:')return null;
++ const effectiveSecure=input.secure===true||url.protocol==='https:';
++ // This observed policy rejection precedes empty-name/expiry serialization.
++ // No global semantic rule for those unmeasured policy-valid inputs is added.
++ if(input.sameSite==='None'&&!effectiveSecure)return null;
++ if(!input.name)failure('Sanitizing cookie failed',-31998);
+  let prepared;try{prepared=prepareCookie(input,fallback)}catch(error){if(error?.code==='ERR_INVALID_URL'||error?.message==='Cookies require an HTTP(S) URL or domain')return null;throw error;}
+- const effectiveSecure=input.secure===true||prepared.url.protocol==='https:';
+- if(input.sameSite==='None'&&!effectiveSecure)return null;
+  return record({url:prepared.url.href,text:prepared.text+(effectiveSecure&&!input.secure?'; Secure':'')});
+ }
+ async function store(jar,prepared){if(!prepared)return false;try{return Boolean(await jar.setCookie(prepared.text,prepared.url))}catch{return false;}}
+@@ -26,5 +33,7 @@
+  if(inputs===undefined)missing();if(!Array.isArray(inputs))unexpected();
+  // Schema conversion precedes successful mutation. Cookie-policy rejections
+  // are skipped individually, retaining valid batch members.
+- const decoded=inputs.map(decode);for(const cookie of decoded)await store(jar,prepare(cookie,fallback));
++ const decoded=inputs.map(decode);
++ for(const cookie of decoded)if(/[;\r\n]/.test(cookie.name+cookie.value))failure('Invalid cookie fields',-32602);
++ for(const cookie of decoded)await store(jar,prepare(cookie,fallback));
+ }
+--- a/test/cookie-ingress.test.js
++++ b/test/cookie-ingress.test.js
+@@ -42,11 +42,15 @@
+  const origin=await actualServer(t),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close()});
+  const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/'});
+  assert.deepEqual(await send('Network.setCookie',{name:'invalid',value:'bad',url:origin+'/',sameSite:'None'}),{success:false});
++ // These combined inputs establish policy ordering, not a global range rule.
++ for(const options of[{name:''},{expires:-2}])assert.deepEqual(await send('Network.setCookie',{name:'invalid',value:'bad',url:origin+'/',sameSite:'None',secure:false,...options}),{success:false});
+  assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'keep',url:origin+'/',sameSite:'None',secure:true}),{success:true});
+  for(const options of[{secure:false},{secure:false,expires:0}])assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'bad',url:origin+'/',sameSite:'None',...options}),{success:false});
+  assert.deepEqual(await send('Network.setCookie',{name:'https_default',value:'actual',url:origin.replace('http:','https:')+'/',sameSite:'None',secure:false}),{success:true});
+  assert.deepEqual(await send('Network.setCookie',{name:'lowercase',value:'actual',url:origin+'/',sameSite:'none'}),{success:true});
+- await assert.rejects(send('Network.setCookie',{name:'missing',url:origin+'/',sameSite:'None'}),/MissingField/);await assert.rejects(send('Network.setCookie',{name:'wrong_type',value:'actual',url:origin+'/',sameSite:'None',secure:0}),/UnexpectedToken/);await assert.rejects(send('Network.setCookie',{name:'bad;name',value:'actual',url:origin+'/',sameSite:'None'}),/Sanitizing cookie failed/);
++ await assert.rejects(send('Network.setCookie',{name:'missing',url:origin+'/',sameSite:'None'}),error=>error.code===-31998&&error.message==='MissingField');await assert.rejects(send('Network.setCookie',{name:'wrong_type',value:'actual',url:origin+'/',sameSite:'None',secure:0}),error=>error.code===-31998&&error.message==='UnexpectedToken');await assert.rejects(send('Network.setCookie',{name:'bad;name',value:'actual',url:origin+'/',sameSite:'None'}),error=>error.code===-31998&&error.message==='Sanitizing cookie failed');
++ for(const url of[null,undefined])await assert.rejects(send('Network.setCookie',{name:'missing_address',value:'actual',url,sameSite:'None'}),error=>error.code===-32602&&error.message==='At least one of the url or domain needs to be specified');
++ for(const[name,invalid,message,code]of[['schema',{name:'missing',url:origin+'/'},'MissingField',-31998],['sanitize',{name:'bad;name',value:'bad',url:origin+'/',sameSite:'None'},'Invalid cookie fields',-32602]])await assert.rejects(send('Network.setCookies',{cookies:[{name:'atomic_'+name,value:'must-not-store',url:origin+'/',sameSite:'None',secure:true},invalid]}),error=>error.code===code&&error.message===message);
+  for(const method of['Network.setCookies','Storage.setCookies']){const cookies=[{name:method[0]+'_valid',value:'keep',url:origin+'/',sameSite:'None',secure:true},{name:method[0]+'_invalid',value:'bad',url:origin+'/',sameSite:'None'}];assert.deepEqual(await(method==='Storage.setCookies'?client.send(method,{browserContextId,cookies}):send(method,{cookies})),{});}
+  const{cookies}=await send('Network.getCookies',{urls:[origin.replace('http:','https:')+'/']});assert.deepEqual(cookies.map(cookie=>cookie.name),['existing','https_default','lowercase','N_valid','S_valid']);assert.equal(cookies[0].value,'keep');assert.equal(cookies[1].secure,true);assert.equal(cookies[2].sameSite,undefined);
+ });

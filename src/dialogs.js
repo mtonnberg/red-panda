@@ -1,3 +1,4 @@
+import {captureIDLMemberFactory} from './public-idl-member.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 // Independent dialog and popover state, events, and default actions.
 import { createRequire } from 'node:module';
@@ -223,11 +224,12 @@ export function installDialogs(page, window) {
       return isPopoverOpen(this);
     },
   };
-  for (const [name,value] of Object.entries(popovers)) Object.defineProperty(window.HTMLElement.prototype,name,{value,writable:true,configurable:true,enumerable:true});
+  const member=captureIDLMemberFactory(window);
+  for (const [name,value] of Object.entries(popovers)) Object.defineProperty(window.HTMLElement.prototype,name,{value:member(name,'value',value),writable:true,configurable:true,enumerable:true});
   Object.defineProperty(window.HTMLElement.prototype, 'popover', {
     configurable:true, enumerable:true,
-    get() { HTMLElement.convert(window,this);return kind(this.getAttribute('popover')); },
-    set(value) { HTMLElement.convert(window,this);if(value==null)this.removeAttribute('popover');else this.setAttribute('popover',string(value,window)); },
+    get:member('popover','get',({get(){ HTMLElement.convert(window,this);return kind(this.getAttribute('popover')); }}).get),
+    set:member('popover','set',({set(value){ HTMLElement.convert(window,this);if(value==null)this.removeAttribute('popover');else this.setAttribute('popover',string(value,window)); }}).set),
   });
   if (typeof window.ToggleEvent !== 'function') {
     const slots = new WeakMap();

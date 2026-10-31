@@ -1,6 +1,7 @@
 import {withLocationFactory} from './location-factory.js';
 import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
 import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
+import {httpResponseCookie} from './http-cookie-ingress.js';
 import {documentNavigation} from './navigation-lifecycle.js';
 import {installNavigationAPI} from './navigation-api.js';
 import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
@@ -538,7 +539,8 @@ export class Page extends EventEmitter {
       try {
         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
-          await this.context.cookies.setCookie(cookie, url, { ignoreError: true });
+          const accepted=httpResponseCookie(this.context.cookies,cookie,url);
+          if(accepted!==null)await this.context.cookies.setCookie(accepted, url, { ignoreError: true });
         }
         const location = response.headers.get('location');
         const redirectStatus = [301, 302, 303, 307, 308].includes(response.status);

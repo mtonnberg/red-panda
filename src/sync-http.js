@@ -1,4 +1,5 @@
 import {cookieHeaderForSync} from './cookie-site.js';
+import {httpResponseCookie} from './http-cookie-ingress.js';
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import {requestMetadataPolicy} from './request-metadata.js';
@@ -55,7 +56,7 @@ export class SyncHTTP {
     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
     const bytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2))),response={...meta,headers:new Headers(meta.headers),bytes};
     checkpoint();
-    if(useCookies)for(const value of meta.cookies){page.context.cookies.setCookieSync(value,url,{ignoreError:true});checkpoint()}
+    if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
     const location=response.headers.get('location');
     if(location&&[301,302,303,307,308].includes(response.status)){
      if(redirects===20)throw Error('Too many redirects');

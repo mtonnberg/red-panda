@@ -1,0 +1,34 @@
+--- a/src/cdp-cookies.js
++++ b/src/cdp-cookies.js
+@@ -7,7 +7,7 @@
+ const missing=()=>failure('MissingField',-31998),unexpected=()=>failure('UnexpectedToken',-31998);
+ function optional(value,type){if(value===null||value===undefined)return undefined;if(typeof value!==type)unexpected();return value;}
+ function decode(value){
+- if(value===null||typeof value!=='object')unexpected();
++ if(value===null||typeof value!=='object'||Array.isArray(value))unexpected();
+  if(value.name===undefined||value.value===undefined)missing();
+  if(typeof value.name!=='string'||typeof value.value!=='string')unexpected();
+  const input=record({name:value.name,value:value.value});
+@@ -33,6 +33,7 @@
+  if(!['None','Lax','Strict'].includes(input.sameSite))delete input.sameSite;
+  let url;try{url=new URL(input.url||`${input.secure?'https':'http'}://${input.domain.replace(/^\./,'')}${input.path??'/'}`)}catch{return null;}
+  if(url.protocol!=='http:'&&url.protocol!=='https:')return null;
++ input.url=url.href;
+  const effectiveSecure=input.secure===true||url.protocol==='https:';
+  // The measured None policy rejection precedes cookie serialization.
+  if(input.sameSite==='None'&&!effectiveSecure)return null;
+--- a/test/cookie-ingress.test.js
++++ b/test/cookie-ingress.test.js
+@@ -71,3 +71,12 @@
+ test('generic importer and raw embedding jar retain their previous behavior outside the measured HTTP and CDP channels',async t=>{
+  const{origin,jar}=await actualPage(t);await setCookie(jar,{name:'generic',value:'actual',url:origin+'/',sameSite:'None'});await jar.setCookie('raw=actual; Path=/; SameSite=None',origin+'/');assert.deepEqual((await cookieView(jar,origin)).map(cookie=>({name:cookie.name,sameSite:cookie.sameSite,secure:cookie.secure})),[{name:'generic',sameSite:'none',secure:false},{name:'raw',sameSite:'none',secure:false}]);
+ });
++
++test('CDP normalizes one domain fallback URL for actual named and nameless cookies and rejects array members before mutation',async t=>{
++ const service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close()});
++ const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId),view=async()=> (await send('Network.getCookies',{urls:['https://127.0.0.1/']})).cookies;
++ for(const[urlKind,url]of[['empty',''],['null',null],['omitted',undefined]])for(const name of['actual_'+urlKind,'']){
++  const value='owned_'+urlKind,params={name,value,domain:'127.0.0.1',path:'/',sameSite:'None',secure:true,...(urlKind==='omitted'?{}:{url})};assert.deepEqual(await send('Network.setCookie',params),{success:true});const cookie=(await view()).find(cookie=>cookie.name===name);assert.equal(cookie.value,value);assert.equal(cookie.domain,'127.0.0.1');assert.equal(cookie.secure,true);assert.equal(cookie.sameSite,'None');
++ }
++ await assert.rejects(send('Network.setCookies',{cookies:[{name:'array_atomic',value:'must-not-store',url:'http://127.0.0.1/',sameSite:'None',secure:true},[]]}),error=>error.code===-31998&&error.message==='UnexpectedToken');assert.equal((await view()).some(cookie=>cookie.name==='array_atomic'),false);
++});

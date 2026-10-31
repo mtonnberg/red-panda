@@ -1,3 +1,4 @@
+import {captureIDLMemberFactory} from './public-idl-member.js';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -367,12 +368,14 @@ function installProperties(window) {
       return flags(implForWrapper(this))[name];
     } });
   }
+  const member=captureIDLMemberFactory(window);
   for (const Constructor of [window.Element, window.ShadowRoot]) {
+    const getHTML=function getHTML(options = {}) {
+      if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
+      return serialize(this, options, window);
+    };
     Object.defineProperty(Constructor.prototype, 'getHTML', { configurable: true, enumerable: true, writable: true,
-      value: function getHTML(options = {}) {
-        if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
-        return serialize(this, options, window);
-      } });
+      value: Constructor===window.Element?member('getHTML','value',getHTML):getHTML });
     Object.defineProperty(Constructor.prototype, 'setHTMLUnsafe', { configurable: true, enumerable: true, writable: true,
       value: function setHTMLUnsafe(markup, options = {}) {
         if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');

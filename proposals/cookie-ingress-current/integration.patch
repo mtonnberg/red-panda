@@ -1,0 +1,225 @@
+--- /dev/null
++++ b/src/http-cookie-ingress.js
+@@ -0,0 +1,20 @@
++import {createRequire} from 'node:module';
++const {Cookie}=createRequire(import.meta.url)('tough-cookie');
++
++// HTTP response ingress only: preserve the unmeasured HTTPS response path and
++// all document/import APIs. The actual jar parser owns every other field.
++export function httpResponseCookie(jar,value,url){
++ if(new URL(url).protocol!=='http:'||typeof value!=='string')return value;
++ const cookie=Cookie.parse(value,{loose:jar.enableLooseMode});if(!cookie)return value;
++ let sameSite;
++ // Native keeps the last recognized value; unknown/quoted attributes do not
++ // erase a preceding recognized SameSite value.
++ for(const attribute of value.split(';').slice(1)){
++  const separator=attribute.indexOf('=');if(separator<0)continue;
++  if(attribute.slice(0,separator).trim().toLowerCase()!=='samesite')continue;
++  const next=attribute.slice(separator+1).trim().toLowerCase();
++  if(next==='none'||next==='lax'||next==='strict')sameSite=next;
++ }
++ cookie.sameSite=sameSite;
++ return sameSite==='none'&&!cookie.secure?null:cookie;
++}
+--- /dev/null
++++ b/src/cdp-cookies.js
+@@ -0,0 +1,30 @@
++import {prepareCookie} from './cookies.js';
++const record=value=>Object.assign(Object.create(null),value);
++const missing=()=>{throw Error('MissingField')},unexpected=()=>{throw Error('UnexpectedToken')};
++function optional(value,type){if(value===null||value===undefined)return undefined;if(typeof value!==type)unexpected();return value;}
++function decode(value){
++ if(value===null||typeof value!=='object')unexpected();
++ if(value.name===undefined||value.value===undefined)missing();
++ if(typeof value.name!=='string'||typeof value.value!=='string')unexpected();
++ const input=record({name:value.name,value:value.value});
++ for(const key of ['url','domain','path','sameSite']){const field=optional(value[key],'string');if(field!==undefined)input[key]=field;}
++ const secure=optional(value.secure,'boolean'),httpOnly=optional(value.httpOnly,'boolean'),expires=optional(value.expires,'number');
++ if(secure!==undefined)input.secure=secure;if(httpOnly!==undefined)input.httpOnly=httpOnly;if(expires!==undefined)input.expires=expires;
++ return input;
++}
++function prepare(input,fallback){
++ if(!input.name||/[;\r\n]/.test(input.name+input.value))throw Error('Sanitizing cookie failed');
++ if(!['None','Lax','Strict'].includes(input.sameSite))delete input.sameSite;
++ let prepared;try{prepared=prepareCookie(input,fallback)}catch(error){if(error?.code==='ERR_INVALID_URL'||error?.message==='Cookies require an HTTP(S) URL or domain')return null;throw error;}
++ const effectiveSecure=input.secure===true||prepared.url.protocol==='https:';
++ if(input.sameSite==='None'&&!effectiveSecure)return null;
++ return record({url:prepared.url.href,text:prepared.text+(effectiveSecure&&!input.secure?'; Secure':'')});
++}
++async function store(jar,prepared){if(!prepared)return false;try{return Boolean(await jar.setCookie(prepared.text,prepared.url))}catch{return false;}}
++export async function setCDPCookie(jar,input,fallback){return store(jar,prepare(decode(input),fallback));}
++export async function setCDPCookies(jar,inputs,fallback){
++ if(inputs===undefined)missing();if(!Array.isArray(inputs))unexpected();
++ // Schema conversion precedes successful mutation. Cookie-policy rejections
++ // are skipped individually, retaining valid batch members.
++ const decoded=inputs.map(decode);for(const cookie of decoded)await store(jar,prepare(cookie,fallback));
++}
+--- a/src/cookies.js
++++ b/src/cookies.js
+@@ -16,7 +16,7 @@
+   };
+ }
+ 
+-export async function setCookie(jar, cookie, fallback = 'about:blank') {
++export function prepareCookie(cookie, fallback = 'about:blank') {
+   if (!cookie || typeof cookie.name !== 'string' || !cookie.name || typeof cookie.value !== 'string' ||
+       /[;\r\n]/.test(cookie.name + cookie.value)) throw new Error('Invalid cookie name or value');
+   for (const key of ['domain', 'path', 'sameSite']) {
+@@ -38,6 +38,11 @@
+   if (cookie.httpOnly) text += '; HttpOnly';
+   if (cookie.sameSite) text += `; SameSite=${cookie.sameSite}`;
+   if (cookie.expires !== undefined && cookie.expires >= 0) text += `; Expires=${new Date(cookie.expires * 1000).toUTCString()}`;
++  return Object.assign(Object.create(null), { text, url });
++}
++
++export async function setCookie(jar, cookie, fallback = 'about:blank') {
++  const { text, url } = prepareCookie(cookie, fallback);
+   await jar.setCookie(text, url.href);
+ }
+ 
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -10,7 +10,8 @@
+ import { protocolValue } from './realm-values.js';
+ import { WebSocketServer, WebSocket } from 'ws';
+ import { Browser, VERSION, withTimeout } from './browser.js';
+-import { cookieToCDP, setCookie, exportCookies } from './cookies.js';
++import { cookieToCDP, exportCookies } from './cookies.js';
++import {setCDPCookie,setCDPCookies} from './cdp-cookies.js';
+ import { supportsDOM, runDOM, resetDOM } from './dom.js';
+ import { supportsInput, runInput } from './input.js';
+ import { createWebDriver } from './webdriver.js';
+@@ -396,8 +397,8 @@
+         const unique = new Map(cookies.map(cookie => [`${cookie.domain}|${cookie.path}|${cookie.key}`, cookie]));
+         return { cookies: [...unique.values()].map(cookieToCDP) };
+       }
+-      case 'Network.setCookie': await setCookie(page.context.cookies, params, page.url); return { success: true };
+-      case 'Network.setCookies': for (const cookie of params.cookies) await setCookie(page.context.cookies, cookie, page.url); return {};
++      case 'Network.setCookie': return { success: await setCDPCookie(page.context.cookies, params, page.url) };
++      case 'Network.setCookies': await setCDPCookies(page.context.cookies, params.cookies, page.url); return {};
+       case 'Network.clearBrowserCookies': await page.context.cookies.removeAllCookies(); return {};
+       case 'Network.getResponseBody': {
+         if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
+@@ -594,7 +595,7 @@
+       case 'Storage.setCookies': {
+         const context = browser.contexts.get(params.browserContextId ?? 'default');
+         if (!context) throw new ProtocolError('Unknown browser context');
+-        for (const cookie of params.cookies) await setCookie(context.cookies, cookie, 'about:blank');
++        await setCDPCookies(context.cookies, params.cookies, 'about:blank');
+         return {};
+       }
+       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,6 +1,7 @@
+ import {withLocationFactory} from './location-factory.js';
+ import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
++import {httpResponseCookie} from './http-cookie-ingress.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
+ import {installNavigationAPI} from './navigation-api.js';
+ import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
+@@ -538,7 +539,8 @@
+       try {
+         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
+         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
+-          await this.context.cookies.setCookie(cookie, url, { ignoreError: true });
++          const accepted=httpResponseCookie(this.context.cookies,cookie,url);
++          if(accepted!==null)await this.context.cookies.setCookie(accepted, url, { ignoreError: true });
+         }
+         const location = response.headers.get('location');
+         const redirectStatus = [301, 302, 303, 307, 308].includes(response.status);
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,4 +1,5 @@
+ import {cookieHeaderForSync} from './cookie-site.js';
++import {httpResponseCookie} from './http-cookie-ingress.js';
+ import { Worker } from 'node:worker_threads';
+ import { randomUUID } from 'node:crypto';
+ import {requestMetadataPolicy} from './request-metadata.js';
+@@ -55,7 +56,7 @@
+     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
+     const bytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2))),response={...meta,headers:new Headers(meta.headers),bytes};
+     checkpoint();
+-    if(useCookies)for(const value of meta.cookies){page.context.cookies.setCookieSync(value,url,{ignoreError:true});checkpoint()}
++    if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
+     const location=response.headers.get('location');
+     if(location&&[301,302,303,307,308].includes(response.status)){
+      if(redirects===20)throw Error('Too many redirects');
+--- a/src/shared-worker-http.js
++++ b/src/shared-worker-http.js
+@@ -1,5 +1,6 @@
+ // A genuine request owner for a SharedWorker, independent of the lifetime of
+ // the creating Document. It owns real controllers/HTTP response byte streams.
++import {httpResponseCookie} from './http-cookie-ingress.js';
+ const fetchHTTP=globalThis.fetch,record=value=>Object.assign(Object.create(null),value);
+ export function createSharedWorkerHTTP(root,page,{origin,url,blobSnapshot,blocked=false}){
+  const controllers=new Set(),context=page.context,userAgent=page.userAgent,language=page.acceptLanguage,extra=new Headers(page.extraHTTPHeaders),cli=new Headers(page.cliHTTPHeaders),timeout=page.timeout??5000;let closed=false,initialBlob=blobSnapshot;
+@@ -14,7 +15,7 @@
+    let method=init.method??'GET',body=init.body;const credentials=init.credentials??'same-origin';
+    try{for(let redirects=0;redirects<=20;redirects++){
+     if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin)){const cookie=await context.cookies.getCookieString(target.href);if(cookie)headers.set('cookie',cookie);else headers.delete('cookie')}else headers.delete('cookie');extra.forEach((v,n)=>headers.set(n,v));cli.forEach((v,n)=>headers.set(n,v));
+-    const response=await fetchHTTP(target,{...init,headers,method,body,signal,redirect:'manual'});if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin))for(const cookie of response.headers.getSetCookie())await context.cookies.setCookie(cookie,target.href,{ignoreError:true});
++    const response=await fetchHTTP(target,{...init,headers,method,body,signal,redirect:'manual'});if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin))for(const cookie of response.headers.getSetCookie()){const accepted=httpResponseCookie(context.cookies,cookie,target.href);if(accepted!==null)await context.cookies.setCookie(accepted,target.href,{ignoreError:true});}
+     const location=response.headers.get('location');if(location&&[301,302,303,307,308].includes(response.status)){await response.body?.cancel();if(redirects===20)throw new Error('Too many SharedWorker redirects');const next=new URL(location,target);if(!['http:','https:'].includes(next.protocol))throw new Error('Unsupported SharedWorker redirect');if(next.origin!==target.origin){headers.delete('authorization');headers.delete('cookie')}if(response.status===303||[301,302].includes(response.status)&&method==='POST'){method='GET';body=undefined;headers.delete('content-type')}target=next;continue}
+     const chunks=[],reader=response.body?.getReader();let size=0;if(reader)for(;;){const{done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>16*1024*1024){await reader.cancel();throw new Error('SharedWorker response exceeds16MiB')}chunks.push(value)}
+     const buffered=new Response([204,205,304].includes(response.status)?null:Buffer.concat(chunks),{status:response.status,statusText:response.statusText,headers:response.headers});Object.defineProperty(buffered,'url',{value:target.href});return buffered;
+--- /dev/null
++++ b/test/cookie-ingress.test.js
+@@ -0,0 +1,56 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {Worker} from 'node:worker_threads';
++import {once} from 'node:events';
++import {Browser} from '../src/browser.js';
++import {serve} from '../src/cdp.js';
++import {createSharedWorkerHTTP} from '../src/shared-worker-http.js';
++import {observeCookieJar} from '../src/cookie-jar-observer.js';
++import {setCookie} from '../src/cookies.js';
++import {connect} from './cdp-client.js';
++
++const headers=[
++ 'plain=actual; Path=/', 'rejected=invalid; Path=/; SameSite=None',
++ 'secure=actual; Path=/; SameSite=None; Secure',
++ 'last_lax=actual; Path=/; SameSite=None; SameSite=Lax',
++ 'last_none=invalid; Path=/; SameSite=Lax; SameSite=None',
++ 'ignored_unknown=invalid; Path=/; SameSite=None; SameSite=unknown',
++ 'quoted=actual; Path=/; SameSite="None"',
++ 'secure_value=actual; Path=/; SameSite=None; Secure=0'
++];
++async function actualServer(t){
++ const source=`import{parentPort,workerData}from'node:worker_threads';import{createServer}from'node:http';const requests=[];const server=createServer((request,response)=>{requests.push({url:request.url,headers:request.headers});if(request.url==='/requests'){response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify(requests));return}const cookies=request.url==='/set'?workerData.headers:request.url==='/invalid'?['existing=invalid;Path=/;SameSite=None','existing=invalid;Path=/;SameSite=None;Max-Age=0']:[];response.writeHead(200,{'content-type':request.url==='/'?'text/html':'text/plain',...(cookies.length?{'set-cookie':cookies}:{})});response.end(request.url==='/'?'<!doctype html><body>Actual cookie transport document':'Actual cookie transport response')});server.listen(0,'127.0.0.1',()=>parentPort.postMessage({port:server.address().port}));`;
++ const worker=new Worker(new URL('data:text/javascript,'+encodeURIComponent(source)),{workerData:{headers},execArgv:[]});t.after(()=>worker.terminate());
++ const[{port}]=await once(worker,'message');return'http://127.0.0.1:'+port;
++}
++const cookieView=async(jar,origin)=>(await jar.getCookies(origin.replace('http:','https:')+'/')).map(cookie=>({name:cookie.key,value:cookie.value,sameSite:cookie.sameSite,secure:cookie.secure}));
++const expectedNames=['plain','secure','last_lax','quoted','secure_value'];
++async function actualPage(t){const origin=await actualServer(t),browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate(origin+'/');return{origin,browser,page,jar:page.context.cookies};}
++
++for(const transport of['async','sync','shared'])test('real '+transport+' HTTP response rejects insecure None before successful mutation and preserves valid cookies',async t=>{
++ const{origin,page,jar}=await actualPage(t);await jar.setCookie('existing=keep; Path=/; SameSite=None; Secure',origin+'/');
++ page.userAgent='actual-cookie-owner-agent';page.acceptLanguage='xx-YY';page.extraHTTPHeaders.set('x-cookie-owner','from-cdp');page.cliHTTPHeaders.set('x-cookie-owner','from-cli');
++ const changes=[],unsubscribe=observeCookieJar(jar,(kind,cookie)=>changes.push({kind,name:cookie.name,value:cookie.value}));t.after(unsubscribe);
++ let owner;if(transport==='shared'){owner=createSharedWorkerHTTP(page,page,{origin,url:origin+'/shared.js'});t.after(()=>owner.close());}
++ const request=async path=>{if(transport==='async')return(await page.fetch(origin+path)).text();if(transport==='shared')return(await owner.fetch(origin+path)).text();return page.evaluate('(()=>{const x=new XMLHttpRequest();x.open("GET",'+JSON.stringify(path)+',false);x.send();if(x.status!==200)throw Error("Actual sync response failed");return x.responseText})()');};
++ assert.equal(await request('/invalid'),'Actual cookie transport response');assert.deepEqual(changes,[]);assert.equal((await cookieView(jar,origin)).find(cookie=>cookie.name==='existing').value,'keep');
++ assert.equal(await request('/set'),'Actual cookie transport response');const cookies=await cookieView(jar,origin);assert.deepEqual(cookies.filter(cookie=>cookie.name!=='existing').map(cookie=>cookie.name),expectedNames);assert.equal(cookies.find(cookie=>cookie.name==='last_lax').sameSite,'lax');assert.equal(cookies.find(cookie=>cookie.name==='quoted').sameSite,undefined);assert.equal(cookies.find(cookie=>cookie.name==='secure_value').secure,true);assert.deepEqual(changes.map(change=>change.name),expectedNames);
++ const wire=await(await fetch(origin+'/requests')).json();for(const entry of wire.filter(entry=>entry.url==='/invalid'||entry.url==='/set')){assert.equal(entry.headers['user-agent'],'actual-cookie-owner-agent');assert.equal(entry.headers['accept-language'],'xx-YY');assert.equal(entry.headers['x-cookie-owner'],'from-cli');}
++});
++
++test('CDP keeps actual HTTPS defaults, exact enum and schema results, valid batch members and rejected replacements',async t=>{
++ const origin=await actualServer(t),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close()});
++ const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/'});
++ assert.deepEqual(await send('Network.setCookie',{name:'invalid',value:'bad',url:origin+'/',sameSite:'None'}),{success:false});
++ assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'keep',url:origin+'/',sameSite:'None',secure:true}),{success:true});
++ for(const options of[{secure:false},{secure:false,expires:0}])assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'bad',url:origin+'/',sameSite:'None',...options}),{success:false});
++ assert.deepEqual(await send('Network.setCookie',{name:'https_default',value:'actual',url:origin.replace('http:','https:')+'/',sameSite:'None',secure:false}),{success:true});
++ assert.deepEqual(await send('Network.setCookie',{name:'lowercase',value:'actual',url:origin+'/',sameSite:'none'}),{success:true});
++ await assert.rejects(send('Network.setCookie',{name:'missing',url:origin+'/',sameSite:'None'}),/MissingField/);await assert.rejects(send('Network.setCookie',{name:'wrong_type',value:'actual',url:origin+'/',sameSite:'None',secure:0}),/UnexpectedToken/);await assert.rejects(send('Network.setCookie',{name:'bad;name',value:'actual',url:origin+'/',sameSite:'None'}),/Sanitizing cookie failed/);
++ for(const method of['Network.setCookies','Storage.setCookies']){const cookies=[{name:method[0]+'_valid',value:'keep',url:origin+'/',sameSite:'None',secure:true},{name:method[0]+'_invalid',value:'bad',url:origin+'/',sameSite:'None'}];assert.deepEqual(await(method==='Storage.setCookies'?client.send(method,{browserContextId,cookies}):send(method,{cookies})),{});}
++ const{cookies}=await send('Network.getCookies',{urls:[origin.replace('http:','https:')+'/']});assert.deepEqual(cookies.map(cookie=>cookie.name),['existing','https_default','lowercase','N_valid','S_valid']);assert.equal(cookies[0].value,'keep');assert.equal(cookies[1].secure,true);assert.equal(cookies[2].sameSite,undefined);
++});
++
++test('generic importer and raw embedding jar retain their previous behavior outside the measured HTTP and CDP channels',async t=>{
++ const{origin,jar}=await actualPage(t);await setCookie(jar,{name:'generic',value:'actual',url:origin+'/',sameSite:'None'});await jar.setCookie('raw=actual; Path=/; SameSite=None',origin+'/');assert.deepEqual((await cookieView(jar,origin)).map(cookie=>({name:cookie.name,sameSite:cookie.sameSite,secure:cookie.secure})),[{name:'generic',sameSite:'none',secure:false},{name:'raw',sameSite:'none',secure:false}]);
++});

@@ -1,0 +1,793 @@
+--- /dev/null
++++ b/src/attribute-adoption.js
+@@ -0,0 +1,26 @@
++import {createRequire} from 'node:module';
++const require=createRequire(import.meta.url);
++const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const {shadowIncludingInclusiveDescendantsIterator}=require('jsdom/lib/jsdom/living/helpers/shadow-dom.js');
++const globals=new WeakSet(),apply=Reflect.apply,adopt=DocumentImpl.prototype._adoptNode;
++
++// Called only by the trusted attribute-interface installer. Ownership follows
++// the actual immutable Document registry; adopting never retargets a wrapper's
++// prototype, creation realm or _globalObject.
++export function registerAttributeAdoptionRealm(globalObject){globals.add(globalObject);}
++
++DocumentImpl.prototype._adoptNode=function(node){
++ if(!globals.has(this._globalObject)||node._ownerDocument===this)return apply(adopt,this,arguments);
++ try{return apply(adopt,this,arguments);}
++ finally{
++  // The canonical backend performs removal, real shadow-inclusive adoption,
++  // custom-element reaction enqueueing and template-content adoption. Complete
++  // each live attribute's document ownership before generated CE post-steps
++  // invoke authored adoptedCallback methods. No public DOM getters are used.
++  for(const element of shadowIncludingInclusiveDescendantsIterator(node)){
++   if(element.nodeType!==1)continue;
++   const attributes=element._attributeList;
++   for(let index=0;index<attributes.length;index++)attributes[index]._ownerDocument=element._ownerDocument;
++  }
++ }
++};
+--- a/src/attribute-names.js
++++ b/src/attribute-names.js
+@@ -5,6 +5,7 @@
+ import {platformFactoryRecord} from './platform-factories.js';
+ import {installPlatformFactoryHooks} from './platform-factory-hooks.js';
+ import {implementationForWrapper} from './dom-event-state.js';
++import {registerAttributeAdoptionRealm} from './attribute-adoption.js';
+ installPlatformFactoryHooks();
+ const require=createRequire(import.meta.url);
+ const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
+@@ -112,6 +113,7 @@
+ export function installAttributeNames(window,{context}={}){
+  context??=implementationForWrapper(window.document)._globalObject;
+  if(installed.has(context))return;installed.add(context);patch();ownedGlobals.add(context);ownedGlobals.add(implementationForWrapper(window.document)._globalObject);
++ registerAttributeAdoptionRealm(window);registerAttributeAdoptionRealm(context);registerAttributeAdoptionRealm(implementationForWrapper(window.document)._globalObject);
+  for(const[name,indices]of [['setAttribute',[0,1]],['toggleAttribute',[0]],['getAttribute',[0]],['getAttributeNode',[0]],['hasAttribute',[0]],['removeAttribute',[0]],['setAttributeNS',[0,1,2]],['getAttributeNS',[0,1]],['getAttributeNodeNS',[0,1]],['hasAttributeNS',[0,1]],['removeAttributeNS',[0,1]]])forward(window,context,window.Element.prototype,name,indices);
+  for(const[name,indices]of [['createAttribute',[0]],['createAttributeNS',[0,1]]])forward(window,context,window.Document.prototype,name,indices);
+  for(const[name,indices]of [['getNamedItem',[0]],['removeNamedItem',[0]],['getNamedItemNS',[0,1]],['removeNamedItemNS',[0,1]]])forward(window,context,window.NamedNodeMap.prototype,name,indices);
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,6 +1,7 @@
+ import {withLocationFactory} from './location-factory.js';
+ import {installWindowLifecycleTimers} from './window-lifecycle-timers.js';
+ import {cookieHeaderFor,captureCookieDocument} from './cookie-site.js';
++import {httpResponseCookie} from './http-cookie-ingress.js';
+ import {documentNavigation} from './navigation-lifecycle.js';
+ import {installNavigationAPI} from './navigation-api.js';
+ import {installJointHistory,commitJointHistory,traverseJointHistory,normalizeHistoryNavigation,initialHistoryNavigation} from './joint-history.js';
+@@ -538,7 +539,8 @@
+       try {
+         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
+         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
+-          await this.context.cookies.setCookie(cookie, url, { ignoreError: true });
++          const accepted=httpResponseCookie(this.context.cookies,cookie,url);
++          if(accepted!==null)await this.context.cookies.setCookie(accepted, url, { ignoreError: true });
+         }
+         const location = response.headers.get('location');
+         const redirectStatus = [301, 302, 303, 307, 308].includes(response.status);
+--- /dev/null
++++ b/src/cdp-cookies.js
+@@ -0,0 +1,30 @@
++import {prepareCookie} from './cookies.js';
++const record=value=>Object.assign(Object.create(null),value);
++const missing=()=>{throw Error('MissingField')},unexpected=()=>{throw Error('UnexpectedToken')};
++function optional(value,type){if(value===null||value===undefined)return undefined;if(typeof value!==type)unexpected();return value;}
++function decode(value){
++ if(value===null||typeof value!=='object')unexpected();
++ if(value.name===undefined||value.value===undefined)missing();
++ if(typeof value.name!=='string'||typeof value.value!=='string')unexpected();
++ const input=record({name:value.name,value:value.value});
++ for(const key of ['url','domain','path','sameSite']){const field=optional(value[key],'string');if(field!==undefined)input[key]=field;}
++ const secure=optional(value.secure,'boolean'),httpOnly=optional(value.httpOnly,'boolean'),expires=optional(value.expires,'number');
++ if(secure!==undefined)input.secure=secure;if(httpOnly!==undefined)input.httpOnly=httpOnly;if(expires!==undefined)input.expires=expires;
++ return input;
++}
++function prepare(input,fallback){
++ if(!input.name||/[;\r\n]/.test(input.name+input.value))throw Error('Sanitizing cookie failed');
++ if(!['None','Lax','Strict'].includes(input.sameSite))delete input.sameSite;
++ let prepared;try{prepared=prepareCookie(input,fallback)}catch(error){if(error?.code==='ERR_INVALID_URL'||error?.message==='Cookies require an HTTP(S) URL or domain')return null;throw error;}
++ const effectiveSecure=input.secure===true||prepared.url.protocol==='https:';
++ if(input.sameSite==='None'&&!effectiveSecure)return null;
++ return record({url:prepared.url.href,text:prepared.text+(effectiveSecure&&!input.secure?'; Secure':'')});
++}
++async function store(jar,prepared){if(!prepared)return false;try{return Boolean(await jar.setCookie(prepared.text,prepared.url))}catch{return false;}}
++export async function setCDPCookie(jar,input,fallback){return store(jar,prepare(decode(input),fallback));}
++export async function setCDPCookies(jar,inputs,fallback){
++ if(inputs===undefined)missing();if(!Array.isArray(inputs))unexpected();
++ // Schema conversion precedes successful mutation. Cookie-policy rejections
++ // are skipped individually, retaining valid batch members.
++ const decoded=inputs.map(decode);for(const cookie of decoded)await store(jar,prepare(cookie,fallback));
++}
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -10,7 +10,8 @@
+ import { protocolValue } from './realm-values.js';
+ import { WebSocketServer, WebSocket } from 'ws';
+ import { Browser, VERSION, withTimeout } from './browser.js';
+-import { cookieToCDP, setCookie, exportCookies } from './cookies.js';
++import { cookieToCDP, exportCookies } from './cookies.js';
++import {setCDPCookie,setCDPCookies} from './cdp-cookies.js';
+ import { supportsDOM, runDOM, resetDOM } from './dom.js';
+ import { supportsInput, runInput } from './input.js';
+ import { createWebDriver } from './webdriver.js';
+@@ -396,8 +397,8 @@
+         const unique = new Map(cookies.map(cookie => [`${cookie.domain}|${cookie.path}|${cookie.key}`, cookie]));
+         return { cookies: [...unique.values()].map(cookieToCDP) };
+       }
+-      case 'Network.setCookie': await setCookie(page.context.cookies, params, page.url); return { success: true };
+-      case 'Network.setCookies': for (const cookie of params.cookies) await setCookie(page.context.cookies, cookie, page.url); return {};
++      case 'Network.setCookie': return { success: await setCDPCookie(page.context.cookies, params, page.url) };
++      case 'Network.setCookies': await setCDPCookies(page.context.cookies, params.cookies, page.url); return {};
+       case 'Network.clearBrowserCookies': await page.context.cookies.removeAllCookies(); return {};
+       case 'Network.getResponseBody': {
+         if (!page.responseBodies?.has(params.requestId)) throw new ProtocolError('No resource with given identifier found');
+@@ -594,7 +595,7 @@
+       case 'Storage.setCookies': {
+         const context = browser.contexts.get(params.browserContextId ?? 'default');
+         if (!context) throw new ProtocolError('Unknown browser context');
+-        for (const cookie of params.cookies) await setCookie(context.cookies, cookie, 'about:blank');
++        await setCDPCookies(context.cookies, params.cookies, 'about:blank');
+         return {};
+       }
+       default: throw new ProtocolError(`Unsupported CDP method: ${method}`, -32601);
+--- a/src/collections.js
++++ b/src/collections.js
+@@ -1,3 +1,4 @@
++import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import { registerProtocolPrototype } from './protocol-classes.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import { createRequire } from 'node:module';
+@@ -120,7 +121,7 @@
+     }, prototype);
+     states.set(result, state); return registerHeapWrapper(result,window);
+   }
+-  Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get() { return collection(this); } });
++  Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get: captureDocumentMemberFactory(window)('all','get',({get() { return collection(this); }}).get) });
+   Object.defineProperty(window, 'HTMLAllCollection', { configurable: true, writable: true, value: HTMLAllCollection });
+ 
+   // jsdom's live RadioNodeList points at a controls collection whose version is
+--- a/src/cookies.js
++++ b/src/cookies.js
+@@ -16,7 +16,7 @@
+   };
+ }
+ 
+-export async function setCookie(jar, cookie, fallback = 'about:blank') {
++export function prepareCookie(cookie, fallback = 'about:blank') {
+   if (!cookie || typeof cookie.name !== 'string' || !cookie.name || typeof cookie.value !== 'string' ||
+       /[;\r\n]/.test(cookie.name + cookie.value)) throw new Error('Invalid cookie name or value');
+   for (const key of ['domain', 'path', 'sameSite']) {
+@@ -38,6 +38,11 @@
+   if (cookie.httpOnly) text += '; HttpOnly';
+   if (cookie.sameSite) text += `; SameSite=${cookie.sameSite}`;
+   if (cookie.expires !== undefined && cookie.expires >= 0) text += `; Expires=${new Date(cookie.expires * 1000).toUTCString()}`;
++  return Object.assign(Object.create(null), { text, url });
++}
++
++export async function setCookie(jar, cookie, fallback = 'about:blank') {
++  const { text, url } = prepareCookie(cookie, fallback);
+   await jar.setCookie(text, url.href);
+ }
+ 
+--- a/src/dialogs.js
++++ b/src/dialogs.js
+@@ -1,3 +1,4 @@
++import {captureIDLMemberFactory} from './public-idl-member.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ // Independent dialog and popover state, events, and default actions.
+ import { createRequire } from 'node:module';
+@@ -223,11 +224,12 @@
+       return isPopoverOpen(this);
+     },
+   };
+-  for (const [name,value] of Object.entries(popovers)) Object.defineProperty(window.HTMLElement.prototype,name,{value,writable:true,configurable:true,enumerable:true});
++  const member=captureIDLMemberFactory(window);
++  for (const [name,value] of Object.entries(popovers)) Object.defineProperty(window.HTMLElement.prototype,name,{value:member(name,'value',value),writable:true,configurable:true,enumerable:true});
+   Object.defineProperty(window.HTMLElement.prototype, 'popover', {
+     configurable:true, enumerable:true,
+-    get() { HTMLElement.convert(window,this);return kind(this.getAttribute('popover')); },
+-    set(value) { HTMLElement.convert(window,this);if(value==null)this.removeAttribute('popover');else this.setAttribute('popover',string(value,window)); },
++    get:member('popover','get',({get(){ HTMLElement.convert(window,this);return kind(this.getAttribute('popover')); }}).get),
++    set:member('popover','set',({set(value){ HTMLElement.convert(window,this);if(value==null)this.removeAttribute('popover');else this.setAttribute('popover',string(value,window)); }}).set),
+   });
+   if (typeof window.ToggleEvent !== 'function') {
+     const slots = new WeakMap();
+--- /dev/null
++++ b/src/document-interface-realms.js
+@@ -0,0 +1,39 @@
++// Execute the canonical generated Document/XMLDocument public definitions in
++// their actual initial owning VM. Setup/backend/unforgeable caches remain on
++// the same Host factory graph; HTMLDocument's existing installer is untouched.
++import{createRequire}from'node:module';
++import{createHash}from'node:crypto';
++const require=createRequire(import.meta.url);
++const definitions=Object.freeze({
++ Document:{sha:'89c68968aa52645c8e0849316c624286ee808020f979e0e97cc4bec8c2fafd20',names:['exports','conversions','utils','ElementCreationOptions','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','Node','NodeFilter','HTMLElement','EventHandlerNonNull','OnErrorEventHandlerNonNull','implSymbol','ctorRegistrySymbol','interfaceName','exposed','Impl','createShell','callFactory']},
++ XMLDocument:{sha:'d59ec74246f8f016d3544a040d005c2a9c6250fee933e9decd361cdea6292302',names:['exports','conversions','utils','implSymbol','ctorRegistrySymbol','Document','interfaceName','exposed','Impl']}
++});
++export function isDocumentInterface(kind){return Object.hasOwn(definitions,kind)}
++function bodyOf(source,kind){
++ const signature='exports.install = (globalObject, globalNames) => {\n',footer='};\n\nconst Impl = require(',start=source.indexOf(signature),end=source.indexOf(footer,start);
++ if(start<0||end<start||source.split(signature).length!==2||source.split(footer).length!==2)throw new Error('Unexpected canonical Document public installer: '+kind);
++ return source.slice(start+signature.length,end);
++}
++function existingDocumentBody(body){
++ // These are exactly the prior frozen canonical same-shell constructor and
++ // method-realm factory calls. No public conversion/body change is added here.
++ const constructor='exports.setup(Object.create(new.target.prototype),';
++ if(body.split(constructor).length!==2)throw new Error('Unexpected prior canonical Document constructor');
++ body=body.replace(constructor,'exports.setup(createShell(globalObject, new.target.prototype),');
++ for(const method of ['createElement','createElementNS','createTextNode','createComment','createAttribute','createAttributeNS']){
++  const expression=`esValue[implSymbol].${method}(...args)`;
++  if(body.split(expression).length!==2)throw new Error('Unexpected prior canonical Document method: '+method);
++  body=body.replace(expression,`callFactory(globalObject, esValue[implSymbol], ${JSON.stringify(method)}, args)`);
++ }
++ const fragment='esValue[implSymbol].createDocumentFragment()';
++ if(body.split(fragment).length!==2)throw new Error('Unexpected prior canonical Document fragment method');
++ return body.replace(fragment,'callFactory(globalObject, esValue[implSymbol], "createDocumentFragment", [])');
++}
++export function transformDocumentInterface(source,kind,originalSource){
++ const definition=definitions[kind];
++ if(!definition||require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(originalSource).digest('hex')!==definition.sha)throw new Error('Pinned canonical Document interface source changed: '+kind);
++ const body=bodyOf(source,kind),original=bodyOf(originalSource,kind),expected=kind==='Document'?existingDocumentBody(original):original;
++ if(body!==expected)throw new Error('Canonical Document public installer changed beyond frozen factory calls: '+kind);
++ const names=definition.names;
++ return source+'\nconst originalDocumentInterfaceInstall = exports.install;\nexports.install = (globalObject, globalNames) => installControlInterface(globalObject, globalNames, originalDocumentInterfaceInstall, '+JSON.stringify(body)+', '+JSON.stringify(names)+', ['+names.join(', ')+'], __filename);\n';
++}
+--- /dev/null
++++ b/src/document-member-realms.js
+@@ -0,0 +1,36 @@
++// Genuine selected-VM publication of the measured manual Document entries.
++// Original operations/backends stay Host-private; recorded Browser/utility
++// documents use only successful private factory provenance for receiver checks.
++import vm from'node:vm';
++import{createRequire}from'node:module';
++import{platformFactoryRecord}from'./platform-factories.js';
++import{captureIDLMemberFactory}from'./public-idl-member.js';
++const require=createRequire(import.meta.url),DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
++const apply=Reflect.apply,define=Object.defineProperty,descriptor=Object.getOwnPropertyDescriptor,ordinaryHasInstance=Function.prototype[Symbol.hasInstance];
++const isDocument=implementation=>apply(ordinaryHasInstance,DocumentImpl,[implementation]);
++export function captureDocumentMemberFactory(window){
++ const member=captureIDLMemberFactory(window),owner=platformFactoryRecord(window.document)?.implementation,ErrorConstructor=window.TypeError;
++ // Standalone installers may predate factory observation. Preserve their real
++ // existing operations rather than infer a private brand from authored slots.
++ if(!isDocument(owner)||!vm.isContext(owner._globalObject))return member;
++ return(name,slot,operation)=>{
++  const guarded=({invoke(...args){
++   if(!isDocument(platformFactoryRecord(this)?.implementation))throw new ErrorConstructor('Illegal invocation');
++   return apply(operation,this,args);
++  }}).invoke;
++  define(guarded,'length',{value:operation.length,configurable:true});
++  return member(name,slot,guarded);
++ };
++}
++export function installDocumentXPathEntries(window){
++ const member=captureDocumentMemberFactory(window);
++ for(const name of ['createExpression','createNSResolver','evaluate']){
++  const original=descriptor(window.Document.prototype,name);
++  if(typeof original?.value!=='function')throw new TypeError('A genuine installed XPath Document operation is required');
++  const value=member(name,'value',original.value);
++  // Measured Native Document mixin functions are distinct from evaluator
++  // methods and all have one required parameter. Backend arguments stay real.
++  if(value!==original.value)define(value,'length',{value:1,configurable:true});
++  define(window.Document.prototype,name,{...original,value});
++ }
++}
+--- a/src/document-xml.js
++++ b/src/document-xml.js
+@@ -1,3 +1,4 @@
++import {installDocumentXPathEntries} from './document-member-realms.js';
+ import {installAttributeNames} from './attribute-names.js';
+ import {installNamespaceSerialization} from './namespace-serialization.js';
+ import {installSerialization} from './serialization.js';
+@@ -117,6 +118,7 @@
+  };
+  window.XPathEvaluator.prototype.createNSResolver=function(node){if(!NodeInterface.is(node))throw new window.TypeError('Expected Node');return node;};
+  window.Document.prototype.createNSResolver=window.XPathEvaluator.prototype.createNSResolver;
++ installDocumentXPathEntries(window);
+  return xpath;
+ }
+ 
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,5 @@
++import {isDocumentInterface,transformDocumentInterface} from './document-interface-realms.js';
++import {isFoundationalInterface,transformFoundationalInterface} from './foundational-interface-realms.js';
+ import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
+ import {transformPrivateWebSocketSource} from './dom-websocket-state.js';
+ import {transformPrivateEventTargetSource} from './dom-event-target-state.js';
+@@ -101,6 +103,8 @@
+   }
+   if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
+   if(isAdditionalControlInterface(kind))source=transformAdditionalControlInterface(source,kind,originalSource);
++  if(isFoundationalInterface(kind))source=transformFoundationalInterface(source,kind,originalSource);
++  if(isDocumentInterface(kind))source=transformDocumentInterface(source,kind,originalSource);
+   if(event)source=transformPrivateEventSource(source,kind);
+   if(Implementation===EventTargetImpl)source=transformPrivateEventTargetSource(source);
+   if(event||Implementation===EventTargetImpl||kind==='WebSocket')source=transformEventIDLInstall(source,kind);
+--- a/src/focus.js
++++ b/src/focus.js
+@@ -29,7 +29,7 @@
+ }
+ 
+ function renderedAndInteractive(element) {
+-  const window = element.ownerDocument?.defaultView;
++  const window = implForWrapper(element)?._ownerDocument?._defaultView;
+   if (!window || !element.isConnected) return false;
+   for (let current = element; current;) {
+     if (window.getComputedStyle(current).display === 'none') return false;
+--- /dev/null
++++ b/src/foundational-interface-realms.js
+@@ -0,0 +1,25 @@
++// Original canonical Node/Element/HTMLElement public definitions, compiled in
++// their actual initial owning VM. Factories/setup/converters stay Host-owned;
++// this is not an alternative Window architecture or a public-class facade.
++import{createRequire}from'node:module';
++import{createHash}from'node:crypto';
++const require=createRequire(import.meta.url);
++const definitions=Object.freeze({
++ Node:{sha:'40e32d97310bb450c5ea169a0f48444f91f38bebdbfcaee77237cbf4e55318a5',names:['exports','conversions','utils','GetRootNodeOptions','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','implSymbol','ctorRegistrySymbol','EventTarget','interfaceName','exposed','Impl']},
++ Element:{sha:'2df81ad6f660fd10e21dcb2a0167425ff07c968c59d2e667b071c65d8ebd873e',names:['exports','conversions','utils','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','Attr','ShadowRootInit','Node','implSymbol','ctorRegistrySymbol','interfaceName','exposed','Impl']},
++ HTMLElement:{sha:'5ed9d5005064e5c34e4919e0f015b358c0e922c49ef57e115a9975dd0c30e63b',names:['exports','conversions','utils','HTMLConstructor_helpers_html_constructor','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','EventHandlerNonNull','OnErrorEventHandlerNonNull','implSymbol','ctorRegistrySymbol','Element','interfaceName','exposed','Impl']}
++});
++export function isFoundationalInterface(kind){return Object.hasOwn(definitions,kind)}
++function bodyOf(source,kind){
++ const signature='exports.install = (globalObject, globalNames) => {\n',footer='};\n\nconst Impl = require(',start=source.indexOf(signature),end=source.indexOf(footer,start);
++ if(start<0||end<start||source.split(signature).length!==2||source.split(footer).length!==2)throw new Error('Unexpected canonical foundational interface installer: '+kind);
++ return source.slice(start+signature.length,end);
++}
++export function transformFoundationalInterface(source,kind,originalSource){
++ const definition=definitions[kind];
++ if(!definition||require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(originalSource).digest('hex')!==definition.sha)throw new Error('Pinned canonical foundational interface source changed: '+kind);
++ const body=bodyOf(source,kind);
++ if(body!==bodyOf(originalSource,kind))throw new Error('Canonical foundational public installer body changed: '+kind);
++ const names=definition.names;
++ return source+'\nconst originalFoundationalInterfaceInstall = exports.install;\nexports.install = (globalObject, globalNames) => installControlInterface(globalObject, globalNames, originalFoundationalInterfaceInstall, '+JSON.stringify(body)+', '+JSON.stringify(names)+', ['+names.join(', ')+'], __filename);\n';
++}
+--- /dev/null
++++ b/src/http-cookie-ingress.js
+@@ -0,0 +1,20 @@
++import {createRequire} from 'node:module';
++const {Cookie}=createRequire(import.meta.url)('tough-cookie');
++
++// HTTP response ingress only: preserve the unmeasured HTTPS response path and
++// all document/import APIs. The actual jar parser owns every other field.
++export function httpResponseCookie(jar,value,url){
++ if(new URL(url).protocol!=='http:'||typeof value!=='string')return value;
++ const cookie=Cookie.parse(value,{loose:jar.enableLooseMode});if(!cookie)return value;
++ let sameSite;
++ // Native keeps the last recognized value; unknown/quoted attributes do not
++ // erase a preceding recognized SameSite value.
++ for(const attribute of value.split(';').slice(1)){
++  const separator=attribute.indexOf('=');if(separator<0)continue;
++  if(attribute.slice(0,separator).trim().toLowerCase()!=='samesite')continue;
++  const next=attribute.slice(separator+1).trim().toLowerCase();
++  if(next==='none'||next==='lax'||next==='strict')sameSite=next;
++ }
++ cookie.sameSite=sameSite;
++ return sameSite==='none'&&!cookie.secure?null:cookie;
++}
+--- a/src/isolated-world.js
++++ b/src/isolated-world.js
+@@ -1,3 +1,4 @@
++import {installDocumentXPathEntries} from './document-member-realms.js';
+ import {canonicalLocation,locationImplementation,installPrivateLocationUtils,prepareLocationContext,installLocationInterface,transformUtilityLocationInterfaces,createLocationAlias,installLocationWindowAlias} from './location-factory.js';
+ import {installEventIDLRealm,transformEventIDLInstall} from './event-idl-realms.js';
+ import {installPrivateWebSocketUtils,transformPrivateWebSocketSource,webSocketImplementation,bindWebSocketImplementation} from './dom-websocket-state.js';
+@@ -109,6 +110,7 @@
+  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
+  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
+  Object.defineProperty(global,'document',{value:wrap(mainWindow.document),enumerable:true});
++ installDocumentXPathEntries(global);
+  installLocationWindowAlias(global,()=>wrapImpl(mainDocument._location));
+  const windowImpl=hostUtils.implForWrapper(mainWindow);bindEventTargetImplementation(global,windowImpl);Object.defineProperty(global,hostUtils.implSymbol,{value:windowImpl});wrappers.set(windowImpl,global);register(global,windowImpl,'Window');mainWrappers.set(mainWindow,windowImpl);
+  global.Window=vm.runInContext('(class Window extends EventTarget {constructor(){throw new TypeError(\"Illegal constructor\")}})',context);restoreWindowGlobalInheritance(global,context,originalGlobalPrototype);Object.defineProperty(global.Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,5 @@
++import {captureDocumentMemberFactory} from './document-member-realms.js';
++import {captureIDLMemberFactory} from './public-idl-member.js';
+ import{installWindowViewport}from'./window-viewport.js';
+ import{installScrollEvents}from'./scroll-events.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+@@ -256,7 +258,15 @@
+   layout.setScrollObserver(installScrollEvents(page,window).windowScroll);
+   const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
+   const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
+-  const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
++  const member=captureIDLMemberFactory(window),documentMember=captureDocumentMemberFactory(window);
++  const define = (target, name, descriptor) => {
++    if(target===window.Document.prototype){
++      descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=documentMember(name,slot,descriptor[slot]);
++    }else if(target===window.Element.prototype||target===window.HTMLElement.prototype){
++      descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(name,slot,descriptor[slot]);
++    }
++    return Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
++  };
+   define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
+   define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(ArrayConstructor,set,ErrorConstructor,ownedLayout(this).rects(this).map(domRect)); } });
+   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
+--- /dev/null
++++ b/src/public-idl-member.js
+@@ -0,0 +1,21 @@
++// Public nonconstructible entries are created in their real selected VM before
++// publication. Their original operations and state remain Host-private.
++import vm from 'node:vm';
++import{createRequire}from'node:module';
++import{getRuntimeBinding}from'./native-runtime.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const apply=Reflect.apply,define=Object.defineProperty;
++export function captureIDLMemberFactory(window){
++ const context=utils.implForWrapper(window.document)?._globalObject;
++ // Genuine non-scriptable JSDOM is already Host. Do not invent a VM or load
++ // a native public entry for that case. Raw owned contexts need their explicit
++ // immutable RealmHandle/native-entry authority at the canonical dispatcher.
++ if(!context||!vm.isContext(context))return(_name,_slot,operation)=>operation;
++ const binding=getRuntimeBinding(),global=window;
++ return(name,slot,operation)=>{
++  if(typeof operation!=='function'||!['value','get','set'].includes(slot))throw new TypeError('A genuine IDL operation and descriptor slot are required');
++  const value=binding.createEntry((_caller,receiver,args)=>apply(operation,receiver,args),global,slot==='value'?name:slot+' '+name);
++  define(value,'length',{value:operation.length,configurable:true});
++  return value;
++ };
++}
+--- a/src/selectors.js
++++ b/src/selectors.js
+@@ -198,6 +198,10 @@
+ function matcher(record){
+  if(record.matcher){record.matcher.Snapshot.root=wrapperForImpl(record.documentImpl.documentElement);return record.matcher;}
+  const engine=nwsapi({document:record.document,DOMException:record.window.DOMException});engine.configure({LOGERRORS:false,VERBOSITY:true,IDS_DUPES:true,MIXEDCASE:true,FORGIVING:false});
++ // Preserve the matcher's focus predicate over canonical backend state. Its
++ // ordinary DOM property reads must not invoke authored wrapper getters while
++ // the private cascade evaluates UA/author :focus selectors.
++ engine.Snapshot.isFocusable=element=>{const implementation=implForWrapper(element);if(!implementation)return false;const document=implementation._ownerDocument;if(implementation.contentDocument&&implementation.localName==='iframe')return false;if(document.hasFocus()&&implementation===document.activeElement&&(implementation.type||implementation.href||typeof implementation.tabIndex==='number'))return element;return false;};
+  engine.Snapshot.rpPredicate=(element,index)=>predicate(record,element,record.predicates[index]);
+  engine.registerSelector(internal,new RegExp('^:'+internal+'\\((\\d+)\\)(.*)'),(match,source)=>({source:`if(s.rpPredicate(e,${Number(match[1])})){${source}}`,status:true}));
+  const has=engine.Snapshot.has;engine.Snapshot.has=(...args)=>{const from=engine.Snapshot.from;try{return has(...args);}finally{engine.Snapshot.from=from;}};
+--- a/src/shadow.js
++++ b/src/shadow.js
+@@ -1,3 +1,4 @@
++import {captureIDLMemberFactory} from './public-idl-member.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -367,12 +368,14 @@
+       return flags(implForWrapper(this))[name];
+     } });
+   }
++  const member=captureIDLMemberFactory(window);
+   for (const Constructor of [window.Element, window.ShadowRoot]) {
++    const getHTML=function getHTML(options = {}) {
++      if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
++      return serialize(this, options, window);
++    };
+     Object.defineProperty(Constructor.prototype, 'getHTML', { configurable: true, enumerable: true, writable: true,
+-      value: function getHTML(options = {}) {
+-        if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
+-        return serialize(this, options, window);
+-      } });
++      value: Constructor===window.Element?member('getHTML','value',getHTML):getHTML });
+     Object.defineProperty(Constructor.prototype, 'setHTMLUnsafe', { configurable: true, enumerable: true, writable: true,
+       value: function setHTMLUnsafe(markup, options = {}) {
+         if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
+--- a/src/shared-worker-http.js
++++ b/src/shared-worker-http.js
+@@ -1,5 +1,6 @@
+ // A genuine request owner for a SharedWorker, independent of the lifetime of
+ // the creating Document. It owns real controllers/HTTP response byte streams.
++import {httpResponseCookie} from './http-cookie-ingress.js';
+ const fetchHTTP=globalThis.fetch,record=value=>Object.assign(Object.create(null),value);
+ export function createSharedWorkerHTTP(root,page,{origin,url,blobSnapshot,blocked=false}){
+  const controllers=new Set(),context=page.context,userAgent=page.userAgent,language=page.acceptLanguage,extra=new Headers(page.extraHTTPHeaders),cli=new Headers(page.cliHTTPHeaders),timeout=page.timeout??5000;let closed=false,initialBlob=blobSnapshot;
+@@ -14,7 +15,7 @@
+    let method=init.method??'GET',body=init.body;const credentials=init.credentials??'same-origin';
+    try{for(let redirects=0;redirects<=20;redirects++){
+     if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin)){const cookie=await context.cookies.getCookieString(target.href);if(cookie)headers.set('cookie',cookie);else headers.delete('cookie')}else headers.delete('cookie');extra.forEach((v,n)=>headers.set(n,v));cli.forEach((v,n)=>headers.set(n,v));
+-    const response=await fetchHTTP(target,{...init,headers,method,body,signal,redirect:'manual'});if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin))for(const cookie of response.headers.getSetCookie())await context.cookies.setCookie(cookie,target.href,{ignoreError:true});
++    const response=await fetchHTTP(target,{...init,headers,method,body,signal,redirect:'manual'});if(credentials!=='omit'&&(credentials!=='same-origin'||target.origin===origin))for(const cookie of response.headers.getSetCookie()){const accepted=httpResponseCookie(context.cookies,cookie,target.href);if(accepted!==null)await context.cookies.setCookie(accepted,target.href,{ignoreError:true});}
+     const location=response.headers.get('location');if(location&&[301,302,303,307,308].includes(response.status)){await response.body?.cancel();if(redirects===20)throw new Error('Too many SharedWorker redirects');const next=new URL(location,target);if(!['http:','https:'].includes(next.protocol))throw new Error('Unsupported SharedWorker redirect');if(next.origin!==target.origin){headers.delete('authorization');headers.delete('cookie')}if(response.status===303||[301,302].includes(response.status)&&method==='POST'){method='GET';body=undefined;headers.delete('content-type')}target=next;continue}
+     const chunks=[],reader=response.body?.getReader();let size=0;if(reader)for(;;){const{done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>16*1024*1024){await reader.cancel();throw new Error('SharedWorker response exceeds16MiB')}chunks.push(value)}
+     const buffered=new Response([204,205,304].includes(response.status)?null:Buffer.concat(chunks),{status:response.status,statusText:response.statusText,headers:response.headers});Object.defineProperty(buffered,'url',{value:target.href});return buffered;
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,3 +1,4 @@
++import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import {computedTransform,computedFontSize} from './computed-values.js';
+ import {evaluateMedia} from './media.js';
+@@ -43,6 +44,7 @@
+   'box-sizing': 'content-box', isolation: 'auto', transform: 'none', '-webkit-transform': 'none',
+   'font-family': 'serif', 'font-size': '16px', 'font-style': 'normal', 'font-weight': '400', 'font-variant': 'normal',
+   'line-height': 'normal', 'text-align': 'start', 'text-transform': 'none', 'text-indent': '0px', 'white-space': 'normal',
++  'text-decoration': 'none', 'text-decoration-line': 'none',
+   'word-spacing': '0px', 'letter-spacing': 'normal', 'word-wrap': 'normal', 'overflow-wrap': 'normal', cursor: 'auto',
+   direction: 'ltr', 'writing-mode': 'horizontal-tb', 'list-style-type': 'disc', 'list-style-position': 'outside',
+   'list-style-image': 'none', 'border-collapse': 'separate', 'border-spacing': '0px', quotes: 'auto',
+@@ -56,9 +58,33 @@
+ 
+ function recordFor(document) { return RECORDS.get(document); }
+ function rootOf(element) { return element.getRootNode(); }
+-function ownerDocument(root) { return root.nodeType === 9 ? root : root.ownerDocument; }
++function ownerDocument(root) { const implementation=implForWrapper(root);return wrapperForImpl(implementation.nodeType===9?implementation:implementation._ownerDocument); }
+ function notSupported(record, message) { return new record.window.DOMException(message, 'NotSupportedError'); }
+ 
++// Element defaults are independent of CSS's initial display value. Qualified
++// names matter here: prefixed and case-distinct unknown interfaces keep their
++// generic default rather than acquiring a typed HTML element's default.
++const GENERIC_INLINE=new Set('abbr b bdi bdo cite code dfn em i kbd mark q s samp small span strong sub sup time u var wbr'.split(' '));
++const HTML_INLINE=new Set([...GENERIC_INLINE,...'a blockquote br del font ins label'.split(' ')]);
++const ACTIVE_NON_RENDERING=new Set('area base datalist head link meta noscript rp script source style template title track'.split(' '));
++function hasActiveStyleContext(element){return !!implForWrapper(element)._ownerDocument._defaultView;}
++function elementDefaultDisplay(element,active=hasActiveStyleContext(element)){
++ const implementation=implForWrapper(element),namespace=implementation._namespaceURI,name=implementation._prefix?implementation._prefix+':'+implementation._localName:implementation._localName;
++ const html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';
++ let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';
++ if(!active)return display;
++ if(implementation.hasAttributeNS(null,'hidden'))return 'none';
++ if((html||svg)&&ACTIVE_NON_RENDERING.has(name))return 'none';
++ const popover=implementation.hasAttributeNS(null,'popover'),popoverOpen=popover&&matchesInScope(element,':popover-open');
++ if((html||svg)&&name==='dialog'&&!implementation.hasAttributeNS(null,'open')&&!popoverOpen)return 'none';
++ if((html||svg)&&name==='dialog'&&popoverOpen)display='block';
++ if((html||svg)&&name==='slot')display='contents';
++ const parent=implementation.parentElement;
++ if(parent?._namespaceURI==='http://www.w3.org/1999/xhtml'&&!parent._prefix&&parent._localName==='details'&&!parent.hasAttributeNS(null,'open')&&name!=='summary')return 'none';
++ if(popover&&!popoverOpen&&!(html&&name==='dialog'&&implementation.hasAttributeNS(null,'open')))return 'none';
++ return display;
++}
++
+ // jsdom creates inline declarations before applying parsed attributes. Adapt the
+ // owned declaration at creation so setAttribute and parser-created style values
+ // follow exactly the same tokenization as later JS cssText assignments.
+@@ -425,7 +451,8 @@
+ }
+ 
+ function localToken(record, element) {
+-  const tokens = [getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
++  const actualDocument=implForWrapper(element)._ownerDocument;
++  const tokens = [id(actualDocument),Boolean(actualDocument._defaultView),getSelectorStateRevision(record.window), record.stateRevision, record.window.location.href, implForWrapper(record.document)._version, id(implForWrapper(record.document)._lastFocusedElement ?? record.document), record.window.innerWidth, record.window.innerHeight];
+   const roots = new Set();
+   for (let current = element; current; current = inheritanceParent(current)) {
+     const root = rootOf(current); roots.add(root);
+@@ -433,7 +460,7 @@
+   }
+   for (const root of roots) {
+     tokens.push(id(root), implForWrapper(root)._version);
+-    for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
++    if(actualDocument._defaultView)for (const { sheet, media } of scopeSheets(record, root)) tokens.push(media, sheetFingerprint(sheet));
+   }
+   return JSON.stringify(tokens);
+ }
+@@ -487,6 +514,7 @@
+ }
+ 
+ function cascade(record, element) {
++  if(!hasActiveStyleContext(element)){const defaults=new Map([['display',elementDefaultDisplay(element,false)]]);defaults.orderKeys=new Map();return defaults;}
+   const values = new Map(); let order = 0;
+   const matchSelector=createScopedMatcher(record.document,record.document.documentElement);record.badStyleSelectors??=new Set();
+   const layerRoot={children:new Map(),rank:Number.MAX_SAFE_INTEGER},layerNodes=new WeakMap();
+@@ -505,10 +533,11 @@
+   const authorSheets=scopeSheets(record,rootOf(element)).filter(({sheet,media})=>!sheet.disabled&&mediaMatches(record,media));
+   for(const{sheet}of authorSheets)if(!flatSheetState(sheet))collectLayers(sheet.cssRules);
+   let layerRank=0;const rankLayers=node=>{for(const child of node.children.values())rankLayers(child);if(node!==layerRoot)node.rank=++layerRank;};rankLayers(layerRoot);
+-  const offer = (style, score, origin, inline = false, layer=layerRoot) => {
++  const offer = (style, score, origin, inline = false, layer=layerRoot, elementDisplay=false) => {
+     style = declaration(style);
+     for (let index = 0; index < style.length; index++) {
+       const property = style[index];
++      if(origin===0&&property==='display'&&!elementDisplay)continue;
+       let value = style.getPropertyValue(property);
+       if (property === 'text-transform') { value = textTransformValue(value); if (value === null) continue; }
+       if (property === 'position') { value = positionValue(value); if (value === null) continue; }
+@@ -572,6 +601,7 @@
+     }
+   };
+   walk(uaRulesFor(element), 0);
++  const defaults=new CSSStyleDeclaration();defaults.display=elementDefaultDisplay(element);offer(defaults,[0,0,0],0,false,layerRoot,true);
+   if (element.localName === 'a' && element.hasAttribute('href')) {
+     const link = new CSSStyleDeclaration(); link.color = 'rgb(0, 0, 238)'; offer(link, [0, 1, 1], 0);
+   }
+@@ -670,8 +700,8 @@
+     let value = resolve(property);
+     if (property === 'transform' || property === '-webkit-transform') value = computedTransform(value);
+     if (property === 'font-size') {
+-      const rootElement = record.document.documentElement;
+-      const rootSize = element === rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
++      const rootElement = wrapperForImpl(implForWrapper(element)._ownerDocument).documentElement;
++      const rootSize = element === rootElement || !rootElement ? '16px' : compute(record,rootElement,memo).fontSize;
+       value = computedFontSize(value,parentStyle?.fontSize,rootSize,{isRoot:element===rootElement});
+     }
+     if (['display','visibility','position','pointer-events','overflow','overflow-x','overflow-y','content-visibility'].includes(property)&&typeof value==='string')value=value.toLowerCase();
+@@ -709,8 +739,8 @@
+   if (views.has(pseudo)) return views.get(pseudo);
+   let token, cached;
+   const current = () => {
+-    const next = localToken(record, element);
+-    if (token !== next) { cached = compute(record, element, undefined, next); token = next; }
++    const actualRecord=recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument))??record,next = localToken(actualRecord, element);
++    if (token !== next) { cached = compute(actualRecord, element, undefined, next); token = next; }
+     return cached;
+   };
+   const readonly = () => { throw new record.window.DOMException('Computed styles are readonly', 'NoModificationAllowedError'); };
+@@ -757,7 +787,11 @@
+     return (this.localName === 'link' ? originalLinkDescriptor : originalStyleDescriptor).get.call(this);
+   }, signal: page.documentAbort?.signal, originalClose: window.close, disposed: false, unsupported: new Set(), revision: 0, stateRevision: 0, signature: null };
+   for (const element of document.querySelectorAll('*')) { const style = implForWrapper(element)._style; if (style) enhanceDeclaration(style, window); }
+-  const define = (prototype, property, descriptor) => Object.defineProperty(prototype, property, descriptor);
++  const member=captureDocumentMemberFactory(window);
++  const define = (prototype, property, descriptor) => {
++    if(prototype===window.Document.prototype){descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(property,slot,descriptor[slot]);}
++    return Object.defineProperty(prototype, property, descriptor);
++  };
+   const adoption = { configurable: true, enumerable: true,
+     get() {
+       if (!DocumentInterface.is(this) && !ShadowInterface.is(this)) throw new window.TypeError('Illegal invocation');
+@@ -804,8 +838,8 @@
+     let key = pseudo == null ? '' : String(pseudo).toLowerCase();
+     if (!key.startsWith(':')) key = '';
+     else key = key.replace(/^:(before|after|first-letter|first-line)$/, '::$1');
+-    const owner = recordFor(element.ownerDocument);
+-    return owner ? computedStyle(owner, element, key) : record.originalGetComputedStyle.call(window, element);
++    const owner = recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument));
++    return owner?computedStyle(owner,element,key):!hasActiveStyleContext(element)?computedStyle(record,element,key):record.originalGetComputedStyle.call(window,element);
+   };
+   const dispose = () => {
+     if (record.disposed) return;
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,4 +1,5 @@
+ import {cookieHeaderForSync} from './cookie-site.js';
++import {httpResponseCookie} from './http-cookie-ingress.js';
+ import { Worker } from 'node:worker_threads';
+ import { randomUUID } from 'node:crypto';
+ import {requestMetadataPolicy} from './request-metadata.js';
+@@ -55,7 +56,7 @@
+     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
+     const bytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2))),response={...meta,headers:new Headers(meta.headers),bytes};
+     checkpoint();
+-    if(useCookies)for(const value of meta.cookies){page.context.cookies.setCookieSync(value,url,{ignoreError:true});checkpoint()}
++    if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
+     const location=response.headers.get('location');
+     if(location&&[301,302,303,307,308].includes(response.status)){
+      if(redirects===20)throw Error('Too many redirects');
+--- /dev/null
++++ b/test/attribute-adoption.test.js
+@@ -0,0 +1,5 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{installAttributeNames}from'../src/attribute-names.js';import{installNamespaceSerialization}from'../src/namespace-serialization.js';
++async function fixture(t){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>');return{w:page.dom.window,d:page.dom.window.document,page};}
++test('actual subtree and shadow adoption moves held Attr ownership while preserving live attributes and identities',async t=>{const{d}=await fixture(t),to=d.implementation.createHTMLDocument('to'),xml=d.implementation.createDocument(null,'r'),root=d.createElement('section'),child=d.createElement('span'),host=d.createElement('div');root.setAttribute('data-a','one');root.setAttributeNS('urn:p','p:a','two');child.setAttribute('data-child','three');root.append(child,host);const shadow=host.attachShadow({mode:'open'}),inside=d.createElement('b');inside.setAttribute('data-shadow','four');shadow.append(inside);const nodes=[root,child,host,inside],attrs=nodes.map(e=>[...e.attributes]),prototypes=attrs.map(list=>list.map(a=>Object.getPrototypeOf(a)));for(const doc of[to,xml,d]){if(doc===xml)xml.documentElement.append(root);else assert.equal(doc.adoptNode(root),root);for(let i=0;i<nodes.length;i++){assert.equal(nodes[i].ownerDocument,doc);for(let j=0;j<attrs[i].length;j++){const a=attrs[i][j];assert.equal(a.ownerDocument,doc);assert.equal(a.ownerElement,nodes[i]);assert.equal(nodes[i].getAttributeNode(a.name),a);assert.equal(Object.getPrototypeOf(a),prototypes[i][j])}}}attrs[0][0].value='live';assert.equal(root.getAttribute('data-a'),'live');const template=d.createElement('template');template.innerHTML='<span a="v">x</span>';const content=template.content.firstChild,a=content.attributes[0];to.adoptNode(template);assert.equal(a.ownerDocument,content.ownerDocument);assert.equal(content.attributes[0],a)});
++test('genuine utility Attr wrappers retain their creation definitions over actual cross-document adoption',async t=>{const{w,page}=await fixture(t),world=createIsolatedWorld(w,{name:'attribute-adoption',signal:page.documentAbort.signal});t.after(()=>world.dispose());installAttributeNames(world.global,{context:world.context});installNamespaceSerialization(world.global,{context:world.context,createDocument:world.createDocument});const value=world.evaluate(`(()=>{const from=new DOMParser().parseFromString('<r a="v"><c b="w"/></r>','application/xml'),to=document.implementation.createHTMLDocument('to'),root=from.documentElement,child=root.firstChild,a=root.attributes[0],b=child.attributes[0],ap=Object.getPrototypeOf(a),bp=Object.getPrototypeOf(b);to.adoptNode(root);a.value='changed';return{owners:a.ownerDocument===to&&b.ownerDocument===to,nodes:root.ownerDocument===to&&child.ownerDocument===to,identities:root.attributes[0]===a&&child.attributes[0]===b,prototypes:Object.getPrototypeOf(a)===ap&&Object.getPrototypeOf(b)===bp,brands:a instanceof Attr&&b instanceof Attr,value:root.getAttribute('a')}})()`);assert.deepEqual(JSON.parse(JSON.stringify(value)),{owners:true,nodes:true,identities:true,prototypes:true,brands:true,value:'changed'})});
++test('ordinary unowned jsdom keeps its original adoption behavior and backend ownership policy',t=>{const dom=new JSDOM('<body>',{runScripts:'dangerously'});t.after(()=>dom.window.close());const d=dom.window.document,to=d.implementation.createHTMLDocument('to'),e=d.createElement('div');e.setAttribute('a','v');const a=e.attributes[0];to.adoptNode(e);assert.equal(e.ownerDocument,to);assert.equal(a.ownerDocument,d);assert.equal(a.ownerElement,e)});
+--- /dev/null
++++ b/test/computed-style-defaults.test.js
+@@ -0,0 +1,8 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';
++async function fixture(t){const browser=new Browser(),page=browser.createPage();await page.navigate('data:text/html,<body>');t.after(()=>browser.close());return{w:page.dom.window,d:page.dom.window.document}}
++test('genuine inactive documents retain inline state while computed styles use their non-active context defaults',async t=>{const{w,d}=await fixture(t);for(const doc of[d.implementation.createHTMLDocument('x'),d.implementation.createDocument(null,'root')])for(const ns of['http://www.w3.org/1999/xhtml','urn:q','http://www.w3.org/2000/svg']){const e=doc.createElementNS(ns,'div');e.setAttribute('style','display:none;color:rgb(9,8,7);font-size:29px;font-weight:100;font-style:italic;position:fixed;visibility:hidden;line-height:3');const c=w.getComputedStyle(e);assert.equal(e.style.color,'rgb(9, 8, 7)');assert.equal(e.style.fontSize,'29px');assert.equal(c.color,'rgb(0, 0, 0)');assert.equal(c.fontSize,'16px');assert.equal(c.fontWeight,'400');assert.equal(c.fontStyle,'normal');assert.equal(c.position,'static');assert.equal(c.visibility,'visible');assert.equal(c.lineHeight,'normal');assert.equal(c.display,ns==='http://www.w3.org/2000/svg'?'inline':'block');assert.equal(e.ownerDocument,doc)}});
++test('retained computed views follow actual ownerDocument adoption and later real declaration changes',async t=>{const{w,d}=await fixture(t),inactive=d.implementation.createHTMLDocument('x'),e=d.createElement('div');e.setAttribute('style','color:rgb(1,2,3);font-size:23px;display:flex');const held=w.getComputedStyle(e),attr=e.getAttributeNode('style');assert.equal(held.color,'rgb(1, 2, 3)');assert.equal(held.display,'flex');inactive.adoptNode(e);assert.equal(e.ownerDocument,inactive);assert.equal(e.getAttributeNode('style'),attr);assert.equal(e.style.color,'rgb(1, 2, 3)');assert.equal(held.color,'rgb(0, 0, 0)');assert.equal(held.fontSize,'16px');assert.equal(held.display,'block');e.style.color='rgb(4,5,6)';d.adoptNode(e);assert.equal(e.ownerDocument,d);assert.equal(held.color,'rgb(4, 5, 6)');assert.equal(held.fontSize,'23px');assert.equal(held.display,'flex')});
++test('element display defaults remain distinct from explicit CSS initial and revert semantics',async t=>{const{w,d}=await fixture(t);for(const ns of[null,'urn:q','http://www.w3.org/1998/Math/MathML']){const e=d.createElementNS(ns,'item');assert.equal(w.getComputedStyle(e).display,'block');e.style.display='initial';assert.equal(w.getComputedStyle(e).display,'inline');e.style.display='unset';assert.equal(w.getComputedStyle(e).display,'inline');e.style.display='revert';assert.equal(w.getComputedStyle(e).display,'block');e.style.display='table';assert.equal(w.getComputedStyle(e).display,'table');e.style.removeProperty('display');assert.equal(w.getComputedStyle(e).display,'block');const span=d.createElementNS(ns,'span');assert.equal(w.getComputedStyle(span).display,'inline')}});
++test('qualified interface defaults and real active attributes produce live display candidates below authored declarations',async t=>{const{w,d}=await fixture(t),H='http://www.w3.org/1999/xhtml',S='http://www.w3.org/2000/svg';for(const[ns,name,expected]of[[H,'span','inline'],[H,'SPAN','block'],[H,'p:span','block'],[H,'blockquote','inline'],['urn:q','blockquote','block'],['urn:q','span','inline'],['urn:q','p:span','block'],[S,'SPAN','inline'],[H,'table','block'],[S,'table','inline']]){const e=d.createElementNS(ns,name);assert.equal(w.getComputedStyle(e).display,expected,ns+':'+name)}for(const ns of[H,'urn:q',S]){const e=d.createElementNS(ns,'dialog'),computed=w.getComputedStyle(e),base=ns===H?'block':ns===S?'inline':'block';assert.equal(computed.display,ns==='urn:q'?'block':'none');e.setAttribute('open','');assert.equal(computed.display,base);e.setAttribute('hidden','');assert.equal(computed.display,'none');e.style.display='block';assert.equal(computed.display,'block');e.style.display='revert';assert.equal(computed.display,'none');e.removeAttribute('hidden');assert.equal(computed.display,base);e.removeAttribute('open');assert.equal(computed.display,ns==='urn:q'?'block':'none')}});
++test('actual adoption context ignores authored ownerDocument getters for both retained and fresh computed views',async t=>{const{w,d}=await fixture(t),inactive=d.implementation.createHTMLDocument('x'),e=d.createElement('div');e.setAttribute('style','color:rgb(1,2,3);display:flex');const held=w.getComputedStyle(e),attr=e.getAttributeNode('style');let reads=0;Object.defineProperty(e,'ownerDocument',{configurable:true,get(){reads++;throw Error('authored owner document')}});assert.equal(held.color,'rgb(1, 2, 3)');assert.equal(w.getComputedStyle(e),held);assert.equal(inactive.adoptNode(e),e);assert.equal(attr.ownerDocument,inactive);assert.equal(held.color,'rgb(0, 0, 0)');assert.equal(held.display,'block');assert.equal(w.getComputedStyle(e).color,'rgb(0, 0, 0)');e.style.color='rgb(4,5,6)';assert.equal(d.adoptNode(e),e);assert.equal(attr.ownerDocument,d);assert.equal(held.color,'rgb(4, 5, 6)');assert.equal(w.getComputedStyle(e),held);assert.equal(reads,0)});
++test('private focus matching preserves actual focus/blur and positive author stylesheet cascade without authored owner reads',async t=>{const{w,d}=await fixture(t),style=d.createElement('style'),e=d.createElement('div');style.textContent='.focus-target{color:rgb(1,2,3)}.focus-target:focus{color:rgb(4,5,6)}';d.head.append(style);e.className='focus-target';e.tabIndex=0;d.body.append(e);const held=w.getComputedStyle(e);assert.equal(e.matches(':focus'),false);assert.equal(held.color,'rgb(1, 2, 3)');let reads=0;Object.defineProperty(e,'ownerDocument',{configurable:true,get(){reads++;throw Error('authored focus owner')}});e.focus();assert.equal(d.activeElement,e);assert.equal(e.matches(':focus'),true);assert.equal(held.color,'rgb(4, 5, 6)');e.blur();assert.equal(e.matches(':focus'),false);assert.equal(held.color,'rgb(1, 2, 3)');assert.equal(reads,0)});
+--- /dev/null
++++ b/test/computed-text-decoration.test.js
+@@ -0,0 +1,5 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{Browser}from'../src/browser.js';
++async function fixture(t){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body>');return{w:page.dom.window,d:page.dom.window.document};}
++test('text decoration defaults leave declarations untouched and reset a non-inherited line through the real cascade',async t=>{const{w,d}=await fixture(t),parent=d.createElement('div'),child=d.createElement('span');parent.style.textDecorationLine='overline';parent.append(child);d.body.append(parent);const held=w.getComputedStyle(child);assert.equal(w.getComputedStyle(parent).textDecorationLine,'overline');assert.equal(child.style.textDecorationLine,'');assert.equal(child.hasAttribute('style'),false);assert.equal(held.textDecorationLine,'none');assert.equal(held.textDecoration,'none');assert.equal(held.getPropertyValue('text-decoration-line'),'none');for(const[value,expected]of[['inherit','overline'],['initial','none'],['unset','none'],['revert','none']]){child.style.textDecorationLine=value;assert.equal(held.textDecorationLine,expected);assert.equal(child.style.textDecorationLine,value)}child.style.removeProperty('text-decoration-line');assert.equal(held.textDecorationLine,'none');assert.equal(w.getComputedStyle(parent).textDecorationLine,'overline')});
++test('actual inline mutation keeps Native verbatim longhand tokens and shorthand does not synthesize a line declaration',async t=>{const{w,d}=await fixture(t),e=d.createElement('span');d.body.append(e);const held=w.getComputedStyle(e);for(const value of['UNDERLINE','bogus','underline underline','none underline','overline underline']){e.style.setProperty('text-decoration-line',value);assert.equal(e.style.textDecorationLine,value);assert.equal(held.textDecorationLine,value);assert.equal(held.getPropertyValue('text-decoration-line'),value)}e.removeAttribute('style');for(const value of['underline','red wavy underline','underline 2px blue','bogus']){e.setAttribute('style','text-decoration:'+value);assert.equal(e.style.textDecoration,value);assert.equal(e.style.textDecorationLine,'');assert.equal(held.textDecoration,value);assert.equal(held.textDecorationLine,'none')}assert.throws(()=>held.setProperty('text-decoration-line','underline'),{name:'NoModificationAllowedError'});assert.equal(held.textDecorationLine,'none')});
++test('retained decoration values follow actual inactive adoption and later author changes without replacing the Attr',async t=>{const{w,d}=await fixture(t),inactive=d.implementation.createHTMLDocument('inactive'),e=d.createElement('span');e.style.textDecorationLine='underline';d.body.append(e);const held=w.getComputedStyle(e),a=e.getAttributeNode('style');assert.equal(held.textDecorationLine,'underline');inactive.adoptNode(e);assert.equal(e.getAttributeNode('style'),a);assert.equal(a.ownerDocument,inactive);assert.equal(e.style.textDecorationLine,'underline');assert.equal(held.textDecorationLine,'none');e.style.textDecorationLine='line-through';assert.equal(held.textDecorationLine,'none');d.body.append(e);assert.equal(e.getAttributeNode('style'),a);assert.equal(a.ownerDocument,d);assert.equal(held.textDecorationLine,'line-through')});
+--- /dev/null
++++ b/test/cookie-ingress.test.js
+@@ -0,0 +1,56 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {Worker} from 'node:worker_threads';
++import {once} from 'node:events';
++import {Browser} from '../src/browser.js';
++import {serve} from '../src/cdp.js';
++import {createSharedWorkerHTTP} from '../src/shared-worker-http.js';
++import {observeCookieJar} from '../src/cookie-jar-observer.js';
++import {setCookie} from '../src/cookies.js';
++import {connect} from './cdp-client.js';
++
++const headers=[
++ 'plain=actual; Path=/', 'rejected=invalid; Path=/; SameSite=None',
++ 'secure=actual; Path=/; SameSite=None; Secure',
++ 'last_lax=actual; Path=/; SameSite=None; SameSite=Lax',
++ 'last_none=invalid; Path=/; SameSite=Lax; SameSite=None',
++ 'ignored_unknown=invalid; Path=/; SameSite=None; SameSite=unknown',
++ 'quoted=actual; Path=/; SameSite="None"',
++ 'secure_value=actual; Path=/; SameSite=None; Secure=0'
++];
++async function actualServer(t){
++ const source=`import{parentPort,workerData}from'node:worker_threads';import{createServer}from'node:http';const requests=[];const server=createServer((request,response)=>{requests.push({url:request.url,headers:request.headers});if(request.url==='/requests'){response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify(requests));return}const cookies=request.url==='/set'?workerData.headers:request.url==='/invalid'?['existing=invalid;Path=/;SameSite=None','existing=invalid;Path=/;SameSite=None;Max-Age=0']:[];response.writeHead(200,{'content-type':request.url==='/'?'text/html':'text/plain',...(cookies.length?{'set-cookie':cookies}:{})});response.end(request.url==='/'?'<!doctype html><body>Actual cookie transport document':'Actual cookie transport response')});server.listen(0,'127.0.0.1',()=>parentPort.postMessage({port:server.address().port}));`;
++ const worker=new Worker(new URL('data:text/javascript,'+encodeURIComponent(source)),{workerData:{headers},execArgv:[]});t.after(()=>worker.terminate());
++ const[{port}]=await once(worker,'message');return'http://127.0.0.1:'+port;
++}
++const cookieView=async(jar,origin)=>(await jar.getCookies(origin.replace('http:','https:')+'/')).map(cookie=>({name:cookie.key,value:cookie.value,sameSite:cookie.sameSite,secure:cookie.secure}));
++const expectedNames=['plain','secure','last_lax','quoted','secure_value'];
++async function actualPage(t){const origin=await actualServer(t),browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate(origin+'/');return{origin,browser,page,jar:page.context.cookies};}
++
++for(const transport of['async','sync','shared'])test('real '+transport+' HTTP response rejects insecure None before successful mutation and preserves valid cookies',async t=>{
++ const{origin,page,jar}=await actualPage(t);await jar.setCookie('existing=keep; Path=/; SameSite=None; Secure',origin+'/');
++ page.userAgent='actual-cookie-owner-agent';page.acceptLanguage='xx-YY';page.extraHTTPHeaders.set('x-cookie-owner','from-cdp');page.cliHTTPHeaders.set('x-cookie-owner','from-cli');
++ const changes=[],unsubscribe=observeCookieJar(jar,(kind,cookie)=>changes.push({kind,name:cookie.name,value:cookie.value}));t.after(unsubscribe);
++ let owner;if(transport==='shared'){owner=createSharedWorkerHTTP(page,page,{origin,url:origin+'/shared.js'});t.after(()=>owner.close());}
++ const request=async path=>{if(transport==='async')return(await page.fetch(origin+path)).text();if(transport==='shared')return(await owner.fetch(origin+path)).text();return page.evaluate('(()=>{const x=new XMLHttpRequest();x.open("GET",'+JSON.stringify(path)+',false);x.send();if(x.status!==200)throw Error("Actual sync response failed");return x.responseText})()');};
++ assert.equal(await request('/invalid'),'Actual cookie transport response');assert.deepEqual(changes,[]);assert.equal((await cookieView(jar,origin)).find(cookie=>cookie.name==='existing').value,'keep');
++ assert.equal(await request('/set'),'Actual cookie transport response');const cookies=await cookieView(jar,origin);assert.deepEqual(cookies.filter(cookie=>cookie.name!=='existing').map(cookie=>cookie.name),expectedNames);assert.equal(cookies.find(cookie=>cookie.name==='last_lax').sameSite,'lax');assert.equal(cookies.find(cookie=>cookie.name==='quoted').sameSite,undefined);assert.equal(cookies.find(cookie=>cookie.name==='secure_value').secure,true);assert.deepEqual(changes.map(change=>change.name),expectedNames);
++ const wire=await(await fetch(origin+'/requests')).json();for(const entry of wire.filter(entry=>entry.url==='/invalid'||entry.url==='/set')){assert.equal(entry.headers['user-agent'],'actual-cookie-owner-agent');assert.equal(entry.headers['accept-language'],'xx-YY');assert.equal(entry.headers['x-cookie-owner'],'from-cli');}
++});
++
++test('CDP keeps actual HTTPS defaults, exact enum and schema results, valid batch members and rejected replacements',async t=>{
++ const origin=await actualServer(t),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close()});
++ const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/'});
++ assert.deepEqual(await send('Network.setCookie',{name:'invalid',value:'bad',url:origin+'/',sameSite:'None'}),{success:false});
++ assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'keep',url:origin+'/',sameSite:'None',secure:true}),{success:true});
++ for(const options of[{secure:false},{secure:false,expires:0}])assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'bad',url:origin+'/',sameSite:'None',...options}),{success:false});
++ assert.deepEqual(await send('Network.setCookie',{name:'https_default',value:'actual',url:origin.replace('http:','https:')+'/',sameSite:'None',secure:false}),{success:true});
++ assert.deepEqual(await send('Network.setCookie',{name:'lowercase',value:'actual',url:origin+'/',sameSite:'none'}),{success:true});
++ await assert.rejects(send('Network.setCookie',{name:'missing',url:origin+'/',sameSite:'None'}),/MissingField/);await assert.rejects(send('Network.setCookie',{name:'wrong_type',value:'actual',url:origin+'/',sameSite:'None',secure:0}),/UnexpectedToken/);await assert.rejects(send('Network.setCookie',{name:'bad;name',value:'actual',url:origin+'/',sameSite:'None'}),/Sanitizing cookie failed/);
++ for(const method of['Network.setCookies','Storage.setCookies']){const cookies=[{name:method[0]+'_valid',value:'keep',url:origin+'/',sameSite:'None',secure:true},{name:method[0]+'_invalid',value:'bad',url:origin+'/',sameSite:'None'}];assert.deepEqual(await(method==='Storage.setCookies'?client.send(method,{browserContextId,cookies}):send(method,{cookies})),{});}
++ const{cookies}=await send('Network.getCookies',{urls:[origin.replace('http:','https:')+'/']});assert.deepEqual(cookies.map(cookie=>cookie.name),['existing','https_default','lowercase','N_valid','S_valid']);assert.equal(cookies[0].value,'keep');assert.equal(cookies[1].secure,true);assert.equal(cookies[2].sameSite,undefined);
++});
++
++test('generic importer and raw embedding jar retain their previous behavior outside the measured HTTP and CDP channels',async t=>{
++ const{origin,jar}=await actualPage(t);await setCookie(jar,{name:'generic',value:'actual',url:origin+'/',sameSite:'None'});await jar.setCookie('raw=actual; Path=/; SameSite=None',origin+'/');assert.deepEqual((await cookieView(jar,origin)).map(cookie=>({name:cookie.name,sameSite:cookie.sameSite,secure:cookie.secure})),[{name:'generic',sameSite:'none',secure:false},{name:'raw',sameSite:'none',secure:false}]);
++});
+--- /dev/null
++++ b/test/document-interface-realms.test.js
+@@ -0,0 +1,10 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{createRequire}from'node:module';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),interfaces=require('jsdom/lib/jsdom/living/interfaces.js'),DocumentFactory=require('jsdom/lib/jsdom/living/generated/Document.js'),XMLFactory=require('jsdom/lib/jsdom/living/generated/XMLDocument.js'),binding=getHeapBinding();
++function realm(value,w){const proto=Object.getPrototypeOf(value),anchor=w.eval('[]');try{for(let n=0;n<2;n++){assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,proto)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><span id=owned>actual</span><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('canonical Document and XMLDocument public definitions are genuinely main/frame VM at first creation',async t=>{const{w}=await fixture(t),child=w.document.querySelector('iframe').contentWindow;for(const g of[w,child]){for(const kind of['Document','XMLDocument','HTMLDocument']){realm(g[kind],g);realm(g[kind].prototype,g)}for(const name of['createElement','createElementNS','createTextNode','getElementsByTagName','importNode','adoptNode'])realm(g.Document.prototype[name],g);for(const name of['URL','documentElement','readyState'])realm(Object.getOwnPropertyDescriptor(g.Document.prototype,name).get,g);realm(g.document,g);assert.notEqual(g.HTMLDocument,g.Document);assert.equal(g.document.constructor,g.HTMLDocument);assert.equal(g.document instanceof g.XMLDocument,false);assert.equal(Object.getPrototypeOf(g.XMLDocument.prototype),g.Document.prototype);assert.equal(Object.getPrototypeOf(g.Document.prototype),g.Node.prototype)}});
++test('real Document constructors and subclasses retain one canonical setup/backend and actual newTarget',async t=>{const{w}=await fixture(t);const d=new w.Document;realm(d,w);assert.equal(DocumentFactory.is(d),true);assert.equal(DocumentFactory.isImpl(utils.implForWrapper(d)),true);assert.equal(utils.wrapperForImpl(utils.implForWrapper(d)),d);assert.equal(d.contentType,'application/xml');assert.equal(d.defaultView,null);const root=d.createElement('actual');root.textContent='real';d.appendChild(root);assert.equal(d.documentElement,root);assert.equal(root.ownerDocument,d);class Derived extends w.Document{}const derived=new Derived;assert.equal(derived instanceof Derived,true);assert.equal(DocumentFactory.is(derived),true);let reads=0;const proto=Object.create(w.Document.prototype),Target=new Proxy(function Target(){},{get(target,key,receiver){if(key==='prototype'){reads++;return proto}return Reflect.get(target,key,receiver)}});const other=Reflect.construct(w.Document,[],Target);assert.equal(reads,1);assert.equal(Object.getPrototypeOf(other),proto);assert.equal(DocumentFactory.is(other),true);const html=new w.HTMLDocument;realm(html,w);assert.equal(html.contentType,'text/html');assert.equal(html instanceof w.Document,true);assert.throws(()=>new w.XMLDocument,e=>e instanceof w.TypeError);assert.equal(interfaces.getInterfaceWrapper('Document'),DocumentFactory);assert.equal(interfaces.getInterfaceWrapper('XMLDocument'),XMLFactory)});
++test('XML and HTML parsing and create/import/adopt/query use real document and node implementations',async t=>{const{w}=await fixture(t),xml=w.document.implementation.createDocument('urn:actual','a:root',null),html=w.document.implementation.createHTMLDocument('owned'),parsed=new w.DOMParser().parseFromString('<root><item>actual</item></root>','application/xml');for(const d of[xml,html,parsed]){realm(d,w);assert.equal(DocumentFactory.is(d),true);assert.equal(utils.wrapperForImpl(utils.implForWrapper(d)),d)}assert.equal(xml instanceof w.XMLDocument,true);assert.equal(XMLFactory.is(xml),true);assert.equal(html instanceof w.HTMLDocument,true);assert.equal(html.title,'owned');assert.equal(parsed.getElementsByTagName('item')[0].textContent,'actual');const source=w.document.createElement('article');source.textContent='real';const imported=xml.importNode(source,true),adopted=xml.adoptNode(source);xml.documentElement.append(imported,adopted);const fragment=xml.createDocumentFragment();fragment.appendChild(xml.createTextNode('tail'));xml.documentElement.appendChild(fragment);assert.equal(xml.getElementsByTagName('article').length,2);assert.equal(xml.documentElement.textContent,'realrealtail');assert.equal(adopted,source);assert.equal(imported.ownerDocument,xml);assert.equal(adopted.ownerDocument,xml)});
++test('borrowed generated methods preserve actual backend owner, method VM, conversions and thrown values',async t=>{const{w}=await fixture(t),child=w.document.querySelector('iframe').contentWindow,owned=w.Document.prototype.createElement.call(child.document,'owned');realm(owned,w);assert.equal(owned.ownerDocument,child.document);assert.equal(owned instanceof w.HTMLElement,true);assert.equal(owned instanceof child.HTMLElement,false);const other=child.Document.prototype.createElement.call(w.document,'foreign');realm(other,child);assert.equal(other.ownerDocument,w.document);assert.equal(other instanceof child.HTMLElement,true);let conversions=0;const arg={toString(){conversions++;return'actual'}};assert.throws(()=>w.Document.prototype.createElement.call({},arg),e=>e instanceof w.TypeError);assert.equal(conversions,0);const thrown=w.eval('({actual:true})');assert.throws(()=>w.Document.prototype.createElement.call(w.document,{toString(){throw thrown}}),e=>e===thrown)});
++test('utility keeps its genuine interface aliases and the same canonical document backend',async t=>{const{w,page}=await fixture(t),world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());const g=world.global;assert.equal(g.HTMLDocument,g.Document);for(const kind of['Document','XMLDocument']){realm(g[kind],g);realm(g[kind].prototype,g)}const doc=world.evaluate('document');assert.equal(canonicalUtilityValue(doc),w.document);assert.equal(platformFactoryRecord(doc).implementation,platformFactoryRecord(w.document).implementation);assert.equal(world.evaluate('document.getElementById("owned").textContent'),'actual')});
++test('genuine non-scriptable Host JSDOM and frozen previous interface modules stay unchanged',()=>{const dom=new JSDOM('');try{for(const kind of['Document','XMLDocument']){assert.equal(binding.sameRealm(dom.window[kind],[]),true);assert.equal(binding.sameRealm(dom.window[kind].prototype,[]),true)}assert.equal(dom.window.HTMLDocument,dom.window.Document);const d=new dom.window.Document;assert.equal(DocumentFactory.is(d),true);assert.equal(d.createElement('actual').ownerDocument,d);for(const[name,sha]of[['foundational-interface-realms.js','5c7a6b6fd2fbe5d7c9cbe14c465aff5573498b383ca41175a9ce6ee415ef7904'],['control-interface-realms.js','9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f'],['additional-control-interface-realms.js','62b1eb9a098e15c7613bcf3a75a0fb60e3fffa2d90a925ea986e844a9385d0bf'],['option-alias.js','0d55df0c73d6ce5413aaf3623abd8e7d3698fdda146ff694a97800bf113099f6'],['public-idl-member.js','3a462af5823f81f5c8b4e2e3d4340254f23d5bd0f1c5e125aef163acdc7b8700']])assert.equal(createHash('sha256').update(readFileSync(new URL('../src/'+name,import.meta.url))).digest('hex'),sha)}finally{dom.window.close()}});
+--- /dev/null
++++ b/test/foundational-interface-realms.test.js
+@@ -0,0 +1,12 @@
++// Prepared during Root freeze; run only after its explicit resource release.
++import{test}from'node:test';import assert from'node:assert/strict';import{createRequire}from'node:module';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{JSDOM}from'jsdom';
++import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{platformFactoryRecord}from'../src/platform-factories.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{transformFoundationalInterface}from'../src/foundational-interface-realms.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),binding=getHeapBinding(),kinds=['Node','Element','HTMLElement'];
++function realm(value,w){const a=w.eval('[]'),old=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,a),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><div id=owned><span>actual</span></div><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('original foundational public definitions and untouched methods are genuinely created in the selected VM',async t=>{const{w}=await fixture(t);for(const kind of kinds){realm(w[kind],w);realm(w[kind].prototype,w);assert.equal(w[kind].prototype.constructor,w[kind]);assert.throws(()=>w[kind](),e=>e instanceof w.TypeError)}for(const value of[w.Node.prototype.hasChildNodes,w.Element.prototype.hasAttributes,w.HTMLElement.prototype.click])realm(value,w);assert.equal(Object.getPrototypeOf(w.Node.prototype),w.EventTarget.prototype);assert.equal(Object.getPrototypeOf(w.Element.prototype),w.Node.prototype);assert.equal(Object.getPrototypeOf(w.HTMLElement.prototype),w.Element.prototype);});
++test('canonical factory exports/setup/cache and actual backend identities remain unchanged across installation',async t=>{const factories=kinds.map(kind=>require('jsdom/lib/jsdom/living/generated/'+kind+'.js')),setup=factories.map(factory=>factory.setup),{w}=await fixture(t);for(let i=0;i<kinds.length;i++){assert.equal(require('jsdom/lib/jsdom/living/generated/'+kinds[i]+'.js'),factories[i]);assert.equal(factories[i].setup,setup[i])}const e=w.document.getElementById('owned'),backend=utils.implForWrapper(e),nodes=e.childNodes,attrs=e.attributes;assert.equal(e.childNodes,nodes);assert.equal(e.attributes,attrs);assert.equal(utils.wrapperForImpl(backend),e);assert.equal(platformFactoryRecord(e).implementation,backend);e.appendChild(w.document.createTextNode('added'));e.setAttribute('data-owned','value');assert.equal(nodes.length,2);assert.equal(attrs.getNamedItem('data-owned').value,'value');const clone=e.cloneNode(true);assert.notEqual(clone,e);assert.equal(clone.textContent,'actualadded');assert.equal(clone.isEqualNode(e),true);});
++test('real custom element constructors and callbacks retain actual element/backend state',async t=>{const{w}=await fixture(t);const value=JSON.parse(w.eval(`JSON.stringify((()=>{const calls=[];class Actual extends HTMLElement{static get observedAttributes(){return['data-owned']}constructor(){super();this.owned='actual';calls.push('construct')}connectedCallback(){calls.push('connected')}attributeChangedCallback(name,old,value){calls.push(['attribute',name,old,value])}}customElements.define('owned-foundation',Actual);const e=new Actual();document.body.append(e);e.setAttribute('data-owned','one');return{calls,owned:e.owned,prototype:Object.getPrototypeOf(e)===Actual.prototype,node:e instanceof Node,element:e instanceof Element,html:e instanceof HTMLElement,owner:e.ownerDocument===document}})())`));assert.deepEqual(value,{calls:['construct','connected',['attribute','data-owned',null,'one']],owned:'actual',prototype:true,node:true,element:true,html:true,owner:true});});
++test('frame and utility definitions keep distinct actual realms without retargeting observed node wrappers',async t=>{const{w,page}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;for(const kind of kinds)realm(c[kind].prototype,c);const e=c.document.createElement('div'),p=Object.getPrototypeOf(e),backend=utils.implForWrapper(e);w.document.adoptNode(e);w.document.body.append(e);assert.equal(e.ownerDocument,w.document);assert.equal(Object.getPrototypeOf(e),p);assert.equal(utils.implForWrapper(e),backend);realm(e,c);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());for(const kind of kinds)realm(world.global[kind].prototype,world.global);const front=world.evaluate('document.getElementById("owned")'),main=w.document.getElementById('owned');assert.equal(canonicalUtilityValue(front),main);assert.equal(platformFactoryRecord(front).implementation,platformFactoryRecord(main).implementation);assert.equal(front.textContent,'actual');});
++test('genuine non-scriptable Host windows retain their original Host interfaces and functional DOM',()=>{const dom=new JSDOM('<div>actual</div>');try{const w=dom.window;for(const kind of kinds){assert.equal(binding.sameRealm(w[kind],[]),true);assert.equal(binding.sameRealm(w[kind].prototype,[]),true)}const e=w.document.querySelector('div');assert.equal(e.textContent,'actual');assert.equal(e instanceof w.Node,true);assert.equal(e instanceof w.Element,true);assert.equal(e instanceof w.HTMLElement,true);e.setAttribute('data-owned','value');assert.equal(e.getAttribute('data-owned'),'value')}finally{dom.window.close()}});
++test('exact source/body guards and frozen Input/additional/Option modules remain intact',()=>{for(const kind of kinds){const source=readFileSync(require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),'utf8');assert.doesNotThrow(()=>transformFoundationalInterface(source,kind,source));assert.throws(()=>transformFoundationalInterface(source,kind,source+'\n'),/Pinned canonical foundational interface source changed/);assert.throws(()=>transformFoundationalInterface(source.replace('  const ctorRegistry =','  /* changed */const ctorRegistry ='),kind,source),/Canonical foundational public installer body changed/)}for(const[name,expected]of[['control-interface-realms.js','9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f'],['additional-control-interface-realms.js','62b1eb9a098e15c7613bcf3a75a0fb60e3fffa2d90a925ea986e844a9385d0bf'],['option-alias.js','0d55df0c73d6ce5413aaf3623abd8e7d3698fdda146ff694a97800bf113099f6']])assert.equal(createHash('sha256').update(readFileSync(new URL('../src/'+name,import.meta.url))).digest('hex'),expected)});
+--- /dev/null
++++ b/test/manual-document-realms.test.js
+@@ -0,0 +1,11 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{spawnSync}from'node:child_process';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{createIsolatedWorld}from'../src/isolated-world.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++const binding=getHeapBinding(),targets=[['styleSheets','get',0],['createExpression','value',1],['createNSResolver','value',1],['evaluate','value',1],['all','get',0],['adoptedStyleSheets','get',0],['adoptedStyleSheets','set',1],['elementFromPoint','value',2],['elementsFromPoint','value',2]];
++function realm(value,w){const p=Object.getPrototypeOf(value),a=w.eval('[]');try{for(let n=0;n<2;n++){assert.equal(binding.sameRealm(value,a),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,p)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><iframe></iframe>');return{browser,page,w:page.dom.window};}
++function args(w,name){if(name==='createExpression')return['1+1',null];if(name==='createNSResolver')return[w.document.body];if(name==='evaluate')return['1+1',w.document,null,w.XPathResult.NUMBER_TYPE,null];if(name==='adoptedStyleSheets')return[[]];return[0,0]}
++test('nine main/frame Document functions are real selectedVM entries with Native metadata',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;for(const g of[w,c])for(const[name,slot,length]of targets){const d=Object.getOwnPropertyDescriptor(g.Document.prototype,name),f=d[slot];realm(f,g);assert.equal(f.name,slot==='value'?name:slot+' '+name);assert.equal(f.length,length);assert.equal(d.enumerable,true);assert.equal(d.configurable,true);assert.deepEqual(Reflect.ownKeys(f),['length','name']);assert.equal(Function.prototype.toString.call(f).includes('[native code]'),true);assert.throws(()=>Reflect.construct(f,[]),TypeError)}for(const name of['createExpression','createNSResolver','evaluate'])assert.notEqual(w.Document.prototype[name],w.XPathEvaluator.prototype[name])});
++test('owned entry receivers use successful private Document provenance without copied slot or Proxy traps',async t=>{const{w}=await fixture(t),copied=Object.create(w.Document.prototype,Object.getOwnPropertyDescriptors(w.document));let traps=0;const proxy=new Proxy(w.document,{get(){traps++;throw Error('get trap')},getPrototypeOf(){traps++;throw Error('prototype trap')},ownKeys(){traps++;throw Error('keys trap')},getOwnPropertyDescriptor(){traps++;throw Error('descriptor trap')}});assert.ok(platformFactoryRecord(w.document)?.implementation);assert.equal(platformFactoryRecord(copied),undefined);for(const[name,slot]of targets){const f=Object.getOwnPropertyDescriptor(w.Document.prototype,name)[slot];for(const bad of[{},copied,proxy,null,undefined,w.document.body])assert.throws(()=>Reflect.apply(f,bad,args(w,name)),e=>e instanceof w.TypeError&&e.message==='Illegal invocation')}assert.equal(traps,0)});
++test('real borrowed stylesheet/all and XPath operations retain genuine childDocument values and ownership',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow,d=c.document,p=d.body.appendChild(d.createElement('p'));p.id='ownedChild';p.textContent='actual';const style=d.head.appendChild(d.createElement('style'));style.textContent='p{color:red}';const sheetList=Object.getOwnPropertyDescriptor(w.Document.prototype,'styleSheets').get.call(d);assert.equal(Array.from(sheetList).includes(style.sheet),true);const all=Object.getOwnPropertyDescriptor(w.Document.prototype,'all').get.call(d);assert.equal(all.namedItem('ownedChild'),p);assert.equal(w.Document.prototype.createNSResolver.call(d,p),p);const expression=w.Document.prototype.createExpression.call(d,'count(//p)',null);assert.equal(expression.evaluate(d,c.XPathResult.NUMBER_TYPE,null).numberValue,1);assert.equal(w.Document.prototype.evaluate.call(d,'string(//p)',d,null,c.XPathResult.STRING_TYPE,null).stringValue,'actual');assert.equal(p.ownerDocument,d)});
++test('stylesheet adoption and hit testing keep actual backend state and authored exceptions',async t=>{const{w}=await fixture(t),sheet=new w.CSSStyleSheet;sheet.replaceSync('body { opacity: 0.5 }');w.document.adoptedStyleSheets=[sheet];assert.equal(w.document.adoptedStyleSheets[0],sheet);assert.equal(sheet.cssRules.length,1);w.document.adoptedStyleSheets=[];assert.equal(w.document.adoptedStyleSheets.length,0);assert.equal(w.document.elementFromPoint(-1,-1),null);assert.equal(w.document.elementsFromPoint(-1,-1).length,0);const thrown=w.eval('({actual:true})');const values={get[Symbol.iterator](){throw thrown}};assert.throws(()=>{w.document.adoptedStyleSheets=values},e=>e===thrown)});
++test('utility Document XPath entries are genuine VM/distinct evaluator values with strong receiver guards',async t=>{const{w,page}=await fixture(t),world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());const g=world.global;assert.equal(g.HTMLDocument,g.Document);for(const name of['createExpression','createNSResolver','evaluate']){const f=g.Document.prototype[name];realm(f,g);assert.equal(f.length,1);assert.notEqual(f,g.XPathEvaluator.prototype[name]);assert.throws(()=>f.call({},...args(g,name)),e=>e instanceof g.TypeError&&e.message==='Illegal invocation')}assert.equal(world.evaluate('document.evaluate("1+1",document,null,XPathResult.NUMBER_TYPE,null).numberValue'),2)});
++test('unregistered standalone VM and genuine Host installers preserve original receiver behavior',()=>{const program=`import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{captureDocumentMemberFactory}from'./src/document-member-realms.js';import{platformFactoryRecord}from'./src/platform-factories.js';import{getHeapBinding}from'./src/native-heap.js';for(const scripts of[undefined,'outside-only']){const dom=new JSDOM('',scripts?{runScripts:scripts}:{});try{const w=dom.window;assert.equal(platformFactoryRecord(w.document),undefined);const op=({owned(){return this}}).owned,member=captureDocumentMemberFactory(w),f=member('owned','value',op),receiver={actual:true};assert.equal(f.call(receiver),receiver);if(scripts){assert.equal(getHeapBinding().sameRealm(f,w.eval('[]')),true);assert.notEqual(f,op)}else assert.equal(f,op)}finally{dom.window.close()}}`;const result=spawnSync(process.execPath,['--input-type=module','-e',program],{cwd:new URL('..',import.meta.url),encoding:'utf8',timeout:3000});assert.equal(result.error,undefined);assert.equal(result.status,0,result.stderr)});
+--- /dev/null
++++ b/test/manual-element-realms.test.js
+@@ -0,0 +1,11 @@
++// Prepared during Root63888/14114 quiet leases; run only after release.
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{captureIDLMemberFactory}from'../src/public-idl-member.js';import{installElementScroll}from'../src/element-scroll.js';
++const binding=getHeapBinding(),targets=[["Element","getClientRects","value"],["Element","getBoundingClientRect","value"],["Element","scrollTop","set"],["Element","scrollLeft","set"],["Element","scrollWidth","get"],["Element","scrollHeight","get"],["Element","clientWidth","get"],["Element","clientHeight","get"],["Element","getHTML","value"],["Element","scrollIntoView","value"],["Element","scrollIntoViewIfNeeded","value"],["HTMLElement","offsetParent","get"],["HTMLElement","offsetTop","get"],["HTMLElement","offsetLeft","get"],["HTMLElement","offsetWidth","get"],["HTMLElement","offsetHeight","get"],["HTMLElement","showPopover","value"],["HTMLElement","hidePopover","value"],["HTMLElement","togglePopover","value"],["HTMLElement","popover","get"],["HTMLElement","popover","set"]];
++function realm(value,w){const old=Object.getPrototypeOf(value),a=w.eval('[]');try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,a),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('nineteen republished entries and two retained scroll setters have genuine selectedVM creation',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;for(const global of[w,c])for(const[kind,name,slot]of targets){const d=Object.getOwnPropertyDescriptor(global[kind].prototype,name),f=d[slot];realm(f,global);assert.equal(f.name,slot==='value'?name:slot+' '+name);assert.equal(f.length,slot==='set'?1:0);assert.equal(Object.hasOwn(f,'prototype'),false);if(!(kind==='Element'&&['scrollTop','scrollLeft'].includes(name)&&slot==='set'))assert.equal(Function.prototype.toString.call(f).includes('[native code]'),true);assert.equal(Object.hasOwn(f,'toString'),false);assert.equal(d.configurable,true);assert.equal(d.enumerable,true)}});
++test('canonical native entry keeps real receiver/argument/result/thrown identities and private operation Host',async t=>{const{w,page}=await fixture(t),member=captureIDLMemberFactory(w),receiver=w.document.body,arg=w.eval('({owned:true})'),thrown=w.eval('({thrown:true})');let seen;const operation=({owned(value){seen={receiver:this,value};return value}}).owned;assert.equal(binding.sameRealm(operation,[]),true);const f=member('owned','value',operation);realm(f,w);assert.equal(f.call(receiver,arg),arg);assert.equal(seen.receiver,receiver);assert.equal(seen.value,arg);const fail=member('failure','value',()=>{throw thrown});assert.throws(()=>fail(),e=>e===thrown);assert.throws(()=>Reflect.construct(f,[]),e=>e instanceof TypeError&&!(e instanceof w.TypeError));const constructInVM=w.Function('fn','return Reflect.construct(fn,[])');assert.throws(()=>constructInVM(f),e=>e instanceof w.TypeError&&!(e instanceof TypeError));const top=Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').get,left=Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollLeft').get;installElementScroll(w,()=>page.layout);assert.equal(Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').get,top);assert.equal(Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollLeft').get,left)});
++test('geometry and scroll APIs keep actual private layout state and live public values',async t=>{const{w}=await fixture(t),box=w.document.body.appendChild(w.document.createElement('div'));box.style.cssText='position:fixed;left:10px;top:20px;width:80px;height:30px;padding:0;border:0';const r=box.getBoundingClientRect(),list=box.getClientRects();assert.deepEqual([r.width,r.height],[80,30]);assert.equal(r instanceof w.DOMRect,true);assert.equal(list.length,1);assert.equal(list[0] instanceof w.DOMRect,true);assert.equal(box.offsetParent,null);const scroll=w.document.body.appendChild(w.document.createElement('div'));scroll.style.cssText='width:40px;height:20px;overflow:auto;padding:0;border:0';const child=scroll.appendChild(w.document.createElement('div'));child.style.cssText='width:140px;height:120px';scroll.scrollTop=25;scroll.scrollLeft=35;assert.deepEqual([scroll.scrollTop,scroll.scrollLeft],[25,35]);scroll.scrollTop=-10;scroll.scrollLeft=-10;assert.deepEqual([scroll.scrollTop,scroll.scrollLeft],[0,0])});
++test('getHTML serializes the real tree and popover operations retain real state and cancellation',async t=>{const{w}=await fixture(t),host=w.document.body.appendChild(w.document.createElement('div'));host.innerHTML='<span data-owned="value">actual</span>';assert.equal(host.getHTML(),'<span data-owned="value">actual</span>');const popover=w.document.body.appendChild(w.document.createElement('div'));popover.popover='manual';const events=[];const cancel=e=>{events.push(e);e.preventDefault()};popover.addEventListener('beforetoggle',cancel,{once:true});popover.showPopover();assert.equal(popover.matches(':popover-open'),false);assert.equal(events.length,1);assert.equal(events[0].isTrusted,true);popover.showPopover();assert.equal(popover.matches(':popover-open'),true);assert.equal(popover.togglePopover(false),false);assert.equal(popover.matches(':popover-open'),false);assert.equal(popover.popover,'manual')});
++test('borrowed operations keep receiver owner layout and original method owner result realm',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow,e=c.document.body.appendChild(c.document.createElement('div'));e.style.cssText='width:40px;height:20px';const r=w.Element.prototype.getBoundingClientRect.call(e);assert.equal(r.width,40);assert.equal(r instanceof w.DOMRect,true);assert.equal(r instanceof c.DOMRect,false);const setter=Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').set;assert.throws(()=>setter.call({},1),e=>e.name==='TypeError');assert.throws(()=>w.HTMLElement.prototype.showPopover.call({}),e=>e.name==='TypeError')});
++test('genuine Host fallback and all frozen foundational/control/Option modules remain unchanged',()=>{const dom=new JSDOM('');try{const op=({owned(){return 1}}).owned;assert.equal(captureIDLMemberFactory(dom.window)('owned','value',op),op);assert.equal(binding.sameRealm(op,[]),true);for(const[name,sha]of[['foundational-interface-realms.js','5c7a6b6fd2fbe5d7c9cbe14c465aff5573498b383ca41175a9ce6ee415ef7904'],['control-interface-realms.js','9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f'],['additional-control-interface-realms.js','62b1eb9a098e15c7613bcf3a75a0fb60e3fffa2d90a925ea986e844a9385d0bf'],['option-alias.js','0d55df0c73d6ce5413aaf3623abd8e7d3698fdda146ff694a97800bf113099f6']])assert.equal(createHash('sha256').update(readFileSync(new URL('../src/'+name,import.meta.url))).digest('hex'),sha)}finally{dom.window.close()}});

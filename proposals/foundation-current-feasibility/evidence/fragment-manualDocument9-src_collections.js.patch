@@ -1,0 +1,16 @@
+--- a/src/collections.js
++++ b/src/collections.js
+@@ -1,3 +1,4 @@
++import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import { registerProtocolPrototype } from './protocol-classes.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+ import { createRequire } from 'node:module';
+@@ -120,7 +121,7 @@
+     }, prototype);
+     states.set(result, state); return registerHeapWrapper(result,window);
+   }
+-  Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get() { return collection(this); } });
++  Object.defineProperty(window.Document.prototype, 'all', { configurable: true, enumerable: true, get: captureDocumentMemberFactory(window)('all','get',({get() { return collection(this); }}).get) });
+   Object.defineProperty(window, 'HTMLAllCollection', { configurable: true, writable: true, value: HTMLAllCollection });
+ 
+   // jsdom's live RadioNodeList points at a controls collection whose version is

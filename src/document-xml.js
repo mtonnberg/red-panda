@@ -1,3 +1,4 @@
+import {installDocumentXPathEntries} from './document-member-realms.js';
 import {installAttributeNames} from './attribute-names.js';
 import {installNamespaceSerialization} from './namespace-serialization.js';
 import {installSerialization} from './serialization.js';
@@ -117,6 +118,7 @@ function installXPath(window){
  };
  window.XPathEvaluator.prototype.createNSResolver=function(node){if(!NodeInterface.is(node))throw new window.TypeError('Expected Node');return node;};
  window.Document.prototype.createNSResolver=window.XPathEvaluator.prototype.createNSResolver;
+ installDocumentXPathEntries(window);
  return xpath;
 }
 

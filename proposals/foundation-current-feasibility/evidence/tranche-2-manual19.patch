@@ -1,0 +1,167 @@
+--- a/src/dialogs.js
++++ b/src/dialogs.js
+@@ -1,3 +1,4 @@
++import {captureIDLMemberFactory} from './public-idl-member.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ // Independent dialog and popover state, events, and default actions.
+ import { createRequire } from 'node:module';
+@@ -223,11 +224,12 @@
+       return isPopoverOpen(this);
+     },
+   };
+-  for (const [name,value] of Object.entries(popovers)) Object.defineProperty(window.HTMLElement.prototype,name,{value,writable:true,configurable:true,enumerable:true});
++  const member=captureIDLMemberFactory(window);
++  for (const [name,value] of Object.entries(popovers)) Object.defineProperty(window.HTMLElement.prototype,name,{value:member(name,'value',value),writable:true,configurable:true,enumerable:true});
+   Object.defineProperty(window.HTMLElement.prototype, 'popover', {
+     configurable:true, enumerable:true,
+-    get() { HTMLElement.convert(window,this);return kind(this.getAttribute('popover')); },
+-    set(value) { HTMLElement.convert(window,this);if(value==null)this.removeAttribute('popover');else this.setAttribute('popover',string(value,window)); },
++    get:member('popover','get',({get(){ HTMLElement.convert(window,this);return kind(this.getAttribute('popover')); }}).get),
++    set:member('popover','set',({set(value){ HTMLElement.convert(window,this);if(value==null)this.removeAttribute('popover');else this.setAttribute('popover',string(value,window)); }}).set),
+   });
+   if (typeof window.ToggleEvent !== 'function') {
+     const slots = new WeakMap();
+--- a/src/dom-wrapper-realms.js
++++ b/src/dom-wrapper-realms.js
+@@ -1,3 +1,4 @@
++import {isFoundationalInterface,transformFoundationalInterface} from './foundational-interface-realms.js';
+ import {isAdditionalControlInterface,transformAdditionalControlInterface} from './additional-control-interface-realms.js';
+ import {transformPrivateWebSocketSource} from './dom-websocket-state.js';
+ import {transformPrivateEventTargetSource} from './dom-event-target-state.js';
+@@ -101,6 +102,7 @@
+   }
+   if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
+   if(isAdditionalControlInterface(kind))source=transformAdditionalControlInterface(source,kind,originalSource);
++  if(isFoundationalInterface(kind))source=transformFoundationalInterface(source,kind,originalSource);
+   if(event)source=transformPrivateEventSource(source,kind);
+   if(Implementation===EventTargetImpl)source=transformPrivateEventTargetSource(source);
+   if(event||Implementation===EventTargetImpl||kind==='WebSocket')source=transformEventIDLInstall(source,kind);
+--- /dev/null
++++ b/src/foundational-interface-realms.js
+@@ -0,0 +1,25 @@
++// Original canonical Node/Element/HTMLElement public definitions, compiled in
++// their actual initial owning VM. Factories/setup/converters stay Host-owned;
++// this is not an alternative Window architecture or a public-class facade.
++import{createRequire}from'node:module';
++import{createHash}from'node:crypto';
++const require=createRequire(import.meta.url);
++const definitions=Object.freeze({
++ Node:{sha:'40e32d97310bb450c5ea169a0f48444f91f38bebdbfcaee77237cbf4e55318a5',names:['exports','conversions','utils','GetRootNodeOptions','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','implSymbol','ctorRegistrySymbol','EventTarget','interfaceName','exposed','Impl']},
++ Element:{sha:'2df81ad6f660fd10e21dcb2a0167425ff07c968c59d2e667b071c65d8ebd873e',names:['exports','conversions','utils','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','Attr','ShadowRootInit','Node','implSymbol','ctorRegistrySymbol','interfaceName','exposed','Impl']},
++ HTMLElement:{sha:'5ed9d5005064e5c34e4919e0f015b358c0e922c49ef57e115a9975dd0c30e63b',names:['exports','conversions','utils','HTMLConstructor_helpers_html_constructor','ceReactionsPreSteps_helpers_custom_elements','ceReactionsPostSteps_helpers_custom_elements','EventHandlerNonNull','OnErrorEventHandlerNonNull','implSymbol','ctorRegistrySymbol','Element','interfaceName','exposed','Impl']}
++});
++export function isFoundationalInterface(kind){return Object.hasOwn(definitions,kind)}
++function bodyOf(source,kind){
++ const signature='exports.install = (globalObject, globalNames) => {\n',footer='};\n\nconst Impl = require(',start=source.indexOf(signature),end=source.indexOf(footer,start);
++ if(start<0||end<start||source.split(signature).length!==2||source.split(footer).length!==2)throw new Error('Unexpected canonical foundational interface installer: '+kind);
++ return source.slice(start+signature.length,end);
++}
++export function transformFoundationalInterface(source,kind,originalSource){
++ const definition=definitions[kind];
++ if(!definition||require('jsdom/package.json').version!=='26.1.0'||createHash('sha256').update(originalSource).digest('hex')!==definition.sha)throw new Error('Pinned canonical foundational interface source changed: '+kind);
++ const body=bodyOf(source,kind);
++ if(body!==bodyOf(originalSource,kind))throw new Error('Canonical foundational public installer body changed: '+kind);
++ const names=definition.names;
++ return source+'\nconst originalFoundationalInterfaceInstall = exports.install;\nexports.install = (globalObject, globalNames) => installControlInterface(globalObject, globalNames, originalFoundationalInterfaceInstall, '+JSON.stringify(body)+', '+JSON.stringify(names)+', ['+names.join(', ')+'], __filename);\n';
++}
+--- a/src/layout.js
++++ b/src/layout.js
+@@ -1,3 +1,4 @@
++import {captureIDLMemberFactory} from './public-idl-member.js';
+ import{installWindowViewport}from'./window-viewport.js';
+ import{installScrollEvents}from'./scroll-events.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+@@ -256,7 +257,13 @@
+   layout.setScrollObserver(installScrollEvents(page,window).windowScroll);
+   const rectGlobal=implForWrapper(window.document)._globalObject,ArrayConstructor=window.Array,set=window.Reflect.set,ErrorConstructor=window.Error;
+   const domRect=value=>RectFactory.create(rectGlobal,[value.x,value.y,value.width,value.height]);
+-  const define = (target, name, descriptor) => Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
++  const member=captureIDLMemberFactory(window);
++  const define = (target, name, descriptor) => {
++    if(target===window.Element.prototype||target===window.HTMLElement.prototype){
++      descriptor={...descriptor};for(const slot of ['value','get','set'])if(typeof descriptor[slot]==='function')descriptor[slot]=member(name,slot,descriptor[slot]);
++    }
++    return Object.defineProperty(target, name, { configurable: true, enumerable: true, ...descriptor });
++  };
+   define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
+   define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(ArrayConstructor,set,ErrorConstructor,ownedLayout(this).rects(this).map(domRect)); } });
+   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
+--- /dev/null
++++ b/src/public-idl-member.js
+@@ -0,0 +1,21 @@
++// Public nonconstructible entries are created in their real selected VM before
++// publication. Their original operations and state remain Host-private.
++import vm from 'node:vm';
++import{createRequire}from'node:module';
++import{getRuntimeBinding}from'./native-runtime.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js');
++const apply=Reflect.apply,define=Object.defineProperty;
++export function captureIDLMemberFactory(window){
++ const context=utils.implForWrapper(window.document)?._globalObject;
++ // Genuine non-scriptable JSDOM is already Host. Do not invent a VM or load
++ // a native public entry for that case. Raw owned contexts need their explicit
++ // immutable RealmHandle/native-entry authority at the canonical dispatcher.
++ if(!context||!vm.isContext(context))return(_name,_slot,operation)=>operation;
++ const binding=getRuntimeBinding(),global=window;
++ return(name,slot,operation)=>{
++  if(typeof operation!=='function'||!['value','get','set'].includes(slot))throw new TypeError('A genuine IDL operation and descriptor slot are required');
++  const value=binding.createEntry((_caller,receiver,args)=>apply(operation,receiver,args),global,slot==='value'?name:slot+' '+name);
++  define(value,'length',{value:operation.length,configurable:true});
++  return value;
++ };
++}
+--- a/src/shadow.js
++++ b/src/shadow.js
+@@ -1,3 +1,4 @@
++import {captureIDLMemberFactory} from './public-idl-member.js';
+ import { createRequire } from 'node:module';
+ 
+ const require = createRequire(import.meta.url);
+@@ -367,12 +368,14 @@
+       return flags(implForWrapper(this))[name];
+     } });
+   }
++  const member=captureIDLMemberFactory(window);
+   for (const Constructor of [window.Element, window.ShadowRoot]) {
++    const getHTML=function getHTML(options = {}) {
++      if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
++      return serialize(this, options, window);
++    };
+     Object.defineProperty(Constructor.prototype, 'getHTML', { configurable: true, enumerable: true, writable: true,
+-      value: function getHTML(options = {}) {
+-        if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
+-        return serialize(this, options, window);
+-      } });
++      value: Constructor===window.Element?member('getHTML','value',getHTML):getHTML });
+     Object.defineProperty(Constructor.prototype, 'setHTMLUnsafe', { configurable: true, enumerable: true, writable: true,
+       value: function setHTMLUnsafe(markup, options = {}) {
+         if (!(Constructor === window.Element ? ElementInterface.is(this) : ShadowRootInterface.is(this))) throw new window.TypeError('Illegal invocation');
+--- /dev/null
++++ b/test/foundational-interface-realms.test.js
+@@ -0,0 +1,12 @@
++// Prepared during Root freeze; run only after its explicit resource release.
++import{test}from'node:test';import assert from'node:assert/strict';import{createRequire}from'node:module';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{JSDOM}from'jsdom';
++import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{platformFactoryRecord}from'../src/platform-factories.js';import{createIsolatedWorld,canonicalUtilityValue}from'../src/isolated-world.js';import{transformFoundationalInterface}from'../src/foundational-interface-realms.js';
++const require=createRequire(import.meta.url),utils=require('jsdom/lib/jsdom/living/generated/utils.js'),binding=getHeapBinding(),kinds=['Node','Element','HTMLElement'];
++function realm(value,w){const a=w.eval('[]'),old=Object.getPrototypeOf(value);try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,a),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><div id=owned><span>actual</span></div><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('original foundational public definitions and untouched methods are genuinely created in the selected VM',async t=>{const{w}=await fixture(t);for(const kind of kinds){realm(w[kind],w);realm(w[kind].prototype,w);assert.equal(w[kind].prototype.constructor,w[kind]);assert.throws(()=>w[kind](),e=>e instanceof w.TypeError)}for(const value of[w.Node.prototype.hasChildNodes,w.Element.prototype.hasAttributes,w.HTMLElement.prototype.click])realm(value,w);assert.equal(Object.getPrototypeOf(w.Node.prototype),w.EventTarget.prototype);assert.equal(Object.getPrototypeOf(w.Element.prototype),w.Node.prototype);assert.equal(Object.getPrototypeOf(w.HTMLElement.prototype),w.Element.prototype);});
++test('canonical factory exports/setup/cache and actual backend identities remain unchanged across installation',async t=>{const factories=kinds.map(kind=>require('jsdom/lib/jsdom/living/generated/'+kind+'.js')),setup=factories.map(factory=>factory.setup),{w}=await fixture(t);for(let i=0;i<kinds.length;i++){assert.equal(require('jsdom/lib/jsdom/living/generated/'+kinds[i]+'.js'),factories[i]);assert.equal(factories[i].setup,setup[i])}const e=w.document.getElementById('owned'),backend=utils.implForWrapper(e),nodes=e.childNodes,attrs=e.attributes;assert.equal(e.childNodes,nodes);assert.equal(e.attributes,attrs);assert.equal(utils.wrapperForImpl(backend),e);assert.equal(platformFactoryRecord(e).implementation,backend);e.appendChild(w.document.createTextNode('added'));e.setAttribute('data-owned','value');assert.equal(nodes.length,2);assert.equal(attrs.getNamedItem('data-owned').value,'value');const clone=e.cloneNode(true);assert.notEqual(clone,e);assert.equal(clone.textContent,'actualadded');assert.equal(clone.isEqualNode(e),true);});
++test('real custom element constructors and callbacks retain actual element/backend state',async t=>{const{w}=await fixture(t);const value=JSON.parse(w.eval(`JSON.stringify((()=>{const calls=[];class Actual extends HTMLElement{static get observedAttributes(){return['data-owned']}constructor(){super();this.owned='actual';calls.push('construct')}connectedCallback(){calls.push('connected')}attributeChangedCallback(name,old,value){calls.push(['attribute',name,old,value])}}customElements.define('owned-foundation',Actual);const e=new Actual();document.body.append(e);e.setAttribute('data-owned','one');return{calls,owned:e.owned,prototype:Object.getPrototypeOf(e)===Actual.prototype,node:e instanceof Node,element:e instanceof Element,html:e instanceof HTMLElement,owner:e.ownerDocument===document}})())`));assert.deepEqual(value,{calls:['construct','connected',['attribute','data-owned',null,'one']],owned:'actual',prototype:true,node:true,element:true,html:true,owner:true});});
++test('frame and utility definitions keep distinct actual realms without retargeting observed node wrappers',async t=>{const{w,page}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;for(const kind of kinds)realm(c[kind].prototype,c);const e=c.document.createElement('div'),p=Object.getPrototypeOf(e),backend=utils.implForWrapper(e);w.document.adoptNode(e);w.document.body.append(e);assert.equal(e.ownerDocument,w.document);assert.equal(Object.getPrototypeOf(e),p);assert.equal(utils.implForWrapper(e),backend);realm(e,c);const world=createIsolatedWorld(w,{signal:page.documentAbort.signal});t.after(()=>world.dispose());for(const kind of kinds)realm(world.global[kind].prototype,world.global);const front=world.evaluate('document.getElementById("owned")'),main=w.document.getElementById('owned');assert.equal(canonicalUtilityValue(front),main);assert.equal(platformFactoryRecord(front).implementation,platformFactoryRecord(main).implementation);assert.equal(front.textContent,'actual');});
++test('genuine non-scriptable Host windows retain their original Host interfaces and functional DOM',()=>{const dom=new JSDOM('<div>actual</div>');try{const w=dom.window;for(const kind of kinds){assert.equal(binding.sameRealm(w[kind],[]),true);assert.equal(binding.sameRealm(w[kind].prototype,[]),true)}const e=w.document.querySelector('div');assert.equal(e.textContent,'actual');assert.equal(e instanceof w.Node,true);assert.equal(e instanceof w.Element,true);assert.equal(e instanceof w.HTMLElement,true);e.setAttribute('data-owned','value');assert.equal(e.getAttribute('data-owned'),'value')}finally{dom.window.close()}});
++test('exact source/body guards and frozen Input/additional/Option modules remain intact',()=>{for(const kind of kinds){const source=readFileSync(require.resolve('jsdom/lib/jsdom/living/generated/'+kind+'.js'),'utf8');assert.doesNotThrow(()=>transformFoundationalInterface(source,kind,source));assert.throws(()=>transformFoundationalInterface(source,kind,source+'\n'),/Pinned canonical foundational interface source changed/);assert.throws(()=>transformFoundationalInterface(source.replace('  const ctorRegistry =','  /* changed */const ctorRegistry ='),kind,source),/Canonical foundational public installer body changed/)}for(const[name,expected]of[['control-interface-realms.js','9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f'],['additional-control-interface-realms.js','62b1eb9a098e15c7613bcf3a75a0fb60e3fffa2d90a925ea986e844a9385d0bf'],['option-alias.js','0d55df0c73d6ce5413aaf3623abd8e7d3698fdda146ff694a97800bf113099f6']])assert.equal(createHash('sha256').update(readFileSync(new URL('../src/'+name,import.meta.url))).digest('hex'),expected)});
+--- /dev/null
++++ b/test/manual-element-realms.test.js
+@@ -0,0 +1,11 @@
++// Prepared during Root63888/14114 quiet leases; run only after release.
++import{test}from'node:test';import assert from'node:assert/strict';import{JSDOM}from'jsdom';import{readFileSync}from'node:fs';import{createHash}from'node:crypto';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{captureIDLMemberFactory}from'../src/public-idl-member.js';import{installElementScroll}from'../src/element-scroll.js';
++const binding=getHeapBinding(),targets=[["Element","getClientRects","value"],["Element","getBoundingClientRect","value"],["Element","scrollTop","set"],["Element","scrollLeft","set"],["Element","scrollWidth","get"],["Element","scrollHeight","get"],["Element","clientWidth","get"],["Element","clientHeight","get"],["Element","getHTML","value"],["Element","scrollIntoView","value"],["Element","scrollIntoViewIfNeeded","value"],["HTMLElement","offsetParent","get"],["HTMLElement","offsetTop","get"],["HTMLElement","offsetLeft","get"],["HTMLElement","offsetWidth","get"],["HTMLElement","offsetHeight","get"],["HTMLElement","showPopover","value"],["HTMLElement","hidePopover","value"],["HTMLElement","togglePopover","value"],["HTMLElement","popover","get"],["HTMLElement","popover","set"]];
++function realm(value,w){const old=Object.getPrototypeOf(value),a=w.eval('[]');try{for(let i=0;i<2;i++){assert.equal(binding.sameRealm(value,a),true);assert.equal(binding.sameRealm(value,[]),false);Object.setPrototypeOf(value,null)}}finally{Object.setPrototypeOf(value,old)}}
++async function fixture(t){const browser=new Browser({loadResources:['iframe']}),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<body><iframe></iframe>');return{browser,page,w:page.dom.window};}
++test('nineteen republished entries and two retained scroll setters have genuine selectedVM creation',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow;for(const global of[w,c])for(const[kind,name,slot]of targets){const d=Object.getOwnPropertyDescriptor(global[kind].prototype,name),f=d[slot];realm(f,global);assert.equal(f.name,slot==='value'?name:slot+' '+name);assert.equal(f.length,slot==='set'?1:0);assert.equal(Object.hasOwn(f,'prototype'),false);if(!(kind==='Element'&&['scrollTop','scrollLeft'].includes(name)&&slot==='set'))assert.equal(Function.prototype.toString.call(f).includes('[native code]'),true);assert.equal(Object.hasOwn(f,'toString'),false);assert.equal(d.configurable,true);assert.equal(d.enumerable,true)}});
++test('canonical native entry keeps real receiver/argument/result/thrown identities and private operation Host',async t=>{const{w,page}=await fixture(t),member=captureIDLMemberFactory(w),receiver=w.document.body,arg=w.eval('({owned:true})'),thrown=w.eval('({thrown:true})');let seen;const operation=({owned(value){seen={receiver:this,value};return value}}).owned;assert.equal(binding.sameRealm(operation,[]),true);const f=member('owned','value',operation);realm(f,w);assert.equal(f.call(receiver,arg),arg);assert.equal(seen.receiver,receiver);assert.equal(seen.value,arg);const fail=member('failure','value',()=>{throw thrown});assert.throws(()=>fail(),e=>e===thrown);assert.throws(()=>Reflect.construct(f,[]),e=>e instanceof TypeError&&!(e instanceof w.TypeError));const constructInVM=w.Function('fn','return Reflect.construct(fn,[])');assert.throws(()=>constructInVM(f),e=>e instanceof w.TypeError&&!(e instanceof TypeError));const top=Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').get,left=Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollLeft').get;installElementScroll(w,()=>page.layout);assert.equal(Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').get,top);assert.equal(Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollLeft').get,left)});
++test('geometry and scroll APIs keep actual private layout state and live public values',async t=>{const{w}=await fixture(t),box=w.document.body.appendChild(w.document.createElement('div'));box.style.cssText='position:fixed;left:10px;top:20px;width:80px;height:30px;padding:0;border:0';const r=box.getBoundingClientRect(),list=box.getClientRects();assert.deepEqual([r.width,r.height],[80,30]);assert.equal(r instanceof w.DOMRect,true);assert.equal(list.length,1);assert.equal(list[0] instanceof w.DOMRect,true);assert.equal(box.offsetParent,null);const scroll=w.document.body.appendChild(w.document.createElement('div'));scroll.style.cssText='width:40px;height:20px;overflow:auto;padding:0;border:0';const child=scroll.appendChild(w.document.createElement('div'));child.style.cssText='width:140px;height:120px';scroll.scrollTop=25;scroll.scrollLeft=35;assert.deepEqual([scroll.scrollTop,scroll.scrollLeft],[25,35]);scroll.scrollTop=-10;scroll.scrollLeft=-10;assert.deepEqual([scroll.scrollTop,scroll.scrollLeft],[0,0])});
++test('getHTML serializes the real tree and popover operations retain real state and cancellation',async t=>{const{w}=await fixture(t),host=w.document.body.appendChild(w.document.createElement('div'));host.innerHTML='<span data-owned="value">actual</span>';assert.equal(host.getHTML(),'<span data-owned="value">actual</span>');const popover=w.document.body.appendChild(w.document.createElement('div'));popover.popover='manual';const events=[];const cancel=e=>{events.push(e);e.preventDefault()};popover.addEventListener('beforetoggle',cancel,{once:true});popover.showPopover();assert.equal(popover.matches(':popover-open'),false);assert.equal(events.length,1);assert.equal(events[0].isTrusted,true);popover.showPopover();assert.equal(popover.matches(':popover-open'),true);assert.equal(popover.togglePopover(false),false);assert.equal(popover.matches(':popover-open'),false);assert.equal(popover.popover,'manual')});
++test('borrowed operations keep receiver owner layout and original method owner result realm',async t=>{const{w}=await fixture(t),c=w.document.querySelector('iframe').contentWindow,e=c.document.body.appendChild(c.document.createElement('div'));e.style.cssText='width:40px;height:20px';const r=w.Element.prototype.getBoundingClientRect.call(e);assert.equal(r.width,40);assert.equal(r instanceof w.DOMRect,true);assert.equal(r instanceof c.DOMRect,false);const setter=Object.getOwnPropertyDescriptor(w.Element.prototype,'scrollTop').set;assert.throws(()=>setter.call({},1),e=>e.name==='TypeError');assert.throws(()=>w.HTMLElement.prototype.showPopover.call({}),e=>e.name==='TypeError')});
++test('genuine Host fallback and all frozen foundational/control/Option modules remain unchanged',()=>{const dom=new JSDOM('');try{const op=({owned(){return 1}}).owned;assert.equal(captureIDLMemberFactory(dom.window)('owned','value',op),op);assert.equal(binding.sameRealm(op,[]),true);for(const[name,sha]of[['foundational-interface-realms.js','5c7a6b6fd2fbe5d7c9cbe14c465aff5573498b383ca41175a9ce6ee415ef7904'],['control-interface-realms.js','9562a190077d6af25b20740fe40e9044e7989f4e3be6952f1bd79a61b6bb5a3f'],['additional-control-interface-realms.js','62b1eb9a098e15c7613bcf3a75a0fb60e3fffa2d90a925ea986e844a9385d0bf'],['option-alias.js','0d55df0c73d6ce5413aaf3623abd8e7d3698fdda146ff694a97800bf113099f6']])assert.equal(createHash('sha256').update(readFileSync(new URL('../src/'+name,import.meta.url))).digest('hex'),sha)}finally{dom.window.close()}});

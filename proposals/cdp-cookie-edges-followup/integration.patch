@@ -1,0 +1,93 @@
+--- a/src/cdp-cookies.js
++++ b/src/cdp-cookies.js
+@@ -1,6 +1,10 @@
+ import {prepareCookie} from './cookies.js';
++import {createRequire} from 'node:module';
++import {isIP} from 'node:net';
++const{Cookie}=createRequire(import.meta.url)('tough-cookie');
+ const record=value=>Object.assign(Object.create(null),value);
+-const missing=()=>{throw Error('MissingField')},unexpected=()=>{throw Error('UnexpectedToken')};
++function failure(message,code){const error=Error(message);Object.defineProperty(error,'code',{value:code});throw error;}
++const missing=()=>failure('MissingField',-31998),unexpected=()=>failure('UnexpectedToken',-31998);
+ function optional(value,type){if(value===null||value===undefined)return undefined;if(typeof value!==type)unexpected();return value;}
+ function decode(value){
+  if(value===null||typeof value!=='object')unexpected();
+@@ -12,19 +16,39 @@
+  if(secure!==undefined)input.secure=secure;if(httpOnly!==undefined)input.httpOnly=httpOnly;if(expires!==undefined)input.expires=expires;
+  return input;
+ }
++function emptyNameCookie(input,url,secure){
++ for(const key of ['domain','path'])if(input[key]!==undefined&&/[;\r\n]/.test(input[key]))failure('Sanitizing cookie failed',-32602);
++ let text=`=${input.value}; Path=${input.path??'/'}`;
++ if(input.domain?.startsWith('.')&&!isIP(input.domain.slice(1)))text+=`; Domain=${input.domain}`;
++ if(secure)text+='; Secure';if(input.httpOnly)text+='; HttpOnly';if(input.sameSite)text+=`; SameSite=${input.sameSite}`;
++ if(input.expires!==undefined)text+=`; Expires=${new Date(input.expires*1000).toUTCString()}`;
++ const cookie=Cookie.parse(text,{loose:true});if(!cookie)return null;
++ // CDP supplies the name and value separately; an '=' in an empty-name value
++ // must not be reinterpreted as a different cookie's name by loose parsing.
++ cookie.key=input.name;cookie.value=input.value;return record({url:url.href,cookie});
++}
+ function prepare(input,fallback){
+- if(!input.name||/[;\r\n]/.test(input.name+input.value))throw Error('Sanitizing cookie failed');
++ if(!input.url&&!input.domain)failure('At least one of the url or domain needs to be specified',-32602);
++ if(/[;\r\n]/.test(input.name+input.value))failure('Sanitizing cookie failed',-32602);
+  if(!['None','Lax','Strict'].includes(input.sameSite))delete input.sameSite;
++ let url;try{url=new URL(input.url||`${input.secure?'https':'http'}://${input.domain.replace(/^\./,'')}${input.path??'/'}`)}catch{return null;}
++ if(url.protocol!=='http:'&&url.protocol!=='https:')return null;
++ const effectiveSecure=input.secure===true||url.protocol==='https:';
++ // The measured None policy rejection precedes cookie serialization.
++ if(input.sameSite==='None'&&!effectiveSecure)return null;
++ // CDP uses negative expiry values as session cookies; zero is a real expiry.
++ if(input.expires<0)delete input.expires;
++ if(!input.name)return emptyNameCookie(input,url,effectiveSecure);
+  let prepared;try{prepared=prepareCookie(input,fallback)}catch(error){if(error?.code==='ERR_INVALID_URL'||error?.message==='Cookies require an HTTP(S) URL or domain')return null;throw error;}
+- const effectiveSecure=input.secure===true||prepared.url.protocol==='https:';
+- if(input.sameSite==='None'&&!effectiveSecure)return null;
+  return record({url:prepared.url.href,text:prepared.text+(effectiveSecure&&!input.secure?'; Secure':'')});
+ }
+-async function store(jar,prepared){if(!prepared)return false;try{return Boolean(await jar.setCookie(prepared.text,prepared.url))}catch{return false;}}
++async function store(jar,prepared){if(!prepared)return false;try{return Boolean(await jar.setCookie(prepared.cookie??prepared.text,prepared.url))}catch{return false;}}
+ export async function setCDPCookie(jar,input,fallback){return store(jar,prepare(decode(input),fallback));}
+ export async function setCDPCookies(jar,inputs,fallback){
+  if(inputs===undefined)missing();if(!Array.isArray(inputs))unexpected();
+  // Schema conversion precedes successful mutation. Cookie-policy rejections
+  // are skipped individually, retaining valid batch members.
+- const decoded=inputs.map(decode);for(const cookie of decoded)await store(jar,prepare(cookie,fallback));
++ const decoded=inputs.map(decode);
++ for(const cookie of decoded)if((!cookie.url&&!cookie.domain)||/[;\r\n]/.test(cookie.name+cookie.value))failure('Invalid cookie fields',-32602);
++ for(const cookie of decoded)await store(jar,prepare(cookie,fallback));
+ }
+--- a/test/cookie-ingress.test.js
++++ b/test/cookie-ingress.test.js
+@@ -42,13 +42,30 @@
+  const origin=await actualServer(t),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close()});
+  const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId);await send('Page.enable');await send('Page.navigate',{url:origin+'/'});
+  assert.deepEqual(await send('Network.setCookie',{name:'invalid',value:'bad',url:origin+'/',sameSite:'None'}),{success:false});
++ // These combined inputs establish policy ordering, not a global range rule.
++ for(const options of[{name:''},{expires:-2}])assert.deepEqual(await send('Network.setCookie',{name:'invalid',value:'bad',url:origin+'/',sameSite:'None',secure:false,...options}),{success:false});
+  assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'keep',url:origin+'/',sameSite:'None',secure:true}),{success:true});
+  for(const options of[{secure:false},{secure:false,expires:0}])assert.deepEqual(await send('Network.setCookie',{name:'existing',value:'bad',url:origin+'/',sameSite:'None',...options}),{success:false});
+  assert.deepEqual(await send('Network.setCookie',{name:'https_default',value:'actual',url:origin.replace('http:','https:')+'/',sameSite:'None',secure:false}),{success:true});
+  assert.deepEqual(await send('Network.setCookie',{name:'lowercase',value:'actual',url:origin+'/',sameSite:'none'}),{success:true});
+- await assert.rejects(send('Network.setCookie',{name:'missing',url:origin+'/',sameSite:'None'}),/MissingField/);await assert.rejects(send('Network.setCookie',{name:'wrong_type',value:'actual',url:origin+'/',sameSite:'None',secure:0}),/UnexpectedToken/);await assert.rejects(send('Network.setCookie',{name:'bad;name',value:'actual',url:origin+'/',sameSite:'None'}),/Sanitizing cookie failed/);
++ await assert.rejects(send('Network.setCookie',{name:'missing',url:origin+'/',sameSite:'None'}),error=>error.code===-31998&&error.message==='MissingField');await assert.rejects(send('Network.setCookie',{name:'wrong_type',value:'actual',url:origin+'/',sameSite:'None',secure:0}),error=>error.code===-31998&&error.message==='UnexpectedToken');await assert.rejects(send('Network.setCookie',{name:'bad;name',value:'actual',url:origin+'/',sameSite:'None'}),error=>error.code===-32602&&error.message==='Sanitizing cookie failed');
++ for(const url of[null,undefined,''])await assert.rejects(send('Network.setCookie',{name:'missing_address',value:'actual',url,sameSite:'None'}),error=>error.code===-32602&&error.message==='At least one of the url or domain needs to be specified');
++ for(const[name,invalid,message,code]of[['schema',{name:'missing',url:origin+'/'},'MissingField',-31998],['sanitize',{name:'bad;name',value:'bad',url:origin+'/',sameSite:'None'},'Invalid cookie fields',-32602],['address',{name:'missing_address',value:'bad',sameSite:'None'},'Invalid cookie fields',-32602]])await assert.rejects(send('Network.setCookies',{cookies:[{name:'atomic_'+name,value:'must-not-store',url:origin+'/',sameSite:'None',secure:true},invalid]}),error=>error.code===code&&error.message===message);
+  for(const method of['Network.setCookies','Storage.setCookies']){const cookies=[{name:method[0]+'_valid',value:'keep',url:origin+'/',sameSite:'None',secure:true},{name:method[0]+'_invalid',value:'bad',url:origin+'/',sameSite:'None'}];assert.deepEqual(await(method==='Storage.setCookies'?client.send(method,{browserContextId,cookies}):send(method,{cookies})),{});}
+  const{cookies}=await send('Network.getCookies',{urls:[origin.replace('http:','https:')+'/']});assert.deepEqual(cookies.map(cookie=>cookie.name),['existing','https_default','lowercase','N_valid','S_valid']);assert.equal(cookies[0].value,'keep');assert.equal(cookies[1].secure,true);assert.equal(cookies[2].sameSite,undefined);
++});
++
++test('CDP stores genuine empty-name cookies and negative session expiries while zero deletes actual entries',async t=>{
++ const origin=await actualServer(t),service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/');t.after(async()=>{await client.close();await service.close()});
++ const{browserContextId}=await client.send('Target.createBrowserContext'),{targetId}=await client.send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(method,params={})=>client.send(method,params,sessionId),view=async()=> (await send('Network.getCookies',{urls:[origin.replace('http:','https:')+'/']})).cookies;
++ for(const fields of[{sameSite:'None',secure:true},{secure:false}]){
++  assert.deepEqual(await send('Network.setCookie',{name:'',value:'actual',url:origin+'/',...fields}),{success:true});const empty=(await view()).find(cookie=>cookie.name==='');assert.equal(empty.value,'actual');assert.equal(empty.secure,fields.secure);
++  for(const[index,expires]of[-2,-1,-.5,-0,0,null].entries()){
++   const name='actual_expiry_'+String(fields.secure)+'_'+index,params={name,value:'keep',url:origin+'/',...fields};assert.deepEqual(await send('Network.setCookie',params),{success:true});assert.deepEqual(await send('Network.setCookie',{...params,value:'changed',expires}),{success:true});const cookie=(await view()).find(cookie=>cookie.name===name);
++   if(expires===0)assert.equal(cookie,undefined);else{assert.equal(cookie.value,'changed');assert.equal(cookie.session,true);assert.equal(cookie.expires,-1);}
++  }
++ }
++ assert.deepEqual(await send('Network.setCookie',{name:'',value:'must-not-overwrite',url:origin+'/',sameSite:'None',secure:false}),{success:false});assert.equal((await view()).find(cookie=>cookie.name==='').value,'actual');
+ });
+ 
+ test('generic importer and raw embedding jar retain their previous behavior outside the measured HTTP and CDP channels',async t=>{
