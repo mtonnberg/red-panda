@@ -1,0 +1,186 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,6 +1,7 @@
+ import {installCSSNamespace} from './css-namespace.js';
+ import {installAudioCore} from './audio-core.js';
+ import {installConsole} from './console.js';
++import {installWebStorage} from './web-storage.js';
+ import { installImageData } from './image-data.js';
+ import { SyncHTTP } from './sync-http.js';
+ import {installFrameActivity} from './frame-activity.js';
+@@ -215,6 +216,7 @@
+     const listenerOwnership = installListenerOwnership(window);
+     listenerOwnership.scope(() => {
+       installErrors(this, window);
++      installWebStorage(this, window);
+       installMutations(this, window);
+       if (main) implForWrapper(window.document).contentType = this.mimeType;
+       installCollections(window, { binding: this.browser.collectionsBinding });
+--- /dev/null
++++ b/src/web-storage.js
+@@ -0,0 +1,101 @@
++import 'jsdom';
++import {createRequire} from 'node:module';
++
++// Keep jsdom's generated Storage proxies and their actual private records.
++// Native's quota counts UTF-8 value bytes (keys do not consume quota). Its two
++// areas are context/origin persistent; wrappers are shared within a live tree
++// and recreated on full top-level navigation. See proposals/webstorage.
++const require=createRequire(import.meta.url);
++const StorageIDL=require('jsdom/lib/jsdom/living/generated/Storage.js');
++const {implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++const StorageImpl=require('jsdom/lib/jsdom/living/webstorage/Storage-impl.js').implementation;
++const contexts=new WeakMap(),trees=new WeakMap(),installed=new WeakMap(),records=new WeakMap(),wrappers=new WeakMap();
++const quota=5*1024*1024,wellFormed=String.prototype.toWellFormed;
++let patched=false;
++const normalize=value=>Reflect.apply(wellFormed,value,[]);
++function write(state,key,value,Exception=state.Exception){
++ const area=state.area,previous=area.items.get(key);
++ const bytes=area.bytes-(previous===undefined?0:Buffer.byteLength(previous,'utf8'))+Buffer.byteLength(value,'utf8');
++ if(bytes>quota)throw new Exception('The quota has been exceeded','QuotaExceededError');
++ area.items.set(key,value);area.bytes=bytes;
++ // Native does not dispatch storage events for these shared live-frame areas.
++}
++function patch(){
++ if(patched)return;patched=true;
++ for(const name of ['setItem','removeItem','clear']){
++  const original=StorageImpl.prototype[name];
++  StorageImpl.prototype[name]=function(...args){
++   const state=records.get(this);if(!state)return Reflect.apply(original,this,args);
++   const area=state.area;
++   if(name==='clear'){area.items.clear();area.bytes=0;return;}
++   const key=normalize(args[0]);
++   if(name==='setItem')return write(state,key,normalize(args[1]));
++   const previous=area.items.get(key);
++   if(previous!==undefined){area.bytes-=Buffer.byteLength(previous,'utf8');area.items.delete(key);}
++  };
++ }
++}
++function storageFactory(g,bridge){
++ const TypeError=g.TypeError,Exception=g.DOMException,Number=g.Number,String=g.String;
++ const apply=Reflect.apply,define=Object.defineProperty,descriptor=Object.getOwnPropertyDescriptor;
++ const symbolDescription=descriptor(Symbol.prototype,'description').get;
++ const text=value=>bridge.normalize(typeof value==='symbol'?String(apply(symbolDescription,value,[])):String(value));
++ const brand=value=>{const state=bridge.state(value);if(!state)throw new TypeError('invalid argument');return state;};
++ const required=count=>{if(!count)throw new TypeError('invalid argument');};
++ const methods={
++  get length(){return bridge.size(brand(this));},
++  getItem(key){const state=brand(this);required(arguments.length);return bridge.getItem(state,text(key));},
++  setItem(key,value){const state=brand(this);required(arguments.length>=2);key=text(key);value=text(value);bridge.setItem(state,key,value,Exception);},
++  removeItem(key){const state=brand(this);required(arguments.length);bridge.removeItem(state,text(key));},
++  clear(){bridge.clear(brand(this));},
++  key(index){const state=brand(this);required(arguments.length);return bridge.key(state,Number(index)>>>0);},
++ };
++ const prototype=g.Storage.prototype,constructor=descriptor(prototype,'constructor'),tag=descriptor(prototype,Symbol.toStringTag);
++ for(const key of Reflect.ownKeys(prototype))delete prototype[key];
++ for(const key of ['length','getItem','setItem','removeItem','clear','key'])define(prototype,key,{...descriptor(methods,key),enumerable:true});
++ define(prototype,'constructor',constructor);define(prototype,Symbol.toStringTag,tag);
++ const getters={get localStorage(){return bridge.area('localStorage');},get sessionStorage(){return bridge.area('sessionStorage');}};
++ for(const kind of ['localStorage','sessionStorage'])define(g,kind,{...descriptor(getters,kind),enumerable:true,configurable:true});
++}
++function principal(window){
++ const controller=installed.get(window),document=controller.document,origin=document._origin;
++ if(origin!=='null')return origin;
++ // Blank/srcdoc frames inherit even opaque parents; independent data documents
++ // retain their actual document identity rather than the string "null".
++ if(controller.parent&&document._URL.scheme==='about'&&['blank','srcdoc'].includes(document._URL.path))return principal(controller.parent);
++ return document;
++}
++export function installWebStorage(page,window){
++ if(installed.has(window))return;
++ patch();
++ const context=page.context,root=page.registry?.page??page,token=root.documentAbort;
++ let areas=contexts.get(context);if(!areas){areas={tuples:new Map(),opaque:new WeakMap()};contexts.set(context,areas);}
++ let tree=trees.get(token);if(!tree){tree=new Map();trees.set(token,tree);}
++ const native={localStorage:window._localStorage,sessionStorage:window._sessionStorage};
++ const parent=window.parent!==window?window.parent:null;
++ const Exception=window.DOMException;
++ const stateFor=kind=>{
++  const origin=principal(window),registry=typeof origin==='string'?areas.tuples:areas.opaque;let pair=registry.get(origin);
++  if(!pair){pair={localStorage:{items:new Map(),bytes:0},sessionStorage:{items:new Map(),bytes:0}};registry.set(origin,pair);}
++  let views=tree.get(origin);if(!views){views={};tree.set(origin,views);}
++  if(views[kind])return views[kind];
++  const original=native[kind],originalImpl=implForWrapper(original);
++  // A redirected frame can expose its provisional window to a preload before
++  // committing its final origin. Never retarget an already published wrapper.
++  const wrapper=records.has(originalImpl)?StorageIDL.create(originalImpl._globalObject,[],{associatedWindow:window,storageArea:pair[kind].items,url:originalImpl._url,type:kind,storageQuota:quota}):original;
++  const implementation=implForWrapper(wrapper),state={area:pair[kind],implementation,Exception};
++  implementation._items=state.area.items;
++  records.set(implementation,state);wrappers.set(wrapper,state);views[kind]=wrapper;
++  return wrapper;
++ };
++ installed.set(window,{parent,document:implForWrapper(window.document)});
++ const removeItem=StorageImpl.prototype.removeItem,clear=StorageImpl.prototype.clear;
++ const bridge={normalize,state:value=>wrappers.get(value),area:stateFor,size:state=>state.area.items.size,
++  getItem:(state,key)=>state.area.items.get(key)??null,
++  setItem:write,
++  removeItem:(state,key)=>Reflect.apply(removeItem,state.implementation,[key]),
++  clear:state=>Reflect.apply(clear,state.implementation,[]),
++  key:(state,index)=>index>=state.area.items.size?null:[...state.area.items.keys()][index],
++ };
++ window.eval(`(${storageFactory.toString()})`)(window,bridge);
++}
+--- /dev/null
++++ b/test/web-storage.test.js
+@@ -0,0 +1,61 @@
++import{test,before,after}from'node:test';
++import assert from'node:assert/strict';
++import http from'node:http';import{once}from'node:events';import{createRequire}from'node:module';
++import{JSDOM}from'jsdom';import{Browser}from'../src/browser.js';
++const require=createRequire(import.meta.url),StorageIDL=require('jsdom/lib/jsdom/living/generated/Storage.js'),{implForWrapper}=require('jsdom/lib/jsdom/living/generated/utils.js');
++let server,origin;
++before(async()=>{server=http.createServer((q,s)=>{if(q.url==='/redirect-child'){s.writeHead(302,{location:origin.replace('127.0.0.1','localhost')+'/final-child'});s.end();return;}s.setHeader('content-type','text/html');s.end('<!doctype html><body>owned storage test')});server.listen(0,'127.0.0.1');await once(server,'listening');origin=`http://127.0.0.1:${server.address().port}`;});
++after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));});
++const fixture=async(t,options={})=>{const b=new Browser(options);t.after(()=>b.close());const p=b.createPage();await p.navigate(origin);return{b,p,w:p.dom.window};};
++test('Storage keeps generated proxy identity and genuine implementation records',async t=>{
++ const{w}=await fixture(t);for(const kind of ['localStorage','sessionStorage']){const s=w[kind];assert.ok(StorageIDL.is(s));assert.ok(StorageIDL.isImpl(implForWrapper(s)));assert.strictEqual(s,w[kind]);assert.strictEqual(Object.getPrototypeOf(s),w.Storage.prototype);assert.equal(Object.prototype.toString.call(s),'[object Storage]');}
++ assert.deepEqual(Reflect.ownKeys(w.Storage.prototype).map(String),['length','getItem','setItem','removeItem','clear','key','constructor','Symbol(Symbol.toStringTag)']);
++ assert.throws(()=>new w.Storage(),e=>e instanceof w.TypeError);
++});
++test('both areas count UTF-8 value bytes, exclude key bytes, fail atomically and reclaim replacement space',async t=>{
++ const{w}=await fixture(t);for(const kind of ['localStorage','sessionStorage'])for(const[unit,count]of[['v',5242880],['é',2621440],['🐼',1310720]]){
++  const s=w[kind],key='k'.repeat(1024*1024);s.clear();s.setItem(key,unit.repeat(count));assert.equal(s.getItem(key),unit.repeat(count));
++  const fails=fn=>assert.throws(fn,e=>e instanceof w.DOMException&&e.name==='QuotaExceededError'&&e.message==='The quota has been exceeded');
++  fails(()=>s.setItem('extra','v'));assert.equal(s.length,1);assert.equal(s.getItem('extra'),null);s.removeItem(key);s.setItem('a','v'.repeat(1024*1024));s.setItem('b','v'.repeat(4*1024*1024));fails(()=>s.setItem('a','v'.repeat(1024*1024+1)));assert.equal(s.getItem('a').length,1024*1024);assert.equal(s.getItem('b').length,4*1024*1024);s.setItem('a','');s.setItem('b','v'.repeat(5*1024*1024));assert.equal(s.getItem('a'),'');s.clear();
++ }
++});
++test('ordinary property writes and definitions use the same quota and actual map',async t=>{
++ const{w}=await fixture(t),s=w.localStorage;s.direct='a';Object.defineProperty(s,'defined',{value:'b',configurable:true});assert.equal(s.getItem('direct'),'a');assert.equal(s.getItem('defined'),'b');delete s.direct;assert.equal(s.getItem('direct'),null);s.clear();s.full='v'.repeat(5*1024*1024);assert.throws(()=>{s.more='v'},e=>e.name==='QuotaExceededError');assert.equal(s.getItem('more'),null);
++});
++test('coercion, required arguments, errors and borrowed receivers use captured realm brands',async t=>{
++ const{w}=await fixture(t),s=w.localStorage,p=w.Storage.prototype;
++ for(const[name,args]of[['getItem',[]],['setItem',['a']],['removeItem',[]],['key',[]]])assert.throws(()=>Reflect.apply(p[name],s,args),e=>e instanceof w.TypeError&&e.message==='invalid argument');
++ for(const name of ['getItem','setItem','removeItem','key','clear'])for(const receiver of [{},new Proxy(s,{}),Object.create(s)])assert.throws(()=>Reflect.apply(p[name],receiver,['a','b']),e=>e instanceof w.TypeError);
++ s.setItem(Symbol('key'),Symbol('value'));assert.equal(s.getItem(Symbol('key')),'value');s.setItem('none',Symbol());assert.equal(s.getItem('none'),'undefined');s.setItem('surrogate','\ud800');assert.equal(s.getItem('surrogate'),'�');
++ assert.throws(()=>s.setItem({toString(){throw 23}},'x'),e=>e===23);assert.throws(()=>s.setItem('object',{[Symbol.toPrimitive](){return Symbol('wrapped')}}),e=>e instanceof w.TypeError);
++ s.clear();s.setItem('only','a');for(const value of [undefined,null,0,4294967296,NaN,Infinity])assert.equal(s.key(value),'only');assert.equal(s.key(-1),null);assert.equal(s.key(1n),null);assert.throws(()=>s.key(Symbol()),e=>e instanceof w.TypeError);
++});
++test('context/origin data persists through navigation and target replacement with fresh real wrappers',async t=>{
++ const{b,p,w}=await fixture(t);w.localStorage.setItem('a','local');w.sessionStorage.setItem('a','session');w.localStorage[Symbol.for('marker')]=w.Storage;await p.navigate(origin+'/next');let next=p.dom.window;
++ assert.notStrictEqual(next.localStorage,w.localStorage);assert.equal(next.localStorage[Symbol.for('marker')],undefined);assert.ok(next.localStorage instanceof next.Storage);assert.equal(next.localStorage.getItem('a'),'local');assert.equal(next.sessionStorage.getItem('a'),'session');
++ await p.navigate(origin.replace('127.0.0.1','localhost')+'/other');assert.equal(p.dom.window.localStorage.getItem('a'),null);assert.equal(p.dom.window.sessionStorage.getItem('a'),null);await p.navigate(origin+'/return');assert.equal(p.dom.window.localStorage.getItem('a'),'local');assert.equal(p.dom.window.sessionStorage.getItem('a'),'session');p.close();
++ const peer=b.createPage();await peer.navigate(origin);assert.equal(peer.dom.window.localStorage.getItem('a'),'local');assert.equal(peer.dom.window.sessionStorage.getItem('a'),'session');
++ const isolated=b.createPage(b.createContext());await isolated.navigate(origin);assert.equal(isolated.dom.window.localStorage.getItem('a'),null);assert.equal(isolated.dom.window.sessionStorage.getItem('a'),null);
++});
++test('live same-origin frames share the actual first-access wrapper and creator realm without automatic events',async t=>{
++ const{w}=await fixture(t,{loadResources:['iframe']}),parent=w.localStorage,session=w.sessionStorage;
++ const f=w.document.createElement('iframe');f.src=origin+'/child';const loaded=new Promise(r=>f.onload=r);w.document.body.append(f);await loaded;const child=f.contentWindow;
++ assert.strictEqual(child.localStorage,parent);assert.strictEqual(child.sessionStorage,session);assert.ok(child.localStorage instanceof w.Storage);assert.ok(!(child.localStorage instanceof child.Storage));
++ const observations=child.eval('({same:localStorage===parent.localStorage,own:localStorage instanceof Storage,parent:localStorage instanceof parent.Storage})');assert.equal(observations.same,true);assert.equal(observations.own,false);assert.equal(observations.parent,true);
++ let events=0;child.addEventListener('storage',()=>events++);parent.setItem('shared','local');session.setItem('shared','session');parent.setItem('shared','updated');session.removeItem('shared');parent.clear();await new Promise(r=>setTimeout(r,30));assert.equal(events,0);
++});
++test('child-first storage access preserves genuine child wrapper and prototype in parent',async t=>{
++ const{w}=await fixture(t,{loadResources:['iframe']});const f=w.document.createElement('iframe');w.document.body.append(f);const child=f.contentWindow,first=child.eval('localStorage');assert.strictEqual(w.localStorage,first);assert.ok(first instanceof child.Storage);assert.ok(!(first instanceof w.Storage));assert.strictEqual(Object.getPrototypeOf(first),child.Storage.prototype);first.setItem('full','v'.repeat(5*1024*1024));for(const [realm,other]of [[w,child],[child,w]])assert.throws(()=>realm.Storage.prototype.setItem.call(first,'extra','v'),e=>e instanceof realm.DOMException&&!(e instanceof other.DOMException));
++});
++test('independent opaque navigations get accessible isolated areas',async t=>{
++ const{p}=await fixture(t);await p.navigate('data:text/html,<body>first');const w=p.dom.window;w.localStorage.setItem('opaque','actual');w.sessionStorage.setItem('opaque','actual');await p.navigate('data:text/html,<body>second');assert.equal(p.dom.window.localStorage.getItem('opaque'),null);assert.equal(p.dom.window.sessionStorage.getItem('opaque'),null);
++});
++test('unowned jsdom windows retain their original quota and SecurityError behavior',async t=>{
++ await fixture(t);const ordinary=new JSDOM('',{url:origin,runScripts:'outside-only'}),opaque=new JSDOM('');try{assert.throws(()=>ordinary.window.localStorage.setItem('x','v'.repeat(5000000)),e=>e.name==='QuotaExceededError'&&e.message.includes('5000000-code unit'));assert.throws(()=>opaque.window.localStorage,e=>e.name==='SecurityError');}finally{ordinary.window.close();opaque.window.close();}
++});
++
++test('redirected frame origin changes cannot retarget a previously published genuine area',async t=>{
++ const{p,w}=await fixture(t,{loadResources:['iframe']});p.newDocumentScripts.set('storage-redirect',{source:"globalThis.provisionalStorage=localStorage;provisionalStorage.setItem('early','owned')"});
++ const f=w.document.createElement('iframe');f.src=origin+'/redirect-child';const loaded=new Promise(r=>f.onload=r);w.document.body.append(f);await loaded;const child=f.contentWindow;
++ assert.notStrictEqual(child.localStorage,child.provisionalStorage);assert.equal(child.localStorage.getItem('early'),null);assert.equal(child.provisionalStorage.getItem('early'),'owned');assert.strictEqual(w.localStorage,child.provisionalStorage);assert.equal(w.localStorage.getItem('early'),'owned');assert.ok(StorageIDL.is(child.localStorage));
++});

@@ -1,3 +1,4 @@
+import { installCanvas } from './canvas.js';
 import { installImageData } from './image-data.js';
 import {workerSocketPolicy} from './worker-socket-policy.js';
 import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
@@ -307,6 +308,7 @@ async function runWorker() {
   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
   installImageData(vm.runInContext('globalThis', context));
+  installCanvas(vm.runInContext('globalThis', context));
   installGeometry(vm.runInContext('globalThis', context));
   installWebCodecsValues(vm.runInContext('globalThis', context));
   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});

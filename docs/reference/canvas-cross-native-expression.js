@@ -1,0 +1,1 @@
+(()=>{const c=document.getElementById('cross-canvas'),x=c.getContext('2d');const before={font:x.font,style:x.fillStyle,dash:x.getLineDash(),lineWidth:x.lineWidth,owner:x.canvas===c,brand:x instanceof CanvasRenderingContext2D};x.font='30px serif';x.fillStyle='blue';x.setLineDash([5]);return before})()

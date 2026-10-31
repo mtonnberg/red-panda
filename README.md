@@ -115,7 +115,9 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Fetch | HTTP(S)/data/Blob URLs, redirects, cookies, CORS/preflight, filtered headers, Request/Response bodies, cloning and aborts, a 16 MiB response limit |
 | HTML / JS | Incremental HTML parsing, parser-blocking/dynamic classic scripts, ordered document writes and parser-script open guards, async ordering/preloads, ES modules/import maps/cycles/top-level await, DOM mutation/events, timers, relative `fetch`, JSON responses |
 | Forms / workers | Live named controls, range/date stepping and radio/label state, trusted FormData/reset events, validated GET/POST forms and dialog forms, dedicated workers with transferable MessagePorts, Blob/File clones, Blob scripts, imports, timers, fetch, real XHR/WebSocket and FileReaderSync |
-| Web APIs | Real HTMLDDA collections, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
+| Web APIs | Real HTMLDDA collections, CSS.escape/supports namespaces, selector validation, dialog/popover state, innerText/checkVisibility, XML/XPath adapters, geometry, scoped CSS, live computed styles/media queries, SVG path geometry, bounds, text metrics, lists and transforms, streams/codecs/compression, Blob byte reads, resize/performance observers and trusted error reporting |
+| Canvas | Genuine context/Path2D state, measured transparent pixel reads and independently encoded PNG output; the target profile has no Canvas rasterizer |
+| Storage | UTF-8 value-byte quota, context/origin backing state and genuine shared frame wrappers; key order and legacy reflection remain incomplete |
 | Media values | Genuine ImageData pixels/clones, encoded audio/video chunk bytes and VideoColorSpace; codec state/queue/reset/flush/error behavior with unsupported media processing reported explicitly |
 | Offline audio | Real AudioBuffer channel data and scheduled buffer-source rendering, resampling, loops, playback rate/detune and completion events; wider audio nodes remain incomplete |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
@@ -141,7 +143,7 @@ Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), inclu
 flow/flex width calculations, word wrapping, boxes, hit testing and actual scroll state. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
 semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
-CSS painting, canvas, shared workers, complete frame behavior and process
+CSS painting, shared workers, complete frame behavior and process
 isolation remain absent. Experimental service workers execute in real threads
 with registration/lifecycle, Cache and CookieStore operations; clients, control
 takeover, fetch interception, updates and persistence remain incomplete. Large HTML sources now feed the real parser in bounded
@@ -265,7 +267,7 @@ Browser.setExtraHTTPHeaders page [ { name: "X-Client", value: "automation" } ]
 Browser.setUserAgent page "RedPandaAutomation/1"
 ```
 
-`automation/test/Test/Main.purs` runs 47 assertions against a real Puppeteer
+`automation/test/Test/Main.purs` runs 60 assertions against a real Puppeteer
 connection and a deterministic local HTTP fixture. `npm run test:protocol` covers
 the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.

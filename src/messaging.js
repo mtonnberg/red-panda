@@ -1,3 +1,4 @@
+import { isCanvasCloneRejected } from './canvas.js';
 import { cloneObjectKind } from './clone-object-kind.js';
 import { registerPlatformFactory, platformFactoryRecord, registerPlatformCloneRealm } from './platform-factories.js';
 import { createPlatformCodec } from "./platform-codec.js";
@@ -134,7 +135,7 @@ export function createMessagingRealm(realm, { active = () => true, dispatch, rep
         if (value === sourcePort) throw cloneError('A MessagePort cannot transfer itself');
         transfer.push(state.native); ports.push(state.native); moved.push(state);
       } else if (types.isArrayBuffer(value)) transfer.push(value);
-      else throw cloneError('Transfer list contains a non-transferable value');
+      else throw cloneError(isCanvasCloneRejected(value)?'The object can not be cloned':'Transfer list contains a non-transferable value');
     }
     const platforms = new Map();
     const message = { data: encode(data, allowed, new Map(), platforms), ports };

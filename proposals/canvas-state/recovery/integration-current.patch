@@ -1,0 +1,2538 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import { installCanvas } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
+ import {installAudioCore} from './audio-core.js';
+ import {installConsole} from './console.js';
+@@ -258,6 +259,7 @@
+       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
+       installBroadcast(this, window);
+       installImageData(window);
++      installCanvas(window);
+       installGeometry(window);
+       installWebCodecsValues(window);
+       installWebCodecsProcessors(window);
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,4 @@
++import { installCanvas } from './canvas.js';
+ import { installImageData } from './image-data.js';
+ import {workerSocketPolicy} from './worker-socket-policy.js';
+ import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
+@@ -307,6 +308,7 @@
+   installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+   streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+   installImageData(vm.runInContext('globalThis', context));
++  installCanvas(vm.runInContext('globalThis', context));
+   installGeometry(vm.runInContext('globalThis', context));
+   installWebCodecsValues(vm.runInContext('globalThis', context));
+   installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import { installCanvas } from './canvas.js';
+ import {installCSSNamespace} from './css-namespace.js';
+ import { installImageData } from './image-data.js';
+ import {installFonts} from './fonts.js';
+@@ -31,7 +32,7 @@
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+  record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+- record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installImageData(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
++ record.global=record.controller.global;record.context=record.controller.context;installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installImageData(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+  record.signal.addEventListener('abort',()=>{record.disposed=true;record.factoryCleanup?.();for(const binding of record.bindings.values())binding.sessions.clear();record.pendingBindings.clear();for(const member of rootSessions(page)){const meta=META.get(member);meta.byId.delete(record.id);meta.announced.delete(record.id);meta.resetRuntime(member,record.id);}},{once:true});
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import { isCanvasCloneRejected } from './canvas.js';
+ import { imageDataRecord, validImageDataRecord, deserializeImageData } from './image-data.js';
+ import { encodedChunkData, validEncodedChunk, deserializeEncodedChunk } from './webcodecs-values.js';
+ import { installNativePlatformFactories } from './native-platform-factories.js';
+@@ -25,6 +26,7 @@
+  const failure=message=>new Exception(message,'DataCloneError');
+  function serialize(value){
+   const provenance=platformFactoryRecord(value);
++  if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
+   if(provenance?.kind==='VideoColorSpace')throw failure('The object can not be cloned');
+   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}
+--- a/src/messaging.js
++++ b/src/messaging.js
+@@ -1,3 +1,4 @@
++import { isCanvasCloneRejected } from './canvas.js';
+ import { cloneObjectKind } from './clone-object-kind.js';
+ import { registerPlatformFactory, platformFactoryRecord, registerPlatformCloneRealm } from './platform-factories.js';
+ import { createPlatformCodec } from "./platform-codec.js";
+@@ -134,7 +135,7 @@
+         if (value === sourcePort) throw cloneError('A MessagePort cannot transfer itself');
+         transfer.push(state.native); ports.push(state.native); moved.push(state);
+       } else if (types.isArrayBuffer(value)) transfer.push(value);
+-      else throw cloneError('Transfer list contains a non-transferable value');
++      else throw cloneError(isCanvasCloneRejected(value)?'The object can not be cloned':'Transfer list contains a non-transferable value');
+     }
+     const platforms = new Map();
+     const message = { data: encode(data, allowed, new Map(), platforms), ports };
+--- /dev/null
++++ b/docs/reference/canvas-async-native-expression.js
+@@ -0,0 +1 @@
++(async()=>{const c=document.createElement('canvas'),rows=[];let resolve;const done=new Promise(r=>resolve=r);c.toBlob(b=>{rows.push({name:'nonzeroThenZero',size:b?.size??null});resolve()});c.width=0;await done;let resolve2;const done2=new Promise(r=>resolve2=r);c.toBlob(b=>{rows.push({name:'zeroThenNonzero',size:b?.size??null});resolve2()});c.width=2;await done2;const font=c.getContext('2d'),d=Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype,'font'),m=font.measureText('a');rows.push({name:'getters',fontGet:d.get.name,fontSet:d.set.name,offWidth:Object.getOwnPropertyDescriptor(OffscreenCanvas.prototype,'width').get.name,metricWidth:Object.getOwnPropertyDescriptor(TextMetrics.prototype,'width').get.name});return rows})()
+--- /dev/null
++++ b/docs/reference/canvas-async-native.json
+@@ -0,0 +1,23 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "4774438792d47791c4a92c5f2b5e5796540cb18dab8e090b3cdc961ab373b6d6",
++  "observations": [
++    {
++      "name": "nonzeroThenZero",
++      "size": 67
++    },
++    {
++      "name": "zeroThenNonzero",
++      "size": null
++    },
++    {
++      "name": "getters",
++      "fontGet": "get font",
++      "fontSet": "set font",
++      "offWidth": "get width",
++      "metricWidth": "get width"
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/canvas-bitmap-native-expression.js
+@@ -0,0 +1,7 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const v=await fn();rows.push({name,value:v===undefined?'undefined':v})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++for(const [name,args]of[['normal',[3,2]],['zero',[0,2]]])await run(name,()=>{const c=new OffscreenCanvas(...args),b=c.transferToImageBitmap(),result={brand:b instanceof ImageBitmap,width:b.width,height:b.height,tag:Object.prototype.toString.call(b),canvasWidth:c.width,canvasHeight:c.height,props:Reflect.ownKeys(ImageBitmap.prototype).map(String)};b.close();return{...result,closedWidth:b.width,closedHeight:b.height}});
++await run('construct',()=>new ImageBitmap());await run('clone',()=>structuredClone(new OffscreenCanvas(3,2).transferToImageBitmap()));
++await run('transfer',()=>{const b=new OffscreenCanvas(3,2).transferToImageBitmap(),c=structuredClone(b,{transfer:[b]});return{old:b.width,new:c.width}});
++await run('crossContexts',()=>{const main=document.createElement('canvas').getContext('2d'),off=new OffscreenCanvas(2,2).getContext('2d');let a,b;try{CanvasRenderingContext2D.prototype.measureText.call(off,'a');a='ok'}catch(e){a=e.name}try{OffscreenCanvasRenderingContext2D.prototype.measureText.call(main,'a');b='ok'}catch(e){b=e.name}return{a,b}});
++await run('numericConstructor',()=>new OffscreenCanvas(Symbol('2'),2));
++return rows})()
+--- /dev/null
++++ b/docs/reference/canvas-bitmap-native.json
+@@ -0,0 +1,54 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "409d53469323caca9fc48dccb1cf390edcfa95050dcbe0f26741e961b2d4e984",
++  "observations": [
++    {
++      "name": "normal",
++      "error": {
++        "name": "ReferenceError",
++        "message": "ImageBitmap is not defined"
++      }
++    },
++    {
++      "name": "zero",
++      "error": {
++        "name": "ReferenceError",
++        "message": "ImageBitmap is not defined"
++      }
++    },
++    {
++      "name": "construct",
++      "error": {
++        "name": "ReferenceError",
++        "message": "ImageBitmap is not defined"
++      }
++    },
++    {
++      "name": "clone",
++      "value": null
++    },
++    {
++      "name": "transfer",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot read properties of null (reading 'width')"
++      }
++    },
++    {
++      "name": "crossContexts",
++      "value": {
++        "a": "TypeError",
++        "b": "TypeError"
++      }
++    },
++    {
++      "name": "numericConstructor",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/canvas-context-native-expression.js
+@@ -0,0 +1,8 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const value=await fn();rows.push({name,value:value===undefined?'undefined':value})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};
++const ctx=()=>document.createElement('canvas').getContext('2d'),snap=x=>({brand:x instanceof CanvasRenderingContext2D,tag:Object.prototype.toString.call(x),canvas:x.canvas instanceof HTMLCanvasElement,width:x.canvas.width,height:x.canvas.height});
++for(const[name,fn]of[['ctor',()=>new CanvasRenderingContext2D()],['offCtor',()=>new OffscreenCanvasRenderingContext2D()],['context',()=>snap(ctx())],['typeMissing',()=>document.createElement('canvas').getContext()],['nullType',()=>document.createElement('canvas').getContext(null)],['symbolType',()=>document.createElement('canvas').getContext(Symbol('2d'))],['unknown',()=>document.createElement('canvas').getContext('unknown')],['identity',()=>{const c=document.createElement('canvas'),x=c.getContext('2d');return{x:snap(x),same:c.getContext('2d')===x,webgl:c.getContext('webgl')}}],['attributes',()=>ctx().getContextAttributes()],['settings',()=>document.createElement('canvas').getContext('2d',{alpha:false,colorSpace:'display-p3',desynchronized:true,willReadFrequently:true}).getContextAttributes()],['reset',()=>{const c=document.createElement('canvas'),x=c.getContext('2d');x.fillStyle='red';x.font='20px serif';x.setLineDash([3]);c.width=17;return{same:x===c.getContext('2d'),style:x.fillStyle,font:x.font,dash:x.getLineDash(),width:x.canvas.width}}],['saveRestore',()=>{const x=ctx();x.fillStyle='red';x.save();x.fillStyle='blue';x.restore();return x.fillStyle}],['transform',()=>{const x=ctx();x.translate(2,3);x.scale(2,2);return x.getTransform()?.toJSON()}],['toDataURLMissing',()=>HTMLCanvasElement.prototype.toDataURL.call({})],['fakeContext',()=>CanvasRenderingContext2D.prototype.fillRect.call(Object.create(CanvasRenderingContext2D.prototype),0,0,1,1)]])await run(name,fn);
++for(const[name,args]of[['str',['16','8']],['fraction',[3.9,2.1]],['negative',[-1,1]],['zero',[0,0]],['undefined',[]],['one',[1]],['bigint',[1n,1]]])await run('offscreen-'+name,()=>{const c=new OffscreenCanvas(...args);return{width:c.width,height:c.height,tag:Object.prototype.toString.call(c),proto:Object.getPrototypeOf(c)===OffscreenCanvas.prototype}});
++await run('offscreenMutable',()=>{const c=new OffscreenCanvas(2,3);c.width=7;c.height=8;const x=c.getContext('2d');return{width:c.width,height:c.height,canvas:x.canvas===c,brand:x instanceof OffscreenCanvasRenderingContext2D,same:c.getContext('2d')===x,html:x instanceof CanvasRenderingContext2D}});
++for(const [name,fn]of[['offscreenBlob',async()=>{const b=await new OffscreenCanvas(2,3).convertToBlob({type:'image/jpeg',quality:.5});return{brand:b instanceof Blob,type:b.type,size:b.size}}],['offscreenZero',async()=>await new OffscreenCanvas(0,2).convertToBlob()],['offscreenClone',()=>structuredClone(new OffscreenCanvas(2,3))],['offscreenTransfer',()=>{const c=new OffscreenCanvas(2,3),d=structuredClone(c,{transfer:[c]});return{brand:d instanceof OffscreenCanvas,width:d.width,height:d.height,oldWidth:c.width}}],['transferHTML',()=>{const c=document.createElement('canvas');c.width=12;c.height=7;const off=c.transferControlToOffscreen();return{width:off.width,height:off.height,brand:off instanceof OffscreenCanvas,again:c.transferControlToOffscreen() instanceof OffscreenCanvas}}],['transferAfterContext',()=>{const c=document.createElement('canvas');c.getContext('2d');return c.transferControlToOffscreen() instanceof OffscreenCanvas}]])await run(name,fn);
++for(const [name,fn]of[['canvasClone',()=>structuredClone(document.createElement('canvas'))],['pathClone',()=>structuredClone(new Path2D())],['pathFakeClone',()=>{const p=Object.assign(Object.create(Path2D.prototype),{user:7}),c=structuredClone(p);return{plain:Object.getPrototypeOf(c)===Object.prototype,user:c.user}}],['pathConvert',()=>{let reads=0;const p=new Path2D({toString(){reads++;throw Error('input')}});p.moveTo({valueOf(){reads++;throw Error('x')}},Symbol());p.roundRect(0,0,1,1,{[Symbol.iterator](){reads++;throw Error('r')}});return{reads}}]])await run(name,fn);
++return rows})()
+--- /dev/null
++++ b/docs/reference/canvas-context-native.json
+@@ -0,0 +1,257 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "6856ea3ae2be02b3ef1df5b2dc4633ef9ca2e6dfee06cbd0cbb6356f5399d50f",
++  "observations": [
++    {
++      "name": "ctor",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    },
++    {
++      "name": "offCtor",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal Constructor"
++      }
++    },
++    {
++      "name": "context",
++      "value": {
++        "brand": true,
++        "tag": "[object CanvasRenderingContext2D]",
++        "canvas": true,
++        "width": 300,
++        "height": 150
++      }
++    },
++    {
++      "name": "typeMissing",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "nullType",
++      "value": null
++    },
++    {
++      "name": "symbolType",
++      "value": {}
++    },
++    {
++      "name": "unknown",
++      "value": null
++    },
++    {
++      "name": "identity",
++      "value": {
++        "x": {
++          "brand": true,
++          "tag": "[object CanvasRenderingContext2D]",
++          "canvas": true,
++          "width": 300,
++          "height": 150
++        },
++        "same": true,
++        "webgl": null
++      }
++    },
++    {
++      "name": "attributes",
++      "error": {
++        "name": "TypeError",
++        "message": "ctx(...).getContextAttributes is not a function"
++      }
++    },
++    {
++      "name": "settings",
++      "error": {
++        "name": "TypeError",
++        "message": "document.createElement(...).getContext(...).getContextAttributes is not a function"
++      }
++    },
++    {
++      "name": "reset",
++      "value": {
++        "same": true,
++        "style": "#ff0000",
++        "font": "20px serif",
++        "dash": [
++          3,
++          3
++        ],
++        "width": 17
++      }
++    },
++    {
++      "name": "saveRestore",
++      "value": "#0000ff"
++    },
++    {
++      "name": "transform",
++      "error": {
++        "name": "TypeError",
++        "message": "x.getTransform is not a function"
++      }
++    },
++    {
++      "name": "toDataURLMissing",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation"
++      }
++    },
++    {
++      "name": "fakeContext",
++      "error": {
++        "name": "TypeError",
++        "message": "Illegal invocation"
++      }
++    },
++    {
++      "name": "offscreen-str",
++      "value": {
++        "width": 16,
++        "height": 8,
++        "tag": "[object OffscreenCanvas]",
++        "proto": true
++      }
++    },
++    {
++      "name": "offscreen-fraction",
++      "value": {
++        "width": 3,
++        "height": 2,
++        "tag": "[object OffscreenCanvas]",
++        "proto": true
++      }
++    },
++    {
++      "name": "offscreen-negative",
++      "value": {
++        "width": 4294967295,
++        "height": 1,
++        "tag": "[object OffscreenCanvas]",
++        "proto": true
++      }
++    },
++    {
++      "name": "offscreen-zero",
++      "value": {
++        "width": 0,
++        "height": 0,
++        "tag": "[object OffscreenCanvas]",
++        "proto": true
++      }
++    },
++    {
++      "name": "offscreen-undefined",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "offscreen-one",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "offscreen-bigint",
++      "value": {
++        "width": 1,
++        "height": 1,
++        "tag": "[object OffscreenCanvas]",
++        "proto": true
++      }
++    },
++    {
++      "name": "offscreenMutable",
++      "value": {
++        "width": 7,
++        "height": 8,
++        "canvas": true,
++        "brand": true,
++        "same": true,
++        "html": false
++      }
++    },
++    {
++      "name": "offscreenBlob",
++      "value": {
++        "brand": true,
++        "type": "image/png",
++        "size": 67
++      }
++    },
++    {
++      "name": "offscreenZero",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "offscreenClone",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "offscreenTransfer",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "transferHTML",
++      "value": {
++        "width": 12,
++        "height": 7,
++        "brand": true,
++        "again": true
++      }
++    },
++    {
++      "name": "transferAfterContext",
++      "value": true
++    },
++    {
++      "name": "canvasClone",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "pathClone",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "pathFakeClone",
++      "value": {
++        "plain": true,
++        "user": 7
++      }
++    },
++    {
++      "name": "pathConvert",
++      "error": {
++        "name": "Error",
++        "message": "input"
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/canvas-conversion-native-expression.js
+@@ -0,0 +1,15 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const v=await fn();rows.push({name,value:v===undefined?'undefined':v})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};const context=()=>document.createElement('canvas').getContext('2d');
++for(const method of['scale','rotate','translate','transform','setTransform','clearRect','fillRect','strokeRect','moveTo','lineTo','quadraticCurveTo','bezierCurveTo','arc','arcTo','rect','ellipse','roundRect','fillText','strokeText','drawImage','putImageData','fill','stroke','clip','isPointInPath','isPointInStroke'])await run('conversion-'+method,()=>{const x=context(),trace=[],v={valueOf(){trace.push('number');return 1},toString(){trace.push('string');return'a'}};let error;try{x[method](v,v,v,v,v,v,v,v,v)}catch(e){error=e.name}return{trace,error}});
++await run('dash',()=>{const x=context(),rows=[];for(const a of[[2,3],[-1],[],[NaN],[Infinity],new Uint8Array([2,1]),new Set([3,2]),null,3,'12']){try{x.setLineDash(a);rows.push({kind:Object.prototype.toString.call(a),values:x.getLineDash()})}catch(e){rows.push({kind:Object.prototype.toString.call(a),error:e.name})}}return rows});
++await run('dashClone',()=>{const x=context();x.setLineDash([3]);const a=x.getLineDash();a[0]=99;return{fresh:x.getLineDash()[0],realm:a instanceof Array}});
++await run('settingsIgnored',()=>{const c=document.createElement('canvas');let calls=0;c.getContext('2d',{get alpha(){calls++;throw Error('alpha')}});return calls});
++await run('toDataURLConversions',()=>{const c=document.createElement('canvas'),trace=[];const s={toString(){trace.push('type');throw Error('type')}},q={valueOf(){trace.push('quality');throw Error('quality')}};let error;try{c.toDataURL(s,q)}catch(e){error=e.name}return{trace,error}});
++await run('convertToBlobConversions',async()=>{const c=new OffscreenCanvas(2,2),trace=[];const v={get type(){trace.push('type');return{toString(){trace.push('string');return'image/jpeg'}}},get quality(){trace.push('quality');return{valueOf(){trace.push('number');return .5}}}};const b=await c.convertToBlob(v);return{trace,type:b.type,size:b.size}});
++await run('toBlobMissingCallback',()=>document.createElement('canvas').toBlob());
++await run('toBlobNullCallback',()=>document.createElement('canvas').toBlob(null));
++await run('toBlobOrder',async()=>{const c=document.createElement('canvas'),order=[];await new Promise(resolve=>{c.toBlob(()=>{order.push('blob');Promise.resolve().then(()=>order.push('microtask'));setTimeout(()=>{order.push('callbackTimer');resolve()},0)});order.push('sync');Promise.resolve().then(()=>order.push('queuedMicrotask'));setTimeout(()=>order.push('outerTimer'),0)});return order});
++await run('offscreenToBlobOrder',async()=>{const c=new OffscreenCanvas(2,2),order=[],p=c.convertToBlob();order.push('sync');p.then(()=>order.push('blob'));Promise.resolve().then(()=>order.push('microtask'));await p;return order});
++await run('offscreenDimensionConversions',()=>{const c=new OffscreenCanvas(2,2),trace=[];c.width={valueOf(){trace.push('width');return 3}};c.height=1n;return{trace,width:c.width,height:c.height}});
++await run('imageCreateOptions',()=>{const x=context(),trace=[];const i=x.createImageData(2,3,{get colorSpace(){trace.push('color');return'bad'}});return{trace,w:i.width,h:i.height,color:i.colorSpace}});
++await run('metricsAll',()=>{const m=context().measureText('ab');return Object.fromEntries(Reflect.ownKeys(TextMetrics.prototype).filter(k=>typeof k==='string'&&k!=='constructor').map(k=>[k,m[k]]))});
++await run('workerCanvas',()=>new Promise(resolve=>{const w=new Worker(URL.createObjectURL(new Blob(["onmessage=async()=>{try{const c=new OffscreenCanvas(3,2),x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,3,2);const b=await c.convertToBlob();postMessage({image:typeof ImageData,path:typeof Path2D,offscreen:typeof OffscreenCanvas,ctx:typeof OffscreenCanvasRenderingContext2D,main:typeof CanvasRenderingContext2D,pixels:[...x.getImageData(0,0,1,1).data],type:b.type,size:b.size})}catch(e){postMessage({error:e.name,message:e.message})}}"],{type:'text/javascript'})));w.onmessage=e=>{resolve(e.data);w.terminate()};w.postMessage(1)}));return rows})()
+--- /dev/null
++++ b/docs/reference/canvas-conversion-native.json
+@@ -0,0 +1,361 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "8b1473648280e88d485730cb1ea507aeb349132e8c199cba84b1209f0dcb1c64",
++  "observations": [
++    {
++      "name": "conversion-scale",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-rotate",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-translate",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-transform",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-setTransform",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-clearRect",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-fillRect",
++      "value": {
++        "trace": [
++          "number",
++          "number",
++          "number",
++          "number"
++        ]
++      }
++    },
++    {
++      "name": "conversion-strokeRect",
++      "value": {
++        "trace": [
++          "number",
++          "number",
++          "number",
++          "number"
++        ]
++      }
++    },
++    {
++      "name": "conversion-moveTo",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-lineTo",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-quadraticCurveTo",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-bezierCurveTo",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-arc",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-arcTo",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-rect",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-ellipse",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-roundRect",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-fillText",
++      "value": {
++        "trace": [
++          "string",
++          "number",
++          "number",
++          "number"
++        ]
++      }
++    },
++    {
++      "name": "conversion-strokeText",
++      "value": {
++        "trace": [
++          "string",
++          "number",
++          "number",
++          "number"
++        ]
++      }
++    },
++    {
++      "name": "conversion-drawImage",
++      "value": {
++        "trace": [
++          "number",
++          "number",
++          "number",
++          "number",
++          "number",
++          "number",
++          "number",
++          "number"
++        ]
++      }
++    },
++    {
++      "name": "conversion-putImageData",
++      "value": {
++        "trace": [],
++        "error": "TypeError"
++      }
++    },
++    {
++      "name": "conversion-fill",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-stroke",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-clip",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-isPointInPath",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "conversion-isPointInStroke",
++      "value": {
++        "trace": []
++      }
++    },
++    {
++      "name": "dash",
++      "value": [
++        {
++          "kind": "[object Array]",
++          "values": [
++            2,
++            3
++          ]
++        },
++        {
++          "kind": "[object Array]",
++          "values": [
++            2,
++            3
++          ]
++        },
++        {
++          "kind": "[object Array]",
++          "values": []
++        },
++        {
++          "kind": "[object Array]",
++          "values": []
++        },
++        {
++          "kind": "[object Array]",
++          "values": []
++        },
++        {
++          "kind": "[object Uint8Array]",
++          "error": "TypeError"
++        },
++        {
++          "kind": "[object Set]",
++          "values": [
++            3,
++            2
++          ]
++        },
++        {
++          "kind": "[object Null]",
++          "error": "TypeError"
++        },
++        {
++          "kind": "[object Number]",
++          "error": "TypeError"
++        },
++        {
++          "kind": "[object String]",
++          "error": "TypeError"
++        }
++      ]
++    },
++    {
++      "name": "dashClone",
++      "value": {
++        "fresh": 3,
++        "realm": true
++      }
++    },
++    {
++      "name": "settingsIgnored",
++      "value": 0
++    },
++    {
++      "name": "toDataURLConversions",
++      "value": {
++        "trace": [
++          "type"
++        ],
++        "error": "Error"
++      }
++    },
++    {
++      "name": "convertToBlobConversions",
++      "value": {
++        "trace": [],
++        "type": "image/png",
++        "size": 67
++      }
++    },
++    {
++      "name": "toBlobMissingCallback",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "toBlobNullCallback",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "toBlobOrder",
++      "value": [
++        "sync",
++        "queuedMicrotask",
++        "blob",
++        "microtask",
++        "outerTimer",
++        "callbackTimer"
++      ]
++    },
++    {
++      "name": "offscreenToBlobOrder",
++      "value": [
++        "sync",
++        "blob",
++        "microtask"
++      ]
++    },
++    {
++      "name": "offscreenDimensionConversions",
++      "value": {
++        "trace": [
++          "width"
++        ],
++        "width": 3,
++        "height": 1
++      }
++    },
++    {
++      "name": "imageCreateOptions",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "metricsAll",
++      "value": {
++        "width": 12,
++        "actualBoundingBoxLeft": 0,
++        "actualBoundingBoxRight": 12,
++        "actualBoundingBoxAscent": 8,
++        "actualBoundingBoxDescent": 2,
++        "fontBoundingBoxAscent": 8,
++        "fontBoundingBoxDescent": 2,
++        "emHeightAscent": 8,
++        "emHeightDescent": 2,
++        "hangingBaseline": 8,
++        "alphabeticBaseline": 0,
++        "ideographicBaseline": -2
++      }
++    },
++    {
++      "name": "workerCanvas",
++      "value": {
++        "image": "function",
++        "path": "function",
++        "offscreen": "function",
++        "ctx": "function",
++        "main": "undefined",
++        "pixels": [
++          0,
++          0,
++          0,
++          0
++        ],
++        "type": "image/png",
++        "size": 67
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/canvas-cross-after-native.json
+@@ -0,0 +1,28 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "0e1cc2a2aab7f9c4038b86e2eeacc20238833725034bad7415a5921b02f3c323",
++  "expressionSHA256": "d10cc32f457f4c02ec63e81860d254034b234aad3c54332e5495e21871aa85e8",
++  "observations": {
++    "before": {
++      "font": "20px serif",
++      "style": "#ff0000",
++      "dash": [
++        3,
++        3
++      ],
++      "lineWidth": 1,
++      "owner": true,
++      "brand": true
++    },
++    "after": {
++      "font": "30px serif",
++      "style": "#0000ff",
++      "dash": [
++        5,
++        5
++      ],
++      "lineWidth": 4
++    }
++  }
++}
+--- /dev/null
++++ b/docs/reference/canvas-cross-native-expression.js
+@@ -0,0 +1 @@
++(()=>{const c=document.getElementById('cross-canvas'),x=c.getContext('2d');const before={font:x.font,style:x.fillStyle,dash:x.getLineDash(),lineWidth:x.lineWidth,owner:x.canvas===c,brand:x instanceof CanvasRenderingContext2D};x.font='30px serif';x.fillStyle='blue';x.setLineDash([5]);return before})()
+--- /dev/null
++++ b/docs/reference/canvas-extra-native-expression.js
+@@ -0,0 +1,11 @@
++(async()=>{const rows=[],run=async(name,fn)=>{try{const v=await fn();rows.push({name,value:v===undefined?'undefined':v})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};const ctx=()=>document.createElement('canvas').getContext('2d');
++for(const name of ['OffscreenCanvas','OffscreenCanvasRenderingContext2D','CanvasGradient','CanvasPattern','TextMetrics','Path2D'])await run('shape-'+name,()=>{const C=globalThis[name];return{length:C.length,parent:Object.getPrototypeOf(C.prototype)===Object.prototype?'Object':Object.getPrototypeOf(C.prototype)===EventTarget.prototype?'EventTarget':'other',keys:Reflect.ownKeys(C.prototype).map(String)}});
++for(const[name,value]of[['gradient',ctx().createLinearGradient(0,0,1,1)],['pattern',ctx().createPattern({},'repeat')],['metrics',ctx().measureText('a')],['context',ctx()]])await run('clone-'+name,()=>structuredClone(value));
++for(const method of['fillRect','strokeRect','createLinearGradient','createRadialGradient','createConicGradient','getImageData'])await run('finite-'+method,()=>{const x=ctx();try{const a=x[method](Infinity,NaN,1,1,1,1);return a instanceof ImageData?{w:a.width,h:a.height}:a?Object.prototype.toString.call(a):'undefined'}catch(e){return{name:e.name,message:e.message}}});
++for(const rep of [undefined,null,'','repeat','repeat-x','repeat-y','no-repeat',Symbol('repeat')])await run('pattern-'+String(rep),()=>ctx().createPattern({},rep) instanceof CanvasPattern);
++await run('addColorStopOrder',()=>{const g=ctx().createLinearGradient(0,0,1,1),trace=[];let error;try{g.addColorStop({valueOf(){trace.push('offset');return 2}},{toString(){trace.push('color');return'red'}})}catch(e){error=e.name}return{trace,error}});
++await run('toDataURLQuality',()=>{const c=document.createElement('canvas'),trace=[];c.toDataURL('image/jpeg',{valueOf(){trace.push('quality');throw Error('quality')}});return trace});
++await run('toBlobConversions',async()=>{const c=document.createElement('canvas'),trace=[];await new Promise(resolve=>c.toBlob(()=>{trace.push('callback');resolve()},{toString(){trace.push('type');return'image/jpeg'}},{valueOf(){trace.push('quality');throw Error('quality')}}));return trace});
++await run('toBlobThis',()=>new Promise(resolve=>{const c=document.createElement('canvas');c.toBlob(function(){'use strict';resolve(this===undefined?'undefined':this===null?'null':this===window?'window':'other')})}));
++await run('contextForeign',()=>{const f=document.createElement('iframe');document.body.append(f);const g=f.contentWindow,c=g.document.createElement('canvas'),x=HTMLCanvasElement.prototype.getContext.call(c,'2d');return{main:x instanceof CanvasRenderingContext2D,child:x instanceof g.CanvasRenderingContext2D,owner:x.canvas===c,canvasChild:x.canvas instanceof g.HTMLCanvasElement}});
++return rows})()
+--- /dev/null
++++ b/docs/reference/canvas-extra-native.json
+@@ -0,0 +1,291 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "94c95bae2416c9b94e920efceaa07b2505c58709685a11fea6fdc913b48c7af7",
++  "observations": [
++    {
++      "name": "shape-OffscreenCanvas",
++      "value": {
++        "length": 2,
++        "parent": "Object",
++        "keys": [
++          "width",
++          "height",
++          "getContext",
++          "convertToBlob",
++          "transferToImageBitmap",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "shape-OffscreenCanvasRenderingContext2D",
++      "value": {
++        "length": 0,
++        "parent": "Object",
++        "keys": [
++          "canvas",
++          "font",
++          "measureText",
++          "setLineDash",
++          "getLineDash",
++          "lineDashOffset",
++          "roundRect",
++          "ellipse",
++          "isPointInPath",
++          "isPointInStroke",
++          "createLinearGradient",
++          "createRadialGradient",
++          "createConicGradient",
++          "createPattern",
++          "shadowBlur",
++          "shadowColor",
++          "shadowOffsetX",
++          "shadowOffsetY",
++          "filter",
++          "imageSmoothingEnabled",
++          "imageSmoothingQuality",
++          "direction",
++          "letterSpacing",
++          "wordSpacing",
++          "fontKerning",
++          "globalAlpha",
++          "globalCompositeOperation",
++          "strokeStyle",
++          "lineWidth",
++          "lineCap",
++          "lineJoin",
++          "miterLimit",
++          "textAlign",
++          "textBaseline",
++          "fillStyle",
++          "createImageData",
++          "putImageData",
++          "getImageData",
++          "save",
++          "restore",
++          "scale",
++          "rotate",
++          "translate",
++          "transform",
++          "setTransform",
++          "resetTransform",
++          "clearRect",
++          "fillRect",
++          "strokeRect",
++          "beginPath",
++          "closePath",
++          "moveTo",
++          "lineTo",
++          "quadraticCurveTo",
++          "bezierCurveTo",
++          "arc",
++          "arcTo",
++          "rect",
++          "fill",
++          "stroke",
++          "clip",
++          "fillText",
++          "strokeText",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "shape-CanvasGradient",
++      "value": {
++        "length": 0,
++        "parent": "Object",
++        "keys": [
++          "addColorStop",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "shape-CanvasPattern",
++      "value": {
++        "length": 0,
++        "parent": "Object",
++        "keys": [
++          "setTransform",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "shape-TextMetrics",
++      "value": {
++        "length": 0,
++        "parent": "Object",
++        "keys": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "shape-Path2D",
++      "value": {
++        "length": 0,
++        "parent": "Object",
++        "keys": [
++          "addPath",
++          "closePath",
++          "moveTo",
++          "lineTo",
++          "quadraticCurveTo",
++          "bezierCurveTo",
++          "arc",
++          "arcTo",
++          "ellipse",
++          "rect",
++          "roundRect",
++          "constructor",
++          "Symbol(Symbol.toStringTag)"
++        ]
++      }
++    },
++    {
++      "name": "clone-gradient",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "clone-pattern",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "clone-metrics",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "clone-context",
++      "error": {
++        "name": "DataCloneError",
++        "message": "The object can not be cloned"
++      }
++    },
++    {
++      "name": "finite-fillRect",
++      "value": "undefined"
++    },
++    {
++      "name": "finite-strokeRect",
++      "value": "undefined"
++    },
++    {
++      "name": "finite-createLinearGradient",
++      "value": "[object CanvasGradient]"
++    },
++    {
++      "name": "finite-createRadialGradient",
++      "value": "[object CanvasGradient]"
++    },
++    {
++      "name": "finite-createConicGradient",
++      "value": "[object CanvasGradient]"
++    },
++    {
++      "name": "finite-getImageData",
++      "value": {
++        "w": 1,
++        "h": 1
++      }
++    },
++    {
++      "name": "pattern-undefined",
++      "value": true
++    },
++    {
++      "name": "pattern-null",
++      "value": true
++    },
++    {
++      "name": "pattern-",
++      "value": true
++    },
++    {
++      "name": "pattern-repeat",
++      "value": true
++    },
++    {
++      "name": "pattern-repeat-x",
++      "value": true
++    },
++    {
++      "name": "pattern-repeat-y",
++      "value": true
++    },
++    {
++      "name": "pattern-no-repeat",
++      "value": true
++    },
++    {
++      "name": "pattern-Symbol(repeat)",
++      "value": true
++    },
++    {
++      "name": "addColorStopOrder",
++      "value": {
++        "trace": [
++          "offset",
++          "color"
++        ],
++        "error": "IndexSizeError"
++      }
++    },
++    {
++      "name": "toDataURLQuality",
++      "error": {
++        "name": "Error",
++        "message": "quality"
++      }
++    },
++    {
++      "name": "toBlobConversions",
++      "error": {
++        "name": "Error",
++        "message": "quality"
++      }
++    },
++    {
++      "name": "toBlobThis",
++      "value": "window"
++    },
++    {
++      "name": "contextForeign",
++      "value": {
++        "main": true,
++        "child": false,
++        "owner": true,
++        "canvasChild": true
++      }
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/canvas-slots-native-expression.js
+@@ -0,0 +1,7 @@
++(()=>{const rows=[],run=(name,fn)=>{try{const v=fn();rows.push({name,value:v===undefined?'undefined':v})}catch(e){rows.push({name,error:{name:e.name,message:e.message}})}};const c=document.createElement('canvas'),x=c.getContext('2d');
++run('surface',()=>Object.fromEntries(Reflect.ownKeys(CanvasRenderingContext2D.prototype).filter(k=>typeof k==='string').map(k=>{const d=Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype,k);return[k,{get:!!d.get,set:!!d.set,value:typeof d.value==='function'?{length:d.value.length,name:d.value.name}:d.value,enumerable:d.enumerable,configurable:d.configurable,writable:d.writable,...(d.get?{initial:typeof x[k]==='object'?{tag:Object.prototype.toString.call(x[k])}:x[k]}:{})}]})));
++for(const[k,value]of[['lineWidth',-2],['miterLimit',-1],['globalAlpha',2],['font','bold'],['font',12],['shadowColor','bad'],['shadowBlur',-1],['filter','foo'],['textAlign','bad'],['lineCap','bad'],['imageSmoothingEnabled',0],['imageSmoothingQuality','bad'],['globalCompositeOperation','bad'],['direction','bad'],['fillStyle',123],['fillStyle',null],['strokeStyle',{}]])run('set-'+k+'-'+String(value),()=>{x[k]=value;return x[k]});
++for(const[method,args]of[['fillRect',[]],['fillRect',[Symbol(),{},null]],['drawImage',[{}]],['drawImage',[null,0,0]],['fill',[{}]],['stroke',[{}]],['clip',[{}]],['fill',[new Path2D(),'bad']],['isPointInPath',[]],['isPointInPath',[{},Symbol()]],['createImageData',[]],['createImageData',[-2,3]],['createImageData',[{}]],['createImageData',[new ImageData(1,1)]],['getImageData',[Symbol(),{},1,1]],['getImageData',[0,0,1.5,2.9]],['getImageData',[0,0,-1,1]],['getImageData',[]],['putImageData',[{}]],['putImageData',[new ImageData(1,1)]],['createLinearGradient',[]],['createLinearGradient',[Symbol(),1,2,3]],['createRadialGradient',[0,0,-1,0,0,3]],['createConicGradient',[]],['createPattern',[{},'repeat']],['createPattern',[c,'bad']]])run(method+'-'+JSON.stringify(args,(k,v)=>typeof v==='symbol'?'symbol':v),()=>{const value=x[method](...args);return value instanceof ImageData?{brand:'ImageData',w:value.width,h:value.height,len:value.data.length}:value instanceof CanvasGradient?'CanvasGradient':value instanceof CanvasPattern?'CanvasPattern':value});
++for(const text of['a','ab','é','😀','中','e\u0301','\n',Symbol('xy')])run('text-'+String(text),()=>{const m=x.measureText(text);return{brand:m instanceof TextMetrics,width:m.width,ascent:m.actualBoundingBoxAscent,descent:m.actualBoundingBoxDescent,right:m.actualBoundingBoxRight,left:m.actualBoundingBoxLeft,props:Reflect.ownKeys(TextMetrics.prototype).filter(k=>typeof k==='string')}});
++for(const[offset,color]of[[0,'red'],[1,'bad'],[-1,'red'],[2,'red'],[NaN,'red'],[Infinity,'red'],[.5,Symbol('red')]])run('stop-'+String(offset)+'-'+String(color),()=>x.createLinearGradient(0,0,1,1).addColorStop(offset,color));
++run('pathArguments',()=>{const p=new Path2D();let hits=0;const bad={valueOf(){hits++;throw Error('arg')},toString(){hits++;throw Error('text')},[Symbol.iterator](){hits++;throw Error('radii')}};for(const k of['moveTo','lineTo','quadraticCurveTo','bezierCurveTo','arc','arcTo','ellipse','rect','roundRect'])p[k](bad,bad,bad,bad,bad,bad,bad,bad);p.addPath(new Path2D(),{get a(){hits++;throw Error('matrix')}});return hits});return rows})()
+--- /dev/null
++++ b/docs/reference/canvas-slots-native.json
+@@ -0,0 +1,1136 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "51beecb4fb7eb13d93c1ba07035c0f79d0a24723e0d07f86d778be9345395050",
++  "expressionSHA256": "e1498f5eb546065f064d704c0b2aa7e2154a0bddee85440211f98e0d793ccb58",
++  "observations": [
++    {
++      "name": "surface",
++      "value": {
++        "canvas": {
++          "get": true,
++          "set": false,
++          "enumerable": true,
++          "configurable": true,
++          "initial": {
++            "tag": "[object HTMLCanvasElement]"
++          }
++        },
++        "font": {
++          "get": true,
++          "set": true,
++          "enumerable": true,
++          "configurable": true,
++          "initial": "10px sans-serif"
++        },
++        "measureText": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "measureText"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "setLineDash": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "setLineDash"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "getLineDash": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "getLineDash"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "lineDashOffset": {
++          "get": false,
++          "set": false,
++          "value": 0,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "roundRect": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "roundRect"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "ellipse": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 7,
++            "name": "ellipse"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "isPointInPath": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "isPointInPath"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "isPointInStroke": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "isPointInStroke"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "createLinearGradient": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "createLinearGradient"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "createRadialGradient": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 6,
++            "name": "createRadialGradient"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "createConicGradient": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 3,
++            "name": "createConicGradient"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "createPattern": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "createPattern"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "shadowBlur": {
++          "get": false,
++          "set": false,
++          "value": 0,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "shadowColor": {
++          "get": false,
++          "set": false,
++          "value": "rgba(0, 0, 0, 0)",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "shadowOffsetX": {
++          "get": false,
++          "set": false,
++          "value": 0,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "shadowOffsetY": {
++          "get": false,
++          "set": false,
++          "value": 0,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "filter": {
++          "get": false,
++          "set": false,
++          "value": "none",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "imageSmoothingEnabled": {
++          "get": false,
++          "set": false,
++          "value": true,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "imageSmoothingQuality": {
++          "get": false,
++          "set": false,
++          "value": "low",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "direction": {
++          "get": false,
++          "set": false,
++          "value": "ltr",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "letterSpacing": {
++          "get": false,
++          "set": false,
++          "value": "0px",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "wordSpacing": {
++          "get": false,
++          "set": false,
++          "value": "0px",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "fontKerning": {
++          "get": false,
++          "set": false,
++          "value": "auto",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "globalAlpha": {
++          "get": false,
++          "set": false,
++          "value": 1,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "globalCompositeOperation": {
++          "get": false,
++          "set": false,
++          "value": "source-over",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "strokeStyle": {
++          "get": true,
++          "set": true,
++          "enumerable": true,
++          "configurable": true,
++          "initial": "#000000"
++        },
++        "lineWidth": {
++          "get": false,
++          "set": false,
++          "value": 1,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "lineCap": {
++          "get": false,
++          "set": false,
++          "value": "butt",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "lineJoin": {
++          "get": false,
++          "set": false,
++          "value": "miter",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "miterLimit": {
++          "get": false,
++          "set": false,
++          "value": 10,
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "textAlign": {
++          "get": false,
++          "set": false,
++          "value": "start",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "textBaseline": {
++          "get": false,
++          "set": false,
++          "value": "alphabetic",
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "fillStyle": {
++          "get": true,
++          "set": true,
++          "enumerable": true,
++          "configurable": true,
++          "initial": "#000000"
++        },
++        "createImageData": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "createImageData"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "putImageData": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 3,
++            "name": "putImageData"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "drawImage": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 3,
++            "name": "drawImage"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "getImageData": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "getImageData"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "save": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "save"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "restore": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "restore"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "scale": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 2,
++            "name": "scale"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "rotate": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 1,
++            "name": "rotate"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "translate": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 2,
++            "name": "translate"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "transform": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 6,
++            "name": "transform"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "setTransform": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 6,
++            "name": "setTransform"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "resetTransform": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "resetTransform"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "clearRect": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "clearRect"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "fillRect": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "fillRect"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "strokeRect": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "strokeRect"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "beginPath": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "beginPath"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "closePath": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "closePath"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "moveTo": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 2,
++            "name": "moveTo"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "lineTo": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 2,
++            "name": "lineTo"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "quadraticCurveTo": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "quadraticCurveTo"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "bezierCurveTo": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 6,
++            "name": "bezierCurveTo"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "arc": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 5,
++            "name": "arc"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "arcTo": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 5,
++            "name": "arcTo"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "rect": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 4,
++            "name": "rect"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "fill": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "fill"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "stroke": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "stroke"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "clip": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "clip"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "fillText": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 3,
++            "name": "fillText"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "strokeText": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 3,
++            "name": "strokeText"
++          },
++          "enumerable": true,
++          "configurable": true,
++          "writable": true
++        },
++        "constructor": {
++          "get": false,
++          "set": false,
++          "value": {
++            "length": 0,
++            "name": "CanvasRenderingContext2D"
++          },
++          "enumerable": false,
++          "configurable": true,
++          "writable": true
++        }
++      }
++    },
++    {
++      "name": "set-lineWidth--2",
++      "value": -2
++    },
++    {
++      "name": "set-miterLimit--1",
++      "value": -1
++    },
++    {
++      "name": "set-globalAlpha-2",
++      "value": 2
++    },
++    {
++      "name": "set-font-bold",
++      "value": "10px sans-serif"
++    },
++    {
++      "name": "set-font-12",
++      "value": "10px sans-serif"
++    },
++    {
++      "name": "set-shadowColor-bad",
++      "value": "bad"
++    },
++    {
++      "name": "set-shadowBlur--1",
++      "value": -1
++    },
++    {
++      "name": "set-filter-foo",
++      "value": "foo"
++    },
++    {
++      "name": "set-textAlign-bad",
++      "value": "bad"
++    },
++    {
++      "name": "set-lineCap-bad",
++      "value": "bad"
++    },
++    {
++      "name": "set-imageSmoothingEnabled-0",
++      "value": 0
++    },
++    {
++      "name": "set-imageSmoothingQuality-bad",
++      "value": "bad"
++    },
++    {
++      "name": "set-globalCompositeOperation-bad",
++      "value": "bad"
++    },
++    {
++      "name": "set-direction-bad",
++      "value": "bad"
++    },
++    {
++      "name": "set-fillStyle-123",
++      "value": "#000000"
++    },
++    {
++      "name": "set-fillStyle-null",
++      "value": "#000000"
++    },
++    {
++      "name": "set-strokeStyle-[object Object]",
++      "value": "#000000"
++    },
++    {
++      "name": "fillRect-[]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "fillRect-[\"symbol\",{},null]",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    },
++    {
++      "name": "drawImage-[{}]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "drawImage-[null,0,0]",
++      "value": "undefined"
++    },
++    {
++      "name": "fill-[{}]",
++      "value": "undefined"
++    },
++    {
++      "name": "stroke-[{}]",
++      "value": "undefined"
++    },
++    {
++      "name": "clip-[{}]",
++      "value": "undefined"
++    },
++    {
++      "name": "fill-[{},\"bad\"]",
++      "value": "undefined"
++    },
++    {
++      "name": "isPointInPath-[]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "isPointInPath-[{},\"symbol\"]",
++      "value": false
++    },
++    {
++      "name": "createImageData-[]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "createImageData-[-2,3]",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "createImageData-[{}]",
++      "error": {
++        "name": "TypeError",
++        "message": ""
++      }
++    },
++    {
++      "name": "createImageData-[{}]",
++      "value": {
++        "brand": "ImageData",
++        "w": 1,
++        "h": 1,
++        "len": 4
++      }
++    },
++    {
++      "name": "getImageData-[\"symbol\",{},1,1]",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    },
++    {
++      "name": "getImageData-[0,0,1.5,2.9]",
++      "value": {
++        "brand": "ImageData",
++        "w": 1,
++        "h": 2,
++        "len": 8
++      }
++    },
++    {
++      "name": "getImageData-[0,0,-1,1]",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "getImageData-[]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "putImageData-[{}]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "putImageData-[{}]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "createLinearGradient-[]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "createLinearGradient-[\"symbol\",1,2,3]",
++      "error": {
++        "name": "TypeError",
++        "message": "Cannot convert a Symbol value to a number"
++      }
++    },
++    {
++      "name": "createRadialGradient-[0,0,-1,0,0,3]",
++      "value": "CanvasGradient"
++    },
++    {
++      "name": "createConicGradient-[]",
++      "error": {
++        "name": "TypeError",
++        "message": "invalid argument"
++      }
++    },
++    {
++      "name": "createPattern-[{},\"repeat\"]",
++      "value": "CanvasPattern"
++    },
++    {
++      "name": "createPattern-[{},\"bad\"]",
++      "error": {
++        "name": "SyntaxError",
++        "message": "The string did not match the expected pattern"
++      }
++    },
++    {
++      "name": "text-a",
++      "value": {
++        "brand": true,
++        "width": 6,
++        "ascent": 8,
++        "descent": 2,
++        "right": 6,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-ab",
++      "value": {
++        "brand": true,
++        "width": 12,
++        "ascent": 8,
++        "descent": 2,
++        "right": 12,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-é",
++      "value": {
++        "brand": true,
++        "width": 6,
++        "ascent": 8,
++        "descent": 2,
++        "right": 6,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-😀",
++      "value": {
++        "brand": true,
++        "width": 10,
++        "ascent": 8,
++        "descent": 2,
++        "right": 10,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-中",
++      "value": {
++        "brand": true,
++        "width": 10,
++        "ascent": 8,
++        "descent": 2,
++        "right": 10,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-é",
++      "value": {
++        "brand": true,
++        "width": 6,
++        "ascent": 8,
++        "descent": 2,
++        "right": 6,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-\n",
++      "value": {
++        "brand": true,
++        "width": 0,
++        "ascent": 8,
++        "descent": 2,
++        "right": 0,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "text-Symbol(xy)",
++      "value": {
++        "brand": true,
++        "width": 12,
++        "ascent": 8,
++        "descent": 2,
++        "right": 12,
++        "left": 0,
++        "props": [
++          "width",
++          "actualBoundingBoxLeft",
++          "actualBoundingBoxRight",
++          "actualBoundingBoxAscent",
++          "actualBoundingBoxDescent",
++          "fontBoundingBoxAscent",
++          "fontBoundingBoxDescent",
++          "emHeightAscent",
++          "emHeightDescent",
++          "hangingBaseline",
++          "alphabeticBaseline",
++          "ideographicBaseline",
++          "constructor"
++        ]
++      }
++    },
++    {
++      "name": "stop-0-red",
++      "value": "undefined"
++    },
++    {
++      "name": "stop-1-bad",
++      "value": "undefined"
++    },
++    {
++      "name": "stop--1-red",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "stop-2-red",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "stop-NaN-red",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "stop-Infinity-red",
++      "error": {
++        "name": "IndexSizeError",
++        "message": "Index or size is negative or greater than the allowed amount"
++      }
++    },
++    {
++      "name": "stop-0.5-Symbol(red)",
++      "value": "undefined"
++    },
++    {
++      "name": "pathArguments",
++      "value": 0
++    }
++  ]
++}
+--- /dev/null
++++ b/docs/reference/canvas-utility-native-expression.js
+@@ -0,0 +1 @@
++(()=>{const c=document.createElement('canvas'),x=c.getContext('2d'),off=new OffscreenCanvas(2,2),o=off.getContext('2d'),path=new Path2D('M0 0L1 1'),gradient=x.createLinearGradient(0,0,1,1),m=x.measureText('ab');let fakeError;try{CanvasRenderingContext2D.prototype.fillRect.call({},0,0,1,1)}catch(e){fakeError=e instanceof TypeError}return{context:x instanceof CanvasRenderingContext2D,owner:x.canvas===c,canvas:c instanceof HTMLCanvasElement,off:o instanceof OffscreenCanvasRenderingContext2D,offOwner:o.canvas===off,path:path instanceof Path2D,gradient:gradient instanceof CanvasGradient,metric:m instanceof TextMetrics,width:m.width,data:x.getImageData(0,0,1,1) instanceof ImageData,bytes:x.getImageData(0,0,1,1).data instanceof Uint8ClampedArray,dash:x.getLineDash() instanceof Array,function:x.measureText instanceof Function,fakeError}})()
+--- /dev/null
++++ b/docs/reference/canvas-utility-native.json
+@@ -0,0 +1,22 @@
++{
++  "binary": "/workspace/shared/lightpanda-reference/lightpanda-x86_64-linux",
++  "binarySHA256": "9dec394124212f796724d4d32737ba66fdf0319ae6faaf8a1df8cccb4a70e23f",
++  "probeSHA256": "afb7bd4137f823911b598cb082f2a480c82c21df8393227be37e08980edfa037",
++  "expressionSHA256": "51edfca5e4b8dc78445b92ab43931d142562077e092d1b8cc24ea4fb5767339b",
++  "observations": {
++    "context": true,
++    "owner": true,
++    "canvas": true,
++    "off": true,
++    "offOwner": true,
++    "path": true,
++    "gradient": true,
++    "metric": true,
++    "width": 12,
++    "data": true,
++    "bytes": true,
++    "dash": true,
++    "function": true,
++    "fakeError": true
++  }
++}
+--- /dev/null
++++ b/src/canvas.js
+@@ -0,0 +1,107 @@
++// Independent Canvas value/state profile. The calibrated target has no Canvas
++// rasterizer: drawing is deliberately ineffective, reads stay transparent and
++// serialization encodes a real transparent1x1 PNG regardless of canvas size.
++import {createRequire} from 'node:module';
++import {encodeRGBAPNG} from './png.js';
++import {registerPlatformFactory,platformFactoryRecord} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++const require=createRequire(import.meta.url),color=require('@asamuzakjp/css-color');
++const installed=new WeakMap(),offscreen=new WeakMap(),documents=new WeakMap(),contexts=new WeakMap(),gradients=new WeakMap(),patterns=new WeakMap(),metrics=new WeakMap(),paths=new WeakMap();
++const kinds=['OffscreenCanvas','OffscreenCanvasRenderingContext2D','CanvasRenderingContext2D','CanvasGradient','CanvasPattern','TextMetrics','Path2D'];
++const slot=fields=>Object.assign(Object.create(null),fields);
++const sharedContext=()=>slot({font:'10px sans-serif',size:10,fillStyle:'#000000',strokeStyle:'#000000',dash:[]});
++const originalCreate=Object.create;
++function copySequence(values){const result=new Array(values.length);for(let i=0;i<values.length;i++)Object.defineProperty(result,i,{value:values[i],writable:true,enumerable:true,configurable:true});return result}
++function documentState(value){const provenance=platformFactoryRecord(value);if(provenance?.kind!=='HTMLCanvasElement'||!provenance.implementation)return null;let state=documents.get(provenance.implementation);if(!state){state=slot({implementation:provenance.implementation,contexts:new WeakMap(),shared:sharedContext()});documents.set(provenance.implementation,state)}return state}
++function canvasState(value){return offscreen.get(value)??documentState(value)}
++function dimensions(value){const state=offscreen.get(value);if(state)return{width:state.width,height:state.height};const d=documentState(value);return d?{width:d.implementation.width,height:d.implementation.height}:null}
++export function canvasDimensions(value){return dimensions(value)}
++export function canvasSnapshot(value){const size=dimensions(value);if(!size)return null;const count=size.width*size.height*4;if(!Number.isSafeInteger(count)||count>64*1024*1024)throw new RangeError('Canvas snapshot exceeds the independent backend byte limit');return{...size,bytes:new Uint8Array(count)}}
++export function isCanvasCloneRejected(value){return !!(canvasState(value)||contexts.has(value)||gradients.has(value)||patterns.has(value)||metrics.has(value)||paths.has(value))}
++function fontInfo(value){const match=/(?:^|\s)(\d+(?:\.\d*)?|\.\d+)(px|pt|pc|in|cm|mm|q|em|rem|%)(?:\/[^ ]+)?\s+.+$/i.exec(value);if(!match)return null;const prefix=value.slice(0,match.index).trim();if(prefix&&!/^(?:(?:normal|italic|oblique|small-caps|bold|bolder|lighter|[1-9]00|condensed|expanded)\s*)+$/i.test(prefix))return null;const factors={px:1,pt:96/72,pc:16,in:96,cm:96/2.54,mm:96/25.4,q:96/101.6,em:16,rem:16,'%':.16};return{font:value,size:Number(match[1])*factors[match[2].toLowerCase()]}}
++const zeroWidth=c=>(c<32)||(c>=0x300&&c<=0x36f)||(c>=0x1ab0&&c<=0x1aff)||(c>=0x1dc0&&c<=0x1dff)||(c>=0x20d0&&c<=0x20ff)||(c>=0xfe00&&c<=0xfe0f)||(c>=0xfe20&&c<=0xfe2f)||c===0x200d;
++const wide=c=>(c>=0x1100&&c<=0x115f)||(c>=0x2329&&c<=0x232a)||(c>=0x2e80&&c<=0xa4cf)||(c>=0xac00&&c<=0xd7a3)||(c>=0xf900&&c<=0xfaff)||(c>=0xfe10&&c<=0xfe19)||(c>=0xfe30&&c<=0xfe6f)||(c>=0xff00&&c<=0xff60)||(c>=0xffe0&&c<=0xffe6)||(c>=0x1f000&&c<=0x1ffff)||(c>=0x20000&&c<=0x3fffd);
++function textWidth(text,size){let width=0;for(const char of text){const c=char.codePointAt(0);width+=size*(zeroWidth(c)?0:char===' '?.33:wide(c)?1:.6)}return width}
++function factory(g,b){
++ const TypeError=g.TypeError,Exception=g.DOMException,ImageData=g.ImageData,Blob=g.Blob,Promise=g.Promise,Number=g.Number,String=g.String;
++ const define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,Array=g.Array,isFinite=Number.isFinite;
++ const iterator=g.Symbol.iterator,symbolDescription=own(g.Symbol.prototype,'description').get,text=v=>typeof v==='symbol'?apply(symbolDescription,v,[])??'':String(v),invalid=()=>new TypeError('invalid argument'),illegal=()=>new TypeError('Illegal invocation');
++ const index=()=>new Exception('Index or size is negative or greater than the allowed amount','IndexSizeError');
++ const numeric=(args,index)=>{if(args.length<=index)throw invalid();return +args[index]};
++ const method=(p,name,length,body)=>{const f=({[name](...args){return apply(body,this,[args])}})[name];define(f,'length',{value:length,configurable:true});define(p,name,{value:f,writable:true,enumerable:true,configurable:true})};
++ const shape=(C,name)=>{for(const key of g.Reflect.ownKeys(C.prototype)){const d=own(C.prototype,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});}define(C,'name',{value:name,configurable:true});delete C.prototype.constructor;define(C.prototype,'constructor',{value:C,writable:true,configurable:true});define(C.prototype,g.Symbol.toStringTag,{value:name,configurable:true});return C};
++ const inaccessible=name=>{const C=function(){throw new TypeError('Illegal Constructor')};define(C,'prototype',{writable:false});define(C,'name',{value:name,configurable:true});delete C.prototype.constructor;return C};
++ const validContext=(v,off)=>{if(!b.context(v,off))throw illegal()};
++ const CanvasGradient=inaccessible('CanvasGradient');method(CanvasGradient.prototype,'addColorStop',2,function(a){if(!b.gradient(this))throw illegal();if(a.length<2)throw invalid();const offset=+a[0],color=text(a[1]);if(!isFinite(offset)||offset<0||offset>1)throw index();b.stop(this,offset,color)});shape(CanvasGradient,'CanvasGradient');
++ const CanvasPattern=inaccessible('CanvasPattern');method(CanvasPattern.prototype,'setTransform',0,function(){if(!b.pattern(this))throw illegal()});shape(CanvasPattern,'CanvasPattern');
++ const TextMetrics=inaccessible('TextMetrics');for(const key of['width','actualBoundingBoxLeft','actualBoundingBoxRight','actualBoundingBoxAscent','actualBoundingBoxDescent','fontBoundingBoxAscent','fontBoundingBoxDescent','emHeightAscent','emHeightDescent','hangingBaseline','alphabeticBaseline','ideographicBaseline'])define(TextMetrics.prototype,key,{get(){if(!b.metrics(this))throw illegal();return b.metric(this,key)},enumerable:true,configurable:true});shape(TextMetrics,'TextMetrics');
++ function Path2D(){if(!new.target)throw invalid();let source='';if(arguments[0]!==undefined){if(b.path(arguments[0]))source=b.pathSource(arguments[0]);else source=text(arguments[0])}b.pathStore(this,source)}
++ delete Path2D.prototype.constructor;define(Path2D,'prototype',{writable:false});method(Path2D.prototype,'addPath',1,function(a){if(!b.path(this))throw illegal();if(a.length<1||!b.path(a[0]))throw invalid();});for(const[name,n]of Object.entries({closePath:0,moveTo:2,lineTo:2,quadraticCurveTo:4,bezierCurveTo:6,arc:5,arcTo:5,ellipse:7,rect:4,roundRect:4}))method(Path2D.prototype,name,n,function(){if(!b.path(this))throw illegal()});shape(Path2D,'Path2D');
++ function makeContext(name,off){
++  const C=inaccessible(name),p=C.prototype;
++  define(p,'canvas',{get(){validContext(this,off);return b.owner(this)},enumerable:true,configurable:true});
++  define(p,'font',{get(){validContext(this,off);return b.read(this,'font')},set(value){validContext(this,off);b.font(this,text(value))},enumerable:true,configurable:true});
++  method(p,'measureText',1,function(a){validContext(this,off);if(!a.length)throw invalid();return b.measure(this,text(a[0]))});
++  method(p,'setLineDash',1,function(a){validContext(this,off);const v=a[0];if(!a.length||v===null||(typeof v!=='object'&&typeof v!=='function')||b.view(v)||typeof v[iterator]!=='function')throw invalid();const values=[];for(const x of v)define(values,values.length,{value:+x,writable:true,enumerable:true,configurable:true});for(let i=0;i<values.length;i++)if(!isFinite(values[i])||values[i]<0)return;b.dash(this,values)});
++  method(p,'getLineDash',0,function(){validContext(this,off);const values=b.dashCopy(this),out=new Array(values.length);for(let i=0;i<values.length;i++)define(out,i,{value:values[i],enumerable:true,writable:true,configurable:true});return out});
++  const defaults={lineDashOffset:0,shadowBlur:0,shadowColor:'rgba(0, 0, 0, 0)',shadowOffsetX:0,shadowOffsetY:0,filter:'none',imageSmoothingEnabled:true,imageSmoothingQuality:'low',direction:'ltr',letterSpacing:'0px',wordSpacing:'0px',fontKerning:'auto',globalAlpha:1,globalCompositeOperation:'source-over',lineWidth:1,lineCap:'butt',lineJoin:'miter',miterLimit:10,textAlign:'start',textBaseline:'alphabetic'};
++  // The target exposes these defaults as writable prototype data properties,
++  // so assignment intentionally retains ordinary JS value/coercion semantics.
++  for(const[key,value]of Object.entries(defaults))define(p,key,{value,writable:true,enumerable:true,configurable:true});
++  for(const key of['strokeStyle','fillStyle'])define(p,key,{get(){validContext(this,off);return b.read(this,key)},set(value){validContext(this,off);if(b.styleObject(value))b.style(this,key,value);else{const normalized=b.color(text(value));if(normalized!==null)b.style(this,key,normalized)}},enumerable:true,configurable:true});
++  method(p,'createImageData',1,function(a){validContext(this,off);if(!a.length)throw invalid();if(a.length===1){const size=b.imageSize(a[0]);if(!size)throw new TypeError('');return new ImageData(size.width,size.height)}return new ImageData(a[0],a[1],a[2])});
++  method(p,'putImageData',3,function(a){validContext(this,off);if(a.length<3||!b.imageSize(a[0]))throw invalid();for(let i=1;i<Math.min(a.length,7);i++)+a[i];});
++  if(!off)method(p,'drawImage',3,function(a){validContext(this,off);if(!a.length)throw invalid();numeric(a,1);numeric(a,2);for(let i=3;i<Math.min(a.length,9);i++)+a[i];});
++  method(p,'getImageData',4,function(a){validContext(this,off);numeric(a,0);numeric(a,1);const w=numeric(a,2)|0,h=numeric(a,3)|0;if(w<=0||h<=0)throw index();return new ImageData(w,h)});
++  for(const[name,n]of Object.entries({save:0,restore:0,scale:2,rotate:1,translate:2,transform:6,setTransform:6,resetTransform:0,clearRect:4,beginPath:0,closePath:0,moveTo:2,lineTo:2,quadraticCurveTo:4,bezierCurveTo:6,arc:5,arcTo:5,rect:4,roundRect:4,ellipse:7,fill:0,stroke:0,clip:0}))method(p,name,n,function(){validContext(this,off)});
++  for(const name of['fillRect','strokeRect'])method(p,name,4,function(a){validContext(this,off);for(let i=0;i<4;i++)numeric(a,i);});
++  for(const name of['fillText','strokeText'])method(p,name,3,function(a){validContext(this,off);if(!a.length)throw invalid();text(a[0]);numeric(a,1);numeric(a,2);if(a[3]!==undefined)+a[3];});
++  for(const name of['isPointInPath','isPointInStroke'])method(p,name,1,function(a){validContext(this,off);if(!a.length)throw invalid();return false});
++  for(const[name,n]of[['createLinearGradient',4],['createRadialGradient',6],['createConicGradient',3]])method(p,name,n,function(a){validContext(this,off);const coords=[];for(let i=0;i<n;i++)define(coords,coords.length,{value:numeric(a,i),writable:true,enumerable:true,configurable:true});return b.makeGradient(name,coords)});
++  method(p,'createPattern',1,function(a){validContext(this,off);if(!a.length)throw invalid();const repetition=a[1]==null?'repeat':text(a[1])||'repeat';if(!['repeat','repeat-x','repeat-y','no-repeat'].includes(repetition))throw new Exception('The string did not match the expected pattern','SyntaxError');return b.makePattern(repetition)});
++  const order=['canvas','font','measureText','setLineDash','getLineDash','lineDashOffset','roundRect','ellipse','isPointInPath','isPointInStroke','createLinearGradient','createRadialGradient','createConicGradient','createPattern','shadowBlur','shadowColor','shadowOffsetX','shadowOffsetY','filter','imageSmoothingEnabled','imageSmoothingQuality','direction','letterSpacing','wordSpacing','fontKerning','globalAlpha','globalCompositeOperation','strokeStyle','lineWidth','lineCap','lineJoin','miterLimit','textAlign','textBaseline','fillStyle','createImageData','putImageData',...(!off?['drawImage']:[]),'getImageData','save','restore','scale','rotate','translate','transform','setTransform','resetTransform','clearRect','fillRect','strokeRect','beginPath','closePath','moveTo','lineTo','quadraticCurveTo','bezierCurveTo','arc','arcTo','rect','fill','stroke','clip','fillText','strokeText'];
++  const descriptors=order.map(key=>[key,own(p,key)]);for(const[key]of descriptors)delete p[key];for(const[key,d]of descriptors)define(p,key,d);
++  return shape(C,name);
++ }
++ const CanvasRenderingContext2D=makeContext('CanvasRenderingContext2D',false),OffscreenCanvasRenderingContext2D=makeContext('OffscreenCanvasRenderingContext2D',true);
++ function OffscreenCanvas(width,height){if(!new.target||arguments.length<2)throw invalid();b.offscreenStore(this,Number(width)>>>0,Number(height)>>>0)}
++ delete OffscreenCanvas.prototype.constructor;define(OffscreenCanvas,'prototype',{writable:false});
++ for(const key of['width','height'])define(OffscreenCanvas.prototype,key,{get(){if(!b.offscreen(this))throw illegal();return b.dimension(this,key)},set(value){if(!b.offscreen(this))throw illegal();b.dimensionSet(this,key,Number(value)>>>0)},enumerable:true,configurable:true});
++ method(OffscreenCanvas.prototype,'getContext',1,function(a){if(!b.offscreen(this))throw illegal();if(!a.length)throw invalid();return b.getContext(this,text(a[0]),true)});
++ method(OffscreenCanvas.prototype,'convertToBlob',0,function(){if(!b.offscreen(this))throw illegal();if(!b.nonzero(this))return Promise.reject(index());return Promise.resolve(new Blob([b.png()],{type:'image/png'}))});
++ method(OffscreenCanvas.prototype,'transferToImageBitmap',0,function(){if(!b.offscreen(this))throw illegal();return null});shape(OffscreenCanvas,'OffscreenCanvas');
++ const html=g.HTMLCanvasElement?.prototype;
++ if(html){
++  method(html,'getContext',1,function(a){if(!b.html(this))throw illegal();if(!a.length)throw invalid();return b.getContext(this,text(a[0]),false)});
++  method(html,'toDataURL',0,function(a){if(!b.html(this))throw illegal();if(a[0]!==undefined)text(a[0]);if(a[1]!==undefined)+a[1];return b.nonzero(this)?'data:image/png;base64,'+b.pngBase64():'data:,'});
++  method(html,'toBlob',1,function(a){if(!b.html(this))throw illegal();if(typeof a[0]!=='function')throw invalid();if(a[1]!==undefined)text(a[1]);if(a[2]!==undefined)+a[2];const callback=a[0],blob=b.nonzero(this)?new Blob([b.png()],{type:'image/png'}):null;b.schedule(()=>apply(callback,g,[blob]));});
++  method(html,'transferControlToOffscreen',0,function(){if(!b.html(this))throw illegal();return new OffscreenCanvas(b.dimension(this,'width'),b.dimension(this,'height'))});
++ }
++ const classes={OffscreenCanvas,OffscreenCanvasRenderingContext2D,CanvasRenderingContext2D,CanvasGradient,CanvasPattern,TextMetrics,Path2D};
++ for(const[name,C]of Object.entries(classes))if(name!=='CanvasRenderingContext2D'||html)define(g,name,{value:C,writable:true,configurable:true});
++ return classes;
++}
++export function installCanvas(realm){
++ if(installed.has(realm))return installed.get(realm);
++ for(const kind of kinds)registerPlatformFactoryKind(kind);
++ const ObjectCtor=realm.Object,apply=Reflect.apply,create=ObjectCtor.create,schedule=realm.setTimeout;let classes;
++ const register=(value,kind,state)=>{registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value};
++ const allocate=(C,kind,state,map)=>{const value=apply(create,ObjectCtor,[C.prototype]);map.set(value,state);return register(value,kind,state)};
++ const b={
++  html:value=>!!documentState(value),offscreen:value=>offscreen.has(value),dimension:(value,key)=>dimensions(value)?.[key],dimensionSet:(value,key,n)=>{offscreen.get(value)[key]=n},nonzero:value=>{const d=dimensions(value);return d.width>0&&d.height>0},
++  offscreenStore(value,width,height){const state=slot({width,height,contexts:new WeakMap(),shared:sharedContext()});offscreen.set(value,state);register(value,'OffscreenCanvas',state)},
++  getContext(owner,type,isOff){if(type!=='2d')return null;const state=canvasState(owner);let value=state.contexts.get(realm);if(!value){const kind=isOff?'OffscreenCanvasRenderingContext2D':'CanvasRenderingContext2D',data=slot({kind,owner,shared:state.shared});value=allocate(classes[kind],kind,data,contexts);state.contexts.set(realm,value)}return value},
++  context:(value,off)=>contexts.get(value)?.kind===(off?'OffscreenCanvasRenderingContext2D':'CanvasRenderingContext2D'),owner:value=>contexts.get(value).owner,read:(value,key)=>contexts.get(value).shared[key],
++  font(value,font){const parsed=fontInfo(font);if(parsed)Object.assign(contexts.get(value).shared,parsed)},
++  style:(value,key,style)=>{contexts.get(value).shared[key]=style},styleObject:value=>gradients.has(value)||patterns.has(value),
++  color(value){if(!color.isColor(value))return null;const hex=color.resolve(value,{format:'hexAlpha'});return hex&&hex.length===7?hex:color.resolve(value,{format:'computedValue'})},
++  dash(value,values){const data=copySequence(values);contexts.get(value).shared.dash=data.length%2?[...data,...data]:data},dashCopy:value=>Array.from(contexts.get(value).shared.dash),view:ArrayBuffer.isView,
++  imageSize(value){const record=platformFactoryRecord(value);return record?.kind==='ImageData'&&record.implementation?{width:record.implementation.width,height:record.implementation.height}:null},
++  gradient:value=>gradients.has(value),stop(value,offset,color){gradients.get(value).stops.push({offset,color})},makeGradient(type,coords){return allocate(classes.CanvasGradient,'CanvasGradient',slot({type,coords:copySequence(coords),stops:[]}),gradients)},
++  pattern:value=>patterns.has(value),makePattern(repetition){return allocate(classes.CanvasPattern,'CanvasPattern',slot({repetition}),patterns)},
++  metrics:value=>metrics.has(value),metric:(value,key)=>metrics.get(value)[key],measure(value,text){const size=contexts.get(value).shared.size,width=textWidth(text,size),ascent=.8*size,descent=.2*size;return allocate(classes.TextMetrics,'TextMetrics',Object.freeze(slot({width,actualBoundingBoxLeft:0,actualBoundingBoxRight:width,actualBoundingBoxAscent:ascent,actualBoundingBoxDescent:descent,fontBoundingBoxAscent:ascent,fontBoundingBoxDescent:descent,emHeightAscent:ascent,emHeightDescent:descent,hangingBaseline:ascent,alphabeticBaseline:0,ideographicBaseline:-descent})),metrics)},
++  path:value=>paths.has(value),pathSource:value=>paths.get(value).source,pathStore(value,source){const data=Object.freeze(slot({source}));paths.set(value,data);register(value,'Path2D',data)},
++  png:()=>encodeRGBAPNG(1,1,new Uint8Array(4)),pngBase64:()=>encodeRGBAPNG(1,1,new Uint8Array(4)).toString('base64'),schedule:callback=>apply(schedule,realm,[callback,0]),
++ };
++ const values=realm.eval(`(${factory.toString()})`)(realm,b);classes=Object.freeze(Object.assign(originalCreate(null),values));installed.set(realm,classes);return classes;
++}
+--- /dev/null
++++ b/src/png.js
+@@ -0,0 +1,22 @@
++// Independent PNG/RFC1950 encoder over real 8-bit RGBA samples. The scanline,
++// DEFLATE, Adler32 and chunk CRCs are generated; no reference image is stored.
++import { deflateRawSync, constants } from 'node:zlib';
++import { types } from 'node:util';
++const MAX_BYTES=64*1024*1024;
++const typed=Object.getPrototypeOf(Uint8Array.prototype),length=Object.getOwnPropertyDescriptor(typed,'length').get,subarray=typed.subarray;
++const table=Uint32Array.from({length:256},(_,value)=>{for(let k=0;k<8;k++)value=(value&1)?0xedb88320^(value>>>1):value>>>1;return value>>>0});
++export function pngCRC(bytes){let value=0xffffffff;for(const byte of bytes)value=table[(value^byte)&255]^(value>>>8);return(value^0xffffffff)>>>0}
++function chunk(type,data){const kind=Buffer.from(type,'ascii'),result=Buffer.alloc(data.length+12);result.writeUInt32BE(data.length);kind.copy(result,4);data.copy(result,8);result.writeUInt32BE(pngCRC(Buffer.concat([kind,data])),result.length-4);return result}
++export function encodeRGBAPNG(width,height,rgba){
++ if(!Number.isInteger(width)||!Number.isInteger(height)||width<1||height<1||width>0x7fffffff||height>0x7fffffff)throw new RangeError('Invalid PNG dimensions');
++ if(!types.isUint8Array(rgba)&&!types.isUint8ClampedArray(rgba))throw new TypeError('PNG samples must be actual 8-bit RGBA bytes');
++ const size=width*height*4;if(!Number.isSafeInteger(size)||size>MAX_BYTES)throw new RangeError('PNG pixel limit exceeded');if(length.call(rgba)!==size)throw new RangeError('PNG sample length does not match dimensions');
++ const stride=width*4,raw=Buffer.alloc(size+height);for(let row=0;row<height;row++){raw[row*(stride+1)]=0;raw.set(subarray.call(rgba,row*stride,(row+1)*stride),row*(stride+1)+1)}
++ const compressed=deflateRawSync(raw,{level:6,strategy:constants.Z_RLE});
++ // Explicit RFC1950 header: DEFLATE,32KiB window, compression level6 metadata,
++ // no preset dictionary. The five check bits make the header divisible by31.
++ const cmf=((15-8)<<4)|8,flags=2<<6,flg=flags+(31-(((cmf<<8)|flags)%31))%31;
++ let a=1,b=0;for(const byte of raw){a=(a+byte)%65521;b=(b+a)%65521}const checksum=Buffer.alloc(4);checksum.writeUInt32BE(((b<<16)|a)>>>0);
++ const idat=Buffer.concat([Buffer.from([cmf,flg]),compressed,checksum]),ihdr=Buffer.alloc(13);ihdr.writeUInt32BE(width);ihdr.writeUInt32BE(height,4);ihdr[8]=8;ihdr[9]=6;
++ return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk('IHDR',ihdr),chunk('IDAT',idat),chunk('IEND',Buffer.alloc(0))]);
++}
+--- /dev/null
++++ b/test/canvas.test.js
+@@ -0,0 +1,44 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {readFile} from 'node:fs/promises';
++import {Browser} from '../src/browser.js';
++async function fixture(t){const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body></body>');return{browser,page,window:page.dom.window}}
++const plain=v=>JSON.parse(JSON.stringify(v));
++for(const file of['canvas-context-native','canvas-slots-native','canvas-conversion-native','canvas-extra-native','canvas-bitmap-native','canvas-async-native'])test(`real Native Canvas controls: ${file}`,async t=>{
++ const{page}=await fixture(t),expression=await readFile(new URL(`../docs/reference/${file}-expression.js`,import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL(`../docs/reference/${file}.json`,import.meta.url),'utf8')).observations;
++ const actual=plain(await page.evaluate(expression));
++ // Native ignores a null transfer-list entry; established candidate transport
++ // explicitly rejects nontransferables. Both raw outcomes are preserved.
++ const skip=new Set(file==='canvas-bitmap-native'?['transfer']:[]);
++ assert.deepEqual(actual.filter(v=>!skip.has(v.name)),expected.filter(v=>!skip.has(v.name)));
++});
++
++const fixtureHashes={'canvas/canvas_rendering_context_2d.html':'255c85f6026fbe04778f7fa754e785354a7dc2cb4ca7e7d0e02bbc32eb9ebf79','canvas/canvas_serialization.html':'c4439ae93104c9f578f8cdf70c7ede2d2358afa6d1ed7a8907377df3790f6c8d','canvas/offscreen_canvas.html':'40788c2460a3f08873d732ca66765b31e978b8b42d6d29fa944b7c8a73f31932','canvas/path2d.html':'5813f8c46cfa42c2d8d9aacc4646fead07f5440548994543260d111ba17ae67c'};
++for(const[path,hash]of Object.entries(fixtureHashes))test(`unchanged native-positive Canvas fixture ${path}`,async t=>{
++ const{upstreamTestRoot}=await import('./upstream-reference.js'),{startFixtureServer}=await import('../scripts/upstream-fixture-server.mjs'),{createHash}=await import('node:crypto');const root=await upstreamTestRoot(),source=await readFile(`${root}/${path}`);assert.equal(createHash('sha256').update(source).digest('hex'),hash);
++ const server=await startFixtureServer(root,{port:0,profile:'static'});t.after(()=>server.close());const browser=new Browser({userAgent:'Lightpanda/1.0'});t.after(()=>browser.close());const page=browser.createPage(),errors=[];page.on('console',e=>{if(e.type==='error')errors.push(e.args.map(String).join(' '))});page.newDocumentScripts.set('external',{source:'globalThis.__lp_external_runner=true;'});await page.navigate(`${server.origin}/src/browser/tests/${path}`);let passed=false;for(let i=0;i<200;i++){passed=page.evaluate('testing.assertOk()')===true;if(passed)break;await new Promise(r=>setTimeout(r,25))}assert.equal(page.evaluate('testing.IS_TEST_RUNNER'),true);assert.equal(passed,true,JSON.stringify(errors));assert.deepEqual(errors,[]);
++});
++
++test('real private Canvas producers carry actual dimensions and independently copied transparent bytes; fakes have no authority',async t=>{
++ const{page,window}=await fixture(t),{canvasSnapshot,canvasDimensions}=await import('../src/canvas.js');const html=window.document.createElement('canvas');html.width=3;html.height=2;const ctx=html.getContext('2d');ctx.fillStyle='red';ctx.fillRect(0,0,3,2);const image=new window.ImageData(1,1);image.data.set([1,2,3,4]);ctx.putImageData(image,0,0);
++ for(const canvas of[html,new window.OffscreenCanvas(3,2)]){const a=canvasSnapshot(canvas),b=canvasSnapshot(canvas);assert.equal(a.width,3);assert.equal(a.height,2);assert.equal(a.bytes.length,24);assert.ok(a.bytes.every(v=>v===0));a.bytes[0]=99;assert.equal(b.bytes[0],0)}
++ assert.equal(canvasSnapshot(Object.create(window.OffscreenCanvas.prototype)),null);assert.equal(canvasDimensions(Object.create(window.OffscreenCanvas.prototype)),null);const large=new window.OffscreenCanvas(100000,100000);assert.deepEqual(canvasDimensions(large),{width:100000,height:100000});assert.throws(()=>canvasSnapshot(large),RangeError);const fake=Object.create(window.HTMLCanvasElement.prototype,Object.getOwnPropertyDescriptors(html));assert.equal(canvasSnapshot(fake),null);assert.throws(()=>window.OffscreenCanvas.prototype.getContext.call({},'2d'),window.TypeError);
++});
++
++test('selected-realm Canvas public values and bytes survive authored internal array/global replacements',async t=>{
++ const{page}=await fixture(t);const value=page.evaluate(`(()=>{const C=OffscreenCanvas,SavedArray=Array,oldPush=Array.prototype.push,oldSome=Array.prototype.some,oldIterator=Array.prototype[Symbol.iterator];const c=new C(2,2),x=c.getContext('2d');let hits=0;try{Object.defineProperty(Array.prototype,'0',{configurable:true,set(){hits++;throw Error('index')}});Array.prototype.push=Array.prototype.some=()=>{hits++;throw Error('private method')};const g=x.createLinearGradient(1,2,3,4);x.setLineDash(new Set([3]));const dash=x.getLineDash();Object.defineProperty(globalThis,'Object',{configurable:true,get(){hits++;throw Error('global')}});const m=x.measureText('ab');return{hits,width:m.width,gradient:g instanceof CanvasGradient,dash:dash instanceof SavedArray&&dash.length===2&&dash[0]===3}}finally{delete Array.prototype[0];Array.prototype.push=oldPush;Array.prototype.some=oldSome;Array.prototype[Symbol.iterator]=oldIterator}})()`);assert.deepEqual(plain(value),{hits:0,width:12,gradient:true,dash:true});
++});
++
++test('actual Canvas heap queries preserve public identities and omit mutable private context/path slots',async t=>{
++ const{page,window}=await fixture(t),{queryHeapObjects}=await import('../src/heap-query.js');window.heapCanvas=new window.OffscreenCanvas(2,3);window.heapContext=window.heapCanvas.getContext('2d');window.heapPath=new window.Path2D('M0 0L1 1');const realm=page.dom.getInternalVMContext();
++ for(const[name,value]of[['OffscreenCanvas',window.heapCanvas],['OffscreenCanvasRenderingContext2D',window.heapContext],['Path2D',window.heapPath]]){const list=queryHeapObjects(window[name].prototype,realm).objects;assert.ok(list.includes(value));assert.equal(Object.getPrototypeOf(list),window.Array.prototype)}
++ const list=queryHeapObjects(window.Object.prototype,realm).objects;assert.equal(list.some(value=>Object.getOwnPropertyDescriptor(value,'owner')?.value===window.heapCanvas&&Object.hasOwn(value,'dash')),false);assert.equal(list.some(value=>Object.getOwnPropertyDescriptor(value,'source')?.value==='M0 0L1 1'),false);
++});
++
++test('genuine utility Canvas wrappers share actual backing state while ordinary JS expandos stay per-world',async t=>{
++ const{serve}=await import('../src/cdp.js'),{connect}=await import('./cdp-client.js');const service=await serve({host:'127.0.0.1',port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`);t.after(async()=>{await client.close();await service.close()});const{targetId}=await client.send('Target.createTarget',{url:'about:blank'}),{sessionId}=await client.send('Target.attachToTarget',{targetId,flatten:true});const send=(m,p)=>client.send(m,p,sessionId),evaluate=(expression,contextId)=>send('Runtime.evaluate',{expression,contextId,returnByValue:true});
++ await evaluate("globalThis.crossCanvas=document.createElement('canvas');crossCanvas.id='cross-canvas';document.body.append(crossCanvas);globalThis.mainContext=crossCanvas.getContext('2d');mainContext.font='20px serif';mainContext.fillStyle='red';mainContext.setLineDash([3]);mainContext.lineWidth=4;");const{frameTree}=await send('Page.getFrameTree',{}),{executionContextId}=await send('Page.createIsolatedWorld',{frameId:frameTree.frame.id,worldName:'canvas-control'});
++ const utilityExpression=await readFile(new URL('../docs/reference/canvas-utility-native-expression.js',import.meta.url),'utf8'),utilityExpected=JSON.parse(await readFile(new URL('../docs/reference/canvas-utility-native.json',import.meta.url),'utf8')).observations,utility=await evaluate(utilityExpression,executionContextId);assert.equal(utility.exceptionDetails,undefined);assert.deepEqual(utility.result.value,utilityExpected);
++ const expression=await readFile(new URL('../docs/reference/canvas-cross-native-expression.js',import.meta.url),'utf8'),expected=JSON.parse(await readFile(new URL('../docs/reference/canvas-cross-after-native.json',import.meta.url),'utf8')).observations;
++ const before=await evaluate(expression,executionContextId);assert.equal(before.exceptionDetails,undefined);assert.deepEqual(before.result.value,expected.before);const after=await evaluate('({font:mainContext.font,style:mainContext.fillStyle,dash:mainContext.getLineDash(),lineWidth:mainContext.lineWidth})');assert.deepEqual(after.result.value,expected.after);
++});
+--- /dev/null
++++ b/test/png.test.js
+@@ -0,0 +1,5 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{inflateSync}from'node:zlib';import{encodeRGBAPNG,pngCRC}from'../src/png.js';
++function decode(bytes){assert.deepEqual([...bytes.subarray(0,8)],[137,80,78,71,13,10,26,10]);const chunks=[];for(let offset=8;offset<bytes.length;){const size=bytes.readUInt32BE(offset),kind=bytes.toString('ascii',offset+4,offset+8),data=bytes.subarray(offset+8,offset+8+size);assert.equal(bytes.readUInt32BE(offset+8+size),pngCRC(bytes.subarray(offset+4,offset+8+size)));chunks.push({kind,data});offset+=size+12}assert.deepEqual(chunks.map(x=>x.kind),['IHDR','IDAT','IEND']);const header=chunks[0].data;assert.equal(header[8],8);assert.equal(header[9],6);const width=header.readUInt32BE(0),height=header.readUInt32BE(4),raw=inflateSync(chunks[1].data),pixels=[];assert.equal(raw.length,(width*4+1)*height);for(let row=0;row<height;row++){assert.equal(raw[row*(width*4+1)],0);pixels.push(...raw.subarray(row*(width*4+1)+1,(row+1)*(width*4+1)))}return{width,height,pixels}}
++
++test('independent PNG encoder stores arbitrary genuine RGBA rows with verified CRC, Adler and DEFLATE data',()=>{const pixels=Uint8Array.from([255,0,0,255,0,255,0,128,0,0,255,64,1,2,3,0]);const bytes=encodeRGBAPNG(2,2,pixels);assert.deepEqual(decode(bytes),{width:2,height:2,pixels:[...pixels]});const corrupted=Buffer.from(bytes);corrupted[40]^=1;assert.throws(()=>decode(corrupted));});
++test('transparent canvas policy uses independently encoded one-pixel image and rejects invalid/oversized sample graphs',()=>{const bytes=encodeRGBAPNG(1,1,new Uint8Array(4));assert.equal(bytes.length,67);assert.deepEqual(decode(bytes),{width:1,height:1,pixels:[0,0,0,0]});assert.throws(()=>encodeRGBAPNG(0,1,new Uint8Array()),RangeError);assert.throws(()=>encodeRGBAPNG(1,1,new Uint8Array(3)),RangeError);assert.throws(()=>encodeRGBAPNG(1,1,{}),TypeError);assert.throws(()=>encodeRGBAPNG(100000,100000,new Uint8Array()),RangeError)});

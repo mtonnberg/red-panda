@@ -218,5 +218,11 @@ main = launchAff_ $
         assert "PureScript Puppeteer reads genuine cloned image pixels and immutable encoded bytes" $ mediaValues == "[2,1,[255,0,0,255,0,128,0,255],true,[0,128,255],17,23]"
         audioSamples <- Browser.evaluateString page "(async()=>{const context=new OfflineAudioContext(1,8,8000);const buffer=context.createBuffer(1,4,8000);buffer.copyToChannel(new Float32Array([0.25,0.5,-0.5,-0.25]),0);const source=context.createBufferSource();source.buffer=buffer;source.connect(context.destination);source.start(2/8000);return JSON.stringify(Array.from((await context.startRendering()).getChannelData(0)))})()"
         assert "PureScript Puppeteer receives actual scheduled offline audio samples" $ audioSamples == "[0,0,0.25,0.5,-0.5,-0.25,0,0]"
+        cssSelection <- Browser.evaluateString page "(()=>{const node=document.createElement('div');node.id='1 #red';document.body.append(node);const selected=document.querySelector('#'+CSS.escape(node.id))===node;node.remove();return JSON.stringify([selected,CSS.supports('(display:grid) and (gap:1px)'),CSS.supports('unknown-property','x'),CSS.supports('selector(:has(a))')])})()"
+        assert "PureScript Puppeteer escapes actual identifiers and evaluates CSS feature conditions" $ cssSelection == "[true,true,false,true]"
+        canvasValues <- Browser.evaluateString page "(()=>{const canvas=document.createElement('canvas'),context=canvas.getContext('2d');canvas.width=2;canvas.height=3;context.fillStyle='red';context.fillRect(0,0,2,3);const image=context.getImageData(0,0,1,1),png=atob(canvas.toDataURL().split(',')[1]);return JSON.stringify([context.canvas===canvas,Array.from(image.data),png.length,png.charCodeAt(0),png.slice(1,4)])})()"
+        assert "PureScript Puppeteer reads actual native-profile Canvas pixels and encoded PNG bytes" $ canvasValues == "[true,[0,0,0,0],67,137,\"PNG\"]"
+        storageValues <- Browser.evaluateString page "(()=>{const area=localStorage;area.clear();try{const value='🐼'.repeat(1310720);area.setItem('quota',value);let error;try{area.setItem('overflow','x')}catch(e){error=e.name}return JSON.stringify([area.getItem('quota')===value,error,area.getItem('overflow')])}finally{area.clear()}})()"
+        assert "PureScript Puppeteer uses the real UTF-8 Storage quota and atomic failed writes" $ storageValues == "[true,\"QuotaExceededError\",null]"
         Browser.closePage page
-        log "PureScript Puppeteer integration: 57 checks passed"
+        log "PureScript Puppeteer integration: 60 checks passed"

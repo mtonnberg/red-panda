@@ -161,6 +161,7 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
 }
 
 export function selectorForSpecificity(source) { try{return parseSelector(source).effective;}catch(error){if(error===NAMESPACE_FALLBACK)return source;throw error;} }
+export function supportsSelector(source){try{return parseSelector(source).groups.length===1;}catch{return false;}}
 
 function predicate(record,element,item) {
  if(item.kind==='never')return false;

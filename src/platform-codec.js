@@ -1,3 +1,4 @@
+import { isCanvasCloneRejected } from './canvas.js';
 import { imageDataRecord, validImageDataRecord, deserializeImageData } from './image-data.js';
 import { encodedChunkData, validEncodedChunk, deserializeEncodedChunk } from './webcodecs-values.js';
 import { installNativePlatformFactories } from './native-platform-factories.js';
@@ -25,6 +26,7 @@ export function createPlatformCodec(realm){
  const failure=message=>new Exception(message,'DataCloneError');
  function serialize(value){
   const provenance=platformFactoryRecord(value);
+  if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
   if(types.isProxy(value)&&!provenance)throw failure('Proxy objects cannot be structured cloned');
   if(provenance?.kind==='VideoColorSpace')throw failure('The object can not be cloned');
   const encoded=encodedChunkData(value);if(encoded){if(!validEncodedChunk(encoded))throw failure('Invalid encoded chunk');return encoded;}

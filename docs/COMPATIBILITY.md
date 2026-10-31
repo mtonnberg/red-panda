@@ -27,20 +27,46 @@ through the ordinary V8 serializer. Broad Window IDL, media processing, wider
 audio/Canvas APIs and protocol/resource behavior remain incomplete.
 
 In the selected additional48 source cohort, the earlier candidate had9 passes.
-The current graph has17 per-case passes and31 application failures after the
+The phase15 graph has17 per-case passes and31 application failures after the
 separately replayed ImageData case. Its first attempt failed during browser setup
 with a WebSocket HTTP200 response and no harness observations; that raw outcome
 is preserved. Native positive controls for these48 span the previously retained
 44, two corrected fixture-route cases and two canonical cases. These scoped,
 separate runs do not establish a full registration/WPT pass rate or speed parity.
 
-The validated checkpoint passes **1106 JavaScript tests,57 PureScript checks
+The preceding checkpoint passed **1106 JavaScript tests,57 PureScript checks
 and13 existing native differential groups**, plus syntax and strict/pedantic
 builds. [Evidence](reference/phase15-integration/validation.json) binds263 inputs
 unchanged across the full run and records exact collection builds on three Node
 versions. The new PureScript flows verify actual image/chunk bytes and scheduled
 offline audio samples through Puppeteer. Earlier checkpoint reports below remain
 historical; they are not cumulative current-source pass rates.
+
+The following CSS namespace slice adds actual realm-local `CSS.escape` and
+`CSS.supports` functions and readonly accessors, including child/utility realms.
+[Its evidence](../proposals/css-namespace/README.md) records1664 native controls,
+eight tests on three Node versions and the unchanged `css.html` passing against
+both targets. Property support recognizes534 inspected names and checks nonempty
+values, following the measured target behavior. Full CSS token recovery,
+property inventory and @supports cascade semantics remain incomplete. This
+focused result does not change the historical full-suite checkpoint above.
+
+The following Storage and Canvas slices preserve actual public objects and
+private backing state. Storage now counts5MiB UTF-8 value bytes, retains both
+areas by context/origin, and shares the original actual wrapper within same-origin
+live frames; key order, reserved-property reflection, protocol classification and
+opaque child initialization remain bounded gaps. Canvas exposes real context,
+Path2D, gradient/pattern and text metric values with shared utility backing state.
+Its measured target profile has ineffective drawing, transparent reads and a1x1
+transparent PNG regardless of nonzero canvas dimensions. An independent encoder
+builds that PNG from actual RGBA samples and verifies CRC/DEFLATE/Adler data;
+general rasterization is not claimed. The current combined checkpoint passes **1,140 JavaScript tests, 60 PureScript
+checks and 13 existing native differential groups**, syntax and strict/pedantic
+builds. [Validation](reference/phase16-integration/validation.json) binds490
+committed source/reference inputs,18 native build artifacts and eight unused
+pre-existing reference files unchanged across the run. All six unchanged affected
+source fixtures pass in a paired native/candidate replay. Diagnostic budgets and
+scoped controls do not establish a full registration/WPT or performance pass rate.
 
 ## Target and evidence boundaries
 

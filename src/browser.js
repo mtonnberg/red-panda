@@ -1,5 +1,8 @@
+import { installCanvas } from './canvas.js';
+import {installCSSNamespace} from './css-namespace.js';
 import {installAudioCore} from './audio-core.js';
 import {installConsole} from './console.js';
+import {installWebStorage} from './web-storage.js';
 import { installImageData } from './image-data.js';
 import { SyncHTTP } from './sync-http.js';
 import {installFrameActivity} from './frame-activity.js';
@@ -214,6 +217,7 @@ export class Page extends EventEmitter {
     const listenerOwnership = installListenerOwnership(window);
     listenerOwnership.scope(() => {
       installErrors(this, window);
+      installWebStorage(this, window);
       installMutations(this, window);
       if (main) implForWrapper(window.document).contentType = this.mimeType;
       installCollections(window, { binding: this.browser.collectionsBinding });
@@ -223,6 +227,7 @@ export class Page extends EventEmitter {
       installBlobURLs(this, window);
       installSelectors(this, window, { isPopoverOpen, getStateRevision: getDialogStateRevision });
       installStyles(this, window);
+      installCSSNamespace(window);
       installInnerText(this, window);
       installCheckVisibility(this, window);
       installIntersection(this, window, installLayout(this, window, this.viewport));
@@ -256,6 +261,7 @@ export class Page extends EventEmitter {
       installWindowMessaging(this, window, { entry: this.browser.runtimeBinding });
       installBroadcast(this, window);
       installImageData(window);
+      installCanvas(window);
       installGeometry(window);
       installWebCodecsValues(window);
       installWebCodecsProcessors(window);
