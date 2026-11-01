@@ -4,7 +4,7 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current composed checkpoint passes **2,190 JavaScript tests, 129 PureScript
+The last complete full workflow, at917f9bd, passes **2,190 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds. The strict build reports zero warnings and errors; runtime
 warnings remain in the untruncated logs. [Full validation](../proposals/feature-composition-full-root-r1/README.md)
@@ -82,7 +82,8 @@ evidence, including Window/document properties, script/module behavior,
 styles/layout, frame lifecycle and timing surfaces. The earlier
 [402/50/3 census](../proposals/conformance-d41/README.md) is preserved separately.
 The audio-context fixture changed from pass to failure at a parameter assertion
-(`expected 0.25, got 0.5`); its cause remains under investigation. Changed outcomes
+(`expected 0.25, got 0.5`). The measured past-time correction below addresses
+the timing-dependent defect; this census retains its original failure. Changed outcomes
 between these different code graphs do not establish which change caused them.
 
 Canonical Markdown now reads actual author-style producers and backend nodes,
@@ -1237,14 +1238,68 @@ reports, complete external logs, before/after guards, actual parent exit0 receip
 controllers, exact profiles and changed-outcome pairs. Every one of1,446 archive
 members passed SHA256/size readback. The historical402/50/3 epoch is unchanged;
 paired outcome differences do not establish causes. In particular, the current
-audio-context parameter failure needs its own Native comparison and correction.
+audio-context parameter failure led to the separate Native comparison and correction
+below; this earlier census was not rerun or reclassified.
 
 [Provider evidence](../proposals/node-provider-r4-linked-controls-incomplete/README.md)
 separately preserves every build epoch, addon compile failure, narrow compile-only
 correction, real addon build, original45s control timeout and its55-marker
 diagnostic. The final marker is before namespace return; it proves neither return
 nor adoption completed. V8 source clears the detached context's microtask queue,
-consistent with the stall, while actual Native retained-realm behavior remains
-unmeasured. No checkpoint, timeout increase or assertion change was used to force
+consistent with the stall. Subsequent Native observations below cover a bounded
+retained-realm prefix. No checkpoint, timeout increase or assertion change was used to force
 acceptance. Generic provider controls and real Window/Document/frame integration
 remain incomplete.
+
+### Audio automation scheduled in the past
+
+AudioParam now normalizes the seven scheduling/cancellation methods against the
+actual context clock. Previously, an implicit `.value` event recorded at a
+positive time could outrank a later explicit event requested at time zero.
+Native controls show the latter time must be clamped to the actual current time.
+The same defect affected suspended contexts, curves, cancellation and real
+offline output after a render pause. The clock, DSP math, suspended state and
+offline intrinsic-value cache are preserved; no event pruning was added.
+Only the observed `setValueAtTime` numeric-conversion order was corrected.
+
+The three-leaf change includes the runtime, six regression tests and their shared
+control program. All50 audio tests pass on each of Node24.22.1,24.19.0 and26.13.0
+(150 executed cases in distinct epochs). On Node24, eight non-clock control
+groups match the retained Native results, and all three unchanged audio source
+fixtures pass within their original2s load/fresh2s assertion limits. Fresh Native
+heldouts cover suspended clocks, error/conversion priority and duration coercion
+that advances the clock. Every raw clock remains recorded.
+
+After exact backed-up application, the installed Root passes50/50 audio tests
+in20.225s and the project syntax check in20.972s. All13,176 guarded inputs match,
+all18 installed native artifacts remain unchanged, and owned processes close.
+[Verified evidence](../proposals/audio-past-time-r2/README.md) preserves the original
+415-census failure and both quieter source passes, which exposed the timing
+dependence without erasing that failure. No new whole455 score, full2190 workflow
+or cross-method invalid-value conversion coverage is inferred.
+
+### Bounded Native retained-realm observations
+
+Active child-realm Promise/import producers fulfilled through both direct and
+parent-adoption paths. After actual same-origin child navigation, the three
+retained plain Promise producers fulfilled via direct `.then()` while parent
+adoption was still pending at each observed0/25/100/500ms checkpoint. That finite
+pending observation is neither successful adoption nor proof of permanent
+cancellation. The cached-import call then caused Native SIGSEGV; its internal
+prefix is unknown and the three later producers did not run.
+
+A separate metadata probe returned the fresh child graph, then produced a Native
+JavaScript error specifically at the old `creationDocument.URL` access. This does
+not prove blanket rejection of old functions. The earlier combined metadata
+probe crashed; its cause is not established by the later getter error. Every
+failed setup, crash, unobserved prefix and cleanup receipt remains separate.
+The custom provider's original45s timeout and ten unrun stages remain unaccepted;
+these observations do not justify restoring every detached queue.
+
+Capture-only initial-load controls also pass six syntax checks and six actual
+cases, including genuine200ms recovery. They prove private queue/Promise callback
+identities and restoration, not a lifecycle fix. Native HTML/XHTML/XML/malformed
+XML frames share the measured readiness/DCL/Window-load/pageshow sequence with
+no Document load; all four reported HTMLDocument wrappers. Those bounded facts
+do not establish other parser/class behavior. The common private lifecycle
+implementation and genuine Window/global indexed interception remain unfinished.

@@ -1,0 +1,95 @@
+diff --git a/src/audio-core.js b/src/audio-core.js
+--- a/src/audio-core.js
++++ b/src/audio-core.js
+@@ -57,7 +57,12 @@
+  // Fresh events have increasing sequence numbers. Insert after the existing
+  // events at the same time, preserving the exact former stable-sort order.
+  function insertParamEvent(state,event){const values=state.events;if(!values.length||event.time>=values[values.length-1].time){values.push(event);return;}let low=0,high=values.length;while(low<high){const at=floor((low+high)/2);if(values[at].time<=event.time)low=at+1;else high=at;}values.splice(low,0,event);}
+- function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=nonnegative(time);automationOverlap(state,time);insertParamEvent(state,record({type,value,time,extra,sequence:state.sequence++}));return object;}
++ // Automation times refer to this actual context's clock, including an
++ // offline render suspended after a completed quantum. Keep the intrinsic
++ // renderedValue cache separate from newly scheduled timeline events.
++ function paramEventTime(state,time){time=nonnegative(time);const context=contexts.get(state.context);return max(time,updateClock(context)/context.rate);}
++ function insertParamValue(state,type,value,time,extra){automationOverlap(state,time);insertParamEvent(state,record({type,value,time,extra,sequence:state.sequence++}));}
++ function addParam(object,type,value,time,extra){const state=brand(params,object);value=float(value);time=paramEventTime(state,time);insertParamValue(state,type,value,time,extra);return object;}
+  function paramValue(state,time,cursor){if(!state.events.length)return state.value;if(cursor&&time<cursor.time){cursor.index=0;cursor.value=state.value;cursor.previousTime=0;cursor.target=null;}let value=cursor?cursor.value:state.value,previousTime=cursor?cursor.previousTime:0,target=cursor?cursor.target:null;if(cursor)cursor.time=time;
+   const current=at=>target?(target.extra===0?target.value:target.value+(value-target.value)*exp(-(at-previousTime)/target.extra)):value;
+   for(let index=cursor?cursor.index:0;index<state.events.length;index++){const event=state.events[index];
+@@ -85,13 +90,13 @@
+   get defaultValue(){return brand(params,this).defaultValue;}
+   get minValue(){return brand(params,this).min??-constant;}
+   get maxValue(){return brand(params,this).max??constant;}
+-  setValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'set',value,time);}
++  setValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();value=number(value);time=number(time);return addParam(this,'set',value,time);}
+   linearRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();return addParam(this,'linear',value,time);}
+   exponentialRampToValueAtTime(value,time){brand(params,this);if(arguments.length<2)throw error();value=float(value);if(value<=0)throw new RangeError('');return addParam(this,'exponential',value,time);}
+   setTargetAtTime(value,time,constant){brand(params,this);if(arguments.length<3)throw error();constant=nonnegative(constant);return addParam(this,'target',value,time,constant);}
+-  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));insertParamEvent(state,record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.curveCount++;return this;}
+-  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);return this;}
+-  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=nonnegative(time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));return addParam(this,'set',value,time);}
++  setValueCurveAtTime(values,time,duration){const state=brand(params,this);if(arguments.length<3)throw error();const original=values;values=internal();const typed=bridge.isFloat32(original);if(!typed&&!bridge.isArray(original))throw error();const count=typed?arrayLength(original):original.length;for(let index=0;index<count;index++)values.push(float(original[index]));const length=values.length;if(length<2)throw dom('InvalidStateError');time=nonnegative(time);duration=nonnegative(duration);if(!duration)throw new RangeError('');time=paramEventTime(state,time);automationOverlap(state,time,time+duration);const copy=internal();for(let at=0;at<length;at++)copy.push(float(values[at]));insertParamEvent(state,record({type:'curve',time,extra:record({values:copy,duration}),sequence:state.sequence++}));state.curveCount++;return this;}
++  cancelScheduledValues(time){const state=brand(params,this);if(!arguments.length)throw error();time=paramEventTime(state,time);state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);return this;}
++  cancelAndHoldAtTime(time){const state=brand(params,this);if(!arguments.length)throw error();time=paramEventTime(state,time);const value=paramValue(state,time);let ramp=null;for(const event of state.events){if(event.type==='curve'&&event.time<time&&(event.extra.hold??event.time+event.extra.duration)>time)event.extra=record({values:event.extra.values,duration:event.extra.duration,hold:time});if(!ramp&&event.time>=time&&(event.type==='linear'||event.type==='exponential'))ramp=event;}state.events=state.events.filter(event=>event.time<time);state.curveCount=state.events.reduce((count,event)=>count+(event.type==='curve'),0);if(ramp)state.events.push(record({type:ramp.type,value,time,sequence:state.sequence++}));insertParamValue(state,'set',float(value),time);return this;}
+  }
+  function handler(target,state,key,value){const next=typeof value==='function'?value:null;state.handlers[key]=next;if(next&&!state.relays[key]){const relay=event=>{const callback=state.handlers[key];if(callback)apply(callback,target,[event]);};state.relays[key]=relay;bridge.listen(target,key,relay,true);}else if(!next&&state.relays[key]){bridge.listen(target,key,state.relays[key],false);delete state.relays[key];}}
+  function nodeCount(state,value){value=uint(value);if(!value||value>32||state.maxChannels&&value>state.maxChannels)throw dom('NotSupportedError');if(state.kind==='destination'&&contexts.get(state.context).realtime&&value>2)throw dom('IndexSizeError');state.channelCount=value;}
+diff --git a/test/audio-past-time.test.js b/test/audio-past-time.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/audio-past-time.test.js
+@@ -0,0 +1,10 @@
++import{test}from'node:test';import assert from'node:assert/strict';import{readFile}from'node:fs/promises';import{Browser}from'../src/browser.js';
++const plain=value=>JSON.parse(JSON.stringify(value));
++async function fixture(action){const b=new Browser({timeout:2000}),p=b.createPage();try{await p.navigate('data:text/html,<body>Audio scheduling');await action(p,p.dom.window)}finally{b.close()}}
++async function actual(p,name){const body=await readFile(new URL('../docs/reference/audio-past-time/controls.mjs',import.meta.url),'utf8');return plain(await p.evaluate('('+body.slice(body.indexOf('async function audioControl'))+')('+JSON.stringify(name)+')'))}
++test('all five past scheduling methods retain their native current value after a delayed implicit setter',{timeout:15000},()=>fixture(async p=>{const x=await actual(p,'delayed-all-scheduling');for(const row of x.rows){assert.equal(row.failure,null);for(const step of row.steps){assert.equal(step.state,'running');if(step.label==='before-implicit-setter')assert.ok(step.time>0);if(step.label==='after-past-explicit-call')assert.equal(step.value,row.method ? .1875 : .3125)}if(row.method){assert.equal(row.returnedThis,true);assert.equal(row.futureFailure,null);assert.equal(row.steps.at(-1).value,.1875)}}}));
++test('past cancellation retains the actual completed event and removes the future event',{timeout:15000},()=>fixture(async p=>{const x=await actual(p,'past-cancel-and-hold');for(const row of x.rows){assert.equal(row.failure,null);assert.equal(row.returnedThis,true);assert.equal(row.steps[0].value,.1875);assert.equal(row.steps.at(-1).value,.1875);assert.ok(row.steps.at(-1).time>0)}}));
++test('a genuinely suspended realtime context still clamps past events to its frozen positive clock',{timeout:15000},()=>fixture(async p=>{const x=await actual(p,'suspended-clock-past-set');assert.ok(x.frozen>0);assert.ok(x.frozen>=x.beforeSuspend);for(const row of x.steps)assert.equal(row.time,x.frozen);assert.equal(x.steps[0].value,.5625);assert.equal(x.steps[1].value,.1875);assert.equal(x.steps[2].value,.1875);assert.equal(x.closedState,'closed')}));
++test('offline getters keep their intrinsic cache while later real samples use the newly scheduled event',{timeout:15000},()=>fixture(async p=>{const x=await actual(p,'offline-cache-and-past-render');assert.equal(x.actualFloat32,true);assert.deepEqual(x.samples,[.4375,.4375,.1640625,.1640625,.1640625,.1640625]);assert.equal(x.steps[1].value,.5625);assert.equal(x.steps[2].value,.5625);assert.equal(x.steps[3].value,.1875);assert.equal(x.steps[0].time,.016);assert.equal(x.steps[3].time,.048)}));
++test('finite time validation remains native and setValueAtTime converts both arguments before value validation',{timeout:15000},()=>fixture(async p=>{const x=await actual(p,'invalid-time-and-coercion-order');for(const row of x.rows.filter(x=>x.kind!=='negative-zero')){assert.equal(row.failure.name,row.kind==='negative'?'RangeError':'TypeError');assert.equal(row.after.value,row.before.value)}assert.deepEqual(x.invalidValueCoercion.trace,['value','time']);assert.equal(x.invalidValueCoercion.failure.typeError,true);assert.deepEqual(x.coercion.trace.map(x=>x.conversion),['value-before','value-after','time-before','time-after']);assert.equal(x.coercion.failure,null);assert.equal(x.coercion.after.value,.34375)}));
++test('past-time scheduling retains private AudioParam brands and actual selected-VM functions and errors',{timeout:15000},()=>fixture(async(p,w)=>{const{getHeapBinding}=await import('../src/native-heap.js'),heap=getHeapBinding(),c=new w.AudioContext();try{const param=c.createGain().gain,method=w.AudioParam.prototype.setValueAtTime;let hits=0,error;const fake=new Proxy({}, {get(){hits++;throw Error('authored')}});assert.throws(()=>method.call(fake,1,0),w.TypeError);assert.equal(hits,0);try{method.call(param,1,NaN)}catch(e){error=e}assert.ok(error instanceof w.TypeError);for(const value of[param,method,error]){assert.equal(heap.sameRealm(value,w.Object.prototype),true);assert.equal(heap.sameRealm(value,{}),false);Object.setPrototypeOf(value,null);assert.equal(heap.sameRealm(value,w.Object.prototype),true)}}finally{await c.close()}}));
+diff --git a/docs/reference/audio-past-time/controls.mjs b/docs/reference/audio-past-time/controls.mjs
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/audio-past-time/controls.mjs
+@@ -0,0 +1,40 @@
++// Authored heldouts; actual context/automation/buffer outputs, no mock or patch.
++export async function audioControl(name){
++ const spin=ms=>{const end=performance.now()+ms;while(performance.now()<end){}},pause=ms=>new Promise(r=>setTimeout(r,ms));
++ const snapshot=(label,c,p)=>({label,time:c.currentTime,state:c.state,value:p.value});
++ const error=e=>({name:e.name,message:e.message,typeError:e instanceof TypeError,rangeError:e instanceof RangeError,domException:e instanceof DOMException});
++ if(name==='delayed-all-scheduling'){
++  const rows=[];
++  for(const method of['setValueAtTime','linearRampToValueAtTime','exponentialRampToValueAtTime','setTargetAtTime','setValueCurveAtTime']){
++   const c=new AudioContext(),p=c.createGain().gain,steps=[];steps.push(snapshot('fresh',c,p));spin(12);steps.push(snapshot('before-implicit-setter',c,p));p.value=.625;steps.push(snapshot('after-implicit-setter',c,p));let failure=null,result;
++   try{result=method==='setTargetAtTime'?p[method](.1875,0,0):method==='setValueCurveAtTime'?p[method]([.1875,.8125],0,.064):p[method](.1875,0)}catch(e){failure=error(e)}
++   steps.push(snapshot('after-past-explicit-call',c,p));let futureFailure=null;try{p.setValueAtTime(.9375,1000)}catch(e){futureFailure=error(e)}steps.push(snapshot('after-future-set',c,p));rows.push({method,steps,returnedThis:result===p,failure,futureFailure});await c.close();
++  }
++  for(const kind of['offset','playbackRate','frequency']){
++   const c=new AudioContext(),node=kind==='offset'?c.createConstantSource():kind==='playbackRate'?c.createBufferSource():c.createOscillator(),p=node[kind];spin(12);const steps=[snapshot('before-implicit-setter',c,p)];p.value=.5625;steps.push(snapshot('after-implicit-setter',c,p));let failure=null;try{p.setValueAtTime(.3125,0)}catch(e){failure=error(e)}steps.push(snapshot('after-past-explicit-call',c,p));rows.push({kind,steps,failure});await c.close();
++  }
++  return{rows};
++ }
++ if(name==='past-cancel-and-hold'){
++  const rows=[];for(const method of['cancelScheduledValues','cancelAndHoldAtTime']){
++   const c=new AudioContext(),p=c.createGain().gain;p.value=.625;const t=c.currentTime;p.setValueAtTime(.1875,t+.008);await pause(24);const steps=[snapshot('after-real-past-event',c,p)];p.setValueAtTime(.8125,c.currentTime+.3);steps.push(snapshot('future-event-added',c,p));let failure=null,result;try{result=p[method](0)}catch(e){failure=error(e)}steps.push(snapshot('after-past-cancellation',c,p));rows.push({method,t,steps,returnedThis:result===p,failure});await c.close();
++  }return{rows};
++ }
++ if(name==='suspended-clock-past-set'){
++  const c=new AudioContext(),p=c.createGain().gain,delivery=[];c.onstatechange=()=>delivery.push({state:c.state,time:c.currentTime});spin(12);const beforeSuspend=c.currentTime;await c.suspend();const frozen=c.currentTime;p.value=.5625;const steps=[snapshot('suspended-implicit-setter',c,p)];p.setValueAtTime(.1875,0);steps.push(snapshot('suspended-past-event',c,p));spin(12);steps.push(snapshot('suspended-after-busy-work',c,p));await c.close();await pause(0);return{beforeSuspend,frozen,steps,delivery,closedState:c.state};
++ }
++ if(name==='offline-cache-and-past-render'){
++  const c=new OfflineAudioContext(1,384,8000),s=c.createConstantSource(),g=c.createGain();s.offset.value=.875;g.gain.value=.5;s.connect(g).connect(c.destination);s.start();const suspended=c.suspend(128/8000),done=c.startRendering();await suspended;const steps=[snapshot('after-real-first-quantum',c,g.gain)];g.gain.value=.5625;steps.push(snapshot('after-intrinsic-setter',c,g.gain));g.gain.setValueAtTime(.1875,0);steps.push(snapshot('after-past-event-before-render',c,g.gain));await c.resume();const buffer=await done,channel=buffer.getChannelData(0),indices=[0,127,128,255,256,383];steps.push(snapshot('after-real-render',c,g.gain));return{steps,rate:buffer.sampleRate,length:buffer.length,channels:buffer.numberOfChannels,actualFloat32:channel instanceof Float32Array,indices,samples:indices.map(i=>channel[i])};
++ }
++ if(name==='invalid-time-and-coercion-order'){
++  const c=new AudioContext(),rows=[];spin(12);
++  const methods=['setValueAtTime','linearRampToValueAtTime','exponentialRampToValueAtTime','setTargetAtTime','setValueCurveAtTime','cancelScheduledValues','cancelAndHoldAtTime'];
++  const invoke=(p,method,time,value=.1875)=>method==='setTargetAtTime'?p[method](value,time,0):method==='setValueCurveAtTime'?p[method]([.1875,.8125],time,.064):method.startsWith('cancel')?p[method](time):p[method](value,time);
++  for(const method of methods)for(const[kind,time]of[['negative',-1],['NaN',NaN],['Infinity',Infinity],['negative-zero',-0]]){
++   const p=c.createGain().gain;p.value=.625;const before=snapshot('before',c,p);let failure=null,result;try{result=invoke(p,method,time)}catch(e){failure=error(e)}rows.push({method,kind,before,after:snapshot('after',c,p),returnedThis:result===p,failure});
++  }
++  const p=c.createGain().gain;p.value=.625;const trace=[],value={valueOf(){trace.push({conversion:'value-before',time:c.currentTime});spin(6);trace.push({conversion:'value-after',time:c.currentTime});return .34375}},time={valueOf(){trace.push({conversion:'time-before',time:c.currentTime});spin(6);trace.push({conversion:'time-after',time:c.currentTime});return 0}};let failure=null;try{p.setValueAtTime(value,time)}catch(e){failure=error(e)}const coercion={trace,failure,after:snapshot('after-real-delayed-coercions',c,p)};
++  const invalidTrace=[];let invalidFailure=null;try{p.setValueAtTime({valueOf(){invalidTrace.push('value');return NaN}},{valueOf(){invalidTrace.push('time');return 0}})}catch(e){invalidFailure=error(e)}await c.close();return{rows,coercion,invalidValueCoercion:{trace:invalidTrace,failure:invalidFailure}};
++ }
++ throw Error('Unknown authored control');
++}
