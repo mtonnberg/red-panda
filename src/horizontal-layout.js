@@ -19,16 +19,16 @@ export function rawTranslation(value){let x=0;for(const match of String(value??'
 export function createHorizontalLayout(window,{style,hidden,viewportWidth,styleRevision}){
  const length=(value,basis)=>resolveFlowLength(value,{width:viewportWidth,height:window.innerHeight},basis);
  const widths=new WeakMap(),intrinsics=new WeakMap(),floors=new WeakMap(),allocations=new WeakMap(),scrolls=new WeakMap(),advances=new WeakMap();
- const css=node=>style(node),outOfFlow=node=>['absolute','fixed'].includes(css(node).position),isFlex=node=>['flex','inline-flex'].includes(css(node).display),isRow=node=>isFlex(node)&&!String(css(node).flexDirection).startsWith('column');
+ const css=node=>style(node),boxDisplay=node=>css(node).boxDisplay??css(node).display,outOfFlow=node=>['absolute','fixed'].includes(css(node).position),isFlex=node=>['flex','inline-flex'].includes(boxDisplay(node)),isRow=node=>isFlex(node)&&!String(css(node).flexDirection).startsWith('column');
  const childLists=new WeakMap();
- function children(node){if(childLists.has(node))return childLists.get(node);const result=[];for(const child of visualChildren(node)){if(hidden(child)||outOfFlow(child))continue;if(css(child).display==='contents')result.push(...children(child));else result.push(child);}childLists.set(node,result);return result;}
- function layoutParent(node){let p=physicalParent(node);while(p&&css(p).display==='contents')p=physicalParent(p);return p;}
- function isItem(node){const p=layoutParent(node);return p&&(isFlex(p)||['grid','inline-grid'].includes(css(p).display))&&!outOfFlow(node);}
- function isContainer(node){const s=css(node);return s.display!=='contents'&&(s.display!=='inline'||(s.float&&s.float!=='none')||outOfFlow(node)||isItem(node));}
+ function children(node){if(childLists.has(node))return childLists.get(node);const result=[];for(const child of visualChildren(node)){if(hidden(child)||outOfFlow(child))continue;if(boxDisplay(child)==='contents')result.push(...children(child));else result.push(child);}childLists.set(node,result);return result;}
+ function layoutParent(node){let p=physicalParent(node);while(p&&boxDisplay(p)==='contents')p=physicalParent(p);return p;}
+ function isItem(node){const p=layoutParent(node);return p&&(isFlex(p)||['grid','inline-grid'].includes(boxDisplay(p)))&&!outOfFlow(node);}
+ function isContainer(node){const s=css(node),display=boxDisplay(node);return display!=='contents'&&(display!=='inline'||(s.float&&s.float!=='none')||outOfFlow(node)||isItem(node));}
  function containingBlock(node){for(let p=physicalParent(node);p;p=physicalParent(p))if(isContainer(p))return p;return null;}
  function margins(node,basis){const s=css(node);return(length(s.marginLeft,basis)??0)+(length(s.marginRight,basis)??0);}
  function clamp(node,value,basis){const s=css(node),min=length(s.minWidth,basis)??0,max=length(s.maxWidth,basis);return Math.max(min,Math.min(max??Infinity,Math.max(0,value)));}
- function content(node,measure){let maximum=0,line=0;const row=isRow(node);for(const child of children(node)){const v=measure(child);if(!row&&blocks.has(css(child).display)){maximum=Math.max(maximum,line,v);line=0;}else line+=v;}return Math.max(maximum,line);}
+ function content(node,measure){let maximum=0,line=0;const row=isRow(node);for(const child of children(node)){const v=measure(child);if(!row&&blocks.has(boxDisplay(child))){maximum=Math.max(maximum,line,v);line=0;}else line+=v;}return Math.max(maximum,line);}
  function intrinsic(node,floor=false){if(hidden(node))return 0;const cache=floor?floors:intrinsics;if(cache.has(node))return cache.get(node);const s=css(node);let value=length(s.width);if(value===undefined){if(floor&&clipped(s.overflowX))value=5;else value=Math.max(5,content(node,child=>intrinsic(child,floor)+margins(child)));}value=clamp(node,value);cache.set(node,value);return value;}
  function baseWidth(node,basis){const s=css(node),fixed=length(s.width,basis);return clamp(node,fixed??intrinsic(node),basis);}
  function allocate(row){if(allocations.has(row))return allocations.get(row);const result=new WeakMap();allocations.set(row,result);const available=width(row),items=children(row),bases=items.map(item=>{const s=css(item),grow=Math.max(0,Number.parseFloat(s.flexGrow)||0),explicit=length(s.width,available);return {node:item,grow,shrink:s.flexShrink!=='0',base:grow>0&&explicit===undefined?0:baseWidth(item,available),margin:margins(item,available),floor:hasSpecifiedStyle(item,'min-width',styleRevision)||clipped(s.overflowX)?0:content(item,child=>intrinsic(child,true)+margins(child))||5};});
@@ -44,14 +44,21 @@ export function createHorizontalLayout(window,{style,hidden,viewportWidth,styleR
   }
   for(let i=0;i<bases.length;i++){const item=bases[i];let value=sizes[i];if(item.grow&&value<=0)value=intrinsic(item.node);result.set(item.node,clamp(item.node,value,available));}return result;
  }
- function width(node){if(widths.has(node))return widths.get(node);if(hidden(node)){widths.set(node,0);return 0;}const s=css(node);if(s.display==='contents'){widths.set(node,0);return 0;}if(node===window.document.documentElement||node===window.document.body){const value=length(s.width,viewportWidth)??viewportWidth;widths.set(node,value);return value;}
+ function width(node){if(widths.has(node))return widths.get(node);if(hidden(node)){widths.set(node,0);return 0;}const s=css(node);if(boxDisplay(node)==='contents'){widths.set(node,0);return 0;}if(node===window.document.documentElement||node===window.document.body){const value=length(s.width,viewportWidth)??viewportWidth;widths.set(node,value);return value;}
   const parent=layoutParent(node);if(parent&&isRow(parent)&&!outOfFlow(node)){const value=allocate(parent).get(node);if(value!==undefined){widths.set(node,value);return value;}}
   const cb=containingBlock(node),basis=cb?width(cb):viewportWidth,explicit=length(s.width,basis);let value=explicit;
-  if(value===undefined){const shrink=replaced.has(node.localName)||['inline','inline-block','inline-flex','inline-grid','table','inline-table'].includes(s.display)||(s.float&&s.float!=='none')||outOfFlow(node)||['max-content','min-content','fit-content'].includes(s.width);value=shrink?intrinsic(node):Math.max(0,basis-margins(node,basis));}
+  if(value===undefined){const shrink=replaced.has(node.localName)||['inline','inline-block','inline-flex','inline-grid','table','inline-table'].includes(boxDisplay(node))||(s.float&&s.float!=='none')||outOfFlow(node)||['max-content','min-content','fit-content'].includes(s.width);value=shrink?intrinsic(node):Math.max(0,basis-margins(node,basis));}
   value=clamp(node,value,basis);widths.set(node,value);return value;
  }
  function advance(node){if(advances.has(node))return advances.get(node);const value=hidden(node)?0:length(css(node).width)??5;advances.set(node,value);return value;}
- function scroll(node){if(scrolls.has(node))return scrolls.get(node);if(hidden(node))return 0;const own=width(node);if(node===window.document.body||node===window.document.documentElement)return own;const basis=own||undefined;const extent=content(node,child=>{const s=css(child),nominal=length(s.width,basis)??width(child),overflow=clipped(s.overflowX)?nominal:scroll(child);return Math.max(nominal,overflow)+margins(child,basis);});const value=Math.max(own,extent);scrolls.set(node,value);return value;}
+ function scroll(node){if(scrolls.has(node))return scrolls.get(node);if(hidden(node))return 0;const own=width(node);if(node===window.document.body||node===window.document.documentElement)return own;
+  // Actual plain-inline boxes contribute intrinsic child widths. Native
+  // fixed-child and percentage-child controls establish this distinction.
+  // Floats, out-of-flow and flex/grid items remain real containers. Percentage
+  // children resolve their own used boxes against the containing block, while
+  // their unresolved intrinsic contribution remains independent of that box.
+  if(!isContainer(node)){const value=Math.max(own,content(node,child=>intrinsic(child,true)+margins(child)));scrolls.set(node,value);return value;}
+  const basis=own||undefined;const extent=content(node,child=>{const s=css(child),nominal=length(s.width,basis)??width(child),overflow=clipped(s.overflowX)?nominal:scroll(child);return Math.max(nominal,overflow)+margins(child,basis);});const value=Math.max(own,extent);scrolls.set(node,value);return value;}
  function translation(node){return rawTranslation(getSpecifiedStyle(node,'transform',styleRevision)??'none');}
  return{width,intrinsic,advance,scroll,translation};
 }

@@ -1,4 +1,4 @@
-import{composedLayoutChildren,retargetLayoutHit}from'./composed-layout-tree.js';
+import{composedLayoutChildren,composedLayoutContains,retargetLayoutHit}from'./composed-layout-tree.js';
 import{platformFactoryRecord}from'./platform-factories.js';
 import{installPlatformFactoryHooks}from'./platform-factory-hooks.js';
 import {captureDocumentMemberFactory} from './document-member-realms.js';
@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const RectFactory=require('jsdom/lib/jsdom/living/generated/DOMRect.js');
 const ElementInterface=require('jsdom/lib/jsdom/living/generated/Element.js');
+const isElementImplementation=ElementInterface.isImpl;
 const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
 const { implForWrapper, wrapperForImpl } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const LAYOUTS=new WeakMap(),COMPUTED_VIEWS=new WeakMap();
@@ -42,39 +43,56 @@ function optionDimension(value, name) {
 }
 
 export function createLayout(window, options = {}) {
-  const rawComputedStyle = options.getComputedStyle ?? window.getComputedStyle.bind(window);
+  const configuredComputedStyle=options.getComputedStyle,defaultProvider=configuredComputedStyle===undefined;
+  const rawComputedStyle = configuredComputedStyle ?? window.getComputedStyle.bind(window);
   let width = optionDimension(options.width ?? 1920, 'Viewport width');
   let height = optionDimension(options.height ?? 1080, 'Viewport height');
   let scrollX = 0, scrollY = 0, scrollObserver, viewportObserver;
-  let cachedKey, cached, cachedFastKey;
+  let cachedKey, cached, cachedFastKey, cachedDocumentImpl, cachedFullGeometry;
   const dimension=value=>resolveFlowLength(value,{width,height});
   const identities = new WeakMap();
   let nextIdentity = 1;
 
-  function snapshot() {
-    const document = window.document;
-    const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,implForWrapper(document)._version,width,height]);
-    if(fastKey!==null&&cachedFastKey===fastKey)return cached;
+  function widthImplementation(node){
+    const implementation=platformFactoryRecord(node)?.implementation;
+    return implementation&&isElementImplementation(implementation)?implementation:undefined;
+  }
+
+  function scrollWidthImplementation(node){
+    const implementation=widthImplementation(node),document=implementation?._ownerDocument;
+    return implementation&&implementation!==document.documentElement&&implementation!==document.body?implementation:undefined;
+  }
+
+  function snapshot(requireFull=false) {
+    const document = window.document,documentImpl=implForWrapper(document);
+    const styleRevision=getLayoutCacheRevision(window),fastKey=styleRevision===undefined?null:JSON.stringify([styleRevision,documentImpl._version,width,height]);
+    if(fastKey!==null&&cachedDocumentImpl===documentImpl&&cachedFastKey===fastKey&&(!requireFull||cachedFullGeometry))return cached;
+    const lazy=!requireFull&&fastKey!==null&&defaultProvider;
     const nodes = [], order = new Map(), computed = new Map(), hidden = new Map(), sizes = new Map(), positions = new Map(),parents=new Map();
     const childNodeLists=new Map(),childElementLists=new Map();
     const children=node=>{let list=childNodeLists.get(node);if(!list){list=composedLayoutChildren(implForWrapper(node)).map(wrapperForImpl);childNodeLists.set(node,list);}return list;};
     const elements=node=>{let list=childElementLists.get(node);if(!list){list=children(node).filter(child=>child.nodeType===1);childElementLists.set(node,list);}return list;};
-    const documentImpl=implForWrapper(document),tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
-    const pending=[{implementation:documentImpl,parent:null}];
-    while(pending.length){
-      const {implementation,parent}=pending.pop(),node=wrapperForImpl(implementation);
-      parents.set(node,parent);order.set(node,nodes.length);nodes.push(node);
-      if(tokens){
-        if(!identities.has(node))identities.set(node,nextIdentity++);
-        tokens.push(identities.get(node),node.nodeType,node.nodeValue);
-        if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
+    const tokens=fastKey===null?[width,height,styleRevision??getStyleRevision(window)]:null;
+    let topologyReady=false,fullReady=false,documentHeight=0;
+    function ensureTopology(){
+      if(topologyReady)return;
+      const pending=[{implementation:documentImpl,parent:null}];
+      while(pending.length){
+        const {implementation,parent}=pending.pop(),node=wrapperForImpl(implementation);
+        parents.set(node,parent);order.set(node,nodes.length);nodes.push(node);
+        if(tokens){
+          if(!identities.has(node))identities.set(node,nextIdentity++);
+          tokens.push(identities.get(node),node.nodeType,node.nodeValue);
+          if(node.attributes)tokens.push([...node.attributes].flatMap(attribute=>[attribute.name,attribute.value]));
+        }
+        const next=children(node);for(let index=next.length-1;index>=0;index--)pending.push({implementation:implForWrapper(next[index]),parent:node});
       }
-      const next=children(node);for(let index=next.length-1;index>=0;index--)pending.push({implementation:implForWrapper(next[index]),parent:node});
+      topologyReady=true;
     }
+    if(!lazy)ensureTopology();
     if(tokens)for(const sheet of document.styleSheets){try{tokens.push([...sheet.cssRules].map(rule=>rule.cssText));}catch{tokens.push(null);}}
     const key=fastKey??JSON.stringify(tokens);
-    if(key===cachedKey)return cached;
-    let documentHeight = nodes.length * 5;
+    if(cachedDocumentImpl===documentImpl&&key===cachedKey&&(!requireFull||cachedFullGeometry))return cached;
     const style = node => {
       if(!computed.has(node)){const projected=getLayoutStyle(node,styleRevision);if(projected)computed.set(node,projected);else{const raw=rawComputedStyle(node);computed.set(node,new Proxy(raw,{get(target,key){if(key==='display')return target.display||'inline';if(key==='float')return target.float||'none';if(key==='position')return target.position||'static';return Reflect.get(target,key,target);}}));}}
       return computed.get(node);
@@ -141,33 +159,71 @@ export function createLayout(window, options = {}) {
       positions.set(node, value); return value;
     }
 
-    // Native document extents differ from individual computed boxes. The
-    // measured root uses inline child advances and nested inline overflow;
-    // stylesheet-only dimensions still affect individual element rectangles.
-    let directHeight = 0;
-    for (const child of document.body?children(document.body):[]) {
-      if (!isHidden(child)) directHeight += dimension(child.style?.height) ?? 5;
-    }
-    documentHeight = Math.max(documentHeight, directHeight, dimension(document.body?.style.height)??0);
-    for (const node of nodes) {
-      const inlineHeight = dimension(node.style?.height);
-      if (inlineHeight !== undefined && !isHidden(node) && node.parentNode !== document.body && !['html', 'body'].includes(node.localName)) {
-        documentHeight = Math.max(documentHeight, order.get(node) * 5 + inlineHeight);
+    function ensureFullGeometry(){
+      if(fullReady)return;
+      ensureTopology();
+      documentHeight=nodes.length*5;
+      // Native document extents differ from individual computed boxes. The
+      // measured root uses inline child advances and nested inline overflow;
+      // stylesheet-only dimensions still affect individual element rectangles.
+      let directHeight = 0;
+      for (const child of document.body?children(document.body):[]) {
+        if (!isHidden(child)) directHeight += dimension(child.style?.height) ?? 5;
       }
+      documentHeight = Math.max(documentHeight, directHeight, dimension(document.body?.style.height)??0);
+      for (const node of nodes) {
+        const inlineHeight = dimension(node.style?.height);
+        if (inlineHeight !== undefined && !isHidden(node) && node.parentNode !== document.body && !['html', 'body'].includes(node.localName)) {
+          documentHeight = Math.max(documentHeight, order.get(node) * 5 + inlineHeight);
+        }
+      }
+
+      fullReady=true;
     }
+    // Explicit providers and the legacy token path keep the original eager
+    // traversal/extent order. Only an authenticated revision/default provider
+    // can leave unrelated global geometry unmaterialized for width reads.
+    if(!lazy)ensureFullGeometry();
 
     function record(node) {
+      ensureFullGeometry();
       if (!order.has(node) || isHidden(node)) return { rect: rectValue(0, 0, 0, 0), rendered: false };
       return { rect: position(node), rendered: true };
     }
-    cachedKey = key;cachedFastKey=fastKey;
-    cached = { nodes, style, record, horizontal,parent:node=>parents.get(node), isRendered:node=>order.has(node)&&!isHidden(node),dimension(node,axis){return order.has(node)&&!isHidden(node)?size(node)[axis]:0;}, contentHeight(node){let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}};
+    cachedKey = key;cachedFastKey=fastKey;cachedDocumentImpl=documentImpl;cachedFullGeometry=fullReady;
+    cached = {
+      // A full consumer creates a fresh eager snapshot rather than reusing
+      // width-only computed maps across a later full-geometry side effect.
+      get nodes(){return fullReady?nodes:snapshot(true).nodes},
+      get style(){return fullReady?style:snapshot(true).style},
+      record(node){return fullReady?record(node):snapshot(true).record(node)},
+      get horizontal(){return fullReady?horizontal:snapshot(true).horizontal},
+      parent(node){return fullReady?parents.get(node):snapshot(true).parent(node)},
+      isRendered(node){
+        const implementation=lazy?widthImplementation(node):undefined;
+        if(lazy&&!implementation)return snapshot(true).isRendered(node);
+        return (lazy?composedLayoutContains(documentImpl,implementation):order.has(node))&&!isHidden(node);
+      },
+      dimension(node,axis){
+        const implementation=axis==='width'?widthImplementation(node):undefined;
+        if(lazy&&!implementation)return snapshot(true).dimension(node,axis);
+        if(!(lazy?composedLayoutContains(documentImpl,implementation):order.has(node))||isHidden(node))return 0;
+        return implementation?horizontal.width(node):size(node)[axis];
+      },
+      scrollIncludes(node){
+        if(!lazy)return nodes.includes(node);
+        const implementation=widthImplementation(node);
+        return implementation?composedLayoutContains(documentImpl,implementation):false;
+      },
+      scrollValue(node){return horizontal.scroll(node)},
+      contentHeight(node){if(!fullReady)return snapshot(true).contentHeight(node);let sum=0;for(const child of elements(node))if(!isHidden(child))sum+=dimension(style(child).height)??5;return Math.max(size(node).height,sum,textHeight(node));}
+    };
     return cached;
   }
 
   function viewportRect(value) { return rectValue(value.x - scrollX, value.y - scrollY, value.width, value.height); }
-  function rect(node) { const value = snapshot().record(node); return value.rendered ? viewportRect(value.rect) : value.rect; }
-  function rects(node) { const value = snapshot().record(node); return value.rendered ? [viewportRect(value.rect)] : []; }
+  function rect(node) { const value = snapshot(true).record(node); return value.rendered ? viewportRect(value.rect) : value.rect; }
+  function rects(node) { const value = snapshot(true).record(node); return value.rendered ? [viewportRect(value.rect)] : []; }
   function quads(node) {
     const value = rect(node);
     return [[value.left, value.top, value.right, value.top, value.right, value.bottom, value.left, value.bottom]];
@@ -180,7 +236,7 @@ export function createLayout(window, options = {}) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
     x = Math.round(x); y = Math.round(y);
     if (x < 0 || y < 0 || x >= width || y >= height) return [];
-    const state=snapshot(),eligible=node=>{
+    const state=snapshot(true),eligible=node=>{
       if(node.nodeType!==1||!state.record(node).rendered)return false;
       const declaration=state.style(node);
       return declaration.display!=='contents'&&declaration.visibility!=='hidden'&&declaration.visibility!=='collapse'&&declaration.pointerEvents!=='none';
@@ -223,14 +279,14 @@ export function createLayout(window, options = {}) {
   }
   function scrollTo(x=0,y=0){scrollAxes(x,y)}
   function scrollIntoView(node, region) {
-    const value = snapshot().record(node);
+    const value = snapshot(true).record(node);
     if (!value.rendered) return;
     const box = rect(node);
     const offset = region?.y ?? 0, regionHeight = region?.height ?? box.height;
     if (box.top + offset < 0 || box.top + offset + regionHeight > height) scrollTo(scrollX, value.rect.y + offset);
   }
   function documentSize() {
-    const state = snapshot();
+    const state = snapshot(true);
     let documentWidth = width;
     for (const node of state.nodes) documentWidth = Math.max(documentWidth, state.record(node).rect.width);
     return { width: documentWidth,
@@ -239,11 +295,17 @@ export function createLayout(window, options = {}) {
   return {
     rect, rects, quads, boxModel, elementsFromPoint, hitTest, intersection, scrollTo, scrollAxes, scrollIntoView,
     setScrollObserver(value){scrollObserver=value},setViewportObserver(value){viewportObserver=value},
-    absoluteRect:node=>snapshot().record(node).rect,
-    dimension:(node,axis)=>snapshot().dimension(node,axis),
-    rendered:node=>snapshot().isRendered(node),
-    scrollWidth:node=>snapshot().nodes.includes(node)?snapshot().horizontal.scroll(node):0,
-    scrollHeight:node=>snapshot().nodes.includes(node)&&snapshot().record(node).rendered?snapshot().contentHeight(node):0,
+    absoluteRect:node=>snapshot(true).record(node).rect,
+    dimension:(node,axis)=>snapshot(axis!=='width'||!widthImplementation(node)).dimension(node,axis),
+    rendered:node=>snapshot(!widthImplementation(node)).isRendered(node),
+    scrollWidth(node){
+      // Root/body, explicit providers and nongenuine/non-Element arguments
+      // keep the exact old eager entry. The default token fallback is also
+      // eager inside snapshot; both branches preserve two real snapshots.
+      if(!defaultProvider||!scrollWidthImplementation(node))return snapshot(true).nodes.includes(node)?snapshot(true).horizontal.scroll(node):0;
+      return snapshot().scrollIncludes(node)?snapshot().scrollValue(node):0;
+    },
+    scrollHeight:node=>snapshot(true).nodes.includes(node)&&snapshot(true).record(node).rendered?snapshot(true).contentHeight(node):0,
     scrollBy(x, y) { scrollTo(scrollX + Number(x || 0), scrollY + Number(y || 0)); },
     get scroll() { return { x: scrollX, y: scrollY }; },
     get documentSize() { return documentSize(); },
@@ -265,6 +327,9 @@ export function installLayout(page, window, options = {}) {
   LAYOUTS.set(implForWrapper(window.document),layout);
   bindCanonicalStyleLayout(implForWrapper(window.document),layout);
   const ownedLayout=element=>{if(!ElementInterface.is(element))throw new window.TypeError('Illegal invocation');return LAYOUTS.get(implForWrapper(element)._ownerDocument)??layout;};
+  const OffsetTypeError=window.TypeError,isElementImplementation=ElementInterface.isImpl;
+  const offsetImplementation=value=>{const implementation=platformFactoryRecord(value)?.implementation;if(!isElementImplementation(implementation))throw new OffsetTypeError('Illegal invocation');return implementation;};
+  const offsetLayout=value=>LAYOUTS.get(offsetImplementation(value)._ownerDocument)??layout;
   const isRoot=element=>{const node=implForWrapper(element);return node===node._ownerDocument.documentElement;};
   installElementScroll(window,implementation=>LAYOUTS.get(implementation._ownerDocument));
   layout.setScrollObserver(installScrollEvents(page,window).windowScroll);
@@ -281,8 +346,11 @@ export function installLayout(page, window, options = {}) {
   };
   define(window.Element.prototype, 'getBoundingClientRect', { writable: true, value() { return domRect(ownedLayout(this).rect(this)); } });
   define(window.Element.prototype, 'getClientRects', { writable: true, value() { return clientRectList(ArrayConstructor,set,ErrorConstructor,ownedLayout(this).rects(this).map(domRect)); } });
+  // Native owns these accessors on Element; generated HTMLElement declarations
+  // would otherwise shadow the same genuine layout operations for HTML nodes.
+  for(const name of ['offsetWidth','offsetHeight','offsetTop','offsetLeft','offsetParent'])delete window.HTMLElement.prototype[name];
   for (const [name, dimension] of [['offsetWidth', 'width'], ['offsetHeight', 'height']]) {
-    define(window.HTMLElement.prototype, name, { get() { return ownedLayout(this).dimension(this,dimension); } });
+    define(window.Element.prototype, name, { get() { return offsetLayout(this).dimension(this,dimension); } });
   }
   for (const [name, dimension] of [['clientWidth', 'width'], ['clientHeight', 'height']]) {
     define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).viewport[dimension] : ownedLayout(this).dimension(this,dimension)); } });
@@ -290,9 +358,9 @@ export function installLayout(page, window, options = {}) {
   for (const [name, dimension] of [['scrollWidth', 'width'], ['scrollHeight', 'height']]) {
     define(window.Element.prototype, name, { get() { return (isRoot(this) ? ownedLayout(this).documentSize[dimension] : dimension==='width'?ownedLayout(this).scrollWidth(this):implForWrapper(this)===implForWrapper(this)._ownerDocument.body?ownedLayout(this).dimension(this,'height'):ownedLayout(this).scrollHeight(this)); } });
   }
-  define(window.HTMLElement.prototype,'offsetTop',{get(){return ownedLayout(this).absoluteRect(this).y;}});
-  define(window.HTMLElement.prototype,'offsetParent',{get(){const model=ownedLayout(this),doc=wrapperForImpl(implForWrapper(this)._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
-  define(window.HTMLElement.prototype,'offsetLeft',{get(){return ownedLayout(this).absoluteRect(this).x;}});
+  define(window.Element.prototype,'offsetTop',{get(){return offsetLayout(this).absoluteRect(this).y;}});
+  define(window.Element.prototype,'offsetParent',{get(){const implementation=offsetImplementation(this),model=LAYOUTS.get(implementation._ownerDocument)??layout,doc=wrapperForImpl(implementation._ownerDocument);if(!model.rendered(this)||this===doc.body||this===doc.documentElement)return null;const own=model.rawComputedStyle(this);if(own.position==='fixed')return null;for(let p=this.parentElement??this.getRootNode().host;p;p=p.parentElement??p.getRootNode().host){const css=model.rawComputedStyle(p);if(css.position&&css.position!=='static')return p;if((!own.position||own.position==='static')&&['td','th','table'].includes(p.localName))return p;}return doc.body;}});
+  define(window.Element.prototype,'offsetLeft',{get(){return offsetLayout(this).absoluteRect(this).x;}});
   const numeric=window.Number,TypeErrorConstructor=window.TypeError,number=value=>{if(typeof value==='symbol')throw new TypeErrorConstructor('Cannot convert a Symbol value to a number');if(typeof value==='bigint')throw new TypeErrorConstructor('Cannot convert a BigInt value to a number');return numeric(value);};
   for(const[kind,prototype]of[['Document',window.Document.prototype],['ShadowRoot',window.ShadowRoot.prototype]]){
     const receiver=value=>{const record=platformFactoryRecord(value),implementation=record?.implementation;

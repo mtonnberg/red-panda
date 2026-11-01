@@ -1,5 +1,6 @@
 import{constructorFor as firstHTMLDocumentConstructor,hasFirstHTMLDocument}from'./html-document-birth.js';
 import {installDocumentXPathEntries} from './document-member-realms.js';
+import {installXPathAxisIteration} from './xpath-axis-iteration.js';
 import {installAttributeNames} from './attribute-names.js';
 import {installNamespaceSerialization} from './namespace-serialization.js';
 import {installSerialization} from './serialization.js';
@@ -105,7 +106,19 @@ function installXPath(window){
  // Correct function evaluation at the AST boundary, not through expression
  // rewrites, fake document nodes or expression-specific expected values.
  const xpath=makeXPath(window),original=xpath.Evaluator.prototype.val;
+ const fuseBareChild=installXPathAxisIteration(xpath,window);
  xpath.Evaluator.prototype.val=function(ast,context){
+  const fused=fuseBareChild(this,ast,context);if(fused!==null)return fused.value;
+  if(Array.isArray(ast)&&ast[0]==='PathExpr'){
+   // A completed path is a forward node-set expression. Axis-step predicates
+   // have already consumed their source-series slots inside this child AST;
+   // outer FilterExpr predicates must count the resulting nodes globally.
+   const value=this.val(ast[1],context),nodes=value!==null&&typeof value==='object'?value.nodes:undefined;
+   if(Array.isArray(nodes))return{nodes};
+   // Preserve the original non-node/error contract without evaluating the
+   // actual child again (including its original null/undefined property error).
+   return value.finalize?{nodes:value.nodes}:value;
+  }
   if(Array.isArray(ast)&&ast[0]==='FunctionCall'&&['name','local-name','namespace-uri'].includes(ast[1])){
    const args=ast[2];if(args.length>1)throw new window.DOMException('Expected zero or one node-set argument','SyntaxError');
    const set=args.length?this.val(args[0],context):context;

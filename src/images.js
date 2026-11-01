@@ -1,3 +1,4 @@
+import {subtreeDefinitelyAbsent,IMAGE_SUBTREE} from './subtree-feature-index.js';
 // Real DOM image source selection, owned tasks and optional real HTTP header
 // inspection. The measured headless default reports selection load without a
 // network request; enabling image resources reads genuine response bytes.
@@ -21,7 +22,7 @@ function state(image){let s=states.get(image);if(!s){s=hidden({image,current:'',
 function attr(node,key){return node.getAttributeNS(null,key)}
 function image(node){return node instanceof ImageImpl}
 function picture(node){return node?.namespaceURI===HTML&&node.localName==='picture'}
-function images(node){if(image(node))return[node];return[...domSymbolTree.treeIterator(node)].filter(image)}
+function images(node){if(image(node))return[node];if(subtreeDefinitelyAbsent(node,IMAGE_SUBTREE))return[];return[...domSymbolTree.treeIterator(node)].filter(image)}
 function sourceSize(text,record){
  for(const part of(text??'').split(',')){const match=part.trim().match(/^(.*?)([+]?(?:\d+(?:\.\d*)?|\.\d+))(px|vw|vh)\s*$/i);if(!match)continue;const condition=match[1].trim();if(condition&&!apply(record.matchMedia,record.window,[condition]).matches)continue;const value=+match[2]*(match[3].toLowerCase()==='vw'?record.window.innerWidth/100:match[3].toLowerCase()==='vh'?record.window.innerHeight/100:1);if(value>0)return value}
  return record.window.innerWidth;

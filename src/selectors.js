@@ -1,4 +1,5 @@
 import{captureDOMExceptionFactory}from'./worker-dom-exception.js';
+import {platformFactoryRecord} from './platform-factories.js';
 import {formAssociatedState} from './element-internals.js';
 // Independent selector parsing and state adapter. No native engine is imported.
 import 'jsdom';
@@ -12,7 +13,27 @@ const DocumentImpl=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').impl
 const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
 const FragmentImpl=require('jsdom/lib/jsdom/living/nodes/DocumentFragment-impl.js').implementation;
 const getAttribute=ElementImpl.prototype.getAttribute;
+const getAttributeNS=ElementImpl.prototype.getAttributeNS,hasAttributeNS=ElementImpl.prototype.hasAttributeNS;
+const InputImpl=require('jsdom/lib/jsdom/living/nodes/HTMLInputElement-impl.js').implementation;
+const SelectImpl=require('jsdom/lib/jsdom/living/nodes/HTMLSelectElement-impl.js').implementation;
+const TextareaImpl=require('jsdom/lib/jsdom/living/nodes/HTMLTextAreaElement-impl.js').implementation;
+const ButtonImpl=require('jsdom/lib/jsdom/living/nodes/HTMLButtonElement-impl.js').implementation;
+const applyBackend=Reflect.apply;
 const RECORDS=new WeakMap();
+// Exact wrapper/backend pairs observed only at private backend producers.
+const SELECTOR_BACKENDS=new WeakMap();
+function selectorFront(node){const front=wrapperForImpl(node);if(node?.nodeType===1&&front)SELECTOR_BACKENDS.set(front,node);return front;}
+function withSelectorRoot(record,root,callback){const previous=record.proofRoot;record.proofRoot=root;try{return callback();}finally{record.proofRoot=previous;}}
+function selectorBackend(record,front){
+ const known=platformFactoryRecord(front)?.implementation??SELECTOR_BACKENDS.get(front);if(known)return known;
+ // Missing canonical fronts can occur for real nodes made before hooks. Walk
+ // only on demand, starting at the active genuine backend receiver/tree.
+ let root=record.proofRoot;if(!root)return undefined;
+ for(let parent;parent=domSymbolTree.parent(root);)root=parent;
+ for(const node of domSymbolTree.treeIterator(root)){if(node.nodeType!==1)continue;const candidate=selectorFront(node);if(candidate===front)return node;}
+ // No negative cache: later actual DOM mutations may add a missing front.
+ return undefined;
+}
 const NAMESPACE_FALLBACK=Symbol('selector namespace handled by existing engine');
 const HTML='http://www.w3.org/1999/xhtml';
 const SPACE=/[\t\n\r\f ]/;
@@ -136,6 +157,8 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
       if(name!=='is'&&name!=='where')fail(window,'Selector function cannot be empty');
       compiled+=emitPredicate({kind:'never'});effective+=`:${name}()`;
      }else{const nested=list(arg,name,name==='has');compiled+=`:${name}(${nested.compiled})`;effective+=`:${name}(${nested.effective})`;}
+    }else if(name==='required'||name==='optional'){
+     if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'required-state',name});effective+=value.slice(i,end);
     }else if(['valid','invalid','disabled','enabled'].includes(name)){
      if(arg!==null)fail(window,'State pseudo-class is not functional');compiled+=emitPredicate({kind:'form-state',name});effective+=value.slice(i,end);
     }else if(name==='empty'){
@@ -167,7 +190,28 @@ function parseSelector(source,{window,emitPredicate=()=>':'+internal+'(0)'}={}) 
 export function selectorForSpecificity(source) { try{return parseSelector(source).effective;}catch(error){if(error===NAMESPACE_FALLBACK)return source;throw error;} }
 export function supportsSelector(source){try{return parseSelector(source).groups.length===1;}catch{return false;}}
 
+// These are real input states where the required content attribute does not
+// participate. Unknown/missing type tokens use the backend's text fallback and
+// therefore share the applicable branch; no public type/required getter is read.
+const requiredInapplicableInputTypes=new Set(['hidden','range','color','button','submit','reset','image']);
+function requiredState(record,element,name){
+ const node=selectorBackend(record,element);
+ // An unproven alias retains the preexisting matcher path. It is never
+ // authenticated as a control from public properties or marker symbols.
+ if(!node)return undefined;
+ if(node._namespaceURI!==HTML)return false;
+ let required;
+ if(node instanceof ButtonImpl)required=false;
+ else if(node instanceof SelectImpl||node instanceof TextareaImpl)required=applyBackend(hasAttributeNS,node,[null,'required']);
+ else if(node instanceof InputImpl){
+  const type=lower(applyBackend(getAttributeNS,node,[null,'type'])??'');
+  required=!requiredInapplicableInputTypes.has(type)&&applyBackend(hasAttributeNS,node,[null,'required']);
+ }else return false;
+ return name==='required'?required:!required;
+}
+
 function predicate(record,element,item) {
+ if(item.kind==='required-state'){const value=requiredState(record,element,item.name);return value===undefined?matcher(record).match(':'+item.name,element):value;}
  if(item.kind==='form-state'){const value=formAssociatedState(element,item.name);return value===undefined?matcher(record).match(':'+item.name,element):value;}
  if(item.kind==='never')return false;
  if(item.kind==='empty'){for(const child of element.childNodes)if(child.nodeType===1||child.nodeType===3&&child.data.length)return false;return true;}
@@ -213,14 +257,14 @@ function match(record,selector,element,scope=element){
  const engine=matcher(record),previous=engine.Snapshot.from;engine.Snapshot.from=scope;
  try{return engine.match(parsed.compiled,element);}finally{engine.Snapshot.from=previous;}
 }
-function select(record,root,selector,first){
+function select(record,root,selector,first){return withSelectorRoot(record,root,()=>{
  const parsed=compiled(record,selector);if(!record.document.documentElement)return first?null:[];
  // Validate/compile even if the queried subtree has no candidate elements.
- const universal=parsed.compiled==='*';if(!universal)match(record,selector,record.document.documentElement,wrapperForImpl(root));
+ const universal=parsed.compiled==='*';if(!universal)match(record,selector,selectorFront(record.documentImpl.documentElement),wrapperForImpl(root));
  const result=[];const scope=wrapperForImpl(root);
- for(const node of domSymbolTree.treeIterator(root)){if(node===root||node.nodeType!==1)continue;if(universal||match(record,selector,wrapperForImpl(node),scope)){if(first)return node;result.push(node);}}
+ for(const node of domSymbolTree.treeIterator(root)){if(node===root||node.nodeType!==1)continue;if(universal||match(record,selector,selectorFront(node),scope)){if(first)return node;result.push(node);}}
  return first?null:result;
-}
+});}
 for(const Interface of [DocumentImpl,ElementImpl,FragmentImpl])for(const name of ['querySelector','querySelectorAll']){
  const original=Interface.prototype[name];Interface.prototype[name]=function(selector){const record=RECORDS.get(this._ownerDocument);if(!record)return original.call(this,selector);try{const nodes=select(record,this,selector,name==='querySelector');return name==='querySelector'?nodes:NodeList.createImpl(this._globalObject,[],{nodes});}catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);throw error;}};
 }
@@ -229,9 +273,9 @@ const getId=DocumentImpl.prototype.getElementById;DocumentImpl.prototype.getElem
  for(const node of domSymbolTree.treeIterator(this))if(node.nodeType===1&&getAttribute.call(node,'id')===id)return node;return null;
 };
 for(const name of ['matches','closest']){
- const original=ElementImpl.prototype[name];ElementImpl.prototype[name]=function(selector){const record=RECORDS.get(this._ownerDocument);if(!record)return original.call(this,selector);const scope=wrapperForImpl(this);if(name==='matches'){try{return match(record,selector,scope,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);throw error;}}
+ const original=ElementImpl.prototype[name];ElementImpl.prototype[name]=function(selector){const record=RECORDS.get(this._ownerDocument);if(!record)return original.call(this,selector);const scope=selectorFront(this);if(name==='matches'){try{return withSelectorRoot(record,this,()=>match(record,selector,scope,scope));}catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);throw error;}}
  if(selector==='')throw record.exception('The string did not match the expected pattern','SyntaxError');
- try {compiled(record,selector);for(let node=this;node&&node.nodeType===1;node=domSymbolTree.parent(node))if(match(record,selector,wrapperForImpl(node),scope))return wrapperForImpl(node);return null;}
+ try {compiled(record,selector);return withSelectorRoot(record,this,()=>{for(let node=this;node&&node.nodeType===1;node=domSymbolTree.parent(node))if(match(record,selector,selectorFront(node),scope))return wrapperForImpl(node);return null;});}
  catch(error){if(error===NAMESPACE_FALLBACK)return original.call(this,selector);if(error?.name==='SyntaxError')throw new record.window.Error(error.message);throw error;}
  };
 }
@@ -259,11 +303,11 @@ export function getSelectorStateRevision(window) {
 export function matchesInScope(element,selector,scope=element.ownerDocument.documentElement) {
  const record=RECORDS.get(implForWrapper(element.ownerDocument));
  if(!record)return element.matches(selector);
- try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}
+ try{return withSelectorRoot(record,record.documentImpl,()=>match(record,selector,element,scope));}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}
 }
 
 // Host cascade code may reuse its genuine document record and scoping root.
-export function createScopedMatcher(document,scope=document.documentElement){const record=RECORDS.get(implForWrapper(document));if(!record)return(selector,element)=>element.matches(selector);return(selector,element)=>{try{return match(record,selector,element,scope);}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}};}
+export function createScopedMatcher(document,scope=document.documentElement){const record=RECORDS.get(implForWrapper(document));if(!record)return(selector,element)=>element.matches(selector);return(selector,element)=>{try{return withSelectorRoot(record,record.documentImpl,()=>match(record,selector,element,scope));}catch(error){if(error===NAMESPACE_FALLBACK)return element.matches(selector);throw error;}};}
 
 // Conservative stylesheet candidate index: only direct type requirements of
 // every outer selector branch qualify. Logical functions remain unindexed.

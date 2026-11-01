@@ -1,3 +1,4 @@
+import {installSubtreeFeatureIndex,noteInitializedSubtreeNode} from './subtree-feature-index.js';
 import {installLocationFactory} from './location-factory.js';
 import {captureCanonicalDispatchWrapper} from './dom-dispatch-recovery.js';
 import {domWrapperGlobal} from './dom-factory-scope.js';
@@ -17,6 +18,7 @@ export function installPlatformFactoryHooks() {
   installLocationFactory();
   installDOMWrapperRealms();
   installed = true;
+  installSubtreeFeatureIndex();
   const directory = path.dirname(require.resolve('jsdom/lib/jsdom/living/generated/utils.js'));
   const modules = readdirSync(directory).filter(name => name.endsWith('.js') && name !== 'utils.js').map(name => ({ filename:path.join(directory,name), kind:path.basename(name,'.js'), utils:require('jsdom/lib/jsdom/living/generated/utils.js') }));
   for (const kind of ['URL','URLSearchParams']) modules.push({ filename:require.resolve(`whatwg-url/lib/${kind}.js`), kind, utils:require('whatwg-url/lib/utils.js') });
@@ -27,7 +29,8 @@ export function installPlatformFactoryHooks() {
       const value = setup.call(this, wrapper, globalObject, ...args);
       const descriptor = Object.getOwnPropertyDescriptor(wrapper, utils.implSymbol);
       captureCanonicalDispatchWrapper(value,utils.implForWrapper(value)??descriptor?.value);
-      registerPlatformFactory(value, { kind, implementation:utils.implForWrapper(value)??descriptor?.value, globalObject:domWrapperGlobal(value,globalObject) });
+      const record=registerPlatformFactory(value, { kind, implementation:utils.implForWrapper(value)??descriptor?.value, globalObject:domWrapperGlobal(value,globalObject) });
+      noteInitializedSubtreeNode(record.implementation);
       return value;
     };
     if (typeof allocate === 'function') factory.new = function (globalObject, ...args) {

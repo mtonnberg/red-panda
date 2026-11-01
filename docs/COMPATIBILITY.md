@@ -4,7 +4,27 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current installed workflow passes **2,222 JavaScript tests, 129 PureScript
+The latest independent DOM/layout/XPath batch has **2,313-case coverage across
+epochs**. Its first full run passed 2,312 cases and failed one outdated offset
+getter owner lookup. Native places those getters on Element; correcting only
+five test-owner labels preserved all 41 assertions, and the whole six-case file
+then passed. All other 669 source files, including production/native code,
+stayed unchanged. This is not a single clean full-run pass. The original failure,
+91 combined focused cases, 140 selector/parser/form regression cases, 129
+PureScript checks, 13 reference groups, syntax, zero-warning/error strict build
+and successful live example are recorded in the
+[validation archive](../proposals/independent-dom-layout-xpath-670/README.md).
+All validation inputs stayed stable and post-live health reported zero pages.
+
+The batch adds conservative private subtree absence facts and ordinary-factory
+fast paths, lazy fresh width/scroll layout, Native-calibrated generic boxes and
+Element offset getters, iterative XPath descendants and global positional
+filters, and actual initial-XHTML attribute casing with interruption recovery.
+Required/optional matching uses genuine HTML-control eligibility. The historical
+fixture census and earlier layout/timeout/XPath differences keep their original
+scopes; no new whole-census or performance-parity result is claimed.
+
+The previous 74edeac installed workflow passed **2,222 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds. The strict build reports zero warnings and errors; runtime
 warnings remain in the complete logs. [Full validation](../proposals/xpath-declarative-shadow-r1/README.md)

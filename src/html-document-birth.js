@@ -35,7 +35,8 @@ export function selectPrototype(globalObject,prototype,kind,privateData){
  finishInterface(globalObject);return record.prototype;
 }
 export function noteShell(value,globalObject,kind){
+ if(kind!=='Document')return;
  const context=contextFor(globalObject),record=context&&realms.get(context);
- if(kind==='Document'&&record&&Object.getPrototypeOf(value)===record.prototype)fronts.add(value);
+ if(record&&Object.getPrototypeOf(value)===record.prototype)fronts.add(value);
 }
 export function hasFirstHTMLDocument(value){return fronts.has(value);}

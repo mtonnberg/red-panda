@@ -7,7 +7,11 @@ import{readFileSync}from'node:fs';
 import{createHash}from'node:crypto';
 import{platformFactoryRecord}from'./platform-factories.js';
 import{ownsNamespaceNode}from'./namespace-state.js';
-const require=createRequire(import.meta.url),pending=new WeakSet();
+const require=createRequire(import.meta.url),pending=new WeakSet(),initialXMLSources=new WeakMap();
+// Actual initial-response parser scope only; no MIME/public-front lookup can
+// activate source attribute casing. Namespace parsing owns abandoned recovery.
+export function isInitialXMLAttributeSource(document){return initialXMLSources.has(document);}
+export function recoverInitialXMLAttributeSource(document){initialXMLSources.delete(document);}
 let installed=false;
 function verify(name,expected){if(createHash('sha256').update(readFileSync(require.resolve(name))).digest('hex')!==expected)throw Error('Unsupported canonical initial parser source: '+name);}
 function install(){
@@ -38,7 +42,10 @@ function install(){
   // Look up the CURRENT canonical entry: its existing genuine namespace scope
   // consumes source XMLNS declarations at attribute birth, preserves authored
   // setAttributeNS, and retains original Element allocation/script execution.
-  return xml.parseIntoDocument(markup,document);
+  const previous=initialXMLSources.get(document),token={};initialXMLSources.set(document,token);
+  try{return xml.parseIntoDocument(markup,document);}finally{
+   if(initialXMLSources.get(document)===token){if(previous)initialXMLSources.set(document,previous);else initialXMLSources.delete(document);}
+  }
  };
  installed=true;
 }

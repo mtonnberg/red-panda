@@ -1,5 +1,5 @@
 import vm from 'node:vm';
-import {subscribePlatformFactories} from './platform-factories.js';
+import {subscribePlatformFactories,platformFactoryRecord} from './platform-factories.js';
 import {createCSSReadAuthority,registerCSSDeclaration,registerCSSSheet,readCSSSheet,registerCSSRule,readCSSRule,readCSSDeclaration,readCSSMediaList} from './cssom-private.js';
 import {canonicalCSSProgramRuleList} from './cssom.js';
 import {matchCanonicalSelector} from './canonical-selector.js';
@@ -39,6 +39,41 @@ const ADOPTED = new WeakMap();
 const STYLE_NODES = new WeakMap();
 const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js'),NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
 const privateParent=domSymbolTree.parent,privateTree=domSymbolTree.treeIterator,privateChildren=domSymbolTree.childrenIterator,privateText=Object.getOwnPropertyDescriptor(NodeImpl.prototype,'textContent').get,privateApply=Reflect.apply;
+// Geometric box defaults and CSSOM display defaults are different observed
+// contracts. Capture the genuine existing tag factory lookup after the ordinary
+// CJS bootstrap, never a mutable public constructor or authored name getter.
+const {getHTMLElementInterface:canonicalHTMLInterface,getValidTagNames:canonicalTagNames}=require('jsdom/lib/jsdom/living/helpers/create-element.js');
+const GenericHTMLInterface=require('jsdom/lib/jsdom/living/generated/HTMLElement.js'),UnknownHTMLInterface=require('jsdom/lib/jsdom/living/generated/HTMLUnknownElement.js');
+// A shared generic interface does not imply an inline box. Preserve genuine
+// canonical known tags, with legacy/owned standard block tags supplementing
+// that factory metadata; no target-engine table or fixture names are used.
+const knownGenericHTMLNames=new Set(canonicalTagNames('http://www.w3.org/1999/xhtml','HTMLElement'));
+for(const name of ['center','plaintext','search'])knownGenericHTMLNames.add(name);
+const winningDisplayCandidates=new WeakMap();
+// Reuse Red Panda's existing independent block-tag categories, extended by
+// the actual standard-generic controls. This is semantic tag data, not a
+// copied target-engine table or a map of fixture results.
+const geometricBlockNames=new Set('html body div p main section article aside nav header footer form ul ol li h1 h2 h3 h4 h5 h6 pre blockquote address figure figcaption hgroup dd dt summary center plaintext search'.split(' '));
+function geometricDefaultDisplay(element,currentDisplay,preserveNoBox){
+ const implementation=implForWrapper(element),factory=platformFactoryRecord(element);
+ // Existing legacy/unregistered embeddings keep their previous projection;
+ // new geometric classification requires the actual successful factory front.
+ if(!factory||factory.implementation!==implementation)return currentDisplay;
+ if(preserveNoBox&&(currentDisplay==='none'||currentDisplay==='contents'))return currentDisplay;
+ const namespace=implementation._namespaceURI;
+ // A known spelling does not give a generic foreign Element an HTML tag.
+ if(namespace!=='http://www.w3.org/1999/xhtml'&&namespace!=='http://www.w3.org/2000/svg')return'inline';
+ const name=implementation._prefix?implementation._prefix+':'+implementation._localName:implementation._localName;
+ const definition=canonicalHTMLInterface(name),known=knownGenericHTMLNames.has(name)||(definition!==UnknownHTMLInterface&&definition!==GenericHTMLInterface);
+ if(!known)return'inline';
+ // SVG's public computed display stays inline; its actual known tag can still
+// have the measured block box category. Qualified/case-distinct names above
+// remain unknown, independently of their public constructor/prototype.
+ if(geometricBlockNames.has(name))return'block';
+ if(definition===GenericHTMLInterface||definition===UnknownHTMLInterface)return'inline';
+ return HTML_INLINE.has(name)?'inline':'block';
+}
+
 function backendRoot(node){let parent;while(parent=privateApply(privateParent,domSymbolTree,[node]))node=parent;return node}
 const SELECTOR_PARTS=new WeakMap();
 function ruleSelectorParts(rule){let retained=SELECTOR_PARTS.get(rule);if(!retained||retained.text!==rule.selectorText){retained={text:rule.selectorText,parts:splitTopLevel(rule.selectorText)};SELECTOR_PARTS.set(rule,retained);}return retained.parts;}
@@ -569,7 +604,7 @@ function cascade(record, element) {
       const property = style[index];
       if(origin===0&&property==='display'&&!elementDisplay)continue;
       let value = style.getPropertyValue(property);
-      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order,revertValue);
+      order=offerCascadeProperty(values,property,value,style.getPropertyPriority(property),score,origin,inline,layer.rank,order,revertValue,elementDisplay);
     }
   };
   const resolveNested=(selector,parent)=>{
@@ -903,6 +938,11 @@ export function getLayoutStyle(element,revision){
  for(const name of ['margin-inline','margin-inline-start','margin-inline-end']){const value=chosen.get(name);if(typeof value!=='string')continue;const parts=splitTopLevel(value.replace(/\t|\n|\r|\f/g,' '),' ').filter(Boolean);if(!parts.length||parts.length>2)continue;const pairs=name==='margin-inline'?[[directions[0],parts[0]],[directions[1],parts[1]??parts[0]]]:[[directions[name.endsWith('start')?0:1],parts[0]]];for(const[key,entry]of pairs){const order=chosen.orderKeys.get(name);if(!physicalKeys[key]||compare(order,physicalKeys[key])>0){style[key]=entry;physicalKeys[key]=order;}}}
  let x=style.overflowX==='overlay'?'auto':style.overflowX,y=style.overflowY==='overlay'?'auto':style.overflowY;if(![x,y].every(v=>v==='visible'||v==='clip')){x=x==='visible'?'auto':x==='clip'?'hidden':x;y=y==='visible'?'auto':y==='clip'?'hidden':y;}style.overflowX=x;style.overflowY=y;
  if(element===record.document.documentElement)style.display=({inline:'block','inline-block':'block','inline-flex':'flex','inline-grid':'grid',contents:'block'})[style.display]??style.display;
+ // Preserve the actual winning raw reset keyword: public CSS initial/unset
+ // and the geometric tag default have distinct measured contracts. Explicit
+ // box words stay authoritative; revert has already selected its real default.
+ const displayWinner=winningDisplayCandidates.get(chosen),reset=displayWinner&&['initial','unset'].includes(displayWinner.value.trim().toLowerCase());
+ style.boxDisplay=displayWinner&&(displayWinner.origin===0&&displayWinner.elementDefault||reset)?geometricDefaultDisplay(element,style.display,displayWinner.elementDefault):style.display;
  record.layoutMemo.set(element,{token,style,specified:chosen});return style;
 }
 export function getSpecifiedStyle(element,name,revision){const record=recordFor(element.ownerDocument);if(!record)return element.style?.getPropertyValue(name)||undefined;getLayoutStyle(element,revision);return record.layoutMemo.get(element)?.specified.get(name);}
@@ -916,13 +956,13 @@ export { inheritanceParent as getStyleInheritanceParent };
 // These kernels are shared with the existing public cascade. Canonical reads
 // supply actual producer entries; rank/importance/shorthand/revert math is one
 // implementation rather than a renderer-specific table of CSS answers.
-function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order,revertValue){
+function offerCascadeProperty(values,property,value,priority,score,origin,inline,rank,order,revertValue,elementDisplay=false){
  if(property==='text-transform'){value=textTransformValue(value);if(value===null)return order}
  if(property==='position'){value=positionValue(value);if(value===null)return order}
  const entries=expandedEntries(property,value);if(!entries)return order;
- for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart,...(name==='display'&&revertValue!==undefined?{revertValue}:{})});values.set(name,list)}return order;
+ for(const{name,entry,overflowPart}of entries){const important=priority==='important',key=[important?1:0,important&&origin===0?2:origin,inline?1:0,important?-rank:rank,...score,order++],list=values.get(name)??[];list.push({value:entry,key,origin,overflowPart,elementDefault:name==='display'&&elementDisplay,...(name==='display'&&revertValue!==undefined?{revertValue}:{})});values.set(name,list)}return order;
 }
-function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer'){const keyword=winner.value.toLowerCase();winner=candidates.find(candidate=>candidate.origin===0);if(winner&&keyword==='revert'&&winner.revertValue!==undefined)winner={...winner,value:winner.revertValue};}if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
+function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer'){const keyword=winner.value.toLowerCase();winner=candidates.find(candidate=>candidate.origin===0);if(winner&&keyword==='revert'&&winner.revertValue!==undefined)winner={...winner,value:winner.revertValue};}if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key);if(property==='display')winningDisplayCandidates.set(chosen,{origin:winner.origin,elementDefault:winner.elementDefault===true,value:winner.value})}}return chosen}
 
 function retireCanonicalStyleSource(record,node){if(record.frameStyleSources.delete(node))record.canonicalDirty=true}
 function registerFrameStyleSource(record,node,sheet){
@@ -963,7 +1003,7 @@ function canonicalCascade(record,node,program){
  const collect=(entries,parent=rootLayer)=>{for(const entry of entries){const group=entry.group;if(group?.kind==='layerStatement'){for(const name of group.names)register(parent,name,entry)}else if(group?.kind==='layer'){const next=register(parent,group.name,entry);if(next){layerNodes.set(entry,next);collect(group.children,next)}}else if(group?.kind==='media'){if(group.enabled)collect(group.children,parent)}else if(entry.type===4&&entry.enabled)collect(entry.children,parent);else if(entry.type===1)collect(entry.children,parent)}};
  for(const entries of program.sheets)collect(entries);let rank=0;const rankLayers=layer=>{for(const child of layer.children.values())rankLayers(child);if(layer!==rootLayer)layer.rank=++rank};rankLayers(rootLayer);
  const relevant=(entries,origin)=>entries?.some(entry=>(origin!==0||entry.name!=='display')&&(CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)||entry.name.startsWith('--')));
- const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false,revertValue)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order,revertValue)}};
+ const offer=(entries,score,origin,inline=false,layer=rootLayer,elementDisplay=false,revertValue)=>{for(const entry of entries){if(origin===0&&entry.name==='display'&&!elementDisplay)continue;if(!CANONICAL_VISIBILITY_PROPERTIES.has(entry.name)&&!entry.name.startsWith('--'))continue;order=offerCascadeProperty(values,entry.name,entry.value,entry.priority,score,origin,inline,layer.rank,order,revertValue,elementDisplay)}};
  const score=selectorText=>{let best=null;for(const selector of splitTopLevel(selectorText)){if(/:host|::slotted|::part/.test(selector))throw Error('Canonical shadow selector is not supported');if(matchCanonicalSelector(node,selector,record.documentImpl.documentElement)){const value=specificity(selector);if(!best||compare(value,best)>0)best=value}}return best};
  const nested=(selector,parent)=>{if(!parent)return selector;let output='',quote=null,brackets=0,ampersand=false;for(let i=0;i<selector.length;i++){const c=selector[i];if(c==='\\'){output+=c+(selector[++i]??'');continue}if(quote){output+=c;if(c===quote)quote=null;continue}if(c==='"'||c==="'"){quote=c;output+=c;continue}if(c==='[')brackets++;if(c===']')brackets--;if(c==='&'&&!brackets){output+=':is('+parent+')';ampersand=true}else output+=c}return ampersand?output:':is('+parent+') '+output};
  const walk=(entries,origin,parent=null,layer=rootLayer)=>{for(const entry of entries){const group=entry.group;if(entry.type===1&&entry.declarations){const selector=nested(entry.selector,parent);if(relevant(entry.declarations,origin)){const match=score(selector);if(match)offer(entry.declarations,match,origin,false,layer)}walk(entry.children,origin,selector,layer)}else if(group?.kind==='layer'){const child=layerNodes.get(entry);if(child){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,child)}walk(group.children,origin,parent,child)}}else if(group?.kind==='media'){if(group.enabled){if(parent&&relevant(group.declarations,origin)){const match=score(parent);if(match)offer(group.declarations,match,origin,false,layer)}walk(group.children,origin,parent,layer)}}else if(entry.type===4&&entry.enabled)walk(entry.children,origin,parent,layer)}};

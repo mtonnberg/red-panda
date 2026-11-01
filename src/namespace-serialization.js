@@ -1,3 +1,4 @@
+import{isInitialXMLAttributeSource,recoverInitialXMLAttributeSource}from'./initial-document-parser.js';
 import{installQualifiedElementBirth}from'./qualified-element-birth.js';
 import{installXMLQueryPolicy}from'./xml-query-policy.js';
 import{createRequire}from'node:module';
@@ -37,7 +38,7 @@ function withXMLDocument(document,call){
  let state=depth.get(document);if(!state){state={count:0,queued:false};depth.set(document,state);}state.count++;
  // Parsing can enter authored custom-element work. Recover only an abandoned
  // owned scope if VM interruption bypasses this Host finally.
- if(!state.queued){state.queued=true;checkpoint(()=>{state.queued=false;state.count=0;});}
+ if(!state.queued){state.queued=true;checkpoint(()=>{state.queued=false;state.count=0;recoverInitialXMLAttributeSource(document);});}
  try{return call()}finally{state.count--;}
 }
 function fragmentContext(element){
@@ -65,7 +66,7 @@ function patch(){
   if(ownsNamespaceNode(element)){
    if(namespace===XMLNS_NS&&(depth.get(element._ownerDocument)?.count??0)>0)return;
    localName=prefix===null?localName:prefix+':'+localName;prefix=null;namespace=null;
-   if(element._namespaceURI===HTML_NS)localName=lower(localName);
+   if(element._namespaceURI===HTML_NS&&!isInitialXMLAttributeSource(element._ownerDocument))localName=lower(localName);
   }
   return apply(set,this,[element,localName,value,prefix,namespace]);
  };

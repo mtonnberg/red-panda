@@ -1,3 +1,4 @@
+import {subtreeDefinitelyAbsent,TRACK_SUBTREE} from './subtree-feature-index.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import 'jsdom';
 import {createRequire} from 'node:module';
@@ -79,7 +80,7 @@ function reconcile(element){
  const previous=state.media;state.media=media;
  if(media){if(previous!==media&&state.readyState===3){state.readyState=0;state.attempted=false;}maybeLoad(state);queue(state.record,()=>selectDefaults(mediaState(media)));}
 }
-function descendants(node){if(node instanceof TrackImpl)return[node];const out=[];for(const current of domSymbolTree.treeIterator(node))if(current instanceof TrackImpl)out.push(current);return out;}
+function descendants(node){if(node instanceof TrackImpl)return[node];if(subtreeDefinitelyAbsent(node,TRACK_SUBTREE))return[];const out=[];for(const current of domSymbolTree.treeIterator(node))if(current instanceof TrackImpl)out.push(current);return out;}
 function patch(){
  if(patched)return;patched=true;
  for(const name of['_insert','_remove']){

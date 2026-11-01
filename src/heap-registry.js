@@ -13,10 +13,10 @@ export function assertHeapFactoryObservations(){if(factoryObservationFailed)thro
 function object(value){return value!==null&&value!==undefined&&(typeof value==='object'||typeof value==='function'||typeof value==='undefined')}
 export function registerHeapWrapper(value,globalObject,replace){
  if(!object(value))return value;
- const binding=getHeapBinding(),targets=binding.proxyTargets(value);
- for(const target of targets){const previous=canonical.get(target);if(previous!==undefined&&previous!==value&&previous!==replace)throw Error('Heap wrapper identity conflict');canonical.set(target,value)}
+ const binding=getHeapBinding(),proxy=isProxy(value),targets=proxy?binding.proxyTargets(value):undefined;
+ if(proxy)for(const target of targets){const previous=canonical.get(target);if(previous!==undefined&&previous!==value&&previous!==replace)throw Error('Heap wrapper identity conflict');canonical.set(target,value)}
  if(object(globalObject))factoryGlobals.set(value,new WeakRef(globalObject));
- publicValues.add(value);privateValues.delete(value);for(const target of targets)privateValues.delete(target);registrations++;return value;
+ publicValues.add(value);privateValues.delete(value);if(proxy)for(const target of targets)privateValues.delete(target);registrations++;return value;
 }
 export function publishHeapObject(value){if(object(value)){publicValues.add(value);privateValues.delete(value)}return value}
 export function privateHeapObject(value){if(object(value))privateValues.add(value);return value}
