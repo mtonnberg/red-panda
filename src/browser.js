@@ -1,3 +1,5 @@
+import {installHTMLBaseURLs} from './html-base-urls.js';
+import {installHTMLHandlerSlots} from './html-handler-slots.js';
 import {installFileInputs} from './file-inputs.js';
 import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse,disposeNetworkCapture}from'./network-capture.js';
 import {withLocationFactory} from './location-factory.js';
@@ -331,6 +333,7 @@ export class Page extends EventEmitter {
       installForms(this, window);
       installDocumentXML(this, window);
       installHTMLReflections(window);
+      installHTMLBaseURLs(window);
       installConsole(window,{emit:(type,args)=>this.emit('console',{type,args})});
       installCustomElements(this, window);
       this.moduleScripts = installModuleScripts(this, window);
@@ -357,6 +360,7 @@ export class Page extends EventEmitter {
       installDOMIDL(this, window);
       installDOMEvents(this, window);
       installFileInputs(this,window);
+      installHTMLHandlerSlots(window);
       installDOMLifecycle(this, window);
       installSanitizer(this,window);
       installSelection(this, window);

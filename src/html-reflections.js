@@ -16,6 +16,7 @@ function integer(raw,fallback,signed){
 function uint32(value){if(!Number.isFinite(value)||value===0)return 0;const residue=Math.trunc(value)%4294967296;return residue<0?residue+4294967296:residue;}
 function number(value,signed,fallback){const unsigned=uint32(value);return signed?(unsigned>=2147483648?unsigned-4294967296:unsigned):unsigned<=2147483647?unsigned:fallback;}
 const specifications=[
+ ['HTMLDetailsElement','name','name','string',''],
  ['HTMLElement','tabIndex','tabindex','signed',null],
  ['HTMLOListElement','start','start','signed',1],
  ['HTMLOListElement','type','type','string','1'],

@@ -13,6 +13,11 @@ const ErrorEvent = require('jsdom/lib/jsdom/living/generated/ErrorEvent.js');
 const { DOMString } = require('webidl-conversions');
 const EventTargetImpl = require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation;
 const records = new WeakMap();
+const compilerOrigins = new WeakMap();
+// Called by the actual private compiler producer, with its same thrown value.
+export function rememberCompilerOrigin(error, origin) {
+  if (error !== null && (typeof error === "object" || typeof error === "function")) compilerOrigins.set(error, Object.freeze({filename: origin.filename, lineno: origin.lineno, colno: origin.colno}));
+}
 // Actual intrinsic anchors stay rooted by their genuine creation context. The
 // ephemeron value retains inactive ownership while that context remains alive.
 // Weak index entries neither retain old contexts nor use a reusable Window proxy
@@ -49,6 +54,8 @@ function forward(record, value) {
 }
 
 function location(record, value, callerStack) {
+  const compiled = compilerOrigins.get(value);
+  if (compiled) return compiled;
   const stack = read(value, 'stack');
   for (const text of [stack, callerStack]) {
     if (typeof text !== 'string') continue;

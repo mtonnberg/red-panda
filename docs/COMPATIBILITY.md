@@ -56,6 +56,14 @@ creation-context checks. The unchanged upstream pointer fixture also passes.
 65-case administrative timeout and the later matching successful controls.
 Broader privileged driver and builtin-function metadata parity remain open.
 
+Details.name now reflects canonical attributes. Base URL handling and event
+handlers use genuine receiver-VM operations and compiler errors, preserving real
+listener order, noncallable clearing and measured handler placement. The
+[eight-leaf change](../proposals/lifecycle-minimal-r2/README.md) passes 13 focused
+checks on each SDK and all three original fixtures in a separate candidate.
+The current Pointer/lifecycle composition passes 150 selected regressions.
+Loaded document.close scheduling and blank-frame generation remain open.
+
 The fresh [registered-fixture census](../proposals/conformance-d41/README.md)
 at pushed d41fd69 completed all 455 fixtures under eight registration profiles:
 **402 verified passes, 50 assertion failures and three source-load timeouts**.

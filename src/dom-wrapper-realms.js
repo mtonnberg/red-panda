@@ -1,3 +1,4 @@
+import {transformBaseInterface,baseInterfaceHelpers} from './html-base-urls.js';
 import {installURLWrapperRealms} from './url-wrapper-realms.js';
 import {installFileWrapperRealms} from './file-wrapper-realms.js';
 import {isDocumentInterface,transformDocumentInterface} from './document-interface-realms.js';
@@ -105,6 +106,7 @@ export function installDOMWrapperRealms(){
    if(source.split(expression).length!==2)throw new Error('Unexpected generated form.elements getter');
    source=source.replace(expression,'return utils.tryWrapperForImpl(callFactory(globalObject, esValue[implSymbol], "elements", []));');
   }
+  if(kind==='HTMLBaseElement')source=transformBaseInterface(source,originalSource);
   if(kind==='HTMLInputElement'){assertControlInterfaceSource(originalSource,kind);source=transformControlInterfaceInstall(source,kind);}
   if(isAdditionalControlInterface(kind))source=transformAdditionalControlInterface(source,kind,originalSource);
   if(isFoundationalInterface(kind))source=transformFoundationalInterface(source,kind,originalSource);
@@ -118,7 +120,7 @@ export function installDOMWrapperRealms(){
  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
  for(const {factory,kind,full,source} of candidates){
   const module={exports:factory};
-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm','installControlInterface'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm,installControlInterface);
+  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm','installControlInterface','baseInterfaceHelpers'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm,installControlInterface,baseInterfaceHelpers);
   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
   const setup=factory.setup;
   factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};
