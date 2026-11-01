@@ -1,0 +1,67 @@
+--- a/contract.json
++++ b/contract.json
+@@ -1,5 +1,5 @@
+ {
+-  "status": "STATICONLY; addon/runtime UNRUN; outputs unavailable until actual link",
++  "status": "STATIC guard-only derivative; genuine C3 linked, addon/runtime UNRUN; Root57 full validation pending at capture",
+   "buildRoot": "/workspace/shared/node-provider-build-r4",
+   "sourceRoot": "/workspace/shared/node-provider-build-r4/source",
+   "customNode": "/workspace/shared/node-provider-build-r4/source/out/Release/node",
+@@ -78,5 +78,25 @@
+   "runtimeStageCount": 13,
+   "RootOrSDKReuse": "forbidden; protect current Root and all18 production native artifacts",
+   "runtimeLease": "separate after matching own addon build; no automatic chaining",
+-  "continuationProvenance": "reference/manual-continuation-provenance.json"
++  "continuationProvenance": "reference/manual-continuation-provenance.json",
++  "approvedRootEpochPins": {
++    "path": "reference/root57-c3/epoch-pins.json",
++    "sha256": "f36c9b3909afeac8d7c1470249fce7cae6cbd368fe60063115b58bb4b2c87c1e"
++  },
++  "approvedLinkEvidence": {
++    "reportSHA256": "5d741a449aeb96077eef37c58d6d4c7092eb550a8303f49b28c7da59b4f1651c",
++    "outputsManifestSHA256": "6a12b61589a6744ae9f1be520158343f473a14c5beec6f6a21aefa5c2a3e9ad8",
++    "outputs": {
++      "node": {
++        "path": "/workspace/shared/node-provider-build-r4/source/out/Release/node",
++        "sha256": "0593334590d0ad0c253bb4ae884daec9e4058d80e7b03afca5650172918a06a0",
++        "bytes": 129857120
++      },
++      "cctest": {
++        "path": "/workspace/shared/node-provider-build-r4/source/out/Release/cctest",
++        "sha256": "9535d9c7d791648581d390a45de9d77ee2728fd588a2b5a25f33c2addfcb0a5b",
++        "bytes": 132675136
++      }
++    }
++  }
+ }
+--- a/common.py
++++ b/common.py
+@@ -2,8 +2,9 @@
+ import json,hashlib,os,signal,time,subprocess
+ ROOT=Path(__file__).resolve().parent;CONTRACT=json.loads((ROOT/'contract.json').read_text());BUILD=Path(CONTRACT['buildRoot']);SOURCE=Path(CONTRACT['sourceRoot']);OUTPUTS=Path(CONTRACT['futureOutputsManifest']);REPORT=Path(CONTRACT['futureBuildReport']);sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+ def matching_linked_outputs():
++ pins=CONTRACT['approvedLinkEvidence'];assert sha(REPORT)==pins['reportSHA256'] and sha(OUTPUTS)==pins['outputsManifestSHA256'],'Approved C3 link evidence changed'
+  assert OUTPUTS.is_file()and REPORT.is_file(),'R4 link evidence unavailable; future stage UNRUN, never use old SDK/partial binary'
+- outputs=json.loads(OUTPUTS.read_text());report=json.loads(REPORT.read_text());assert report['status']=='BUILT_LINKED_ONLY_TESTS_UNRUN'and report['guardsStable']is True,report.get('status')
++ outputs=json.loads(OUTPUTS.read_text());assert outputs==pins['outputs'],'Approved custom Node/cctest identity changed';report=json.loads(REPORT.read_text());assert report['status']=='BUILT_LINKED_ONLY_TESTS_UNRUN'and report['guardsStable']is True,report.get('status')
+  for name,expected in [('node',CONTRACT['customNode']),('cctest',CONTRACT['customCctest'])]:
+   row=outputs[name];assert row['path']==expected;assert sha(expected)==row['sha256'],name
+  return outputs
+@@ -32,7 +33,17 @@
+  for name in ['node','cctest']:file=Path(CONTRACT['customNode']if name=='node'else CONTRACT['customCctest']);values[str(file)]=sha(file)
+  return values
+ 
++def verify_approved_root_epoch():
++ reference=ROOT/CONTRACT['approvedRootEpochPins']['path'];assert sha(reference)==CONTRACT['approvedRootEpochPins']['sha256'],'Approved Root epoch pin table changed'
++ pins=json.loads(reference.read_text());assert sha(ROOT/pins['applicationJournalFrozenCopy'])==pins['applicationJournalSHA256'],'Frozen application journal changed'
++ app=Path(pins['root'])
++ for relative,wanted in pins['rootAfter645'].items():assert sha(app/relative)==wanted,('Approved Root source/application epoch changed',relative)
++ actual={str(p.relative_to(app)):sha(p)for p in(app/'native/build').rglob('*')if p.is_file()and p.name.endswith(('.node','.node.json'))}
++ assert len(actual)==18 and actual==pins['artifacts18'],'Approved installed18 artifact/manifest set changed'
++ return pins
++
+ def protected_root():
++ verify_approved_root_epoch()
+  app=Path('/workspace/red-panda');files=[p for folder in ['src','bin']for p in(app/folder).rglob('*')if p.is_file()];files.extend(p for p in(app/'native').rglob('*')if p.is_file()and('build'in p.parts or p.suffix in ['.cc','.json','.mjs','.py']));files.extend([app/'package.json',app/'package-lock.json']);artifacts=[p for p in(app/'native/build').rglob('*')if p.is_file()and(p.name.endswith('.node')or p.name.endswith('.node.json'))];assert len(artifacts)==18,len(artifacts)
+  return{str(file):sha(file)for file in sorted(set(files))}
+ 

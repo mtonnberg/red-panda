@@ -1,0 +1,12 @@
+--- a/src/module_wrap.cc
++++ b/src/module_wrap.cc
+@@ -925,6 +925,9 @@
+     return THROW_ERR_MODULE_NOT_INSTANTIATED(realm->env());
+   }
+ 
++  // The namespace is lazy and uses the current native context's map. Enter
++  // the genuine stored module context before its first engine allocation.
++  Context::Scope context_scope(obj->context());
+   Local<Value> result = module->GetModuleNamespace();
+   args.GetReturnValue().Set(result);
+ }

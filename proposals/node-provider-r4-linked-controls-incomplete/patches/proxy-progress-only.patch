@@ -1,0 +1,170 @@
+--- a/proxy-reservation-controls.mjs
++++ b/proxy-progress.mjs
+@@ -3,62 +3,164 @@
+ import vm from 'node:vm';
+ import { createRequire } from 'node:module';
+ import { test } from 'node:test';
++import { writeSync } from 'node:fs'; // DIAG_INSERT
++let diagnosticSequence=0; function progress(phase){writeSync(2,JSON.stringify({diagnostic:'owned-proxy-progress-r1',sequence:++diagnosticSequence,phase})+'\n');} // DIAG_INSERT
++progress("provider:before-load"); // DIAG_INSERT
+ const binding = createRequire(import.meta.url)(process.env.OWNED_PROVIDER_ADDON);
++progress("provider:after-load"); // DIAG_INSERT
+ async function namespace(owner) {
++  progress('namespace:'+owner+':begin'); // DIAG_INSERT
++  progress('namespace:'+owner+':before-prepare-and-create'); // DIAG_INSERT
+   const carrier=vm.prepareOwnedContext();binding.create(carrier);
++  progress('namespace:'+owner+':after-prepare-and-create'); // DIAG_INSERT
++  progress('namespace:'+owner+':before-module-constructor'); // DIAG_INSERT
+   const module=new vm.SourceTextModule(`export const owner=${JSON.stringify(owner)}`,{context:carrier});
+-  await module.link(()=>{});await module.evaluate({timeout:1000});return module.namespace;
++  progress('namespace:'+owner+':after-module-constructor'); // DIAG_INSERT
++  progress('namespace:'+owner+':before-link-await'); // DIAG_INSERT
++  await module.link(()=>{});
++  progress('namespace:'+owner+':after-link-await'); // DIAG_INSERT
++  progress('namespace:'+owner+':before-evaluate-await'); // DIAG_INSERT
++  await module.evaluate({timeout:1000});
++  progress('namespace:'+owner+':after-evaluate-await'); // DIAG_INSERT
++  progress('namespace:'+owner+':before-namespace-return'); // DIAG_INSERT
++  return module.namespace;
+ }
+ 
++progress("case1:before-test"); // DIAG_INSERT
+ await test('active/detached/reused raw proxy cannot become ordinary sandbox; old/new real HDO remain separate',async()=>{
++  progress("case1:entered"); // DIAG_INSERT
++  progress("dependencies:before-A-and-B-await"); // DIAG_INSERT
+   const depA=await namespace('A'),depB=await namespace('B');
++  progress("dependencies:after-A-and-B-await"); // DIAG_INSERT
+   const calls=[];
+   let a,b;
++  progress("prepare:A:before"); // DIAG_INSERT
+   a=vm.prepareOwnedContext({importModuleDynamically(specifier,referrer){
+-    assert.equal(specifier,'dep');assert.equal(referrer,a);calls.push('A');return depA;
++    progress("callback:A:entered"); // DIAG_INSERT
++    assert.equal(specifier,'dep');assert.equal(referrer,a);calls.push('A');
++    progress("callback:A:before-return-namespace"); // DIAG_INSERT
++    return depA;
+   }});
++  progress("prepare:A:after"); // DIAG_INSERT
++  progress("active:create:before"); // DIAG_INSERT
+   const proxy=binding.create(a);
++  progress("active:create:after"); // DIAG_INSERT
++  progress("active:capture-original-VM-functions:before"); // DIAG_INSERT
+   const saved=binding.run(a,'globalThis.marker="A"; ({Object,read:()=>marker,load:()=>import("dep")})');
++  progress("active:capture-original-VM-functions:after"); // DIAG_INSERT
++  progress("active:is-context:before"); // DIAG_INSERT
+   assert.equal(vm.isContext(proxy),false);
++  progress("active:is-context:after"); // DIAG_INSERT
++  progress("active:reject-create-context:before"); // DIAG_INSERT
+   assert.throws(()=>vm.createContext(proxy),{code:'ERR_INVALID_STATE'});
++  progress("active:reject-create-context:after"); // DIAG_INSERT
++  progress("active:reject-run-in-new-context:before"); // DIAG_INSERT
+   assert.throws(()=>vm.runInNewContext('1',proxy),{code:'ERR_INVALID_STATE'});
++  progress("active:reject-run-in-new-context:after"); // DIAG_INSERT
++  progress("active:old-Object-identity:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('Object',a),saved.Object);
++  progress("active:old-Object-identity:after"); // DIAG_INSERT
++  progress("active:direct-old-VM-import-await:before"); // DIAG_INSERT
+   assert.equal((await saved.load()).owner,'A');
++  progress("active:direct-old-VM-import-await:after"); // DIAG_INSERT
++  progress("active:detach:before"); // DIAG_INSERT
+   assert.equal(binding.detach(a),proxy);
++  progress("active:detach:after"); // DIAG_INSERT
++  progress("detached:reject-create-context:before"); // DIAG_INSERT
+   assert.throws(()=>vm.createContext(proxy),{code:'ERR_INVALID_STATE'});
++  progress("detached:reject-create-context:after"); // DIAG_INSERT
++  progress("detached:reject-run-in-new-context:before"); // DIAG_INSERT
+   assert.throws(()=>vm.runInNewContext('1',proxy),{code:'ERR_INVALID_STATE'});
++  progress("detached:reject-run-in-new-context:after"); // DIAG_INSERT
++  progress("detached:old-closure-read:before"); // DIAG_INSERT
+   assert.equal(saved.read(),'A');
++  progress("detached:old-closure-read:after"); // DIAG_INSERT
++  progress("detached:direct-old-VM-import-await:before"); // DIAG_INSERT
+   assert.equal((await saved.load()).owner,'A');
++  progress("detached:direct-old-VM-import-await:after"); // DIAG_INSERT
++  progress("prepare:B:before"); // DIAG_INSERT
+   b=vm.prepareOwnedContext({importModuleDynamically(specifier,referrer){
+-    assert.equal(specifier,'dep');assert.equal(referrer,b);calls.push('B');return depB;
++    progress("callback:B:entered"); // DIAG_INSERT
++    assert.equal(specifier,'dep');assert.equal(referrer,b);calls.push('B');
++    progress("callback:B:before-return-namespace"); // DIAG_INSERT
++    return depB;
+   }});
++  progress("prepare:B:after"); // DIAG_INSERT
++  progress("detached:reuse-create:before"); // DIAG_INSERT
+   assert.equal(binding.create(b,a),proxy);
++  progress("detached:reuse-create:after"); // DIAG_INSERT
++  progress("reused:set-marker:before"); // DIAG_INSERT
+   vm.runInContext('globalThis.marker="B"',b);
++  progress("reused:set-marker:after"); // DIAG_INSERT
++  progress("reused:reject-create-context:before"); // DIAG_INSERT
+   assert.throws(()=>vm.createContext(proxy),{code:'ERR_INVALID_STATE'});
++  progress("reused:reject-create-context:after"); // DIAG_INSERT
++  progress("reused:reject-run-in-new-context:before"); // DIAG_INSERT
+   assert.throws(()=>vm.runInNewContext('1',proxy),{code:'ERR_INVALID_STATE'});
++  progress("reused:reject-run-in-new-context:after"); // DIAG_INSERT
++  progress("reused:old-Object-identity:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('Object',a),saved.Object);
++  progress("reused:old-Object-identity:after"); // DIAG_INSERT
++  progress("reused:old-closure-read:before"); // DIAG_INSERT
+   assert.equal(saved.read(),'A');
++  progress("reused:old-closure-read:after"); // DIAG_INSERT
++  progress("reused:direct-old-VM-import-await:before"); // DIAG_INSERT
+   assert.equal((await saved.load()).owner,'A');
++  progress("reused:direct-old-VM-import-await:after"); // DIAG_INSERT
++  progress("reused:direct-new-script-import-await:before"); // DIAG_INSERT
+   assert.equal((await binding.run(b,'import("dep")')).owner,'B');
++  progress("reused:direct-new-script-import-await:after"); // DIAG_INSERT
++  progress("reused:exact-callback-owner-sequence:before"); // DIAG_INSERT
+   assert.deepEqual(calls,['A','A','A','B']);
++  progress("reused:exact-callback-owner-sequence:after"); // DIAG_INSERT
+   console.log(JSON.stringify({case:'reserved actual proxy',phases:['active','detached','reused'],
+     sameRawIdentity:true,actualCallbackOwners:calls}));
++  progress("case1:body-end"); // DIAG_INSERT
+ });
++progress("case1:test-complete"); // DIAG_INSERT
+ 
++progress("case2:before-test"); // DIAG_INSERT
+ await test('ordinary plain objects and authored Proxy objects retain actual Node contextification',()=>{
++  progress("case2:entered"); // DIAG_INSERT
++  progress("ordinary:124:original-operation:before"); // DIAG_INSERT
+   const carrier=vm.prepareOwnedContext();const raw=binding.create(carrier);
++  progress("ordinary:124:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:127:original-operation:before"); // DIAG_INSERT
+   const plain=vm.runInContext('({answer:40})',carrier);
++  progress("ordinary:127:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:130:original-operation:before"); // DIAG_INSERT
+   const ordinary=vm.createContext(plain);
++  progress("ordinary:130:original-operation:after"); // DIAG_INSERT
+   assert.equal(ordinary,plain);
++  progress("ordinary:134:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('answer+=2;answer',ordinary),42);
++  progress("ordinary:134:original-operation:after"); // DIAG_INSERT
+   const proxy=new Proxy({answer:5},{});
++  progress("ordinary:138:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.createContext(proxy),proxy);
++  progress("ordinary:138:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:141:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('answer+=1;answer',proxy),6);
++  progress("ordinary:141:original-operation:after"); // DIAG_INSERT
+   const lookalike={answer:7,[Symbol.toStringTag]:'GenericOwnedWindow'};
++  progress("ordinary:145:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.createContext(lookalike),lookalike);
++  progress("ordinary:145:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:148:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('answer',lookalike),7);
++  progress("ordinary:148:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:151:original-operation:before"); // DIAG_INSERT
+   binding.detach(carrier);
++  progress("ordinary:151:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:154:original-operation:before"); // DIAG_INSERT
+   const fresh=vm.prepareOwnedContext();assert.equal(binding.create(fresh,carrier),raw);
++  progress("ordinary:154:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:157:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('answer',ordinary),42);
++  progress("ordinary:157:original-operation:after"); // DIAG_INSERT
++  progress("ordinary:160:original-operation:before"); // DIAG_INSERT
+   assert.equal(vm.runInContext('answer',proxy),6);
++  progress("ordinary:160:original-operation:after"); // DIAG_INSERT
++  progress("case2:body-end"); // DIAG_INSERT
+ });
++progress("case2:test-complete"); // DIAG_INSERT

@@ -1,0 +1,89 @@
+--- a/src/module_wrap.cc
++++ b/src/module_wrap.cc
+@@ -925,6 +925,9 @@
+     return THROW_ERR_MODULE_NOT_INSTANTIATED(realm->env());
+   }
+ 
++  // The namespace is lazy and uses the current native context's map. Enter
++  // the genuine stored module context before its first engine allocation.
++  Context::Scope context_scope(obj->context());
+   Local<Value> result = module->GetModuleNamespace();
+   args.GetReturnValue().Set(result);
+ }
+--- /dev/null
++++ b/test/cctest/test_owned_module_namespace.cc
+@@ -0,0 +1,74 @@
++// SOURCE ONLY, UNCOMPILED/UNRUN. Real Node ModuleWrap namespace allocation.
++#include <node.h>
++#include <v8.h>
++#include "env-inl.h"
++#include "node_test_fixture.h"
++using namespace v8;
++class OwnedModuleNamespaceTest : public EnvironmentTestFixture {};
++namespace {
++Local<Value> Settle(Isolate* isolate,Local<Promise> promise){
++  for(int i=0;i<16&&promise->State()==Promise::kPending;++i)isolate->PerformMicrotaskCheckpoint();
++  EXPECT_EQ(promise->State(),Promise::kFulfilled);
++  if(promise->State()!=Promise::kFulfilled)return {};
++  return promise->Result();
++}
++void CheckActualNamespace(Isolate* isolate,Local<Context> host,
++                          Local<Context> owner,Local<Object> module){
++  Local<String> key=String::NewFromUtf8Literal(isolate,"namespace");
++  Local<Value> value;
++  ASSERT_TRUE(module->Get(host,key).ToLocal(&value));
++  ASSERT_TRUE(value->IsModuleNamespaceObject());
++  Local<Object> actual=value.As<Object>();
++  Local<Context> before;
++  ASSERT_TRUE(actual->GetCreationContext().ToLocal(&before));
++  EXPECT_EQ(before,owner);
++  EXPECT_NE(before,host);
++  ASSERT_TRUE(actual->SetPrototypeV2(host,Null(isolate)).FromMaybe(false));
++  Local<Context> after;
++  ASSERT_TRUE(actual->GetCreationContext().ToLocal(&after));
++  EXPECT_EQ(after,owner);
++  EXPECT_TRUE(actual->GetPrototypeV2()->IsNull());
++  EXPECT_EQ(module->Get(host,key).ToLocalChecked(),value);
++  EXPECT_EQ(actual->Get(host,String::NewFromUtf8Literal(isolate,"value"))
++      .ToLocalChecked().As<Number>()->Value(),42);
++}
++}  // namespace
++TEST_F(OwnedModuleNamespaceTest, HostGetterAllocatesInActualOrdinaryModuleContext){
++  const HandleScope handles(isolate_);const Argv argv;Env env{handles,argv};
++  (*env)->options()->experimental_vm_modules=true;
++  auto pending=node::LoadEnvironment(*env,
++      "return (async()=>{const vm=require('node:vm');const context=vm.createContext({});"
++      "const module=new vm.SourceTextModule('export const value=42',{context});"
++      "await module.link(()=>{});await module.evaluate();"
++      "return {module,anchor:vm.runInContext('[]',context)}})();")
++      .ToLocalChecked().As<Promise>();
++  auto result=Settle(isolate_,pending);ASSERT_FALSE(result.IsEmpty());
++  auto values=result.As<Object>();
++  auto anchor=values->Get(env.context(),String::NewFromUtf8Literal(isolate_,"anchor"))
++      .ToLocalChecked().As<Object>();
++  Local<Context> owner;ASSERT_TRUE(anchor->GetCreationContext().ToLocal(&owner));
++  auto module=values->Get(env.context(),String::NewFromUtf8Literal(isolate_,"module"))
++      .ToLocalChecked().As<Object>();
++  CheckActualNamespace(isolate_,env.context(),owner,module);
++}
++TEST_F(OwnedModuleNamespaceTest, HostGetterAllocatesInActualOwnedProviderContext){
++  const HandleScope handles(isolate_);const Argv argv;Env env{handles,argv};
++  (*env)->options()->experimental_vm_modules=true;
++  auto setup=node::LoadEnvironment(*env,
++      "const vm=require('node:vm');return {carrier:vm.prepareOwnedContext(),"
++      "make:async context=>{const module=new vm.SourceTextModule('export const value=42',{context});"
++      "await module.link(()=>{});await module.evaluate();return module}};")
++      .ToLocalChecked().As<Object>();
++  auto carrier=setup->Get(env.context(),String::NewFromUtf8Literal(isolate_,"carrier"))
++      .ToLocalChecked().As<Object>();
++  node::OwnedContextOptions options;
++  auto owner=node::CreateOwnedContext(*env,carrier,ObjectTemplate::New(isolate_),
++      env.context()->GetSecurityToken(),options).ToLocalChecked();
++  auto make=setup->Get(env.context(),String::NewFromUtf8Literal(isolate_,"make"))
++      .ToLocalChecked().As<Function>();
++  Local<Value> args[]={carrier};
++  auto pending=make->Call(env.context(),Undefined(isolate_),1,args)
++      .ToLocalChecked().As<Promise>();
++  auto result=Settle(isolate_,pending);ASSERT_FALSE(result.IsEmpty());
++  CheckActualNamespace(isolate_,env.context(),owner,result.As<Object>());
++}

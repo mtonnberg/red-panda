@@ -1,0 +1,317 @@
+diff --git a/src/env.cc b/src/env.cc
+--- a/src/env.cc
++++ b/src/env.cc
+@@ -81,6 +81,15 @@
+ 
+ constexpr size_t kManagedBufferCacheSize = 64 * 1024;
+ 
++// These cells must not move: parameterless SetWeak stores the address of each
++// Global's own slot for automatic reset. unique_ptr keeps that address stable.
++struct OwnedGlobalProxyReservations {
++  std::vector<std::unique_ptr<v8::Global<v8::Object>>> entries;
++  void Prune() {
++    std::erase_if(entries, [](const auto& cell) { return cell->IsEmpty(); });
++  }
++};
++
+ int const ContextEmbedderTag::kNodeContextTag = 0x6e6f64;
+ void* const ContextEmbedderTag::kNodeContextTagPtr = const_cast<void*>(
+     static_cast<const void*>(&ContextEmbedderTag::kNodeContextTag));
+@@ -335,6 +344,11 @@
+   Isolate* isolate = creator->GetIsolate();
+   IsolateDataSerializeInfo info;
+   HandleScope handle_scope(isolate);
++  // Runtime reservations are deliberately not snapshot payload. Owned creation
++  // is disabled during snapshot builds; embedding live provider state into a
++  // snapshot is unsupported. Uncollected weak entries conservatively reject.
++  owned_global_proxy_reservations_->Prune();
++  CHECK(owned_global_proxy_reservations_->entries.empty());
+   // XXX(joyeecheung): technically speaking, the indexes here should be
+   // consecutive and we could just return a range instead of an array,
+   // but that's not part of the V8 API contract so we use an array
+@@ -580,6 +594,8 @@
+ // this layout only to distinguish internally how the memory of a Node.js
+ // wrapper is managed or whether a wrapper is managed by Node.js.
+ constexpr uint16_t kDefaultCppGCEmbedderID = 0x90de;
++std::unordered_map<Isolate*, std::weak_ptr<OwnedGlobalProxyReservations>>
++    IsolateData::owned_global_proxy_registry_;
+ Mutex IsolateData::isolate_data_mutex_;
+ std::unordered_map<uint16_t, std::unique_ptr<PerIsolateWrapperData>>
+     IsolateData::wrapper_data_map_;
+@@ -629,6 +645,16 @@
+       it = pair.first;
+     }
+     wrapper_data_ = it->second.get();
++    std::erase_if(owned_global_proxy_registry_, [](const auto& item) {
++      return item.second.expired();
++    });
++    auto& weak_state = owned_global_proxy_registry_[isolate];
++    owned_global_proxy_reservations_ = weak_state.lock();
++    if (!owned_global_proxy_reservations_) {
++      owned_global_proxy_reservations_ =
++          std::make_shared<OwnedGlobalProxyReservations>();
++      weak_state = owned_global_proxy_reservations_;
++    }
+   }
+ 
+   if (snapshot_data == nullptr) {
+@@ -638,7 +664,32 @@
+   }
+ }
+ 
+-IsolateData::~IsolateData() {}
++IsolateData::~IsolateData() {
++  // Last-live-Data release resets weak cells while the Isolate is still alive.
++  // No process-global V8 handle remains after this shared state disappears.
++  owned_global_proxy_reservations_.reset();
++  Mutex::ScopedLock lock(isolate_data_mutex_);
++  std::erase_if(owned_global_proxy_registry_, [](const auto& item) {
++    return item.second.expired();
++  });
++}
++
++bool IsolateData::IsReservedOwnedGlobalProxy(Local<Object> value) {
++  HandleScope scope(isolate_);
++  owned_global_proxy_reservations_->Prune();
++  for (const auto& cell : owned_global_proxy_reservations_->entries) {
++    if (cell->Get(isolate_) == value) return true;
++  }
++  return false;
++}
++
++void IsolateData::ReserveOwnedGlobalProxy(Local<Object> value) {
++  CHECK(!value.IsEmpty());
++  if (IsReservedOwnedGlobalProxy(value)) return;
++  auto cell = std::make_unique<v8::Global<Object>>(isolate_, value);
++  cell->SetWeak();  // No callback, owner pointer, strong root, or author code.
++  owned_global_proxy_reservations_->entries.push_back(std::move(cell));
++}
+ 
+ // Deprecated API, embedders should use v8::Object::Wrap() directly instead.
+ void SetCppgcReference(Isolate* isolate,
+diff --git a/src/env.h b/src/env.h
+--- a/src/env.h
++++ b/src/env.h
+@@ -113,6 +113,7 @@
+ 
+ class Environment;
+ class Realm;
++struct OwnedGlobalProxyReservations;
+ 
+ struct IsolateDataSerializeInfo {
+   std::vector<SnapshotIndex> primitive_values;
+@@ -150,6 +151,10 @@
+   SET_SELF_SIZE(IsolateData)
+   void MemoryInfo(MemoryTracker* tracker) const override;
+   IsolateDataSerializeInfo Serialize(v8::SnapshotCreator* creator);
++
++  // Eligibility only; never a context/brand/creation-realm lookup.
++  bool IsReservedOwnedGlobalProxy(v8::Local<v8::Object> value);
++  void ReserveOwnedGlobalProxy(v8::Local<v8::Object> value);
+ 
+   bool is_building_snapshot() const { return snapshot_config_.has_value(); }
+   const SnapshotConfig* snapshot_config() const {
+@@ -261,6 +266,13 @@
+   std::shared_ptr<PerIsolateOptions> options_;
+   worker::Worker* worker_context_ = nullptr;
+   PerIsolateWrapperData* wrapper_data_;
++
++  // Shared among every simultaneously live IsolateData for this Isolate.
++  // Contains stable weak Global cells only; no Context/Environment/template.
++  std::shared_ptr<OwnedGlobalProxyReservations> owned_global_proxy_reservations_;
++  static std::unordered_map<
++      v8::Isolate*, std::weak_ptr<OwnedGlobalProxyReservations>>
++      owned_global_proxy_registry_;
+ 
+   static Mutex isolate_data_mutex_;
+   static std::unordered_map<uint16_t, std::unique_ptr<PerIsolateWrapperData>>
+diff --git a/src/node_contextify.cc b/src/node_contextify.cc
+--- a/src/node_contextify.cc
++++ b/src/node_contextify.cc
+@@ -574,10 +574,11 @@
+                                         proxy,
+                                         {},
+                                         queue);
+-  if (context.IsEmpty() ||
+-      InitializeBaseContextForSnapshot(context).IsNothing()) {
+-    return {};
+-  }
++  if (context.IsEmpty()) return {};
++  // Reserve the actual raw identity before Node initialization/publication.
++  // It stays reserved through active, detached and reused states.
++  env->isolate_data()->ReserveOwnedGlobalProxy(context->Global());
++  if (InitializeBaseContextForSnapshot(context).IsNothing()) return {};
+   ContextifyContext* result = New(context, env, {}, &options);
+   if (result == nullptr) return {};
+   result->owned_template_.Reset(isolate, global_template);
+@@ -610,6 +611,13 @@
+   Local<Object> sandbox;
+   if (args[0]->IsObject()) {
+     sandbox = args[0].As<Object>();
++    // A provider raw global proxy cannot be a wrapper holder: detachment
++    // severs its hidden-global private properties and their lifetime edge.
++    if (env->isolate_data()->IsReservedOwnedGlobalProxy(sandbox)) {
++      THROW_ERR_INVALID_STATE(env->isolate(),
++                              "Owned global proxy cannot be contextified");
++      return;
++    }
+     // Don't allow contextifying a sandbox multiple times.
+     CHECK(!sandbox
+                ->HasPrivate(env->context(),
+diff --git a/test/cctest/test_owned_proxy_reservations.cc b/test/cctest/test_owned_proxy_reservations.cc
+new file mode 100644
+--- /dev/null
++++ b/test/cctest/test_owned_proxy_reservations.cc
+@@ -0,0 +1,152 @@
++// SOURCE ONLY, UNCOMPILED/UNRUN. Shared eligibility, not provenance or branding.
++#include <cppgc/persistent.h>
++#include <node.h>
++#include <v8.h>
++#include "env-inl.h"
++#include "node_contextify.h"
++#include "node_test_fixture.h"
++
++using node::contextify::ContextifyContext;
++using namespace v8;
++class OwnedProxyReservationsTest : public EnvironmentTestFixture {};
++namespace {
++void RejectRaw(Local<Context> host,
++               Local<Function> ordinary_factory,
++               node::Environment* env,
++               Local<Object> raw) {
++  auto* isolate=host->GetIsolate();
++  Context::Scope scope(host);
++  EXPECT_TRUE(env->isolate_data()->IsReservedOwnedGlobalProxy(raw));
++  TryCatch caught(isolate);
++  Local<Value> args[]={raw};
++  EXPECT_TRUE(ordinary_factory->Call(host,Undefined(isolate),1,args).IsEmpty());
++  ASSERT_TRUE(caught.HasCaught());
++  auto code=caught.Exception().As<Object>()->Get(host,
++      String::NewFromUtf8Literal(isolate,"code")).ToLocalChecked();
++  EXPECT_TRUE(code->StrictEquals(String::NewFromUtf8Literal(isolate,"ERR_INVALID_STATE")));
++  EXPECT_FALSE(raw->HasPrivate(host,env->contextify_context_private_symbol()).FromJust());
++  EXPECT_FALSE(raw->HasPrivate(host,env->host_defined_option_symbol()).FromJust());
++}
++struct WeakRoots {
++  Global<Function> retained;
++  Global<Context> context;
++  Global<Object> carrier;
++  Global<Object> wrapper;
++  Global<Object> proxy;
++  cppgc::WeakPersistent<ContextifyContext> cppgc;
++};
++V8_NOINLINE void PrepareWeak(Isolate* isolate,node::Environment* env,
++                             Local<Context> host,WeakRoots* roots) {
++  HandleScope handles(isolate);
++  auto carrier=node::LoadEnvironment(env,
++      "return require('node:vm').prepareOwnedContext();").ToLocalChecked().As<Object>();
++  node::OwnedContextOptions options;
++  auto context=node::CreateOwnedContext(env,carrier,ObjectTemplate::New(isolate),
++      host->GetSecurityToken(),options).ToLocalChecked();
++  auto* cppgc=ContextifyContext::FromOwnedCarrier(env,carrier);
++  ASSERT_NE(cppgc,nullptr);
++  roots->cppgc=cppgc;
++  roots->context.Reset(isolate,context);roots->context.SetWeak();
++  roots->carrier.Reset(isolate,carrier);roots->carrier.SetWeak();
++  roots->wrapper.Reset(isolate,cppgc->object(isolate));roots->wrapper.SetWeak();
++  roots->proxy.Reset(isolate,context->Global());roots->proxy.SetWeak();
++  EXPECT_TRUE(env->isolate_data()->IsReservedOwnedGlobalProxy(context->Global()));
++  Context::Scope scope(context);
++  auto fn=Script::Compile(context,String::NewFromUtf8Literal(isolate,"()=>42"))
++      .ToLocalChecked()->Run(context).ToLocalChecked().As<Function>();
++  roots->retained.Reset(isolate,fn);
++}
++V8_NOINLINE void CheckKept(Isolate* isolate,Local<Context> host,WeakRoots* roots) {
++  HandleScope handles(isolate);
++  EXPECT_NE(roots->cppgc.Get(),nullptr);
++  EXPECT_EQ(roots->retained.Get(isolate)->Call(host,Undefined(isolate),0,nullptr)
++      .ToLocalChecked().As<Number>()->Value(),42);
++}
++}  // namespace
++
++TEST_F(OwnedProxyReservationsTest, TwoLiveDataShareActiveDetachedReusedReservation) {
++  const HandleScope handles(isolate_);
++  const Argv argv;
++  Env first{handles,argv};
++  auto host=first.context();
++  auto prepare=node::LoadEnvironment(*first,
++      "return require('node:vm').prepareOwnedContext;").ToLocalChecked().As<Function>();
++  auto carrier=prepare->Call(host,Undefined(isolate_),0,nullptr).ToLocalChecked().As<Object>();
++  auto global_template=ObjectTemplate::New(isolate_);
++  node::OwnedContextOptions options;
++  auto owned=node::CreateOwnedContext(*first,carrier,global_template,
++      host->GetSecurityToken(),options).ToLocalChecked();
++  auto raw=owned->Global();
++  uv_loop_t other_loop;
++  ASSERT_EQ(uv_loop_init(&other_loop),0);
++  auto free_data=[](node::IsolateData* value){node::FreeIsolateData(value);};
++  std::unique_ptr<node::IsolateData,decltype(free_data)> other_data{
++      node::CreateIsolateData(isolate_,&other_loop,platform.get()),free_data};
++  ASSERT_NE(other_data.get(),isolate_data_);
++  ASSERT_EQ(other_data->isolate(),isolate_data_->isolate());
++  {
++    auto other_context=node::NewContext(isolate_);
++    Context::Scope scope(other_context);
++    auto free_env=[](node::Environment* value){node::FreeEnvironment(value);};
++    std::unique_ptr<node::Environment,decltype(free_env)> other_env{
++        node::CreateEnvironment(other_data.get(),other_context,{},{}),free_env};
++    ASSERT_NE(other_env.get(),nullptr);
++    // Shared-token control isolates the eligibility gate from an earlier SOP
++    // denial. It does not establish distinct-origin policy or Promise support.
++    other_context->SetSecurityToken(host->GetSecurityToken());
++    auto factory=node::LoadEnvironment(other_env.get(),
++        "return value=>require('node:vm').createContext(value);")
++        .ToLocalChecked().As<Function>();
++    RejectRaw(other_context,factory,other_env.get(),raw);
++    EXPECT_EQ(node::DetachOwnedContext(*first,carrier).ToLocalChecked(),raw);
++    RejectRaw(other_context,factory,other_env.get(),raw);
++    Local<Object> fresh;
++    {
++      Context::Scope first_scope(host);
++      fresh=prepare->Call(host,Undefined(isolate_),0,nullptr).ToLocalChecked().As<Object>();
++      EXPECT_EQ(node::CreateOwnedContext(*first,fresh,global_template,
++          host->GetSecurityToken(),options,carrier).ToLocalChecked()->Global(),raw);
++    }
++    RejectRaw(other_context,factory,other_env.get(),raw);
++    // Nonreserved values still receive actual canonical ordinary contexts.
++    auto plain=Object::New(isolate_);
++    plain->CreateDataProperty(other_context,
++        String::NewFromUtf8Literal(isolate_,"answer"),Integer::New(isolate_,40)).Check();
++    Local<Value> argument[]={plain};
++    EXPECT_EQ(factory->Call(other_context,Undefined(isolate_),1,argument)
++        .ToLocalChecked(),plain);
++    auto* ordinary=ContextifyContext::ContextFromContextifiedSandbox(other_env.get(),plain);
++    ASSERT_NE(ordinary,nullptr);
++    Context::Scope ordinary_scope(ordinary->context());
++    EXPECT_EQ(Script::Compile(ordinary->context(),
++        String::NewFromUtf8Literal(isolate_,"answer+=2;answer")).ToLocalChecked()
++        ->Run(ordinary->context()).ToLocalChecked().As<Number>()->Value(),42);
++  }
++  other_data.reset(); // First Data remains; weak reservations must survive.
++  EXPECT_TRUE(isolate_data_->IsReservedOwnedGlobalProxy(raw));
++  EXPECT_EQ(uv_loop_close(&other_loop),0);
++}
++
++TEST_F(OwnedProxyReservationsTest, ReservationDoesNotRootActualContextOrProxy) {
++  const HandleScope handles(isolate_);
++  const Argv argv;
++  Env env{handles,argv};
++  WeakRoots roots;
++  PrepareWeak(isolate_,*env,env.context(),&roots);
++  ASSERT_FALSE(roots.retained.IsEmpty());
++  isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);
++  EXPECT_FALSE(roots.context.IsEmpty());
++  EXPECT_FALSE(roots.carrier.IsEmpty());
++  EXPECT_FALSE(roots.wrapper.IsEmpty());
++  EXPECT_FALSE(roots.proxy.IsEmpty());
++  CheckKept(isolate_,env.context(),&roots);
++  roots.retained.Reset();
++  for(int i=0;i<8;++i){isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);}
++  EXPECT_TRUE(roots.context.IsEmpty());
++  EXPECT_TRUE(roots.carrier.IsEmpty());
++  EXPECT_TRUE(roots.wrapper.IsEmpty());
++  EXPECT_TRUE(roots.proxy.IsEmpty());
++  EXPECT_EQ(roots.cppgc.Get(),nullptr);
++  // Force pruning without resurrecting a collected proxy or guessing an address.
++  EXPECT_FALSE(isolate_data_->IsReservedOwnedGlobalProxy(Object::New(isolate_)));
++}

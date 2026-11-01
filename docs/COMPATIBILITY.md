@@ -67,18 +67,23 @@ checks on each SDK and all three original fixtures in a separate candidate.
 The current Pointer/lifecycle composition passes 150 selected regressions.
 Loaded document.close scheduling and blank-frame generation remain open.
 
-The fresh [registered-fixture census](../proposals/conformance-d41/README.md)
-at pushed d41fd69 completed all 455 fixtures under eight registration profiles:
-**402 verified passes, 50 assertion failures and three source-load timeouts**.
-All 8,542 graph/control inputs and 165 source contracts stayed unchanged.
+The current [registered-fixture census](../proposals/conformance-917f9bd/README.md)
+at pushed 917f9bd completed all 455 fixtures under eight registration profiles:
+**415 verified passes, 37 assertion failures and three source-load timeouts**.
+All 18,088 graph/control inputs, 165 source contracts and six controller inputs
+stayed unchanged. All owned rows closed and both fixture ports were released.
 Original load/assertion budgets and WS50 were preserved. Only the external
 harness eligibility predicate recognizes Red Panda; public UA/client hints and
 fixture assertions are unchanged. Navigator/fetch/XHR branding literals remain
 counted failures, with later unexecuted assertions unverified. This adapted
 conformance run establishes neither strict unchanged-harness success nor full
-replication, WPT or performance equivalence. Its 53 nonpasses remain actionable
+replication, WPT or performance equivalence. Its 40 nonpasses remain actionable
 evidence, including Window/document properties, script/module behavior,
-styles/layout, frame lifecycle and timing surfaces.
+styles/layout, frame lifecycle and timing surfaces. The earlier
+[402/50/3 census](../proposals/conformance-d41/README.md) is preserved separately.
+The audio-context fixture changed from pass to failure at a parameter assertion
+(`expected 0.25, got 0.5`); its cause remains under investigation. Changed outcomes
+between these different code graphs do not establish which change caused them.
 
 Canonical Markdown now reads actual author-style producers and backend nodes,
 with source-document style ownership, main render-context URLs, measured slot
@@ -1185,10 +1190,11 @@ Network-initial Window rewrites, the full original Source96 row and broader
 Window/document creation ownership remain open.
 [Lifecycle evidence](../proposals/blank-frame-initial-lifecycle-r1/README.md).
 
-The independent custom Node provider has linked successfully. Its matching
-addon, C++ controls and browser integration have not yet run; compilation alone
-does not establish browser functionality or performance parity. Red Panda
-branding remains intentional. Full independent replication is still unfinished.
+The independent custom Node provider and matching addon have linked. Identity
+and three collision controls passed; proxy reservation hit its original
+45-second limit, leaving ten later stages, including C++ controls, unrun.
+Browser integration has not run. Red Panda branding remains intentional.
+Full independent replication is still unfinished.
 
 
 ### Full validation of the composed feature graph
@@ -1205,8 +1211,40 @@ reports zero warnings and errors.
 [Verified raw evidence](../proposals/feature-composition-full-root-r1/README.md)
 contains the controller, original controller/plan, complete logs, progress and
 actual input maps, with each archive member checked by name, size and SHA256.
-The independent custom Node provider remains linked-only with addon/runtime
-acceptance pending. The historical455 census remains402 passes/50 assertion
-failures/3 load timeouts on its earlier graph; no new score is inferred.
+The independent custom Node provider remains unaccepted after the proxy-control
+timeout. The separately executed 455-fixture census below supplies its own totals.
 Full independent replication, broader realm/Window ownership, original Source96,
 complete conformance/WPT and performance equivalence remain unfinished.
+
+### Complete registered-fixture census at 917f9bd
+
+All455 original registered fixtures ran under their eight original profiles:
+415 verified adapted-harness passes,37 assertion failures and3 source-load
+timeouts in763.369 seconds, with no unobserved rows, runner errors, setup stops
+or integrity stops. All18,088 graph inputs,165 source contracts and six extra
+controller inputs matched; exact owned process identities were checked closed,
+and ports9582/9584 were released and independently checked again during archival.
+
+Only the disclosed external runner eligibility predicate recognizes Red Panda.
+Actual UA/client hints, fixture assertions, resource flags, WS50, original2s load
+and fresh2s/8s assertion limits remain unchanged. Literal branding assertions
+stay counted failures, and later unexecuted assertions are unverified. The
+experimental provider's timeout is negative provenance, not a gate or acceptance
+claim for this census using production stock Node24.22.1.
+
+[Verified evidence](../proposals/conformance-917f9bd/README.md) retains all455
+reports, complete external logs, before/after guards, actual parent exit0 receipt,
+controllers, exact profiles and changed-outcome pairs. Every one of1,446 archive
+members passed SHA256/size readback. The historical402/50/3 epoch is unchanged;
+paired outcome differences do not establish causes. In particular, the current
+audio-context parameter failure needs its own Native comparison and correction.
+
+[Provider evidence](../proposals/node-provider-r4-linked-controls-incomplete/README.md)
+separately preserves every build epoch, addon compile failure, narrow compile-only
+correction, real addon build, original45s control timeout and its55-marker
+diagnostic. The final marker is before namespace return; it proves neither return
+nor adoption completed. V8 source clears the detached context's microtask queue,
+consistent with the stall, while actual Native retained-realm behavior remains
+unmeasured. No checkpoint, timeout increase or assertion change was used to force
+acceptance. Generic provider controls and real Window/Document/frame integration
+remain incomplete.

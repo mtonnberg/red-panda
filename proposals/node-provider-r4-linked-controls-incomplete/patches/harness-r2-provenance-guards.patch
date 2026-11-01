@@ -1,0 +1,35 @@
+--- a/common.py
++++ b/common.py
+@@ -13,7 +13,9 @@
+  values={}
+  for name,wanted in CONTRACT['source13'].items():assert sha(name)==wanted,('actual R4 composed13 source mismatch',name);values[name]=wanted
+  for name,row in CONTRACT['harness'].items():
+-  for file in [ROOT/'harness'/name,BUILD/'harness'/name]:assert sha(file)==row['sha256'],str(file);values[str(file)]=row['sha256']
++  for file,wanted in [(ROOT/'harness'/name,row['sha256']),(BUILD/'harness'/name,row.get('referenceSHA256',row['sha256']))]:assert sha(file)==wanted,str(file);values[str(file)]=wanted
++  if 'referenceSHA256'in row:
++   original=Path(row['source']);assert sha(original)==row['referenceSHA256'],str(original);values[str(original)]=row['referenceSHA256']
+  graph=json.loads((ROOT/'reference/actual-r4-ninja-graph.json').read_text())
+  for name,wanted in graph.items():assert sha(name)==wanted,('actual Ninja graph drift',name);values[name]=wanted
+  metadata=CONTRACT['syntaxMetadata'];assert sha(metadata['path'])==metadata['sha256'];assert sha(metadata['database'])==metadata['databaseSHA256'];values[metadata['path']]=metadata['sha256'];values[metadata['database']]=metadata['databaseSHA256']
+--- a/contract.json
++++ b/contract.json
+@@ -1,5 +1,5 @@
+ {
+-  "status": "STATIC guard-only derivative; genuine C3 linked, addon/runtime UNRUN; Root57 full validation pending at capture",
++  "status": "STATIC compile-only harness correction after actual addon-1 failure; no rebuild/runtime yet",
+   "buildRoot": "/workspace/shared/node-provider-build-r4",
+   "sourceRoot": "/workspace/shared/node-provider-build-r4/source",
+   "customNode": "/workspace/shared/node-provider-build-r4/source/out/Release/node",
+@@ -58,7 +58,11 @@
+     },
+     "provider.cc": {
+       "source": "/workspace/shared/node-provider-prototype-r3/harness/provider.cc",
+-      "sha256": "e609c9b6223025c5230024cf7150d329990bf7277febe1db9b9637d1e7f474f0"
++      "sha256": "4c57369df9e2dbbbbe3b87f78d132fdc2ac9157079d99cca86b0e6a6f70be308",
++      "referenceSHA256": "e609c9b6223025c5230024cf7150d329990bf7277febe1db9b9637d1e7f474f0",
++      "correctionPatchSHA256": "8ca3e3d6dd4209096f7cd6432b7749d1d1a6e27757f4a64ac9b1e9adfd8bda48",
++      "ownSource": "harness/provider.cc",
++      "referenceMeaning": "Unmodified original R3/B4 harness source; corrected own addon is separately pinned"
+     },
+     "snapshot-rejection.cjs": {
+       "source": "/workspace/shared/node-provider-prototype-r3/harness/snapshot-rejection.cjs",

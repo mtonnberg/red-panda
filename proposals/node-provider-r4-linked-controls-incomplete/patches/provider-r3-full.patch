@@ -1,0 +1,1065 @@
+diff --git a/lib/vm.js b/lib/vm.js
+--- a/lib/vm.js
++++ b/lib/vm.js
+@@ -32,6 +32,7 @@
+ const {
+   ContextifyScript,
+   makeContext,
++  prepareOwnedContext: _prepareOwnedContext,
+   constants,
+   measureMemory: _measureMemory,
+ } = internalBinding('contextify');
+@@ -222,6 +223,18 @@
+ }
+ 
+ let defaultContextNameIndex = 1;
++// Cooperative provider ticket, not a vm.Context until native creation succeeds.
++// Registry/HDO setup remains Node-owned and does not replace isolate callbacks.
++function prepareOwnedContext(options = kEmptyObject) {
++  validateObject(options, 'options');
++  const { name = 'Owned VM Context', importModuleDynamically } = options;
++  validateString(name, 'options.name');
++  const id = getHostDefinedOptionId(importModuleDynamically, name);
++  const carrier = _prepareOwnedContext(id);
++  registerImportModuleDynamically(carrier, importModuleDynamically);
++  return carrier;
++}
++
+ function createContext(contextObject = {}, options = kEmptyObject) {
+   if (contextObject !== vm_context_no_contextify && isContext(contextObject)) {
+     return contextObject;
+@@ -404,6 +417,7 @@
+ module.exports = {
+   Script,
+   createContext,
++  prepareOwnedContext,
+   createScript,
+   runInContext,
+   runInNewContext,
+diff --git a/src/env.cc b/src/env.cc
+--- a/src/env.cc
++++ b/src/env.cc
+@@ -81,6 +81,15 @@
+ 
+ constexpr size_t kManagedBufferCacheSize = 64 * 1024;
+ 
++// These cells must not move: parameterless SetWeak stores the address of each
++// Global's own slot for automatic reset. unique_ptr keeps that address stable.
++struct OwnedGlobalProxyReservations {
++  std::vector<std::unique_ptr<v8::Global<v8::Object>>> entries;
++  void Prune() {
++    std::erase_if(entries, [](const auto& cell) { return cell->IsEmpty(); });
++  }
++};
++
+ int const ContextEmbedderTag::kNodeContextTag = 0x6e6f64;
+ void* const ContextEmbedderTag::kNodeContextTagPtr = const_cast<void*>(
+     static_cast<const void*>(&ContextEmbedderTag::kNodeContextTag));
+@@ -335,6 +344,11 @@
+   Isolate* isolate = creator->GetIsolate();
+   IsolateDataSerializeInfo info;
+   HandleScope handle_scope(isolate);
++  // Runtime reservations are deliberately not snapshot payload. Owned creation
++  // is disabled during snapshot builds; embedding live provider state into a
++  // snapshot is unsupported. Uncollected weak entries conservatively reject.
++  owned_global_proxy_reservations_->Prune();
++  CHECK(owned_global_proxy_reservations_->entries.empty());
+   // XXX(joyeecheung): technically speaking, the indexes here should be
+   // consecutive and we could just return a range instead of an array,
+   // but that's not part of the V8 API contract so we use an array
+@@ -580,6 +594,8 @@
+ // this layout only to distinguish internally how the memory of a Node.js
+ // wrapper is managed or whether a wrapper is managed by Node.js.
+ constexpr uint16_t kDefaultCppGCEmbedderID = 0x90de;
++std::unordered_map<Isolate*, std::weak_ptr<OwnedGlobalProxyReservations>>
++    IsolateData::owned_global_proxy_registry_;
+ Mutex IsolateData::isolate_data_mutex_;
+ std::unordered_map<uint16_t, std::unique_ptr<PerIsolateWrapperData>>
+     IsolateData::wrapper_data_map_;
+@@ -629,6 +645,16 @@
+       it = pair.first;
+     }
+     wrapper_data_ = it->second.get();
++    std::erase_if(owned_global_proxy_registry_, [](const auto& item) {
++      return item.second.expired();
++    });
++    auto& weak_state = owned_global_proxy_registry_[isolate];
++    owned_global_proxy_reservations_ = weak_state.lock();
++    if (!owned_global_proxy_reservations_) {
++      owned_global_proxy_reservations_ =
++          std::make_shared<OwnedGlobalProxyReservations>();
++      weak_state = owned_global_proxy_reservations_;
++    }
+   }
+ 
+   if (snapshot_data == nullptr) {
+@@ -638,7 +664,32 @@
+   }
+ }
+ 
+-IsolateData::~IsolateData() {}
++IsolateData::~IsolateData() {
++  // Last-live-Data release resets weak cells while the Isolate is still alive.
++  // No process-global V8 handle remains after this shared state disappears.
++  owned_global_proxy_reservations_.reset();
++  Mutex::ScopedLock lock(isolate_data_mutex_);
++  std::erase_if(owned_global_proxy_registry_, [](const auto& item) {
++    return item.second.expired();
++  });
++}
++
++bool IsolateData::IsReservedOwnedGlobalProxy(Local<Object> value) {
++  HandleScope scope(isolate_);
++  owned_global_proxy_reservations_->Prune();
++  for (const auto& cell : owned_global_proxy_reservations_->entries) {
++    if (cell->Get(isolate_) == value) return true;
++  }
++  return false;
++}
++
++void IsolateData::ReserveOwnedGlobalProxy(Local<Object> value) {
++  CHECK(!value.IsEmpty());
++  if (IsReservedOwnedGlobalProxy(value)) return;
++  auto cell = std::make_unique<v8::Global<Object>>(isolate_, value);
++  cell->SetWeak();  // No callback, owner pointer, strong root, or author code.
++  owned_global_proxy_reservations_->entries.push_back(std::move(cell));
++}
+ 
+ // Deprecated API, embedders should use v8::Object::Wrap() directly instead.
+ void SetCppgcReference(Isolate* isolate,
+diff --git a/src/env.h b/src/env.h
+--- a/src/env.h
++++ b/src/env.h
+@@ -113,6 +113,7 @@
+ 
+ class Environment;
+ class Realm;
++struct OwnedGlobalProxyReservations;
+ 
+ struct IsolateDataSerializeInfo {
+   std::vector<SnapshotIndex> primitive_values;
+@@ -150,6 +151,10 @@
+   SET_SELF_SIZE(IsolateData)
+   void MemoryInfo(MemoryTracker* tracker) const override;
+   IsolateDataSerializeInfo Serialize(v8::SnapshotCreator* creator);
++
++  // Eligibility only; never a context/brand/creation-realm lookup.
++  bool IsReservedOwnedGlobalProxy(v8::Local<v8::Object> value);
++  void ReserveOwnedGlobalProxy(v8::Local<v8::Object> value);
+ 
+   bool is_building_snapshot() const { return snapshot_config_.has_value(); }
+   const SnapshotConfig* snapshot_config() const {
+@@ -261,6 +266,13 @@
+   std::shared_ptr<PerIsolateOptions> options_;
+   worker::Worker* worker_context_ = nullptr;
+   PerIsolateWrapperData* wrapper_data_;
++
++  // Shared among every simultaneously live IsolateData for this Isolate.
++  // Contains stable weak Global cells only; no Context/Environment/template.
++  std::shared_ptr<OwnedGlobalProxyReservations> owned_global_proxy_reservations_;
++  static std::unordered_map<
++      v8::Isolate*, std::weak_ptr<OwnedGlobalProxyReservations>>
++      owned_global_proxy_registry_;
+ 
+   static Mutex isolate_data_mutex_;
+   static std::unordered_map<uint16_t, std::unique_ptr<PerIsolateWrapperData>>
+diff --git a/src/env_properties.h b/src/env_properties.h
+--- a/src/env_properties.h
++++ b/src/env_properties.h
+@@ -20,6 +20,7 @@
+ #define PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES(V)                               \
+   V(arrow_message_private_symbol, "node:arrowMessage")                         \
+   V(contextify_context_private_symbol, "node:contextify:context")              \
++  V(owned_context_pending_symbol, "node:contextify:owned-pending")              \
+   V(decorated_private_symbol, "node:decorated")                                \
+   V(empty_context_frame_sentinel_symbol, "node:empty_context_frame_sentinel")  \
+   V(transfer_mode_private_symbol, "node:transfer_mode")                        \
+diff --git a/src/module_wrap.cc b/src/module_wrap.cc
+--- a/src/module_wrap.cc
++++ b/src/module_wrap.cc
+@@ -1116,10 +1116,24 @@
+   // from the realm global object.
+   if (options->Length() == HostDefinedOptions::kLength) {
+     id = options->Get(context, HostDefinedOptions::kID).As<Symbol>();
+-  } else if (!context->Global()
+-                  ->GetPrivate(context, env->host_defined_option_symbol())
+-                  .ToLocal(&id)) {
+-    return MaybeLocal<Promise>();
++  } else {
++    // The old actual Context must select its own HDO after its public proxy
++    // has been detached/reused. Ordinary contexts keep the existing fallback.
++    ContextifyContext* contextify = nullptr;
++    if (ContextEmbedderTag::IsNodeContext(context)) {
++      contextify = static_cast<ContextifyContext*>(
++          context->GetAlignedPointerFromEmbedderData(
++              ContextEmbedderIndex::kContextifyContext));
++    }
++    if (contextify != nullptr && contextify->is_owned()) {
++      if (!ContextifyContext::GetOwnedImportId(env, context).ToLocal(&id)) {
++        return MaybeLocal<Promise>();
++      }
++    } else if (!context->Global()
++                    ->GetPrivate(context, env->host_defined_option_symbol())
++                    .ToLocal(&id)) {
++      return MaybeLocal<Promise>();
++    }
+   }
+ 
+   Local<Object> attributes =
+diff --git a/src/node.h b/src/node.h
+--- a/src/node.h
++++ b/src/node.h
+@@ -608,6 +608,32 @@
+     v8::Isolate* isolate,
+     v8::Local<v8::ObjectTemplate> object_template =
+         v8::Local<v8::ObjectTemplate>());
++
++// Experimental cooperative provider v1. These are NEW source-extension APIs;
++// they are not available in stock Node. A carrier is prepared by the Node-owned
++// vm.prepareOwnedContext() entry and consumed exactly once. It is separate from
++// the actual reusable public global proxy. Do not RegisterContext() again.
++// The caller owns quiescence before detachment and must use the same template
++// for reuse. Live owned contexts are unsupported in startup snapshots.
++struct OwnedContextOptions {
++  v8::Local<v8::String> name;
++  v8::Local<v8::String> origin;
++  bool code_generation_strings = true;
++  bool code_generation_wasm = true;
++  bool own_microtask_queue = false;
++};
++inline constexpr uint32_t kOwnedContextProviderVersion = 1;
++NODE_EXTERN v8::MaybeLocal<v8::Context> CreateOwnedContext(
++    Environment* env,
++    v8::Local<v8::Object> prepared_carrier,
++    v8::Local<v8::ObjectTemplate> global_template,
++    v8::Local<v8::Value> security_token,
++    const OwnedContextOptions& options,
++    v8::Local<v8::Object> previous_carrier = v8::Local<v8::Object>());
++NODE_EXTERN v8::MaybeLocal<v8::Context> GetOwnedContext(
++    Environment* env, v8::Local<v8::Object> carrier);
++NODE_EXTERN v8::MaybeLocal<v8::Object> DetachOwnedContext(
++    Environment* env, v8::Local<v8::Object> carrier);
+ 
+ // Runs Node.js-specific tweaks on an already constructed context
+ // Return value indicates success of operation
+diff --git a/src/node_context_data.h b/src/node_context_data.h
+--- a/src/node_context_data.h
++++ b/src/node_context_data.h
+@@ -97,6 +97,9 @@
+   // context. For example the first argument of vm.createContext().
+   // Only set for context type 4 and used in ContextifyContext methods.
+   kSandboxObject = NODE_CONTEXT_SANDBOX_OBJECT_INDEX,
++  // New owned-provider mode only: actual Context roots its unique genuine
++  // carrier. This reserved index was unused in stock Node v24.22.1.
++  kOwnedContextCarrier = NODE_BINDING_DATA_STORE_INDEX,
+   // A v8::Value indicating whether the context allows WebAssembly code
+   // generation.
+   // Only set for context type 2-5, and for them the default is v8::True.
+@@ -127,6 +130,17 @@
+   // to check whether a context is a Node.js context.
+   kContextTag = NODE_CONTEXT_TAG,
+ };
++
++// Do not alias a configurable pointer/value slot or enlarge the tag boundary.
++static_assert(kOwnedContextCarrier >= 0 &&
++              kOwnedContextCarrier < kContextTag &&
++              kOwnedContextCarrier != kEnvironment &&
++              kOwnedContextCarrier != kSandboxObject &&
++              kOwnedContextCarrier != kAllowWasmCodeGeneration &&
++              kOwnedContextCarrier != kAllowCodeGenerationFromStrings &&
++              kOwnedContextCarrier != kContextifyContext &&
++              kOwnedContextCarrier != kRealm,
++              "Owned Context carrier collides with Node context data layout");
+ 
+ class ContextEmbedderTag {
+  public:
+diff --git a/src/node_contextify.cc b/src/node_contextify.cc
+--- a/src/node_contextify.cc
++++ b/src/node_contextify.cc
+@@ -140,6 +140,8 @@
+ void ContextifyContext::Trace(cppgc::Visitor* visitor) const {
+   CppgcMixin::Trace(visitor);
+   visitor->Trace(context_);
++  visitor->Trace(owned_template_);
++  visitor->Trace(owned_proxy_);
+ }
+ 
+ ContextifyContext::ContextifyContext(Environment* env,
+@@ -152,6 +154,7 @@
+   CppgcMixin::Wrap(this, env, wrapper);
+ 
+   context_.Reset(env->isolate(), v8_context);
++  owned_ = !options->owned_carrier.IsEmpty();
+   // This should only be done after the initial initializations of the context
+   // global object is finished.
+   DCHECK_NULL(v8_context->GetAlignedPointerFromEmbedderData(
+@@ -250,7 +253,9 @@
+ 
+   Local<Context> main_context = env->context();
+   Local<Object> new_context_global = v8_context->Global();
+-  v8_context->SetSecurityToken(main_context->GetSecurityToken());
++  v8_context->SetSecurityToken(options->owned_carrier.IsEmpty()
++                                   ? main_context->GetSecurityToken()
++                                   : options->owned_security_token);
+ 
+   // We need to tie the lifetime of the sandbox object with the lifetime of
+   // newly created context. We do this by making them hold references to each
+@@ -305,7 +310,8 @@
+     // callback of ImportModuleDynamically, we can get the
+     // host_defined_options_id from the v8::Context without accessing the
+     // wrapper object.
+-    if (new_context_global
++    if (options->owned_carrier.IsEmpty() &&
++        new_context_global
+             ->SetPrivate(v8_context,
+                          env->host_defined_option_symbol(),
+                          options->host_defined_options_id)
+@@ -325,8 +331,11 @@
+         env->cppgc_allocation_handle(), env, wrapper, v8_context, options);
+   }
+ 
+-  Local<Object> wrapper_holder =
+-      sandbox_obj.IsEmpty() ? new_context_global : sandbox_obj;
++  Local<Object> wrapper_holder = !options->owned_carrier.IsEmpty()
++                                     ? options->owned_carrier
++                                     : (sandbox_obj.IsEmpty()
++                                            ? new_context_global
++                                            : sandbox_obj);
+   if (!wrapper_holder.IsEmpty() &&
+       wrapper_holder
+           ->SetPrivate(
+@@ -346,6 +355,12 @@
+           .IsNothing()) {
+     return {};
+   }
++  if (!options->owned_carrier.IsEmpty()) {
++    // Tagged Value, traced by the actual old Context independently of proxy
++    // reuse. The carrier already owns its immutable Node-generated HDO id.
++    v8_context->SetEmbedderData(ContextEmbedderIndex::kOwnedContextCarrier,
++                               options->owned_carrier);
++  }
+   return result;
+ }
+ 
+@@ -353,11 +368,13 @@
+     IsolateData* isolate_data, Local<ObjectTemplate> target) {
+   Isolate* isolate = isolate_data->isolate();
+   SetMethod(isolate, target, "makeContext", MakeContext);
++  SetMethod(isolate, target, "prepareOwnedContext", PrepareOwnedContext);
+ }
+ 
+ void ContextifyContext::RegisterExternalReferences(
+     ExternalReferenceRegistry* registry) {
+   registry->Register(MakeContext);
++  registry->Register(PrepareOwnedContext);
+   registry->Register(PropertyQueryCallback);
+   registry->Register(PropertyGetterCallback);
+   registry->Register(PropertySetterCallback);
+@@ -374,6 +391,217 @@
+   registry->Register(IndexedPropertyEnumeratorCallback);
+ }
+ 
++// Node owns this ticket and its HDO. It is intentionally not yet a vm.Context.
++void ContextifyContext::PrepareOwnedContext(
++    const FunctionCallbackInfo<Value>& args) {
++  Environment* env = Environment::GetCurrent(args);
++  Isolate* isolate = env->isolate();
++  CHECK_EQ(args.Length(), 1);
++  CHECK(args[0]->IsSymbol());
++  if (env->isolate_data()->is_building_snapshot()) {
++    THROW_ERR_INVALID_STATE(isolate,
++                            "Owned contexts are not supported in snapshots");
++    return;
++  }
++  Local<Context> host = env->context();
++  Context::Scope scope(host);
++  Local<Object> carrier = Object::New(isolate);
++  if (carrier->SetPrototype(host, v8::Null(isolate)).IsNothing() ||
++      carrier->SetPrivate(host,
++                          env->owned_context_pending_symbol(),
++                          v8::True(isolate)).IsNothing() ||
++      carrier->SetPrivate(host,
++                          env->host_defined_option_symbol(),
++                          args[0]).IsNothing()) {
++    return;
++  }
++  args.GetReturnValue().Set(carrier);
++}
++
++ContextifyContext* ContextifyContext::FromOwnedCarrier(
++    Environment* env, Local<Object> carrier) {
++  ContextifyContext* contextify =
++      carrier.IsEmpty() ? nullptr : ContextFromContextifiedSandbox(env, carrier);
++  if (contextify == nullptr || contextify->realm() == nullptr ||
++      contextify->env() != env ||
++      !contextify->owned_ || contextify->context_.IsEmpty() ||
++      !ContextEmbedderTag::IsNodeContext(contextify->context()) ||
++      Environment::GetCurrent(contextify->context()) != env ||
++      contextify->context()->GetAlignedPointerFromEmbedderData(
++          ContextEmbedderIndex::kContextifyContext) != contextify ||
++      !contextify->context()->GetEmbedderData(
++          ContextEmbedderIndex::kOwnedContextCarrier)->StrictEquals(carrier)) {
++    THROW_ERR_INVALID_STATE(env->isolate(), "Not an owned context carrier");
++    return nullptr;
++  }
++  return contextify;
++}
++
++MaybeLocal<Value> ContextifyContext::GetOwnedImportId(
++    Environment* env, Local<Context> context) {
++  Local<Value> anchor =
++      context->GetEmbedderData(ContextEmbedderIndex::kOwnedContextCarrier);
++  if (!anchor->IsObject()) {
++    THROW_ERR_INVALID_STATE(env->isolate(), "Missing owned context carrier");
++    return {};
++  }
++  Local<Object> carrier = anchor.As<Object>();
++  ContextifyContext* owned = FromOwnedCarrier(env, carrier);
++  if (owned == nullptr) return {};
++  if (owned->context() != context) {
++    THROW_ERR_INVALID_STATE(env->isolate(), "Owned context authority mismatch");
++    return {};
++  }
++  Local<Value> id;
++  if (!carrier->GetPrivate(env->context(), env->host_defined_option_symbol())
++           .ToLocal(&id)) {
++    return {};
++  }
++  if (!id->IsSymbol()) {
++    THROW_ERR_INVALID_STATE(env->isolate(), "Missing owned context import id");
++    return {};
++  }
++  return id;
++}
++
++MaybeLocal<Context> ContextifyContext::NewOwned(
++    Environment* env,
++    Local<Object> carrier,
++    Local<ObjectTemplate> global_template,
++    Local<Value> security_token,
++    const OwnedContextOptions& public_options,
++    Local<Object> previous_carrier) {
++  Isolate* isolate = env->isolate();
++  EscapableHandleScope scope(isolate);
++  if (env->isolate_data()->is_building_snapshot() || carrier.IsEmpty() ||
++      global_template.IsEmpty() || security_token.IsEmpty()) {
++    THROW_ERR_INVALID_STATE(isolate, "Invalid owned context creation");
++    return {};
++  }
++  // Private symbols are per-Isolate. Also require the exact Host creation
++  // Context so a ticket from a second Environment cannot cross registries.
++  Local<Context> carrier_context;
++  if (!carrier->GetCreationContext().ToLocal(&carrier_context) ||
++      carrier_context != env->context()) {
++    THROW_ERR_INVALID_STATE(isolate, "Owned ticket belongs to another Environment");
++    return {};
++  }
++  // A pending ticket can have been consumed by ordinary vm.createContext().
++  // Its private pending mark then remains true, but the genuine canonical
++  // wrapper/HDO now belong to that ordinary Context. Never replace them.
++  v8::Maybe<bool> has_context = carrier->HasPrivate(
++      env->context(), env->contextify_context_private_symbol());
++  if (has_context.IsNothing()) return {};
++  if (has_context.FromJust()) {
++    Local<Value> existing_wrapper;
++    if (!carrier->GetPrivate(env->context(),
++                              env->contextify_context_private_symbol())
++             .ToLocal(&existing_wrapper)) {
++      return {};
++    }
++    ContextifyContext* existing = existing_wrapper->IsObject()
++        ? Unwrap<ContextifyContext>(existing_wrapper.As<Object>())
++        : nullptr;
++    THROW_ERR_INVALID_STATE(isolate, existing != nullptr
++        ? "Owned ticket is already contextified"
++        : "Owned ticket has occupied Contextify authority");
++    return {};
++  }
++  Local<Value> pending;
++  Local<Value> id;
++  if (!carrier->GetPrivate(env->context(), env->owned_context_pending_symbol())
++           .ToLocal(&pending) ||
++      !carrier->GetPrivate(env->context(), env->host_defined_option_symbol())
++           .ToLocal(&id)) {
++    return {};
++  }
++  if (!pending->IsTrue() || !id->IsSymbol()) {
++    THROW_ERR_INVALID_STATE(isolate, "Expected an unused owned context ticket");
++    return {};
++  }
++
++  Local<Object> proxy;
++  ContextifyContext* previous = nullptr;
++  if (!previous_carrier.IsEmpty()) {
++    previous = FromOwnedCarrier(env, previous_carrier);
++    if (previous == nullptr) return {};
++    if (!previous->owned_detached_ || previous->owned_reuse_consumed_ ||
++        previous->owned_proxy_.IsEmpty() ||
++        previous->owned_template_.Get(isolate) != global_template) {
++      THROW_ERR_INVALID_STATE(isolate, "Invalid owned global reuse lease");
++      return {};
++    }
++    proxy = previous->owned_proxy_.Get(isolate);
++  }
++
++  // Creation and reuse attempts consume their tickets even on allocation
++  // failure. No retry may operate on a possibly partially reset global proxy.
++  if (carrier->SetPrivate(env->context(),
++                          env->owned_context_pending_symbol(),
++                          v8::False(isolate)).IsNothing()) {
++    return {};
++  }
++  if (previous != nullptr) {
++    previous->owned_reuse_consumed_ = true;
++    previous->owned_proxy_.Reset();
++  }
++
++  ContextOptions options;
++  options.vanilla = true;
++  options.name = public_options.name.IsEmpty()
++                     ? FIXED_ONE_BYTE_STRING(isolate, "Owned VM Context")
++                     : public_options.name;
++  options.origin = public_options.origin;
++  options.allow_code_gen_strings =
++      Boolean::New(isolate, public_options.code_generation_strings);
++  options.allow_code_gen_wasm =
++      Boolean::New(isolate, public_options.code_generation_wasm);
++  options.host_defined_options_id = id.As<Symbol>();
++  options.owned_carrier = carrier;
++  options.owned_security_token = security_token;
++  if (public_options.own_microtask_queue) {
++    options.own_microtask_queue =
++        MicrotaskQueue::New(isolate, MicrotasksPolicy::kExplicit);
++  }
++  MicrotaskQueue* queue = options.own_microtask_queue
++                              ? options.own_microtask_queue.get()
++                              : isolate->GetCurrentContext()->GetMicrotaskQueue();
++  // Intentionally bypass the stock interceptor-backed VM snapshot. V8's
++  // actual compatible global template/proxy creation does the reuse.
++  Local<Context> context = Context::New(isolate,
++                                        nullptr,
++                                        global_template,
++                                        proxy,
++                                        {},
++                                        queue);
++  if (context.IsEmpty()) return {};
++  // Reserve the actual raw identity before Node initialization/publication.
++  // It stays reserved through active, detached and reused states.
++  env->isolate_data()->ReserveOwnedGlobalProxy(context->Global());
++  if (InitializeBaseContextForSnapshot(context).IsNothing()) return {};
++  ContextifyContext* result = New(context, env, {}, &options);
++  if (result == nullptr) return {};
++  result->owned_template_.Reset(isolate, global_template);
++  result->owned_proxy_.Reset(isolate, context->Global());
++  return scope.Escape(context);
++}
++
++MaybeLocal<Object> ContextifyContext::DetachOwned(
++    Environment* env, Local<Object> carrier) {
++  ContextifyContext* owned = FromOwnedCarrier(env, carrier);
++  if (owned == nullptr) return {};
++  if (owned->owned_detached_ || owned->owned_proxy_.IsEmpty()) {
++    THROW_ERR_INVALID_STATE(env->isolate(), "Owned global already detached");
++    return {};
++  }
++  // Caller must quiesce actual document execution first. No stack/URL/global
++  // property heuristic can manufacture that lifetime guarantee here.
++  Local<Object> proxy = owned->owned_proxy_.Get(env->isolate());
++  owned->context()->DetachGlobal();
++  owned->owned_detached_ = true;
++  return proxy;
++}
++
+ // makeContext(sandbox, name, origin, strings, wasm);
+ void ContextifyContext::MakeContext(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
+@@ -383,6 +611,13 @@
+   Local<Object> sandbox;
+   if (args[0]->IsObject()) {
+     sandbox = args[0].As<Object>();
++    // A provider raw global proxy cannot be a wrapper holder: detachment
++    // severs its hidden-global private properties and their lifetime edge.
++    if (env->isolate_data()->IsReservedOwnedGlobalProxy(sandbox)) {
++      THROW_ERR_INVALID_STATE(env->isolate(),
++                              "Owned global proxy cannot be contextified");
++      return;
++    }
+     // Don't allow contextifying a sandbox multiple times.
+     CHECK(!sandbox
+                ->HasPrivate(env->context(),
+@@ -2077,6 +2312,34 @@
+   registry->Register(ContainsModuleSyntax);
+ }
+ }  // namespace contextify
++
++v8::MaybeLocal<v8::Context> CreateOwnedContext(
++    Environment* env,
++    v8::Local<v8::Object> prepared_carrier,
++    v8::Local<v8::ObjectTemplate> global_template,
++    v8::Local<v8::Value> security_token,
++    const OwnedContextOptions& options,
++    v8::Local<v8::Object> previous_carrier) {
++  return contextify::ContextifyContext::NewOwned(env,
++                                                prepared_carrier,
++                                                global_template,
++                                                security_token,
++                                                options,
++                                                previous_carrier);
++}
++
++v8::MaybeLocal<v8::Context> GetOwnedContext(
++    Environment* env, v8::Local<v8::Object> carrier) {
++  contextify::ContextifyContext* owned =
++      contextify::ContextifyContext::FromOwnedCarrier(env, carrier);
++  if (owned == nullptr) return {};
++  return owned->context();
++}
++
++v8::MaybeLocal<v8::Object> DetachOwnedContext(
++    Environment* env, v8::Local<v8::Object> carrier) {
++  return contextify::ContextifyContext::DetachOwned(env, carrier);
++}
+ }  // namespace node
+ 
+ NODE_BINDING_CONTEXT_AWARE_INTERNAL(
+diff --git a/src/node_contextify.h b/src/node_contextify.h
+--- a/src/node_contextify.h
++++ b/src/node_contextify.h
+@@ -10,6 +10,7 @@
+ 
+ namespace node {
+ class ExternalReferenceRegistry;
++struct OwnedContextOptions;
+ 
+ namespace contextify {
+ 
+@@ -21,6 +22,9 @@
+   std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
+   v8::Local<v8::Symbol> host_defined_options_id;
+   bool vanilla = false;
++  // Only the canonical new owned creation path populates these fields.
++  v8::Local<v8::Object> owned_carrier;
++  v8::Local<v8::Value> owned_security_token;
+ };
+ 
+ /**
+@@ -131,6 +135,21 @@
+ 
+   static void InitializeGlobalTemplates(IsolateData* isolate_data);
+ 
++  static v8::MaybeLocal<v8::Context> NewOwned(
++      Environment* env,
++      v8::Local<v8::Object> carrier,
++      v8::Local<v8::ObjectTemplate> global_template,
++      v8::Local<v8::Value> security_token,
++      const OwnedContextOptions& options,
++      v8::Local<v8::Object> previous_carrier);
++  static ContextifyContext* FromOwnedCarrier(
++      Environment* env, v8::Local<v8::Object> carrier);
++  static v8::MaybeLocal<v8::Object> DetachOwned(
++      Environment* env, v8::Local<v8::Object> carrier);
++  static v8::MaybeLocal<v8::Value> GetOwnedImportId(
++      Environment* env, v8::Local<v8::Context> context);
++  bool is_owned() const { return owned_; }
++
+  private:
+   static ContextifyContext* New(Environment* env,
+                                 v8::Local<v8::Object> sandbox_obj,
+@@ -144,6 +163,8 @@
+   static bool IsStillInitializing(const ContextifyContext* ctx);
+   static void MakeContext(const v8::FunctionCallbackInfo<v8::Value>& args);
+   static void IsContext(const v8::FunctionCallbackInfo<v8::Value>& args);
++  static void PrepareOwnedContext(
++      const v8::FunctionCallbackInfo<v8::Value>& args);
+   static v8::Intercepted PropertyQueryCallback(
+       v8::Local<v8::Name> property,
+       const v8::PropertyCallbackInfo<v8::Integer>& args);
+@@ -186,6 +207,11 @@
+       const v8::PropertyCallbackInfo<v8::Array>& args);
+ 
+   v8::TracedReference<v8::Context> context_;
++  v8::TracedReference<v8::ObjectTemplate> owned_template_;
++  v8::TracedReference<v8::Object> owned_proxy_;
++  bool owned_ = false;
++  bool owned_detached_ = false;
++  bool owned_reuse_consumed_ = false;
+   std::unique_ptr<v8::MicrotaskQueue> microtask_queue_;
+ };
+ 
+diff --git a/test/cctest/test_owned_context_collision.cc b/test/cctest/test_owned_context_collision.cc
+new file mode 100644
+--- /dev/null
++++ b/test/cctest/test_owned_context_collision.cc
+@@ -0,0 +1,98 @@
++// SOURCE ONLY, UNCOMPILED/UNRUN. R2 over the exact frozen provider R1.
++#include <cppgc/persistent.h>
++#include <node.h>
++#include <v8.h>
++#include "node_contextify.h"
++#include "node_test_fixture.h"
++
++using node::contextify::ContextifyContext;
++using namespace v8;
++class OwnedContextCollisionTest : public EnvironmentTestFixture {};
++namespace {
++struct Roots {
++  Global<Function> retained;
++  Global<Context> weak_context;
++  Global<Object> weak_carrier;
++  Global<Object> weak_wrapper;
++  cppgc::WeakPersistent<ContextifyContext> weak_cppgc;
++};
++V8_NOINLINE void PrepareOrdinaryAfterRejection(
++    Isolate* isolate, node::Environment* env, Local<Context> host, Roots* roots) {
++  HandleScope handles(isolate);
++  Local<Object> carrier = node::LoadEnvironment(env,
++      "const vm=require('node:vm');"
++      "return vm.createContext(vm.prepareOwnedContext());")
++      .ToLocalChecked().As<Object>();
++  auto* before = ContextifyContext::ContextFromContextifiedSandbox(env, carrier);
++  ASSERT_NE(before, nullptr);
++  ASSERT_FALSE(before->is_owned());
++  Local<Context> ordinary = before->context();
++  Local<Object> original_wrapper = before->object(isolate);
++  Local<Value> original_id = carrier->GetPrivate(
++      host, env->host_defined_option_symbol()).ToLocalChecked();
++  {
++    TryCatch caught(isolate);
++    node::OwnedContextOptions options;
++    ASSERT_TRUE(node::CreateOwnedContext(env, carrier,
++        ObjectTemplate::New(isolate), host->GetSecurityToken(), options).IsEmpty());
++    ASSERT_TRUE(caught.HasCaught());
++    Local<Value> code = caught.Exception().As<Object>()->Get(
++        host, String::NewFromUtf8Literal(isolate, "code")).ToLocalChecked();
++    ASSERT_TRUE(code->StrictEquals(
++        String::NewFromUtf8Literal(isolate, "ERR_INVALID_STATE")));
++  }
++  auto* after = ContextifyContext::ContextFromContextifiedSandbox(env, carrier);
++  ASSERT_EQ(after, before);
++  ASSERT_EQ(after->context(), ordinary);
++  ASSERT_EQ(after->object(isolate), original_wrapper);
++  ASSERT_TRUE(carrier->GetPrivate(host, env->host_defined_option_symbol())
++      .ToLocalChecked()->StrictEquals(original_id));
++  ASSERT_TRUE(carrier->GetPrivate(host, env->owned_context_pending_symbol())
++      .ToLocalChecked()->IsTrue());
++  ASSERT_TRUE(ordinary->GetEmbedderData(node::ContextEmbedderIndex::kSandboxObject)
++      ->StrictEquals(carrier));
++  roots->weak_cppgc = after;
++  roots->weak_context.Reset(isolate, ordinary);
++  roots->weak_context.SetWeak();
++  roots->weak_carrier.Reset(isolate, carrier);
++  roots->weak_carrier.SetWeak();
++  roots->weak_wrapper.Reset(isolate, original_wrapper);
++  roots->weak_wrapper.SetWeak();
++  Context::Scope scope(ordinary);
++  Local<Function> fn = Script::Compile(ordinary,
++      String::NewFromUtf8Literal(isolate, "globalThis.marker=23; ()=>marker"))
++      .ToLocalChecked()->Run(ordinary).ToLocalChecked().As<Function>();
++  roots->retained.Reset(isolate, fn);
++}
++V8_NOINLINE void CheckRetained(Isolate* isolate,
++                               Local<Context> host, Roots* roots) {
++  HandleScope handles(isolate);
++  EXPECT_NE(roots->weak_cppgc.Get(), nullptr);
++  EXPECT_EQ(roots->retained.Get(isolate)
++      ->Call(host, Undefined(isolate), 0, nullptr).ToLocalChecked()
++      .As<Number>()->Value(), 23);
++}
++}  // namespace
++TEST_F(OwnedContextCollisionTest, RejectPreservesOrdinaryWrapperAndRetention) {
++  const HandleScope handles(isolate_);
++  const Argv argv;
++  Env env{handles, argv};
++  Roots roots;
++  PrepareOrdinaryAfterRejection(isolate_, *env, env.context(), &roots);
++  ASSERT_FALSE(roots.retained.IsEmpty());
++  isolate_->LowMemoryNotification();
++  platform->DrainTasks(isolate_);
++  ASSERT_FALSE(roots.weak_context.IsEmpty());
++  ASSERT_FALSE(roots.weak_carrier.IsEmpty());
++  ASSERT_FALSE(roots.weak_wrapper.IsEmpty());
++  CheckRetained(isolate_, env.context(), &roots);
++  roots.retained.Reset();
++  for (int i = 0; i < 8; ++i) {
++    isolate_->LowMemoryNotification();
++    platform->DrainTasks(isolate_);
++  }
++  EXPECT_TRUE(roots.weak_context.IsEmpty());
++  EXPECT_TRUE(roots.weak_carrier.IsEmpty());
++  EXPECT_TRUE(roots.weak_wrapper.IsEmpty());
++  EXPECT_EQ(roots.weak_cppgc.Get(), nullptr);
++}
+diff --git a/test/cctest/test_owned_context_provider.cc b/test/cctest/test_owned_context_provider.cc
+new file mode 100644
+--- /dev/null
++++ b/test/cctest/test_owned_context_provider.cc
+@@ -0,0 +1,112 @@
++// UNCOMPILED/UNRUN. Real Node-internal cppgc lifetime observation; no addon
++// private-slot writes or synthetic wrapper identities.
++#include <cppgc/persistent.h>
++#include <node.h>
++#include <v8.h>
++#include "node_contextify.h"
++#include "node_test_fixture.h"
++
++using node::contextify::ContextifyContext;
++using namespace v8;
++class OwnedContextProviderTest : public EnvironmentTestFixture {};
++
++namespace {
++struct ObservedRoots {
++  Global<Function> retained;
++  Global<Context> weak_context;
++  Global<Object> weak_carrier;
++  Global<Object> weak_wrapper;
++  cppgc::WeakPersistent<ContextifyContext> weak_cppgc;
++};
++// Keep raw setup pointers and temporary Local handles out of the collecting
++// caller's live frame; otherwise a conservative stack root can spoil the test.
++V8_NOINLINE void PrepareRoots(Isolate* isolate,
++                              node::Environment* env,
++                              Local<Context> host,
++                              ObservedRoots* roots) {
++  HandleScope handles(isolate);
++  Local<Value> ticket = node::LoadEnvironment(
++      env, "return require('node:vm').prepareOwnedContext();").ToLocalChecked();
++  ASSERT_TRUE(ticket->IsObject());
++  Local<Object> carrier = ticket.As<Object>();
++  Local<ObjectTemplate> global_template = ObjectTemplate::New(isolate);
++  node::OwnedContextOptions options;
++  Local<Context> owned = node::CreateOwnedContext(
++      env, carrier, global_template, host->GetSecurityToken(), options)
++      .ToLocalChecked();
++  auto* backend = ContextifyContext::FromOwnedCarrier(env, carrier);
++  ASSERT_NE(backend, nullptr);
++  ASSERT_EQ(backend->context(), owned);
++  roots->weak_cppgc = backend;
++  roots->weak_context.Reset(isolate, owned);
++  roots->weak_context.SetWeak();
++  roots->weak_carrier.Reset(isolate, carrier);
++  roots->weak_carrier.SetWeak();
++  roots->weak_wrapper.Reset(isolate, backend->object(isolate));
++  roots->weak_wrapper.SetWeak();
++  Context::Scope owner_scope(owned);
++  Local<Function> function = Script::Compile(
++      owned, String::NewFromUtf8Literal(isolate, "()=>42"))
++      .ToLocalChecked()->Run(owned).ToLocalChecked().As<Function>();
++  roots->retained.Reset(isolate, function);
++}
++V8_NOINLINE void CheckActualRetainedFunction(Isolate* isolate,
++                                            Local<Context> host,
++                                            ObservedRoots* roots) {
++  HandleScope handles(isolate);
++  EXPECT_NE(roots->weak_cppgc.Get(), nullptr);
++  Local<Value> answer = roots->retained.Get(isolate)
++      ->Call(host, Undefined(isolate), 0, nullptr).ToLocalChecked();
++  EXPECT_EQ(answer.As<Number>()->Value(), 42);
++}
++}  // namespace
++
++TEST_F(OwnedContextProviderTest, RetainedClosureRootsActualCarrierAndCppgc) {
++  const HandleScope outer_handles(isolate_);
++  const Argv argv;
++  Env env{outer_handles, argv};
++  ObservedRoots roots;
++  PrepareRoots(isolate_, *env, env.context(), &roots);
++  ASSERT_FALSE(roots.retained.IsEmpty());
++  // Only the real old function is a strong application root.
++  isolate_->LowMemoryNotification();
++  platform->DrainTasks(isolate_);
++  ASSERT_FALSE(roots.weak_context.IsEmpty());
++  ASSERT_FALSE(roots.weak_carrier.IsEmpty());
++  ASSERT_FALSE(roots.weak_wrapper.IsEmpty());
++  CheckActualRetainedFunction(isolate_, env.context(), &roots);
++  roots.retained.Reset();
++  // Bounded observation, not an assertion replacement if collection fails.
++  for (int i = 0; i < 8; ++i) {
++    isolate_->LowMemoryNotification();
++    platform->DrainTasks(isolate_);
++  }
++  EXPECT_TRUE(roots.weak_context.IsEmpty());
++  EXPECT_TRUE(roots.weak_carrier.IsEmpty());
++  EXPECT_TRUE(roots.weak_wrapper.IsEmpty());
++  EXPECT_EQ(roots.weak_cppgc.Get(), nullptr);
++}
++
++TEST_F(OwnedContextProviderTest, RejectsTicketFromDifferentEnvironment) {
++  const HandleScope handles(isolate_);
++  const Argv argv;
++  Env first{handles, argv};
++  Local<Object> ticket = node::LoadEnvironment(
++      *first, "return require('node:vm').prepareOwnedContext();")
++      .ToLocalChecked().As<Object>();
++  {
++    Env second{handles, argv};
++    node::LoadEnvironment(*second, "return 1;").ToLocalChecked();
++    TryCatch caught(isolate_);
++    node::OwnedContextOptions options;
++    EXPECT_TRUE(node::CreateOwnedContext(
++        *second, ticket, ObjectTemplate::New(isolate_),
++        second.context()->GetSecurityToken(), options).IsEmpty());
++    ASSERT_TRUE(caught.HasCaught());
++    Local<Value> code = caught.Exception().As<Object>()->Get(
++        second.context(), String::NewFromUtf8Literal(isolate_, "code"))
++        .ToLocalChecked();
++    EXPECT_TRUE(code->StrictEquals(
++        String::NewFromUtf8Literal(isolate_, "ERR_INVALID_STATE")));
++  }
++}
+diff --git a/test/cctest/test_owned_proxy_reservations.cc b/test/cctest/test_owned_proxy_reservations.cc
+new file mode 100644
+--- /dev/null
++++ b/test/cctest/test_owned_proxy_reservations.cc
+@@ -0,0 +1,152 @@
++// SOURCE ONLY, UNCOMPILED/UNRUN. Shared eligibility, not provenance or branding.
++#include <cppgc/persistent.h>
++#include <node.h>
++#include <v8.h>
++#include "env-inl.h"
++#include "node_contextify.h"
++#include "node_test_fixture.h"
++
++using node::contextify::ContextifyContext;
++using namespace v8;
++class OwnedProxyReservationsTest : public EnvironmentTestFixture {};
++namespace {
++void RejectRaw(Local<Context> host,
++               Local<Function> ordinary_factory,
++               node::Environment* env,
++               Local<Object> raw) {
++  auto* isolate=host->GetIsolate();
++  Context::Scope scope(host);
++  EXPECT_TRUE(env->isolate_data()->IsReservedOwnedGlobalProxy(raw));
++  TryCatch caught(isolate);
++  Local<Value> args[]={raw};
++  EXPECT_TRUE(ordinary_factory->Call(host,Undefined(isolate),1,args).IsEmpty());
++  ASSERT_TRUE(caught.HasCaught());
++  auto code=caught.Exception().As<Object>()->Get(host,
++      String::NewFromUtf8Literal(isolate,"code")).ToLocalChecked();
++  EXPECT_TRUE(code->StrictEquals(String::NewFromUtf8Literal(isolate,"ERR_INVALID_STATE")));
++  EXPECT_FALSE(raw->HasPrivate(host,env->contextify_context_private_symbol()).FromJust());
++  EXPECT_FALSE(raw->HasPrivate(host,env->host_defined_option_symbol()).FromJust());
++}
++struct WeakRoots {
++  Global<Function> retained;
++  Global<Context> context;
++  Global<Object> carrier;
++  Global<Object> wrapper;
++  Global<Object> proxy;
++  cppgc::WeakPersistent<ContextifyContext> cppgc;
++};
++V8_NOINLINE void PrepareWeak(Isolate* isolate,node::Environment* env,
++                             Local<Context> host,WeakRoots* roots) {
++  HandleScope handles(isolate);
++  auto carrier=node::LoadEnvironment(env,
++      "return require('node:vm').prepareOwnedContext();").ToLocalChecked().As<Object>();
++  node::OwnedContextOptions options;
++  auto context=node::CreateOwnedContext(env,carrier,ObjectTemplate::New(isolate),
++      host->GetSecurityToken(),options).ToLocalChecked();
++  auto* cppgc=ContextifyContext::FromOwnedCarrier(env,carrier);
++  ASSERT_NE(cppgc,nullptr);
++  roots->cppgc=cppgc;
++  roots->context.Reset(isolate,context);roots->context.SetWeak();
++  roots->carrier.Reset(isolate,carrier);roots->carrier.SetWeak();
++  roots->wrapper.Reset(isolate,cppgc->object(isolate));roots->wrapper.SetWeak();
++  roots->proxy.Reset(isolate,context->Global());roots->proxy.SetWeak();
++  EXPECT_TRUE(env->isolate_data()->IsReservedOwnedGlobalProxy(context->Global()));
++  Context::Scope scope(context);
++  auto fn=Script::Compile(context,String::NewFromUtf8Literal(isolate,"()=>42"))
++      .ToLocalChecked()->Run(context).ToLocalChecked().As<Function>();
++  roots->retained.Reset(isolate,fn);
++}
++V8_NOINLINE void CheckKept(Isolate* isolate,Local<Context> host,WeakRoots* roots) {
++  HandleScope handles(isolate);
++  EXPECT_NE(roots->cppgc.Get(),nullptr);
++  EXPECT_EQ(roots->retained.Get(isolate)->Call(host,Undefined(isolate),0,nullptr)
++      .ToLocalChecked().As<Number>()->Value(),42);
++}
++}  // namespace
++
++TEST_F(OwnedProxyReservationsTest, TwoLiveDataShareActiveDetachedReusedReservation) {
++  const HandleScope handles(isolate_);
++  const Argv argv;
++  Env first{handles,argv};
++  auto host=first.context();
++  auto prepare=node::LoadEnvironment(*first,
++      "return require('node:vm').prepareOwnedContext;").ToLocalChecked().As<Function>();
++  auto carrier=prepare->Call(host,Undefined(isolate_),0,nullptr).ToLocalChecked().As<Object>();
++  auto global_template=ObjectTemplate::New(isolate_);
++  node::OwnedContextOptions options;
++  auto owned=node::CreateOwnedContext(*first,carrier,global_template,
++      host->GetSecurityToken(),options).ToLocalChecked();
++  auto raw=owned->Global();
++  uv_loop_t other_loop;
++  ASSERT_EQ(uv_loop_init(&other_loop),0);
++  auto free_data=[](node::IsolateData* value){node::FreeIsolateData(value);};
++  std::unique_ptr<node::IsolateData,decltype(free_data)> other_data{
++      node::CreateIsolateData(isolate_,&other_loop,platform.get()),free_data};
++  ASSERT_NE(other_data.get(),isolate_data_);
++  ASSERT_EQ(other_data->isolate(),isolate_data_->isolate());
++  {
++    auto other_context=node::NewContext(isolate_);
++    Context::Scope scope(other_context);
++    auto free_env=[](node::Environment* value){node::FreeEnvironment(value);};
++    std::unique_ptr<node::Environment,decltype(free_env)> other_env{
++        node::CreateEnvironment(other_data.get(),other_context,{},{}),free_env};
++    ASSERT_NE(other_env.get(),nullptr);
++    // Shared-token control isolates the eligibility gate from an earlier SOP
++    // denial. It does not establish distinct-origin policy or Promise support.
++    other_context->SetSecurityToken(host->GetSecurityToken());
++    auto factory=node::LoadEnvironment(other_env.get(),
++        "return value=>require('node:vm').createContext(value);")
++        .ToLocalChecked().As<Function>();
++    RejectRaw(other_context,factory,other_env.get(),raw);
++    EXPECT_EQ(node::DetachOwnedContext(*first,carrier).ToLocalChecked(),raw);
++    RejectRaw(other_context,factory,other_env.get(),raw);
++    Local<Object> fresh;
++    {
++      Context::Scope first_scope(host);
++      fresh=prepare->Call(host,Undefined(isolate_),0,nullptr).ToLocalChecked().As<Object>();
++      EXPECT_EQ(node::CreateOwnedContext(*first,fresh,global_template,
++          host->GetSecurityToken(),options,carrier).ToLocalChecked()->Global(),raw);
++    }
++    RejectRaw(other_context,factory,other_env.get(),raw);
++    // Nonreserved values still receive actual canonical ordinary contexts.
++    auto plain=Object::New(isolate_);
++    plain->CreateDataProperty(other_context,
++        String::NewFromUtf8Literal(isolate_,"answer"),Integer::New(isolate_,40)).Check();
++    Local<Value> argument[]={plain};
++    EXPECT_EQ(factory->Call(other_context,Undefined(isolate_),1,argument)
++        .ToLocalChecked(),plain);
++    auto* ordinary=ContextifyContext::ContextFromContextifiedSandbox(other_env.get(),plain);
++    ASSERT_NE(ordinary,nullptr);
++    Context::Scope ordinary_scope(ordinary->context());
++    EXPECT_EQ(Script::Compile(ordinary->context(),
++        String::NewFromUtf8Literal(isolate_,"answer+=2;answer")).ToLocalChecked()
++        ->Run(ordinary->context()).ToLocalChecked().As<Number>()->Value(),42);
++  }
++  other_data.reset(); // First Data remains; weak reservations must survive.
++  EXPECT_TRUE(isolate_data_->IsReservedOwnedGlobalProxy(raw));
++  EXPECT_EQ(uv_loop_close(&other_loop),0);
++}
++
++TEST_F(OwnedProxyReservationsTest, ReservationDoesNotRootActualContextOrProxy) {
++  const HandleScope handles(isolate_);
++  const Argv argv;
++  Env env{handles,argv};
++  WeakRoots roots;
++  PrepareWeak(isolate_,*env,env.context(),&roots);
++  ASSERT_FALSE(roots.retained.IsEmpty());
++  isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);
++  EXPECT_FALSE(roots.context.IsEmpty());
++  EXPECT_FALSE(roots.carrier.IsEmpty());
++  EXPECT_FALSE(roots.wrapper.IsEmpty());
++  EXPECT_FALSE(roots.proxy.IsEmpty());
++  CheckKept(isolate_,env.context(),&roots);
++  roots.retained.Reset();
++  for(int i=0;i<8;++i){isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);}
++  EXPECT_TRUE(roots.context.IsEmpty());
++  EXPECT_TRUE(roots.carrier.IsEmpty());
++  EXPECT_TRUE(roots.wrapper.IsEmpty());
++  EXPECT_TRUE(roots.proxy.IsEmpty());
++  EXPECT_EQ(roots.cppgc.Get(),nullptr);
++  // Force pruning without resurrecting a collected proxy or guessing an address.
++  EXPECT_FALSE(isolate_data_->IsReservedOwnedGlobalProxy(Object::New(isolate_)));
++}

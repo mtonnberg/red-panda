@@ -1,0 +1,43 @@
+--- a/harness/provider.cc
++++ b/harness/provider.cc
+@@ -67,7 +67,7 @@
+   if (!Owner(args, 0).ToLocal(&owned)) return;
+   if (args.Length() != 2 || !args[1]->IsString()) return Bad(args, "Expected source");
+   Context::Scope scope(owned);
+-  ScriptOrigin origin(args.GetIsolate(), Text(args.GetIsolate(), "owned-empty-hdo.js"));
++  ScriptOrigin origin(Text(args.GetIsolate(), "owned-empty-hdo.js"));
+   ScriptCompiler::Source source(args[1].As<String>(), origin);
+   Local<Script> script;
+   Local<Value> result;
+@@ -115,7 +115,7 @@
+ void ReleaseTemplate(const FunctionCallbackInfo<Value>& args) {
+   Data(args)->global_template.Reset();
+ }
+-void Set(Local<Object> exports, Local<Context> context, State* state,
++void ExportMethod(Local<Object> exports, Local<Context> context, State* state,
+          const char* name, FunctionCallback callback) {
+   exports->CreateDataProperty(context, Text(context->GetIsolate(), name),
+       Function::New(context, callback, External::New(context->GetIsolate(), state))
+@@ -133,14 +133,14 @@
+   node::AddEnvironmentCleanupHook(isolate, [](void* value) {
+     delete static_cast<State*>(value);
+   }, state);
+-  Set(exports, context, state, "create", Create);
+-  Set(exports, context, state, "detach", Detach);
+-  Set(exports, context, state, "run", Run);
+-  Set(exports, context, state, "sameRealm", SameRealm);
+-  Set(exports, context, state, "tokenMatches", Token);
+-  Set(exports, context, state, "watch", WatchOwner);
+-  Set(exports, context, state, "watchState", WatchState);
+-  Set(exports, context, state, "releaseTemplate", ReleaseTemplate);
++  ExportMethod(exports, context, state, "create", Create);
++  ExportMethod(exports, context, state, "detach", Detach);
++  ExportMethod(exports, context, state, "run", Run);
++  ExportMethod(exports, context, state, "sameRealm", SameRealm);
++  ExportMethod(exports, context, state, "tokenMatches", Token);
++  ExportMethod(exports, context, state, "watch", WatchOwner);
++  ExportMethod(exports, context, state, "watchState", WatchState);
++  ExportMethod(exports, context, state, "releaseTemplate", ReleaseTemplate);
+   exports->CreateDataProperty(context, Text(isolate,"providerVersion"),
+       Integer::NewFromUnsigned(isolate, node::kOwnedContextProviderVersion)).Check();
+ }
