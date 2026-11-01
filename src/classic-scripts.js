@@ -7,6 +7,7 @@ import { parseDocumentWriteFragment } from './shadow.js';
 import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
 import { prepareInputParserAdapter } from './input-controls.js';
 import { prepareCustomElementParserAdapter } from './custom-elements.js';
+import { prepareShadowParserAdapter } from './shadow.js';
 import {onFrameRetirement} from './frame-retirement-hooks.js';
 import { installDocumentReset } from './document-reset.js';
 import {runInitialNetworkParserClose} from './initial-network-load.js';
@@ -136,6 +137,7 @@ function resumeAfterScript(record, script) {
 }
 
 function makeParser(record, options) {
+  prepareShadowParserAdapter(options?.treeAdapter);
   prepareInputParserAdapter(options?.treeAdapter);
   prepareCustomElementParserAdapter(options?.treeAdapter);
   const parser = new parse5.Parser(options, undefined, null, script => {

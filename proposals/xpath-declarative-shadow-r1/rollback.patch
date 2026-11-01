@@ -1,0 +1,336 @@
+--- a/src/document-member-realms.js
++++ b/src/document-member-realms.js
+@@ -23,23 +23,11 @@
+  };
+ }
+ export function installDocumentXPathEntries(window){
+- const member=captureDocumentMemberFactory(window),owner=platformFactoryRecord(window.document)?.implementation;
+- const owned=isDocument(owner)&&vm.isContext(owner._globalObject);
++ const member=captureDocumentMemberFactory(window);
+  for(const name of ['createExpression','createNSResolver','evaluate']){
+   const original=descriptor(window.Document.prototype,name);
+   if(typeof original?.value!=='function')throw new TypeError('A genuine installed XPath Document operation is required');
+-  let operation=original.value;
+-  if(name==='evaluate'&&owned){
+-   // Document supplies its genuine receiver only for the measured absent/null
+-   // context. Explicit contexts and the evaluator API retain their own path.
+-   // captureDocumentMemberFactory checks the real Document before this runs.
+-   operation=({evaluate(...args){
+-    if(args[1]===null||args[1]===undefined)args[1]=this;
+-    return apply(original.value,this,args);
+-   }}).evaluate;
+-   define(operation,'length',{value:original.value.length,configurable:true});
+-  }
+-  const value=member(name,'value',operation);
++  const value=member(name,'value',original.value);
+   // Measured Native Document mixin functions are distinct from evaluator
+   // methods and all have one required parameter. Backend arguments stay real.
+   if(value!==original.value)define(value,'length',{value:1,configurable:true});
+--- a/test/xpath-default-context.test.js
++++ /dev/null
+@@ -1,82 +0,0 @@
+-import {test} from 'node:test';
+-import assert from 'node:assert/strict';
+-import {Browser} from '../src/browser.js';
+-import {spawnSync} from 'node:child_process';
+-
+-async function fixture(t) {
+-  const browser = new Browser({loadResources: ['iframe']});
+-  t.after(() => browser.close());
+-  const page = browser.createPage();
+-  await page.navigate('data:text/html,<body><p id=one>first</p><section><p id=two>second</p></section><iframe></iframe>');
+-  return page.dom.window;
+-}
+-
+-test('Document XPath absent contexts query the actual receiver and keep real result nodes', async t => {
+-  const w = await fixture(t), d = w.document;
+-  for (const context of [null, undefined]) {
+-    const result = d.evaluate('//p', context, null, w.XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+-    assert.equal(result.snapshotLength, 2);
+-    assert.equal(result.snapshotItem(0), d.getElementById('one'));
+-    assert.equal(result.snapshotItem(1), d.getElementById('two'));
+-    assert.equal(result.snapshotItem(2), null);
+-  }
+-  const held = d.evaluate('//p', null, null, w.XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+-  d.getElementById('one').remove();
+-  assert.equal(held.snapshotLength, 2);
+-  assert.equal(d.evaluate('count(//p)', null, null, w.XPathResult.NUMBER_TYPE, null).numberValue, 1);
+-});
+-
+-test('borrowed Document XPath defaults to the genuine child receiver and preserves explicit scope', async t => {
+-  const w = await fixture(t), child = w.document.querySelector('iframe').contentDocument;
+-  const parent = child.body.appendChild(child.createElement('section'));
+-  const p = parent.appendChild(child.createElement('p')); p.textContent = 'child only';
+-  const outside = child.body.appendChild(child.createElement('p')); outside.textContent = 'outside';
+-  const evaluate = w.Document.prototype.evaluate;
+-  assert.equal(evaluate.call(child, 'count(//p)', null, null, w.XPathResult.NUMBER_TYPE, null).numberValue, 2);
+-  assert.equal(evaluate.call(child, 'string(./p)', parent, null, w.XPathResult.STRING_TYPE, null).stringValue, 'child only');
+-  assert.equal(evaluate.call(child, './p', parent, null, w.XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue, p);
+-  assert.equal(p.ownerDocument, child);
+-  assert.equal(w.document.querySelectorAll('p').length, 2);
+-});
+-
+-test('Document XPath defaulting preserves private receiver guards without authored lookups', async t => {
+-  const w = await fixture(t), d = w.document, evaluate = w.Document.prototype.evaluate;
+-  const fake = Object.create(w.Document.prototype);
+-  let reads = 0;
+-  for (const key of ['nodeType', 'ownerDocument', 'document']) {
+-    Object.defineProperty(fake, key, {configurable: true, get() {reads++; throw Error('authored ' + key);}});
+-  }
+-  const proxy = new Proxy(d, {get() {reads++; throw Error('authored get');}, getPrototypeOf() {reads++; throw Error('authored prototype');}});
+-  for (const receiver of [null, undefined, {}, fake, proxy, d.body]) {
+-    assert.throws(() => evaluate.call(receiver, '//p', null, null, w.XPathResult.ANY_TYPE, null), e => e instanceof w.TypeError && e.message === 'Illegal invocation');
+-  }
+-  assert.equal(reads, 0);
+-});
+-
+-test('unregistered standalone Document installers keep their original explicit and absent-context behavior', () => {
+-  const source = `import assert from 'node:assert/strict';
+-import {JSDOM} from 'jsdom';
+-import {installDocumentXPathEntries} from './src/document-member-realms.js';
+-import {platformFactoryRecord} from './src/platform-factories.js';
+-for (const runScripts of [undefined, 'outside-only']) {
+- const dom = new JSDOM('<p>standalone</p>', runScripts ? {runScripts} : {});
+- try {
+-  const w = dom.window, d = w.document;
+-  assert.equal(platformFactoryRecord(d), undefined);
+-  const original = w.Document.prototype.evaluate;
+-  let before;
+-  try {original.call(d, '//p', null, null, w.XPathResult.ANY_TYPE, null)} catch (e) {before = {name:e.name,message:e.message}}
+-  assert.ok(before);
+-  installDocumentXPathEntries(w);
+-  assert.equal(d.evaluate('count(//p)', d, null, w.XPathResult.NUMBER_TYPE, null).numberValue, 1);
+-  let after;
+-  try {d.evaluate('//p', null, null, w.XPathResult.ANY_TYPE, null)} catch (e) {after = {name:e.name,message:e.message}}
+-  assert.deepEqual(after, before);
+- } finally {dom.window.close()}
+-}`;
+-  const result = spawnSync(process.execPath, ['--experimental-vm-modules', '--input-type=module', '-e', source], {
+-    cwd: new URL('..', import.meta.url), encoding: 'utf8', timeout: 3000
+-  });
+-  assert.equal(result.error, undefined);
+-  assert.equal(result.status, 0, result.stderr);
+-});
+--- a/src/shadow.js
++++ b/src/shadow.js
+@@ -29,7 +29,6 @@
+ const ROOTS = new WeakMap();
+ const FORCED_FRAGMENTS = new WeakMap();
+ const FORCED_DOCUMENTS = new WeakMap();
+-const PARSER_ADAPTERS = new WeakSet();
+ const MANUAL_LISTS = new WeakMap();
+ const MANUAL_OWNERS = new WeakMap();
+ const HTML = 'http://www.w3.org/1999/xhtml';
+@@ -190,18 +189,13 @@
+     clonable: template.hasAttributeNS(null, 'shadowrootclonable') };
+ }
+ 
+-function declarativeAdapter(adapter, record, document = record?.documentImpl, inert = false, allowAssociatedInert = false) {
++function declarativeAdapter(adapter, record, document = record?.documentImpl, inert = false) {
+   const append = adapter.appendChild;
+   adapter.appendChild = function (parent, child) {
+     if (active(record) && child.nodeType === 1 && child.namespaceURI === HTML && child.localName === 'template') {
+       const host = parent;
+       const options = rootOptions(child);
+-      const ownerDocument = host?._ownerDocument;
+-      // Only a full parser's actual canonical template-content owner is
+-      // additionally admitted. The new root keeps that inactive Document.
+-      const ownsHost = ownerDocument === document || (allowAssociatedInert &&
+-        ownerDocument && ownerDocument === document._associatedInertTemplateDocument);
+-      if (options && host?.nodeType === 1 && ownsHost && !host._shadowRoot) {
++      if (options && host?.nodeType === 1 && host._ownerDocument === document && !host._shadowRoot) {
+         try {
+           const root = attach(host, options, true);
+           // parse5 now inserts template children directly into the real root.
+@@ -325,7 +319,9 @@
+   };
+   const parseDocument = parse5.parse;
+   parse5.parse = function (markup, options) {
+-    prepareShadowParserAdapter(options?.treeAdapter);
++    const document=options?.treeAdapter?._documentImpl,permit=FORCED_DOCUMENTS.get(document);if(permit)FORCED_DOCUMENTS.delete(document);
++    const record = permit?.record ?? recordFor(document);
++    if (record) declarativeAdapter(options.treeAdapter, record, document, Boolean(permit?.inert));
+     return parseDocument.call(this, markup, options);
+   };
+   const parseFragment = parse5.parseFragment;
+@@ -438,21 +434,6 @@
+   return record.controller;
+ }
+ 
+-// Both canonical parse5.parse and the owned streaming Parser constructor
+-// enter here before any tokens are fed. This uses the actual adapter's Document
+-// and the existing active owner (or one consumed inert-document permit).
+-export function prepareShadowParserAdapter(adapter) {
+-  if (!adapter || PARSER_ADAPTERS.has(adapter)) return;
+-  const document = adapter._documentImpl;
+-  const permit = FORCED_DOCUMENTS.get(document);
+-  if (permit) FORCED_DOCUMENTS.delete(document);
+-  const record = permit?.record ?? recordFor(document);
+-  if (!record) return;
+-  PARSER_ADAPTERS.add(adapter);
+-  const allowAssociatedInert = !permit?.inert && !adapter._fragment && document === record.documentImpl;
+-  declarativeAdapter(adapter, record, document, Boolean(permit?.inert), allowAssociatedInert);
+-}
+-
+ // Scope one actual fragment-parser entry. Nested ordinary innerHTML parsing
+ // remains inert after the permit is consumed, as with setHTMLUnsafe.
+ export function parseDocumentWriteFragment(document, markup) {
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -7,7 +7,6 @@
+ import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
+ import { prepareInputParserAdapter } from './input-controls.js';
+ import { prepareCustomElementParserAdapter } from './custom-elements.js';
+-import { prepareShadowParserAdapter } from './shadow.js';
+ import {onFrameRetirement} from './frame-retirement-hooks.js';
+ import { installDocumentReset } from './document-reset.js';
+ import {runInitialNetworkParserClose} from './initial-network-load.js';
+@@ -137,7 +136,6 @@
+ }
+ 
+ function makeParser(record, options) {
+-  prepareShadowParserAdapter(options?.treeAdapter);
+   prepareInputParserAdapter(options?.treeAdapter);
+   prepareCustomElementParserAdapter(options?.treeAdapter);
+   const parser = new parse5.Parser(options, undefined, null, script => {
+--- a/test/shadow.test.js
++++ b/test/shadow.test.js
+@@ -112,7 +112,7 @@
+   } finally { f.close(); }
+ });
+ 
+-test('invalid hosts and duplicate roots retain templates while full document template content owns declarative roots', () => {
++test('invalid hosts, duplicate declarative roots and templates in inert template content remain light DOM templates', () => {
+   const f = fixture('<body><template id="inert"><div><template shadowrootmode="open"><b>inert</b></template></div></template>');
+   try {
+     const host = f.document.createElement('div');
+@@ -120,14 +120,8 @@
+     const valid = host.querySelector('#valid');
+     assert.equal(valid.shadowRoot.textContent, 'first'); assert.ok(valid.querySelector('template'));
+     assert.equal(host.querySelector('template[shadowrootmode=bad]').content.textContent, 'invalid');
+-    const content = f.document.querySelector('#inert').content;
+-    const inert = content.querySelector('div'), root = inert.shadowRoot;
+-    assert.ok(root instanceof f.window.ShadowRoot); assert.equal(root.nodeType, 11); assert.equal(root.mode, 'open');
+-    assert.equal(root.host, inert); assert.equal(root.textContent, 'inert');
+-    assert.equal(root.ownerDocument, inert.ownerDocument); assert.equal(root.ownerDocument, content.ownerDocument);
+-    assert.notEqual(root.ownerDocument, f.document); assert.equal(root.ownerDocument.defaultView, null);
+-    assert.equal(inert.isConnected, false); assert.equal(root.isConnected, false);
+-    assert.equal(inert.querySelector('template'), null);
++    const inert = f.document.querySelector('#inert').content.querySelector('div');
++    assert.equal(inert.shadowRoot, null); assert.ok(inert.querySelector('template'));
+   } finally { f.close(); }
+ });
+ 
+--- a/test/parser-declarative-shadow.test.js
++++ /dev/null
+@@ -1,110 +0,0 @@
+-import {test} from 'node:test';
+-import assert from 'node:assert/strict';
+-import {createRequire} from 'node:module';
+-import {Browser} from '../src/browser.js';
+-import {platformFactoryRecord} from '../src/platform-factories.js';
+-import {implementationForWrapper} from '../src/dom-event-state.js';
+-import {getHeapBinding} from '../src/native-heap.js';
+-import {staticResourceServer} from './static-resource-server.js';
+-const require=createRequire(import.meta.url);
+-const {wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
+-const plain=value=>JSON.parse(JSON.stringify(value));
+-async function fixture(t,html,routes={}) {
+-  const server=await staticResourceServer(t,{html,routes});
+-  let browser;
+-  t.after(()=>browser?.close());
+-  browser=new Browser({timeout:2500,loadResources:['iframe']});
+-  const page=browser.createPage(),errors=[];
+-  page.on('pageError',error=>errors.push(error.message));
+-  await page.navigate(server.origin+'/page.html');
+-  return {page,window:page.dom.window,errors,...server};
+-}
+-
+-test('owned incremental parsing creates the real declarative root before the following parser script',{timeout:15000},async t=>{
+-  const f=await fixture(t,'<!doctype html><body><!--'+'p'.repeat(17000)+'--><div id="host"><template shadowrootmode="open" shadowrootserializable><p id="inside">actual shadow</p></template><span>actual light</span></div><script>const host=document.getElementById("host");globalThis.atParserBoundary={root:host.shadowRoot!==null,text:host.shadowRoot?.getElementById("inside").textContent,template:host.querySelector("template")!==null,privateId:document.getElementById("inside")!==null,current:document.currentScript.tagName};</script>');
+-  assert.deepEqual(plain(f.window.atParserBoundary),{root:true,text:'actual shadow',template:false,privateId:false,current:'SCRIPT'});
+-  const host=f.window.document.getElementById('host');
+-  assert.equal(host.shadowRoot.ownerDocument,f.window.document);
+-  assert.equal(host.shadowRoot.serializable,true);
+-  assert.equal(host.querySelector('span').textContent,'actual light');
+-  assert.deepEqual(f.errors,[]);
+-});
+-
+-test('streamed nested closed roots preserve genuine backing, flags and declarative reattachment',{timeout:15000},async t=>{
+-  const f=await fixture(t,'<!doctype html><div id="host"><template shadowrootmode="open"><section id="closed"><template shadowrootmode="closed" shadowrootdelegatesfocus shadowrootclonable shadowrootserializable><b>actual nested</b></template></section></template></div>');
+-  const host=f.window.document.getElementById('host'),nested=host.shadowRoot.getElementById('closed');
+-  assert.equal(nested.shadowRoot,null);
+-  const root=wrapperForImpl(implementationForWrapper(nested)._shadowRoot);
+-  assert.equal(root.host,nested);assert.equal(root.ownerDocument,f.window.document);
+-  assert.equal(root.mode,'closed');assert.equal(root.textContent,'actual nested');
+-  assert.equal(root.delegatesFocus,true);assert.equal(root.clonable,true);assert.equal(root.serializable,true);
+-  assert.equal(platformFactoryRecord(root).implementation,implementationForWrapper(root));
+-  assert.throws(()=>nested.attachShadow({mode:'open'}),error=>error.name==='NotSupportedError');
+-  assert.equal(nested.attachShadow({mode:'closed'}),root);
+-  assert.equal(root.childNodes.length,0);assert.equal(root.serializable,true);
+-  assert.throws(()=>nested.attachShadow({mode:'closed'}),error=>error.name==='NotSupportedError');
+-  assert.deepEqual(f.errors,[]);
+-});
+-
+-test('real shadow parser scripts execute once in order and blocking external source resumes the same parser',{timeout:15000},async t=>{
+-  const html='<!doctype html><script>globalThis.seen=[]</script><div id="host"><template shadowrootmode="open"><script>seen.push(["inline",document.currentScript.getRootNode()===document.getElementById("host").shadowRoot])</script><script src="/shadow.js"></script><p id="tail">shadow tail</p></template></div><script>seen.push(["after",document.getElementById("host").shadowRoot.getElementById("tail").textContent])</script>';
+-  const f=await fixture(t,html,{'/shadow.js':{delay:20,body:'seen.push(["external",document.currentScript.getRootNode()===document.getElementById("host").shadowRoot]);'}});
+-  assert.deepEqual(plain(f.window.seen),[['inline',true],['external',true],['after','shadow tail']]);
+-  assert.equal(f.requests.filter(path=>path==='/shadow.js').length,1);
+-  assert.equal(f.window.document.currentScript,null);assert.deepEqual(f.errors,[]);
+-});
+-
+-test('parser host validation preserves foreign templates, inactive root owners, disabled features and duplicate roots',{timeout:15000},async t=>{
+-  const f=await fixture(t,'<!doctype html><script>customElements.define("no-shadow-host",class extends HTMLElement{static get disabledFeatures(){return ["shadow"]}})</script><div id="valid"><template shadowrootmode="open"><b>first</b></template><template shadowrootmode="closed"><i>second</i></template></div><button id="invalid"><template shadowrootmode="open"><b>unsupported host</b></template></button><template id="inert"><div><template shadowrootmode="open"><b>inert</b></template></div></template><no-shadow-host id="disabled"><template shadowrootmode="open"><b>disabled</b></template></no-shadow-host><svg><g id="foreign"><template shadowrootmode="open"><text>foreign</text></template></g></svg>');
+-  const d=f.window.document,valid=d.getElementById('valid');
+-  assert.equal(valid.shadowRoot.textContent,'first');assert.equal(valid.querySelector('template').content.textContent,'second');
+-  assert.equal(d.getElementById('invalid').shadowRoot,null);assert.ok(d.getElementById('invalid').querySelector('template'));
+-  const content=d.getElementById('inert').content,inert=content.querySelector('div'),inertRoot=inert.shadowRoot;
+-  assert.ok(inertRoot instanceof f.window.ShadowRoot);assert.equal(inertRoot.nodeType,11);assert.equal(inertRoot.mode,'open');
+-  assert.equal(inertRoot.textContent,'inert');assert.equal(inertRoot.host,inert);assert.equal(inertRoot.getRootNode(),inertRoot);
+-  assert.equal(inertRoot.ownerDocument,inert.ownerDocument);assert.equal(inertRoot.ownerDocument,content.ownerDocument);
+-  assert.notEqual(inertRoot.ownerDocument,d);assert.equal(inertRoot.ownerDocument.defaultView,null);
+-  assert.equal(inert.isConnected,false);assert.equal(inertRoot.isConnected,false);assert.equal(inert.querySelector('template'),null);
+-  assert.equal(d.getElementById('disabled').shadowRoot,null);assert.ok(d.getElementById('disabled').querySelector('template'));
+-  assert.equal(d.getElementById('foreign').shadowRoot,null);assert.ok(d.getElementById('foreign').querySelector('template'));
+-  assert.deepEqual(f.errors,[]);
+-});
+-
+-test('real HTTP child parser roots retain the child Document, exact backend and actual VM creation context',{timeout:15000},async t=>{
+-  const f=await fixture(t,'<!doctype html><iframe id="child" src="/child"></iframe>',{'/child':{type:'text/html',body:'<!doctype html><div id="host"><template shadowrootmode="open"><p>child shadow</p></template></div><script>globalThis.beforeChildEOF=document.getElementById("host").shadowRoot?.textContent</script>'}});
+-  const child=f.window.document.getElementById('child'),w=child.contentWindow,host=w.document.getElementById('host'),root=host.shadowRoot;
+-  assert.equal(w.beforeChildEOF,'child shadow');assert.equal(root.ownerDocument,w.document);assert.notEqual(root.ownerDocument,f.window.document);
+-  assert.equal(platformFactoryRecord(root).implementation,implementationForWrapper(root));
+-  const binding=getHeapBinding(),anchor=new w.Array();
+-  for(const value of [root,root.firstElementChild]) {
+-    assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,new f.window.Array()),false);
+-    const prototype=Object.getPrototypeOf(value);
+-    try{Object.setPrototypeOf(value,null);assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,{}),false);}finally{Object.setPrototypeOf(value,prototype);}
+-  }
+-  let reads=0;const counterfeit=Object.create(w.ShadowRoot.prototype);Object.defineProperty(counterfeit,Symbol('impl'),{get(){reads++;throw Error('authored implementation')}});
+-  assert.equal(platformFactoryRecord(counterfeit),undefined);assert.equal(reads,0);
+-  assert.deepEqual(f.errors,[]);
+-});
+-
+-test('document-open write-created parsing admits roots in each actual reset generation',{timeout:15000},async t=>{
+-  const f=await fixture(t,'<!doctype html><p>initial</p>'),document=f.window.document;
+-  for(const text of ['first real write','second real write']) {
+-    f.page.evaluate(`document.open();document.write(${JSON.stringify('<!doctype html><div id="host"><template shadowrootmode="open"><p>'+text+'</p></template></div><script>globalThis.atWrittenParserBoundary=document.getElementById("host").shadowRoot?.textContent</script>')});document.close()`);
+-    assert.equal(f.window.document,document);assert.equal(f.window.atWrittenParserBoundary,text);
+-    assert.equal(document.getElementById('host').shadowRoot.textContent,text);
+-    assert.equal(document.getElementById('host').shadowRoot.ownerDocument,document);
+-  }
+-  assert.deepEqual(f.errors,[]);
+-});
+-
+-test('ordinary fragment parsing stays inert while an explicitly unsafe entry retains real declarative behavior',{timeout:15000},async t=>{
+-  const f=await fixture(t,'<!doctype html><body></body>'),d=f.window.document;
+-  const markup='<div><template shadowrootmode="open"><b>actual</b><script>globalThis.fragmentExecuted=true</script></template></div>';
+-  const normal=d.createElement('section');normal.innerHTML=markup;d.body.append(normal);
+-  assert.equal(normal.firstElementChild.shadowRoot,null);assert.ok(normal.querySelector('template'));
+-  const detached=new f.window.DOMParser().parseFromString(markup,'text/html');
+-  assert.equal(detached.querySelector('div').shadowRoot,null);
+-  const unsafe=d.createElement('section');unsafe.setHTMLUnsafe(markup);d.body.append(unsafe);
+-  assert.equal(unsafe.firstElementChild.shadowRoot.querySelector('b').textContent,'actual');
+-  assert.equal(f.window.fragmentExecuted,undefined);assert.deepEqual(f.errors,[]);
+-});

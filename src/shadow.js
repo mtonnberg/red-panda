@@ -29,6 +29,7 @@ const DISPOSED_DOCUMENTS = new WeakSet();
 const ROOTS = new WeakMap();
 const FORCED_FRAGMENTS = new WeakMap();
 const FORCED_DOCUMENTS = new WeakMap();
+const PARSER_ADAPTERS = new WeakSet();
 const MANUAL_LISTS = new WeakMap();
 const MANUAL_OWNERS = new WeakMap();
 const HTML = 'http://www.w3.org/1999/xhtml';
@@ -189,13 +190,18 @@ function rootOptions(template) {
     clonable: template.hasAttributeNS(null, 'shadowrootclonable') };
 }
 
-function declarativeAdapter(adapter, record, document = record?.documentImpl, inert = false) {
+function declarativeAdapter(adapter, record, document = record?.documentImpl, inert = false, allowAssociatedInert = false) {
   const append = adapter.appendChild;
   adapter.appendChild = function (parent, child) {
     if (active(record) && child.nodeType === 1 && child.namespaceURI === HTML && child.localName === 'template') {
       const host = parent;
       const options = rootOptions(child);
-      if (options && host?.nodeType === 1 && host._ownerDocument === document && !host._shadowRoot) {
+      const ownerDocument = host?._ownerDocument;
+      // Only a full parser's actual canonical template-content owner is
+      // additionally admitted. The new root keeps that inactive Document.
+      const ownsHost = ownerDocument === document || (allowAssociatedInert &&
+        ownerDocument && ownerDocument === document._associatedInertTemplateDocument);
+      if (options && host?.nodeType === 1 && ownsHost && !host._shadowRoot) {
         try {
           const root = attach(host, options, true);
           // parse5 now inserts template children directly into the real root.
@@ -319,9 +325,7 @@ function patchHosts() {
   };
   const parseDocument = parse5.parse;
   parse5.parse = function (markup, options) {
-    const document=options?.treeAdapter?._documentImpl,permit=FORCED_DOCUMENTS.get(document);if(permit)FORCED_DOCUMENTS.delete(document);
-    const record = permit?.record ?? recordFor(document);
-    if (record) declarativeAdapter(options.treeAdapter, record, document, Boolean(permit?.inert));
+    prepareShadowParserAdapter(options?.treeAdapter);
     return parseDocument.call(this, markup, options);
   };
   const parseFragment = parse5.parseFragment;
@@ -432,6 +436,21 @@ export function installShadowDOM(page, window) {
   window.close = record.close;
   record.signal?.addEventListener('abort', dispose, { once: true }); page.once?.('close', dispose);
   return record.controller;
+}
+
+// Both canonical parse5.parse and the owned streaming Parser constructor
+// enter here before any tokens are fed. This uses the actual adapter's Document
+// and the existing active owner (or one consumed inert-document permit).
+export function prepareShadowParserAdapter(adapter) {
+  if (!adapter || PARSER_ADAPTERS.has(adapter)) return;
+  const document = adapter._documentImpl;
+  const permit = FORCED_DOCUMENTS.get(document);
+  if (permit) FORCED_DOCUMENTS.delete(document);
+  const record = permit?.record ?? recordFor(document);
+  if (!record) return;
+  PARSER_ADAPTERS.add(adapter);
+  const allowAssociatedInert = !permit?.inert && !adapter._fragment && document === record.documentImpl;
+  declarativeAdapter(adapter, record, document, Boolean(permit?.inert), allowAssociatedInert);
 }
 
 // Scope one actual fragment-parser entry. Nested ordinary innerHTML parsing

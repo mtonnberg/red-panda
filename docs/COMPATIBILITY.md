@@ -4,14 +4,18 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current installed workflow passes **2,211 JavaScript tests, 129 PureScript
+The current installed workflow passes **2,222 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds. The strict build reports zero warnings and errors; runtime
-warnings remain in the complete logs. [Full validation](../proposals/canonical-style-scalar-r2/README.md)
-records 13,260 unchanged inputs for JavaScript and 13,261 for the remaining
-stages, after the three-leaf canonical-style change over b0217de. All 18 production native
-artifacts remain unchanged. Original assertions, fixtures and budgets are
-preserved. This is not a new whole-455 census or a full replication claim.
+warnings remain in the complete logs. [Full validation](../proposals/xpath-declarative-shadow-r1/README.md)
+records 17,761 unchanged inputs for JavaScript, 17,776 for the remaining stages
+and 17,778 for the live PureScript example. Post-live health reported zero pages.
+The six-leaf XPath and streaming-shadow change over 636c794 installs 657 protected
+files while preserving the other 651 files, all 18 production native artifacts
+and the C++ source. Upstream fixture assertions and budgets are preserved.
+This is not a new whole-455 census or a full replication claim. The earlier
+[2,211-case stylesheet checkpoint](../proposals/canonical-style-scalar-r2/README.md)
+retains its own validation and negative epochs.
 The [2,206-case lifecycle checkpoint](../proposals/initial-network-lifecycle-r5/README.md)
 retains its own 13,430/13,451-input validation and earlier interrupted run.
 The earlier [2,190/129/13 checkpoint](../proposals/feature-composition-full-root-r1/README.md)
@@ -19,6 +23,13 @@ and its 51-source/six-artifact application remain separate evidence, as do the
 [2,043/129/13](../proposals/phase26-full-file-element-url/README.md) and
 [1,992/117/13](../proposals/phase26-full-accepted/README.md) checkpoints remain
 separate evidence.
+
+Document XPath evaluation supplies the genuine receiver when its context is
+absent or null; explicit contexts keep their original path. Full streaming
+parsers attach declarative shadow roots before following scripts. The measured
+ordinary template-content case keeps its real inactive owner document. Focused
+checks passed on all three prepared SDKs; their original source observations
+remain separate from the historical conformance census.
 
 Disk file selection now reads actual bytes/MIME/stat timestamps, validates the
 whole vector before mutation, preserves canonical FileList identity and dispatches

@@ -112,7 +112,7 @@ test('setHTMLUnsafe builds nested declarative roots and round trips while direct
   } finally { f.close(); }
 });
 
-test('invalid hosts, duplicate declarative roots and templates in inert template content remain light DOM templates', () => {
+test('invalid hosts and duplicate roots retain templates while full document template content owns declarative roots', () => {
   const f = fixture('<body><template id="inert"><div><template shadowrootmode="open"><b>inert</b></template></div></template>');
   try {
     const host = f.document.createElement('div');
@@ -120,8 +120,14 @@ test('invalid hosts, duplicate declarative roots and templates in inert template
     const valid = host.querySelector('#valid');
     assert.equal(valid.shadowRoot.textContent, 'first'); assert.ok(valid.querySelector('template'));
     assert.equal(host.querySelector('template[shadowrootmode=bad]').content.textContent, 'invalid');
-    const inert = f.document.querySelector('#inert').content.querySelector('div');
-    assert.equal(inert.shadowRoot, null); assert.ok(inert.querySelector('template'));
+    const content = f.document.querySelector('#inert').content;
+    const inert = content.querySelector('div'), root = inert.shadowRoot;
+    assert.ok(root instanceof f.window.ShadowRoot); assert.equal(root.nodeType, 11); assert.equal(root.mode, 'open');
+    assert.equal(root.host, inert); assert.equal(root.textContent, 'inert');
+    assert.equal(root.ownerDocument, inert.ownerDocument); assert.equal(root.ownerDocument, content.ownerDocument);
+    assert.notEqual(root.ownerDocument, f.document); assert.equal(root.ownerDocument.defaultView, null);
+    assert.equal(inert.isConnected, false); assert.equal(root.isConnected, false);
+    assert.equal(inert.querySelector('template'), null);
   } finally { f.close(); }
 });
 

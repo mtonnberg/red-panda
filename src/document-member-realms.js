@@ -23,11 +23,23 @@ export function captureDocumentMemberFactory(window){
  };
 }
 export function installDocumentXPathEntries(window){
- const member=captureDocumentMemberFactory(window);
+ const member=captureDocumentMemberFactory(window),owner=platformFactoryRecord(window.document)?.implementation;
+ const owned=isDocument(owner)&&vm.isContext(owner._globalObject);
  for(const name of ['createExpression','createNSResolver','evaluate']){
   const original=descriptor(window.Document.prototype,name);
   if(typeof original?.value!=='function')throw new TypeError('A genuine installed XPath Document operation is required');
-  const value=member(name,'value',original.value);
+  let operation=original.value;
+  if(name==='evaluate'&&owned){
+   // Document supplies its genuine receiver only for the measured absent/null
+   // context. Explicit contexts and the evaluator API retain their own path.
+   // captureDocumentMemberFactory checks the real Document before this runs.
+   operation=({evaluate(...args){
+    if(args[1]===null||args[1]===undefined)args[1]=this;
+    return apply(original.value,this,args);
+   }}).evaluate;
+   define(operation,'length',{value:original.value.length,configurable:true});
+  }
+  const value=member(name,'value',operation);
   // Measured Native Document mixin functions are distinct from evaluator
   // methods and all have one required parameter. Backend arguments stay real.
   if(value!==original.value)define(value,'length',{value:1,configurable:true});

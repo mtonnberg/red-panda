@@ -297,15 +297,24 @@ the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current installed graph passes 2,211 JavaScript tests, 129 PureScript
+The current installed graph passes 2,222 JavaScript tests, 129 PureScript
 Puppeteer checks, 13 native differential groups, syntax and strict/pedantic
-PureScript checks. [Validation](proposals/canonical-style-scalar-r2/README.md)
-records 13,260 unchanged JavaScript-workflow inputs and 13,261 unchanged inputs
-for the remaining stages. The earlier
+PureScript checks. [Validation](proposals/xpath-declarative-shadow-r1/README.md)
+records 17,761 unchanged JavaScript-workflow inputs, 17,776 for the remaining
+stages and 17,778 for the live PureScript example. The service remained healthy
+with zero pages. Runtime warnings remain in the raw logs. The earlier
+[2,211-case stylesheet checkpoint](proposals/canonical-style-scalar-r2/README.md),
 [2,206-case lifecycle checkpoint](proposals/initial-network-lifecycle-r5/README.md), failed runs and the
 [2,190-case checkpoint](proposals/feature-composition-full-root-r1/README.md)
 remain separate evidence. This is not a new whole-fixture census or a full
 replication claim.
+
+Document XPath evaluation supplies the genuine receiver when its context is
+absent or null; explicit contexts keep their original path. Full streaming
+parsers attach declarative shadow roots before following scripts. The measured
+ordinary template-content case keeps its real inactive owner document. Focused
+checks passed on all three prepared SDKs; their original source observations
+remain separate from the historical conformance census.
 
 `performance.eventCounts` counts real dispatch before listeners, including trusted
 input and file uploads. Its VM fronts, live iterators and snapshot `forEach` pass
