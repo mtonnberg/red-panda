@@ -307,6 +307,12 @@ real dependency-free inline-module evaluation. [Validation](proposals/managed-wr
 records seven matching Native scenarios, five checks on each remaining SDK and
 115 Root regressions; initial bootstrap and broader module graph timing remain open.
 
+Document byte decoding, declared charset metadata and legacy URL queries use real
+codecs. XHTML and qualified XML/HTML nodes use canonical first-allocation factories
+and live collections. [Validation](proposals/document-encoding-xml-r9/README.md) records
+378 SDK cases, 23 Native groups and 194 Root checks, with earlier failures and
+reporting/provenance limits retained explicitly.
+
 File uploads use real disk bytes and timestamps, atomic path validation and stable
 canonical FileList objects. PureScript owns the actual Puppeteer nonempty and
 empty upload branches and ElementHandle cleanup. The public and utility worlds

@@ -1,10 +1,12 @@
+import{installQualifiedElementBirth}from'./qualified-element-birth.js';
+import{installXMLQueryPolicy}from'./xml-query-policy.js';
 import{createRequire}from'node:module';
 import{implementationForWrapper}from'./dom-event-state.js';
 import{serializeHTML}from'./serialization.js';
 import{ownNamespaceGlobal,ownsNamespaceNode,namespaceCreator}from'./namespace-state.js';
 const require=createRequire(import.meta.url),ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation,NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
 const attributes=require('jsdom/lib/jsdom/living/attributes.js'),xmlParser=require('jsdom/lib/jsdom/browser/parser/xml.js'),htmlParser=require('jsdom/lib/jsdom/browser/parser/html.js');
-const DOMParserImpl=require('jsdom/lib/jsdom/living/domparsing/DOMParser-impl.js').implementation,Document=require('jsdom/lib/jsdom/living/generated/Document.js'),parser=require('jsdom/lib/jsdom/browser/parser/index.js');
+const DOMParserImpl=require('jsdom/lib/jsdom/living/domparsing/DOMParser-impl.js').implementation,Document=require('jsdom/lib/jsdom/living/generated/Document.js'),XMLDocument=require('jsdom/lib/jsdom/living/generated/XMLDocument.js'),parser=require('jsdom/lib/jsdom/browser/parser/index.js');
 const Element=require('jsdom/lib/jsdom/living/generated/Element.js'),UnknownElement=require('jsdom/lib/jsdom/living/generated/HTMLUnknownElement.js');
 const{getHTMLElementInterface}=require('jsdom/lib/jsdom/living/helpers/create-element.js');
 const{HTML_NS,SVG_NS,MATHML_NS,XML_NS,XMLNS_NS}=require('jsdom/lib/jsdom/living/helpers/namespaces.js');
@@ -54,7 +56,8 @@ function patch(){
  const createDocument=DOMParserImpl.prototype.createScriptingDisabledDocument;DOMParserImpl.prototype.createScriptingDisabledDocument=function(parsingMode,contentType,string){
   const creator=namespaceCreator(this._globalObject);if(!creator)return apply(createDocument,this,arguments);
   const options={parsingMode,encoding:'UTF-8',contentType,readyState:'complete',scriptingDisabled:true,url:creator.document.URL};
-  const document=creator.createDocument?creator.createDocument(options):Document.createImpl(this._globalObject,[],{options});
+  const factory=parsingMode==='xml'?XMLDocument:Document;
+  const document=creator.createDocument?creator.createDocument(options):factory.createImpl(this._globalObject,[],{options});
   if(string!==undefined)parser.parseIntoDocument(string,document);return document;
  };
  const set=attributes.setAttributeValue;
@@ -81,5 +84,5 @@ function patch(){
 export function installNamespaceSerialization(window,{context,createDocument}={}){
  const document=implementationForWrapper(window.document),creator={document,createDocument};
  ownNamespaceGlobal(document._globalObject);ownNamespaceGlobal(window,creator);if(context)ownNamespaceGlobal(context,creator);
- if(!context)ownNamespaceGlobal(document._globalObject,creator);patch();
+ if(!context)ownNamespaceGlobal(document._globalObject,creator);installQualifiedElementBirth();patch();installXMLQueryPolicy();
 }

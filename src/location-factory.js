@@ -15,6 +15,12 @@ const apply=Reflect.apply,define=Object.defineProperty,create=Object.create,prot
 const nil=value=>Object.assign(create(null),value);
 let installed=false;
 export function withLocationFactory(callback){creationDepth++;try{return callback()}finally{creationDepth--;}}
+// Trusted Host consumers reuse the same actual creation/utility registration.
+// No authored Window property or stable proxy retarget selects realm authority.
+export function ownedLocationCreationContext(globalObject){
+ const context=realms.get(globalObject)?.context??contexts.get(globalObject)??(vm.isContext(globalObject)?globalObject:null);
+ return context&&(creationDepth>0||ownedGlobals.has(globalObject)||realms.has(globalObject))?context:null;
+}
 export function locationImplementation(value){return fronts.get(value)}
 export function canonicalLocation(value){return canonical.get(value)}
 export function installPrivateLocationUtils(target=utils){

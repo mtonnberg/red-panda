@@ -1,3 +1,4 @@
+import{constructorFor as firstHTMLDocumentConstructor,hasFirstHTMLDocument}from'./html-document-birth.js';
 import {installDocumentXPathEntries} from './document-member-realms.js';
 import {installAttributeNames} from './attribute-names.js';
 import {installNamespaceSerialization} from './namespace-serialization.js';
@@ -8,6 +9,7 @@ import {atomicFormMove} from './element-internals.js';
 // target implementation source is neither imported nor copied.
 import{createRequire}from'node:module';
 const require=createRequire(import.meta.url);
+import{platformFactoryRecord}from'./platform-factories.js';
 const{implForWrapper,wrapperForImpl}=require('jsdom/lib/jsdom/living/generated/utils.js');
 const NodeInterface=require('jsdom/lib/jsdom/living/generated/Node.js');
 const DocumentInterface=require('jsdom/lib/jsdom/living/generated/Document.js');
@@ -80,10 +82,10 @@ export function normalizeXML(source){
 function realmMetadata(g,bridge){
  const Document=g.Document,domainValues=new WeakMap();
  const brand=doc=>{if(!bridge.isDocument(doc))throw new g.TypeError('Illegal invocation');};
- class HTMLDocument extends Document{constructor(){super();bridge.html(this);}}
+ const HTMLDocument=bridge.firstConstructor??class HTMLDocument extends Document{constructor(){super();bridge.html(this);}};
  Object.defineProperty(HTMLDocument.prototype,Symbol.toStringTag,{value:'HTMLDocument',configurable:true});
  Object.defineProperty(g,'HTMLDocument',{value:HTMLDocument,writable:true,configurable:true});
- const adopt=doc=>{Object.setPrototypeOf(doc,doc.contentType==='text/html'?HTMLDocument.prototype:g.XMLDocument.prototype);return doc;};
+ const adopt=doc=>{if(bridge.isFirst(doc)||bridge.isXML(doc))return doc;Object.setPrototypeOf(doc,doc.contentType==='text/html'?HTMLDocument.prototype:g.XMLDocument.prototype);return doc;};
  for(const[name,get]of Object.entries({prerendering(){brand(this);return false;},scrollingElement(){brand(this);return this.documentElement;}}))Object.defineProperty(Document.prototype,name,{get,configurable:true,enumerable:true});
  Object.defineProperty(Document.prototype,'domain',{configurable:true,enumerable:true,
   get(){brand(this);return domainValues.has(this)?domainValues.get(this):bridge.hostname(this);},
@@ -94,7 +96,7 @@ function realmMetadata(g,bridge){
  g.DOMImplementation.prototype.createHTMLDocument=function(...args){const document=create.apply(this,args);bridge.completeHTMLDocument(document);return adopt(document);};
  const parse=g.DOMParser.prototype.parseFromString;
  g.DOMParser.prototype.parseFromString=function(source,type){if(!bridge.isParser(this)||arguments.length<2)throw new g.TypeError('Invalid DOMParser receiver or arguments');source=''+source;type=''+type;return adopt(parse.call(this,type==='text/html'?source:bridge.normalizeXML(source),type));};
- if(g.document.contentType==='text/html')Object.setPrototypeOf(g.document,HTMLDocument.prototype);
+ if(g.document.contentType==='text/html'&&!bridge.isFirst(g.document))Object.setPrototypeOf(g.document,HTMLDocument.prototype);
  return{adopt};
 }
 
@@ -139,7 +141,7 @@ export function installDocumentXML(page,window){
  const document=window.document;
  const docBrand=value=>DocumentInterface.is(value);
  const metadata=window.eval(`(${realmMetadata.toString()})`)(window,{
-  normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,
+  normalizeXML,isDocument:docBrand,isParser:ParserInterface.is,firstConstructor:firstHTMLDocumentConstructor(window),isFirst:hasFirstHTMLDocument,isXML:value=>platformFactoryRecord(value)?.kind==='XMLDocument',
   html(doc){const impl=implForWrapper(doc);impl._parsingMode='html';impl.contentType='text/html';},
   completeHTMLDocument(doc){const impl=implForWrapper(doc);impl._currentDocumentReadiness='complete';},
   hostname(doc){const origin=implForWrapper(doc)._origin;try{return new URL(origin).hostname;}catch{}try{return window.location.hostname;}catch{return'';}},

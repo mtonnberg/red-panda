@@ -1,0 +1,1 @@
+Actual current-instance service/health and real PureScript example at pushed79ad40d,6856stable. Fresh349roots/1735links discovery, draft42saved/readback; installer/network/secrets/requirements preserved. Saved is not applied/published; restoration unverified. All original receipts/controllers archived byte-exact.

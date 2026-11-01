@@ -1,3 +1,4 @@
+import * as htmlDocumentBirth from './html-document-birth.js';
 import {transformBaseInterface,baseInterfaceHelpers} from './html-base-urls.js';
 import {installURLWrapperRealms} from './url-wrapper-realms.js';
 import {installFileWrapperRealms} from './file-wrapper-realms.js';
@@ -48,9 +49,12 @@ export function captureDOMWrapperRealm(globalObject,context){
  if(previous&&previous!==record)throw new TypeError('DOM wrapper realm identity cannot be retargeted');
  realms.set(globalObject,record);
 }
-export function createDOMWrapperShell(globalObject,prototype,kind){
- const selection=selectDOMWrapperAllocation(globalObject,prototype,kind),record=realm(selection.globalObject);
+export function createDOMWrapperShell(globalObject,prototype,kind,privateData){
+ const selection=selectDOMWrapperAllocation(globalObject,prototype,kind);
+ selection.prototype=htmlDocumentBirth.selectPrototype(selection.globalObject,selection.prototype,kind,privateData);
+ const record=realm(selection.globalObject);
  const value=record?setPrototype(Reflect.construct(record.Object,[]),selection.prototype):hostCreate(selection.prototype);
+ htmlDocumentBirth.noteShell(value,selection.globalObject,kind);
  return noteDOMWrapperShell(value,selection);
 }
 export function observeDOMWrapperProxy(kind,callback){
@@ -92,6 +96,9 @@ export function installDOMWrapperRealms(){
   source=source.replaceAll(proxy,`return createProxy(wrapper, proxyHandler, globalObject, ${JSON.stringify(kind)});`);
   source=source.replaceAll(constructor,'exports.setup(createShell(globalObject, new.target.prototype),');
   if(kind==='Document'){
+   const signature='function makeWrapper(globalObject, newTarget) {',call='const wrapper = makeWrapper(globalObject);',allocation='return createShell(globalObject, proto, "Document");';
+   if(source.split(signature).length!==2||source.split(call).length!==2||source.split(allocation).length!==2)throw new Error('Canonical Document birth data seam changed');
+   source=source.replace(signature,'function makeWrapper(globalObject, newTarget, privateData) {').replace(call,'const wrapper = makeWrapper(globalObject, undefined, privateData);').replace(allocation,'return createShell(globalObject, proto, "Document", privateData);');
    for(const method of ['createElement','createElementNS','createTextNode','createComment','createAttribute','createAttributeNS']){
     const expression=`esValue[implSymbol].${method}(...args)`;
     if(source.split(expression).length!==2)throw new Error('Unexpected generated Document factory call: '+method);
@@ -120,7 +127,7 @@ export function installDOMWrapperRealms(){
  if(require('jsdom/package.json').version!=='26.1.0'||fingerprint!=='f199523c2fb0570868c2e3aa84c9fd7b380687298db9b52f1d5531a3f561ae8f')throw new Error('Pinned jsdom DOM allocation source changed');
  for(const {factory,kind,full,source} of candidates){
   const module={exports:factory};
-  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm','installControlInterface','baseInterfaceHelpers'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm,installControlInterface,baseInterfaceHelpers);
+  vm.compileFunction(source,['exports','require','module','__filename','__dirname','createShell','createProxy','callFactory','installEventIDLRealm','installControlInterface','baseInterfaceHelpers','htmlDocumentBirth'],{filename:full})(factory,createRequire(full),module,full,directory,createDOMWrapperShell,createDOMWrapperProxy,callDOMFactory,installEventIDLRealm,installControlInterface,baseInterfaceHelpers,htmlDocumentBirth);
   if(module.exports!==factory)throw new Error('Generated Node factory identity changed: '+kind);
   const setup=factory.setup;
   factory.setup=function(wrapper,...args){try{return Reflect.apply(setup,this,[wrapper,...args]);}finally{finishDOMWrapperSetup(wrapper);}};

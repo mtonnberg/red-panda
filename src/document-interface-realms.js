@@ -40,8 +40,12 @@ export function transformDocumentInterface(source,kind,originalSource){
  // public arrays and all conversion/backend operations remain unchanged.
  const allocation='const args = [];',privateAllocation='const args = createPrivateIDLArguments();';
  if(body.split(allocation).length-1!==definition.privateArgumentArrays||body.includes('createPrivateIDLArguments'))throw new Error('Canonical private IDL argument allocation changed: '+kind);
- const publicBody=body.replaceAll(allocation,privateAllocation);
- const names=definition.privateArgumentArrays?[...definition.names,'createPrivateIDLArguments']:definition.names;
+ let publicBody=body.replaceAll(allocation,privateAllocation);
+ const names=definition.privateArgumentArrays?[...definition.names,'createPrivateIDLArguments']:[...definition.names];
+ if(kind==='Document'){
+  names.push('htmlDocumentBirth');
+  publicBody+='\nif (htmlDocumentBirth.enabled(globalObject)) {\nclass HTMLDocument extends Document { constructor() { super(); htmlDocumentBirth.initialize(this); } }\nObject.defineProperty(HTMLDocument.prototype, Symbol.toStringTag, {value: "HTMLDocument", configurable: true});\nhtmlDocumentBirth.remember(globalObject, HTMLDocument);\n}\n';
+ }
  const privateAllocator=definition.privateArgumentArrays?'\nconst createPrivateIDLArguments = () => [];\n':'';
  return source+privateAllocator+'\nconst originalDocumentInterfaceInstall = exports.install;\nexports.install = (globalObject, globalNames) => installControlInterface(globalObject, globalNames, originalDocumentInterfaceInstall, '+JSON.stringify(publicBody)+', '+JSON.stringify(names)+', ['+names.join(', ')+'], __filename);\n';
 }

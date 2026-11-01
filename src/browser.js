@@ -1,3 +1,5 @@
+import {prepareInitialDocumentParser} from './initial-document-parser.js';
+import {captureDocumentEncoding,decodeHTMLResponse} from './document-encoding.js';
 import {installHTMLBaseURLs} from './html-base-urls.js';
 import {installHTMLHandlerSlots} from './html-handler-slots.js';
 import {installFileInputs} from './file-inputs.js';
@@ -255,7 +257,7 @@ export class Page extends EventEmitter {
     this.dom = this.createDOM('<!doctype html><html><head></head><body></body></html>');
   }
 
-  createDOM(html, historyState = null) {
+  createDOM(html, historyState = null, encoding = 'UTF-8') {
     const virtualConsole = new VirtualConsole();
     virtualConsole.on('jsdomError', error => {
       // Fetch diagnostics are distinct from uncaught authored JavaScript.
@@ -274,11 +276,17 @@ export class Page extends EventEmitter {
       resources: this.javascript ? new PageResources(this) : undefined,
       virtualConsole,
       pretendToBeVisual: true,
-      beforeParse: window => this.prepareWindow(window, historyState),
+      beforeParse: window => {
+        // Actual byte-selected metadata is published before parsing or scripts.
+        captureDocumentEncoding(window.document)._encoding=encoding;
+        prepareInitialDocumentParser(window.document,this.mimeType);
+        this.prepareWindow(window, historyState);
+      },
     }));
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
+    captureDocumentEncoding(window.document);
     preparePopupDocument(this,window);
     captureCookieDocument(this,implForWrapper(window.document));
     if(main)PRINCIPAL_DOCUMENTS.set(this,implForWrapper(window.document));
@@ -653,7 +661,7 @@ export class Page extends EventEmitter {
     try {
       let html;
       let response;
-      let mimeType = 'text/html';
+      let mimeType = 'text/html', documentEncoding = 'UTF-8';
       if (target.split('#')[0] === 'about:blank') html = '<!doctype html><html><head></head><body></body></html>';
       else {
         const referrerSource = referrer ?? '';
@@ -670,11 +678,13 @@ export class Page extends EventEmitter {
           if (size > 16 * 1024 * 1024) { await reader.cancel(); throw new Error('Document exceeds 16 MiB limit'); }
           chunks.push(value);
         }
-        const source = Buffer.concat(chunks).toString('utf8');
+        const bytes=Buffer.concat(chunks);
         const mime = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
         mimeType = mime ?? 'text/html';
         // Plain-text and API responses must not become executable HTML documents.
         const textDocument = mime && !['text/html', 'application/xhtml+xml'].includes(mime);
+        const decoded=textDocument?{source:bytes.toString('utf8'),encoding:'UTF-8'}:decodeHTMLResponse(bytes,response.headers.get('content-type'));
+        const source=decoded.source;documentEncoding=decoded.encoding;
         const escaped = textDocument ? source.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') : source;
         html = textDocument ? `<!doctype html><html><head><meta charset="utf-8"></head><body><pre>\n${escaped}</pre></body></html>` : source;
         // Inspector bytes remain in the independent transport capture ledger.
@@ -727,7 +737,7 @@ export class Page extends EventEmitter {
         if (generation !== this.navigationGeneration || this.closed) { reject(new Error('Navigation superseded')); return; }
         this.creatingDOM = true;
         try {
-          this.dom = this.createDOM(html, state);
+          this.dom = this.createDOM(html, state, documentEncoding);
           this.emit('navigated');
           this.emit('contextCreated');
           resolve();
