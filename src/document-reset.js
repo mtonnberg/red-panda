@@ -6,6 +6,7 @@ import {readFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 import { createWriteParser } from './write-created-parser.js';
 import { installListenerOwnership } from './listener-ownership.js';
+import {registerInitialNetworkLoad,closeInitialNetworkLoad} from './initial-network-load.js';
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
 const DocumentImpl = require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
@@ -66,7 +67,7 @@ function reset(context, args) {
   });
   Object.defineProperties(cycle, Object.getOwnPropertyDescriptors(controller));
   context.current = cycle; record.stream = cycle;
-  if (context.loaded && !ownership.hasNativeLoadBridge && !context.bridgeInstalled) {
+  if (context.loaded && !context.initialNetworkRegistered && !ownership.hasNativeLoadBridge && !context.bridgeInstalled) {
     context.bridgeInstalled = true;
     // The old unmarked jsdom bridge was erased. Initial Window load already
     // happened, so its pending nextTick registration cannot race this bridge.
@@ -114,7 +115,7 @@ function patch() {
         if (completeManagedWrittenEOF(context, cycle)) return;
       }
     }
-    return close.apply(this, args);
+    return closeInitialNetworkLoad(context,close,this,args);
   };
   return open;
 }
@@ -128,6 +129,7 @@ export function installDocumentReset(page, window, record, makeParser, finishPar
   context.managedLifecycleRegistered = registerManagedLifecycle(context);
   if(page.registry&&page.url==='about:blank'&&hasPendingWindowFactoryTask(window,context.document))verifyInitialProducerSource();
   context.initialBlankPending=!!(context.managedLifecycleRegistered&&page.registry&&page.url==='about:blank'&&hasPendingWindowFactoryTask(window,context.document));
+  context.initialNetworkRegistered=registerInitialNetworkLoad(context);
   context.ownership.add(window.document, 'DOMContentLoaded', () => {
     if (active(context) && context.current && !page.registry) page.emit?.('domContentLoaded');
   });

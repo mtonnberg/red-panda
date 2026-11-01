@@ -5,6 +5,7 @@ import {platformFactoryRecord} from './platform-factories.js';
 import {createInvocationTrampoline} from './invocation.js';
 import {captureDispatchWindow,withOwnedDispatchRecovery,beginDispatchRecoveryParticipant,completeDispatchRecoveryParticipant} from './dom-dispatch-recovery.js';
 const require=createRequire(import.meta.url),{fireAnEvent}=require('jsdom/lib/jsdom/living/helpers/events.js');
+const{fireAPageTransitionEvent}=require('jsdom/lib/jsdom/living/helpers/page-transition-event.js');
 const Document=require('jsdom/lib/jsdom/living/nodes/Document-impl.js').implementation;
 const EventImplementation=require('jsdom/lib/jsdom/living/events/Event-impl.js').implementation,hasInstance=Function.prototype[Symbol.hasInstance];
 const readiness=Object.getOwnPropertyDescriptor(Document.prototype,'readyState'),apply=Reflect.apply;
@@ -23,7 +24,7 @@ export function registerManagedLifecycle(context){
  if(records.has(document))throw new TypeError('Managed lifecycle document owner already registered');
  captureDispatchWindow(context.window,actual);
  const manager=context.page.moduleScripts;if(manager&&typeof manager.startWrittenEOF!=='function')throw new TypeError('The genuine written module producer is required');
- const record=Object.assign(Object.create(null),{context,invocation:createInvocationTrampoline(actual),options:{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false},phase:undefined,windowLoadDepth:0,iframeLoadDepth:0,muteFrameLoad:false,initialBlankStarted:false,startModules:manager?manager.startWrittenEOF.bind(manager):null,frame:context.page.registry?context.page.record?.element??null:null});
+ const record=Object.assign(Object.create(null),{context,invocation:createInvocationTrampoline(actual),options:{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false},phase:undefined,windowLoadDepth:0,iframeLoadDepth:0,muteFrameLoad:false,initialBlankStarted:false,initialNetwork:false,parentNotified:false,startModules:manager?manager.startWrittenEOF.bind(manager):null,frame:context.page.registry?context.page.record?.element??null:null});
  records.set(document,record);if(record.frame)frames.set(record.frame,record);return true;
 }
 export function beginManagedWrittenCycle(context){
@@ -40,7 +41,7 @@ export function completeManagedWrittenEOF(context,cycle){
   // nor a request/body/script execution is fabricated as completed.
   record.startModules?.();context.document._deferQueue.resume();context.document._queue.resume();
   const document=context.document;
-  if(record.phase==='complete')record.phase='parsing';
+  if(record.phase==='complete'){record.phase='parsing';if(record.initialNetwork)record.parentNotified=false;}
   if(record.phase==='parsing'){
    record.phase='load';apply(readiness.set,document,['interactive']);if(!active(record))return;
    fireAnEvent('DOMContentLoaded',document,undefined,{bubbles:true});
@@ -51,7 +52,7 @@ export function completeManagedWrittenEOF(context,cycle){
   record.phase='complete';if(apply(readiness.get,document,[])!=='complete')apply(readiness.set,document,['complete']);
   if(!active(record)||record.windowLoadDepth||record.iframeLoadDepth)return;
   during(record,'windowLoadDepth',()=>fireAnEvent('load',context.window,undefined,{},true));
-  if(currentFrame(record)&&!record.muteFrameLoad)during(record,'iframeLoadDepth',()=>fireAnEvent('load',record.frame));
+  if(currentFrame(record)&&!record.muteFrameLoad){if(record.initialNetwork)record.parentNotified=true;during(record,'iframeLoadDepth',()=>fireAnEvent('load',record.frame));}
  });
  return true;
 }
@@ -72,7 +73,36 @@ export function completeManagedInitialBlank(context){
   record.phase='complete';if(apply(readiness.get,document,[])!=='complete')apply(readiness.set,document,['complete']);
   if(!active(record)||record.windowLoadDepth||record.iframeLoadDepth)return;
   during(record,'windowLoadDepth',()=>fireAnEvent('load',context.window,undefined,{},true));
-  if(currentFrame(record)&&!record.muteFrameLoad)during(record,'iframeLoadDepth',()=>fireAnEvent('load',record.frame));
+  if(currentFrame(record)&&!record.muteFrameLoad){if(record.initialNetwork)record.parentNotified=true;during(record,'iframeLoadDepth',()=>fireAnEvent('load',record.frame));}
  });
  return true;
+}
+
+// Host-only initial-parser capability. Callers already own actual EOF/resource
+// milestones; this does not recognize or filter a published Event.
+export function managedInitialNetworkLifecycle(context){
+ const record=records.get(context.document);if(!record||record.context!==context||record.initialNetwork)return null;
+ const initialOwned=operation=>withOwnedDispatchRecovery(()=>record.invocation.invoke(operation,undefined,[],{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false}));
+ return Object.freeze({
+  activate(){if(record.initialNetwork)throw new TypeError('Initial lifecycle capability already activated');record.initialNetwork=true;record.phase='parsing';record.parentNotified=false;},
+  active:()=>active(record),
+  interactive(){return initialOwned(()=>{
+   if(!active(record)||record.phase!=='parsing')return;record.phase='load';
+   apply(readiness.set,context.document,['interactive']);if(active(record))fireAnEvent('DOMContentLoaded',context.document,undefined,{bubbles:true});
+  });},
+  complete(){return initialOwned(()=>{
+   if(!active(record)||record.phase==='complete')return;
+   record.phase='complete';if(apply(readiness.get,context.document,[])!=='complete')apply(readiness.set,context.document,['complete']);
+   if(!active(record)||record.windowLoadDepth||record.iframeLoadDepth)return;
+   during(record,'windowLoadDepth',()=>fireAnEvent('load',context.window,undefined,{},true));
+   // Keep the canonical pageshow producer OUTSIDE the Window load depth.
+   if(active(record)&&!context.document._pageShowingFlag){context.document._pageShowingFlag=true;fireAPageTransitionEvent('pageshow',context.window,false);}
+  });},
+  error(callback,receiver,args){if(!active(record))return undefined;return initialOwned(()=>apply(callback,receiver,args));},
+  parent(callback,receiver,args){
+   if(!currentFrame(record)||record.muteFrameLoad||record.parentNotified)return undefined;
+   record.parentNotified=true;return initialOwned(()=>during(record,'iframeLoadDepth',()=>apply(callback,receiver,args)));
+  },
+  inspect:()=>({phase:record.phase,windowLoadDepth:record.windowLoadDepth,iframeLoadDepth:record.iframeLoadDepth,parentNotified:record.parentNotified,muteFrameLoad:record.muteFrameLoad})
+ });
 }

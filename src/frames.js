@@ -10,6 +10,7 @@ import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import {runInitialNetworkFrameSource} from './initial-network-load.js';
 
 // These hooks target pinned jsdom26. They affect only frames whose owner
 // document belongs to an installed registry, and retain jsdom's actual windows.
@@ -114,7 +115,7 @@ function patch() {
       if (page.closed) throw stale();
       owner.registry.beforeFrameParse(frame, request);
       page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
-      return loaded?.(data);
+      return runInitialNetworkFrameSource(page,loaded,undefined,[data]);
     }, onError(error) {
       page.documentAbort.signal.removeEventListener('abort', abort); page.resourceRequests.delete(request);
       if (!page.closed && !page.retired) owner.registry.announce('frameNavigationError', { frameId: page.frameId, error });

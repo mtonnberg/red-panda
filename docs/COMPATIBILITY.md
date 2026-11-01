@@ -4,13 +4,16 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The last complete full workflow, at917f9bd, passes **2,190 JavaScript tests, 129 PureScript
+The current installed workflow passes **2,206 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds. The strict build reports zero warnings and errors; runtime
-warnings remain in the untruncated logs. [Full validation](../proposals/feature-composition-full-root-r1/README.md)
-records 13,174 unchanged inputs after the exact 51-source/six-artifact application
-over 2342b41. Original assertions, fixtures and budgets are unchanged. This is
-not a new whole-455 census or a full replication claim. The earlier
+warnings remain in the complete logs. [Full validation](../proposals/initial-network-lifecycle-r5/README.md)
+records 13,430 unchanged inputs for JavaScript and 13,451 for the remaining
+stages, after the 14-leaf lifecycle change over 3963656. All 18 production native
+artifacts remain unchanged. Original assertions, fixtures and budgets are
+preserved. This is not a new whole-455 census or a full replication claim.
+The earlier [2,190/129/13 checkpoint](../proposals/feature-composition-full-root-r1/README.md)
+and its 51-source/six-artifact application remain separate evidence, as do the
 [2,043/129/13](../proposals/phase26-full-file-element-url/README.md) and
 [1,992/117/13](../proposals/phase26-full-accepted/README.md) checkpoints remain
 separate evidence.
@@ -1187,8 +1190,9 @@ accessibility, queue timing and callback timeout behavior remain incomplete.
 
 Initial blank-frame lifecycle delivery captures the actual Window task and
 Document-to-Window listener record and preserves owner-VM interruption recovery.
-Network-initial Window rewrites, the full original Source96 row and broader
-Window/document creation ownership remain open.
+Network-initial delivery is addressed by the later lifecycle section below;
+broader Window/document creation ownership remains open. Source96 already
+passed the historical 455-fixture census and has a separate regression below.
 [Lifecycle evidence](../proposals/blank-frame-initial-lifecycle-r1/README.md).
 
 The independent custom Node provider and matching addon have linked. Identity
@@ -1198,9 +1202,9 @@ Browser integration has not run. Red Panda branding remains intentional.
 Full independent replication is still unfinished.
 
 
-### Full validation of the composed feature graph
+### Full validation of the composed feature graph at 917f9bd
 
-The actual installed graph passes all 2,190 JavaScript tests (790.509s), all129
+At 917f9bd, the installed graph passed all 2,190 JavaScript tests (790.509s), all129
 PureScript/Puppeteer checks (11.168s), all13 Native differential groups (22.798s),
 syntax checks (24.503s) and strict/pedantic build (1.517s). There are no skipped,
 cancelled or failing JavaScript cases. All13,174 guarded source, dependency,
@@ -1214,7 +1218,7 @@ contains the controller, original controller/plan, complete logs, progress and
 actual input maps, with each archive member checked by name, size and SHA256.
 The independent custom Node provider remains unaccepted after the proxy-control
 timeout. The separately executed 455-fixture census below supplies its own totals.
-Full independent replication, broader realm/Window ownership, original Source96,
+Full independent replication, broader realm/Window ownership,
 complete conformance/WPT and performance equivalence remain unfinished.
 
 ### Complete registered-fixture census at 917f9bd
@@ -1301,5 +1305,64 @@ cases, including genuine200ms recovery. They prove private queue/Promise callbac
 identities and restoration, not a lifecycle fix. Native HTML/XHTML/XML/malformed
 XML frames share the measured readiness/DCL/Window-load/pageshow sequence with
 no Document load; all four reported HTMLDocument wrappers. Those bounded facts
-do not establish other parser/class behavior. The common private lifecycle
-implementation and genuine Window/global indexed interception remain unfinished.
+do not establish other parser/class behavior. The later initial-network
+implementation below uses those observations; genuine Window/global indexed
+interception remains unfinished.
+
+### Initial network lifecycle and blocking frame completion
+
+Initial network documents now deliver readiness, DOMContentLoaded, Window load
+and pageshow from the real parser and resource queues. The runtime claims the
+Window's original construction task before author scripts run and follows the
+actual defer/async milestones. Public Document load events cannot complete a
+held resource or resolve a frame's load Promise. Navigation timing reads the
+canonical Document backend instead of an overridden frontend getter.
+
+Parser-blocking HTTP frames retain their original load Promise while parsing
+is paused, then consume the real pending close request when that parser reaches
+EOF. A script's later document.close() remains effective. Retirement invalidates
+pending resource callbacks without disabling retained DOM queries, functions
+or newly scheduled timers. Already-entered asynchronous callbacks remain outside
+that cancellation guarantee. General readiness/DCL interruption, private
+tampering, broader transport failures and XML parser/class parity remain bounded
+gaps.
+
+The correction passes 77 related whole-file cases on Node 24.22.1 and ten new
+lifecycle/retirement cases on each of Node 24.19.0 and 26.13.0. The unchanged
+document/open_load_events.html fixture passes separately with a 485 ms load
+barrier and fresh 5 ms assertions inside its original 2s + 2s limits. Its five
+script IDs are declarations, not five independently counted observations.
+This is a regression check: the same fixture already passed the 917f9bd census.
+The installed PureScript/Puppeteer example passes with 13,187 inputs unchanged.
+
+The complete installed workflow passes 2,206 JavaScript cases in 838.205s,
+129 PureScript checks in 10.038s, 13 Native groups in 20.553s, syntax in 24.617s
+and strict/pedantic build in 1.263s. JavaScript reports no failures, skips,
+cancellations or late activity. All 13,430 JavaScript inputs and 13,451 remaining
+workflow inputs stay unchanged; every owned job closes and the service retains
+its actual identity. [Evidence](../proposals/initial-network-lifecycle-r5/README.md)
+preserves the earlier installed652 animation timeout at its original 10s limit
+and subsequent interruption. The post-signal cancellation summary is not a
+full-suite total. The corrected installed654 run has its own complete result;
+application journals retain their original validation-unrun labels.
+
+### Experimental public-carrier API prerequisites
+
+The custom Node experiment now has separate passing build, defined-export,
+four passive authority, one heap-observer and five fresh-entry groups. It
+preserves the original eight-GC bound and measures actual creation Contexts
+before and after null prototypes. The earlier compiler-dependency setup failure
+and detached-async negatives remain recorded.
+[Evidence](../proposals/node-provider-r5-api-prerequisites/README.md) applies to
+Linux x64 custom Node 24.22.1; it is not production browser, retained-old-JavaScript,
+all-SDK or performance acceptance. Public V8 Holder() is a version-pinned,
+deprecated candidate for real indexed-callback owner lookup; its callback
+behavior remains untested.
+
+Separate [namespace checks](../proposals/node-provider-namespace-prerequisites-r7/README.md)
+pass two C++ and three JavaScript cases. The later
+[observer-storage diagnostic](../proposals/node-provider-gc-observer-diagnostic-r1/README.md)
+reports seven cases, six passes and one failure: all five provider/authority
+cases and the ordinary heap observer pass, while the ordinary stack observer
+fails. This supports sensitivity to observer storage and conservative stack
+roots; it does not prove a permanent leak or full provider acceptance.

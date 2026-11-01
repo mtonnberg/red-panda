@@ -1,0 +1,83 @@
+--- /dev/null
++++ b/test/cctest/test_ordinary_context_gc_observer_baseline.cc
+@@ -0,0 +1,80 @@
++// SOURCE-ONLY diagnostic baseline. Ordinary vm.createContext({}), no owned ticket/API.
++// Both storage variants preserve the same bounded weak observation/assertions.
++#include <cppgc/persistent.h>
++#include <memory>
++#include <node.h>
++#include <v8.h>
++#include "node_contextify.h"
++#include "node_test_fixture.h"
++using node::contextify::ContextifyContext;
++using namespace v8;
++class OrdinaryContextGcObserverBaselineTest : public EnvironmentTestFixture {};
++namespace {
++struct OrdinaryRoots {
++  Global<Function> retained;
++  Global<Context> weak_context;
++  Global<Object> weak_carrier;
++  Global<Object> weak_wrapper;
++  cppgc::WeakPersistent<ContextifyContext> weak_cppgc;
++};
++V8_NOINLINE void PrepareOrdinaryRoots(Isolate* isolate,node::Environment* env,
++                                     Local<Context> host,OrdinaryRoots* roots) {
++  HandleScope handles(isolate);
++  auto carrier=node::LoadEnvironment(env,
++      "return require('node:vm').createContext({});").ToLocalChecked().As<Object>();
++  auto* backend=ContextifyContext::ContextFromContextifiedSandbox(env,carrier);
++  ASSERT_NE(backend,nullptr);
++  ASSERT_FALSE(backend->is_owned());
++  auto ordinary=backend->context();
++  roots->weak_cppgc=backend;
++  roots->weak_context.Reset(isolate,ordinary);roots->weak_context.SetWeak();
++  roots->weak_carrier.Reset(isolate,carrier);roots->weak_carrier.SetWeak();
++  roots->weak_wrapper.Reset(isolate,backend->object(isolate));roots->weak_wrapper.SetWeak();
++  Context::Scope owner_scope(ordinary);
++  auto function=Script::Compile(ordinary,String::NewFromUtf8Literal(isolate,"()=>42"))
++      .ToLocalChecked()->Run(ordinary).ToLocalChecked().As<Function>();
++  roots->retained.Reset(isolate,function);
++}
++V8_NOINLINE void CheckOrdinaryRetained(Isolate* isolate,Local<Context> host,
++                                      OrdinaryRoots* roots) {
++  HandleScope handles(isolate);
++  EXPECT_NE(roots->weak_cppgc.Get(),nullptr);
++  auto answer=roots->retained.Get(isolate)->Call(host,Undefined(isolate),0,nullptr)
++      .ToLocalChecked();
++  EXPECT_EQ(answer.As<Number>()->Value(),42);
++}
++} // namespace
++TEST_F(OrdinaryContextGcObserverBaselineTest, StackObserver) {
++  const HandleScope handles(isolate_);const Argv argv;Env env{handles,argv};
++  OrdinaryRoots roots;
++  PrepareOrdinaryRoots(isolate_,*env,env.context(),&roots);
++  ASSERT_FALSE(roots.retained.IsEmpty());
++  isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);
++  ASSERT_FALSE(roots.weak_context.IsEmpty());
++  ASSERT_FALSE(roots.weak_carrier.IsEmpty());
++  ASSERT_FALSE(roots.weak_wrapper.IsEmpty());
++  CheckOrdinaryRetained(isolate_,env.context(),&roots);
++  roots.retained.Reset();
++  for(int i=0;i<8;++i){isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);}
++  EXPECT_TRUE(roots.weak_context.IsEmpty());
++  EXPECT_TRUE(roots.weak_carrier.IsEmpty());
++  EXPECT_TRUE(roots.weak_wrapper.IsEmpty());
++  EXPECT_EQ(roots.weak_cppgc.Get(),nullptr);
++}
++TEST_F(OrdinaryContextGcObserverBaselineTest, HeapObserver) {
++  const HandleScope handles(isolate_);const Argv argv;Env env{handles,argv};
++  auto roots=std::make_unique<OrdinaryRoots>();
++  PrepareOrdinaryRoots(isolate_,*env,env.context(),roots.get());
++  ASSERT_FALSE(roots->retained.IsEmpty());
++  isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);
++  ASSERT_FALSE(roots->weak_context.IsEmpty());
++  ASSERT_FALSE(roots->weak_carrier.IsEmpty());
++  ASSERT_FALSE(roots->weak_wrapper.IsEmpty());
++  CheckOrdinaryRetained(isolate_,env.context(),roots.get());
++  roots->retained.Reset();
++  for(int i=0;i<8;++i){isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);}
++  EXPECT_TRUE(roots->weak_context.IsEmpty());
++  EXPECT_TRUE(roots->weak_carrier.IsEmpty());
++  EXPECT_TRUE(roots->weak_wrapper.IsEmpty());
++  EXPECT_EQ(roots->weak_cppgc.Get(),nullptr);
++}

@@ -7,7 +7,9 @@ import { parseDocumentWriteFragment } from './shadow.js';
 import { installCurrentScriptCheckpoint, withClassicEvaluation } from './clear-hook.js';
 import { prepareInputParserAdapter } from './input-controls.js';
 import { prepareCustomElementParserAdapter } from './custom-elements.js';
+import {onFrameRetirement} from './frame-retirement-hooks.js';
 import { installDocumentReset } from './document-reset.js';
+import {runInitialNetworkParserClose} from './initial-network-load.js';
 import { createParserStream } from './parser-stream.js';
 import { createRequire } from 'node:module';
 
@@ -108,8 +110,11 @@ function finishParser(record, parser) {
   if (!active(record) || record.parser !== parser || parser.tokenizer.paused || !parser.stopped) return;
   record.parserDone = true; record.blocker = null;
   if (record.closeRequested) {
-    const arguments_ = record.closeRequested; record.closeRequested = null;
-    record.document.close(...arguments_);
+    const arguments_ = record.closeRequested;
+    runInitialNetworkParserClose(record, parser, arguments_, () => {
+      record.closeRequested = null;
+      return record.document.close(...arguments_);
+    });
   }
 }
 function hostTask(run) {
@@ -160,11 +165,14 @@ function loaderOverlay(loader,overlays,invoke){
  try{return invoke()}finally{for(const[name,value]of Object.entries(overlays))if(loader[name]===value)loader[name]=frame.previous[name];const index=state.frames.indexOf(frame);if(index>=0)state.frames.splice(index,1);}
 }
 function fetchOwnedResource(record, loader, fetch, url, options, delivery) {
+// Callback custody belongs to the actual fetch-registration generation.
+ // Retirement invalidates pending delivery, without disabling retained APIs.
+ const registrationGeneration=record.resourceDeliveryGeneration;
  const overlays={};
  for(const name of ['_queue','_deferQueue','_asyncQueue']){
   const queue=loader[name];overlays[name]=Object.create(queue,{push:{value(request,loaded,failed,...args){
    const guard=callback=>typeof callback==='function'?(...values)=>{
-    if(active(record)&&(!delivery||delivery.current())){
+    if(active(record)&&record.resourceDeliveryGeneration===registrationGeneration&&(!delivery||delivery.current())){
      if(!delivery)return callback(...values);
      stylesheetDeliveries.set(delivery.element,delivery);let result;
      try{result=callback(...values)}catch(error){if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);throw error;}
@@ -423,7 +431,8 @@ export function installClassicScripts(page, window) {
   const document = implForWrapper(window.document), previous = documents.get(document);
   if (previous && !previous.disposed) return previous.controller;
   const record = { page, window, document, signal: page.documentAbort?.signal, requests: new Set(), disposed: false,
-    preloads: new Map(), preloadAbort: new AbortController(), styles: new Set() };
+    preloads: new Map(), preloadAbort: new AbortController(), styles: new Set(), resourceDeliveryGeneration: Object.create(null) };
+  const stopRetirement=onFrameRetirement(window,()=>{record.resourceDeliveryGeneration=Object.create(null)});
   record.currentScriptCheckpoint = installCurrentScriptCheckpoint(record, () => active(record));
   const prototype = window.HTMLScriptElement.prototype;
   const script = value => {
@@ -441,7 +450,7 @@ export function installClassicScripts(page, window) {
   });
   const dispose = () => {
     if (record.disposed) return;
-    record.disposed = true; record.currentScriptCheckpoint.dispose(); record.resetController?.dispose(); record.stream?.abort();
+    record.disposed = true; stopRetirement(); record.currentScriptCheckpoint.dispose(); record.resetController?.dispose(); record.stream?.abort();
     if (record.parser && !record.parserDone) { record.parser.tokenizer.pause(); record.parser.stopped = true; }
     record.blocker = null; record.closeRequested = null;
     record.preloadAbort.abort(); record.preloads.clear();

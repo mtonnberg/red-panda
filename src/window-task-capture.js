@@ -99,3 +99,17 @@ export function claimInitialBlankWindowTask(window,document){
  if(!hasPendingWindowFactoryTask(window,document)||!token.committed)throw boundary('the exact committed initial Window task is required');
  const task=token.tasks[0];task.retired=true;task.callback=null;token.initialBlankClaimed=true;notify(token,'initialBlankClaimed');
 }
+
+// Birth-time capability for a genuine initial HTML parser, before authored code.
+// Main factories are still executing; real frame factories have already returned.
+// Both must still own their exact undelivered single task. No close-time lookup
+// or public readiness/listener path supplies this authority.
+export function claimInitialNetworkWindowTask(window,document,path){
+ const token=windows.get(window),task=token?.tasks[0];
+ if(!token||token.document!==document||token.tasks.length!==1||!token.closed||token.retired||task.retired||task.delivered)return null;
+ const main=path==='constructing-main'&&!token.committed&&pending.has(token)&&executions.at(-1)===token;
+ const frame=path==='committed-frame'&&token.committed&&!pending.has(token)&&!executions.includes(token);
+ if(!main&&!frame)return null;
+ task.retired=true;task.callback=null;token.initialNetworkClaimed=true;notify(token,'initialNetworkClaimed');
+ return Object.freeze(nil({capture:token.id,path,committedAtClaim:token.committed,inspect:token.handle.inspect}));
+}

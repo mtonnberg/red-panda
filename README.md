@@ -178,8 +178,9 @@ actual POST delivery with `--load-resources beacon`; enabled beacons share a
 64 KiB in-flight body budget per document. Streams use real Node primitives with
 realm adapters. Post-load document.open/write keeps the Window, Document and
 JavaScript realm while feeding a fresh parser and removing authored listeners.
-Initial loading/frame resets and synchronous written external scripts remain
-incomplete. Performance entries report observed transport/lifecycle data;
+Initial network loading follows real EOF and resource milestones. Broader frame
+resets, XML parser/class differences and synchronous written external scripts
+remain incomplete. Performance entries report observed transport/lifecycle data;
 unavailable DNS/TLS/header-phase/wire-byte fields remain zero or empty.
 
 `Runtime.queryObjects` uses the public V8 heap profiler and returns real public
@@ -296,11 +297,14 @@ the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The last complete checkpoint at `97bb0ac` passed 2,043 JavaScript tests, 129 PureScript Puppeteer
-checks and 13 native differential groups, plus syntax and strict/pedantic
-PureScript checks. [Validation](proposals/phase26-full-file-element-url/README.md)
-records all 10,035 unchanged monitored inputs. Earlier failed runs remain
-separate evidence.
+The current installed graph passes 2,206 JavaScript tests, 129 PureScript
+Puppeteer checks, 13 native differential groups, syntax and strict/pedantic
+PureScript checks. [Validation](proposals/initial-network-lifecycle-r5/README.md)
+records 13,430 unchanged JavaScript-workflow inputs and 13,451 unchanged inputs
+for the remaining stages. Earlier failed runs and the
+[2,190-case checkpoint](proposals/feature-composition-full-root-r1/README.md)
+remain separate evidence. This is not a new whole-fixture census or a full
+replication claim.
 
 `performance.eventCounts` counts real dispatch before listeners, including trusted
 input and file uploads. Its VM fronts, live iterators and snapshot `forEach` pass
@@ -311,7 +315,12 @@ generic Proxy clone-message difference and the exact validation boundaries.
 Already-loaded document rewrites use genuine synchronous lifecycle phases and
 real dependency-free inline-module evaluation. [Validation](proposals/managed-written-lifecycle-r2/README.md)
 records seven matching Native scenarios, five checks on each remaining SDK and
-115 Root regressions; initial bootstrap and broader module graph timing remain open.
+115 Root regressions. Initial network lifecycle now follows real parser and
+defer/async queues. Blocking HTTP frames retain their original load Promise
+through deferred parser completion, including a later document.close() request.
+Pending resource callbacks stop at real retirement while retained queries,
+functions and new timers remain usable. Broader module graph timing and
+already-entered asynchronous retirement callbacks remain open.
 
 Document byte decoding, declared charset metadata and legacy URL queries use real
 codecs. XHTML and qualified XML/HTML nodes use canonical first-allocation factories

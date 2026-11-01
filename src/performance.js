@@ -297,8 +297,8 @@ export function installPerformance(page,window,{navigationType=page.performanceN
     controller.recordResource(networkData(record));
   };
   tracker?.subscribers.add(receive);
-  const interactive=()=>{if(document.readyState==='interactive')controller.updateNavigation({domInteractive:now()});
-    else if(document.readyState==='complete')controller.updateNavigation({domComplete:now()});};
+  const interactive=()=>{if(principal.readyState==='interactive')controller.updateNavigation({domInteractive:now()});
+    else if(principal.readyState==='complete')controller.updateNavigation({domComplete:now()});};
   const contentLoaded=()=>{controller.updateNavigation({domContentLoadedEventStart:now()});window.queueMicrotask(()=>controller.updateNavigation({domContentLoadedEventEnd:now()}));};
   const loaded=()=>{controller.updateNavigation({loadEventStart:now()});window.queueMicrotask(()=>{const end=now();controller.updateNavigation({loadEventEnd:end,duration:end});});};
   document.addEventListener('readystatechange',interactive);

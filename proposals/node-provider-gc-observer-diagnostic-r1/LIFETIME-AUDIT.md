@@ -1,0 +1,35 @@
+# Static C3 collection-root audit
+
+The actual first independent filter ran5cases:2OK,3bounded collection assertion failures after the original8post-release LowMemoryNotification/DrainTasks iterations. The failures retained weak Context/carrier/wrapper (and proxy in the reservation case) and a nonnull cppgc weak pointer. They are not a timeout and do not yet prove a permanent runtime leak or a test bug. A later independent namespace-only process passed both original cases; that is a separate genuine creation-context/cache/export fact, not a GC fix or resumed13-stage acceptance. Raw reports/logs/clarifications are copied under reference.
+
+The shared source-backed candidate is the observation object's placement. Every failing test keeps ObservedRoots/Roots/WeakRoots in automatic storage, including cppgc::WeakPersistent<ContextifyContext>. Pinned cppgc/persistent.h stores its actual C++ target address inline as PersistentBase::raw_. The weak policy controls its registered persistent-region node; it does not erase that raw word from a live native stack.
+
+The actual C3 V8 source defaults the embedder stack state to kMayContainHeapPointers. LowMemoryNotification calls CollectAllAvailableGarbage(kLowMemoryNotification); major collection passes that state to CppHeap::EnterFinalPause. The cppgc marker then conservatively scans native-stack words and recognizes inner/full pointers to live cppgc objects. If that inline target word lies in the scanned range, it can mark the ContextifyContext even though the field is declared weak. ContextifyContext::Trace then follows context_, owned_template_, owned_proxy_ and CppgcMixin's actual wrapper. The resulting Context/carrier/private-wrapper cycle explains the family of weak handles staying alive without requiring an unexpected provider registry root.
+
+This is a concrete source mechanism consistent with all three failures. Actual scanned root/register words and precise retention paths were not observed. Compiler spills and other conservative roots can remain, so moving the observer alone is a diagnostic, not a guaranteed fix or test-bug verdict.
+
+Scope and edge inventory:
+
+| Path | Actual source lifetime/strength | What is unresolved |
+|---|---|---|
+| Strong Global<Function> retained | Explicit application root, reset before8-loop | Nothing indicates the reset was skipped; no actual root trace collected |
+| Setup/check helpers | V8_NOINLINE plus inner HandleScopes; owned/ordinary Local Context/function/wrapper handles end before collection loop | Raw registers/stale stack words are not proven absent |
+| Outer fixture HandleScope and Env | Keeps actual Host context entered/alive until test end; owned/ordinary target Context::Scope ends inside setup helper | Host services may contain other roots; no full heap enumeration performed |
+| cppgc::WeakPersistent in observer struct | Weak registry plus inline actual raw target pointer, on scanned native stack in all3original failures | Strongest shared test-local candidate; actual marking root not captured |
+| v8::Global weak observations | SetWeak on Context/carrier/wrapper/proxy | Their registered policy is weak; conservative copies/other roots remain a separate question |
+| CppgcMixin | Actual Object::Wrap and TracedReference to wrapper; registered in Realm via off-heap new CppgcWrapperListNode with WeakPersistent | Not the classic BaseObject constructor's strong Global path; actual unified mark root unknown |
+| ContextifyContext | TracedReference Context/template/proxy plus actual Context embedder carrier/private-wrapper edges | These are traced cycles, not by themselves proof of a strong external root |
+| Classic BaseObject | Default persistent can be strong; MakeWeak changes that policy | ContextifyContext inherits CPPGC_MIXIN, not BaseObject. Reusing its JS template initializer does not instantiate a BaseObject strong persistent |
+| Environment context tracking | contexts_[i].SetWeak() | Weak tracking is not identified as an unconditional strong root |
+| Inspector contexts | Agent may not have a client; inspected-context m_context is SetWeak when used | No attached debugger/session root was measured; no inspector-based diagnosis performed |
+| Owned proxy reservation index | shared C++ state owns stable weak Global cells; process registry is weak_ptr-only | No per-entry strong Context/Environment/template. Continuous-live-IsolateData bound remains; no complete dynamic root proof |
+| Owned per-context template/proxy | TracedReference members; no per-generation strong Global added by provider | V8 template/cache internals are not exhaustively proven root-free |
+| HDO/JS module registry | These tests pass no custom import callback: getHostDefinedOptionId returns no-callback sentinel, registerImportModuleDynamically returns without registering | The custom-callback WeakMap retention branch is not active in these3tests |
+
+The collision failure uses an actual ordinary Contextify context, but its carrier came from prepareOwnedContext and a subsequent owned creation was rejected. That excludes successful-owned template/proxy setup and reservation entries as a necessary common cause, while leaving the extra prepared-ticket properties/rejection path as a difference. It is not an untouched ordinary baseline. The separate baseline producer here uses only vm.createContext({}) on the same C3 runtime, never prepareOwnedContext/CreateOwnedContext; it is an ordinary-path baseline, not a claim to use an unmodified upstream binary.
+
+GC scheduling does not justify simply adding turns: kLowMemoryNotification sets forced collection, CppHeap selects atomic marking/sweeping for forced GC, and the exact existing DrainTasks runs worker/foreground tasks. CollectAllAvailableGarbage itself performs its own original internal attempts. No extra GC, task drain, reset, stack-state override, private hook, fabricated weak callback, optimizer root wiping or assertion weakening is proposed. Actual per-call scheduling/root behavior was not instrumented.
+
+The source-only candidate changes only observer storage to std::unique_ptr ordinary C++ heap allocation in the3original files. Inverse normalization reproduces every original byte other than storage/access syntax and explicit memory include; all assertions/strong-root resets/weak-handle policies/8-loop remain. A separate untouched ordinary producer has stack and heap observer variants with the same weak assertions. These new diagnostic cases may genuinely fail; that is evidence, not an all-pass target. Original failures remain unchanged.
+
+Discriminating outcomes, if separately authorized and built: if only stack observer controls fail while heap observers collect, that supports observation-root sensitivity; if ordinary heap and owned heap both fail, common root/scheduling/observer causes remain; if ordinary heap collects while owned heap does not, a provider-specific edge merits further tracing. None alone proves permanent leakage, browser lifetime correctness or the absence of every conservative register root. This packet is static and does not run or build those cases.

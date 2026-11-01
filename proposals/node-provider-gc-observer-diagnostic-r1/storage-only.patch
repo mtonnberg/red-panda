@@ -1,0 +1,139 @@
+--- a/test/cctest/test_owned_context_provider.cc
++++ b/test/cctest/test_owned_context_provider.cc
+@@ -1,6 +1,7 @@
+ // UNCOMPILED/UNRUN. Real Node-internal cppgc lifetime observation; no addon
+ // private-slot writes or synthetic wrapper identities.
+ #include <cppgc/persistent.h>
++#include <memory>
+ #include <node.h>
+ #include <v8.h>
+ #include "node_contextify.h"
+@@ -65,26 +66,26 @@
+   const HandleScope outer_handles(isolate_);
+   const Argv argv;
+   Env env{outer_handles, argv};
+-  ObservedRoots roots;
+-  PrepareRoots(isolate_, *env, env.context(), &roots);
+-  ASSERT_FALSE(roots.retained.IsEmpty());
++  auto roots = std::make_unique<ObservedRoots>();
++  PrepareRoots(isolate_, *env, env.context(), roots.get());
++  ASSERT_FALSE(roots->retained.IsEmpty());
+   // Only the real old function is a strong application root.
+   isolate_->LowMemoryNotification();
+   platform->DrainTasks(isolate_);
+-  ASSERT_FALSE(roots.weak_context.IsEmpty());
+-  ASSERT_FALSE(roots.weak_carrier.IsEmpty());
+-  ASSERT_FALSE(roots.weak_wrapper.IsEmpty());
+-  CheckActualRetainedFunction(isolate_, env.context(), &roots);
+-  roots.retained.Reset();
++  ASSERT_FALSE(roots->weak_context.IsEmpty());
++  ASSERT_FALSE(roots->weak_carrier.IsEmpty());
++  ASSERT_FALSE(roots->weak_wrapper.IsEmpty());
++  CheckActualRetainedFunction(isolate_, env.context(), roots.get());
++  roots->retained.Reset();
+   // Bounded observation, not an assertion replacement if collection fails.
+   for (int i = 0; i < 8; ++i) {
+     isolate_->LowMemoryNotification();
+     platform->DrainTasks(isolate_);
+   }
+-  EXPECT_TRUE(roots.weak_context.IsEmpty());
+-  EXPECT_TRUE(roots.weak_carrier.IsEmpty());
+-  EXPECT_TRUE(roots.weak_wrapper.IsEmpty());
+-  EXPECT_EQ(roots.weak_cppgc.Get(), nullptr);
++  EXPECT_TRUE(roots->weak_context.IsEmpty());
++  EXPECT_TRUE(roots->weak_carrier.IsEmpty());
++  EXPECT_TRUE(roots->weak_wrapper.IsEmpty());
++  EXPECT_EQ(roots->weak_cppgc.Get(), nullptr);
+ }
+ 
+ TEST_F(OwnedContextProviderTest, RejectsTicketFromDifferentEnvironment) {
+--- a/test/cctest/test_owned_context_collision.cc
++++ b/test/cctest/test_owned_context_collision.cc
+@@ -1,5 +1,6 @@
+ // SOURCE ONLY, UNCOMPILED/UNRUN. R2 over the exact frozen provider R1.
+ #include <cppgc/persistent.h>
++#include <memory>
+ #include <node.h>
+ #include <v8.h>
+ #include "node_contextify.h"
+@@ -77,22 +78,22 @@
+   const HandleScope handles(isolate_);
+   const Argv argv;
+   Env env{handles, argv};
+-  Roots roots;
+-  PrepareOrdinaryAfterRejection(isolate_, *env, env.context(), &roots);
+-  ASSERT_FALSE(roots.retained.IsEmpty());
++  auto roots = std::make_unique<Roots>();
++  PrepareOrdinaryAfterRejection(isolate_, *env, env.context(), roots.get());
++  ASSERT_FALSE(roots->retained.IsEmpty());
+   isolate_->LowMemoryNotification();
+   platform->DrainTasks(isolate_);
+-  ASSERT_FALSE(roots.weak_context.IsEmpty());
+-  ASSERT_FALSE(roots.weak_carrier.IsEmpty());
+-  ASSERT_FALSE(roots.weak_wrapper.IsEmpty());
+-  CheckRetained(isolate_, env.context(), &roots);
+-  roots.retained.Reset();
++  ASSERT_FALSE(roots->weak_context.IsEmpty());
++  ASSERT_FALSE(roots->weak_carrier.IsEmpty());
++  ASSERT_FALSE(roots->weak_wrapper.IsEmpty());
++  CheckRetained(isolate_, env.context(), roots.get());
++  roots->retained.Reset();
+   for (int i = 0; i < 8; ++i) {
+     isolate_->LowMemoryNotification();
+     platform->DrainTasks(isolate_);
+   }
+-  EXPECT_TRUE(roots.weak_context.IsEmpty());
+-  EXPECT_TRUE(roots.weak_carrier.IsEmpty());
+-  EXPECT_TRUE(roots.weak_wrapper.IsEmpty());
+-  EXPECT_EQ(roots.weak_cppgc.Get(), nullptr);
++  EXPECT_TRUE(roots->weak_context.IsEmpty());
++  EXPECT_TRUE(roots->weak_carrier.IsEmpty());
++  EXPECT_TRUE(roots->weak_wrapper.IsEmpty());
++  EXPECT_EQ(roots->weak_cppgc.Get(), nullptr);
+ }
+--- a/test/cctest/test_owned_proxy_reservations.cc
++++ b/test/cctest/test_owned_proxy_reservations.cc
+@@ -1,5 +1,6 @@
+ // SOURCE ONLY, UNCOMPILED/UNRUN. Shared eligibility, not provenance or branding.
+ #include <cppgc/persistent.h>
++#include <memory>
+ #include <node.h>
+ #include <v8.h>
+ #include "env-inl.h"
+@@ -131,22 +132,22 @@
+   const HandleScope handles(isolate_);
+   const Argv argv;
+   Env env{handles,argv};
+-  WeakRoots roots;
+-  PrepareWeak(isolate_,*env,env.context(),&roots);
+-  ASSERT_FALSE(roots.retained.IsEmpty());
++  auto roots = std::make_unique<WeakRoots>();
++  PrepareWeak(isolate_,*env,env.context(),roots.get());
++  ASSERT_FALSE(roots->retained.IsEmpty());
+   isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);
+-  EXPECT_FALSE(roots.context.IsEmpty());
+-  EXPECT_FALSE(roots.carrier.IsEmpty());
+-  EXPECT_FALSE(roots.wrapper.IsEmpty());
+-  EXPECT_FALSE(roots.proxy.IsEmpty());
+-  CheckKept(isolate_,env.context(),&roots);
+-  roots.retained.Reset();
++  EXPECT_FALSE(roots->context.IsEmpty());
++  EXPECT_FALSE(roots->carrier.IsEmpty());
++  EXPECT_FALSE(roots->wrapper.IsEmpty());
++  EXPECT_FALSE(roots->proxy.IsEmpty());
++  CheckKept(isolate_,env.context(),roots.get());
++  roots->retained.Reset();
+   for(int i=0;i<8;++i){isolate_->LowMemoryNotification();platform->DrainTasks(isolate_);}
+-  EXPECT_TRUE(roots.context.IsEmpty());
+-  EXPECT_TRUE(roots.carrier.IsEmpty());
+-  EXPECT_TRUE(roots.wrapper.IsEmpty());
+-  EXPECT_TRUE(roots.proxy.IsEmpty());
+-  EXPECT_EQ(roots.cppgc.Get(),nullptr);
++  EXPECT_TRUE(roots->context.IsEmpty());
++  EXPECT_TRUE(roots->carrier.IsEmpty());
++  EXPECT_TRUE(roots->wrapper.IsEmpty());
++  EXPECT_TRUE(roots->proxy.IsEmpty());
++  EXPECT_EQ(roots->cppgc.Get(),nullptr);
+   // Force pruning without resurrecting a collected proxy or guessing an address.
+   EXPECT_FALSE(isolate_data_->IsReservedOwnedGlobalProxy(Object::New(isolate_)));
+ }
