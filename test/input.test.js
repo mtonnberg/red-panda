@@ -296,7 +296,8 @@ test('PointerEvent constructor and page-dispatched mouse events remain untrusted
     const target = f.element('button'); f.window.document.elementFromPoint = () => target;
     const pointer = new f.window.PointerEvent('pointerdown', { pointerId: 9, pointerType: 'pen', pressure: 0.7 });
     assert.equal(pointer instanceof f.window.MouseEvent, true); assert.equal(pointer.pointerId, 9); assert.equal(pointer.isTrusted, false);
-    assert.equal(pointer.getCoalescedEvents() instanceof f.window.Array, true);
+    assert.equal(pointer.getCoalescedEvents, undefined);
+    assert.equal(pointer.getPredictedEvents, undefined);
     assert.equal(Object.prototype.toString.call(pointer), '[object PointerEvent]');
     const trusted = []; target.addEventListener('click', event => trusted.push(event.isTrusted));
     target.dispatchEvent(new f.window.MouseEvent('click', { bubbles: true })); click(f.session, 5, 5);

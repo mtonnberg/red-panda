@@ -1,3 +1,4 @@
+import {installPointerEvents} from './pointer-events.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { requestDialogClose } from './dialogs.js';
 import { createRequire } from 'node:module';
@@ -29,21 +30,7 @@ export function supportsInput(method) { return METHODS.has(method); }
 
 export function installInput(window) {
   installFocus(window);
-  if (typeof window.PointerEvent === 'function') return;
-  class PointerEvent extends window.MouseEvent {
-    constructor(type, init = {}) {
-      super(type, init);
-      for (const [name, fallback] of Object.entries({
-        pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0,
-        tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false,
-        altitudeAngle: Math.PI / 2, azimuthAngle: 0,
-      })) Object.defineProperty(this, name, { value: init[name] ?? fallback, enumerable: true });
-    }
-    getCoalescedEvents() { return window.Array.of(); }
-    getPredictedEvents() { return window.Array.of(); }
-    get [Symbol.toStringTag]() { return 'PointerEvent'; }
-  }
-  Object.defineProperty(window, 'PointerEvent', { value: PointerEvent, writable: true, configurable: true });
+  installPointerEvents(window);
 }
 
 function dispatchDriverEvent(target, event) {

@@ -47,6 +47,15 @@ Red Panda branding remains intentional. Plugin result-wrapper allocation and
 broader foreign borrowing remain unverified. The full-suite checkpoint above
 predates this focused change.
 
+PointerEvent now uses canonical Mouse/Event backing with genuine VM definitions,
+private brands and utility aliases. Fractional coordinates survive construction
+and reinitialization; click-family reads follow the measured rounding policy.
+The selected 75-case integration passes, with separate cross-SDK and physical
+creation-context checks. The unchanged upstream pointer fixture also passes.
+[Evidence](../proposals/pointer-public-recovery/README.md) preserves an earlier
+65-case administrative timeout and the later matching successful controls.
+Broader privileged driver and builtin-function metadata parity remain open.
+
 The fresh [registered-fixture census](../proposals/conformance-d41/README.md)
 at pushed d41fd69 completed all 455 fixtures under eight registration profiles:
 **402 verified passes, 50 assertion failures and three source-load timeouts**.

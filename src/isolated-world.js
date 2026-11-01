@@ -1,3 +1,4 @@
+import {installPointerEvents,pointerEventInterface,wrapPointerEvent} from './pointer-events.js';
 import {utilityFileModule,wrapFileAPIView,fileWrapperImplementation,isFileAPIImplementation,fileAPIKind} from './file-wrapper-realms.js';
 import {installDocumentXPathEntries} from './document-member-realms.js';
 import {canonicalLocation,locationImplementation,installPrivateLocationUtils,prepareLocationContext,installLocationInterface,transformUtilityLocationInterfaces,createLocationAlias,installLocationWindowAlias} from './location-factory.js';
@@ -54,6 +55,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
   const canonical=canonicalLocation(impl)??own(impl,hostUtils.wrapperSymbol)?.value;if(canonical===mainWindow||canonical===mainWindow._globalProxy)return global;for(const resolver of targetWrappers){const wrapper=resolver(canonical,impl);if(wrapper)return wrapper;}
   if(isFileAPIImplementation(impl)){const value=wrapFileAPIView(context,global,impl);wrappers.set(impl,value);if(fileAPIKind(impl)!=='File'){register(value,impl,fileAPIKind(impl));if(objectLike(canonical))mainWrappers.set(canonical,impl)}return value;}
   const metric=viewportTargetInterface(impl);if(metric){const wrapper=wrapViewportTarget(context,impl);wrappers.set(impl,wrapper);register(wrapper,impl,metric);return wrapper;}
+  if(pointerEventInterface(impl)){const wrapper=wrapPointerEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,'PointerEvent');return wrapper;}
   const extension=customEventInterface(impl);if(extension){const wrapper=wrapCustomEvent(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,extension);return wrapper;}
   const name=canonicalLocation(impl)?'Location':interfaceFor(impl);if(['Blob','File','FileList'].includes(name))return canonical;if(name==='Location'){const wrapper=createLocationAlias(global,impl);wrappers.set(impl,wrapper);register(wrapper,impl,name);if(objectLike(canonical))mainWrappers.set(canonical,impl);return wrapper;}if(utilityPrototypes.has(Object.getPrototypeOf(canonical))){canonicalizeNew(name,canonical);if(!types.isProxy(canonical))return canonical;}const generated=load(join(generatedRoot,name+'.js'));
   if(typeof generated.new!=='function')throw new Error('IDL interface cannot wrap existing implementation: '+name);
@@ -112,6 +114,7 @@ export function createIsolatedWorld(mainWindow,{name='independent-utility-world'
  prepareLocationContext(global,context,mainDocument);installLocationInterface(global);
  load(interfacesPath).installInterfaces(global,['Window']);
  installEventAPIParity(global,{context,onFactoryConstruct(wrapper,impl){const kind=customEventInterface(impl);if(!kind)return canonicalizeNew(interfaceFor(impl),wrapper);wrappers.set(impl,wrapper);const canonical=wrapCustomEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,kind);return wrapper},onConstruct(wrapper,impl,kind){wrappers.set(impl,wrapper);const canonical=wrapCustomEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,kind);}});
+ installPointerEvents(global,{context,windowImplementation:hostUtils.implForWrapper(mainWindow),onConstruct(wrapper,impl){wrappers.set(impl,wrapper);const canonical=wrapPointerEvent(mainWindow,impl);impl[hostUtils.wrapperSymbol]=canonical;mainWrappers.set(canonical,impl);register(wrapper,impl,'PointerEvent');}});
  for(const[name,constructor]of Object.entries(global[hostUtils.ctorRegistrySymbol]??{}))if(constructor?.prototype)utilityPrototypes.set(constructor.prototype,name);
  Object.defineProperty(global,'length',{get:realmFunction(()=>mainWindow.length??0)});
  Object.defineProperty(global,'frameElement',{get:realmFunction(()=>wrap(mainWindow.frameElement))});
