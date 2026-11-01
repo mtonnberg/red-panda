@@ -1,0 +1,585 @@
+--- /dev/null
++++ b/src/http-cache.js
+@@ -0,0 +1,121 @@
++// Independent optional HTTP response store. CacheStorage and inspector body
++// retention are separate owners; only completed real HTTP bytes enter this DB.
++import {mkdirSync} from 'node:fs';
++import {join} from 'node:path';
++import {createRequire} from 'node:module';
++
++const require=createRequire(import.meta.url);
++const validators=['if-none-match','if-modified-since','if-unmodified-since','if-match','if-range'];
++const heuristicStatuses=new Set([200,203,204,300,404,405,410,414,501]);
++const disabled=new WeakSet();
++function directives(value){
++ const result=new Map();
++ for(const part of (value??'').split(',')){
++  const split=part.indexOf('='),name=(split<0?part:part.slice(0,split)).trim().toLowerCase();
++  if(name&&!result.has(name))result.set(name,split<0?true:part.slice(split+1).trim().replace(/^"|"$/g,''));
++ }
++ return result;
++}
++function seconds(value){return typeof value==='string'&&/^\d+$/.test(value)?Math.min(Number(value),2147483648):null}
++function timestamp(value){const number=Date.parse(value);return Number.isFinite(number)?number:null}
++function policy(headers,status,now,renewal=false){
++ const control=directives(headers.get('cache-control'));
++ if((!renewal&&(control.has('no-store')||control.has('private')||headers.has('set-cookie')))||headers.has('authorization')||headers.get('vary')?.trim()==='*')return null;
++ const etag=headers.get('etag'),modified=headers.get('last-modified');
++ if(control.has('no-cache')&&!etag&&!modified)return null;
++ let lifetime=seconds(control.get('max-age'));
++ const shared=seconds(control.get('s-maxage'));
++ if(lifetime===null){
++  const expires=timestamp(headers.get('expires')),date=timestamp(headers.get('date'))??now;
++  if(expires!==null)lifetime=Math.max(0,(expires-date)/1000);
++  else if(heuristicStatuses.has(status)||control.has('public')){
++   const last=timestamp(modified);lifetime=last===null?0:Math.min(86400,Math.max(0,(date-last)/10000));
++  }else return null;
++ }
++ if(shared!==null)lifetime=Math.min(lifetime,shared);
++ return {lifetime:control.has('no-cache')||control.has('no-store')?0:lifetime,age:seconds(headers.get('age'))??0,etag,modified};
++}
++function validEntry(entry){
++ return entry&&Number.isInteger(entry.status)&&entry.status>=200&&entry.status<=599&&
++  typeof entry.statusText==='string'&&Array.isArray(entry.headers)&&Array.isArray(entry.vary)&&
++  Number.isFinite(entry.stored)&&Number.isFinite(entry.lifetime)&&Number.isFinite(entry.age);
++}
++
++export function setHTTPCacheDisabled(context,value){if(value)disabled.add(context);else disabled.delete(context)}
++export function openHTTPCache({httpCacheDir,httpCacheEntryLimit=1000}={}){
++ if(!Number.isInteger(httpCacheEntryLimit)||httpCacheEntryLimit<0||httpCacheEntryLimit>4294967295)throw new TypeError('httpCacheEntryLimit must be an unsigned 32-bit integer');
++ if(httpCacheDir===undefined)return null;
++ if(typeof httpCacheDir!=='string'||!httpCacheDir)throw new TypeError('httpCacheDir must be a nonempty path');
++ return new HTTPCache(httpCacheDir,httpCacheEntryLimit);
++}
++
++class HTTPCache {
++ #db;#get;#put;#remove;#limit;#epoch=0;#closed=false;
++ constructor(directory,limit){
++  // Loading SQLite is deferred until the caller explicitly configures a store.
++  // This is our own schema/file; never remove or migrate unrelated cache files.
++  const {DatabaseSync}=require('node:sqlite');
++  mkdirSync(directory,{recursive:true,mode:0o700});
++  this.#db=new DatabaseSync(join(directory,'red-panda-http-cache.sqlite'));
++  try{
++   this.#db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; CREATE TABLE IF NOT EXISTS responses (url TEXT PRIMARY KEY, metadata TEXT NOT NULL, body BLOB NOT NULL, stored REAL NOT NULL)');
++   this.#get=this.#db.prepare('SELECT metadata, body FROM responses WHERE url=?');
++   this.#put=this.#db.prepare('INSERT OR REPLACE INTO responses(url,metadata,body,stored) VALUES(?,?,?,?)');
++   this.#remove=this.#db.prepare('DELETE FROM responses WHERE url=?');this.#limit=limit;this.#maintain();
++  }catch(error){this.#db.close();throw error}
++ }
++ #maintain(){
++  if(this.#limit)this.#db.prepare('DELETE FROM responses WHERE url IN (SELECT url FROM responses ORDER BY stored DESC, rowid DESC LIMIT -1 OFFSET ?)').run(this.#limit);
++ }
++ clear(){if(this.#closed)return;this.#epoch++;this.#db.exec('DELETE FROM responses')}
++ close(){if(this.#closed)return;this.#closed=true;this.#epoch++;try{this.#maintain()}finally{this.#db.close()}}
++ #active(token){return !this.#closed&&token.epoch===this.#epoch&&!disabled.has(token.context)}
++ begin(context,url,method,headers,{topLevelDocument=false}={}){
++  if(this.#closed||disabled.has(context)||method.toUpperCase()!=='GET'||topLevelDocument||!/^https?:/.test(url)||validators.some(name=>headers.has(name)))return null;
++  const token={context,url,epoch:this.#epoch,requestHeaders:new Headers(headers),entry:null,fresh:false};
++  // A broken cache row is a miss, never an alternate network response.
++  try{
++   const row=this.#get.get(url);if(!row)return token;
++   const entry=JSON.parse(row.metadata);if(!validEntry(entry))throw new Error('Invalid response record');
++   if(!entry.vary.every(([name,value])=>(headers.get(name)??'').toLowerCase()===value.toLowerCase()))return token;
++   entry.body=Buffer.from(row.body);token.entry=entry;
++   token.fresh=(Date.now()-entry.stored)/1000+entry.age<entry.lifetime;
++   if(!token.fresh&&!entry.etag&&!entry.modified){this.#remove.run(url);token.entry=null}
++  }catch{try{this.#remove.run(url)}catch{}}
++  return token;
++ }
++ requestHeaders(token,headers){
++  if(!token?.entry||token.fresh)return headers;
++  const result=new Headers(headers);
++  if(token.entry.etag)result.set('if-none-match',token.entry.etag);
++  if(token.entry.modified)result.set('if-modified-since',token.entry.modified);
++  return result;
++ }
++ cachedData(token,statusText=token?.entry?.statusText){
++  if(!token?.entry||!this.#active(token))return null;
++  const entry=token.entry;
++  return {url:token.url,status:entry.status,statusText,headers:new Headers(entry.headers),bytes:Buffer.from(entry.body)};
++ }
++ #response(data){
++  return data?new Response([204,205,304].includes(data.status)?null:data.bytes,{status:data.status,statusText:data.statusText,headers:data.headers}):null;
++ }
++ cachedResponse(token,statusText=token?.entry?.statusText){return this.#response(this.cachedData(token,statusText))}
++ revalidateData(token,response){
++  if(!token?.entry||!this.#active(token)||response.status!==304)return null;
++  // Inspector/cookie ingress retain real transport headers separately. Both
++  // synchronous and asynchronous consumers use this same metadata transition.
++  const previous=this.cachedData(token,response.statusText),headers=new Headers(token.entry.headers);
++  response.headers.forEach((value,name)=>{if(!['content-length','content-encoding','transfer-encoding'].includes(name))headers.set(name,value)});
++  this.store(token,{status:token.entry.status,statusText:token.entry.statusText,headers},token.entry.body,true);
++  return previous;
++ }
++ revalidate(token,response){return this.#response(this.revalidateData(token,response))}
++ store(token,response,bytes,renewal=false){
++  if(!token||!this.#active(token)||response.status===206||response.status===304||response.status>=300&&response.status<400)return;
++  const now=Date.now(),metadata=policy(response.headers,response.status,now,renewal);if(!metadata)return;
++  const vary=(response.headers.get('vary')??'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).map(name=>[name,token.requestHeaders.get(name)??'']);
++  const entry={...metadata,status:response.status,statusText:response.statusText,headers:[...response.headers],vary,stored:now};
++  // Storage failure cannot replace successful transport bytes with an error.
++  try{this.#put.run(token.url,JSON.stringify(entry),bytes,now)}catch{}
++ }
++}
+--- /dev/null
++++ b/src/http-cache-control.js
+@@ -0,0 +1,24 @@
++import {setHTTPCacheDisabled} from './http-cache.js';
++
++const settings=new WeakMap();
++const methods=new Set(['LP.configureCDP','Network.setCacheDisabled','Network.clearBrowserCache','Network.canClearBrowserCache']);
++export function supportsHTTPCacheControl(method){return methods.has(method)}
++export function runHTTPCacheControl(connection,session,method,params,present,ProtocolError,context){
++ if(method==='LP.configureCDP'){
++  if(!present)throw new ProtocolError('InvalidParams',-31998);
++  if(params.disableSetCacheDisabled!==undefined&&typeof params.disableSetCacheDisabled!=='boolean')throw new ProtocolError('UnexpectedToken',-31998);
++  const state=settings.get(connection)??{disableSetCacheDisabled:false};
++  if(params.disableSetCacheDisabled!==undefined)state.disableSetCacheDisabled=params.disableSetCacheDisabled;
++  settings.set(connection,state);return {};
++ }
++ if(method==='Network.setCacheDisabled'){
++  if(!present)throw new ProtocolError('InvalidParams',-31998);
++  if(!Object.hasOwn(params,'cacheDisabled'))throw new ProtocolError('MissingField',-31998);
++  if(typeof params.cacheDisabled!=='boolean')throw new ProtocolError('UnexpectedToken',-31998);
++ }
++ if(!context)throw new ProtocolError('NoBrowserContext',-31998);
++ if(method==='Network.canClearBrowserCache')return {result:!!connection.browser.httpCache};
++ if(method==='Network.clearBrowserCache'){connection.browser.httpCache?.clear();return {}}
++ if(!settings.get(connection)?.disableSetCacheDisabled)setHTTPCacheDisabled(context,params.cacheDisabled);
++ return {};
++}
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {openHTTPCache} from './http-cache.js';
+ import {prepareInitialDocumentParser} from './initial-document-parser.js';
+ import {captureDocumentEncoding,decodeHTMLResponse} from './document-encoding.js';
+ import {installHTMLBaseURLs} from './html-base-urls.js';
+@@ -179,6 +180,7 @@
+     this.syncHTTP = new SyncHTTP();
+     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
+     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
++    this.httpCache = openHTTPCache(options);
+     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
+     registerPermissionContext(this.contexts.get('default'),defaultPermissionOwner(this));
+     this.pages = new Map();
+@@ -216,7 +218,7 @@
+     disposeJavaScriptDialogContext(this,context);
+     disposePermissionContext(context);
+   }
+-  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); closePermissionBrowser(this); for(const context of this.contexts.values())disposeNetworkCapture(context);this.syncHTTP.close(); }
++  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); closePermissionBrowser(this); for(const context of this.contexts.values())disposeNetworkCapture(context);this.syncHTTP.close();this.httpCache?.close(); }
+ }
+ 
+ export class Page extends EventEmitter {
+@@ -457,10 +459,11 @@
+   }
+ 
+   async traverseHistory(index,options={}){return traverseJointHistory(this,index,options);}
+-  requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId) {
++  requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId, fromDiskCache = false, responseStatusText) {
+     this.activeRequests.delete(id);
+     this.lastActivity = Date.now();
+-    this.emit('response', { id, url, status, size, headers, type, timestamp: now(), frameId, loaderId });
++    if(fromDiskCache)this.emit('requestServedFromCache',{id});
++    this.emit('response', { id, url, status, size, headers, type, timestamp: now(), frameId, loaderId,...(fromDiskCache?{fromDiskCache:true}:{}),...(responseStatusText!==undefined?{statusText:responseStatusText}:{}) });
+   }
+   requestFailed(id, error) {
+     this.activeRequests.delete(id);
+@@ -567,8 +570,20 @@
+       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
+       let capture;const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId,body,token=>{capture=token});
+       try {
+-        const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
+-        if (useCookies) for (const cookie of response.headers.getSetCookie()) {
++        const cache=this.browser.httpCache;
++        if(cache)signal.throwIfAborted();
++        const exchange=cache?.begin(this.context,url,method,headers,{topLevelDocument:type==='Document'&&(!init.frameId||init.frameId===this.frameId)});
++        let fromDiskCache=false,transportStatusText,incomingHeaders;
++        let response=exchange?.fresh?cache.cachedResponse(exchange):null;
++        if(response)fromDiskCache=true;
++        else {
++          response=await fetch(url,{...init,method,body,headers:cache?.requestHeaders(exchange,headers)??headers,signal,redirect:'manual'});
++          incomingHeaders=response.headers;transportStatusText=response.statusText;
++          if(response.status===304){const renewed=cache?.revalidate(exchange,response);if(renewed){response=renewed;fromDiskCache=true}}
++        }
++        // Cookie ingress belongs to the actual HTTP response, including a304.
++        // The cached consumer snapshot intentionally retains its older headers.
++        if (useCookies&&incomingHeaders) for (const cookie of incomingHeaders.getSetCookie()) {
+           const accepted=httpResponseCookie(this.context.cookies,cookie,url);
+           if(accepted!==null)await this.context.cookies.setCookie(accepted, url, { ignoreError: true });
+         }
+@@ -625,6 +640,8 @@
+           if(navigationReader)signal.throwIfAborted();
+         }finally{finishNavigationReader(navigationReader)}
+         const bytes = Buffer.concat(chunks);
++        if(cache)signal.throwIfAborted();
++        if(!fromDiskCache)cache?.store(exchange,response,bytes);
+         if(type!=='Document'){beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes)}
+         finishNetworkResponse(capture);
+         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
+@@ -634,7 +651,7 @@
+           Object.defineProperty(buffered, key, { value });
+         }
+ 
+-        this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
++        this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId, fromDiskCache, fromDiskCache?(transportStatusText??''):undefined);
+         return buffered;
+       } catch (error) { this.requestFailed(id, error); throw error; }
+     }
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import {supportsHTTPCacheControl,runHTTPCacheControl} from './http-cache-control.js';
+ import {supportsFileInput,rememberFileInputContext,forgetFileInputContext,runFileInput} from './cdp-file-input.js';
+ import {dumpMarkdownNode} from './markdown-node.js';
+ import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
+@@ -197,14 +198,15 @@
+         ...(request.redirectResponse ? { redirectResponse: request.redirectResponse, redirectHasExtraInfo: false } : {}),
+       });
+     });
++    listen('requestServedFromCache',response=>this.event('Network.requestServedFromCache',{requestId:response.id}));
+     listen('response', response => {
+       this.event('Network.responseReceived', {
+         requestId: response.id, loaderId: response.loaderId ?? page.loaderId, timestamp: response.timestamp,
+         type: response.type, hasExtraInfo: false, frameId: response.frameId ?? page.frameId,
+-        response: { url: response.url, status: response.status, statusText: http.STATUS_CODES[response.status] ?? '',
++        response: { url: response.url, status: response.status, statusText: response.statusText??http.STATUS_CODES[response.status]??'',
+           headers: response.headers, mimeType: (response.headers['content-type'] ?? 'text/html').split(';')[0],
+           connectionReused: false, connectionId: 0, encodedDataLength: response.size,
+-          securityState: 'neutral', protocol: 'http/1.1', fromDiskCache: false, fromServiceWorker: false },
++          securityState: 'neutral', protocol: 'http/1.1', fromDiskCache: response.fromDiskCache??false, fromServiceWorker: false },
+       });
+       this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
+     });
+@@ -518,7 +520,6 @@
+         } catch (error) { throw new ProtocolError(error.message, error.code === 'UnsupportedDumpFormat' ? -32601 : -32602); }
+       }
+       // Acknowledgements for protocol configuration that does not require layout.
+-      case 'Network.setCacheDisabled':
+       case 'Page.setInterceptFileChooserDialog':
+       case 'Emulation.setFocusEmulationEnabled':
+       case 'Emulation.setEmulatedMedia':
+@@ -604,7 +605,7 @@
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
+       const sessionCommand=session&&!method.startsWith('Browser.')&&!method.startsWith('Target.')&&!CONFIGURATION_ACK_METHODS.has(method);
+       dispatchedSession=sessionCommand?session:undefined;
+-      const result = supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
++      const result = supportsHTTPCacheControl(method) ? runHTTPCacheControl(this,session,method,message.params,Object.hasOwn(message,'params'),ProtocolError,session?.page.context??selectCDPCookieContext(this.browser)) : supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+       // Closed sessions have no receiver for their pending command replies.
+       // Page.close itself completes only after its successful response below.
+--- a/bin/red-panda.js
++++ b/bin/red-panda.js
+@@ -44,6 +44,8 @@
+   --wait-selector CSS     Wait for a matching DOM element
+   --wait-script JS        Wait for a truthy JavaScript expression
+   --wait-script-file PATH Read a wait expression from a UTF-8 file (last script flag wins)
++  --http-cache-dir PATH  Persist completed eligible HTTP responses in this directory
++  --http-cache-entry-limit N  Soft entry limit (default 1000; 0: unlimited)
+   --http-header HEADER   Set a fixed Name: Value header on every HTTP request (repeatable)
+   --no-javascript         Parse HTML without running page scripts
+   --fail-on-http-error    Dump HTTP errors and exit 22
+@@ -65,6 +67,8 @@
+   }
+   return Number(value);
+ }
++
++function cacheEntryLimit(value){if(!/^[+]?[0-9][0-9_]*$/.test(value))throw new Error('Invalid --http-cache-entry-limit');const number=Number(value.replaceAll('_',''));if(!Number.isInteger(number)||number<0||number>4294967295)throw new Error('Overflow --http-cache-entry-limit');return number}
+ 
+ export async function main(argv = process.argv.slice(2)) {
+   const { values, positionals, tokens } = parseArgs({ args: prepareCLIArguments(argv, [...DUMP_FORMATS, 'png', 'pdf']), allowPositionals: true, tokens: true, options: {
+@@ -77,6 +81,7 @@
+     'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
+     'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' }, 'wait-script-file': { type: 'string' },
+     'http-header': { type: 'string', multiple: true },
++    'http-cache-dir': {type:'string'}, 'http-cache-entry-limit': {type:'string'},
+     'ws-max-concurrent': { type: 'string' },
+     'no-javascript': { type: 'boolean' }, 'user-agent': { type: 'string' },
+     'fail-on-http-error': { type: 'boolean' },
+@@ -100,7 +105,7 @@
+   if (loadResources.includes('none')) loadResources = [];
+   const features = values['experimental-features'] ?? [];
+   for (const feature of features) if (feature !== 'serviceworker') throw new Error(`Unsupported experimental feature: ${feature}`);
+-  const options = { wsMaxConcurrent:parseWebSocketLimit(values['ws-max-concurrent']),experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
++  const options = {httpCacheDir:values['http-cache-dir'],httpCacheEntryLimit:values['http-cache-entry-limit']===undefined?1000:cacheEntryLimit(values['http-cache-entry-limit']), wsMaxConcurrent:parseWebSocketLimit(values['ws-max-concurrent']),experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
+   if (command === 'run') {
+     if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
+     if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -51,14 +51,23 @@
+     const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+     page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),postDataFields:inlinePostData(capture),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+     checkpoint();
+-    const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
+-    this.#ensureWorker().postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
+-    const remaining=deadline-Date.now();
+-    if(remaining<=0||Atomics.wait(state,0,0,remaining)==='timed-out')throw Error('Synchronous HTTP request timed out');
+-    const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
+-    const bytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2))),response={...meta,headers:new Headers(meta.headers),bytes};
+-    checkpoint();
+-    if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
++    const cache=page.browser.httpCache,exchange=cache?.begin(page.context,url,method,headers,{topLevelDocument:resourceType==='Document'&&(!init.frameId||init.frameId===page.frameId)});
++    let response=exchange?.fresh?cache.cachedData(exchange):null,fromDiskCache=!!response,transportStatusText;
++    if(!response){
++     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
++     const outgoing=cache?.requestHeaders(exchange,headers)??headers;
++     this.#ensureWorker().postMessage({id,url,init:{method,headers:[...outgoing],body},shared,maxBodyBytes});
++     const remaining=deadline-Date.now();
++     if(remaining<=0||Atomics.wait(state,0,0,remaining)==='timed-out')throw Error('Synchronous HTTP request timed out');
++     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
++     const actualBytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2)));
++     response={...meta,headers:new Headers(meta.headers),bytes:actualBytes};transportStatusText=response.statusText;
++     checkpoint();
++     if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
++     const renewed=cache?.revalidateData(exchange,response);if(renewed){response=renewed;fromDiskCache=true}
++    }
++    const bytes=response.bytes;checkpoint();
++    if(bytes.length>maxBodyBytes)throw Error(maxBodyBytes===16*1024*1024?'Response exceeds 16 MiB limit':'Response exceeds '+maxBodyBytes+' byte limit');
+     const location=response.headers.get('location');
+     if(location&&[301,302,303,307,308].includes(response.status)){
+      if(redirects===20)throw Error('Too many redirects');
+@@ -71,11 +80,12 @@
+      redirectResponse={url,status:response.status,statusText:response.statusText,headers:Object.fromEntries(response.headers),mimeType:response.headers.get('content-type')??'text/html',connectionReused:false,connectionId:0,encodedDataLength:0,securityState:'neutral'};
+      url=next.href;continue;
+     }
++    if(!fromDiskCache)cache?.store(exchange,response,bytes);
+     beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes);finishNetworkResponse(capture);
+     // Remove the captured id before entering arbitrary event callbacks. The
+     // operation itself remains owned until those callbacks return normally.
+     page.activeRequests.delete(id);
+-    page.requestFinished(id,url,response.status,bytes.length,Object.fromEntries(response.headers),resourceType,init.frameId,init.loaderId);
++    page.requestFinished(id,url,response.status,bytes.length,Object.fromEntries(response.headers),resourceType,init.frameId,init.loaderId,fromDiskCache,fromDiskCache?(transportStatusText??''):undefined);
+     owned.delete(id);op.complete=true;init.signal?.removeEventListener('abort',onAbort);this.operations.delete(op);return response;
+    }
+   }catch(error){
+--- /dev/null
++++ b/test/http-cache.test.js
+@@ -0,0 +1,139 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {mkdtemp,rm,readdir} from 'node:fs/promises';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {Browser} from '../src/browser.js';
++import {serve} from '../src/cdp.js';
++import {connect} from './cdp-client.js';
++import {openHTTPCache,setHTTPCacheDisabled} from '../src/http-cache.js';
++
++async function fixture(t,{configured=true}={}){
++ const directory=await mkdtemp(join(tmpdir(),'red-panda-http-cache-test-')),requests=[];
++ const server=http.createServer((request,response)=>{
++  const ordinal=requests.length+1;requests.push({url:request.url,headers:request.headers,ordinal});
++  response.setHeader('cache-control','public, max-age=600');response.setHeader('x-receipt',String(ordinal));
++  if(request.url==='/document'){response.setHeader('content-type','text/html');response.end('<!doctype html><body>actual page');return}
++  if(request.url==='/no-store')response.setHeader('cache-control','no-store');
++  if(request.url==='/vary')response.setHeader('vary','X-Variant');
++  if(request.url.startsWith('/renew-')){
++   response.setHeader('etag','"actual-renewed-v1"');
++   if(request.headers['if-none-match']==='"actual-renewed-v1"'){
++    response.statusCode=304;const mode=request.url.slice(7);response.setHeader('cache-control',mode==='cookie'?'public, max-age=600':mode==='private'?'private, max-age=600':'no-store');
++    if(mode==='cookie')response.setHeader('set-cookie','actualFuture=received; HttpOnly; SameSite=Lax; Path=/');
++    response.end();return;
++   }
++   response.setHeader('cache-control','no-cache');
++  }
++  if(['/validator','/validator-cookie'].includes(request.url)){
++   response.setHeader('etag','"actual-v1"');
++   if(request.headers['if-none-match']==='"actual-v1"'){response.statusCode=304;response.setHeader('x-renewed',String(ordinal));if(request.url==='/validator-cookie')response.setHeader('set-cookie','actual304=received; HttpOnly; SameSite=Lax; Path=/');response.end();return}
++   response.setHeader('cache-control','no-cache');
++  }
++  if(['/range','/range-cold'].includes(request.url)){
++   const full=Buffer.from([0,65,128,255,66,67,13,10,68,69]);response.setHeader('accept-ranges','bytes');
++   if(request.headers.range==='bytes=0-1'){response.statusCode=206;response.setHeader('content-range','bytes 0-1/10');response.end(full.subarray(0,2));return}
++   response.end(full);return;
++  }
++  response.end(Buffer.concat([Buffer.from(`${request.url}:${request.headers['x-variant']??''}:${ordinal}:`),Buffer.from([0,255,128,13,10])]));
++ });server.listen(0,'127.0.0.1');await once(server,'listening');
++ const browser=new Browser({timeout:3000,...(configured?{httpCacheDir:directory}:{})});
++ t.after(async()=>{browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true})});
++ const origin=`http://127.0.0.1:${server.address().port}`,page=browser.createPage();await page.navigate(origin+'/document');
++ return {browser,page,requests,directory,origin};
++}
++async function bytes(response){return [...new Uint8Array(await response.arrayBuffer())]}
++
++test('HTTP cache is absent by default and real repeated requests stay distinct',{timeout:15000},async t=>{
++ const {browser,page,requests,directory}=await fixture(t,{configured:false});
++ assert.equal(browser.httpCache,null);const a=await bytes(await page.fetch('/bytes')),b=await bytes(await page.fetch('/bytes'));
++ assert.notDeepEqual(a,b);assert.equal(requests.length,3);assert.deepEqual(await readdir(directory),[]);
++});
++test('HTTP cache retains actual binary bytes and publishes real hit provenance',{timeout:15000},async t=>{
++ const {page,requests,directory}=await fixture(t),events=[];
++ page.on('requestServedFromCache',event=>events.push(['cache',event.id]));page.on('response',event=>events.push(['response',event.id,event.fromDiskCache??false]));
++ const first=await page.fetch('/bytes'),body=await bytes(first),second=await page.fetch('/bytes');
++ assert.deepEqual(await bytes(second),body);assert.equal(second.headers.get('x-receipt'),first.headers.get('x-receipt'));assert.equal(requests.length,2);
++ assert.deepEqual(events.map(event=>[event[0],event[2]]),[['response',false],['cache',undefined],['response',true]]);assert.equal(events[1][1],events[2][1]);
++ assert.ok((await readdir(directory)).includes('red-panda-http-cache.sqlite'));
++});
++test('HTTP cache never stores no-store and bypasses top-level navigation',{timeout:15000},async t=>{
++ const {page,requests,origin}=await fixture(t);await page.fetch('/no-store');await page.fetch('/no-store');await page.navigate(origin+'/document');await page.navigate(origin+'/document');
++ assert.equal(requests.filter(row=>row.url==='/no-store').length,2);assert.equal(requests.filter(row=>row.url==='/document').length,3);
++});
++test('HTTP cache disable bypasses both reading and replacement of retained bytes',{timeout:15000},async t=>{
++ const {browser,page,requests}=await fixture(t),first=await bytes(await page.fetch('/bytes'));
++ setHTTPCacheDisabled(page.context,true);const bypass=await bytes(await page.fetch('/bytes'));assert.notDeepEqual(bypass,first);
++ setHTTPCacheDisabled(page.context,false);assert.deepEqual(await bytes(await page.fetch('/bytes')),first);assert.equal(requests.length,3);
++ browser.httpCache.clear();assert.notDeepEqual(await bytes(await page.fetch('/bytes')),first);assert.equal(requests.length,4);
++});
++test('HTTP cache uses one actual Vary variant per URL',{timeout:15000},async t=>{
++ const {page,requests}=await fixture(t),fetchVariant=async value=>bytes(await page.fetch('/vary',{headers:{'x-variant':value}}));
++ const a=await fetchVariant('A');assert.deepEqual(await fetchVariant('A'),a);const b=await fetchVariant('B');assert.notDeepEqual(b,a);assert.deepEqual(await fetchVariant('B'),b);assert.notDeepEqual(await fetchVariant('A'),a);
++ assert.deepEqual(requests.filter(row=>row.url==='/vary').map(row=>row.headers['x-variant']),['A','B','A']);
++});
++test('HTTP cache genuinely revalidates 304 and renews only the future header snapshot',{timeout:15000},async t=>{
++ const {page,requests}=await fixture(t),first=await page.fetch('/validator'),old=[...first.headers],body=await bytes(first),second=await page.fetch('/validator');
++ assert.equal(second.status,200);assert.equal(second.statusText,'Not Modified');assert.deepEqual([...second.headers],old);assert.deepEqual(await bytes(second),body);
++ const third=await page.fetch('/validator');assert.equal(third.statusText,'OK');assert.deepEqual(await bytes(third),body);assert.notEqual(third.headers.get('x-receipt'),first.headers.get('x-receipt'));assert.ok(third.headers.has('x-renewed'));
++ assert.deepEqual(requests.filter(row=>row.url==='/validator').map(row=>row.headers['if-none-match']??null),[null,'"actual-v1"']);
++});
++test('HTTP cache is browser-owned across context disposal and independent browser reopen',{timeout:15000},async t=>{
++ const {browser,page,requests,directory,origin}=await fixture(t),first=await bytes(await page.fetch('/bytes'));
++ const id=browser.createContext(),child=browser.createPage(id);await child.navigate(origin+'/document');assert.deepEqual(await bytes(await child.fetch('/bytes')),first);browser.disposeContext(id);
++ browser.close();const reopened=new Browser({timeout:3000,httpCacheDir:directory});t.after(()=>reopened.close());const next=reopened.createPage();await next.navigate(origin+'/document');assert.deepEqual(await bytes(await next.fetch('/bytes')),first);assert.equal(requests.filter(row=>row.url==='/bytes').length,1);
++});
++test('HTTP cache validates options and rejects storage authority after real clear or close',{timeout:15000},async t=>{
++ assert.throws(()=>openHTTPCache({httpCacheEntryLimit:-1}),TypeError);assert.throws(()=>openHTTPCache({httpCacheDir:''}),TypeError);
++ const directory=await mkdtemp(join(tmpdir(),'red-panda-cache-policy-'));t.after(()=>rm(directory,{recursive:true,force:true}));
++ const cache=openHTTPCache({httpCacheDir:directory}),context={},headers=new Headers(),response=new Response('actual',{headers:{'cache-control':'public, max-age=600'}});
++ const beforeClear=cache.begin(context,'https://example.test/item','GET',headers);cache.clear();cache.store(beforeClear,response,Buffer.from('abandoned'));assert.equal(cache.begin(context,'https://example.test/item','GET',headers).entry,null);
++ const beforeClose=cache.begin(context,'https://example.test/item','GET',headers);cache.close();cache.store(beforeClose,response,Buffer.from('abandoned'));assert.equal(cache.cachedResponse(beforeClose),null);cache.close();
++});
++test('CDP cache controls act on transport and preserve the ignore-toggle gate',{timeout:15000},async t=>{
++ const {directory,origin,requests}=await fixture(t),service=await serve({httpCacheDir:directory,timeout:3000,port:0}),client=await connect(`ws://127.0.0.1:${service.port}/`,{timeout:2500});
++ try{
++ const page=service.browser.createPage();await page.navigate(origin+'/document');
++ const {sessionId}=await client.send('Target.attachToTarget',{targetId:page.id,flatten:true});await client.send('Network.enable',{},sessionId);
++ assert.deepEqual(await client.send('Network.canClearBrowserCache',{},sessionId),{result:true});
++ const get=()=>client.send('Runtime.evaluate',{expression:`fetch(${JSON.stringify(origin+'/bytes')}).then(r=>r.arrayBuffer()).then(b=>Array.from(new Uint8Array(b)))`,awaitPromise:true,returnByValue:true},sessionId);
++ const first=await get();await get();await client.send('Network.setCacheDisabled',{cacheDisabled:true},sessionId);const bypass=await get();assert.notDeepEqual(first.result.value,bypass.result.value);
++ await client.send('Network.setCacheDisabled',{cacheDisabled:false},sessionId);await client.send('LP.configureCDP',{disableSetCacheDisabled:true},sessionId);await client.send('Network.setCacheDisabled',{cacheDisabled:true},sessionId);assert.deepEqual((await get()).result.value,first.result.value);
++ assert.equal(requests.filter(row=>row.url==='/bytes').length,2);const hits=client.events.filter(row=>row.method==='Network.requestServedFromCache');assert.equal(hits.length,2);const cachedResponses=client.events.filter(row=>row.method==='Network.responseReceived'&&row.params.response.fromDiskCache);assert.deepEqual(cachedResponses.map(row=>row.params.response.statusText),['','']);
++ await client.send('Network.clearBrowserCache',{},sessionId);await get();assert.equal(requests.filter(row=>row.url==='/bytes').length,3); }finally{await client.close();await service.close()}
++});
++test('real 304 cookies reach the jar and HTTP while the consumer keeps old headers',{timeout:15000},async t=>{
++ const {browser,page,origin,requests}=await fixture(t),first=await page.fetch('/validator-cookie'),body=await bytes(first),second=await page.fetch('/validator-cookie');
++ assert.equal(second.statusText,'Not Modified');assert.deepEqual(await bytes(second),body);assert.equal(second.headers.has('set-cookie'),false);
++ const cookies=await browser.contexts.get('default').cookies.getCookies(origin+'/');const cookie=cookies.find(value=>value.key==='actual304');assert.ok(cookie);assert.equal(cookie.value,'received');assert.equal(cookie.httpOnly,true);
++ await page.fetch('/echo-cookie');assert.match(requests.at(-1).headers.cookie,/actual304=received/);assert.equal(requests.filter(row=>row.url==='/validator-cookie').length,2);
++});
++test('measured Range requests reuse a real full cache entry while cold Range reaches HTTP',{timeout:15000},async t=>{
++ const {page,requests}=await fixture(t),range={headers:{Range:'bytes=0-1'}},cold=await page.fetch('/range-cold',range);
++ assert.equal(cold.status,206);assert.deepEqual(await bytes(cold),[0,65]);const first=await page.fetch('/range'),full=await bytes(first);
++ for(let i=0;i<2;i++){const response=await page.fetch('/range',range);assert.equal(response.status,200);assert.deepEqual(await bytes(response),full);assert.equal(response.headers.get('x-receipt'),first.headers.get('x-receipt'))}
++ assert.equal(requests.filter(row=>row.url==='/range').length,1);assert.equal(requests.filter(row=>row.url==='/range-cold').length,1);
++});
++test('measured Vary value matching reuses upper-case bytes for lower-case values',{timeout:15000},async t=>{
++ const {page,requests}=await fixture(t),get=async value=>bytes(await page.fetch('/vary',{headers:{'X-Variant':value}}));
++ const first=await get('A');for(const value of ['a','a','A'])assert.deepEqual(await get(value),first);assert.equal(requests.filter(row=>row.url==='/vary').length,1);
++});
++test('real 304 renewal applies its own metadata policy while preserving current consumer headers',{timeout:15000},async t=>{
++ const {page,requests,browser,origin}=await fixture(t);
++ for(const mode of ['cookie','private','no-store']){
++  const path='/renew-'+mode,first=await page.fetch(path),body=await bytes(first),oldReceipt=first.headers.get('x-receipt');
++  const second=await page.fetch(path);assert.equal(second.statusText,'Not Modified');assert.deepEqual(await bytes(second),body);assert.equal(second.headers.get('cache-control'),'no-cache');assert.equal(second.headers.get('x-receipt'),oldReceipt);
++  const third=await page.fetch(path);assert.deepEqual(await bytes(third),body);assert.notEqual(third.headers.get('x-receipt'),oldReceipt);
++  assert.equal(third.headers.get('cache-control'),mode==='cookie'?'public, max-age=600':mode==='private'?'private, max-age=600':'no-store');
++  const fourth=await page.fetch(path);assert.deepEqual(await bytes(fourth),body);
++  assert.equal(third.statusText,mode==='no-store'?'Not Modified':'OK');assert.equal(fourth.statusText,third.statusText);
++  assert.equal(requests.filter(row=>row.url===path).length,mode==='no-store'?4:2);
++  if(mode==='cookie'){
++   assert.match(third.headers.get('set-cookie'),/actualFuture=received/);
++   const exposed=await page.evaluate(`fetch(${JSON.stringify(origin+path)}).then(r=>({cookie:r.headers.get('set-cookie'),status:r.status}))`);assert.deepEqual(JSON.parse(JSON.stringify(exposed)),{cookie:null,status:200});
++   const cookies=await browser.contexts.get('default').cookies.getCookies(origin+'/');assert.equal(cookies.find(value=>value.key==='actualFuture')?.value,'received');
++  }
++ }
++});
+--- /dev/null
++++ b/test/http-cache-sync.test.js
+@@ -0,0 +1,58 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {Worker} from 'node:worker_threads';
++import {once} from 'node:events';
++import {mkdtemp,rm,readdir} from 'node:fs/promises';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {Browser} from '../src/browser.js';
++
++async function fixture(t,{configured=true}={}){
++ const directory=await mkdtemp(join(tmpdir(),'red-panda-http-cache-sync-'));
++ const worker=new Worker(new URL('./fixtures/http-cache-sync-server.mjs',import.meta.url));
++ const [{port}]=await once(worker,'message');const origin=`http://127.0.0.1:${port}`;
++ const browser=new Browser({timeout:3000,loadResources:['worker'],...(configured?{httpCacheDir:directory}:{})});
++ t.after(async()=>{browser.close();await worker.terminate();await rm(directory,{recursive:true,force:true})});
++ const page=browser.createPage();await page.navigate(origin+'/document');
++ const log=()=>fetch(origin+'/log').then(response=>response.json());
++ const sync=path=>page.evaluate(`(()=>{const xhr=new XMLHttpRequest();xhr.open('GET',${JSON.stringify(origin+path)},false);xhr.send();return{status:xhr.status,text:xhr.statusText,body:xhr.responseText,receipt:xhr.getResponseHeader('x-receipt'),cookie:xhr.getResponseHeader('set-cookie')}})()`);
++ return {browser,page,origin,directory,log,sync};
++}
++const plain=value=>JSON.parse(JSON.stringify(value));
++const bytes=async response=>[...new Uint8Array(await response.arrayBuffer())];
++
++test('default synchronous HTTP still performs real requests and creates no filesystem cache',{timeout:15000},async t=>{
++ const {browser,sync,log,directory}=await fixture(t,{configured:false});
++ const a=plain(sync('/bytes')),b=plain(sync('/bytes'));assert.equal(a.status,200);assert.notEqual(a.receipt,b.receipt);assert.notEqual(a.body,b.body);
++ assert.equal((await log()).filter(row=>row.url==='/bytes').length,2);assert.ok(browser.syncHTTP.worker);assert.deepEqual(await readdir(directory),[]);
++});
++test('async HTTP seeds genuine synchronous hits without allocating a transport thread',{timeout:15000},async t=>{
++ const {browser,page,sync,log}=await fixture(t),events=[];
++ const first=await page.fetch('/bytes'),body=Buffer.from(await first.arrayBuffer()),receipt=first.headers.get('x-receipt');
++ page.on('requestServedFromCache',event=>events.push(event.id));
++ for(let i=0;i<2;i++)assert.deepEqual(plain(sync('/bytes')),{status:200,text:'OK',body:body.toString('utf8'),receipt,cookie:null});
++ assert.equal(browser.syncHTTP.worker,undefined);assert.equal((await log()).filter(row=>row.url==='/bytes').length,1);assert.equal(events.length,2);assert.notEqual(events[0],events[1]);assert.equal(page.activeRequests.size,0);assert.equal(browser.syncHTTP.operations.size,0);
++});
++test('synchronous 304 uses the shared real renewal and cookie producers before async reuse',{timeout:15000},async t=>{
++ const {browser,page,sync,log,origin}=await fixture(t),first=plain(sync('/validator')),second=plain(sync('/validator'));
++ assert.equal(first.text,'OK');assert.equal(second.text,'Not Modified');assert.equal(second.body,first.body);assert.equal(second.receipt,first.receipt);assert.equal(second.cookie,null);
++ const third=await page.fetch('/validator');assert.equal(third.statusText,'OK');assert.equal(await third.text(),first.body);assert.notEqual(third.headers.get('x-receipt'),first.receipt);
++ const cookies=await browser.contexts.get('default').cookies.getCookies(origin+'/');const cookie=cookies.find(value=>value.key==='actualSync');assert.equal(cookie?.value,'received');assert.equal(cookie?.httpOnly,true);
++ const echoed=plain(sync('/echo-cookie'));assert.match(echoed.body,/actualSync=received/);
++ assert.deepEqual((await log()).filter(row=>row.url==='/validator').map(row=>row.headers['if-none-match']??null),[null,'"actual-sync-v1"']);assert.equal(page.activeRequests.size,0);
++});
++test('Window and Worker synchronous HTTP share actual cached binary bodies with async Fetch',{timeout:15000},async t=>{
++ const {page,origin,log}=await fixture(t),first=await page.fetch('/binary'),initial=await bytes(first),receipt=first.headers.get('x-receipt');
++ async function workerRequest(path){
++  return plain(await page.evaluate(`new Promise((resolve,reject)=>{const worker=new Worker(${JSON.stringify(origin+'/worker.js')});worker.onmessage=event=>{worker.terminate();resolve(event.data)};worker.onerror=event=>{worker.terminate();reject(Error(event.message))};worker.postMessage(${JSON.stringify(origin+path)})})`));
++ }
++ const a=await workerRequest('/binary');assert.equal(a.status,200);assert.equal(a.receipt,receipt);assert.deepEqual(a.bytes,initial);
++ const b=await workerRequest('/binary-second');assert.equal(b.status,200);assert.ok(Array.isArray(b.bytes));
++ const fromWindow=await page.fetch('/binary-second');assert.equal(fromWindow.headers.get('x-receipt'),b.receipt);assert.deepEqual(await bytes(fromWindow),b.bytes);
++ const rows=await log();assert.equal(rows.filter(row=>row.url==='/binary').length,1);assert.equal(rows.filter(row=>row.url==='/binary-second').length,1);
++});
++test('a cached synchronous response still obeys the actual selected body limit and cleanup',{timeout:15000},async t=>{
++ const {browser,page,origin,log}=await fixture(t);await page.fetch('/bytes');
++ assert.throws(()=>browser.syncHTTP.fetch(page,origin+'/bytes',{maxBodyBytes:1}),{message:'Response exceeds 1 byte limit'});
++ assert.equal(browser.syncHTTP.worker,undefined);assert.equal(page.activeRequests.size,0);assert.equal(browser.syncHTTP.operations.size,0);assert.equal((await log()).filter(row=>row.url==='/bytes').length,1);
++});
+--- /dev/null
++++ b/test/fixtures/http-cache-sync-server.mjs
+@@ -0,0 +1,22 @@
++import http from 'node:http';
++import {parentPort} from 'node:worker_threads';
++
++const requests=[];
++const server=http.createServer((request,response)=>{
++ if(request.url==='/log'){response.setHeader('content-type','application/json');response.end(JSON.stringify(requests));return}
++ const ordinal=requests.length+1;requests.push({url:request.url,headers:request.headers,ordinal});
++ response.setHeader('cache-control','public, max-age=600');response.setHeader('x-receipt',String(ordinal));
++ if(request.url==='/document'){response.setHeader('content-type','text/html');response.end('<!doctype html><body>actual cache transport page');return}
++ if(request.url==='/worker.js'){
++  response.setHeader('content-type','application/javascript');
++  response.end(`onmessage=async event=>{try{const xhr=new XMLHttpRequest();xhr.open('GET',event.data,false);xhr.responseType='arraybuffer';xhr.send();postMessage({status:xhr.status,text:xhr.statusText,receipt:xhr.getResponseHeader('x-receipt'),bytes:Array.from(new Uint8Array(xhr.response))})}catch(error){postMessage({error:{name:error.name,message:error.message}})}}`);return;
++ }
++ if(request.url==='/echo-cookie'){response.setHeader('cache-control','no-store');response.end(request.headers.cookie??'');return}
++ if(request.url==='/validator'){
++  response.setHeader('etag','"actual-sync-v1"');
++  if(request.headers['if-none-match']==='"actual-sync-v1"'){response.statusCode=304;response.setHeader('set-cookie','actualSync=received; HttpOnly; SameSite=Lax; Path=/');response.end();return}
++  response.setHeader('cache-control','no-cache');
++ }
++ response.end(Buffer.concat([Buffer.from(`${request.url}:actual ${ordinal}:`),Buffer.from([0,65,128,255,13,10,226,130,172])]));
++});
++server.listen(0,'127.0.0.1',()=>parentPort.postMessage({port:server.address().port}));

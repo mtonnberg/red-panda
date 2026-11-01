@@ -1,3 +1,4 @@
+import{types}from'node:util';
 import {addAbortListener} from 'node:events';
 // Genuine selected-VM Event/EventTarget frontends over private real Node state.
 // No Node prototype is grafted onto a public VM constructor or wrapper.
@@ -11,7 +12,7 @@ const methods=Object.fromEntries(['preventDefault','stopPropagation','stopImmedi
 const add=NativeTarget.prototype.addEventListener,remove=NativeTarget.prototype.removeEventListener,dispatch=NativeTarget.prototype.dispatchEvent;
 const installed=new WeakMap(),eventStates=new WeakMap(),targetStates=new WeakMap();
 const slot=fields=>Object.assign(Object.create(null),fields);
-function factory(g,b){
+function factory(g,b,promiseEvents){
  const create=g.Object.create,TypeError=g.TypeError,String=g.String,define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,Array=g.Array,freeze=g.Object.freeze;
  const description=own(g.Symbol.prototype,'description').get,text=v=>typeof v==='symbol'?apply(description,v,[])??'':String(v);
  const invalid=()=>new TypeError('invalid argument'),illegal=()=>new TypeError('Illegal invocation');
@@ -34,17 +35,23 @@ function factory(g,b){
   constructor(type,init=undefined){if(!arguments.length)throw invalid();super(type,init);const o=dict(init),colno=o.colno===undefined?0:(+o.colno)>>>0,error=o.error??null,filename=o.filename===undefined?'':text(o.filename),lineno=o.lineno===undefined?0:(+o.lineno)>>>0,message=o.message===undefined?'':text(o.message);b.error(this,message,filename,lineno,colno,error)}
   get message(){validEvent(this);return b.extra(this,'message')}get filename(){validEvent(this);return b.extra(this,'filename')}get lineno(){validEvent(this);return b.extra(this,'lineno')}get colno(){validEvent(this);return b.extra(this,'colno')}get error(){validEvent(this);return b.extra(this,'error')}
  }
+ function PromiseRejectionEvent(type,init=undefined){
+  if(!new.target||!arguments.length)throw invalid();type=text(type);const o=dict(init),bubbles=!!o.bubbles,cancelable=!!o.cancelable,composed=!!o.composed;
+  b.eventStore(this,type,bubbles,cancelable,composed);const promise=o.promise??null;if(promise!==null&&!b.promise(promise))throw invalid();const reason=o.reason??null;b.rejection(this,promise,reason);
+ }
+ g.Object.setPrototypeOf(PromiseRejectionEvent,Event);g.Object.setPrototypeOf(PromiseRejectionEvent.prototype,ep);define(PromiseRejectionEvent,'prototype',{writable:false});
+ for(const key of['promise','reason'])define(PromiseRejectionEvent.prototype,key,{get(){validEvent(this);return b.extra(this,key)},enumerable:true,configurable:true});
  function options(v){if(v==null||typeof v!=='object'&&typeof v!=='function')return{capture:!!v,once:false,passive:false,signal:null};const capture=!!v.capture,once=!!v.once,passive=!!v.passive,signal=v.signal??null;if(signal!==null&&!b.signal(signal))throw invalid();return{capture,once,passive,signal}}
  function EventTarget(){if(!new.target)throw invalid();b.targetStore(this)}
  const tp=EventTarget.prototype;delete tp.constructor;define(EventTarget,'prototype',{writable:false});
  const tm={dispatchEvent(event){validTarget(this);if(!arguments.length||!b.event(event))throw invalid();return b.dispatch(this,event)},addEventListener(type,callback){validTarget(this);if(arguments.length<2)throw invalid();type=text(type);if(callback==null)return;if(typeof callback!=='function'&&typeof callback!=='object')throw invalid();b.add(this,type,callback,options(arguments[2]))},removeEventListener(type,callback){validTarget(this);if(arguments.length<2)throw invalid();type=text(type);const o=arguments[2],capture=typeof o==='object'&&o!==null?!!o.capture:!!o;b.remove(this,type,callback,capture)}};
  for(const[name,value]of Object.entries(tm))define(tp,name,{value,writable:true,enumerable:true,configurable:true});
- for(const C of[Event,EventTarget,MessageEvent,ErrorEvent]){const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});if(d.configurable)define(p,key,{...d,enumerable:typeof key==='string'})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true})}
- return{Event,EventTarget,MessageEvent,ErrorEvent,allocate(prototype){return create(prototype)}};
+ for(const C of[Event,EventTarget,MessageEvent,ErrorEvent,...(promiseEvents?[PromiseRejectionEvent]:[])]){const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});if(d.configurable)define(p,key,{...d,enumerable:typeof key==='string'})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true})}
+ return{Event,EventTarget,MessageEvent,ErrorEvent,...(promiseEvents?{PromiseRejectionEvent}:{}),allocate(prototype){return create(prototype)}};
 }
-export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true}={}){
+export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true,promiseEvents=false}={}){
  if(installed.has(realm))return installed.get(realm);
- for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget'])registerPlatformFactoryKind(kind);
+ for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget',...(promiseEvents?['PromiseRejectionEvent']:[])])registerPlatformFactoryKind(kind);
  const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,ArrayType=realm.Array,define=Object.defineProperty;let signalAdapter=value=>null,classes;
  const receiver=state=>state.receiver??state.publicValue;
  function eventState(value){const state=eventStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
@@ -66,20 +73,23 @@ export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),r
   eventCall(value,name){const s=eventState(value);if(name==='preventDefault'&&s.passive)return;if((name==='stopPropagation'||name==='stopImmediatePropagation')&&!s.inDispatch)s.completed=false;apply(methods[name],s.backend,[])},path(value){eventState(value);return[]},
   init(value,type,bubbles,cancelable){const s=eventState(value);if(s.inDispatch)return;s.backend=new NativeEvent(type,{bubbles,cancelable,composed:apply(readers.composed,s.backend,[])});s.trusted=false;s.pendingTrust=false;s.completed=false;nativeEvents.set(s.backend,value)},
   message(value,data,origin,lastEventId,source,ports){const s=eventState(value);s.extra=slot({data,origin,lastEventId,source,ports});registerPlatformFactory(value,{kind:'MessageEvent',implementation:s,globalObject:realm})},
-  error(value,message,filename,lineno,colno,error){const s=eventState(value);s.extra=slot({message,filename,lineno,colno,error});registerPlatformFactory(value,{kind:'ErrorEvent',implementation:s,globalObject:realm})},extra(v,k){const extra=eventState(v).extra;if(!Object.hasOwn(extra,k))throw new TypeError('Illegal invocation');return extra[k]},
+  error(value,message,filename,lineno,colno,error){const s=eventState(value);s.extra=slot({message,filename,lineno,colno,error});registerPlatformFactory(value,{kind:'ErrorEvent',implementation:s,globalObject:realm})},promise:value=>types.isPromise(value),rejection(value,promise,reason){const s=eventState(value);s.extra=slot({promise,reason});registerPlatformFactory(value,{kind:'PromiseRejectionEvent',implementation:s,globalObject:realm})},extra(v,k){const extra=eventState(v).extra;if(!Object.hasOwn(extra,k))throw new TypeError('Illegal invocation');return extra[k]},
   targetStore(value){api.registerTarget(value,new NativeTarget())},signal:value=>!!signalAdapter(value),dispatch:dispatchEvent,add:addEntry,remove(value,type,callback,capture){const s=targetState(value);for(const entry of s.listeners)if(entry.type===type&&entry.callback===callback&&entry.capture===capture)removeEntry(s,entry)},
  };
  const api={
-  registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map()});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
+  registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map(),globalErrorHandler:false});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
   portEvent(type,data,ports){const array=new ArrayType(ports.length);for(let i=0;i<ports.length;i++)Object.defineProperty(array,String(i),{value:ports[i],writable:true,enumerable:true,configurable:true});const event=new classes.MessageEvent(type,{data});eventState(event).extra.ports=array;return api.trust(event)},
   connectEvent(ports){const event=api.portEvent('connect','',ports);eventState(event).extra.source=ports[0];return event},
   configureSignals(callback){signalAdapter=callback},nativeTarget:value=>targetState(value).backend,
   trust(value){const s=eventState(value);s.trusted=true;s.pendingTrust=true;return value},
   setReceiver(value,receiverValue){targetState(value).receiver=receiverValue},
+  configureGlobalErrorHandler(value){targetState(value).globalErrorHandler=true},
+  rejectionEvent(type,promise,reason){if(!classes.PromiseRejectionEvent)throw new TypeError('Rejection events are not installed');const value=new classes.PromiseRejectionEvent(type,{promise,cancelable:type==='unhandledrejection'});eventState(value).extra.reason=reason;return value},
+  producedError(value,error){const state=eventState(value);if(!Object.hasOwn(state.extra,'error'))throw new TypeError('An actual ErrorEvent is required');state.extra.error=error;return value},
   getHandler(value,type){return targetState(value).handlers.get(type)?.callback??null},
-  setHandler(value,type,callback){const s=targetState(value),existing=s.handlers.get(type);callback=typeof callback==='function'?callback:null;if(existing){if(callback){existing.callback=callback;return}removeEntry(s,existing.entry);s.handlers.delete(type);return}if(!callback)return;const h=slot({callback,entry:null}),relay=event=>{const result=apply(h.callback,receiver(s),[event]);if(type==='error'&&result===true)apply(methods.preventDefault,eventState(event).backend,[])};addEntry(value,type,relay,{capture:false,once:false,passive:false,signal:null});h.entry=[...s.listeners].find(e=>e.callback===relay);s.handlers.set(type,h)},
+  setHandler(value,type,callback){const s=targetState(value),existing=s.handlers.get(type);callback=typeof callback==='function'?callback:null;if(existing){if(callback){existing.callback=callback;return}removeEntry(s,existing.entry);s.handlers.delete(type);return}if(!callback)return;const h=slot({callback,entry:null}),relay=event=>{const extra=eventState(event).extra,args=type==='error'&&s.globalErrorHandler&&Object.hasOwn(extra,'error')?[extra.message,extra.filename,extra.lineno,extra.colno,extra.error]:[event];const result=apply(h.callback,receiver(s),args);if(type==='error'&&result===true)apply(methods.preventDefault,eventState(event).backend,[])};addEntry(value,type,relay,{capture:false,once:false,passive:false,signal:null});h.entry=[...s.listeners].find(e=>e.callback===relay);s.handlers.set(type,h)},
   dispatch:dispatchEvent,
   dispose(){for(const ref of live){const value=ref.deref();if(!value)continue;const s=targetStates.get(value);for(const e of s.listeners)removeEntry(s,e);s.handlers.clear()}live.clear()},
  };
- const made=evaluate(`(${factory.toString()})`)(realm,bridge);classes=Object.freeze(Object.assign(Object.create(null),made));installed.set(realm,api);return api;
+ const made=evaluate(`(${factory.toString()})`)(realm,bridge,promiseEvents);classes=Object.freeze(Object.assign(Object.create(null),made));installed.set(realm,api);return api;
 }

@@ -1,3 +1,4 @@
+import {workerPerformanceCloneRejected} from './worker-performance.js';
 import { cryptoKeyRecord, validCryptoKeyRecord, deserializeCryptoKey } from './web-crypto.js';
 import { domExceptionRecord, validDOMExceptionRecord, deserializeDOMException, captureDOMExceptionFactory } from './worker-dom-exception.js';
 import { videoFrameRecord, validVideoFrameRecord, deserializeVideoFrame } from './video-frame.js';
@@ -31,6 +32,7 @@ export function createPlatformCodec(realm){
  const failure=message=>new Exception(message,'DataCloneError');
  function serialize(value){
   const provenance=platformFactoryRecord(value);
+  if(workerPerformanceCloneRejected(value))throw failure('The object can not be cloned');
   if(provenance?.kind==='PeriodicWave'||provenance?.kind==='OscillatorNode')throw failure('The object can not be cloned');
   const exception=domExceptionRecord(value);if(exception)return exception;
   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');

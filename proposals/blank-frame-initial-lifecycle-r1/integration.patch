@@ -1,0 +1,357 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {captureWindowFactoryTask} from './window-task-capture.js';
+ import {prepareInitialDocumentParser} from './initial-document-parser.js';
+ import {captureDocumentEncoding,decodeHTMLResponse} from './document-encoding.js';
+ import {installHTMLBaseURLs} from './html-base-urls.js';
+@@ -268,7 +269,9 @@
+     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
+       virtualConsole.on(type, (...args) => this.emit('console', { type, args }));
+     }
+-    return withLocationFactory(()=>new JSDOM(html, {
++    if(typeof html!=='string')throw new TypeError('Window task capture requires normalized owned HTML text');
++    let finishCapture;
++    const constructionOptions = {
+       url: this.url,
+       referrer: this.referrerFor(this.url,this.documentReferrer??'') || undefined,
+       cookieJar: this.context.cookies,
+@@ -277,12 +280,14 @@
+       virtualConsole,
+       pretendToBeVisual: true,
+       beforeParse: window => {
++        finishCapture(window);
+         // Actual byte-selected metadata is published before parsing or scripts.
+         captureDocumentEncoding(window.document)._encoding=encoding;
+         prepareInitialDocumentParser(window.document,this.mimeType);
+         this.prepareWindow(window, historyState);
+       },
+-    }));
++    };
++    return captureWindowFactoryTask(finish=>{finishCapture=finish;return withLocationFactory(()=>new JSDOM(html,constructionOptions));});
+   }
+ 
+   prepareWindow(window, historyState = null, { main = true } = {}) {
+--- a/src/document-reset.js
++++ b/src/document-reset.js
+@@ -1,6 +1,9 @@
+-import {registerManagedLifecycle,beginManagedWrittenCycle,completeManagedWrittenEOF,isTrustedLifecycleEvent} from './managed-document-lifecycle.js';
++import {hasPendingWindowFactoryTask,claimInitialBlankWindowTask} from './window-task-capture.js';
++import {registerManagedLifecycle,beginManagedWrittenCycle,completeManagedWrittenEOF,completeManagedInitialBlank,isTrustedLifecycleEvent} from './managed-document-lifecycle.js';
+ // Post-load Document resets preserve the existing Window and JavaScript realm.
+ import { createRequire } from 'node:module';
++import {readFileSync} from 'node:fs';
++import {createHash} from 'node:crypto';
+ import { createWriteParser } from './write-created-parser.js';
+ import { installListenerOwnership } from './listener-ownership.js';
+ const require = createRequire(import.meta.url);
+@@ -12,7 +15,8 @@
+ const PerDocumentResourceLoader = require('jsdom/lib/jsdom/browser/resources/per-document-resource-loader.js');
+ const { fireAnEvent } = require('jsdom/lib/jsdom/living/helpers/events.js');
+ const contexts = new WeakMap();
+-let patched = false, underlyingOpen;
++let patched = false, underlyingOpen,initialSourceVerified=false;
++function verifyInitialProducerSource(){if(initialSourceVerified)return;const pins=[['jsdom/lib/jsdom/living/nodes/HTMLFrameElement-impl.js', 'eb8cca6aa971e1746c0c06860c3e8cfa871c0c52deba46ae438ef15f0bed482a'], ['jsdom/lib/jsdom/living/nodes/Document-impl.js', '28a1ac5b19463cc2db29b59d5721ce20299b998f00a222ac2ab74117dc66ba0d']];if(require('jsdom/package.json').version!=='26.1.0')throw new Error('Initial frame jsdom version changed');for(const[file,hash]of pins)if(createHash('sha256').update(readFileSync(require.resolve(file))).digest('hex')!==hash)throw new Error('Pinned initial frame producer source changed');initialSourceVerified=true;}
+ function active(context) {
+   return !context.disposed && !context.page.closed && !context.record.signal?.aborted &&
+     implForWrapper(context.window.document) === context.document;
+@@ -99,6 +103,7 @@
+   };
+   DocumentImpl.prototype.close = function (...args) {
+     const context = contexts.get(this), cycle = context?.current;
++    if(context?.initialBlankPending&&active(context)&&!cycle){if(args.length===1&&args[0]===false&&context.record.parserDone)context.placeholderCloseObserved=true;return;}
+     if (context && this._parsingMode === 'html' && !active(context)) return;
+     if (context && active(context) && this._parsingMode === 'html' && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
+     if (cycle && active(context)) {
+@@ -121,6 +126,8 @@
+     loaded: false, disposed: false, generation: 0, current: null, retired: new Set() };
+   contexts.set(record.document, context);
+   context.managedLifecycleRegistered = registerManagedLifecycle(context);
++  if(page.registry&&page.url==='about:blank'&&hasPendingWindowFactoryTask(window,context.document))verifyInitialProducerSource();
++  context.initialBlankPending=!!(context.managedLifecycleRegistered&&page.registry&&page.url==='about:blank'&&hasPendingWindowFactoryTask(window,context.document));
+   context.ownership.add(window.document, 'DOMContentLoaded', () => {
+     if (active(context) && context.current && !page.registry) page.emit?.('domContentLoaded');
+   });
+@@ -142,20 +149,18 @@
+   return context;
+ }
+ 
+-// Complete only the actual, parsed empty about:blank placeholder. Its queued
+-// native close has not run yet; retire those queues and use the real synchronous
+-// Document.close path. The native load-to-frame bridge still dispatches its real
+-// initial load, and subsequent writes create an independent open parser.
+-export function completeInitialBlankFrame(window) {
+-  const context = contexts.get(implForWrapper(window.document));
+-  if (!context || !active(context) || context.loaded || context.current || !context.record.parserDone ||
+-      context.page.url !== 'about:blank' || context.document.scripts.length ||
+-      context.document._requestManager.size() || context.record.styles.size) return false;
+-  const document = context.document;
+-  document._queue.paused = true; document._deferQueue.paused = true;
+-  document._deferQueue.setListener(null); document._asyncQueue.setListener(null);
+-  context.page.moduleScripts?.start();
+-  document.close(true);
+-  context.initialBlank = true;
+-  return true;
++// Complete the real literal blank parser before append returns, as measured in
++// Native. Canonical placeholder close was deferred until its bridge identity is
++// available. Other initial/network/srcdoc/XML close paths remain unchanged.
++export function completeInitialBlankFrame(window,listenerCheckpoint){
++ const context=contexts.get(implForWrapper(window.document));
++ if(!context?.initialBlankPending)return false;
++ if(!active(context)||context.loaded||context.current||!context.record.parserDone||context.page.url!=='about:blank'||context.document.scripts.length||context.document._requestManager.size()||context.record.styles.size)throw new Error('Actual initial blank EOF ownership boundary');
++ if(!context.placeholderCloseObserved)throw new Error('Actual canonical placeholder close was not observed');
++ context.ownership.retireSince(window.document,'load',listenerCheckpoint,1);
++ claimInitialBlankWindowTask(window,context.document);
++ const document=context.document;document._queue.paused=true;document._deferQueue.paused=true;document._deferQueue.setListener(null);document._asyncQueue.setListener(null);
++ context.initialBlankPending=false;context.initialBlank=true;
++ if(!completeManagedInitialBlank(context))throw new Error('Actual initial blank lifecycle producer unavailable');
++ return true;
+ }
+--- a/src/frames.js
++++ b/src/frames.js
+@@ -382,8 +382,9 @@
+     const record = operation.record;
+     if (!record?.page || record.page.closed || record.waitingResource) return;
+     if (operation.blankListeners) {
+-      installListenerOwnership(record.window._globalProxy).adoptSince(record.document, 'load', operation.blankListeners);
+-      completeInitialBlankFrame(record.window._globalProxy);
++      // Exact source-owned listener interval: the literal blank parser adds
++      // one native Document→frame bridge after prepareWindow has returned.
++      completeInitialBlankFrame(record.window._globalProxy,operation.blankListeners);
+     }
+     registry.committed(record);
+   };
+--- a/src/listener-ownership.js
++++ b/src/listener-ownership.js
+@@ -1,3 +1,4 @@
++import {captureWindowFactoryTask} from './window-task-capture.js';
+ import { AsyncLocalStorage } from 'node:async_hooks';
+ // Explicit host-listener registration scopes mark
+ // actual private records; authored callbacks are never classified by source.
+@@ -73,6 +74,16 @@
+   context.controller = { scope, eraseAuthoredListeners,
+     get hasNativeLoadBridge() { return context.nativeLoadBridge; },
+     checkpoint(target, type) { return new Set(implForWrapper(target)._eventListeners[type] ?? []); },
++    retireSince(target, type, checkpoint, expected) {
++      // Caller owns the exact canonical frame-factory interval. Retire actual
++      // newly registered records in place; no event dispatch is classified.
++      const implementation=implForWrapper(target);
++      if(implementation!==context.document||!(checkpoint instanceof Set))throw new TypeError('Actual owning Document/listener checkpoint required');
++      const listeners=implementation._eventListeners[type],added=(listeners??[]).filter(listener=>!checkpoint.has(listener));
++      if(added.length!==expected)throw new Error('Initial frame bridge registration boundary: expected '+expected+', observed '+added.length);
++      for(const listener of added){const index=listeners.indexOf(listener);if(index===-1)throw new Error('Actual initial bridge disappeared');listeners.splice(index,1)}
++      return added.length;
++    },
+     adoptSince(target, type, checkpoint) {
+       for (const listener of implForWrapper(target)._eventListeners[type] ?? []) if (!checkpoint.has(listener)) context.internal.add(listener);
+     },
+@@ -85,7 +96,7 @@
+ // No callback source/realm heuristics or public getter overrides are involved.
+ export function createOwnedWindow(factory, options) {
+   const binding = { context: null };
+-  const window = creation.run(binding, () => factory(options));
++  const window = captureWindowFactoryTask(finish=>{const created=creation.run(binding,()=>factory(options));finish(created._globalProxy??created);return created;});
+   const proxy = window._globalProxy ?? window;
+   installListenerOwnership(proxy); binding.context = contexts.get(proxy);
+   return window;
+--- a/src/managed-document-lifecycle.js
++++ b/src/managed-document-lifecycle.js
+@@ -23,7 +23,7 @@
+  if(records.has(document))throw new TypeError('Managed lifecycle document owner already registered');
+  captureDispatchWindow(context.window,actual);
+  const manager=context.page.moduleScripts;if(manager&&typeof manager.startWrittenEOF!=='function')throw new TypeError('The genuine written module producer is required');
+- const record=Object.assign(Object.create(null),{context,invocation:createInvocationTrampoline(actual),options:{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false},phase:undefined,windowLoadDepth:0,iframeLoadDepth:0,muteFrameLoad:false,startModules:manager?manager.startWrittenEOF.bind(manager):null,frame:context.page.registry?context.page.record?.element??null:null});
++ const record=Object.assign(Object.create(null),{context,invocation:createInvocationTrampoline(actual),options:{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false},phase:undefined,windowLoadDepth:0,iframeLoadDepth:0,muteFrameLoad:false,initialBlankStarted:false,startModules:manager?manager.startWrittenEOF.bind(manager):null,frame:context.page.registry?context.page.record?.element??null:null});
+  records.set(document,record);if(record.frame)frames.set(record.frame,record);return true;
+ }
+ export function beginManagedWrittenCycle(context){
+@@ -33,7 +33,7 @@
+ }
+ export function completeManagedWrittenEOF(context,cycle){
+  const record=records.get(context.document);
+- if(!record||!context.loaded||!active(record)||context.current!==cycle||context.record.parser!==cycle.parser||!context.record.parserDone||!cycle.parser.stopped||cycle.state.status!=='complete')return false;
++ if(!record||!(context.loaded||record.initialBlankStarted&&context.initialBlank)||!active(record)||context.current!==cycle||context.record.parser!==cycle.parser||!context.record.parserDone||!cycle.parser.stopped||cycle.state.status!=='complete')return false;
+  cycle.managedLifecycle=true;
+  owned(record,()=>{
+   // Start actual work and resume its genuine queues. Neither the ready promise
+@@ -55,3 +55,24 @@
+  });
+  return true;
+ }
++
++// Native-measured EOF of the real literal empty blank-frame parser. Both
++// competing canonical bootstrap bridges were retired by actual identity before
++// this producer enters. No authored Document.load event is synthesized.
++export function completeManagedInitialBlank(context){
++ const record=records.get(context.document);
++ if(!record||!active(record)||!currentFrame(record)||record.initialBlankStarted)return false;
++ record.initialBlankStarted=true;record.phase='parsing';
++ owned(record,()=>{
++  context.page.moduleScripts?.start();context.document._deferQueue.resume();context.document._queue.resume();
++  const document=context.document;
++  record.phase='load';apply(readiness.set,document,['interactive']);if(!active(record))return;
++  fireAnEvent('DOMContentLoaded',document,undefined,{bubbles:true});
++  if(!active(record)||record.phase==='complete')return;
++  record.phase='complete';if(apply(readiness.get,document,[])!=='complete')apply(readiness.set,document,['complete']);
++  if(!active(record)||record.windowLoadDepth||record.iframeLoadDepth)return;
++  during(record,'windowLoadDepth',()=>fireAnEvent('load',context.window,undefined,{},true));
++  if(currentFrame(record)&&!record.muteFrameLoad)during(record,'iframeLoadDepth',()=>fireAnEvent('load',record.frame));
++ });
++ return true;
++}
+--- /dev/null
++++ b/src/window-task-capture.js
+@@ -0,0 +1,101 @@
++// Capture only actual synchronous Window-factory task registrations. Canonical
++// factories/exports/backends are untouched; no callback source/name is inspected.
++import {createRequire} from 'node:module';import {readFileSync} from 'node:fs';import {createHash} from 'node:crypto';import {types} from 'node:util';import vm from 'node:vm';
++import {platformFactoryRecord} from './platform-factories.js';
++import {createInvocationTrampoline} from './invocation.js';
++import {beginDispatchRecoveryParticipant,completeDispatchRecoveryParticipant,captureDispatchWindow,withOwnedDispatchRecovery} from './dom-dispatch-recovery.js';
++const require=createRequire(import.meta.url),hostProcess=process,own=Object.getOwnPropertyDescriptor,define=Object.defineProperty,apply=Reflect.apply;
++const initial=own(hostProcess,'nextTick'),schedule=initial.value,pending=new Set(),captures=[],executions=[],handles=new WeakMap(),windows=new WeakMap(),observers=new Set(),notifications=[],cleanupQueue=[],bindings=[];let serial=0,pinned=false,draining=false;
++const nil=value=>Object.assign(Object.create(null),value),same=(a,b)=>!!a&&!!b&&Object.hasOwn(a,'value')&&Object.hasOwn(b,'value')&&a.value===b.value&&a.writable===b.writable&&a.enumerable===b.enumerable&&a.configurable===b.configurable;
++const boundary=message=>Object.assign(new Error('Window task capture boundary: '+message),{windowTaskCaptureBoundary:true});
++function verify(){if(pinned)return;const files=[['jsdom/lib/jsdom/browser/Window.js','cfd16270beb33c10564b3474fd2e184b902f66f35eee2cab9191c699e36b4287'],['jsdom/lib/api.js','0653e655065e93d44d885b04a975c0bac3221513bfc7be0be0afd2a4cc99ff2e']];if(require('jsdom/package.json').version!=='26.1.0')throw boundary('jsdom version changed');for(const[file,hash]of files)if(createHash('sha256').update(readFileSync(require.resolve(file))).digest('hex')!==hash)throw boundary('original construction source changed');pinned=true}
++function restored(){return captures.length===0&&same(own(hostProcess,'nextTick'),initial)}
++function notify(token,phase){notifications.push(nil({capture:token.id,phase,taskCount:token.tasks.length,closed:token.closed,committed:token.committed,retired:token.retired,window:token.window??null}));drain()}
++function drain(){if(!restored()||draining)return;draining=true;try{while(bindings.length){const token=bindings.shift();if(token.prospectiveWindow&&!token.window)prepareBinding(token,token.prospectiveWindow)}while(cleanupQueue.length)cleanup(cleanupQueue.shift());while(notifications.length){const value=notifications.shift();for(const observer of observers)observer(value)}}finally{draining=false}}
++export function observeWindowTaskCapture(observer){if(typeof observer!=='function')throw new TypeError('A Host observer is required');observers.add(observer);return()=>observers.delete(observer)}
++export function windowTaskCaptureState(){return nil({capturing:captures.length,pending:pending.size,executing:executions.length,descriptorRestored:restored()})}
++function remove(list,value){const index=list.lastIndexOf(value);if(index!==-1)list.splice(index,1)}
++function restoreOne(token){
++ if(!token.capturing)return;
++ if(captures.at(-1)!==token)throw boundary('construction restoration must be LIFO');
++ const current=own(hostProcess,'nextTick');if(!same(current,token.installed)&&!same(current,token.prior)){token.ambientChanged=true;token.diagnostics.push('ambient scheduler descriptor changed during protected construction')}
++ define(hostProcess,'nextTick',token.prior);token.capturing=false;captures.pop();token.closed=true;
++}
++function restoreThrough(token){const at=captures.indexOf(token);if(at===-1)return;for(let index=captures.length-1;index>=at;index--)restoreOne(captures[index])}
++function cleanup(token){
++ if(token.cleaned)return;token.cleaned=true;
++ if(!token.window&&token.prospectiveWindow){try{prepareBinding(token,token.prospectiveWindow)}catch(error){token.diagnostics.push("partial Window binding failed: "+error.message)}}
++ if(token.cleanup){try{withOwnedDispatchRecovery(()=>token.invocation.invoke(token.cleanup,undefined,[],token.options))}catch(error){token.diagnostics.push('captured partial Window cleanup failed: '+error.message)}}
++ if(token.failure){try{token.failure()}catch(error){token.diagnostics.push('Host construction cleanup hook failed: '+error.message)}}
++}
++function retire(token,reason){
++ if(token.retired)return;for(const child of token.children)retire(child,reason);token.retired=true;token.reason=reason;for(const task of token.tasks){task.retired=true;task.callback=null}
++ for(const child of token.children)child.parent=null;token.children.length=0;token.prior=null;token.installed=null;token.wrapper=null;
++ cleanupQueue.push(token);notify(token,'retired');
++}
++function recover(token){
++ if(!pending.has(token))return;
++ // Recover actual descendants in reverse construction order while preserving a
++ // live outer construction. The independent nextTick enrollment is outside the
++ // terminated VM and runs before any captured constructor task can be delivered.
++ const descendants=[...pending].filter(value=>{for(let cursor=value;cursor;cursor=cursor.parent)if(cursor===token)return true;return false}).reverse();
++ for(const value of descendants){restoreThrough(value);retire(value,'abandoned construction');pending.delete(value);remove(executions,value);value.closed=true;completeDispatchRecoveryParticipant(value.participant);notify(value,'recovered')}
++ drain();
++}
++function close(token,window,requireBaseline){
++ if(token.closed)throw boundary('capture already closed');if(captures.at(-1)!==token)throw boundary('capture close must be LIFO');restoreOne(token);
++ if(window){token.prospectiveWindow=window;if(restored())prepareBinding(token,window)}
++ if(token.ambientChanged)throw boundary('ambient scheduler changed inside construction');
++ if(token.tasks.length!==1)throw boundary('expected exactly one actual factory task, observed '+token.tasks.length);
++ if(requireBaseline&&!restored())throw boundary('authored preparation cannot run inside an outer scheduler capture');
++ drain();return token.handle;
++}
++export function captureWindowFactoryTask(construct,{onFailure}={}){
++ verify();if(typeof construct!=='function')throw new TypeError('A synchronous Host constructor is required');
++ const prior=own(hostProcess,'nextTick'),expected=captures.at(-1)?.installed??initial;if(!same(prior,expected))throw boundary('ambient scheduler is not the exact captured descriptor/function');
++ const token=nil({id:++serial,parent:executions.at(-1)??null,prior,tasks:[],children:[],diagnostics:[],capturing:false,closed:false,committed:false,retired:false,cleaned:false,failure:onFailure,window:null,participant:null});
++ const handle=Object.freeze(nil({inspect:()=>nil({capture:token.id,taskCount:token.tasks.length,closed:token.closed,committed:token.committed,retired:token.retired,diagnostics:token.diagnostics.slice()})}));token.handle=handle;handles.set(handle,token);token.parent?.children.push(token);
++ // Enroll BOTH recoveries before the first scheduler mutation. No async_hooks
++ // init/Promise hook or JS finally inside the VM is relied on for restoration.
++ apply(schedule,hostProcess,[()=>recover(token)]);
++ token.participant=beginDispatchRecoveryParticipant(()=>recover(token));pending.add(token);executions.push(token);
++ token.wrapper=function capturedNextTick(callback,...args){
++  if(typeof callback!=='function')return apply(schedule,this,[callback,...args]);
++  const task=nil({callback,retired:false,delivered:false});token.tasks.push(task);
++  return apply(schedule,this,[function capturedWindowTask(...values){
++   if(task.retired)return;
++   if(!token.committed){task.retired=true;token.earlyDelivery=true;return}
++   task.delivered=true;notify(token,'delivered');const original=task.callback;task.callback=null;return apply(original,this,values);
++  },...args]);
++ };
++ token.installed={...prior,value:token.wrapper};token.capturing=true;captures.push(token);
++ try{
++  define(hostProcess,'nextTick',token.installed);
++  const result=construct((window,options={})=>close(token,window,options.requireBaseline!==false));
++  if(types.isPromise(result))throw boundary('construction must not return a Promise');
++  if(!token.closed)throw boundary('construction returned before ending its protected capture');
++  if(token.retired||token.earlyDelivery||token.tasks.length!==1)throw boundary('construction task did not remain owned');
++  if(token.prospectiveWindow&&!token.window){if(restored())prepareBinding(token,token.prospectiveWindow);else bindings.push(token)}
++  token.committed=true;pending.delete(token);remove(executions,token);completeDispatchRecoveryParticipant(token.participant);if(!token.parent){const release=value=>{for(const child of value.children){release(child);child.parent=null}value.children.length=0;value.prior=null;value.installed=null;value.wrapper=null};release(token)}notify(token,'committed');return result;
++ }catch(error){restoreThrough(token);retire(token,'constructor failure');pending.delete(token);remove(executions,token);completeDispatchRecoveryParticipant(token.participant);drain();throw error}
++}
++function prepareBinding(token,window){
++ if(token.window){if(token.window!==window)throw boundary('actual constructor Window cannot be rebound');return}
++ const document=platformFactoryRecord(window.document)?.implementation,context=document?._globalObject;
++ if(!document||!vm.isContext(context)||vm.runInContext('globalThis',context)!==window)throw boundary('successful actual Window/Document VM required');
++ const descriptor=own(window,'close');if(!descriptor||typeof descriptor.value!=='function')throw boundary('original Window cleanup entry must be a data function');
++ token.document=document;token.window=window;token.invocation=createInvocationTrampoline(context);token.options={timeout:2000,displayErrors:false};const originalClose=descriptor.value;token.cleanup=()=>apply(originalClose,window,[]);captureDispatchWindow(window,context);
++ if(windows.has(window))throw boundary('initial Window task cannot be rebound');windows.set(window,token);notify(token,'bound');
++}
++
++// Only successful canonical factory registration supplies this authority. These
++// Host-only operations never infer ownership from public event/marker values.
++export function hasPendingWindowFactoryTask(window,document){
++ const token=windows.get(window),task=token?.tasks[0];
++ return !!token&&token.document===document&&token.tasks.length===1&&!token.retired&&!task.retired&&!task.delivered;
++}
++export function claimInitialBlankWindowTask(window,document){
++ const token=windows.get(window);
++ if(!hasPendingWindowFactoryTask(window,document)||!token.committed)throw boundary('the exact committed initial Window task is required');
++ const task=token.tasks[0];task.retired=true;task.callback=null;token.initialBlankClaimed=true;notify(token,'initialBlankClaimed');
++}
+--- /dev/null
++++ b/test/fixtures/initial-blank-timeout.mjs
+@@ -0,0 +1,4 @@
++import {Browser} from '../../src/browser.js';import {platformFactoryRecord} from '../../src/platform-factories.js';import {implementationForWrapper} from '../../src/dom-event-state.js';
++const mode=process.argv[2];if(!['window','frame'].includes(mode))throw Error('Explicit owned mode required');const browser=new Browser({timeout:1000,loadResources:['iframe']}),page=browser.createPage();let report;
++try{await page.navigate('data:text/html,<!doctype html><body>owned initial recovery</body>');page.timeout=200;if(mode==='window')page.newDocumentScripts.set('actual-loop',{source:"if(self!==top)addEventListener('load',event=>{globalThis.actualSavedInitialEvent=event;while(true){}})"});let error;try{page.evaluate("globalThis.actualInitialFrame=document.createElement('iframe');"+(mode==='frame'?"actualInitialFrame.onload=event=>{globalThis.actualSavedInitialEvent=event;while(true){}};":"")+"document.body.append(actualInitialFrame)")}catch(value){error=value}await new Promise(resolve=>setImmediate(resolve));const parent=page.dom.window,f=parent.actualInitialFrame,w=f.contentWindow,saved=mode==='window'?w.actualSavedInitialEvent:parent.actualSavedInitialEvent,backend=platformFactoryRecord(saved)?.implementation??implementationForWrapper(saved);if(!backend)throw Error('Actual saved canonical event missing');const context=platformFactoryRecord((mode==='window'?w:parent).document)?.implementation?._globalObject;const eventState={eventPhase:backend.eventPhase,currentTargetNull:backend.currentTarget===null,pathLength:backend._path.length,dispatchFlag:backend._dispatchFlag,passive:backend._inPassiveListenerFlag,stop:backend._stopPropagationFlag,immediateStop:backend._stopImmediatePropagationFlag,windowEventRestored:Object.getOwnPropertyDescriptor(context,'_currentEvent')?.value===undefined};const future=page.evaluate("(()=>{const f=actualInitialFrame;f.onload=null;const w=f.contentWindow,d=w.document;d.open();let loads=0;w.addEventListener('load',()=>loads++);d.write('<p id=actualRecovery>real recovery bytes</p>');d.close();return{loads,body:d.getElementById('actualRecovery').textContent,state:d.readyState}})()");let redispatched=0;const target=(mode==='window'?w:parent).document.createElement('div');target.addEventListener('load',()=>redispatched++);target.dispatchEvent(saved);report={mode,pid:process.pid,policyMilliseconds:200,ownedChildDeadlineMilliseconds:7000,timeoutObserved:error?.code==='ERR_SCRIPT_EXECUTION_TIMEOUT'||/Script execution timed out/.test(error?.message??''),actualError:error?{name:error.name,code:error.code,message:error.message}:null,eventState,redispatched,futureWindowLoads:future.loads,futureBody:future.body,futureState:future.state,futureQuery:page.evaluate('6*7')};
++}finally{await browser.close();if(report){report.closed=page.closed;console.log(JSON.stringify(report))}}
+--- /dev/null
++++ b/test/fixtures/window-task-capture-timeout.mjs
+@@ -0,0 +1,15 @@
++import {ResourceLoader} from 'jsdom';
++import vm from 'node:vm';import {createRequire} from 'node:module';import '../../src/browser.js';
++import {captureWindowFactoryTask,observeWindowTaskCapture,windowTaskCaptureState} from '../../src/window-task-capture.js';
++import {withOwnedDispatchRecovery} from '../../src/dom-dispatch-recovery.js';
++const rawResourceLoader=new ResourceLoader();
++const require=createRequire(import.meta.url),factory=require('jsdom/lib/jsdom/browser/Window.js'),mode=process.argv[2];if(!['single','nested'].includes(mode))throw Error('Explicit owned mode required');
++const baseline=Object.getOwnPropertyDescriptor(process,'nextTick'),context=vm.createContext({}),loop=vm.runInContext('(function(){while(true){}})',context),events=[];let partial,outer,timeout=false,liveOuterPreserved=false,liveOuterState=null;
++const stop=observeWindowTaskCapture(value=>events.push({capture:value.capture,phase:value.phase,count:value.taskCount}));
++const closePartial=()=>{if(partial?.document)partial.close()};
++context.runInner=()=>captureWindowFactoryTask(finish=>{const created=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});partial=created._globalProxy;Reflect.apply(loop,undefined,[]);finish(partial);return created},{onFailure:closePartial});
++function timed(){try{vm.runInContext('runInner()',context,{timeout:200,displayErrors:false})}catch(error){timeout=error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT';if(!timeout)throw error}}
++try{
++ if(mode==='single')timed();else captureWindowFactoryTask(finish=>{outer=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});const descriptor=Object.getOwnPropertyDescriptor(process,'nextTick');withOwnedDispatchRecovery(timed);const after=Object.getOwnPropertyDescriptor(process,'nextTick');liveOuterState=windowTaskCaptureState();liveOuterPreserved=after.value===descriptor.value&&after.writable===descriptor.writable&&after.enumerable===descriptor.enumerable&&after.configurable===descriptor.configurable;finish(outer._globalProxy);return outer});
++ await new Promise(resolve=>setImmediate(resolve));const actual=Object.getOwnPropertyDescriptor(process,'nextTick');const descriptorExact=actual.value===baseline.value&&actual.writable===baseline.writable&&actual.enumerable===baseline.enumerable&&actual.configurable===baseline.configurable;const retired=events.find(value=>value.phase==='retired');const partialTaskDelivered=!!retired&&events.some(value=>value.capture===retired.capture&&value.phase==='delivered');const recoveredCaptureIDs=events.filter(value=>value.phase==='recovered').map(value=>value.capture);const retiredCaptureIDs=events.filter(value=>value.phase==='retired').map(value=>value.capture);const finalState=windowTaskCaptureState();console.log(JSON.stringify({mode,pid:process.pid,timeout,descriptorExact,liveOuterPreserved,liveOuterState,recoveredCaptureIDs,retiredCaptureIDs,partialClosed:partial?.document===undefined,partialTaskDelivered,finalState,events}));
++}finally{stop();delete context.runInner;if(outer?.document)outer.close();closePartial()}
+--- /dev/null
++++ b/test/initial-blank-lifecycle.test.js
+@@ -0,0 +1,9 @@
++import test from 'node:test';import assert from 'node:assert/strict';import http from 'node:http';import {once} from 'node:events';import {execFile} from 'node:child_process';import {promisify} from 'node:util';import {Browser} from '../src/browser.js';import {getHeapBinding} from '../src/native-heap.js';
++const execute=promisify(execFile),tick=()=>new Promise(resolve=>setImmediate(resolve));
++async function pageFor(t,source){const browser=new Browser({timeout:1000,loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage();if(source)page.newDocumentScripts.set('real-initial-observer',{source});await page.navigate('data:text/html,<!doctype html><body>owned parent</body>');return page}
++test('actual blank parser delivers interactive DCL complete Window and frame synchronously without Document load',async t=>{const page=await pageFor(t,"globalThis.early=[];document.addEventListener('readystatechange',()=>early.push('rsc:'+document.readyState));document.addEventListener('DOMContentLoaded',()=>early.push('DCL:'+document.readyState));document.addEventListener('load',()=>early.push('document load'));addEventListener('load',()=>early.push('window:'+document.readyState));");const actual=page.evaluate("(()=>{const log=[],f=document.createElement('iframe');f.addEventListener('load',()=>log.push('frame'));log.push('before');document.body.append(f);log.push('after');globalThis.actualFrame=f;return{log,early:Array.from(f.contentWindow.early),state:f.contentDocument.readyState}})()");assert.deepEqual(Array.from(actual.log),['before','frame','after']);assert.deepEqual(Array.from(actual.early),['rsc:interactive','DCL:interactive','rsc:complete','window:complete']);assert.equal(actual.state,'complete');await tick();assert.deepEqual(Array.from(page.evaluate('actualFrame.contentWindow.early')),['rsc:interactive','DCL:interactive','rsc:complete','window:complete'])});
++test('fresh written EOF completes once before close returns with the same genuine Document and no old frame tail',async t=>{const page=await pageFor(t);const actual=await page.evaluate("(async()=>{const f=document.createElement('iframe');document.body.append(f);const w=f.contentWindow,d=w.document,log=[];d.open();d.addEventListener('readystatechange',()=>log.push('rsc:'+d.readyState));d.addEventListener('DOMContentLoaded',()=>log.push('DCL'));w.addEventListener('load',()=>log.push('window'));f.addEventListener('load',()=>log.push('frame'));d.write('<p id=actual>real written bytes</p>');log.push('before:'+d.readyState);d.close();log.push('after:'+d.readyState);const immediate=log.slice();await new Promise(r=>setTimeout(r,20));return{immediate,eventual:log,state:d.readyState,body:d.getElementById('actual').textContent,same:w.document===d}})()");const expected=['before:loading','rsc:interactive','DCL','rsc:complete','window','frame','after:complete'];assert.deepEqual(Array.from(actual.immediate),expected);assert.deepEqual(Array.from(actual.eventual),expected);assert.equal(actual.body,'real written bytes');assert.equal(actual.state,'complete');assert.equal(actual.same,true)});
++test('real initial iframe load owns reentrant written EOF suppression and durable frame muting',async t=>{const page=await pageFor(t);const actual=await page.evaluate("(async()=>{const f=document.createElement('iframe'),log=[];let frame=0,windowLoads=0,dcls=0;f.addEventListener('load',()=>{frame++;log.push('frame');if(frame!==1)return;const w=f.contentWindow,d=w.document;d.open();d.addEventListener('DOMContentLoaded',()=>{dcls++;log.push('DCL')});w.addEventListener('load',()=>{windowLoads++;log.push('window')});d.write('<p id=actual>inside frame producer</p>');d.close();log.push('after:'+d.readyState)});document.body.append(f);const immediate=log.slice();await new Promise(r=>setTimeout(r,20));return{immediate,log,frame,windowLoads,dcls,body:f.contentDocument.getElementById('actual').textContent}})()");assert.deepEqual(Array.from(actual.immediate),['frame','DCL','after:complete']);assert.deepEqual(Array.from(actual.log),['frame','DCL','after:complete']);assert.equal(actual.frame,1);assert.equal(actual.windowLoads,0);assert.equal(actual.dcls,1);assert.equal(actual.body,'inside frame producer')});
++test('blank to real HTTP navigation delivers the blank generation before replacement and the parsed new generation once',async t=>{const timers=new Set(),requests=[];const server=http.createServer((req,res)=>{requests.push(req.url);const send=()=>{res.writeHead(200,{'content-type':'text/html; charset=utf-8'});res.end(req.url==='/network'?'<p id=actualNetwork>real network bytes</p><script>parent.postMessage("actual-network-ready","*")</scr'+'ipt>':'<!doctype html><body>owned HTTP parent</body>')};if(req.url==='/network'){const timer=setTimeout(()=>{timers.delete(timer);send()},25);timers.add(timer)}else send()});server.listen(0,'127.0.0.1');await once(server,'listening');t.after(async()=>{for(const timer of timers)clearTimeout(timer);server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});const browser=new Browser({timeout:1000,loadResources:['iframe']});t.after(()=>browser.close());const page=browser.createPage(),origin='http://127.0.0.1:'+server.address().port;await page.navigate(origin+'/parent');const actual=await page.evaluate(`(async()=>{const f=document.createElement('iframe'),log=[];let release,receive;const loaded=new Promise(r=>release=r),message=new Promise(r=>{receive=e=>{if(e.source===f.contentWindow&&e.data==='actual-network-ready')r()};addEventListener('message',receive)});f.addEventListener('load',()=>{const d=f.contentDocument;log.push({url:d.URL,marker:d.getElementById('actualNetwork')?.textContent??null});if(d.getElementById('actualNetwork'))release()});document.body.append(f);const old=f.contentDocument;f.src=${JSON.stringify(origin+'/network')};try{await Promise.all([loaded,message]);await new Promise(r=>setTimeout(r,20));return{log,oldInactive:old.defaultView===null,newDocument:f.contentDocument!==old}}finally{removeEventListener('message',receive)}})()`);assert.equal(actual.log.length,2);assert.deepEqual(JSON.parse(JSON.stringify(actual.log)),[{url:'about:blank',marker:null},{url:origin+'/network',marker:'real network bytes'}]);assert.equal(actual.oldInactive,true);assert.equal(actual.newDocument,true);assert.ok(requests.includes('/network'))});
++test('initial lifecycle retains actual canonical VM Window Document and trusted event allocation before and after null prototypes',async t=>{const page=await pageFor(t,"globalThis.actualInitialEvent=null;addEventListener('load',event=>actualInitialEvent=event)");const parent=page.dom.window,f=parent.document.createElement('iframe');parent.document.body.append(f);const w=f.contentWindow,d=w.document,event=w.actualInitialEvent,anchor=w.eval('[]'),binding=getHeapBinding();assert.equal(event.target,d);assert.equal(event.isTrusted,true);assert.equal(d.defaultView,w);for(const value of [w,d,event]){const prototype=Object.getPrototypeOf(value);assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,[]),false);try{Object.setPrototypeOf(value,null);assert.equal(binding.sameRealm(value,anchor),true);assert.equal(binding.sameRealm(value,[]),false)}finally{Object.setPrototypeOf(value,prototype)}}assert.equal(f.contentDocument,d);assert.equal(w.document,d)});
++test('real200ms initial Window and iframe handlers recover private event state and permit real future write and close',async()=>{for(const mode of ['window','frame']){const result=await execute(process.execPath,['--experimental-vm-modules',new URL('./fixtures/initial-blank-timeout.mjs',import.meta.url).pathname,mode],{timeout:7000,maxBuffer:1024*1024});console.log('owned-initial-recovery '+result.stdout.trim());const value=JSON.parse(result.stdout.trim());assert.equal(value.timeoutObserved,true);assert.deepEqual(value.eventState,{eventPhase:0,currentTargetNull:true,pathLength:0,dispatchFlag:false,passive:false,stop:false,immediateStop:false,windowEventRestored:true});assert.equal(value.redispatched,1);assert.equal(value.futureWindowLoads,1);assert.equal(value.futureBody,'real recovery bytes');assert.equal(value.futureState,'complete');assert.equal(value.futureQuery,42);assert.equal(value.closed,true)}});
+--- /dev/null
++++ b/test/window-task-capture.test.js
+@@ -0,0 +1,12 @@
++import test from 'node:test';import assert from 'node:assert/strict';import {createRequire} from 'node:module';import {AsyncLocalStorage} from 'node:async_hooks';import {execFile} from 'node:child_process';import {promisify} from 'node:util';import {JSDOM,ResourceLoader} from 'jsdom';import {Browser} from '../src/browser.js';
++import {captureWindowFactoryTask,observeWindowTaskCapture,windowTaskCaptureState} from '../src/window-task-capture.js';
++const rawResourceLoader=new ResourceLoader();
++const require=createRequire(import.meta.url),factory=require('jsdom/lib/jsdom/browser/Window.js'),execute=promisify(execFile),baseline=Object.getOwnPropertyDescriptor(process,'nextTick'),tick=()=>new Promise(resolve=>setImmediate(resolve));
++function restored(){assert.deepEqual(Object.getOwnPropertyDescriptor(process,'nextTick'),baseline);assert.equal(windowTaskCaptureState().descriptorRestored,true)}
++test('actual main Window construction captures one real task and restores exact scheduler before authored preparation',async t=>{const seen=[],stop=observeWindowTaskCapture(value=>{if(value.phase==='bound'){seen.push(value);restored();assert.equal(value.window.eval('1+1'),2)}});t.after(stop);const browser=new Browser({timeout:1000});t.after(()=>browser.close());const page=browser.createPage();page.newDocumentScripts.set('capture-before-parse',{source:'globalThis.captureAuthorProbe=41'});await page.navigate('data:text/html,<p>actual main bytes</p>');assert.equal(page.evaluate('captureAuthorProbe+1'),42);assert.equal(page.dom.window.document.querySelector('p').textContent,'actual main bytes');assert.equal(seen.length,2);assert.ok(seen.every(value=>value.taskCount===1));restored()});
++test('actual queued original callback retains AsyncLocalStorage context and real load delivery',async t=>{const storage=new AsyncLocalStorage(),marker={},observed=[];let window,loaded;const dom=storage.run(marker,()=>captureWindowFactoryTask(finish=>new JSDOM('<p>real</p>',{runScripts:'outside-only',beforeParse:w=>{window=w;finish(w);restored();loaded=new Promise(resolve=>w.addEventListener('load',event=>{observed.push({context:storage.getStore()===marker,trusted:event.isTrusted});resolve()},{once:true}))}})));t.after(()=>dom.window.close());await loaded;assert.equal(window,dom.window);assert.deepEqual(observed,[{context:true,trusted:true}]);restored()});
++test('real nested iframe construction runs authored beforeParse scripts only after scheduler restoration',async t=>{const seen=[],stop=observeWindowTaskCapture(value=>{if(value.phase==='bound'){seen.push(value.window);restored()}});t.after(stop);const browser=new Browser({loadResources:['iframe'],timeout:1000});t.after(()=>browser.close());const page=browser.createPage();page.newDocumentScripts.set('capture-nested',{source:'globalThis.captureNestedProbe=17'});await page.navigate('data:text/html,<iframe id=child></iframe>');const child=page.dom.window.document.querySelector('iframe').contentWindow;assert.equal(child.captureNestedProbe,17);assert.ok(seen.includes(child));assert.equal(seen.length,3);assert.equal(new Set(seen).size,3);restored()});
++test('actual constructor error identity survives while the queued partial Window task retires and closes',async()=>{const sentinel=new Error('owned constructor failure'),events=[],stop=observeWindowTaskCapture(value=>events.push({phase:value.phase,count:value.taskCount}));let partial;try{assert.throws(()=>captureWindowFactoryTask(finish=>new JSDOM('<p>never parsed</p>',{runScripts:'outside-only',beforeParse:w=>{partial=w;finish(w);throw sentinel}})),error=>error===sentinel);restored();await tick();assert.equal(partial.document,undefined);assert.equal(events.some(value=>value.phase==='delivered'),false);assert.ok(events.some(value=>value.phase==='retired'&&value.count===1));assert.equal(windowTaskCaptureState().pending,0)}finally{stop()}});
++test('zero and multiple actual task registrations fail closed with exact ambient scheduler restored',async()=>{let extra=0,window;assert.throws(()=>captureWindowFactoryTask(finish=>{finish();return{}}),error=>error.windowTaskCaptureBoundary===true);restored();assert.throws(()=>captureWindowFactoryTask(finish=>{window=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});process.nextTick(()=>extra++);finish(window._globalProxy);return window}),error=>error.windowTaskCaptureBoundary===true);restored();await tick();assert.equal(extra,0);assert.equal(window.document,undefined);assert.equal(windowTaskCaptureState().pending,0)});
++test('protected nested raw Window factories preserve LIFO descriptor restoration and canonical instances',async()=>{let outer,inner;captureWindowFactoryTask(finishOuter=>{outer=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});const outerDescriptor=Object.getOwnPropertyDescriptor(process,'nextTick');captureWindowFactoryTask(finishInner=>{inner=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});finishInner(inner._globalProxy,{requireBaseline:false});return inner});assert.deepEqual(Object.getOwnPropertyDescriptor(process,'nextTick'),outerDescriptor);finishOuter(outer._globalProxy);return outer});restored();assert.notEqual(outer._globalProxy,inner._globalProxy);assert.equal(outer.document.defaultView,outer._globalProxy);assert.equal(inner.document.defaultView,inner._globalProxy);outer.close();inner.close();await tick();assert.equal(windowTaskCaptureState().pending,0)});
++test('actual200ms abandoned single and nested VM creation recover scheduler and retire partial tasks outside the VM',async()=>{for(const mode of['single','nested']){const result=await execute(process.execPath,['--experimental-vm-modules',new URL('./fixtures/window-task-capture-timeout.mjs',import.meta.url).pathname,mode],{timeout:7000,maxBuffer:1024*1024});console.log('owned-capture-recovery '+result.stdout.trim());const value=JSON.parse(result.stdout.trim());assert.equal(value.timeout,true);assert.equal(value.descriptorExact,true);assert.deepEqual(value.finalState,{capturing:0,pending:0,executing:0,descriptorRestored:true});assert.equal(value.partialClosed,true);assert.equal(value.partialTaskDelivered,false);assert.equal(value.recoveredCaptureIDs.length,1);assert.deepEqual(value.recoveredCaptureIDs,value.retiredCaptureIDs);if(mode==='nested'){assert.equal(value.liveOuterPreserved,true);assert.deepEqual(value.liveOuterState,{capturing:1,pending:1,executing:1,descriptorRestored:false})}}});

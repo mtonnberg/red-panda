@@ -1,7 +1,9 @@
+import {canonicalNodeImplementation,cdpWrapperForNode,cdpDocumentForPage} from './cdp-node-registry.js';
+import {createRequire} from 'node:module';
 import {canonicalUtilityValue} from './isolated-world.js';
 import {wrapUtilityDOMNode} from './world-sessions.js';
 import { randomUUID } from 'node:crypto';
-import { createInternalMutationObserver } from './mutations.js';
+import { createInternalMutationObserver,canonicalMutationRecord } from './mutations.js';
 
 const methods = new Set([
   'DOM.enable', 'DOM.disable', 'DOM.getDocument', 'DOM.describeNode',
@@ -13,6 +15,13 @@ const methods = new Set([
   'DOM.getContentQuads', 'DOM.getBoxModel', 'DOM.scrollIntoViewIfNeeded',
   'DOM.getFrameOwner',
 ]);
+const require=createRequire(import.meta.url),{domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
+const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
+const privateAttribute=ElementImpl.prototype.getAttribute,apply=Reflect.apply;
+const privateParent=node=>apply(tree.parent,tree,[node]),privatePrevious=node=>apply(tree.previousSibling,tree,[node]);
+function privateFront(node){const front=cdpWrapperForNode(node);if(canonicalNodeImplementation(front)!==node)throw error('Canonical actual DOM frontend unavailable',-32000);return front;}
+function privateChildren(state,node){return Array.from(apply(tree.childrenIterator,tree,[node])).filter(child=>state.includeWhitespace||child.nodeType!==3||/\S/.test(child._data)).map(privateFront);}
+
 const states = new WeakMap();
 
 export const supportsDOM = method => methods.has(method);
@@ -37,11 +46,7 @@ function stateFor(session) {
   return state;
 }
 
-function isNode(session, value) {
-  if (!value) return false;
-  try { return session.page.dom.window.Node.prototype.isSameNode.call(value, value); }
-  catch { return false; }
-}
+function isNode(session, value) { return canonicalNodeImplementation(value)!==undefined; }
 
 function nodeFor(session, params, identifiers = ['nodeId', 'backendNodeId', 'objectId']) {
   const provided = identifiers.filter(key => params[key] !== undefined);
@@ -73,10 +78,40 @@ function depthFor(value, allowZero = true) {
 }
 
 function childrenFor(state, node) {
+  const implementation=canonicalNodeImplementation(node);if(implementation)return privateChildren(state,implementation);
   return [...node.childNodes].filter(child => state.includeWhitespace || child.nodeType !== 3 || /\S/.test(child.data));
 }
 
+// Privileged protocol metadata uses the genuine actual backend, never Node
+// getters replaced by an author. Legacy non-owned embedding keeps its reader.
+function serializeCanonical(session,state,implementation,depth,pierce,budget){
+ if(--budget.remaining<0)throw error('DOM tree exceeds the 100000-node response budget',-32000);
+ const node=privateFront(implementation),id=session.backendId(node),type=implementation.nodeType;
+ state.known.add(node);
+ const result={nodeId:id,backendNodeId:id,nodeType:type,nodeName:implementation.nodeName,localName:implementation._localName??'',nodeValue:implementation.nodeValue??''};
+ const parent=privateParent(implementation),parentFront=parent&&privateFront(parent);
+ if(parentFront&&state.known.has(parentFront))result.parentId=session.backendId(parentFront);
+ if([1,9,11].includes(type)){
+  const children=privateChildren(state,implementation);result.childNodeCount=children.length;
+  if(depth!==0){state.expanded.add(node);result.children=children.map(child=>serialize(session,state,child,depth===-1?-1:depth-1,pierce,budget));}
+ }
+ if(type===1){
+  result.attributes=implementation._attributeList.flatMap(attribute=>[attribute._qualifiedName,attribute._value]);
+  const frame=session.page.frames?.findElement(implementation);if(frame)result.frameId=frame.frameId;
+  if(implementation._namespaceURI==='http://www.w3.org/2000/svg')result.isSVG=true;
+  const shadow=implementation._shadowRoot;if(pierce&&shadow&&shadow._mode!=='closed')result.shadowRoots=[serialize(session,state,privateFront(shadow),depth===-1?-1:Math.max(0,depth-1),pierce,budget)];
+  const content=implementation._contentDocument;if(pierce&&content)result.contentDocument=serialize(session,state,privateFront(content),depth===-1?-1:Math.max(0,depth-1),pierce,budget);
+  if(implementation._templateContents)result.templateContent=serialize(session,state,privateFront(implementation._templateContents),depth===-1?-1:Math.max(0,depth-1),pierce,budget);
+ }else if(type===9){result.documentURL=implementation.URL;result.baseURL=implementation.baseURI;result.compatibilityMode=implementation.compatMode==='BackCompat'?'QuirksMode':'NoQuirksMode';}
+ else if(type===10){result.publicId=implementation.publicId;result.systemId=implementation.systemId;}
+ else if(type===2){result.name=implementation._qualifiedName;result.value=implementation._value;}
+ if(type===11&&implementation._host&&implementation._mode!==undefined)result.shadowRootType=implementation._mode;
+ return result;
+}
+
 function serialize(session, state, node, depth = 0, pierce = false, budget = { remaining: 100000 }) {
+  const implementation=canonicalNodeImplementation(node);
+  if(implementation&&cdpDocumentForPage(session.page))return serializeCanonical(session,state,implementation,depth,pierce,budget);
   if (--budget.remaining < 0) throw error('DOM tree exceeds the 100000-node response budget', -32000);
   const id = session.backendId(node);
   state.known.add(node);
@@ -120,16 +155,23 @@ function enable(session, state) {
   session.domains?.add('DOM');
   if (state.observer) return;
   state.observer = createInternalMutationObserver(session.page.dom.window, records => {
-    for (const record of records) {
+    for (const publicRecord of records) {
+      let record=publicRecord;
+      if(cdpDocumentForPage(session.page)){
+        const actual=canonicalMutationRecord(publicRecord);if(!actual)throw error('Actual registered mutation record is required',-32000);
+        record={type:actual.type,target:privateFront(actual.target),attributeName:actual.attributeName,addedNodes:actual._addedNodes.map(privateFront),removedNodes:actual._removedNodes.map(privateFront)};
+      }
       if (!state.known.has(record.target)) continue;
       const id = session.backendId(record.target);
       if (record.type === 'attributes') {
-        const value = record.target.getAttribute(record.attributeName);
+        const implementation=canonicalNodeImplementation(record.target);
+        const value = implementation?apply(privateAttribute,implementation,[record.attributeName]):record.target.getAttribute(record.attributeName);
         session.event(value === null ? 'DOM.attributeRemoved' : 'DOM.attributeModified', {
           nodeId: id, name: record.attributeName, ...(value === null ? {} : { value }),
         });
       } else if (record.type === 'characterData') {
-        session.event('DOM.characterDataModified', { nodeId: id, characterData: record.target.data });
+        const implementation=canonicalNodeImplementation(record.target);
+        session.event('DOM.characterDataModified', { nodeId: id, characterData: implementation?implementation._data:record.target.data });
       } else if (record.type === 'childList') {
         if (!state.expanded.has(record.target)) {
           session.event('DOM.childNodeCountUpdated', { nodeId: id, childNodeCount: childrenFor(state, record.target).length });
@@ -139,9 +181,11 @@ function enable(session, state) {
           if (state.known.has(node)) session.event('DOM.childNodeRemoved', { parentNodeId: id, nodeId: session.backendId(node) });
         }
         for (const node of record.addedNodes) {
-          if (!state.includeWhitespace && node.nodeType === 3 && !/\S/.test(node.data)) continue;
-          let previous = node.previousSibling;
-          while (previous && !state.known.has(previous)) previous = previous.previousSibling;
+          const implementation=canonicalNodeImplementation(node);
+          if (!state.includeWhitespace && (implementation?implementation.nodeType:node.nodeType) === 3 && !/\S/.test(implementation?implementation._data:node.data)) continue;
+          let previous = implementation?privatePrevious(implementation):undefined;
+          if(implementation){while(previous&&!state.known.has(privateFront(previous)))previous=privatePrevious(previous);previous=previous&&privateFront(previous);}
+          else {previous=node.previousSibling;while(previous&&!state.known.has(previous))previous=previous.previousSibling;}
           session.event('DOM.childNodeInserted', {
             parentNodeId: id, previousNodeId: previous ? session.backendId(previous) : 0,
             node: serialize(session, state, node),

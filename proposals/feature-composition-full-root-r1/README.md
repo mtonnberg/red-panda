@@ -1,0 +1,5 @@
+The applied feature composition passes the complete Root protocol, PureScript/Puppeteer, Native-reference, syntax and strict/pedantic workflow. Exact actual reporter totals, elapsed times, immutable input hashes and untruncated logs are retained in manifest.json and the archive. Original limits and fixtures remain unchanged. All before/after guarded inputs match, and every owned stage process is closed.
+
+The earlier first82+2 gate and exact57 application are separate evidence in ../feature-composition-final82-r1. This full workflow runs Node24.22.1 against installed CPP95 bindings; selected cross-SDK component checks remain separate. It does not establish whole455, custom-provider/browser integration, performance parity or full independent replication.
+
+Every compressed member was read back and checked against inventory.json by name, size and SHA256. No binaries, dependency trees or upstream production engine source are included. Original receipts remain at their recorded paths. Runtime warnings are retained in the raw logs.

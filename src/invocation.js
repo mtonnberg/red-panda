@@ -5,7 +5,16 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import {setImmediate as hostSchedule,clearImmediate as hostCancel} from 'node:timers';
 
-const installed = new WeakMap();
+const installed = new WeakMap(), exitObservers = new WeakMap();
+// Trusted owners may schedule work after a real VM entry unwinds. Observers
+// receive no authored values or invocation records, and never run inside the VM.
+export function observeInvocationExit(context, observer) {
+  let observers=exitObservers.get(context);if(!observers){observers=new Set();exitObservers.set(context,observers)}
+  observers.add(observer);return()=>observers.delete(observer);
+}
+export function notifyInvocationExit(context) {
+  for(const observer of exitObservers.get(context)??[])observer();
+}
 const hostApply = Reflect.apply, hostDefine=Object.defineProperty, hostDelete=Reflect.deleteProperty;
 const nil=()=>Object.create(null),privateFunction=fn=>Object.setPrototypeOf(fn,null);
 
@@ -39,7 +48,7 @@ export function createInvocationTrampoline(context) {
   const inspection = new vm.Script(`${binding}.inspect()`, { filename: 'red-panda:owned-serialization' });
   function recover(){recovery=undefined;for(const token of [...pending].reverse())unwind(token.frame,token.previous);pending.clear();}
   function begin(frame){const token=Object.assign(nil(),{frame,previous:null});pending.add(token);recovery??=hostSchedule(recover);token.previous=enter(frame);return token;}
-  function finish(token){current=disposed?null:token.previous;pending.delete(token);if(!pending.size&&recovery!==undefined){hostCancel(recovery);recovery=undefined;}}
+  function finish(token){current=disposed?null:token.previous;pending.delete(token);if(!pending.size&&recovery!==undefined){hostCancel(recovery);recovery=undefined;}if(!pending.size)notifyInvocationExit(context);}
   const adapter = Object.freeze({
     binding,
     withValue(value, inspect, options) {

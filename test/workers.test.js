@@ -187,14 +187,26 @@ test('classic workers dynamically import actual cached modules in their own real
   assert.equal(f.requests.filter(request => request.url.endsWith('/dynamic.js')).length, 1); worker.terminate();
 });
 
-test('worker errors dispatch cancelable ErrorEvents and allow recovery from callback exceptions', async t => {
-  const f = fixture(t, { 'https://example.test/app/error.js': `onmessage = event => { if (event.data === 'throw') throw new Error('worker boom'); postMessage('recovered'); };` });
-  const worker = new f.window.Worker('./error.js');
-  const error = deadline(new Promise(resolve => worker.addEventListener('error', event => { event.preventDefault(); resolve(event); }, { once: true })));
-  worker.postMessage('throw'); const event = await error;
-  assert.equal(event.message, 'worker boom'); assert.equal(event.filename, 'https://example.test/app/error.js');
-  assert.equal(event.error instanceof f.window.Error, true); assert.deepEqual(f.errors, []);
-  const result = message(worker); worker.postMessage('ok'); assert.equal(await result, 'recovered'); worker.terminate();
+test('worker callback errors remain local and recover after a canceled error event', async t => {
+  const f = fixture(t, { 'https://example.test/app/error.js': `addEventListener('error', event => {
+    const before = event.defaultPrevented; event.preventDefault();
+    postMessage({ kind: 'local-error', message: event.message, filename: event.filename,
+      lineno: event.lineno, colno: event.colno, errorName: event.error.name,
+      errorMessage: event.error.message, errorRealm: event.error instanceof Error,
+      trusted: event.isTrusted, cancelable: event.cancelable, before, after: event.defaultPrevented });
+  }); onmessage = event => { if (event.data === 'throw') throw new Error('worker boom'); postMessage('recovered'); };` });
+  const worker = new f.window.Worker('./error.js'), outerErrors = [];
+  worker.addEventListener('error', event => outerErrors.push(event));
+  const localError = message(worker); worker.postMessage('throw'); const event = await localError;
+  assert.equal(event.kind, 'local-error'); assert.equal(event.message, 'Error: worker boom');
+  assert.equal(event.filename, 'https://example.test/app/error.js');
+  assert.equal(typeof event.lineno, 'number'); assert.equal(event.lineno > 0, true);
+  assert.equal(typeof event.colno, 'number'); assert.equal(event.colno > 0, true);
+  assert.equal(event.errorName, 'Error'); assert.equal(event.errorMessage, 'worker boom');
+  assert.equal(event.errorRealm, true); assert.equal(event.trusted, true); assert.equal(event.cancelable, true);
+  assert.equal(event.before, false); assert.equal(event.after, true);
+  const result = message(worker); worker.postMessage('ok'); assert.equal(await result, 'recovered');
+  assert.deepEqual(outerErrors, []); assert.deepEqual(f.errors, []); worker.terminate();
 });
 
 test('termination interrupts an infinite worker loop and page abort disposes all owned workers', async t => {

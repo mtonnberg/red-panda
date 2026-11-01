@@ -123,6 +123,9 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | Storage | UTF-8 value-byte quota, context/origin backing state and genuine shared frame wrappers; key order and legacy reflection remain incomplete |
 | Media values | Genuine ImageData, AudioData and VideoFrame bytes/planes/clones, encoded chunks and VideoColorSpace; codec task/error behavior without fabricated processing output |
 | Offline audio | Real AudioBuffer channel data and scheduled buffer-source rendering, resampling, loops, gain/oscillator/compressor nodes, WAV decoding and completion events, including measured curve quantum and cached parameter state; wider audio nodes remain incomplete |
+| HTTP cache | Optional SQLite response cache shared by fetch, scripts and synchronous XHR; validator revalidation, persistent bodies, context disable/clear controls and soft entry limits |
+| Worker performance | Independent actor clocks, marks/measures and queued PerformanceObserver delivery in the owning VM |
+| Author tools | Window ModelContext registration, lifetime-bound callbacks and CDP WebMCP invocation/events; distinct from the automation MCP server |
 | Readiness | `load`, `domcontentloaded`, CSS selector, truthy JS expression, and `done` as a 500 ms network-idle approximation |
 | Dumps | HTML, Markdown/author alternates, semantic JSON/text, structured metadata, PNG/PDF text rendering, selector/node scoping, UTF-8 truncation, strip groups and optional absolute base |
 | Frames / shadow DOM | Real child VM contexts and CDP lifecycle/ownership/navigation; declarative/clonable roots, HTML serialization, manual slots and delegated focus |
@@ -133,7 +136,7 @@ Live processes must be restarted after restoring a cloud environment snapshot.
 | CDP DOM/input | Tree/search/editing/mutation events, trusted keyboard/text/mouse input, DOM.setFileInputFiles with actual disk bytes and trusted input/change events, nested frame/shadow keyboard focus, Enter form activation, Tab traversal, composed shadow/slot hit testing and viewport dimensions |
 | CDP network/storage | Request/response events, bounded byte-accurate response and POST retention, cookie deletion/clearing and attached writes, UTF-8 cookie transport, per-page extra HTTP headers, user agent, language/platform overrides |
 | Rendering | Text-only CLI dumps, CDP screenshots/PDF streams and MCP screenshots, with real font rasterization and selectable PDF text |
-| Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64; `LP.version`, canonical-node `LP.getMarkdown`, and measured one-shot JavaScript dialog handling |
+| Extension | `LP.dump` returns `{format, content}`; PNG/PDF content is base64; `LP.version`, canonical-node `LP.getMarkdown`, `LP.getNodeDetails`, `LP.detectForms`, `LP.getInteractiveElements`, and measured one-shot JavaScript dialog handling |
 | WebDriver | Classic HTTP sessions and a BiDi subset for contexts, navigation, script values/handles and lifecycle subscriptions |
 | MCP / saved scripts | Stdio and HTTP MCP sessions, extraction/actions/waits/cookies/downloads; saved scripts with top-level await/return and synchronous browser actions |
 | PureScript / Puppeteer | Resource lifetime, page/frame navigation and evaluation, history, response text/bytes, preloads, headers, waits, keyboard/text input, coordinate clicks, bracketed ElementHandle file uploads, cookies/deletion, typed permission/geolocation overrides, screenshots, PDFs and `content` |
@@ -154,8 +157,7 @@ Geometry uses a [measured surrogate](docs/reference/geometry-FINDINGS.md), inclu
 flow/flex width calculations, word wrapping, boxes, hit testing and actual scroll state. It is not a CSS renderer. Intersection
 observation uses those boxes; visibility tracking, nested scrolling and delay
 semantics remain incomplete. PNG/PDF use a separate text flow renderer; general
-CSS painting, shared workers, complete frame behavior and process
-isolation remain absent. Experimental service workers execute in real threads
+CSS painting and process isolation remain absent; complete frame and shared-worker behavior remain unfinished. Experimental service workers execute in real threads
 with registration/lifecycle, Cache and CookieStore operations; clients, control
 takeover, fetch interception, updates and persistence remain incomplete. Large HTML sources now feed the real parser in bounded
 tasks, allowing actual mutation delivery during loading. Classic scripts now drain actual queued microtasks before clearing currentScript,
@@ -230,7 +232,11 @@ rules and rejects redirects needing another preflight and opaque-origin redirect
 taint. Synchronous Blob URLs and utility-world XHR remain unsupported.
 Page `fetch` also enforces CORS and filters response headers; opaque
 responses hide status, headers and bodies. Progress is buffered; preflight
-caching, the browser HTTP cache and streaming uploads remain unsupported.
+caching and streaming uploads remain unsupported. An optional disk HTTP cache stores
+completed eligible GET responses for fetch, scripts and synchronous XHR. Enable it
+with `--http-cache-dir PATH`; `--http-cache-entry-limit N` sets a soft entry limit
+(default 1000, zero unlimited). Top-level documents bypass this cache. Expiry,
+authorization and concurrency edge cases remain incomplete.
 Blob URLs resolve through the document/context registry. Invalid compression can fail before response headers become
 available. These bounds apply to the implemented subset, not full network parity.
 

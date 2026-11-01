@@ -1,3 +1,4 @@
+import{urlBlockedError}from'./url-blocking.js';
 import {registerPlatformFactory} from './platform-factories.js';
 import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
 import {installFetchInterfaceRealm} from './fetch-interface-realms.js';
@@ -91,6 +92,7 @@ export function installFetch(page, window, {mainWindow=window,evaluate}={}) {
   const active = () => !disposed && !page.closed && !!window.document && page.documentGeneration === generation && !documentSignal?.aborted;
   const documentOrigin = () => implForWrapper(mainWindow.document)?._origin ?? mainWindow.location.origin;
   function realmError(error) {
+    if(urlBlockedError(error))return new TypeError('fetch error');
     if (types.isProxy(error)) return error;
     if (error !== null && ['object', 'function'].includes(typeof error) && Object.getPrototypeOf(error) === globalThis.DOMException.prototype) {
       return new window.DOMException(error.message, error.name);

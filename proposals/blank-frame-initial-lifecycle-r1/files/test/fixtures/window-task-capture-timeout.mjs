@@ -1,0 +1,15 @@
+import {ResourceLoader} from 'jsdom';
+import vm from 'node:vm';import {createRequire} from 'node:module';import '../../src/browser.js';
+import {captureWindowFactoryTask,observeWindowTaskCapture,windowTaskCaptureState} from '../../src/window-task-capture.js';
+import {withOwnedDispatchRecovery} from '../../src/dom-dispatch-recovery.js';
+const rawResourceLoader=new ResourceLoader();
+const require=createRequire(import.meta.url),factory=require('jsdom/lib/jsdom/browser/Window.js'),mode=process.argv[2];if(!['single','nested'].includes(mode))throw Error('Explicit owned mode required');
+const baseline=Object.getOwnPropertyDescriptor(process,'nextTick'),context=vm.createContext({}),loop=vm.runInContext('(function(){while(true){}})',context),events=[];let partial,outer,timeout=false,liveOuterPreserved=false,liveOuterState=null;
+const stop=observeWindowTaskCapture(value=>events.push({capture:value.capture,phase:value.phase,count:value.taskCount}));
+const closePartial=()=>{if(partial?.document)partial.close()};
+context.runInner=()=>captureWindowFactoryTask(finish=>{const created=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});partial=created._globalProxy;Reflect.apply(loop,undefined,[]);finish(partial);return created},{onFailure:closePartial});
+function timed(){try{vm.runInContext('runInner()',context,{timeout:200,displayErrors:false})}catch(error){timeout=error.code==='ERR_SCRIPT_EXECUTION_TIMEOUT';if(!timeout)throw error}}
+try{
+ if(mode==='single')timed();else captureWindowFactoryTask(finish=>{outer=factory.createWindow({runScripts:'outside-only',url:'about:blank',resourceLoader:rawResourceLoader});const descriptor=Object.getOwnPropertyDescriptor(process,'nextTick');withOwnedDispatchRecovery(timed);const after=Object.getOwnPropertyDescriptor(process,'nextTick');liveOuterState=windowTaskCaptureState();liveOuterPreserved=after.value===descriptor.value&&after.writable===descriptor.writable&&after.enumerable===descriptor.enumerable&&after.configurable===descriptor.configurable;finish(outer._globalProxy);return outer});
+ await new Promise(resolve=>setImmediate(resolve));const actual=Object.getOwnPropertyDescriptor(process,'nextTick');const descriptorExact=actual.value===baseline.value&&actual.writable===baseline.writable&&actual.enumerable===baseline.enumerable&&actual.configurable===baseline.configurable;const retired=events.find(value=>value.phase==='retired');const partialTaskDelivered=!!retired&&events.some(value=>value.capture===retired.capture&&value.phase==='delivered');const recoveredCaptureIDs=events.filter(value=>value.phase==='recovered').map(value=>value.capture);const retiredCaptureIDs=events.filter(value=>value.phase==='retired').map(value=>value.capture);const finalState=windowTaskCaptureState();console.log(JSON.stringify({mode,pid:process.pid,timeout,descriptorExact,liveOuterPreserved,liveOuterState,recoveredCaptureIDs,retiredCaptureIDs,partialClosed:partial?.document===undefined,partialTaskDelivered,finalState,events}));
+}finally{stop();delete context.runInner;if(outer?.document)outer.close();closePartial()}

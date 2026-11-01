@@ -1,0 +1,512 @@
+import{workerErrorOrigins}from'./worker-error-origin.js';
+import{implementationForWrapper}from'./dom-event-state.js';
+import{createRequire}from'node:module';
+import {withRequestMetadata} from './request-metadata.js';
+import {fetchWorkerHTTP} from './worker-fetch-policy.js';
+import {installWorkerFetchRealm} from './worker-fetch-realm.js';
+import {getHeapBinding} from './native-heap.js';
+import {createSharedWorkerContext,installSharedWorkerGlobal} from './shared-worker-global.js';
+import {installSharedWorkers} from './shared-workers.js';
+import {installEventSource} from './eventsource.js';
+import {createParentEventSources,createWorkerEventSourceClient} from './worker-eventsource.js';
+import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
+import { installWebCrypto } from './web-crypto.js';
+import {installScheduler} from './scheduler.js';
+import {installWorkerDOMException} from './worker-dom-exception.js';
+import {installWorkerEvents} from './worker-events.js';
+import {installWorkerAbort} from './worker-abort.js';
+import { installURLPattern } from './url-pattern.js';
+import { installCanvas,canvasSnapshot,canvasDimensions } from './canvas.js';
+import { installImageData } from './image-data.js';
+import {workerSocketPolicy} from './worker-socket-policy.js';
+import {installWorkerAPIs,captureWorkerCreator} from './worker-apis.js';
+import {completeWorkerSyncResponse,createSyncWorkerRequest,completeWorkerSocketPolicy,createSyncWorkerSocketPolicy} from './worker-sync-transport.js';
+import {installServiceWorkerRealm} from './service-workers.js';
+import {installCache,cacheStoreFor} from './cache.js';
+import { broadcastConfig } from "./broadcast-config.js";
+import { createBroadcastRealm, createBroadcastRelay } from "./broadcast-realm.js";
+import vm from 'node:vm';
+import { Worker as ThreadWorker, isMainThread, parentPort as workerThreadPort, workerData as workerThreadData } from 'node:worker_threads';
+import { createMessagingRealm, installMessaging } from './messaging.js';
+import { resolveBlobURL,createWorkerBlobURLs } from './blob-urls.js';
+import {completeWorkerBlobURL,installWorkerBlobURLs} from './worker-blob-urls.js';
+import { installWebCodecsProcessors } from './webcodecs-processors.js';
+import { installVideoFrame } from './video-frame.js';
+import { installAudioData } from './audio-data.js';
+import { installWebCodecsValues } from './webcodecs-values.js';
+import { installGeometry } from './geometry.js';
+import { installNavigator } from './navigator.js';
+import { installStreams } from './streams.js';
+
+// Dedicated worker support. Shared workers and nested workers fail explicitly.
+// Channels and transferred ports use real Node endpoints with realm adapters.
+// Blob/File message values preserve native bytes and metadata through private codecs.
+// SharedArrayBuffer messages reject explicitly. importScripts has an 8MiB response limit.
+// Worker networking is buffered, with per-fetch AbortSignal and document abort.
+// The VM worker global is an API boundary, not a
+// security sandbox for hostile code. HTTP CORS/CSP policy remains a browser gap.
+const SYNC_BYTES = 8 * 1024 * 1024;
+export function installWorkers(page, window, { enabled = true } = {}) {
+  const creatorSnapshot=captureWorkerCreator(page,window);
+  // This is the real Window path only. Owned Worker boot never loads the
+  // generated Window target graph to create its independent Node backend.
+  const require=createRequire(import.meta.url),dispatchTarget=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype._dispatch;
+  const ErrorEventConstructor=window.ErrorEvent,apply=Reflect.apply;
+  function startupError(target,data,fallbackURL){
+    const implementation=implementationForWrapper(target);
+    const event=new ErrorEventConstructor('error',{message:data.message,filename:data.filename||fallbackURL,cancelable:true});
+    const backend=implementationForWrapper(event);backend.error=undefined;backend.isTrusted=true;
+    apply(dispatchTarget,implementation,[backend]);
+    // Canonical dispatch reports genuine owner-handler throws. The measured
+    // startup producer does not invent a second owner exception when no Worker
+    // handler is installed; actual Worker error dispatch still occurs above.
+  }
+  const signal = page.documentAbort?.signal, owned = new Set();
+  const messaging = installMessaging(page, window);
+  const clone = value => messaging.receive({ data: value, ports: [] }).data;
+  const serviceRequests=new Map();
+  let disposed = false;
+  const active = () => !disposed && !signal?.aborted && !page.closed;
+  function dispose() { disposed = true; for (const worker of [...owned]) worker.terminate(); }
+  signal?.addEventListener('abort', dispose, { once: true });
+  class Worker extends window.EventTarget {
+    #thread; #broadcastRelay; #abort = new AbortController(); #terminated = false; #requests = new Map(); #eventSources; #socketTransports;
+    constructor(input, options = {}, serviceToken) {
+      super();
+      const service=serviceRequests.get(serviceToken);serviceRequests.delete(serviceToken);
+      if (!active()) throw new window.DOMException('The document is disposed', 'InvalidStateError');
+      const creator=creatorSnapshot();
+      const url = new URL(String(input), creator.baseURL);
+      if (!['http:', 'https:', 'data:', 'blob:'].includes(url.protocol)) throw new window.DOMException(`Unsupported worker URL: ${url.protocol}`, 'NotSupportedError');
+      const origin = creator.origin;
+      if (url.protocol !== 'data:' && origin !== 'null' && url.origin !== origin) throw new window.DOMException('Worker URL must have the document origin', 'SecurityError');
+      const type = options.type ?? 'classic';
+      if (!['classic', 'module'].includes(type)) throw new TypeError('Worker type must be classic or module');
+      const credentials = options.credentials ?? 'same-origin';
+      if (!['omit', 'same-origin', 'include'].includes(credentials)) throw new TypeError('Invalid worker credentials');
+      // A disabled resource policy intentionally creates an inert Worker, as
+      // observed in native serve/fetch defaults; no script request is issued.
+      if (!enabled&&!service) return;
+      let startupBlob = url.protocol === 'blob:' ? resolveBlobURL(page, url.href) : undefined;
+      const blobURLs=createWorkerBlobURLs(page,window);
+      this.#broadcastRelay = createBroadcastRelay(messaging, broadcastConfig(page,window));
+      this.#eventSources=createParentEventSources(page,{origin:creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+      this.#socketTransports=createParentWorkerSockets(page,{origin:url.protocol==='data:'?'null':creator.origin,active:()=>!this.#terminated&&active(),send:message=>this.#thread.postMessage(message)});
+      this.#thread = new ThreadWorker(new URL(import.meta.url), {
+        // File-backed workers must not inherit an embedding CLI's --input-type
+        // or --eval flags. Only the VM-module capability is needed here.
+        execArgv: typeof vm.SourceTextModule === 'function' ? ['--experimental-vm-modules'] : [], workerData: {
+        redPandaWorker: true, blobURLs:Boolean(blobURLs), origin:url.protocol==='data:'?'null':creator.origin, service:service?.initial, cacheEnabled:Boolean(page.browser?.options?.experimentalFeatures?.serviceworker), secure:creator.secure, cacheOrigin:creator.origin, broadcast: broadcastConfig(page, window), url: url.href, type, name: String(options.name ?? ''),
+        navigator: { userAgentMetadata: page.userAgentMetadata, userAgent: window.navigator.userAgent, language: window.navigator.language,
+          languages: [...window.navigator.languages], platform: window.navigator.platform },
+      } });
+      service?.setControls(message=>{if(!this.#terminated)this.#thread.postMessage(message);},()=>this.terminate(),(data,transfer)=>this.postMessage(data,transfer));
+      owned.add(this);
+      this.#thread.on('message', async message => {
+        if(message.kind==='eventSourceOpen'||message.kind==='eventSourceClose'){this.#eventSources.handle(message);return;}
+        if(message.kind==='socketStart'||message.kind==='socketSend'||message.kind==='socketClose'||message.kind==='socketCloseDispatched'){this.#socketTransports.handle(message);return;}
+        if(message.kind==='broadcastRelay'){this.#broadcastRelay.accept(message);return;}
+        if(message.kind==='broadcastReady'){this.#broadcastRelay.ready(message.id);return;}
+        if(message.kind==='broadcastCancel'){this.#broadcastRelay.cancel(message.id);return;}
+        if (this.#terminated || !active()) { for (const port of message.ports ?? []) port.close(); return; }
+        if(message.kind==='serviceReady')service?.ready();
+        else if(message.kind==='serviceLifecycle')service?.lifecycle(message.type,message.error);
+        else if(message.kind==='serviceError')service?.error(message.error);
+        else if(message.kind==='serviceCall'){
+          try{const result=await service.call(message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'serviceResponse',id:message.id,result});}
+          catch(error){if(!this.#terminated&&active())this.#thread.postMessage({kind:'serviceResponse',id:message.id,error:{name:error.name,message:error.message}});}
+        }
+        else if (message.kind === 'cacheOperation') {
+          try { const result=await cacheStoreFor(page).operate(creator.origin,message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,result}); }
+          catch(error) {if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}});}
+        } else if (message.kind === 'message') messaging.dispatchMessage(this, message);
+        else if(message.kind==='startupError'){startupError(this,message.error,url.href);}
+        else if (message.kind === 'error') {
+          if(service){page.emit('console',{type:'error',args:[message.error.message]});return;}
+          const error = new window.Error(message.error.message); error.name = message.error.name; error.stack = message.error.stack;
+          const event = new window.ErrorEvent('error', { message: error.message, filename: message.error.filename || url.href, error, cancelable: true });
+          if (this.dispatchEvent(event)) page.emit('pageError', error);
+        } else if (message.kind === 'console') page.emit('console', { type: message.type, args: clone(message.args) });
+        else if (message.kind === 'close') this.terminate();
+        else if (message.kind === 'cancel') this.#requests.get(message.id)?.abort();
+        else if(message.kind==='blobURL'){
+          try{if(!blobURLs)throw new TypeError('Object URL authority is unavailable');const result=message.operation==='create'?await blobURLs.create(message.blob):blobURLs.revoke(message.value);completeWorkerBlobURL(message.sync,result);}
+          catch(error){completeWorkerBlobURL(message.sync,null,error);}
+        }
+        else if(message.kind==='socketPolicy'){
+          try{completeWorkerSocketPolicy(message.sync,message.protocols!==undefined?this.#socketTransports.create(message.url,message.protocols):await workerSocketPolicy(page,message.url));}
+          catch(error){completeWorkerSocketPolicy(message.sync,null,error);}
+        }
+        else if (message.kind === 'request') {
+          const requestAbort = new AbortController();
+          this.#requests.set(message.id, requestAbort);
+          try {
+            if(!service&&!message.script&&!message.sync&&message.resourceType!=='XHR'){
+              const combined=AbortSignal.any([...(signal?[signal]:[]),this.#abort.signal,requestAbort.signal]);
+              const result=await fetchWorkerHTTP({origin:creator.origin,referrerFor:(target,source)=>page.referrerFor?.(target,source),request:(target,init,history)=>{
+                const blobSnapshot=new URL(target).protocol==='blob:'?blobURLs?.resolve(target):undefined;
+                const transportInit=withRequestMetadata({...init,signal:combined,credentialsOrigin:creator.origin,...(blobSnapshot?{blobSnapshot}:{})},{origin:creator.origin,mode:init.mode,redirects:history});
+                return page.fetch(target,transportInit,'Fetch');
+              }},message.url,message.init,message.sourceURL??url.href);
+              if(!this.#terminated&&active())this.#thread.postMessage({kind:'response',id:message.id,result},[result.bytes.buffer]);
+              return;
+            }
+            const headers = new Headers(message.init?.headers);
+            if (!headers.has('referer')) {
+              const referrer = page.referrerFor?.(message.url, url.href);
+              if (referrer) headers.set('referer', referrer);
+            }
+            const combined = AbortSignal.any([...(signal ? [signal] : []), this.#abort.signal, requestAbort.signal]);
+            const blobSnapshot = message.script && message.url === url.href && startupBlob ? startupBlob : new URL(message.url).protocol==='blob:' ? blobURLs?.resolve(message.url) : undefined;
+            if (blobSnapshot) startupBlob = undefined;
+            const transportInit = { ...message.init, headers, signal: combined,
+              credentials: message.init?.credentials ?? (message.script ? credentials : 'same-origin'),
+              credentialsOrigin: url.origin,
+              ...(blobSnapshot ? { blobSnapshot } : {}),
+            };
+            if (!message.script) withRequestMetadata(transportInit,{origin:creator.origin,mode:message.resourceType==='XHR'?'cors':message.init?.mode??'cors'});
+            const response = await page.fetch(message.url, transportInit, message.script ? 'Script' : message.resourceType ?? 'Fetch');
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            const responseURL=response.url||message.url;
+            const basic=new URL(responseURL).protocol==='blob:'||new URL(responseURL).protocol==='data:'||new URL(responseURL).origin===creator.origin;
+            const result = { status: response.status, statusText: response.statusText,
+              headers: [...response.headers], url: responseURL, bytes,...(basic?{type:'basic'}:{}) };
+            if(message.syncBinary)completeWorkerSyncResponse(message.sync,result);
+            else if (message.sync) {
+              const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
+              const encoded = new TextEncoder().encode(JSON.stringify({ ...result, bytes: undefined, source: new TextDecoder().decode(bytes) }));
+              if (encoded.length > destination.length) throw new Error('importScripts response exceeds 8MiB limit');
+              destination.set(encoded); Atomics.store(state, 1, encoded.length); Atomics.store(state, 0, 1); Atomics.notify(state, 0);
+            } else if (!this.#terminated && active()) this.#thread.postMessage({ kind: 'response', id: message.id, result }, [bytes.buffer]);
+          } catch (error) {
+            if(message.syncBinary)completeWorkerSyncResponse(message.sync,null,error);
+            else if (message.sync) {
+              const state = new Int32Array(message.sync, 0, 2), destination = new Uint8Array(message.sync, 8);
+              const encoded = new TextEncoder().encode(JSON.stringify({ error: String(error.message ?? error) }));
+              destination.set(encoded.subarray(0, destination.length)); Atomics.store(state, 1, Math.min(encoded.length, destination.length)); Atomics.store(state, 0, 1); Atomics.notify(state, 0);
+            } else if (!this.#terminated && active()) this.#thread.postMessage({ kind: 'response', id: message.id, error: String(error.message ?? error) });
+          } finally { this.#requests.delete(message.id); }
+        }
+      });
+      this.#thread.on('error', error => {
+        if (!this.#terminated && active()) {
+          if(service){service.error({name:error.name,message:error.message});return;}
+          const event = new window.ErrorEvent('error', { message: error.message, error, filename: url.href, cancelable: true });
+          if (this.dispatchEvent(event)) page.emit('pageError', error);
+        }
+      });
+      this.#thread.on('messageerror', () => {
+        if (!this.#terminated && active()) messaging.dispatchMessage(this, { data: null, ports: [] }, 'messageerror');
+      });
+      this.#thread.once('exit', () => { this.#eventSources?.detach(); this.#socketTransports?.detach(); this.#broadcastRelay.exit(); owned.delete(this); this.#abort.abort(); this.#terminated = true; });
+      // Installing a message listener refs Node's underlying MessagePort; unref
+      // after installing listeners so workers cannot hold server shutdown open.
+      this.#thread.unref();
+    }
+    postMessage(data, transfer) {
+      if (!this.#terminated && active()) {
+        if (this.#thread) {
+          const prepared = messaging.prepare(data, transfer);
+          try { this.#thread.postMessage({ kind: 'message', ...prepared.message }, prepared.transfer); prepared.commit(); }
+          catch (error) { if (error?.name === 'DataCloneError') throw new window.DOMException(error.message, 'DataCloneError'); throw error; }
+        } else messaging.discard(data, transfer);
+      }
+    }
+    terminate() {
+      if (this.#terminated) return;
+      this.#terminated = true;this.#eventSources?.detach();this.#socketTransports?.detach(); owned.delete(this); this.#abort.abort(); void this.#thread?.terminate();
+    }
+  }
+  for (const name of ['message', 'messageerror', 'error']) {
+    const handlers = new WeakMap();
+    Object.defineProperty(Worker.prototype, `on${name}`, { configurable: true, enumerable: true,
+      get() { return handlers.get(this) ?? null; }, set(value) {
+        const previous = handlers.get(this); if (previous) this.removeEventListener(name, previous);
+        const handler = typeof value === 'function' ? value : null; handlers.set(this, handler);
+        if (handler) this.addEventListener(name, handler);
+      } });
+  }
+  Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker' });
+  window.Worker = Worker;
+  installSharedWorkers(page,window,{enabled});
+  return { dispose, createService(input,options,configuration){const token=Symbol();serviceRequests.set(token,configuration);return new Worker(input,options,token);}, get size() { return owned.size; } };
+}
+
+async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData) {
+  const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+  let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient,connectShared;
+  let fetchTypeError,fetchRealm;
+  let dispatchError = value => report(value),dispatchRejection,dispatchHandled;
+  const lifetime = new AbortController();
+  const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+  let reportingStartup=false,localErrorDepth=0,currentOrigin,originRead=false;
+  let origins;
+  const report = value => { if (!closed) parentPort.postMessage({ kind: reportingStartup&&!workerData.shared&&!workerData.service?'startupError':'error', error: error(value) }); };
+  const request = (url, init = {}, script = false, signal, resourceType) => new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return; }
+    const id = requestId++;
+    const abort = () => { pending.delete(id); parentPort.postMessage({ kind: 'cancel', id }); reject(signal.reason); };
+    signal?.addEventListener('abort', abort, { once: true });
+    pending.set(id, { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
+    parentPort.postMessage({ kind: 'request', id, url, init, script, resourceType,sourceURL:workerData.url });
+  });
+  const syncSource = url => {
+    const sync = new SharedArrayBuffer(SYNC_BYTES + 8), state = new Int32Array(sync, 0, 2);
+    parentPort.postMessage({ kind: 'request', url, script: true, sync });
+    Atomics.wait(state, 0, 0);
+    const result = JSON.parse(new TextDecoder().decode(new Uint8Array(sync, 8, Atomics.load(state, 1))));
+    if (result.error) throw new Error(result.error);
+    if (result.status < 200 || result.status >= 300) throw new Error(`importScripts load failed (${result.status}): ${url}`);
+    return result;
+  };
+  const timers = new Map(); let timerId = 1;
+  const bridge = {
+    postMessage(data, transfer) {
+      if (!closed) {
+        const prepared = messaging.prepare(data, transfer);
+        parentPort.postMessage({ kind: 'message', ...prepared.message }, prepared.transfer); prepared.commit();
+      }
+    },
+    close() { if (!closed) {
+      closed = true; lifetime.abort(); for (const handle of timers.values()) clearTimeout(handle); timers.clear(); messaging?.dispose(); broadcast?.dispose();
+      for (const message of queued) for (const port of message.ports ?? []) port.close(); queued.length = 0;
+      parentPort.postMessage({ kind: 'close' }); parentPort.close();
+    } },
+    report,
+    beginError(){if(localErrorDepth)return false;localErrorDepth++;currentOrigin=undefined;originRead=false;return true},
+    endError(){currentOrigin=undefined;originRead=false;localErrorDepth--},
+    errorField(value,key){if(!originRead){currentOrigin=origins.read(value);originRead=true}return currentOrigin?.[key]??(key==='filename'?'':0)},
+    defaultError(value){if(reportingStartup||workerData.shared||workerData.service)report(value)},
+    timer(callback, delay, args, repeat) {
+      const id = timerId++;
+      const fire = () => {
+        if (!repeat) timers.delete(id);
+        if (closed) return;
+        try { typeof callback === 'function' ? Reflect.apply(callback, vm.runInContext('globalThis', context), args) : vm.runInContext(String(callback), context); }
+        catch (error) { dispatchError(error); }
+      };
+      const handle = (repeat ? setInterval : setTimeout)(fire, Math.max(0, Number(delay) || 0)); timers.set(id, handle); return id;
+    },
+    clear(id) { const handle = timers.get(Number(id)); if (handle) { clearTimeout(handle); clearInterval(handle); timers.delete(Number(id)); } },
+    microtask(callback) { queueMicrotask(() => { if (!closed) { try { callback(); } catch (error) { dispatchError(error); } } }); },
+    importScripts(...urls) {
+      if (workerData.type === 'module') throw new TypeError('importScripts is unavailable in module workers');
+      for (const input of urls) {
+        const url = new URL(String(input), workerData.url).href, result = syncSource(url);
+        vm.runInContext(result.source, context, { filename: result.url });
+      }
+    },
+    async fetch(input, init = {}, resourceType) {
+      if(fetchRealm&&resourceType!=='XHR'){
+        const prepared=fetchRealm.prepare(input,init),original=prepared.raw,nativeSignal=original.signal;
+        const method=original.method,headers=[...original.headers],body=['GET','HEAD'].includes(method)?undefined:new Uint8Array(await original.clone().arrayBuffer());
+        let result;try{result=await request(original.url,{method,headers,body,mode:original.mode,credentials:original.credentials,redirect:original.redirect},false,nativeSignal,resourceType)}catch(error){if(nativeSignal.aborted)throw nativeSignal.reason;throw new fetchTypeError('fetch error')}
+        return fetchRealm.response(result);
+      }
+      const supplied = init.signal;
+      const nativeSignal = supplied == null ? supplied : abortPlatform.hasSignal(supplied) ? abortPlatform.nativeSignal(supplied) : supplied;
+      const nativeInit = supplied == null ? init : {...init,signal:nativeSignal};
+      const original = new Request(input instanceof Request ? input : new URL(String(input), workerData.url), nativeInit);
+      const headers = [...new Headers(init.headers ?? original.headers)];
+      const method = init.method ?? original.method;
+      const body = ['GET', 'HEAD'].includes(method.toUpperCase()) ? undefined : new Uint8Array(await original.clone().arrayBuffer());
+      let result;
+      try { result = await request(original.url, { method, headers, body, mode:original.mode, credentials: original.credentials }, false, nativeSignal ?? original.signal, resourceType); }
+      catch(error) { if((nativeSignal??original.signal)?.aborted)throw (nativeSignal??original.signal).reason; throw new fetchTypeError('fetch error'); }
+      const response = new Response([204, 205, 304].includes(result.status) ? null : result.bytes, result);
+      streams.adopt(response.body);
+      Object.defineProperty(response, 'url', { value: result.url });
+      if(result.type)Object.defineProperty(response,'type',{value:result.type});
+      return response;
+    },
+    structuredClone(value, options) { return messaging.clone(value, options); },
+    console(type, args) { parentPort.postMessage({ kind: 'console', type, args }); },
+  };
+  const sandbox = { __bridge: bridge, __url: workerData.url, __name: workerData.name, __navigator: workerData.navigator,
+    URL, URLSearchParams, TextEncoder, TextDecoder, Headers, Request, Response, FormData, Blob, File,
+    AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
+    atob, btoa };
+  context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
+  const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
+  fetchTypeError=realm.TypeError;
+  origins=workerErrorOrigins(vm.runInContext('Object.prototype',context));
+  installWorkerDOMException(realm,{evaluate});
+  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed,promiseEvents:!workerData.shared&&!workerData.service});
+  lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
+  context.__eventPlatform=eventPlatform;
+  if(workerData.shared)eventPlatform.registerTarget(realm,new EventTarget());
+  context.__sharedWorker=Boolean(workerData.shared);
+  context.__dedicatedWorker=!workerData.shared&&!workerData.service;
+  vm.runInContext(`(function () {
+    'use strict';const eventPlatform=__eventPlatform,bridge=__bridge;
+    delete globalThis.__bridge;
+    const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
+    globalThis.self = globalThis; globalThis.name = __name;
+    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);const dedicated=__dedicatedWorker;delete globalThis.__dedicatedWorker;if(dedicated)eventPlatform.configureGlobalErrorHandler(target);
+    for(const key of ['onmessage','onmessageerror','onerror',...(dedicated?['onunhandledrejection','onrejectionhandled']:[])]) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
+    for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = EventTarget.prototype[name].bind(target);
+    const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
+    globalThis.dispatchEvent = dispatchGlobal;
+    let reportingError = false;
+    const actualString=String,symbolDescription=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,apply=Reflect.apply;
+    const text=value=>typeof value==='symbol'?apply(symbolDescription,value,[])??'':actualString(value);
+    globalThis.__dispatchError = error => {
+      // Shared/service behavior remains the previously measured producer.
+      if(!dedicated){if(reportingError)return;reportingError=true;try{const event=new ErrorEvent('error',{message:String(error?.message??error),error,cancelable:true});eventPlatform.trust(event);if(dispatchGlobal(event))bridge.report(error)}finally{reportingError=false}return}
+      if(!bridge.beginError())return;
+      try{const event=new ErrorEvent('error',{message:text(error),filename:bridge.errorField(error,'filename'),lineno:bridge.errorField(error,'lineno'),colno:bridge.errorField(error,'colno'),cancelable:true});eventPlatform.producedError(event,error);eventPlatform.trust(event);if(dispatchGlobal(event))bridge.defaultError(error)}finally{bridge.endError()}
+    };
+    globalThis.__dispatchRejection=(type,promise,reason)=>dispatchGlobal(eventPlatform.rejectionEvent(type,promise,reason));
+    globalThis.postMessage = (data, transfer) => bridge.postMessage(data, transfer);
+    globalThis.close = () => bridge.close();
+    globalThis.importScripts = (...urls) => bridge.importScripts(...urls);
+    globalThis.setTimeout = function(callback, delay = 0, ...args) { return bridge.timer(callback, delay, args, false); };
+    globalThis.setInterval = function(callback, delay = 0, ...args) { return bridge.timer(callback, delay, args, true); };
+    globalThis.clearTimeout = globalThis.clearInterval = id => bridge.clear(id);
+    globalThis.queueMicrotask = callback => bridge.microtask(callback);
+    globalThis.fetch = async (input, init) => bridge.fetch(input, init);
+    globalThis.structuredClone = (value, options) => bridge.structuredClone(value, options);
+    globalThis.console = Object.fromEntries(['log','info','warn','error','debug'].map(type => [type, (...args) => bridge.console(type, args)]));
+    class WorkerLocation { constructor(url) { for (const key of ['href','origin','protocol','host','hostname','port','pathname','search','hash']) Object.defineProperty(this, key, { value: url[key], enumerable: true }); } toString() { return this.href; } }
+    Object.assign(globalThis, { WorkerLocation, location: new WorkerLocation(new URL(__url)) });
+    class WorkerNavigator {} Object.assign(WorkerNavigator.prototype, { appName: 'Netscape', onLine: true });
+    const nav = new WorkerNavigator(); Object.assign(nav, __navigator); Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator' });
+    Object.assign(globalThis, { WorkerNavigator, navigator: nav });
+    globalThis.Worker = class Worker { constructor() { throw new DOMException('Nested workers are not implemented', 'NotSupportedError'); } };
+    globalThis.__trustWorkerEvent=event=>eventPlatform.trust(event);
+    const createTrustedMessage = (type, data, ports, origin = '') => { const event = new MessageEvent(type, { data, ports, origin }); eventPlatform.trust(event); return event; };
+    globalThis.__createTrustedMessage = createTrustedMessage;
+    globalThis.__emitMessage = (data, ports) => dispatchGlobal(createTrustedMessage('message', data, ports));
+    globalThis.__connectShared=event=>dispatchGlobal(event);
+    delete globalThis.__sharedWorker;
+  })();`, context);
+  delete context.__eventPlatform;
+  if(workerData.shared)installSharedWorkerGlobal(realm,{context,events:eventPlatform,name:workerData.name,close:bridge.close});
+  abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
+  installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
+  dispatchError=vm.runInContext('__dispatchError',context);
+  const rejectionProducer=vm.runInContext('__dispatchRejection',context);
+  dispatchRejection=(reason,promise)=>rejectionProducer('unhandledrejection',promise,reason);
+  dispatchHandled=promise=>rejectionProducer('rejectionhandled',promise,null);
+  vm.runInContext('delete globalThis.__dispatchError;delete globalThis.__dispatchRejection',context);
+  emit = vm.runInContext('__emitMessage', context);
+  const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
+  const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
+  const dispatchShared=vm.runInContext('__connectShared',context);
+  vm.runInContext('delete globalThis.__connectShared',context);
+  connectShared=message=>{const {ports}=messaging.receive({data:null,ports:message.ports});dispatchShared(eventPlatform.connectEvent(ports))};
+  messaging = createMessagingRealm(vm.runInContext('globalThis', context), {
+    active: () => !closed,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),portCopiesArrayBuffers:Boolean(workerData.shared),mutableMessagePorts:Boolean(workerData.shared),
+    dispatch: (target, type, data, ports) => eventPlatform.dispatch(target,workerData.shared?eventPlatform.portEvent(type,data,ports):createTrustedMessage(type, data, ports)),
+    reportError: value => dispatchError(value),
+  });
+  Object.assign(context, { MessageChannel: messaging.MessageChannel, MessagePort: messaging.MessagePort });
+  broadcast = createBroadcastRealm(vm.runInContext('globalThis', context), {messaging, config:workerData.broadcast, active:()=>!closed, relay:value=>parentPort.postMessage(value), dispatch:(target,type,data,ports,origin)=>eventPlatform.dispatch(target,createTrustedMessage(type,data,ports,origin)), reportError:value=>dispatchError(value)});
+  Object.assign(context,{BroadcastChannel:broadcast.BroadcastChannel});
+  installNavigator(workerData.navigator, vm.runInContext('globalThis', context), { worker: true, active: () => !closed });
+  streams = installStreams(null, vm.runInContext('globalThis', context), { signal: lifetime.signal });
+  if(!workerData.shared&&!workerData.service)fetchRealm=installWorkerFetchRealm(realm,{evaluate,streams,abort:abortPlatform,baseURL:()=>workerData.url,lifetime:lifetime.signal,fetch:(input,init)=>bridge.fetch(input,init)});
+  installImageData(vm.runInContext('globalThis', context));
+  installWebCrypto(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context)});
+  installURLPattern(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context)});
+  installCanvas(vm.runInContext('globalThis', context));
+  installGeometry(vm.runInContext('globalThis', context));
+  installWebCodecsValues(vm.runInContext('globalThis', context));
+  installAudioData(vm.runInContext('globalThis', context));
+  installVideoFrame(vm.runInContext('globalThis', context),{canvasSnapshot,canvasDimensions});
+  installWebCodecsProcessors(vm.runInContext('globalThis', context),{trustEvent:trustWorkerEvent});
+  eventSourceClient=createWorkerEventSourceClient(parentPort);
+  installEventSource(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),baseURL:()=>workerData.url,createTransport:eventSourceClient.create,initializeTarget:value=>eventPlatform.registerTarget(value,new EventTarget()),active:()=>!closed,trustEvent:trustWorkerEvent});
+  socketClient=createWorkerSocketClient(parentPort,createSyncWorkerSocketPolicy(parentPort));
+  installWorkerAPIs(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),fetch:(input,init)=>bridge.fetch(input,init,'XHR'),syncRequest:createSyncWorkerRequest(parentPort),socketFactory:socketClient.create,origin:workerData.origin,baseURL:()=>workerData.url,secure:workerData.secure,signal:lifetime.signal,active:()=>!closed,trustEvent:trustWorkerEvent,dedicated:!workerData.service});
+  if(workerData.blobURLs&&!workerData.service&&!workerData.shared)installWorkerBlobURLs(realm,{evaluate,port:parentPort,active:()=>!closed});
+  installCache({url:workerData.url,securityOrigin:workerData.cacheOrigin,documentAbort:lifetime},vm.runInContext('globalThis',context),{enabled:workerData.cacheEnabled,secure:workerData.secure,baseURL:()=>workerData.url,
+    store:{operate(_origin,operation,args){return new Promise((resolve,reject)=>{const id=requestId++;cachePending.set(id,{resolve,reject});parentPort.postMessage({kind:'cacheOperation',id,operation,args});});}},evaluate:source=>vm.runInContext(source,context)});
+
+  if(workerData.service)serviceRuntime=installServiceWorkerRealm(vm.runInContext('globalThis',context),{evaluate:source=>vm.runInContext(source,context),initial:workerData.service,active:()=>!closed,trustEvent:trustWorkerEvent,
+    call(operation,args){return new Promise((resolve,reject)=>{const id=requestId++;servicePending.set(id,{resolve,reject});parentPort.postMessage({kind:'serviceCall',id,operation,args});});}});
+  vm.runInContext('delete globalThis.__emitMessage; delete globalThis.__createTrustedMessage;delete globalThis.__trustWorkerEvent;delete globalThis.__url;delete globalThis.__name;delete globalThis.__navigator;', context);
+  parentPort.on('message', message => {
+    if (closed) return;
+    if(message.kind==='sharedConnect'){if(!ready)queued.push(message);else connectShared(message);return;}
+    if(message.kind==='eventSourceEvent'){eventSourceClient.handle(message);return;}
+    if(message.kind==='socketEvent'||message.kind==='socketSent'){socketClient.handle(message);return;}
+    if(message.kind==='serviceState'){serviceRuntime?.update(message.record,true);}
+    else if(message.kind==='serviceLifecycle'){serviceRuntime.dispatch(message.type).then(()=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type});},failure=>{if(!closed)parentPort.postMessage({kind:'serviceLifecycle',type:message.type,error:error(failure)});});}
+    else if(message.kind==='serviceResponse'){const entry=servicePending.get(message.id);if(!entry)return;servicePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+    else if(message.kind==='cacheResponse') {const entry=cachePending.get(message.id);if(!entry)return;cachePending.delete(message.id);message.error?entry.reject(Object.assign(new Error(message.error.message),{name:message.error.name})):entry.resolve(message.result);}
+    else if (message.kind === 'response') {
+      const entry = pending.get(message.id); if (!entry) return; pending.delete(message.id); entry.cleanup();
+      message.error ? entry.reject(new Error(message.error)) : entry.resolve(message.result);
+    } else if (message.kind === 'message') {
+      if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
+    }
+  });
+  const observedRejections=new WeakSet();
+  const rejection=(value,promise)=>{
+    if(!workerData.shared&&!workerData.service){if(getHeapBinding().sameRealm(promise,realm)){observedRejections.add(promise);dispatchRejection(value,promise)}else report(value);return}
+    if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value);
+  };
+  const handled=promise=>{if(observedRejections.has(promise)){observedRejections.delete(promise);dispatchHandled(promise)}};
+  process.on('unhandledRejection',rejection);if(!workerData.shared&&!workerData.service)process.on('rejectionHandled',handled);
+  lifetime.signal.addEventListener('abort',()=>{process.off('unhandledRejection',rejection);process.off('rejectionHandled',handled)},{once:true});
+  parentPort.on('close',()=>bridge.close());
+  try {
+    const result = await request(workerData.url, {}, true);
+    if (result.status < 200 || result.status >= 300) throw new Error(workerData.shared||workerData.service?`Worker load failed (${result.status}): ${workerData.url}`:'Abort');
+    if(!workerData.shared)workerData.url = result.url;
+    context.__resolvedURL = workerData.shared?workerData.url:result.url;
+    vm.runInContext('globalThis.location = new WorkerLocation(new URL(__resolvedURL)); delete globalThis.__resolvedURL;', context);
+    const source = new TextDecoder().decode(result.bytes);
+    {
+      const modules = new Map(), evaluations = new WeakMap();
+      let linking = Promise.resolve();
+      const validateModule = result => {
+        const mime = new Headers(result.headers).get('content-type') ?? '';
+        if (!/^(?:text|application)\/(?:javascript|ecmascript|x-javascript)(?:\s*;|$)/i.test(mime)) throw new TypeError(`Worker module has unsupported MIME type: ${mime}`);
+      };
+      const specifierURL = (specifier, parent) => {
+        if (!/^(?:[./]|[a-zA-Z][a-zA-Z\d+.-]*:)/.test(specifier)) throw new TypeError(`Unmapped bare worker module specifier: ${specifier}`);
+        return new URL(specifier, parent.identifier).href;
+      };
+      const attributes = value => { if (Object.keys(value?.attributes ?? value ?? {}).length) throw new TypeError('Worker module import attributes are not supported'); };
+      const dynamicImport = async (specifier, parent, extra) => {
+        attributes(extra); const module = await load(specifierURL(specifier, parent)); await evaluate(module); return module;
+      };
+      const compile = (source, url) => {
+        if (!vm.SourceTextModule) throw new Error('Worker module imports require Node --experimental-vm-modules');
+        return new vm.SourceTextModule(source, { context, identifier: url,
+          initializeImportMeta(meta) { meta.url = url; }, importModuleDynamically: dynamicImport });
+      };
+      const load = url => {
+        if (!modules.has(url)) modules.set(url, request(url, {}, true).then(result => {
+          if (result.status < 200 || result.status >= 300) throw new TypeError('Abort', { cause: new Error(`Worker module load failed (${result.status}): ${url}`) });
+          validateModule(result);
+          return compile(new TextDecoder().decode(result.bytes), result.url);
+        }));
+        return modules.get(url);
+      };
+      const linker = (specifier, parent, extra) => { attributes(extra); return load(specifierURL(specifier, parent)); };
+      const evaluate = async module => {
+        const linked = linking.then(async () => { if (module.status === 'unlinked') await module.link(linker); });
+        linking = linked.catch(() => {}); await linked;
+        if (!evaluations.has(module)) evaluations.set(module, module.evaluate());
+        return evaluations.get(module);
+      };
+      if (workerData.type === 'module') {
+        validateModule(result);
+        const root = compile(source, workerData.url); modules.set(workerData.url, Promise.resolve(root));
+        await evaluate(root);
+      } else {vm.runInContext(source, context, { filename: workerData.url,
+        importModuleDynamically: (specifier, _script, extra) => dynamicImport(specifier, { identifier: workerData.url }, extra),
+      });}
+    }
+    ready = true;
+    if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
+    for (const message of queued) { if (!closed) { if(message.kind==='sharedConnect'){connectShared(message);continue;} messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
+    queued.length = 0;
+  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else{reportingStartup=true;try{dispatchError(failure)}finally{reportingStartup=false}} }
+}
+
+if (!isMainThread && workerThreadData?.redPandaWorker) void runWorker();
+if(!isMainThread&&workerThreadData?.redPandaSharedHost)workerThreadPort.on('message',message=>{if(message.kind==='createSharedRuntime')void runWorker(message.control,message.data).catch(error=>{try{message.control.postMessage({kind:'error',error:{name:error.name,message:error.message,stack:error.stack}})}finally{message.control.close()}})});

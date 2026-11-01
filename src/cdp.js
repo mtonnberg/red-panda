@@ -1,3 +1,8 @@
+import {supportsSemantic,runSemantic} from './semantic-commands.js';
+import {cdpNodeMap,registerCDPNode,cdpNodeEntry} from './cdp-node-registry.js';
+import{initializeURLBlockConnection,urlBlockOwnerForConnection,urlBlockOwnerForContext,registerURLBlockContext,markURLBlockPageContext,releaseURLBlockConnection,setBlockedURLs}from'./url-blocking.js';
+import {initializeModelContextSession,closeModelContextSession,runModelContextCDP} from './model-context.js';
+import {supportsHTTPCacheControl,runHTTPCacheControl} from './http-cache-control.js';
 import {supportsFileInput,rememberFileInputContext,forgetFileInputContext,runFileInput} from './cdp-file-input.js';
 import {dumpMarkdownNode} from './markdown-node.js';
 import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
@@ -98,10 +103,11 @@ class Session {
     this.scripts = new Map();
     this.bindings = new Set();
     this.listeners = [];
-    this.nextBackendNodeId = 1;
+    this.nodes = cdpNodeMap(page.context);
     this.lifecycle = false;
     initializeUtilitySession(this,resetRuntime);
     this.utility = utilitySessionController(this,ProtocolError);
+    initializeModelContextSession(this);
     const listen = (event, callback) => { page.on(event, callback); this.listeners.push([event, callback]); };
     listen('navigationStarted', () => {
       this.event('Page.frameStartedNavigating', { frameId: page.frameId, url: page.url, loaderId: page.loaderId, navigationType: 'differentDocument' });
@@ -110,7 +116,7 @@ class Session {
     listen('contextsCleared', () => {
       resetDOM(this);
       resetRuntime(this);
-      this.objects.clear(); this.worlds.clear(); this.frameWorlds.clear(); this.nodes?.clear(); this.nodeContexts.clear();
+      this.objects.clear(); this.worlds.clear(); this.frameWorlds.clear(); this.nodeContexts.clear();
       this.event('Runtime.executionContextsCleared', {});
     });
     listen('navigated', () => {
@@ -149,7 +155,7 @@ class Session {
         this.event('Runtime.executionContextDestroyed', { executionContextId: world.id });
       }
       for (const [id, object] of this.objects) if (ids.has(object.contextId)) this.objects.delete(id);
-      for (const [id, context] of this.nodeContexts) if (ids.has(context)) { this.nodes?.delete(id); this.nodeContexts.delete(id); }
+      for (const [id, context] of this.nodeContexts) if (ids.has(context)) { this.nodeContexts.delete(id); }
       resetRuntime(this, params.executionContextId);
       this.event('Runtime.executionContextDestroyed', { executionContextId: params.executionContextId,
         executionContextUniqueId: params.executionContextUniqueId });
@@ -197,19 +203,20 @@ class Session {
         ...(request.redirectResponse ? { redirectResponse: request.redirectResponse, redirectHasExtraInfo: false } : {}),
       });
     });
+    listen('requestServedFromCache',response=>this.event('Network.requestServedFromCache',{requestId:response.id}));
     listen('response', response => {
       this.event('Network.responseReceived', {
         requestId: response.id, loaderId: response.loaderId ?? page.loaderId, timestamp: response.timestamp,
         type: response.type, hasExtraInfo: false, frameId: response.frameId ?? page.frameId,
-        response: { url: response.url, status: response.status, statusText: http.STATUS_CODES[response.status] ?? '',
+        response: { url: response.url, status: response.status, statusText: response.statusText??http.STATUS_CODES[response.status]??'',
           headers: response.headers, mimeType: (response.headers['content-type'] ?? 'text/html').split(';')[0],
           connectionReused: false, connectionId: 0, encodedDataLength: response.size,
-          securityState: 'neutral', protocol: 'http/1.1', fromDiskCache: false, fromServiceWorker: false },
+          securityState: 'neutral', protocol: 'http/1.1', fromDiskCache: response.fromDiskCache??false, fromServiceWorker: false },
       });
       this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
     });
     listen('requestFailed', request => this.event('Network.loadingFailed', {
-      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: request.canceled??false,
+      requestId: request.id, timestamp: request.timestamp, type: request.blockedReason?'Ping':'Document', errorText: request.message, canceled: request.canceled??false,...(request.blockedReason?{blockedReason:request.blockedReason}:{}),
     }));
     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
       type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
@@ -306,6 +313,8 @@ class Session {
   }
   async run(method, params) {
     const page = this.page;
+    if(method==='Network.setBlockedURLs')return setBlockedURLs(this.connection,page,params,ProtocolError);
+    if(method.startsWith('WebMCP.'))return runModelContextCDP(this,method,params,ProtocolError);
     if (supportsDOM(method)) return runDOM(this, method, params);
     if (supportsInput(method)) return runInput(this, method, params);
     if (supportsRuntime(method)) return runRuntime(this, method, params);
@@ -354,7 +363,7 @@ class Session {
         let settled = false;
         return await new Promise(resolve => {
           const finish = result => { if (settled) return; settled = true; resolve(result); };
-          const committed = () => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false });
+          const committed = error => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false,...(error?{errorText:error.message}:{}) });
           page.navigate(url, { onCommit: committed, referrer: params.referrer }).catch(error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
         });
       }
@@ -518,7 +527,6 @@ class Session {
         } catch (error) { throw new ProtocolError(error.message, error.code === 'UnsupportedDumpFormat' ? -32601 : -32602); }
       }
       // Acknowledgements for protocol configuration that does not require layout.
-      case 'Network.setCacheDisabled':
       case 'Page.setInterceptFileChooserDialog':
       case 'Emulation.setFocusEmulationEnabled':
       case 'Emulation.setEmulatedMedia':
@@ -530,22 +538,22 @@ class Session {
     }
   }
   backendId(node) {
-    node=canonicalUtilityValue(node);
-    this.nodes ??= new Map();
-    for (const [id, value] of this.nodes) if (value === node) return id;
-    const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
+    const id=registerCDPNode(this.page.context,node),entry=cdpNodeEntry(this.page.context,id);
+    this.nodeContexts.set(id,entry.owner.page.executionContextId);return id;
   }
+
   close() {
     if(this.closed)return;this.closed=true;
     this.releaseClosing?.();
     this.serializer.close();
     this.disposeJavaScriptDialogs?.();
+    closeModelContextSession(this);
     this.utility.close();
     clearTimeout(this.idleTimer);
     resetDOM(this);
     resetRuntime(this);
     for (const [event, callback] of this.listeners) this.page.off(event, callback);
-    this.objects.clear(); this.nodes?.clear(); this.streams.clear();
+    this.objects.clear(); this.streams.clear();
     for (const id of this.scripts.keys()) this.page.newDocumentScripts.delete(id);
   }
 }
@@ -556,6 +564,7 @@ class Connection {
     this.socket = socket;
     this.browser = browser;
     initializePermissionConnection(this,directPage);
+    initializeURLBlockConnection(this,directPage);
     this.sessions = new Map();
     this.discover = false;
     this.autoAttach = false;
@@ -594,7 +603,7 @@ class Connection {
     try {
       message = JSON.parse(raw);
       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
-          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version' || supportsPermissionControl(message.method))) &&
+          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version' || supportsSemantic(message.method) || supportsPermissionControl(message.method))) &&
             (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
         throw new ProtocolError('Invalid CDP request', -32600);
       }
@@ -604,7 +613,7 @@ class Connection {
       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
       const sessionCommand=session&&!method.startsWith('Browser.')&&!method.startsWith('Target.')&&!CONFIGURATION_ACK_METHODS.has(method);
       dispatchedSession=sessionCommand?session:undefined;
-      const result = supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+      const result = supportsSemantic(method) ? runSemantic(this,session,method,message.params,Object.hasOwn(message,'params'),ProtocolError) : supportsHTTPCacheControl(method) ? runHTTPCacheControl(this,session,method,message.params,Object.hasOwn(message,'params'),ProtocolError,session?.page.context??selectCDPCookieContext(this.browser)) : supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
         ? await session.run(method, params) : await this.run(method, params, session);
       // Closed sessions have no receiver for their pending command replies.
       // Page.close itself completes only after its successful response below.
@@ -620,6 +629,7 @@ class Connection {
   async run(method, params, parent) {
     const browser = this.browser;
     switch (method) {
+      case 'Network.setBlockedURLs': return setBlockedURLs(this,undefined,params,ProtocolError);
       case 'LP.version': return { version: VERSION };
       case 'LP.getMarkdown': {
         const context=selectCDPCookieContext(browser);
@@ -646,10 +656,11 @@ class Connection {
         return {};
       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
-      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));rememberFileInputContext(this,browser.contexts.get(id));return {browserContextId:id};}
+      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));registerURLBlockContext(this,browser.contexts.get(id));rememberFileInputContext(this,browser.contexts.get(id));return {browserContextId:id};}
       case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId);forgetFileInputContext(this,params.browserContextId); return {};
       case 'Target.createTarget': {
-        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});
+        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this),urlBlockOwner:urlBlockOwnerForContext(browser.contexts.get(params.browserContextId??'default'))??urlBlockOwnerForConnection(this)});
+        markURLBlockPageContext(this,page);
         rememberFileInputContext(this,page.context);
         if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
         return { targetId: page.id };
@@ -706,6 +717,7 @@ class Connection {
   }
   close() {
     releasePermissionConnection(this);
+    releaseURLBlockConnection(this);
     this.browser.off('targetCreated', this.created);
     this.browser.off('targetDestroyed', this.destroyed);
     for (const session of this.sessions.values()) session.close();

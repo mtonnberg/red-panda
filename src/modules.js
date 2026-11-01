@@ -1,6 +1,8 @@
+import {canonicalNodeImplementation,cdpWrapperForNode,cdpDocumentForPage} from './cdp-node-registry.js';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
-import { createInternalMutationObserver } from './mutations.js';
+import { createInternalMutationObserver,canonicalMutationRecord } from './mutations.js';
+import {matchCanonicalSelector} from './canonical-selector.js';
 
 // This adapter intentionally targets the pinned jsdom dependency. Its deferred
 // resource queue lets module evaluation begin before the real DOMContentLoaded.
@@ -23,6 +25,7 @@ const javascriptMIME = /^(?:text|application)\/(?:javascript|ecmascript|x-javasc
 // import outside a SourceTextModule still needs its own VM import callback.
 export function installModuleScripts(page, window) {
   const document = window.document;
+  const ownedDocument=cdpDocumentForPage(page),privateDiscovery=!!ownedDocument&&canonicalNodeImplementation(document)===ownedDocument;
   const signal = page.documentAbort?.signal;
   const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet(), writtenPrepared = new WeakMap();
   const imports = new Map(), scopes = new Map();
@@ -225,6 +228,18 @@ export function installModuleScripts(page, window) {
     })(), cycle);
   }
   function discover(root = document, includeParser = false) {
+    if(privateDiscovery){
+      const implementation=canonicalNodeImplementation(root);if(!implementation)throw new TypeError('Actual registered module-discovery root is required');
+      const candidates=[];
+      for(const backend of domSymbolTree.treeIterator(implementation)){
+        if(backend.nodeType!==1||!(backend===implementation?backend._localName==='script':matchCanonicalSelector(backend,'script',ownedDocument.documentElement)))continue;
+        const script=cdpWrapperForNode(backend);if(canonicalNodeImplementation(script)!==backend)throw new TypeError('Canonical actual script frontend is required');
+        if(!backend.isConnected||!['module','importmap'].includes(backend.getAttributeNS(null,'type')?.trim().toLowerCase())||seen.has(script))continue;
+        if(!includeParser&&!parseCycle.started&&backend._parserInserted)continue;
+        seen.add(script);candidates.push(script);
+      }
+      return candidates;
+    }
     const candidates = root.nodeType === 1 && root.localName === 'script' ? [root] : [];
     candidates.push(...root.querySelectorAll?.('script') ?? []);
     return candidates.filter(script => {
@@ -264,7 +279,11 @@ export function installModuleScripts(page, window) {
     observer = createInternalMutationObserver(window, records => {
       if (!active()) return;
       for (const record of records) {
-        if (record.type === 'attributes') {
+        if(privateDiscovery){
+          const actual=canonicalMutationRecord(record);if(!actual)throw new TypeError('Actual registered module mutation record is required');
+          const roots=actual.type==='attributes'?[actual.target]:actual._addedNodes;
+          for(const backend of roots){const node=cdpWrapperForNode(backend);if(canonicalNodeImplementation(node)!==backend)throw new TypeError('Canonical actual mutation node is required');for(const script of discover(node))startScript(script);}
+        }else if (record.type === 'attributes') {
           for (const script of discover(record.target)) startScript(script);
         } else for (const node of record.addedNodes) {
           for (const script of discover(node)) startScript(script);

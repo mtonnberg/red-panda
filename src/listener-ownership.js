@@ -1,3 +1,4 @@
+import {captureWindowFactoryTask} from './window-task-capture.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 // Explicit host-listener registration scopes mark
 // actual private records; authored callbacks are never classified by source.
@@ -73,6 +74,16 @@ export function installListenerOwnership(window) {
   context.controller = { scope, eraseAuthoredListeners,
     get hasNativeLoadBridge() { return context.nativeLoadBridge; },
     checkpoint(target, type) { return new Set(implForWrapper(target)._eventListeners[type] ?? []); },
+    retireSince(target, type, checkpoint, expected) {
+      // Caller owns the exact canonical frame-factory interval. Retire actual
+      // newly registered records in place; no event dispatch is classified.
+      const implementation=implForWrapper(target);
+      if(implementation!==context.document||!(checkpoint instanceof Set))throw new TypeError('Actual owning Document/listener checkpoint required');
+      const listeners=implementation._eventListeners[type],added=(listeners??[]).filter(listener=>!checkpoint.has(listener));
+      if(added.length!==expected)throw new Error('Initial frame bridge registration boundary: expected '+expected+', observed '+added.length);
+      for(const listener of added){const index=listeners.indexOf(listener);if(index===-1)throw new Error('Actual initial bridge disappeared');listeners.splice(index,1)}
+      return added.length;
+    },
     adoptSince(target, type, checkpoint) {
       for (const listener of implForWrapper(target)._eventListeners[type] ?? []) if (!checkpoint.has(listener)) context.internal.add(listener);
     },
@@ -85,8 +96,16 @@ export function installListenerOwnership(window) {
 // No callback source/realm heuristics or public getter overrides are involved.
 export function createOwnedWindow(factory, options) {
   const binding = { context: null };
-  const window = creation.run(binding, () => factory(options));
+  const window = captureWindowFactoryTask(finish=>{const created=creation.run(binding,()=>factory(options));finish(created._globalProxy??created);return created;});
   const proxy = window._globalProxy ?? window;
   installListenerOwnership(proxy); binding.context = contexts.get(proxy);
   return window;
+}
+
+// Host-only semantic observation of actual listener records. No callbacks,
+// public on* getters, source/name guesses or authored registration changes.
+export function authoredListenerTypesForImplementation(implementation) {
+  const context=contexts.get(implementation._globalObject);
+  return Object.keys(implementation._eventListeners??{}).filter(type =>
+    implementation._eventListeners[type].some(listener=>!context?.internal.has(listener)));
 }

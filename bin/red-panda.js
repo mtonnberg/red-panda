@@ -44,6 +44,8 @@ Fetch options:
   --wait-selector CSS     Wait for a matching DOM element
   --wait-script JS        Wait for a truthy JavaScript expression
   --wait-script-file PATH Read a wait expression from a UTF-8 file (last script flag wins)
+  --http-cache-dir PATH  Persist completed eligible HTTP responses in this directory
+  --http-cache-entry-limit N  Soft entry limit (default 1000; 0: unlimited)
   --http-header HEADER   Set a fixed Name: Value header on every HTTP request (repeatable)
   --no-javascript         Parse HTML without running page scripts
   --fail-on-http-error    Dump HTTP errors and exit 22
@@ -66,6 +68,8 @@ function integer(value, name, minimum = 1) {
   return Number(value);
 }
 
+function cacheEntryLimit(value){if(!/^[+]?[0-9][0-9_]*$/.test(value))throw new Error('Invalid --http-cache-entry-limit');const number=Number(value.replaceAll('_',''));if(!Number.isInteger(number)||number<0||number>4294967295)throw new Error('Overflow --http-cache-entry-limit');return number}
+
 export async function main(argv = process.argv.slice(2)) {
   const { values, positionals, tokens } = parseArgs({ args: prepareCLIArguments(argv, [...DUMP_FORMATS, 'png', 'pdf']), allowPositionals: true, tokens: true, options: {
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
@@ -77,6 +81,7 @@ export async function main(argv = process.argv.slice(2)) {
     'wait-until': { type: 'string', default: 'load' }, 'wait-ms': { type: 'string', default: '5000' },
     'wait-selector': { type: 'string' }, 'wait-script': { type: 'string' }, 'wait-script-file': { type: 'string' },
     'http-header': { type: 'string', multiple: true },
+    'http-cache-dir': {type:'string'}, 'http-cache-entry-limit': {type:'string'},
     'ws-max-concurrent': { type: 'string' },
     'no-javascript': { type: 'boolean' }, 'user-agent': { type: 'string' },
     'fail-on-http-error': { type: 'boolean' },
@@ -100,7 +105,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (loadResources.includes('none')) loadResources = [];
   const features = values['experimental-features'] ?? [];
   for (const feature of features) if (feature !== 'serviceworker') throw new Error(`Unsupported experimental feature: ${feature}`);
-  const options = { wsMaxConcurrent:parseWebSocketLimit(values['ws-max-concurrent']),experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
+  const options = {httpCacheDir:values['http-cache-dir'],httpCacheEntryLimit:values['http-cache-entry-limit']===undefined?1000:cacheEntryLimit(values['http-cache-entry-limit']), wsMaxConcurrent:parseWebSocketLimit(values['ws-max-concurrent']),experimentalFeatures: {serviceworker: features.includes('serviceworker')}, timeout, cliHTTPHeaders, javascript: !values['no-javascript'], userAgent: values['user-agent'], loadResources };
   if (command === 'run') {
     if (rest.length !== 1) throw new Error('run requires one script path or - for stdin');
     if (values.cookie || values['cookie-jar'] || values['inject-script'] || values['inject-script-file']) throw new Error('Cookie files and preload flags are not yet supported for saved scripts');

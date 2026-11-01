@@ -4,6 +4,8 @@ import { installWorkerXHR } from './worker-xhr.js';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const documentTrust = new WeakMap();
+const trustworthyDocument=document=>isPotentiallyTrustworthy(document?._origin??'null')||documentTrust.get(document)===true;
 
 export function isPotentiallyTrustworthy(input) {
   try {
@@ -17,16 +19,19 @@ export function isPotentiallyTrustworthy(input) {
  * state at construction, so redirects/legitimate base elements remain live.
  * Public origin/isSecureContext/baseURI overrides never select the principal.
  */
-export function captureWorkerCreator(page, window) {
+export function captureWorkerCreator(page, window, {opaqueTopLevelBlank=false}={}) {
   const document = implForWrapper(window.document), baseURL = document.baseURLSerialized;
+  // Only the genuine top-level creation hook may seed an opaque blank document.
+  // Capture before authored code: a History URL rewrite cannot grant this trust.
+  if(!documentTrust.has(document))documentTrust.set(document,opaqueTopLevelBlank&&!page.parentFrameId&&document._origin==='null'&&document.URL==='about:blank');
   return () => {
-    const origin = document._origin ?? 'null'; let secure = isPotentiallyTrustworthy(origin), owner = page;
+    const origin = document._origin ?? 'null'; let secure = trustworthyDocument(document), owner = page;
     const seen = new Set();
     while (secure && owner?.parentFrameId && !seen.has(owner)) {
       seen.add(owner); owner = owner.registry?.findFrame(owner.parentFrameId);
       if (!owner?.dom?.window) { secure = false; break; }
       const ancestor = implForWrapper(owner.dom.window.document);
-      secure = isPotentiallyTrustworthy(ancestor?._origin ?? 'null');
+      secure = trustworthyDocument(ancestor);
     }
     return Object.freeze({ origin, secure, baseURL: Reflect.apply(baseURL, document, []) });
   };

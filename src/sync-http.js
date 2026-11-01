@@ -1,3 +1,4 @@
+import{assertURLAllowed}from'./url-blocking.js';
 import {internalCookieHeader} from './internal-cookie-header.js';
 import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
 import {cookieHeaderForSync} from './cookie-site.js';
@@ -51,14 +52,24 @@ export class SyncHTTP {
     const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
     page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),postDataFields:inlinePostData(capture),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
     checkpoint();
-    const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
-    this.#ensureWorker().postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
-    const remaining=deadline-Date.now();
-    if(remaining<=0||Atomics.wait(state,0,0,remaining)==='timed-out')throw Error('Synchronous HTTP request timed out');
-    const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
-    const bytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2))),response={...meta,headers:new Headers(meta.headers),bytes};
-    checkpoint();
-    if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
+    assertURLAllowed(page,url);
+    const cache=page.browser.httpCache,exchange=cache?.begin(page.context,url,method,headers,{topLevelDocument:resourceType==='Document'&&(!init.frameId||init.frameId===page.frameId)});
+    let response=exchange?.fresh?cache.cachedData(exchange):null,fromDiskCache=!!response,transportStatusText;
+    if(!response){
+     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
+     const outgoing=cache?.requestHeaders(exchange,headers)??headers;
+     this.#ensureWorker().postMessage({id,url,init:{method,headers:[...outgoing],body},shared,maxBodyBytes});
+     const remaining=deadline-Date.now();
+     if(remaining<=0||Atomics.wait(state,0,0,remaining)==='timed-out')throw Error('Synchronous HTTP request timed out');
+     const meta=JSON.parse(Buffer.from(shared,12,Atomics.load(state,1)).toString('utf8'));if(meta.error)throw Error(meta.error);
+     const actualBytes=Buffer.from(new Uint8Array(shared,12+Atomics.load(state,1),Atomics.load(state,2)));
+     response={...meta,headers:new Headers(meta.headers),bytes:actualBytes};transportStatusText=response.statusText;
+     checkpoint();
+     if(useCookies)for(const value of meta.cookies){const accepted=httpResponseCookie(page.context.cookies,value,url);if(accepted!==null)page.context.cookies.setCookieSync(accepted,url,{ignoreError:true});checkpoint()}
+     const renewed=cache?.revalidateData(exchange,response);if(renewed){response=renewed;fromDiskCache=true}
+    }
+    const bytes=response.bytes;checkpoint();
+    if(bytes.length>maxBodyBytes)throw Error(maxBodyBytes===16*1024*1024?'Response exceeds 16 MiB limit':'Response exceeds '+maxBodyBytes+' byte limit');
     const location=response.headers.get('location');
     if(location&&[301,302,303,307,308].includes(response.status)){
      if(redirects===20)throw Error('Too many redirects');
@@ -71,11 +82,12 @@ export class SyncHTTP {
      redirectResponse={url,status:response.status,statusText:response.statusText,headers:Object.fromEntries(response.headers),mimeType:response.headers.get('content-type')??'text/html',connectionReused:false,connectionId:0,encodedDataLength:0,securityState:'neutral'};
      url=next.href;continue;
     }
+    if(!fromDiskCache)cache?.store(exchange,response,bytes);
     beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes);finishNetworkResponse(capture);
     // Remove the captured id before entering arbitrary event callbacks. The
     // operation itself remains owned until those callbacks return normally.
     page.activeRequests.delete(id);
-    page.requestFinished(id,url,response.status,bytes.length,Object.fromEntries(response.headers),resourceType,init.frameId,init.loaderId);
+    page.requestFinished(id,url,response.status,bytes.length,Object.fromEntries(response.headers),resourceType,init.frameId,init.loaderId,fromDiskCache,fromDiskCache?(transportStatusText??''):undefined);
     owned.delete(id);op.complete=true;init.signal?.removeEventListener('abort',onAbort);this.operations.delete(op);return response;
    }
   }catch(error){

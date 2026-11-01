@@ -1,3 +1,4 @@
+import {platformFactoryRecord} from './platform-factories.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 import { createRequire } from 'node:module';
 
@@ -161,4 +162,11 @@ export function installMutations(page, window) {
   window.addEventListener('unload', dispose, { once: true });
   if (!active(context)) dispose();
   return context.controller;
+}
+
+// Successful canonical generated setup supplies the actual record backend.
+// Internal consumers must not invoke authored MutationRecord accessors.
+export function canonicalMutationRecord(value) {
+  const record=platformFactoryRecord(value);
+  return record?.kind==='MutationRecord'?record.implementation:undefined;
 }

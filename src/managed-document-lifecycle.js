@@ -23,7 +23,7 @@ export function registerManagedLifecycle(context){
  if(records.has(document))throw new TypeError('Managed lifecycle document owner already registered');
  captureDispatchWindow(context.window,actual);
  const manager=context.page.moduleScripts;if(manager&&typeof manager.startWrittenEOF!=='function')throw new TypeError('The genuine written module producer is required');
- const record=Object.assign(Object.create(null),{context,invocation:createInvocationTrampoline(actual),options:{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false},phase:undefined,windowLoadDepth:0,iframeLoadDepth:0,muteFrameLoad:false,startModules:manager?manager.startWrittenEOF.bind(manager):null,frame:context.page.registry?context.page.record?.element??null:null});
+ const record=Object.assign(Object.create(null),{context,invocation:createInvocationTrampoline(actual),options:{timeout:Math.min(context.page.timeout??2000,2000),displayErrors:false},phase:undefined,windowLoadDepth:0,iframeLoadDepth:0,muteFrameLoad:false,initialBlankStarted:false,startModules:manager?manager.startWrittenEOF.bind(manager):null,frame:context.page.registry?context.page.record?.element??null:null});
  records.set(document,record);if(record.frame)frames.set(record.frame,record);return true;
 }
 export function beginManagedWrittenCycle(context){
@@ -33,7 +33,7 @@ export function beginManagedWrittenCycle(context){
 }
 export function completeManagedWrittenEOF(context,cycle){
  const record=records.get(context.document);
- if(!record||!context.loaded||!active(record)||context.current!==cycle||context.record.parser!==cycle.parser||!context.record.parserDone||!cycle.parser.stopped||cycle.state.status!=='complete')return false;
+ if(!record||!(context.loaded||record.initialBlankStarted&&context.initialBlank)||!active(record)||context.current!==cycle||context.record.parser!==cycle.parser||!context.record.parserDone||!cycle.parser.stopped||cycle.state.status!=='complete')return false;
  cycle.managedLifecycle=true;
  owned(record,()=>{
   // Start actual work and resume its genuine queues. Neither the ready promise
@@ -47,6 +47,27 @@ export function completeManagedWrittenEOF(context,cycle){
   }
   // A genuine nested EOF during state/DCL may already finish this frame. The
   // private frame phase is distinct from the same Document's live readiness.
+  if(!active(record)||record.phase==='complete')return;
+  record.phase='complete';if(apply(readiness.get,document,[])!=='complete')apply(readiness.set,document,['complete']);
+  if(!active(record)||record.windowLoadDepth||record.iframeLoadDepth)return;
+  during(record,'windowLoadDepth',()=>fireAnEvent('load',context.window,undefined,{},true));
+  if(currentFrame(record)&&!record.muteFrameLoad)during(record,'iframeLoadDepth',()=>fireAnEvent('load',record.frame));
+ });
+ return true;
+}
+
+// Native-measured EOF of the real literal empty blank-frame parser. Both
+// competing canonical bootstrap bridges were retired by actual identity before
+// this producer enters. No authored Document.load event is synthesized.
+export function completeManagedInitialBlank(context){
+ const record=records.get(context.document);
+ if(!record||!active(record)||!currentFrame(record)||record.initialBlankStarted)return false;
+ record.initialBlankStarted=true;record.phase='parsing';
+ owned(record,()=>{
+  context.page.moduleScripts?.start();context.document._deferQueue.resume();context.document._queue.resume();
+  const document=context.document;
+  record.phase='load';apply(readiness.set,document,['interactive']);if(!active(record))return;
+  fireAnEvent('DOMContentLoaded',document,undefined,{bubbles:true});
   if(!active(record)||record.phase==='complete')return;
   record.phase='complete';if(apply(readiness.get,document,[])!=='complete')apply(readiness.set,document,['complete']);
   if(!active(record)||record.windowLoadDepth||record.iframeLoadDepth)return;

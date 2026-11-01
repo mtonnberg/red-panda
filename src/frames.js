@@ -4,7 +4,7 @@ import {disposeBrowsingWindow} from './popup-pages.js';
 import {forwardRequestMetadata} from './request-metadata.js';
 import {retireFrameActivity} from './frame-activity.js';
 import { completeInitialBlankFrame } from './document-reset.js';
-import { createInvocationTrampoline } from './invocation.js';
+import { createInvocationTrampoline,notifyInvocationExit } from './invocation.js';
 import { installListenerOwnership, createOwnedWindow } from './listener-ownership.js';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
@@ -193,14 +193,14 @@ class FramePage extends EventEmitter {
   evaluate(expression) {
     this.current();
     try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout ?? 10000, 2000), displayErrors: false }); }
-    finally { if (!this.closed) this.reconcileURL(); }
+    finally { if (!this.closed) this.reconcileURL();notifyInvocationExit(this.dom.getInternalVMContext()); }
   }
   callFunction(declaration, thisArg, args = []) {
     this.current();
     try {
       return createInvocationTrampoline(this.dom.getInternalVMContext()).invokeDeclaration(declaration, thisArg, args,
         {timeout:Math.min(this.timeout ?? 10000,2000),displayErrors:false});
-    } finally { if (!this.closed) this.reconcileURL(); }
+    } finally { if (!this.closed) this.reconcileURL();notifyInvocationExit(this.dom.getInternalVMContext()); }
   }
   referrerFor(url, source = this.url) { return this.registry.page.referrerFor(url, source); }
   async fetch(input, init = {}, type = 'Fetch') {
@@ -382,8 +382,9 @@ export function installFrames(page, window, { prepareWindow } = {}) {
     const record = operation.record;
     if (!record?.page || record.page.closed || record.waitingResource) return;
     if (operation.blankListeners) {
-      installListenerOwnership(record.window._globalProxy).adoptSince(record.document, 'load', operation.blankListeners);
-      completeInitialBlankFrame(record.window._globalProxy);
+      // Exact source-owned listener interval: the literal blank parser adds
+      // one native Document→frame bridge after prepareWindow has returned.
+      completeInitialBlankFrame(record.window._globalProxy,operation.blankListeners);
     }
     registry.committed(record);
   };

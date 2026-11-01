@@ -1,0 +1,1679 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import {captureCDPDocument} from './cdp-node-registry.js';
+ import {prepareInitialDocumentParser} from './initial-document-parser.js';
+ import {captureDocumentEncoding,decodeHTMLResponse} from './document-encoding.js';
+ import {installHTMLBaseURLs} from './html-base-urls.js';
+@@ -286,6 +287,7 @@
+   }
+ 
+   prepareWindow(window, historyState = null, { main = true } = {}) {
++    captureCDPDocument(this,window);
+     captureDocumentEncoding(window.document);
+     preparePopupDocument(this,window);
+     captureCookieDocument(this,implForWrapper(window.document));
+diff --git a/src/cdp-node-registry.js b/src/cdp-node-registry.js
+new file mode 100644
+--- /dev/null
++++ b/src/cdp-node-registry.js
+@@ -0,0 +1,79 @@
++// Host-private CDP identity and actual Document/generation ownership.
++// Public fields, symbols, prototypes and Proxy forwarding never confer membership.
++import 'jsdom';
++import vm from 'node:vm';
++import {createRequire} from 'node:module';
++import {onFrameRetirement} from './frame-retirement-hooks.js';
++import {platformFactoryRecord,subscribePlatformFactories} from './platform-factories.js';
++const require=createRequire(import.meta.url);
++const NodeImpl=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const apply=Reflect.apply,hasInstance=Function.prototype[Symbol.hasInstance];
++const registries=new WeakMap(),documents=new WeakMap(),pages=new WeakMap(),realms=new WeakMap(),firstFronts=new WeakMap();
++// Observe successful canonical setup before authors receive the first value.
++// Utility aliases never replace it; mutable implementation symbols are unused.
++subscribePlatformFactories((value,record)=>{const node=record.implementation;if(node&&apply(hasInstance,NodeImpl,[node])&&!firstFronts.has(node))firstFronts.set(node,value);});
++export function cdpWrapperForNode(node){return firstFronts.get(node);}
++export function canonicalNodeImplementation(value){
++ const implementation=platformFactoryRecord(value)?.implementation;
++ return implementation&&apply(hasInstance,NodeImpl,[implementation])?implementation:undefined;
++}
++const documentOf=node=>node.nodeType===9?node:node._ownerDocument;
++function active(owner){return !!owner&&!owner.signal.aborted&&!owner.page.closed&&!owner.page.retired&&owner.page.documentGeneration===owner.generation;}
++function registry(context){
++ let record=registries.get(context);
++ if(!record){record={context,next:1,byId:new Map(),ids:new WeakMap()};registries.set(context,record);}
++ return record;
++}
++function erase(record,entry){record.byId.delete(entry.id);record.ids.delete(entry.node);entry.owner.ids.delete(entry.id);}
++function reconcile(record,entry){
++ const currentDocument=documentOf(entry.node),owner=documents.get(currentDocument)??realms.get(currentDocument?._globalObject);
++ if(owner&&owner.context!==record.context){erase(record,entry);return undefined;}
++ if(owner&&owner.context===record.context&&owner!==entry.owner&&active(owner)){
++  entry.owner.ids.delete(entry.id);entry.owner=owner;owner.ids.add(entry.id);
++ }
++ if(!active(entry.owner)){erase(record,entry);return undefined;}
++ return entry;
++}
++export function captureCDPDocument(page,window){
++ // Trusted beforeParse call, before authored script/public entry publication.
++ const document=canonicalNodeImplementation(window.document);
++ if(!document||document.nodeType!==9)throw new TypeError('Actual owned Document factory is required');
++ const previous=documents.get(document);if(previous){if(previous.page!==page)throw new TypeError('Document owner is immutable');return;}
++ const owner={page,context:page.context,document,signal:page.documentAbort.signal,generation:page.documentGeneration,ids:new Set()};
++ documents.set(document,owner);pages.set(page,owner);realms.set(document._globalObject,owner);
++ const actualGlobal=platformFactoryRecord(window.document)?.globalRef?.deref();if(actualGlobal)realms.set(actualGlobal,owner);
++ const record=registry(page.context);
++ const retire=()=>{for(const id of [...owner.ids]){const entry=record.byId.get(id);if(entry)reconcile(record,entry);}};
++ owner.signal.addEventListener('abort',retire,{once:true});onFrameRetirement(window,retire);
++}
++export function registerCDPNodeRealm(page,globalObject,context){
++ if(!vm.isContext(context)||vm.runInContext('globalThis',context)!==globalObject)throw new TypeError('Actual selected VM/global pair is required');
++ const owner=pages.get(page);if(!active(owner))throw new TypeError('Actual current Document owner is required');
++ const previous=realms.get(globalObject);if(previous&&previous!==owner)throw new TypeError('Node allocation realm owner is immutable');
++ realms.set(globalObject,owner);realms.set(context,owner);
++}
++export function cdpDocumentForPage(page){const owner=pages.get(page);return active(owner)&&owner.document._defaultView!==null?owner.document:undefined;}
++export function cdpNodeOwner(node,context){
++ if(!node||!apply(hasInstance,NodeImpl,[node]))return undefined;
++ const owner=documents.get(documentOf(node));
++ return active(owner)&&owner.context===context&&owner.document._defaultView!==null?owner:undefined;
++}
++export function registerCDPNode(context,value){
++ const node=canonicalNodeImplementation(value);if(!node)throw new TypeError('A genuine registered DOM node is required');
++ const document=documentOf(node),owner=documents.get(document)??realms.get(document?._globalObject);
++ if(!active(owner)||owner.context!==context)throw new TypeError('DOM node belongs to a different or retired browser context');
++ const record=registry(context),id=record.ids.get(node),previous=id===undefined?undefined:record.byId.get(id);
++ if(previous&&reconcile(record,previous))return previous.id;
++ if(record.next>4294967295)throw new RangeError('DOM node identifier overflow');
++ const entry={id:record.next++,node,owner,wrapper:cdpWrapperForNode(node)};
++ if(canonicalNodeImplementation(entry.wrapper)!==node)throw new TypeError('Canonical first DOM wrapper is required');
++ record.byId.set(entry.id,entry);record.ids.set(node,entry.id);owner.ids.add(entry.id);return entry.id;
++}
++export function cdpNodeEntry(context,id){const record=registry(context),entry=record.byId.get(id);return entry?reconcile(record,entry):undefined;}
++export function cdpNodeMap(context){
++ // Existing protocol consumers keep their Map-like lookup contract. The only
++ // allocator is registerCDPNode; session teardown cannot clear another session.
++ const record=registry(context);
++ function* entries(){for(const [id,entry]of record.byId)if(reconcile(record,entry))yield[id,entry.wrapper];}
++ return Object.freeze({get:id=>cdpNodeEntry(context,id)?.wrapper,has:id=>!!cdpNodeEntry(context,id),entries,keys:function*(){for(const[id]of entries())yield id},values:function*(){for(const[,value]of entries())yield value},[Symbol.iterator]:entries,get size(){return Array.from(entries()).length}});
++}
+diff --git a/src/cdp.js b/src/cdp.js
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,5 @@
++import {supportsSemantic,runSemantic} from './semantic-commands.js';
++import {cdpNodeMap,registerCDPNode,cdpNodeEntry} from './cdp-node-registry.js';
+ import {supportsFileInput,rememberFileInputContext,forgetFileInputContext,runFileInput} from './cdp-file-input.js';
+ import {dumpMarkdownNode} from './markdown-node.js';
+ import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
+@@ -98,7 +100,7 @@
+     this.scripts = new Map();
+     this.bindings = new Set();
+     this.listeners = [];
+-    this.nextBackendNodeId = 1;
++    this.nodes = cdpNodeMap(page.context);
+     this.lifecycle = false;
+     initializeUtilitySession(this,resetRuntime);
+     this.utility = utilitySessionController(this,ProtocolError);
+@@ -110,7 +112,7 @@
+     listen('contextsCleared', () => {
+       resetDOM(this);
+       resetRuntime(this);
+-      this.objects.clear(); this.worlds.clear(); this.frameWorlds.clear(); this.nodes?.clear(); this.nodeContexts.clear();
++      this.objects.clear(); this.worlds.clear(); this.frameWorlds.clear(); this.nodeContexts.clear();
+       this.event('Runtime.executionContextsCleared', {});
+     });
+     listen('navigated', () => {
+@@ -149,7 +151,7 @@
+         this.event('Runtime.executionContextDestroyed', { executionContextId: world.id });
+       }
+       for (const [id, object] of this.objects) if (ids.has(object.contextId)) this.objects.delete(id);
+-      for (const [id, context] of this.nodeContexts) if (ids.has(context)) { this.nodes?.delete(id); this.nodeContexts.delete(id); }
++      for (const [id, context] of this.nodeContexts) if (ids.has(context)) { this.nodeContexts.delete(id); }
+       resetRuntime(this, params.executionContextId);
+       this.event('Runtime.executionContextDestroyed', { executionContextId: params.executionContextId,
+         executionContextUniqueId: params.executionContextUniqueId });
+@@ -530,11 +532,10 @@
+     }
+   }
+   backendId(node) {
+-    node=canonicalUtilityValue(node);
+-    this.nodes ??= new Map();
+-    for (const [id, value] of this.nodes) if (value === node) return id;
+-    const id = this.nextBackendNodeId++; this.nodes.set(id, node); this.nodeContexts.set(id, this.valueContext(node)); return id;
+-  }
++    const id=registerCDPNode(this.page.context,node),entry=cdpNodeEntry(this.page.context,id);
++    this.nodeContexts.set(id,entry.owner.page.executionContextId);return id;
++  }
++
+   close() {
+     if(this.closed)return;this.closed=true;
+     this.releaseClosing?.();
+@@ -545,7 +546,7 @@
+     resetDOM(this);
+     resetRuntime(this);
+     for (const [event, callback] of this.listeners) this.page.off(event, callback);
+-    this.objects.clear(); this.nodes?.clear(); this.streams.clear();
++    this.objects.clear(); this.streams.clear();
+     for (const id of this.scripts.keys()) this.page.newDocumentScripts.delete(id);
+   }
+ }
+@@ -594,7 +595,7 @@
+     try {
+       message = JSON.parse(raw);
+       if (!message || !Number.isInteger(message.id) || typeof message.method !== 'string' ||
+-          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version' || supportsPermissionControl(message.method))) &&
++          (message.params !== undefined && !(message.params === null && (CONFIGURATION_ACK_METHODS.has(message.method) || message.method === 'LP.getMarkdown' || message.method === 'LP.version' || supportsSemantic(message.method) || supportsPermissionControl(message.method))) &&
+             (!message.params || Array.isArray(message.params) || typeof message.params !== 'object'))) {
+         throw new ProtocolError('Invalid CDP request', -32600);
+       }
+@@ -604,7 +605,7 @@
+       if (sessionId && !session) throw new ProtocolError('Unknown sessionId', -32001);
+       const sessionCommand=session&&!method.startsWith('Browser.')&&!method.startsWith('Target.')&&!CONFIGURATION_ACK_METHODS.has(method);
+       dispatchedSession=sessionCommand?session:undefined;
+-      const result = supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
++      const result = supportsSemantic(method) ? runSemantic(this,session,method,message.params,Object.hasOwn(message,'params'),ProtocolError) : supportsFileInput(method) ? runFileInput(this,session,params,ProtocolError) : supportsPermissionControl(method) ? runPermissionControl(permissionOwnerForConnection(this,session?.page),method,message.params,Object.hasOwn(message,'params'),ProtocolError) : CONFIGURATION_ACK_METHODS.has(method) ? {} : session && !method.startsWith('Browser.') && !method.startsWith('Target.')
+         ? await session.run(method, params) : await this.run(method, params, session);
+       // Closed sessions have no receiver for their pending command replies.
+       // Page.close itself completes only after its successful response below.
+diff --git a/src/dom.js b/src/dom.js
+--- a/src/dom.js
++++ b/src/dom.js
+@@ -1,7 +1,9 @@
++import {canonicalNodeImplementation,cdpWrapperForNode,cdpDocumentForPage} from './cdp-node-registry.js';
++import {createRequire} from 'node:module';
+ import {canonicalUtilityValue} from './isolated-world.js';
+ import {wrapUtilityDOMNode} from './world-sessions.js';
+ import { randomUUID } from 'node:crypto';
+-import { createInternalMutationObserver } from './mutations.js';
++import { createInternalMutationObserver,canonicalMutationRecord } from './mutations.js';
+ 
+ const methods = new Set([
+   'DOM.enable', 'DOM.disable', 'DOM.getDocument', 'DOM.describeNode',
+@@ -13,6 +15,13 @@
+   'DOM.getContentQuads', 'DOM.getBoxModel', 'DOM.scrollIntoViewIfNeeded',
+   'DOM.getFrameOwner',
+ ]);
++const require=createRequire(import.meta.url),{domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const ElementImpl=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const privateAttribute=ElementImpl.prototype.getAttribute,apply=Reflect.apply;
++const privateParent=node=>apply(tree.parent,tree,[node]),privatePrevious=node=>apply(tree.previousSibling,tree,[node]);
++function privateFront(node){const front=cdpWrapperForNode(node);if(canonicalNodeImplementation(front)!==node)throw error('Canonical actual DOM frontend unavailable',-32000);return front;}
++function privateChildren(state,node){return Array.from(apply(tree.childrenIterator,tree,[node])).filter(child=>state.includeWhitespace||child.nodeType!==3||/\S/.test(child._data)).map(privateFront);}
++
+ const states = new WeakMap();
+ 
+ export const supportsDOM = method => methods.has(method);
+@@ -37,11 +46,7 @@
+   return state;
+ }
+ 
+-function isNode(session, value) {
+-  if (!value) return false;
+-  try { return session.page.dom.window.Node.prototype.isSameNode.call(value, value); }
+-  catch { return false; }
+-}
++function isNode(session, value) { return canonicalNodeImplementation(value)!==undefined; }
+ 
+ function nodeFor(session, params, identifiers = ['nodeId', 'backendNodeId', 'objectId']) {
+   const provided = identifiers.filter(key => params[key] !== undefined);
+@@ -73,10 +78,40 @@
+ }
+ 
+ function childrenFor(state, node) {
++  const implementation=canonicalNodeImplementation(node);if(implementation)return privateChildren(state,implementation);
+   return [...node.childNodes].filter(child => state.includeWhitespace || child.nodeType !== 3 || /\S/.test(child.data));
+ }
+ 
++// Privileged protocol metadata uses the genuine actual backend, never Node
++// getters replaced by an author. Legacy non-owned embedding keeps its reader.
++function serializeCanonical(session,state,implementation,depth,pierce,budget){
++ if(--budget.remaining<0)throw error('DOM tree exceeds the 100000-node response budget',-32000);
++ const node=privateFront(implementation),id=session.backendId(node),type=implementation.nodeType;
++ state.known.add(node);
++ const result={nodeId:id,backendNodeId:id,nodeType:type,nodeName:implementation.nodeName,localName:implementation._localName??'',nodeValue:implementation.nodeValue??''};
++ const parent=privateParent(implementation),parentFront=parent&&privateFront(parent);
++ if(parentFront&&state.known.has(parentFront))result.parentId=session.backendId(parentFront);
++ if([1,9,11].includes(type)){
++  const children=privateChildren(state,implementation);result.childNodeCount=children.length;
++  if(depth!==0){state.expanded.add(node);result.children=children.map(child=>serialize(session,state,child,depth===-1?-1:depth-1,pierce,budget));}
++ }
++ if(type===1){
++  result.attributes=implementation._attributeList.flatMap(attribute=>[attribute._qualifiedName,attribute._value]);
++  const frame=session.page.frames?.findElement(implementation);if(frame)result.frameId=frame.frameId;
++  if(implementation._namespaceURI==='http://www.w3.org/2000/svg')result.isSVG=true;
++  const shadow=implementation._shadowRoot;if(pierce&&shadow&&shadow._mode!=='closed')result.shadowRoots=[serialize(session,state,privateFront(shadow),depth===-1?-1:Math.max(0,depth-1),pierce,budget)];
++  const content=implementation._contentDocument;if(pierce&&content)result.contentDocument=serialize(session,state,privateFront(content),depth===-1?-1:Math.max(0,depth-1),pierce,budget);
++  if(implementation._templateContents)result.templateContent=serialize(session,state,privateFront(implementation._templateContents),depth===-1?-1:Math.max(0,depth-1),pierce,budget);
++ }else if(type===9){result.documentURL=implementation.URL;result.baseURL=implementation.baseURI;result.compatibilityMode=implementation.compatMode==='BackCompat'?'QuirksMode':'NoQuirksMode';}
++ else if(type===10){result.publicId=implementation.publicId;result.systemId=implementation.systemId;}
++ else if(type===2){result.name=implementation._qualifiedName;result.value=implementation._value;}
++ if(type===11&&implementation._host&&implementation._mode!==undefined)result.shadowRootType=implementation._mode;
++ return result;
++}
++
+ function serialize(session, state, node, depth = 0, pierce = false, budget = { remaining: 100000 }) {
++  const implementation=canonicalNodeImplementation(node);
++  if(implementation&&cdpDocumentForPage(session.page))return serializeCanonical(session,state,implementation,depth,pierce,budget);
+   if (--budget.remaining < 0) throw error('DOM tree exceeds the 100000-node response budget', -32000);
+   const id = session.backendId(node);
+   state.known.add(node);
+@@ -120,16 +155,23 @@
+   session.domains?.add('DOM');
+   if (state.observer) return;
+   state.observer = createInternalMutationObserver(session.page.dom.window, records => {
+-    for (const record of records) {
++    for (const publicRecord of records) {
++      let record=publicRecord;
++      if(cdpDocumentForPage(session.page)){
++        const actual=canonicalMutationRecord(publicRecord);if(!actual)throw error('Actual registered mutation record is required',-32000);
++        record={type:actual.type,target:privateFront(actual.target),attributeName:actual.attributeName,addedNodes:actual._addedNodes.map(privateFront),removedNodes:actual._removedNodes.map(privateFront)};
++      }
+       if (!state.known.has(record.target)) continue;
+       const id = session.backendId(record.target);
+       if (record.type === 'attributes') {
+-        const value = record.target.getAttribute(record.attributeName);
++        const implementation=canonicalNodeImplementation(record.target);
++        const value = implementation?apply(privateAttribute,implementation,[record.attributeName]):record.target.getAttribute(record.attributeName);
+         session.event(value === null ? 'DOM.attributeRemoved' : 'DOM.attributeModified', {
+           nodeId: id, name: record.attributeName, ...(value === null ? {} : { value }),
+         });
+       } else if (record.type === 'characterData') {
+-        session.event('DOM.characterDataModified', { nodeId: id, characterData: record.target.data });
++        const implementation=canonicalNodeImplementation(record.target);
++        session.event('DOM.characterDataModified', { nodeId: id, characterData: implementation?implementation._data:record.target.data });
+       } else if (record.type === 'childList') {
+         if (!state.expanded.has(record.target)) {
+           session.event('DOM.childNodeCountUpdated', { nodeId: id, childNodeCount: childrenFor(state, record.target).length });
+@@ -139,9 +181,11 @@
+           if (state.known.has(node)) session.event('DOM.childNodeRemoved', { parentNodeId: id, nodeId: session.backendId(node) });
+         }
+         for (const node of record.addedNodes) {
+-          if (!state.includeWhitespace && node.nodeType === 3 && !/\S/.test(node.data)) continue;
+-          let previous = node.previousSibling;
+-          while (previous && !state.known.has(previous)) previous = previous.previousSibling;
++          const implementation=canonicalNodeImplementation(node);
++          if (!state.includeWhitespace && (implementation?implementation.nodeType:node.nodeType) === 3 && !/\S/.test(implementation?implementation._data:node.data)) continue;
++          let previous = implementation?privatePrevious(implementation):undefined;
++          if(implementation){while(previous&&!state.known.has(privateFront(previous)))previous=privatePrevious(previous);previous=previous&&privateFront(previous);}
++          else {previous=node.previousSibling;while(previous&&!state.known.has(previous))previous=previous.previousSibling;}
+           session.event('DOM.childNodeInserted', {
+             parentNodeId: id, previousNodeId: previous ? session.backendId(previous) : 0,
+             node: serialize(session, state, node),
+diff --git a/src/listener-ownership.js b/src/listener-ownership.js
+--- a/src/listener-ownership.js
++++ b/src/listener-ownership.js
+@@ -90,3 +90,11 @@
+   installListenerOwnership(proxy); binding.context = contexts.get(proxy);
+   return window;
+ }
++
++// Host-only semantic observation of actual listener records. No callbacks,
++// public on* getters, source/name guesses or authored registration changes.
++export function authoredListenerTypesForImplementation(implementation) {
++  const context=contexts.get(implementation._globalObject);
++  return Object.keys(implementation._eventListeners??{}).filter(type =>
++    implementation._eventListeners[type].some(listener=>!context?.internal.has(listener)));
++}
+diff --git a/src/modules.js b/src/modules.js
+--- a/src/modules.js
++++ b/src/modules.js
+@@ -1,6 +1,8 @@
++import {canonicalNodeImplementation,cdpWrapperForNode,cdpDocumentForPage} from './cdp-node-registry.js';
+ import vm from 'node:vm';
+ import { createRequire } from 'node:module';
+-import { createInternalMutationObserver } from './mutations.js';
++import { createInternalMutationObserver,canonicalMutationRecord } from './mutations.js';
++import {matchCanonicalSelector} from './canonical-selector.js';
+ 
+ // This adapter intentionally targets the pinned jsdom dependency. Its deferred
+ // resource queue lets module evaluation begin before the real DOMContentLoaded.
+@@ -23,6 +25,7 @@
+ // import outside a SourceTextModule still needs its own VM import callback.
+ export function installModuleScripts(page, window) {
+   const document = window.document;
++  const ownedDocument=cdpDocumentForPage(page),privateDiscovery=!!ownedDocument&&canonicalNodeImplementation(document)===ownedDocument;
+   const signal = page.documentAbort?.signal;
+   const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet(), writtenPrepared = new WeakMap();
+   const imports = new Map(), scopes = new Map();
+@@ -225,6 +228,18 @@
+     })(), cycle);
+   }
+   function discover(root = document, includeParser = false) {
++    if(privateDiscovery){
++      const implementation=canonicalNodeImplementation(root);if(!implementation)throw new TypeError('Actual registered module-discovery root is required');
++      const candidates=[];
++      for(const backend of domSymbolTree.treeIterator(implementation)){
++        if(backend.nodeType!==1||!(backend===implementation?backend._localName==='script':matchCanonicalSelector(backend,'script',ownedDocument.documentElement)))continue;
++        const script=cdpWrapperForNode(backend);if(canonicalNodeImplementation(script)!==backend)throw new TypeError('Canonical actual script frontend is required');
++        if(!backend.isConnected||!['module','importmap'].includes(backend.getAttributeNS(null,'type')?.trim().toLowerCase())||seen.has(script))continue;
++        if(!includeParser&&!parseCycle.started&&backend._parserInserted)continue;
++        seen.add(script);candidates.push(script);
++      }
++      return candidates;
++    }
+     const candidates = root.nodeType === 1 && root.localName === 'script' ? [root] : [];
+     candidates.push(...root.querySelectorAll?.('script') ?? []);
+     return candidates.filter(script => {
+@@ -264,7 +279,11 @@
+     observer = createInternalMutationObserver(window, records => {
+       if (!active()) return;
+       for (const record of records) {
+-        if (record.type === 'attributes') {
++        if(privateDiscovery){
++          const actual=canonicalMutationRecord(record);if(!actual)throw new TypeError('Actual registered module mutation record is required');
++          const roots=actual.type==='attributes'?[actual.target]:actual._addedNodes;
++          for(const backend of roots){const node=cdpWrapperForNode(backend);if(canonicalNodeImplementation(node)!==backend)throw new TypeError('Canonical actual mutation node is required');for(const script of discover(node))startScript(script);}
++        }else if (record.type === 'attributes') {
+           for (const script of discover(record.target)) startScript(script);
+         } else for (const node of record.addedNodes) {
+           for (const script of discover(node)) startScript(script);
+diff --git a/src/mutations.js b/src/mutations.js
+--- a/src/mutations.js
++++ b/src/mutations.js
+@@ -1,3 +1,4 @@
++import {platformFactoryRecord} from './platform-factories.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import { createRequire } from 'node:module';
+ 
+@@ -162,3 +163,10 @@
+   if (!active(context)) dispose();
+   return context.controller;
+ }
++
++// Successful canonical generated setup supplies the actual record backend.
++// Internal consumers must not invoke authored MutationRecord accessors.
++export function canonicalMutationRecord(value) {
++  const record=platformFactoryRecord(value);
++  return record?.kind==='MutationRecord'?record.implementation:undefined;
++}
+diff --git a/src/semantic-commands.js b/src/semantic-commands.js
+new file mode 100644
+--- /dev/null
++++ b/src/semantic-commands.js
+@@ -0,0 +1,36 @@
++// Real bounded LP producers. Semantic-tree and AX commands are intentionally
++// absent until their independent traversal writers exist.
++import {selectCDPCookieContext} from './cdp-cookie-metadata.js';
++import {cdpDocumentForPage,cdpNodeEntry,cdpNodeOwner,registerCDPNode} from './cdp-node-registry.js';
++import {createSemanticReader,semanticWalk,semanticWrapper} from './semantic-node-reader.js';
++const methods=new Set(['LP.getNodeDetails','LP.detectForms','LP.getInteractiveElements']);
++export const supportsSemantic=method=>methods.has(method);
++function uint(value,Error){
++ if(typeof value!=='number'&&typeof value!=='string')throw new Error('UnexpectedToken',-31998);
++ if(typeof value==='string'){
++  if(!/^[+-]?[0-9]+$/.test(value))throw new Error('InvalidCharacter',-31998);
++  const actual=BigInt(value);if(actual<0n||actual>4294967295n)throw new Error('Overflow',-31998);return Number(actual);
++ }
++ if(value<0||value>4294967295)throw new Error('Overflow',-31998);
++ if(!Number.isInteger(value))throw new Error('InvalidNumber',-31998);return value;
++}
++export function runSemantic(connection,session,method,params,present,Error){
++ let selected;
++ if(method==='LP.getNodeDetails'){
++  if(!present||params===null)throw new Error('InvalidParam',-31998);
++  if(!Object.hasOwn(params,'backendNodeId'))throw new Error('MissingField',-31998);
++  selected=uint(params.backendNodeId,Error);
++ }else if(method==='LP.getInteractiveElements'&&params?.nodeId!=null)selected=uint(params.nodeId,Error);
++ const context=session?.page.context??selectCDPCookieContext(connection.browser);
++ if(!context)throw new Error('NoBrowserContext',-31998);
++ const page=session?.page??[...connection.browser.pages.values()].find(value=>value.context===context&&!value.closed);
++ if(!page)throw new Error('FrameNotLoaded',-31998);
++ const document=cdpDocumentForPage(page);if(!document)throw new Error('FrameNotLoaded',-31998);
++ const node=selected===undefined?document:cdpNodeEntry(context,selected)?.node;
++ const owner=cdpNodeOwner(node,context);if(!owner)throw new Error('InvalidNodeId',-31998);
++ const reader=createSemanticReader(owner.document),idFor=value=>registerCDPNode(context,semanticWrapper(value));
++ if(method==='LP.getNodeDetails')return{nodeDetails:reader.details(node,selected)};
++ if(method==='LP.detectForms')return{forms:reader.forms(idFor)};
++ const elements=[];for(const value of semanticWalk(node))if(value.nodeType===1&&reader.classification(value)&&reader.visible(value)){const result=reader.interactive(value,idFor(value));if(result)elements.push(result);}
++ return{elements};
++}
+diff --git a/src/semantic-node-reader.js b/src/semantic-node-reader.js
+new file mode 100644
+--- /dev/null
++++ b/src/semantic-node-reader.js
+@@ -0,0 +1,119 @@
++// Independent semantic values from authenticated real DOM implementations.
++// Names/roles/state are recomputed from current nodes, never fixture snapshots.
++import 'jsdom';
++import {createRequire} from 'node:module';
++import {createCanonicalStyleResolver} from './styles.js';
++import {cdpWrapperForNode} from './cdp-node-registry.js';
++import {editingState} from './html-element-state.js';
++import {authoredListenerTypesForImplementation} from './listener-ownership.js';
++const require=createRequire(import.meta.url);
++const {domSymbolTree:tree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
++const Element=require('jsdom/lib/jsdom/living/nodes/Element-impl.js').implementation;
++const Node=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
++const Input=require('jsdom/lib/jsdom/living/nodes/HTMLInputElement-impl.js').implementation;
++const Textarea=require('jsdom/lib/jsdom/living/nodes/HTMLTextAreaElement-impl.js').implementation;
++const Select=require('jsdom/lib/jsdom/living/nodes/HTMLSelectElement-impl.js').implementation;
++const Option=require('jsdom/lib/jsdom/living/nodes/HTMLOptionElement-impl.js').implementation;
++const Tab=require('jsdom/lib/jsdom/living/nodes/HTMLOrSVGElement-impl.js').implementation;
++const {isDisabled,formOwner}=require('jsdom/lib/jsdom/living/helpers/form-controls.js');
++const apply=Reflect.apply,getAttribute=Element.prototype.getAttributeNS,baseURI=Object.getOwnPropertyDescriptor(Node.prototype,'baseURI').get;
++const inputType=Object.getOwnPropertyDescriptor(Input.prototype,'type').get,inputValue=Object.getOwnPropertyDescriptor(Input.prototype,'value').get,textareaValue=Object.getOwnPropertyDescriptor(Textarea.prototype,'value').get,selectValue=Object.getOwnPropertyDescriptor(Select.prototype,'value').get,optionValue=Object.getOwnPropertyDescriptor(Option.prototype,'value').get,tabIndex=Object.getOwnPropertyDescriptor(Tab.prototype,'tabIndex').get;
++const HTML='http://www.w3.org/1999/xhtml',URLConstructor=URL;
++const interactiveRoles=new Set('button link textbox checkbox radio combobox listbox switch slider spinbutton menuitem menuitemcheckbox menuitemradio tab treeitem searchbox option'.split(' '));
++const actionEvents=new Set('click dblclick mousedown mouseup pointerdown pointerup keydown keyup keypress touchstart touchend input change submit'.split(' '));
++const clean=value=>value.replace(/[\t\n\r\f ]+/g,' ').trim(),tag=node=>node._localName,html=(node,name)=>node.nodeType===1&&node._namespaceURI===HTML&&tag(node)===name;
++const attr=(node,name)=>apply(getAttribute,node,[null,name]);
++const parent=node=>apply(tree.parent,tree,[node]),children=node=>Array.from(apply(tree.childrenIterator,tree,[node]));
++export const semanticWrapper=cdpWrapperForNode;
++export function* semanticWalk(root){yield* apply(tree.treeIterator,tree,[root]);}
++function rootOf(node){let root=node;while(parent(root))root=parent(root);return root;}
++function cssEscape(value){let result='';for(let i=0;i<value.length;i++){const c=value.charCodeAt(i),char=value[i];if(c===0){result+='\uFFFD';continue;}if(c<32||c===127||i===0&&c>=48&&c<=57||i===1&&c>=48&&c<=57&&value[0]==='-'){result+='\\'+c.toString(16)+' ';continue;}result+=c>=128||/[A-Za-z0-9_-]/.test(char)?char:'\\'+char;}return result;}
++export function createSemanticReader(document){
++ const resolveStyle=createCanonicalStyleResolver(document),treeRoot=rootOf(document);
++ function text(node){if(node.nodeType===3||node.nodeType===4)return node._data;let output='';for(const child of children(node))if(child.nodeType!==1||!['script','style','template'].includes(tag(child)))output+=text(child);return output;}
++ function findId(id,root=document){for(const node of semanticWalk(root))if(node.nodeType===1&&attr(node,'id')===id)return node;return undefined;}
++ function type(node){return html(node,'input')?apply(inputType,node,[]):undefined;}
++ function role(node){
++  const explicit=attr(node,'role');if(explicit?.trim())return explicit.trim().split(/\s+/)[0];
++  if(node._namespaceURI!==HTML)return'none';const name=tag(node);
++  if(/^h[1-6]$/.test(name))return'heading';
++  if(['a','area'].includes(name)&&attr(node,'href')!==null)return'link';
++  if(['button','summary'].includes(name))return'button';
++  if(name==='textarea')return'textbox';if(name==='select')return attr(node,'multiple')!==null?'listbox':'combobox';
++  if(name==='input'){const t=type(node);return t==='hidden'?'none':({checkbox:'checkbox',radio:'radio',range:'slider',number:'spinbutton',button:'button',submit:'button',reset:'button',image:'button'})[t]??'textbox';}
++  return({form:'form',fieldset:'group',p:'paragraph',ol:'list',ul:'list',li:'listitem',option:'option',img:'image',iframe:'Iframe'})[name]??'none';
++ }
++ function labels(node){
++  const values=[],id=attr(node,'id');for(const candidate of semanticWalk(rootOf(node))){if(!html(candidate,'label'))continue;const target=attr(candidate,'for');if(target!==null){if(id&&target===id&&findId(id,rootOf(node))===node)values.push(candidate);continue;}for(const current of semanticWalk(candidate))if(current.nodeType===1&&current._namespaceURI===HTML&&['input','select','textarea','button','meter','output','progress'].includes(tag(current))&&type(current)!=='hidden'){if(current===node)values.push(candidate);break;}}
++  return values;
++ }
++ function name(node,seen=new Set()){
++  if(seen.has(node))return null;seen.add(node);
++  const related=attr(node,'aria-labelledby');if(related){const names=[];for(const id of related.split(/\s+/)){const target=findId(id,rootOf(node));if(target&&!seen.has(target)){const nested=name(target,new Set(seen))??clean(text(target));if(nested)names.push(nested);}}if(names.length)return clean(names.join(' '));}
++  const aria=attr(node,'aria-label');if(aria)return clean(aria);
++  if(node._namespaceURI===HTML&&['input','textarea','select','button','meter','progress','output'].includes(tag(node))){const value=clean(labels(node).map(text).join(' '));if(value)return value;}
++  const nameTag=tag(node),t=type(node);
++  if(node._namespaceURI===HTML&&['img','area'].includes(nameTag)){const alt=attr(node,'alt');if(alt!==null)return clean(alt)||null;}
++  if(node._namespaceURI===HTML&&nameTag==='input'&&['button','submit','reset','image'].includes(t)){const value=attr(node,t==='image'?'alt':'value');if(value)return clean(value);}
++  if(['button','a','label','legend','option','summary'].includes(nameTag)||/^h[1-6]$/.test(nameTag)||interactiveRoles.has(role(node))&&!['input','select','textarea'].includes(nameTag)){const value=clean(text(node));if(value)return value;}
++  const placeholder=attr(node,'placeholder');if(['input','textarea'].includes(nameTag)&&placeholder)return clean(placeholder);
++  const title=attr(node,'title');return title?clean(title):null;
++ }
++ function stateValue(node){const t=type(node);if(t!==undefined)return t==='password'?'*****':apply(inputValue,node,[]);if(html(node,'textarea'))return apply(textareaValue,node,[]);if(html(node,'select'))return apply(selectValue,node,[]);return undefined;}
++ function options(node){return [...semanticWalk(node)].filter(current=>html(current,'option')).map(option=>({value:apply(optionValue,option,[]),text:clean(text(option))}));}
++ function classification(node){
++  if(node.nodeType!==1||type(node)==='hidden')return null;
++  if(node._namespaceURI===HTML&&(['button','input','textarea','select','summary'].includes(tag(node))||['a','area'].includes(tag(node))&&attr(node,'href')!==null))return{type:'native'};
++  const explicitRole=attr(node,'role')?.trim().split(/\s+/)[0];
++  if(interactiveRoles.has(explicitRole))return{type:'aria'};
++  if(editingState(node))return{type:'contenteditable'};
++  const listeners=authoredListenerTypesForImplementation(node).filter(type=>actionEvents.has(type));if(listeners.length)return{type:'listener',listeners};
++  if(attr(node,'tabindex')!==null&&apply(tabIndex,node,[])>=0)return{type:'focusable'};
++  return null;
++ }
++ function visible(node){
++  if(resolveStyle(node).visibility!=='visible')return false;
++  for(let current=node;current;current=parent(current)??current._host??null)if(current.nodeType===1&&resolveStyle(current).display==='none')return false;
++  return true;
++ }
++ function selector(node){
++  if(rootOf(node)!==treeRoot||node.nodeType!==1)return undefined;
++  const id=attr(node,'id');if(id){let count=0;for(const item of semanticWalk(document))if(item.nodeType===1&&attr(item,'id')===id)count++;if(count===1)return'#'+cssEscape(id);}
++  const parts=[];for(let current=node;current?.nodeType===1;current=parent(current)){const p=parent(current),siblings=p?children(p).filter(item=>item.nodeType===1&&item._localName===current._localName&&item._namespaceURI===current._namespaceURI):[current];parts.unshift(cssEscape(tag(current))+':nth-of-type('+(siblings.indexOf(current)+1)+')');}return parts.join(' > ');
++ }
++ function href(node){const raw=attr(node,'href');if(raw===null)return undefined;try{return new URLConstructor(raw,apply(baseURI,node,[])).href;}catch{return raw;}}
++ function details(node,id){
++  if(node.nodeType!==1)throw Object.assign(new Error('InternalError'),{code:-31998});
++  const kind=classification(node),result={backendNodeId:id,tagName:tag(node),role:role(node),isInteractive:!!kind},actualName=name(node);if(actualName!==null)result.name=actualName;
++  if(isDisabled(node))result.isDisabled=true;
++  const value=stateValue(node);if(value!==undefined)result.value=value;
++  if(type(node)!==undefined)result.inputType=type(node);
++  for(const key of ['placeholder','id','class']){const value=attr(node,key);if(value)result[key]=value;}
++  if(['a','area'].includes(tag(node))&&attr(node,'href')!==null)result.href=href(node);
++  const actualSelector=selector(node);if(actualSelector!==undefined)result.selector=actualSelector;
++  if(['checkbox','radio'].includes(type(node)))result.checked=node._checkedness;
++  if(html(node,'select'))result.options=options(node).map((option,index)=>({...option,selected:[...semanticWalk(node)].filter(current=>html(current,'option'))[index]._selectedness}));
++  return result;
++ }
++ function interactive(node,id){
++  const kind=classification(node);if(!kind||!visible(node))return undefined;
++  const r=role(node),actualName=name(node)??(['listener','focusable'].includes(kind.type)?clean(text(node))||null:null),result={backendNodeId:id,tagName:tag(node),role:r==='none'?null:r,name:actualName,...kind,tabIndex:apply(tabIndex,node,[])};
++  if(isDisabled(node))result.disabled=true;
++  for(const key of ['id','class']){const value=attr(node,key);if(value)result[key]=value;}
++  if(['a','area'].includes(tag(node))&&attr(node,'href')!==null)result.href=href(node);
++  if(html(node,'input')){result.inputType=type(node);result.value=stateValue(node);}
++  if(['input','select','textarea'].includes(tag(node))){const name=attr(node,'name');if(name)result.elementName=name;const placeholder=attr(node,'placeholder');if(placeholder)result.placeholder=placeholder;}
++  return result;
++ }
++ function forms(idFor){
++  const forms=[];for(const form of semanticWalk(document)){if(!html(form,'form'))continue;const result={backendNodeId:idFor(form),fields:[]};for(const key of ['action','method']){const value=attr(form,key);if(value)result[key]=value;}
++   for(const control of semanticWalk(rootOf(form))){if(control.nodeType!==1||control._namespaceURI!==HTML||!['input','select','textarea'].includes(tag(control))||formOwner(control)!==form||['hidden','submit','button','reset','image'].includes(type(control)))continue;
++    const field={backendNodeId:idFor(control),tagName:tag(control),required:attr(control,'required')!==null,disabled:isDisabled(control)};
++    const elementName=attr(control,'name');if(elementName)field.name=elementName;if(html(control,'input'))field.inputType=type(control);
++    const value=stateValue(control);if(value!==undefined)field.value=value;const placeholder=attr(control,'placeholder');if(placeholder)field.placeholder=placeholder;
++    if(html(control,'select'))field.options=options(control);result.fields.push(field);
++   }forms.push(result);
++  }return forms;
++ }
++ return{details,interactive,forms,classification,visible};
++}
+diff --git a/src/world-sessions.js b/src/world-sessions.js
+--- a/src/world-sessions.js
++++ b/src/world-sessions.js
+@@ -1,3 +1,4 @@
++import {registerCDPNodeRealm} from './cdp-node-registry.js';
+ import {installUtilityDataTransfer} from './data-transfer.js';
+ import {installFetch} from './fetch.js';
+ import {installJavaScriptDialogs} from './javascript-dialogs.js';
+@@ -52,7 +53,7 @@
+  record={page,name,mainWindow:window,id:page.browser.nextExecutionContext++,uniqueId:randomUUID(),signal:page.documentAbort.signal,bindings:new Map(),pendingBindings:new Map(),executedScripts:new Set(),disposed:false};
+  const resolveWindow=value=>{const owner=findPageForWindow(session,value);if(owner&&owner!==page)return worldFor(session,owner,name).global;return undefined;};
+  const resolveImplementation=impl=>{const owner=Object.getOwnPropertyDescriptor(impl,'_globalObject')?.value;const ownerPage=findPageForWindow(session,owner);return ownerPage&&ownerPage!==page?worldFor(session,ownerPage,name).controller.wrap(impl):undefined;};
+- record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
++ record.controller=createIsolatedWorld(window,{name,timeout:Math.min(page.timeout,2000),signal:record.signal,isWindowClosed:()=>page.closed||page.retired,onError:error=>{for(const member of rootSessions(page))member.event('Runtime.exceptionThrown',{timestamp:Date.now(),exceptionDetails:member.exception(error,record.id)});},resolveWindow,resolveImplementation,onRealm:(global,context,metadata)=>{registerCDPNodeRealm(page,global,context);const cleanup=FACTORY_HOOKS.onRealm?.(global,context,{...metadata,contextId:record.id,page,isActive:()=>live(record)});if(typeof cleanup==='function')record.factoryCleanup=cleanup;},onWrapper:(value,global,metadata)=>FACTORY_HOOKS.onWrapper?.(value,global,{...metadata,contextId:record.id,page,isActive:()=>live(record)}),onConsole:(type,args)=>{for(const member of rootSessions(page))member.event('Runtime.consoleAPICalled',{type,args:args.map(value=>member.remote(value,false,undefined,record.id)),executionContextId:record.id,timestamp:Date.now()});}});
+  installUtilitySelection(record.controller,window);installUtilityFormControlParity(record.controller,window);installUtilityDocumentEditing(record.controller,window);installUtilitySanitizer(page,record.controller,window);record.global=record.controller.global;installAttributeNames(record.global,{context:record.controller.context});installNamespaceSerialization(record.global,{context:record.controller.context,createDocument:record.controller.createDocument});record.context=record.controller.context;installHTMLElementState(page,record.global,{context:record.context,mainWindow:window});installHTMLReflections(record.global,{context:record.context});installFetch(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source)});installUtilityDataTransfer(page,record.controller);const utilityMessaging=installUtilityMessaging(page,record.controller);installSharedWorkers(page,record.global,{enabled:page.browser.options.loadResources===undefined||page.browser.options.loadResources.includes('worker'),mainWindow:window,messaging:utilityMessaging,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowEventSource(page,record.global,{mainWindow:window,evaluate:source=>record.controller.evaluate(source),initializeTarget:value=>record.controller.setupEventTarget(value)});installWindowWebSocket(page,record.global,{mainWindow:window});installCSSNamespace(record.global,{evaluate:source=>record.controller.evaluate(source)});installScheduler(page,record.controller.global,{context:record.controller.context,mainWindow:window});installImageData(record.controller.global);installPaymentRequest(record.global,{secure:captureWorkerCreator(page,window)().secure,evaluate:source=>record.controller.evaluate(source),utility:true,wrap:record.controller.wrap});installWebCrypto(record.controller.global);installURLPattern(record.controller.global);installCanvas(record.controller.global);installFonts(record.controller.global);installUtilityLayout(page,record.controller,window);installJavaScriptDialogs(page,record.global,{context:record.context,mainWindow:window});installUtilityRangeGeometry(record.controller);installUtilityAnimationFrame(page,record.controller,window);installUtilityIntersection(page,record.controller,window);record.Error=record.global.Error;record.realmFunction=record.controller.realmFunction;captureProtocolRealm(record.global);BY_CONTEXT.set(record.context,record);
+  const facade=Object.create(page);Object.defineProperties(facade,{dom:{value:{window:record.global,getInternalVMContext:()=>record.context}},executionContextId:{value:record.id},executionContextUniqueId:{value:record.uniqueId},closed:{get:()=>!live(record)},reconcileURL:{value:()=>page.reconcileURL?.()},evaluate:{value:source=>record.controller.evaluate(source)},callFunction:{value:(declaration,thisArg,args)=>record.controller.callFunction(declaration,thisArg,args)}});record.facade=facade;record.facadeRecord=true;
+  store.records.set(name,record);for(const member of rootSessions(page)){installRecord(member,record);for(const binding of member.bindings)installBinding(member,binding,record.facade);}
+diff --git a/test/semantic-client.js b/test/semantic-client.js
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-client.js
+@@ -0,0 +1,11 @@
++import {createRequire} from 'node:module';
++import {once} from 'node:events';
++const require=createRequire(import.meta.url),{WebSocket}=require('ws');
++export function connect(endpoint,{recordWire=()=>{},stamp=()=>Date.now()}={}){const events=[];return new Promise((resolve,reject)=>{
++ const socket=new WebSocket(endpoint,{handshakeTimeout:2500}),pending=new Map();let sequence=0;
++ const fail=error=>{for(const entry of pending.values()){clearTimeout(entry.timer);entry.reject(error)}pending.clear()};
++ socket.once('error',reject);socket.once('open',()=>resolve({socket,events,send(method,params,sid){return new Promise((resolve,reject)=>{const id=++sequence,message={id,method,...(params===undefined?{}:{params}),...(sid?{sessionId:sid}:{})};const timer=setTimeout(()=>{pending.delete(id);reject(Error('Actual 2500ms RPC timeout: '+method))},2500);pending.set(id,{resolve,reject,timer});recordWire({direction:'send',atMS:stamp(),message});socket.send(JSON.stringify(message),failure=>{if(failure){clearTimeout(timer);pending.delete(id);reject(failure)}})})},async close(){fail(Error('Owned CDP client closing'));if(socket.readyState===WebSocket.CLOSED)return;const closed=once(socket,'close'),timer=setTimeout(()=>socket.terminate(),1000);timer.unref();socket.close();try{await closed}finally{clearTimeout(timer)}}}));
++ socket.on('error',failure=>{recordWire({direction:'transport-error',atMS:stamp(),name:failure.name,message:failure.message,code:failure.code});fail(failure);socket.terminate()});
++ socket.on('close',(code,reason)=>{recordWire({direction:'close',atMS:stamp(),code,reason:reason.toString()});fail(Error('Actual CDP connection closed'))});
++ socket.on('message',data=>{let message;try{message=JSON.parse(data.toString())}catch(error){recordWire({direction:'malformed',atMS:stamp(),base64:Buffer.from(data).toString('base64')});fail(error);socket.terminate();return}recordWire({direction:'receive',atMS:stamp(),message,base64:Buffer.from(data).toString('base64')});if(!message.id){events.push(message);return;}const entry=pending.get(message.id);if(entry){pending.delete(message.id);clearTimeout(entry.timer);entry.resolve(message)}});
++ });}
+diff --git a/test/semantic-commands.test.js b/test/semantic-commands.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-commands.test.js
+@@ -0,0 +1,62 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import {once} from 'node:events';
++import {readFile,writeFile} from 'node:fs/promises';
++import {serve} from '../src/cdp.js';
++import {connect} from './semantic-client.js';
++const oracle=JSON.parse(await readFile(new URL('../docs/reference/semantic-automation/lp-native-subset.json',import.meta.url),'utf8'));
++async function fixture(t,{navigate=true}={}){
++ const files=await Promise.all(['main','frame','replacement'].map(name=>readFile(new URL('./semantic-'+name+'.html',import.meta.url))));
++ const sockets=new Set(),requests=[],wire=[],fixture=http.createServer((request,response)=>{requests.push({method:request.method,url:request.url,rawHeaders:request.rawHeaders});const index=['/fixture','/frame','/replacement'].indexOf(request.url);response.writeHead(index<0?404:200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});response.end(files[index]??'Actual owned route absent');});fixture.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});});fixture.listen(0,'127.0.0.1');await once(fixture,'listening');
++ const origin='http://127.0.0.1:'+fixture.address().port,service=await serve({port:0,loadResources:['iframe']}),client=await connect('ws://127.0.0.1:'+service.port+'/',{recordWire:value=>wire.push(value)});let sessionId,targetId;
++ t.after(async()=>{await client.close();await service.close();for(const socket of sockets)socket.destroy();fixture.closeAllConnections();await new Promise(resolve=>fixture.close(resolve));});
++ const send=(method,params,sid=sessionId)=>client.send(method,params,sid),required=async(method,params,sid=sessionId)=>{const reply=await send(method,params,sid);assert.equal(reply.error,undefined,JSON.stringify(reply));return reply.result;};
++ const evaluate=async(expression,sid=sessionId)=>{const value=await required('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true,timeout:200},sid);assert.equal(value.exceptionDetails,undefined,JSON.stringify(value));return value.result.value;};
++ async function load(){({targetId}=await required('Target.createTarget',{url:'about:blank'},null));({sessionId}=await required('Target.attachToTarget',{targetId,flatten:true},null));await required('Page.enable',{});await required('Runtime.enable',{});await required('Page.navigate',{url:origin+'/fixture'});const began=Date.now();let ready=false;while(Date.now()-began<2500){ready=await evaluate('document.readyState==="complete"&&globalThis.semanticReady===true&&document.getElementById("child").contentWindow?.frameReady===true');if(ready)break;await new Promise(resolve=>setTimeout(resolve,5));}assert.equal(ready,true);assert.deepEqual(await evaluate('semanticSetupErrors'),[]);}
++ if(navigate)await load();return{service,client,origin,send,required,evaluate,load,wire,requests,get sessionId(){return sessionId},get targetId(){return targetId}};
++}
++function content(reply){return reply.error?{error:reply.error}:{result:reply.result};}
++function normalize(value,origin,identities){
++ if(Array.isArray(value))return value.map(item=>normalize(item,origin,identities));
++ if(value&&typeof value==='object'){const result={};for(const[key,item]of Object.entries(value)){if(key==='backendNodeId'||key==='backendDOMNodeId'){assert.ok(identities.has(String(item)),'Unmapped actual backend identity '+item);result[key]=identities.get(String(item));}else result[key]=normalize(item,origin,identities);}return result;}
++ return typeof value==='string'?value.replaceAll(origin,'OWNED_ORIGIN'):value;
++}
++test('twenty whole Native LP objects/errors use actual shared DOM identities across mutation, frames, detachment and retirement',{timeout:10000},async t=>{
++ const f=await fixture(t),actualIdentities=new Map(),raw=[],comparisons=[];
++ t.after(async()=>{if(process.env.SEMANTIC_REPORT)await writeFile(process.env.SEMANTIC_REPORT,JSON.stringify({raw,comparisons,wire:f.wire,requests:f.requests},null,2)+'\n');});
++ const document=(await f.required('DOM.getDocument',{depth:0})).root.nodeId;
++ for(const id of(await f.required('DOM.querySelectorAll',{nodeId:document,selector:'[id]'})).nodeIds){const node=(await f.required('DOM.describeNode',{nodeId:id,depth:0})).node,attributes=node.attributes;const index=attributes.indexOf('id');assert.ok(index>=0);actualIdentities.set(String(node.backendNodeId),'#'+attributes[index+1]);}
++ const forms=(await f.required('DOM.querySelectorAll',{nodeId:document,selector:'form'})).nodeIds;forms.forEach((id,index)=>actualIdentities.set(String(id),'form:'+index));
++ const button=(await f.required('DOM.querySelector',{nodeId:document,selector:'#plain'})).nodeId;
++ async function node(expression){const remote=(await f.required('Runtime.evaluate',{expression,returnByValue:false,timeout:200})).result;assert.equal(typeof remote.objectId,'string');const value=(await f.required('DOM.describeNode',{objectId:remote.objectId,depth:0})).node,attributes=value.attributes,index=attributes.indexOf('id');if(index>=0)actualIdentities.set(String(value.backendNodeId),'#'+attributes[index+1]);return{...value,objectId:remote.objectId};}
++ async function compare(epoch,name,params,sid=f.sessionId){const expected=oracle.epochs[epoch],row=expected.rows.find(row=>row.name===name);assert.ok(row,name);const response=await f.send(row.method,params,sid);raw.push({epoch,name,params,response});const a=normalize(content(response),f.origin,actualIdentities),e=normalize(content(row.response),expected.origin,new Map(Object.entries(expected.nodeIdentityLabels)));comparisons.push({epoch,name,actual:a,expected:e});assert.deepEqual(a,e,name);}
++ await compare('r1','interactive default',{});await compare('r1','details real button',{backendNodeId:button});await compare('r1','forms default',{});
++ await compare('r1','required details params omitted',undefined);await compare('r1','required details field missing',{});await compare('r1','numeric-string actual backend',{backendNodeId:String(button)});await compare('r1','unknown details backend',{backendNodeId:4294967295});await compare('r1','unknown interactive root',{nodeId:4294967295});
++ const second=(await f.required('Target.attachToTarget',{targetId:f.targetId,flatten:true},null)).sessionId;await compare('r2','backend via second real session',{backendNodeId:button},second);
++ const child=await node('document.getElementById("child").contentDocument.getElementById("frame-action")');await compare('r2','child details use child label',{backendNodeId:child.backendNodeId});await compare('r2','child interactive root',{nodeId:child.nodeId});
++ const shadow=await node('heldShadow'),host=(await f.required('DOM.querySelector',{nodeId:document,selector:'#shadow-host'})).nodeId;await compare('r2','shadow actual node details',{backendNodeId:shadow.backendNodeId});await compare('r2','shadow host interactive walk',{nodeId:host});
++ await f.evaluate('(()=>{heldButton.setAttribute("aria-label","Changed action");heldButton.textContent="Changed button contents";document.getElementById("email").value="changed@example.test";document.getElementById("check").checked=true;document.getElementById("role-button").setAttribute("aria-pressed","true");return true})()');await compare('r2','same node live details',{backendNodeId:button});await compare('r2','live interactive values',{});await compare('r2','live forms values',{});
++ await f.evaluate('heldButton.remove();true');await compare('r2','detached actual backend details',{backendNodeId:button});const inactive=await node('(globalThis.framelessNode=new DOMParser().parseFromString("<r><button>inactive</button></r>","application/xml").documentElement)');await compare('r2','frameless backend details',{backendNodeId:inactive.backendNodeId});
++ await f.evaluate('(()=>{document.body.append(heldButton);globalThis.semanticTrapReads=0;for(const key of ["localName","tagName","ownerDocument","textContent"])Object.defineProperty(heldButton,key,{configurable:true,get(){semanticTrapReads++;throw Error("Authored getter read: "+key)}});Object.defineProperty(heldButton,"getAttribute",{configurable:true,value(){semanticTrapReads++;throw Error("Authored getAttribute read")}});return true})()');await compare('r2','details with authored getters',{backendNodeId:button});assert.deepEqual(await f.evaluate('({reads:semanticTrapReads,listenerActivations})'),{reads:0,listenerActivations:0});
++ await f.required('Page.navigate',{url:f.origin+'/replacement'});await compare('r2','old backend after real navigation',{backendNodeId:button});assert.equal(comparisons.length,20);
++});
++test('schema conversion and no-context errors preserve genuine optional/required parameter distinctions',{timeout:6000},async t=>{
++ const f=await fixture(t,{navigate:false});for(const[method,params,message]of[['LP.getInteractiveElements',{},'NoBrowserContext'],['LP.detectForms',{},'NoBrowserContext'],['LP.getNodeDetails',undefined,'InvalidParam'],['LP.getNodeDetails',{},'MissingField'],['LP.getNodeDetails',{backendNodeId:-1},'Overflow'],['LP.getNodeDetails',{backendNodeId:'x'},'InvalidCharacter'],['LP.getNodeDetails',{backendNodeId:true},'UnexpectedToken']]){const reply=await f.send(method,params,null);assert.deepEqual(reply.error,{code:-31998,message});}
++});
++test('actual Runtime objects stay session-bound while closing one session preserves shared numeric node lookup',{timeout:6000},async t=>{
++ const f=await fixture(t),root=(await f.required('DOM.getDocument',{depth:0})).root.nodeId,button=(await f.required('DOM.querySelector',{nodeId:root,selector:'#plain'})).nodeId,object=(await f.required('Runtime.evaluate',{expression:'heldButton',returnByValue:false})).result.objectId;
++ const second=(await f.required('Target.attachToTarget',{targetId:f.targetId,flatten:true},null)).sessionId;const wrong=await f.send('Runtime.callFunctionOn',{objectId:object,functionDeclaration:'function(){return this.nodeType}',returnByValue:true},second);assert.equal(wrong.error.code,-32000);assert.match(wrong.error.message,/Could not find object/);
++ await f.required('Target.detachFromTarget',{sessionId:f.sessionId},null);assert.equal((await f.required('LP.getNodeDetails',{backendNodeId:button},second)).nodeDetails.name,'Original action');
++});
++test('listener classification follows real add/remove state and does not activate callbacks',{timeout:6000},async t=>{
++ const f=await fixture(t);await f.evaluate('globalThis.dynamic=document.createElement("div");dynamic.id="dynamic";dynamic.textContent="Live listener";globalThis.activation=0;globalThis.callback=()=>{activation++};document.body.append(dynamic);true');
++ const has=async()=>((await f.required('LP.getInteractiveElements',{})).elements).find(value=>value.id==='dynamic');assert.equal(await has(),undefined);await f.evaluate('dynamic.addEventListener("click",callback);true');assert.deepEqual((await has()).listeners,['click']);assert.equal((await has()).type,'listener');await f.evaluate('dynamic.removeEventListener("click",callback);true');assert.equal(await has(),undefined);assert.equal(await f.evaluate('activation'),0);
++});
++test('all three LP readers ignore authored control/form getters while reporting actual live form state',{timeout:6000},async t=>{
++ const f=await fixture(t);await f.evaluate('(()=>{globalThis.controlReads=0;for(const id of ["email","actual-form"]){const node=document.getElementById(id);for(const key of ["value","disabled","form","elements","ownerDocument","getAttribute"])Object.defineProperty(node,key,{configurable:true,get(){controlReads++;throw Error("authored control getter")}})}return true})()');
++ const forms=(await f.required('LP.detectForms',{})).forms;assert.equal(forms[0].fields[0].value,'first@example.test');const interactive=(await f.required('LP.getInteractiveElements',{})).elements;assert.equal(interactive.find(value=>value.id==='email').name,'Email from actual label');const root=(await f.required('DOM.getDocument',{depth:0})).root.nodeId,button=(await f.required('DOM.querySelector',{nodeId:root,selector:'#plain'})).nodeId;assert.equal((await f.required('LP.getNodeDetails',{backendNodeId:button})).nodeDetails.name,'Original action');assert.equal(await f.evaluate('controlReads'),0);
++});
++test('semantic-tree and Accessibility data methods retain explicit unsupported status until real traversal producers exist',{timeout:6000},async t=>{
++ const f=await fixture(t);for(const method of['LP.getSemanticTree','Accessibility.getFullAXTree','Accessibility.getPartialAXTree'])assert.equal((await f.send(method,{})).error.code,-32601);
++});
+diff --git a/test/semantic-frame.html b/test/semantic-frame.html
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-frame.html
+@@ -0,0 +1,3 @@
++<!doctype html><html><head><title>Owned child semantics</title><style>#frame-hidden{display:none}</style></head><body>
++<form id="frame-form" action="/frame-submit"><label for="frame-input">Frame-owned label</label><input id="frame-input" name="frame-input" value="frame value"><button id="frame-action" aria-label="Frame-owned action">Frame content</button></form>
++<button id="frame-hidden">Hidden frame action</button><script>globalThis.frameReady=true;</script></body></html>
+diff --git a/test/semantic-main.html b/test/semantic-main.html
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-main.html
+@@ -0,0 +1,27 @@
++<!doctype html><html><head><meta charset="utf-8"><title>Owned semantic automation controls</title>
++<style>#display-hidden{display:none}.invisible{visibility:hidden}.visible-again{visibility:visible}</style></head><body>
++<h1>Independent semantic controls</h1><p id="description">Actual label and state fixture.</p>
++<form id="actual-form" action="/submit?owned=1" method="post">
++<label for="email">Email from actual label</label><input id="email" name="email" type="email" required placeholder="mail fixture" value="first@example.test">
++<label><input id="check" name="check" type="checkbox" value="yes">Actual checkbox label</label>
++<label for="choice">Choose actual option</label><select id="choice" name="choice"><option value="a">First choice</option><option value="b" selected>Second choice</option></select>
++<textarea id="note" name="note" placeholder="Actual notes">Initial note</textarea>
++<input id="concealed" name="concealed" type="hidden" value="hidden form state"><input id="password" name="password" type="password" value="synthetic-not-a-secret">
++<fieldset disabled><legend>Disabled group</legend><input id="disabled-field" name="disabled-field" value="disabled value"></fieldset>
++<button id="submit" type="submit">Save actual form</button></form>
++<label for="outside">Outside form label</label><input id="outside" form="actual-form" name="outside" value="outside association">
++<button id="plain" aria-label="Original action" aria-describedby="description">Original visible button</button>
++<span id="role-label">Role label</span><div id="role-button" role="button" tabindex="0" aria-labelledby="role-label" aria-pressed="false">Role button contents</div>
++<a id="actual-link" href="/destination?actual=1">Actual link</a><div id="listener">Listener action</div><div id="focusable" tabindex="0">Focusable div</div>
++<button id="html-hidden" hidden>HTML hidden action</button><div id="display-hidden"><button id="css-hidden">CSS hidden action</button></div>
++<div aria-hidden="true"><button id="aria-hidden">ARIA hidden action</button></div>
++<div class="invisible"><button id="invisible">Invisible action</button><button class="visible-again" id="visible-again">Visible descendant</button></div>
++<ol id="list"><li>First actual list item</li><li>Second actual list item</li></ol>
++<div id="shadow-host"><button id="slotted" slot="actual-slot">Slotted action</button></div>
++<iframe id="child" src="/frame"></iframe>
++<script>
++globalThis.semanticSetupErrors=[];
++try{const host=document.getElementById('shadow-host');const root=host.attachShadow({mode:'open'});root.innerHTML='<label id="shadow-label" for="shadow-input">Shadow label</label><input id="shadow-input"><button id="shadow-action" aria-label="Shadow action">Shadow contents</button><slot name="actual-slot"></slot>';globalThis.heldShadow=root.querySelector('#shadow-action');}catch(error){semanticSetupErrors.push({name:error.name,message:error.message});}
++globalThis.listenerActivations=0;document.getElementById('listener').addEventListener('click',()=>{listenerActivations++;});
++globalThis.heldButton=document.getElementById('plain');globalThis.semanticReady=true;
++</script></body></html>
+diff --git a/test/semantic-observer-readers.test.js b/test/semantic-observer-readers.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-observer-readers.test.js
+@@ -0,0 +1,33 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {serve} from '../src/cdp.js';
++import {connect} from './semantic-client.js';
++async function fixture(t){
++ const service=await serve({port:0}),client=await connect('ws://127.0.0.1:'+service.port+'/'),cleanup=[];
++ const required=async(method,params={},sid)=>{const response=await client.send(method,params,sid);assert.equal(response.error,undefined,JSON.stringify(response));return response.result;};
++ const {targetId}=await required('Target.createTarget',{url:'about:blank'}),{sessionId}=await required('Target.attachToTarget',{targetId,flatten:true});
++ const send=(method,params={})=>required(method,params,sessionId),evaluate=async expression=>{const result=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true,timeout:200});assert.equal(result.exceptionDetails,undefined,JSON.stringify(result));return result.result.value;};
++ t.after(async()=>{try{for(const operation of cleanup.reverse())await operation();}finally{await client.close();await service.close();}});
++ await send('Runtime.enable');await send('Page.navigate',{url:'data:text/html,'+encodeURIComponent('<!doctype html><title>Actual private observers</title><body><main id="parent"><button id="held">Actual text</button></main>')});
++ const root=(await send('DOM.getDocument',{depth:-1})).root.nodeId,nodeId=(await send('DOM.querySelector',{nodeId:root,selector:'#held'})).nodeId;
++ await evaluate('globalThis.heldButton=document.getElementById("held");heldButton.remove();true');
++ cleanup.push(()=>evaluate('(()=>{for(const key of ["localName","tagName","ownerDocument","textContent","getAttribute"])delete heldButton[key];return true})()'));
++ return{send,evaluate,client,nodeId};
++}
++const poison='globalThis.observerReads=0;for(const key of ["localName","tagName","ownerDocument","textContent"])Object.defineProperty(heldButton,key,{configurable:true,get(){observerReads++;throw Error("Actual authored observer getter: "+key)}});Object.defineProperty(heldButton,"getAttribute",{configurable:true,value(){observerReads++;throw Error("Actual authored observer getAttribute")}});';
++test('enabled DOM notifications preserve real insertion and attribute data without authored metadata reads',{timeout:6000},async t=>{
++ const f=await fixture(t),index=f.client.events.length;
++ await f.evaluate('(()=>{document.getElementById("parent").append(heldButton);'+poison+'return true})()');
++ assert.equal(await f.evaluate('observerReads'),0);
++ const insertion=f.client.events.slice(index).find(event=>event.method==='DOM.childNodeInserted'&&event.params.node.nodeId===f.nodeId);assert.ok(insertion,'actual insertion notification');
++ assert.equal(insertion.params.node.localName,'button');assert.equal(insertion.params.node.nodeName,'BUTTON');assert.deepEqual(insertion.params.node.attributes,['id','held']);assert.equal(insertion.params.node.childNodeCount,1);
++ await f.evaluate('heldButton.setAttribute("data-live","actual");true');
++ const attribute=f.client.events.slice(index).find(event=>event.method==='DOM.attributeModified'&&event.params.nodeId===f.nodeId&&event.params.name==='data-live');assert.ok(attribute,'actual attribute notification');assert.equal(attribute.params.value,'actual');
++ assert.equal(await f.evaluate('observerReads'),0);assert.deepEqual(f.client.events.slice(index).filter(event=>event.method==='Runtime.exceptionThrown'),[]);
++});
++test('real module discovery still evaluates an inserted nested module beside a poisoned ordinary node',{timeout:6000},async t=>{
++ const f=await fixture(t),index=f.client.events.length;
++ await f.evaluate('(()=>{const container=document.createElement("section"),script=document.createElement("script");script.type="module";script.textContent="globalThis.actualModuleExecutions=(globalThis.actualModuleExecutions??0)+1;export const actual=42;globalThis.actualModuleValue=actual";container.append(script);document.body.append(heldButton,container);'+poison+'return true})()');
++ const began=Date.now();let result;while(Date.now()-began<2500){result=await f.evaluate('({count:globalThis.actualModuleExecutions,value:globalThis.actualModuleValue})');if(result.count===1&&result.value===42)break;await new Promise(resolve=>setTimeout(resolve,2));}
++ assert.deepEqual(result,{count:1,value:42});assert.equal(await f.evaluate('observerReads'),0);assert.deepEqual(f.client.events.slice(index).filter(event=>event.method==='Runtime.exceptionThrown'),[]);
++});
+diff --git a/test/semantic-registry.test.js b/test/semantic-registry.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-registry.test.js
+@@ -0,0 +1,38 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import {Browser} from '../src/browser.js';
++import {createIsolatedWorld} from '../src/isolated-world.js';
++import {installNamespaceSerialization} from '../src/namespace-serialization.js';
++import {getHeapBinding} from '../src/native-heap.js';
++import {canonicalNodeImplementation,registerCDPNode,cdpNodeEntry,cdpNodeMap,cdpNodeOwner,registerCDPNodeRealm} from '../src/cdp-node-registry.js';
++const binding=getHeapBinding(),proofs=[];
++function physical(value,anchor,label){const original=Object.getPrototypeOf(value),before={selected:binding.sameRealm(value,anchor),host:binding.sameRealm(value,{}),global:binding.creationGlobal(value)===binding.creationGlobal(anchor)};let after;try{Object.setPrototypeOf(value,null);after={selected:binding.sameRealm(value,anchor),host:binding.sameRealm(value,{}),global:binding.creationGlobal(value)===binding.creationGlobal(anchor)}}finally{Object.setPrototypeOf(value,original)}assert.deepEqual(before,{selected:true,host:false,global:true});assert.deepEqual(after,before);proofs.push({label,before,after});console.log('SEMANTIC_CREATION_PROOF '+JSON.stringify({label,before,after}));}
++async function fixture(t){const browser=new Browser(),page=browser.createPage();t.after(()=>browser.close());await page.navigate('data:text/html,<main><button id="live">Actual</button><input id="file" type="file"></main>');return{browser,page,w:page.dom.window,context:page.context};}
++test('registry preserves genuine canonical first frontend and actual VM birth before and after prototype null', {timeout:6000},async t=>{
++ const{page,w,context}=await fixture(t),button=w.document.getElementById('live'),node=canonicalNodeImplementation(button),id=registerCDPNode(context,button);
++ physical(button,w.Object.prototype,'main button');physical(w.document,w.Object.prototype,'main document');assert.equal(cdpNodeEntry(context,id).node,node);assert.equal(cdpNodeMap(context).get(id),button);assert.equal(registerCDPNode(context,button),id);
++ const prototype=Object.getPrototypeOf(button);try{Object.setPrototypeOf(button,null);assert.equal(registerCDPNode(context,button),id);assert.equal(cdpNodeEntry(context,id).node,node);}finally{Object.setPrototypeOf(button,prototype);}
++});
++test('copied symbols, Proxy forwarding and lookalike public Node fields do not confer registry authority or invoke authored traps',{timeout:6000},async t=>{
++ const{w,context}=await fixture(t),node=w.document.getElementById('live');let reads=0;const fake=Object.create(Object.getPrototypeOf(node));Object.defineProperties(fake,Object.getOwnPropertyDescriptors(node));
++ const proxy=new Proxy(node,{get(){reads++;throw Error('public trap')},getOwnPropertyDescriptor(){reads++;throw Error('descriptor trap')},getPrototypeOf(){reads++;throw Error('prototype trap')}});
++ for(const value of[fake,proxy,{nodeType:1,ownerDocument:w.document}]){assert.equal(canonicalNodeImplementation(value),undefined);assert.throws(()=>registerCDPNode(context,value),/genuine registered/);}
++ assert.equal(reads,0);assert.ok(registerCDPNode(context,node)>0);
++});
++test('detachment retains actual IDs while navigation retires the true generation and never reuses its number',{timeout:6000},async t=>{
++ const{page,w,context}=await fixture(t),node=w.document.getElementById('live'),id=registerCDPNode(context,node);node.remove();assert.equal(cdpNodeMap(context).get(id),node);assert.ok(cdpNodeOwner(canonicalNodeImplementation(node),context));
++ await page.navigate('data:text/html,<button id="next">New actual</button>');assert.equal(cdpNodeMap(context).get(id),undefined);const next=registerCDPNode(context,page.dom.window.document.getElementById('next'));assert.ok(next>id);assert.throws(()=>registerCDPNode(context,node),/retired/);
++});
++test('genuine utility aliases retain the same backend ID while utility creation contexts and first frontends remain real',{timeout:6000},async t=>{
++ const{page,w,context}=await fixture(t),world=createIsolatedWorld(w,{signal:page.documentAbort.signal,onRealm:(global,actual)=>registerCDPNodeRealm(page,global,actual)});t.after(()=>world.dispose());
++ // Match production world-sessions' genuine utility DOMParser factory setup.
++ installNamespaceSerialization(world.global,{context:world.context,createDocument:world.createDocument});
++ const main=w.document.getElementById('live'),alias=world.evaluate('document.getElementById("live")');physical(alias,world.global.Object.prototype,'utility button');assert.notEqual(alias,main);assert.equal(canonicalNodeImplementation(alias),canonicalNodeImplementation(main));assert.equal(registerCDPNode(context,alias),registerCDPNode(context,main));assert.equal(cdpNodeMap(context).get(registerCDPNode(context,alias)),main);
++ const inactive=world.evaluate('new DOMParser().parseFromString("<actual/>","application/xml").documentElement'),id=registerCDPNode(context,inactive);assert.ok(cdpNodeEntry(context,id));assert.equal(cdpNodeOwner(canonicalNodeImplementation(inactive),context),undefined);
++});
++test('genuine nodes from a different actual BrowserContext cannot enter the selected registry',{timeout:6000},async t=>{
++ const{browser,context}=await fixture(t),other=browser.createPage(browser.createContext());await other.navigate('data:text/html,<button>Foreign</button>');const node=other.dom.window.document.querySelector('button');assert.throws(()=>registerCDPNode(context,node),/different/);const id=registerCDPNode(other.context,node);assert.equal(cdpNodeMap(context).get(id),undefined);
++});
++test('context-shared lookup outlives a session view and genuine Page.close removes its document identities',{timeout:6000},async t=>{
++ const{page,w,context}=await fixture(t),a=cdpNodeMap(context),b=cdpNodeMap(context),node=w.document.getElementById('live'),id=registerCDPNode(context,node);assert.notEqual(a,b);assert.equal(a.get(id),b.get(id));assert.equal(typeof a.clear,'undefined');page.close();assert.equal(a.get(id),undefined);assert.equal(b.get(id),undefined);
++});
+diff --git a/test/semantic-replacement.html b/test/semantic-replacement.html
+new file mode 100644
+--- /dev/null
++++ b/test/semantic-replacement.html
+@@ -0,0 +1 @@
++<!doctype html><html><head><title>Actual replacement document</title></head><body><button id="replacement">Replacement action</button></body></html>
+diff --git a/docs/reference/semantic-automation/lp-native-subset.json b/docs/reference/semantic-automation/lp-native-subset.json
+new file mode 100644
+--- /dev/null
++++ b/docs/reference/semantic-automation/lp-native-subset.json
+@@ -0,0 +1,892 @@
++{
++  "status": "ACTUAL20OF58REPLIES_FOR_IMPLEMENTED3METHODS",
++  "epochs": {
++    "r1": {
++      "rawSHA256": "166503d98e72a586e2bb382483c6ada1016aa4fc4077dc2b21a4f67e0784b1e0",
++      "origin": "http://127.0.0.1:46525",
++      "nodeIdentityLabels": {
++        "9": "#description",
++        "11": "form:0",
++        "45": "#email",
++        "47": "#check",
++        "51": "#choice",
++        "52": "#note",
++        "54": "#password",
++        "58": "#disabled-field",
++        "59": "#submit",
++        "14": "#outside",
++        "4": "#plain",
++        "18": "#role-button",
++        "20": "#actual-link",
++        "21": "#listener",
++        "22": "#focusable",
++        "67": "#aria-hidden",
++        "70": "#visible-again",
++        "76": "#slotted",
++        "36": "#child"
++      },
++      "rows": [
++        {
++          "rawRow": 3,
++          "name": "interactive default",
++          "method": "LP.getInteractiveElements",
++          "response": {
++            "id": 17,
++            "result": {
++              "elements": [
++                {
++                  "backendNodeId": 45,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": "Email from actual label",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "email",
++                  "inputType": "email",
++                  "value": "first@example.test",
++                  "elementName": "email",
++                  "placeholder": "mail fixture"
++                },
++                {
++                  "backendNodeId": 47,
++                  "tagName": "input",
++                  "role": "checkbox",
++                  "name": "Actual checkbox label",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "check",
++                  "inputType": "checkbox",
++                  "value": "yes",
++                  "elementName": "check"
++                },
++                {
++                  "backendNodeId": 51,
++                  "tagName": "select",
++                  "role": "combobox",
++                  "name": "Choose actual option",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "choice",
++                  "elementName": "choice"
++                },
++                {
++                  "backendNodeId": 52,
++                  "tagName": "textarea",
++                  "role": "textbox",
++                  "name": "Actual notes",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "note",
++                  "elementName": "note",
++                  "placeholder": "Actual notes"
++                },
++                {
++                  "backendNodeId": 54,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": null,
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "password",
++                  "inputType": "password",
++                  "value": "*****",
++                  "elementName": "password"
++                },
++                {
++                  "backendNodeId": 58,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": null,
++                  "type": "native",
++                  "disabled": true,
++                  "tabIndex": 0,
++                  "id": "disabled-field",
++                  "inputType": "text",
++                  "value": "disabled value",
++                  "elementName": "disabled-field"
++                },
++                {
++                  "backendNodeId": 59,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Save actual form",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "submit"
++                },
++                {
++                  "backendNodeId": 14,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": "Outside form label",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "outside",
++                  "inputType": "text",
++                  "value": "outside association",
++                  "elementName": "outside"
++                },
++                {
++                  "backendNodeId": 4,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Original action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "plain"
++                },
++                {
++                  "backendNodeId": 18,
++                  "tagName": "div",
++                  "role": "button",
++                  "name": "Role label",
++                  "type": "aria",
++                  "tabIndex": 0,
++                  "id": "role-button"
++                },
++                {
++                  "backendNodeId": 20,
++                  "tagName": "a",
++                  "role": "link",
++                  "name": "Actual link",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "actual-link",
++                  "href": "http://127.0.0.1:46525/destination?actual=1"
++                },
++                {
++                  "backendNodeId": 21,
++                  "tagName": "div",
++                  "role": null,
++                  "name": "Listener action",
++                  "type": "listener",
++                  "listeners": [
++                    "click"
++                  ],
++                  "tabIndex": -1,
++                  "id": "listener"
++                },
++                {
++                  "backendNodeId": 22,
++                  "tagName": "div",
++                  "role": null,
++                  "name": "Focusable div",
++                  "type": "focusable",
++                  "tabIndex": 0,
++                  "id": "focusable"
++                },
++                {
++                  "backendNodeId": 67,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "ARIA hidden action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "aria-hidden"
++                },
++                {
++                  "backendNodeId": 70,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Visible descendant",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "visible-again",
++                  "class": "visible-again"
++                },
++                {
++                  "backendNodeId": 76,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Slotted action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "slotted"
++                }
++              ]
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 4,
++          "name": "details real button",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 18,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 4,
++                "tagName": "button",
++                "role": "button",
++                "name": "Original action",
++                "isInteractive": true,
++                "id": "plain",
++                "selector": "#plain"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 5,
++          "name": "forms default",
++          "method": "LP.detectForms",
++          "response": {
++            "id": 19,
++            "result": {
++              "forms": [
++                {
++                  "backendNodeId": 11,
++                  "action": "/submit?owned=1",
++                  "method": "post",
++                  "fields": [
++                    {
++                      "backendNodeId": 45,
++                      "tagName": "input",
++                      "name": "email",
++                      "inputType": "email",
++                      "required": true,
++                      "disabled": false,
++                      "value": "first@example.test",
++                      "placeholder": "mail fixture"
++                    },
++                    {
++                      "backendNodeId": 47,
++                      "tagName": "input",
++                      "name": "check",
++                      "inputType": "checkbox",
++                      "required": false,
++                      "disabled": false,
++                      "value": "yes"
++                    },
++                    {
++                      "backendNodeId": 51,
++                      "tagName": "select",
++                      "name": "choice",
++                      "required": false,
++                      "disabled": false,
++                      "value": "b",
++                      "options": [
++                        {
++                          "value": "a",
++                          "text": "First choice"
++                        },
++                        {
++                          "value": "b",
++                          "text": "Second choice"
++                        }
++                      ]
++                    },
++                    {
++                      "backendNodeId": 52,
++                      "tagName": "textarea",
++                      "name": "note",
++                      "required": false,
++                      "disabled": false,
++                      "value": "Initial note",
++                      "placeholder": "Actual notes"
++                    },
++                    {
++                      "backendNodeId": 54,
++                      "tagName": "input",
++                      "name": "password",
++                      "inputType": "password",
++                      "required": false,
++                      "disabled": false,
++                      "value": "*****"
++                    },
++                    {
++                      "backendNodeId": 58,
++                      "tagName": "input",
++                      "name": "disabled-field",
++                      "inputType": "text",
++                      "required": false,
++                      "disabled": true,
++                      "value": "disabled value"
++                    },
++                    {
++                      "backendNodeId": 14,
++                      "tagName": "input",
++                      "name": "outside",
++                      "inputType": "text",
++                      "required": false,
++                      "disabled": false,
++                      "value": "outside association"
++                    }
++                  ]
++                }
++              ]
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 12,
++          "name": "required details params omitted",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 26,
++            "error": {
++              "code": -31998,
++              "message": "InvalidParam"
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 13,
++          "name": "required details field missing",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 27,
++            "error": {
++              "code": -31998,
++              "message": "MissingField"
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 15,
++          "name": "numeric-string actual backend",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 29,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 4,
++                "tagName": "button",
++                "role": "button",
++                "name": "Original action",
++                "isInteractive": true,
++                "id": "plain",
++                "selector": "#plain"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 16,
++          "name": "unknown details backend",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 30,
++            "error": {
++              "code": -31998,
++              "message": "InvalidNodeId"
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 19,
++          "name": "unknown interactive root",
++          "method": "LP.getInteractiveElements",
++          "response": {
++            "id": 33,
++            "error": {
++              "code": -31998,
++              "message": "InvalidNodeId"
++            },
++            "sessionId": "SID-1"
++          }
++        }
++      ]
++    },
++    "r2": {
++      "rawSHA256": "9ad2173e0461ccb0292499e79040b35c8d4e921c373f8b657308fcfd51f209ca",
++      "origin": "http://127.0.0.1:45907",
++      "nodeIdentityLabels": {
++        "4": "#plain",
++        "89": "#frame-action",
++        "33": "#shadow-host",
++        "87": "#slotted",
++        "83": "#shadow-action",
++        "44": "#email",
++        "53": "#check",
++        "47": "#choice",
++        "48": "#note",
++        "49": "#password",
++        "62": "#disabled-field",
++        "51": "#submit",
++        "14": "#outside",
++        "18": "#role-button",
++        "20": "#actual-link",
++        "21": "#listener",
++        "22": "#focusable",
++        "98": "#aria-hidden",
++        "72": "#visible-again",
++        "36": "#child",
++        "11": "form:0"
++      },
++      "rows": [
++        {
++          "rawRow": 10,
++          "name": "backend via second real session",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 26,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 4,
++                "tagName": "button",
++                "role": "button",
++                "name": "Original action",
++                "isInteractive": true,
++                "id": "plain",
++                "selector": "#plain"
++              }
++            },
++            "sessionId": "SID-2"
++          }
++        },
++        {
++          "rawRow": 13,
++          "name": "child details use child label",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 31,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 89,
++                "tagName": "button",
++                "role": "button",
++                "name": "Frame-owned action",
++                "isInteractive": true,
++                "id": "frame-action",
++                "selector": "#frame-action"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 15,
++          "name": "child interactive root",
++          "method": "LP.getInteractiveElements",
++          "response": {
++            "id": 33,
++            "result": {
++              "elements": [
++                {
++                  "backendNodeId": 89,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Frame-owned action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "frame-action"
++                }
++              ]
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 19,
++          "name": "shadow actual node details",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 41,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 83,
++                "tagName": "button",
++                "role": "button",
++                "name": "Shadow action",
++                "isInteractive": true,
++                "id": "shadow-action"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 21,
++          "name": "shadow host interactive walk",
++          "method": "LP.getInteractiveElements",
++          "response": {
++            "id": 43,
++            "result": {
++              "elements": [
++                {
++                  "backendNodeId": 87,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Slotted action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "slotted"
++                }
++              ]
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 22,
++          "name": "same node live details",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 45,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 4,
++                "tagName": "button",
++                "role": "button",
++                "name": "Changed action",
++                "isInteractive": true,
++                "id": "plain",
++                "selector": "#plain"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 23,
++          "name": "live interactive values",
++          "method": "LP.getInteractiveElements",
++          "response": {
++            "id": 46,
++            "result": {
++              "elements": [
++                {
++                  "backendNodeId": 44,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": "Email from actual label",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "email",
++                  "inputType": "email",
++                  "value": "changed@example.test",
++                  "elementName": "email",
++                  "placeholder": "mail fixture"
++                },
++                {
++                  "backendNodeId": 53,
++                  "tagName": "input",
++                  "role": "checkbox",
++                  "name": "Actual checkbox label",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "check",
++                  "inputType": "checkbox",
++                  "value": "yes",
++                  "elementName": "check"
++                },
++                {
++                  "backendNodeId": 47,
++                  "tagName": "select",
++                  "role": "combobox",
++                  "name": "Choose actual option",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "choice",
++                  "elementName": "choice"
++                },
++                {
++                  "backendNodeId": 48,
++                  "tagName": "textarea",
++                  "role": "textbox",
++                  "name": "Actual notes",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "note",
++                  "elementName": "note",
++                  "placeholder": "Actual notes"
++                },
++                {
++                  "backendNodeId": 49,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": null,
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "password",
++                  "inputType": "password",
++                  "value": "*****",
++                  "elementName": "password"
++                },
++                {
++                  "backendNodeId": 62,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": null,
++                  "type": "native",
++                  "disabled": true,
++                  "tabIndex": 0,
++                  "id": "disabled-field",
++                  "inputType": "text",
++                  "value": "disabled value",
++                  "elementName": "disabled-field"
++                },
++                {
++                  "backendNodeId": 51,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Save actual form",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "submit"
++                },
++                {
++                  "backendNodeId": 14,
++                  "tagName": "input",
++                  "role": "textbox",
++                  "name": "Outside form label",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "outside",
++                  "inputType": "text",
++                  "value": "outside association",
++                  "elementName": "outside"
++                },
++                {
++                  "backendNodeId": 4,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Changed action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "plain"
++                },
++                {
++                  "backendNodeId": 18,
++                  "tagName": "div",
++                  "role": "button",
++                  "name": "Role label",
++                  "type": "aria",
++                  "tabIndex": 0,
++                  "id": "role-button"
++                },
++                {
++                  "backendNodeId": 20,
++                  "tagName": "a",
++                  "role": "link",
++                  "name": "Actual link",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "actual-link",
++                  "href": "http://127.0.0.1:45907/destination?actual=1"
++                },
++                {
++                  "backendNodeId": 21,
++                  "tagName": "div",
++                  "role": null,
++                  "name": "Listener action",
++                  "type": "listener",
++                  "listeners": [
++                    "click"
++                  ],
++                  "tabIndex": -1,
++                  "id": "listener"
++                },
++                {
++                  "backendNodeId": 22,
++                  "tagName": "div",
++                  "role": null,
++                  "name": "Focusable div",
++                  "type": "focusable",
++                  "tabIndex": 0,
++                  "id": "focusable"
++                },
++                {
++                  "backendNodeId": 98,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "ARIA hidden action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "aria-hidden"
++                },
++                {
++                  "backendNodeId": 72,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Visible descendant",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "visible-again",
++                  "class": "visible-again"
++                },
++                {
++                  "backendNodeId": 87,
++                  "tagName": "button",
++                  "role": "button",
++                  "name": "Slotted action",
++                  "type": "native",
++                  "tabIndex": 0,
++                  "id": "slotted"
++                }
++              ]
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 24,
++          "name": "live forms values",
++          "method": "LP.detectForms",
++          "response": {
++            "id": 47,
++            "result": {
++              "forms": [
++                {
++                  "backendNodeId": 11,
++                  "action": "/submit?owned=1",
++                  "method": "post",
++                  "fields": [
++                    {
++                      "backendNodeId": 44,
++                      "tagName": "input",
++                      "name": "email",
++                      "inputType": "email",
++                      "required": true,
++                      "disabled": false,
++                      "value": "changed@example.test",
++                      "placeholder": "mail fixture"
++                    },
++                    {
++                      "backendNodeId": 53,
++                      "tagName": "input",
++                      "name": "check",
++                      "inputType": "checkbox",
++                      "required": false,
++                      "disabled": false,
++                      "value": "yes"
++                    },
++                    {
++                      "backendNodeId": 47,
++                      "tagName": "select",
++                      "name": "choice",
++                      "required": false,
++                      "disabled": false,
++                      "value": "b",
++                      "options": [
++                        {
++                          "value": "a",
++                          "text": "First choice"
++                        },
++                        {
++                          "value": "b",
++                          "text": "Second choice"
++                        }
++                      ]
++                    },
++                    {
++                      "backendNodeId": 48,
++                      "tagName": "textarea",
++                      "name": "note",
++                      "required": false,
++                      "disabled": false,
++                      "value": "Initial note",
++                      "placeholder": "Actual notes"
++                    },
++                    {
++                      "backendNodeId": 49,
++                      "tagName": "input",
++                      "name": "password",
++                      "inputType": "password",
++                      "required": false,
++                      "disabled": false,
++                      "value": "*****"
++                    },
++                    {
++                      "backendNodeId": 62,
++                      "tagName": "input",
++                      "name": "disabled-field",
++                      "inputType": "text",
++                      "required": false,
++                      "disabled": true,
++                      "value": "disabled value"
++                    },
++                    {
++                      "backendNodeId": 14,
++                      "tagName": "input",
++                      "name": "outside",
++                      "inputType": "text",
++                      "required": false,
++                      "disabled": false,
++                      "value": "outside association"
++                    }
++                  ]
++                }
++              ]
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 27,
++          "name": "detached actual backend details",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 51,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 4,
++                "tagName": "button",
++                "role": "button",
++                "name": "Changed action",
++                "isInteractive": true,
++                "id": "plain"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 29,
++          "name": "frameless backend details",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 55,
++            "error": {
++              "code": -31998,
++              "message": "InvalidNodeId"
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 31,
++          "name": "details with authored getters",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 58,
++            "result": {
++              "nodeDetails": {
++                "backendNodeId": 4,
++                "tagName": "button",
++                "role": "button",
++                "name": "Changed action",
++                "isInteractive": true,
++                "id": "plain",
++                "selector": "#plain"
++              }
++            },
++            "sessionId": "SID-1"
++          }
++        },
++        {
++          "rawRow": 35,
++          "name": "old backend after real navigation",
++          "method": "LP.getNodeDetails",
++          "response": {
++            "id": 64,
++            "error": {
++              "code": -31998,
++              "message": "InvalidNodeId"
++            },
++            "sessionId": "SID-1"
++          }
++        }
++      ]
++    }
++  },
++  "note": "Raw fields retained. Only correlated transport envelope IDs/session IDs are removed by comparison; backend IDs map to actual DOM identities; ephemeral origin is mapped explicitly. R1 terminal1002 remains outside these20 method replies. AX/tree remain unimplemented."
++}

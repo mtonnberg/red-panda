@@ -1,6 +1,9 @@
-import {registerManagedLifecycle,beginManagedWrittenCycle,completeManagedWrittenEOF,isTrustedLifecycleEvent} from './managed-document-lifecycle.js';
+import {hasPendingWindowFactoryTask,claimInitialBlankWindowTask} from './window-task-capture.js';
+import {registerManagedLifecycle,beginManagedWrittenCycle,completeManagedWrittenEOF,completeManagedInitialBlank,isTrustedLifecycleEvent} from './managed-document-lifecycle.js';
 // Post-load Document resets preserve the existing Window and JavaScript realm.
 import { createRequire } from 'node:module';
+import {readFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import { createWriteParser } from './write-created-parser.js';
 import { installListenerOwnership } from './listener-ownership.js';
 const require = createRequire(import.meta.url);
@@ -12,7 +15,8 @@ const RequestManager = require('jsdom/lib/jsdom/browser/resources/request-manage
 const PerDocumentResourceLoader = require('jsdom/lib/jsdom/browser/resources/per-document-resource-loader.js');
 const { fireAnEvent } = require('jsdom/lib/jsdom/living/helpers/events.js');
 const contexts = new WeakMap();
-let patched = false, underlyingOpen;
+let patched = false, underlyingOpen,initialSourceVerified=false;
+function verifyInitialProducerSource(){if(initialSourceVerified)return;const pins=[['jsdom/lib/jsdom/living/nodes/HTMLFrameElement-impl.js', 'eb8cca6aa971e1746c0c06860c3e8cfa871c0c52deba46ae438ef15f0bed482a'], ['jsdom/lib/jsdom/living/nodes/Document-impl.js', '28a1ac5b19463cc2db29b59d5721ce20299b998f00a222ac2ab74117dc66ba0d']];if(require('jsdom/package.json').version!=='26.1.0')throw new Error('Initial frame jsdom version changed');for(const[file,hash]of pins)if(createHash('sha256').update(readFileSync(require.resolve(file))).digest('hex')!==hash)throw new Error('Pinned initial frame producer source changed');initialSourceVerified=true;}
 function active(context) {
   return !context.disposed && !context.page.closed && !context.record.signal?.aborted &&
     implForWrapper(context.window.document) === context.document;
@@ -99,6 +103,7 @@ function patch() {
   };
   DocumentImpl.prototype.close = function (...args) {
     const context = contexts.get(this), cycle = context?.current;
+    if(context?.initialBlankPending&&active(context)&&!cycle){if(args.length===1&&args[0]===false&&context.record.parserDone)context.placeholderCloseObserved=true;return;}
     if (context && this._parsingMode === 'html' && !active(context)) return;
     if (context && active(context) && this._parsingMode === 'html' && this._throwOnDynamicMarkupInsertionCounter) throw new context.Exception('Cannot close document during custom element construction', 'InvalidStateError');
     if (cycle && active(context)) {
@@ -121,6 +126,8 @@ export function installDocumentReset(page, window, record, makeParser, finishPar
     loaded: false, disposed: false, generation: 0, current: null, retired: new Set() };
   contexts.set(record.document, context);
   context.managedLifecycleRegistered = registerManagedLifecycle(context);
+  if(page.registry&&page.url==='about:blank'&&hasPendingWindowFactoryTask(window,context.document))verifyInitialProducerSource();
+  context.initialBlankPending=!!(context.managedLifecycleRegistered&&page.registry&&page.url==='about:blank'&&hasPendingWindowFactoryTask(window,context.document));
   context.ownership.add(window.document, 'DOMContentLoaded', () => {
     if (active(context) && context.current && !page.registry) page.emit?.('domContentLoaded');
   });
@@ -142,20 +149,18 @@ export function installDocumentReset(page, window, record, makeParser, finishPar
   return context;
 }
 
-// Complete only the actual, parsed empty about:blank placeholder. Its queued
-// native close has not run yet; retire those queues and use the real synchronous
-// Document.close path. The native load-to-frame bridge still dispatches its real
-// initial load, and subsequent writes create an independent open parser.
-export function completeInitialBlankFrame(window) {
-  const context = contexts.get(implForWrapper(window.document));
-  if (!context || !active(context) || context.loaded || context.current || !context.record.parserDone ||
-      context.page.url !== 'about:blank' || context.document.scripts.length ||
-      context.document._requestManager.size() || context.record.styles.size) return false;
-  const document = context.document;
-  document._queue.paused = true; document._deferQueue.paused = true;
-  document._deferQueue.setListener(null); document._asyncQueue.setListener(null);
-  context.page.moduleScripts?.start();
-  document.close(true);
-  context.initialBlank = true;
-  return true;
+// Complete the real literal blank parser before append returns, as measured in
+// Native. Canonical placeholder close was deferred until its bridge identity is
+// available. Other initial/network/srcdoc/XML close paths remain unchanged.
+export function completeInitialBlankFrame(window,listenerCheckpoint){
+ const context=contexts.get(implForWrapper(window.document));
+ if(!context?.initialBlankPending)return false;
+ if(!active(context)||context.loaded||context.current||!context.record.parserDone||context.page.url!=='about:blank'||context.document.scripts.length||context.document._requestManager.size()||context.record.styles.size)throw new Error('Actual initial blank EOF ownership boundary');
+ if(!context.placeholderCloseObserved)throw new Error('Actual canonical placeholder close was not observed');
+ context.ownership.retireSince(window.document,'load',listenerCheckpoint,1);
+ claimInitialBlankWindowTask(window,context.document);
+ const document=context.document;document._queue.paused=true;document._deferQueue.paused=true;document._deferQueue.setListener(null);document._asyncQueue.setListener(null);
+ context.initialBlankPending=false;context.initialBlank=true;
+ if(!completeManagedInitialBlank(context))throw new Error('Actual initial blank lifecycle producer unavailable');
+ return true;
 }

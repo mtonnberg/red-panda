@@ -1,0 +1,207 @@
+--- a/src/platform-codec.js
++++ b/src/platform-codec.js
+@@ -1,3 +1,4 @@
++import {workerPerformanceCloneRejected} from './worker-performance.js';
+ import { cryptoKeyRecord, validCryptoKeyRecord, deserializeCryptoKey } from './web-crypto.js';
+ import { domExceptionRecord, validDOMExceptionRecord, deserializeDOMException, captureDOMExceptionFactory } from './worker-dom-exception.js';
+ import { videoFrameRecord, validVideoFrameRecord, deserializeVideoFrame } from './video-frame.js';
+@@ -31,6 +32,7 @@
+  const failure=message=>new Exception(message,'DataCloneError');
+  function serialize(value){
+   const provenance=platformFactoryRecord(value);
++  if(workerPerformanceCloneRejected(value))throw failure('The object can not be cloned');
+   if(provenance?.kind==='PeriodicWave'||provenance?.kind==='OscillatorNode')throw failure('The object can not be cloned');
+   const exception=domExceptionRecord(value);if(exception)return exception;
+   if(isCanvasCloneRejected(value))throw failure('The object can not be cloned');
+--- /dev/null
++++ b/src/worker-performance.js
+@@ -0,0 +1,149 @@
++import {isContext,runInContext} from 'node:vm';
++import {performance as clock} from 'node:perf_hooks';
++import {registerPlatformFactory} from './platform-factories.js';
++import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
++
++// Actual per-actor timelines and successful public allocations remain Host-private.
++// The Node clock supplies time only; its public Performance objects are never used.
++const NativeEventTarget=globalThis.EventTarget;
++const installed=new WeakMap(),performances=new WeakMap(),entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap();
++export function workerPerformanceCloneRejected(value){return performances.has(value)||entries.has(value)||observers.has(value)||lists.has(value)}
++
++function factory(g,b){
++ 'use strict';
++ const create=g.Object.create,define=g.Object.defineProperty,apply=g.Reflect.apply,freeze=g.Object.freeze,ArrayType=g.Array,TypeErrorType=g.TypeError,Exception=g.DOMException,StringType=g.String,symbolDescription=g.Object.getOwnPropertyDescriptor(g.Symbol.prototype,'description').get,isFinite=g.Number.isFinite,truncate=g.Math.trunc;
++ const invalid=()=>new TypeErrorType('invalid argument'),illegal=()=>new TypeErrorType('Illegal invocation');
++ const text=value=>{if(typeof value==='symbol')throw new TypeErrorType('Cannot convert a Symbol value to a string');return StringType(value)};
++ const number=value=>{if(typeof value==='bigint')throw new TypeErrorType('Cannot convert a BigInt value to a number');return +value};
++ const valid=(value,kind)=>{if(!b.has(value,kind))throw illegal()};
++ const array=values=>{const result=new ArrayType(values.length);for(let i=0;i<values.length;i++)define(result,i,{value:values[i],writable:true,enumerable:true,configurable:true});return result};
++ const prototypes={};
++ function Performance(){throw new TypeErrorType('Illegal Constructor')}
++ const pp=create(g.EventTarget.prototype);
++ define(Performance,'prototype',{value:pp,writable:false});
++ function PerformanceEntry(){throw new TypeErrorType('Illegal Constructor')}
++ const ep=PerformanceEntry.prototype;define(PerformanceEntry,'prototype',{writable:false});
++ const entryMembers={
++  get name(){valid(this,'entry');return b.read(this,'name')},
++  get entryType(){valid(this,'entry');return b.read(this,'entryType')},
++  get startTime(){valid(this,'entry');return b.read(this,'startTime')},
++  get duration(){valid(this,'entry');return b.read(this,'duration')},
++  toJSON(){valid(this,'entry');return{name:b.read(this,'name'),entryType:b.read(this,'entryType'),startTime:b.read(this,'startTime'),duration:b.read(this,'duration')}},
++ };
++ for(const key of g.Reflect.ownKeys(entryMembers))define(ep,key,{...g.Object.getOwnPropertyDescriptor(entryMembers,key),enumerable:true});
++ function PerformanceMark(){throw new TypeErrorType('Illegal Constructor')}
++ function PerformanceMeasure(){throw new TypeErrorType('Illegal Constructor')}
++ function PerformanceResourceTiming(){throw new TypeErrorType('Illegal Constructor')}
++ function PerformanceNavigationTiming(){throw new TypeErrorType('Illegal Constructor')}
++ for(const C of[PerformanceMark,PerformanceMeasure,PerformanceResourceTiming])define(C,'prototype',{value:create(ep),writable:false});
++ define(PerformanceNavigationTiming,'prototype',{value:create(PerformanceResourceTiming.prototype),writable:false});
++ const markMembers={get detail(){valid(this,'PerformanceMark');return b.read(this,'detail')}},measureMembers={get detail(){valid(this,'PerformanceMeasure');return b.read(this,'detail')}};
++ define(PerformanceMark.prototype,'detail',{...g.Object.getOwnPropertyDescriptor(markMembers,'detail'),enumerable:true});
++ define(PerformanceMeasure.prototype,'detail',{...g.Object.getOwnPropertyDescriptor(measureMembers,'detail'),enumerable:true});
++ function PerformanceObserverEntryList(){throw new TypeErrorType('Illegal Constructor')}
++ define(PerformanceObserverEntryList,'prototype',{writable:false});
++ const listMembers={
++  getEntries(){valid(this,'list');return array(b.selectList(this))},
++  getEntriesByType(type){valid(this,'list');if(!arguments.length)throw invalid();return array(b.selectList(this,undefined,text(type)))},
++  getEntriesByName(name,type){valid(this,'list');if(!arguments.length)throw invalid();return array(b.selectList(this,text(name),type===undefined?undefined:text(type)))},
++ };
++ for(const[name,value]of g.Object.entries(listMembers))define(PerformanceObserverEntryList.prototype,name,{value,writable:true,enumerable:true,configurable:true});
++ function PerformanceObserver(callback){if(!new.target||typeof callback!=='function')throw invalid();b.observer(this,callback)}
++ const op=PerformanceObserver.prototype;define(PerformanceObserver,'prototype',{writable:false});
++ const observerMethods={
++  observe(options){
++   valid(this,'observer');if(options===null||!['object','function'].includes(typeof options))throw invalid();
++   const entryTypes=options.entryTypes,type=options.type,multiple=entryTypes!==undefined,single=type!==undefined;
++   if(multiple===single)throw new TypeErrorType('');
++   const mode=multiple?'multiple':'single';
++   if(b.mode(this)!==null&&b.mode(this)!==mode)throw new Exception('The object can not be modified in this way','InvalidModificationError');
++   const types=[];if(multiple){if(entryTypes===null||typeof entryTypes[g.Symbol.iterator]!=='function')throw invalid();for(const value of entryTypes)types.push(text(value))}else types.push(text(type));
++   b.observe(this,mode,types,single&&!!options.buffered);
++  },
++  disconnect(){valid(this,'observer');b.disconnect(this)},
++  takeRecords(){valid(this,'observer');return array(b.take(this))},
++ };
++ for(const[name,value]of g.Object.entries(observerMethods))define(op,name,{value,writable:true,enumerable:true,configurable:true});
++ const supportedGetter={get supportedEntryTypes(){return['mark','measure','navigation','resource']}};define(PerformanceObserver,'supportedEntryTypes',{...g.Object.getOwnPropertyDescriptor(supportedGetter,'supportedEntryTypes'),enumerable:true,configurable:true});
++ function resolveTime(owner,value,fallback){
++  if(value===undefined)return fallback;if(typeof value==='number'){if(value<0)throw new TypeErrorType('');return value}
++  const result=b.resolveMark(owner,text(value));if(result.found)return result.value;
++  throw new Exception('The string did not match the expected pattern','SyntaxError');
++ }
++ function append(owner,kind,name,startTime,duration,detail){const value=create(prototypes[kind]);b.entry(owner,value,kind,name,startTime,duration,detail);return value}
++ const methods={
++  now(){valid(this,'performance');return b.now(this)},
++  mark(name,options={}){valid(this,'performance');if(!arguments.length)throw invalid();name=typeof name==='symbol'?StringType(apply(symbolDescription,name,[])):text(name);options=options??{};if(!['object','function'].includes(typeof options))throw invalid();const detail=options.detail,raw=options.startTime,start=raw===undefined?b.now(this):number(raw);if(start<0)throw new TypeErrorType('');return append(this,'PerformanceMark',name,start,0,detail===undefined?null:detail)},
++  measure(name,startOrOptions,endMark){
++   valid(this,'performance');if(!arguments.length)throw invalid();name=text(name);let start,end,duration,detail=null;
++   if(startOrOptions!==null&&typeof startOrOptions==='object'){
++    const o=startOrOptions,rawDuration=o.duration;duration=rawDuration===undefined?undefined:number(rawDuration);if(duration<0)throw new TypeErrorType('');
++    const rawStart=o.start,rawEnd=o.end;if(rawStart!==undefined)start=resolveTime(this,rawStart,0);if(rawEnd!==undefined)end=resolveTime(this,rawEnd,b.now(this));
++    if(start===undefined)start=duration!==undefined&&end!==undefined?end-duration:0;if(end===undefined)end=duration!==undefined?start+duration:b.now(this);const rawDetail=o.detail;detail=rawDetail===undefined?null:rawDetail;
++   }else{start=resolveTime(this,startOrOptions,0);end=resolveTime(this,endMark,b.now(this))}
++   duration=duration===undefined?end-start:duration;if(start<0||duration<0)throw new TypeErrorType('');return append(this,'PerformanceMeasure',name,start,duration,detail);
++  },
++  clearMarks(name){valid(this,'performance');b.clear(this,'mark',arguments.length?text(name):undefined)},
++  clearMeasures(name){valid(this,'performance');b.clear(this,'measure',arguments.length?text(name):undefined)},
++  setResourceTimingBufferSize(size){valid(this,'performance');if(!arguments.length)throw invalid();const value=number(size);b.bufferSize(this,isFinite(value)?truncate(value)>>>0:0)},
++  clearResourceTimings(){valid(this,'performance');b.clear(this,'resource')},
++  getEntries(){valid(this,'performance');return array(b.select(this))},
++  getEntriesByType(type){valid(this,'performance');if(!arguments.length)throw invalid();return array(b.select(this,undefined,text(type)))},
++  getEntriesByName(name,type){valid(this,'performance');if(!arguments.length)throw invalid();return array(b.select(this,text(name),type===undefined?undefined:text(type)))},
++ };
++ for(const[name,value]of g.Object.entries(methods))define(pp,name,{value,writable:true,enumerable:true,configurable:true});
++ const originGetter={get timeOrigin(){valid(this,'performance');return b.origin(this)}};define(pp,'timeOrigin',{...g.Object.getOwnPropertyDescriptor(originGetter,'timeOrigin'),enumerable:true,configurable:true});
++ define(pp,'onresourcetimingbufferfull',{get(){valid(this,'performance');return b.handler(this)},set(value){valid(this,'performance');b.handler(this,typeof value==='function'?value:null)},enumerable:true,configurable:true});
++ define(pp,'constructor',{value:Performance,writable:true,enumerable:true,configurable:true});
++ define(pp,g.Symbol.toStringTag,{value:'Performance',configurable:true});
++ for(const C of[PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceResourceTiming,PerformanceNavigationTiming,PerformanceObserverEntryList,PerformanceObserver]){
++  prototypes[C.name]=C.prototype;define(C.prototype,'constructor',{value:C,writable:true,configurable:true});
++  for(const key of g.Object.getOwnPropertyNames(C.prototype))if(key!=='constructor')define(C.prototype,key,{...g.Object.getOwnPropertyDescriptor(C.prototype,key),enumerable:true});
++  define(C.prototype,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true});
++ }
++ define(g,'Performance',{value:Performance,writable:true,configurable:true});
++ const performance=create(pp);b.performance(performance);const globalGetter={get performance(){if(this!==null&&this!==undefined&&!b.globalReceiver(this))throw illegal();return performance}};define(g,'performance',{...g.Object.getOwnPropertyDescriptor(globalGetter,'performance'),enumerable:true,configurable:true});
++ return{list(records){const value=create(PerformanceObserverEntryList.prototype);b.list(value,records);return value},invoke(callback,observer,list){return apply(callback,observer,[list,observer])}};
++}
++
++export function installWorkerPerformance(realm,{context,evaluate=source=>realm.eval(source),events,setTimer,clearTimer,reportError=()=>{},active=()=>true,signal,origin=clock.now()}={}){
++ if(installed.has(realm))return installed.get(realm);
++ // This is the actual successful Node VM producer, never an authored globalThis property.
++ if(!isContext(context)||runInContext('this',context)!==realm)throw new TypeError('Worker Performance requires its actual owning VM Context');
++ if(typeof setTimer!=='function'||typeof clearTimer!=='function'||!events?.registerTarget)throw new TypeError('Worker Performance requires actual Worker event/timer ownership');
++ for(const kind of['Performance','PerformanceEntry','PerformanceMark','PerformanceMeasure','PerformanceResourceTiming','PerformanceNavigationTiming','PerformanceObserver','PerformanceObserverEntryList'])registerPlatformFactoryKind(kind);
++ const state={timeline:[],registered:new Set(),stopped:false,timer:undefined,origin,timeOrigin:clock.timeOrigin+origin,resourceLimit:250,handler:null};let fronts;
++ const alive=()=>!state.stopped&&active();
++ const own=(value,kind,implementation)=>registerPlatformFactory(value,{kind,implementation,globalObject:realm});
++ const now=()=>Math.max(0,clock.now()-state.origin);state.now=now;
++ const select=(values,name,type)=>values.filter(v=>{const e=entries.get(v);return(name===undefined||e.name===name)&&(type===undefined||e.entryType===type)}).slice().sort((a,b)=>entries.get(a).startTime-entries.get(b).startTime);
++ function deliver(){
++  state.timer=undefined;if(!alive())return;
++  for(const observer of [...state.registered]){
++   if(!alive())break;const data=observers.get(observer);if(!state.registered.has(observer)||!data.records.length)continue;
++   const list=fronts.list(data.records.splice(0));try{fronts.invoke(data.callback,observer,list)}catch(error){reportError(error)}
++  }
++ }
++ function schedule(){if(alive()&&state.timer===undefined)state.timer=setTimer(deliver,0)}state.schedule=schedule;
++ const bridge={
++  globalReceiver(value){return value===realm||value===context},
++  has(value,kind){if(kind==='performance')return performances.has(value);if(kind==='entry')return entries.has(value);if(kind==='observer')return observers.has(value);if(kind==='list')return lists.has(value);return entries.get(value)?.kind===kind},
++  read(value,key){return entries.get(value)[key]},now(value){return performances.get(value).now()},origin(value){return performances.get(value).timeOrigin},
++  performance(value){events.registerTarget(value,new NativeEventTarget(),'Performance');performances.set(value,state);own(value,'Performance',state)},
++  entry(owner,value,kind,name,startTime,duration,detail){const data={kind,name,entryType:kind==='PerformanceMark'?'mark':'measure',startTime,duration,detail};entries.set(value,data);own(value,kind,data);const target=performances.get(owner);if(!target.stopped){target.timeline.push(value);for(const observer of target.registered){const data=observers.get(observer);if(data.types.has(entries.get(value).entryType))data.records.push(value)}target.schedule()}},
++  select(value,name,type){return select(performances.get(value).timeline,name,type)},
++  clear(value,type,name){const timeline=performances.get(value).timeline;for(let i=timeline.length-1;i>=0;i--){const e=entries.get(timeline[i]);if(e.entryType===type&&(name===undefined||e.name===name))timeline.splice(i,1)}},
++  resolveMark(owner,name){const target=performances.get(owner);for(let i=target.timeline.length-1;i>=0;i--){const e=entries.get(target.timeline[i]);if(e.entryType==='mark'&&e.name===name)return{found:true,value:e.startTime}}return{found:false}},
++  bufferSize(value,size){performances.get(value).resourceLimit=size},handler(value,...args){const data=performances.get(value);if(args.length)data.handler=args[0];return data.handler},
++  observer(value,callback){const data={owner:state,callback,mode:null,types:new Set(),records:[]};observers.set(value,data);own(value,'PerformanceObserver',data)},
++  mode(value){return observers.get(value).mode},
++  observe(value,mode,types,buffered){const data=observers.get(value),owner=data.owner;data.mode=mode;if(mode==='multiple')data.types.clear();for(let i=0;i<types.length;i++){const type=types[i];if(['mark','measure','navigation','resource'].includes(type))data.types.add(type)}if(buffered)for(const entry of owner.timeline)if(data.types.has(entries.get(entry).entryType))data.records.push(entry);if(data.types.size&&!owner.stopped)owner.registered.add(value);if(data.records.length)owner.schedule()},
++  disconnect(value){const data=observers.get(value);data.owner.registered.delete(value);data.records.length=0;data.types.clear()},
++  take(value){return observers.get(value).records.splice(0)},
++  list(value,records){lists.set(value,records);own(value,'PerformanceObserverEntryList',records)},
++  selectList(value,name,type){return select(lists.get(value),name,type)},
++ };
++ fronts=evaluate(`(${factory.toString()})`)(realm,bridge);
++ function dispose(){if(state.stopped)return;state.stopped=true;if(state.timer!==undefined)clearTimer(state.timer);state.timer=undefined;for(const observer of state.registered){const data=observers.get(observer);data.records.length=0;data.types.clear()}state.registered.clear();state.timeline.length=0;signal?.removeEventListener('abort',dispose)}
++ const controller={dispose};installed.set(realm,controller);if(signal?.aborted)dispose();else signal?.addEventListener('abort',dispose,{once:true});return controller;
++}
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -9,6 +9,8 @@
+ import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
+ import { installWebCrypto } from './web-crypto.js';
+ import {installScheduler} from './scheduler.js';
++import {installWorkerPerformance} from './worker-performance.js';
++import {performance as workerPerformanceClock} from 'node:perf_hooks';
+ import {installWorkerDOMException} from './worker-dom-exception.js';
+ import {installWorkerEvents} from './worker-events.js';
+ import {installWorkerAbort} from './worker-abort.js';
+@@ -301,8 +303,9 @@
+   };
+   const sandbox = { __bridge: bridge, __url: workerData.url, __name: workerData.name, __navigator: workerData.navigator,
+     URL, URLSearchParams, TextEncoder, TextDecoder, Headers, Request, Response, FormData, Blob, File,
+-    AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
++    AbortController, AbortSignal, DOMException, crypto: globalThis.crypto,
+     atob, btoa };
++  const performanceOrigin=workerPerformanceClock.now();
+   context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
+   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
+   fetchTypeError=realm.TypeError;
+@@ -323,7 +326,7 @@
+     const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
+     globalThis.dispatchEvent = dispatchGlobal;
+     let reportingError = false;
+-    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); eventPlatform.trust(event); if (dispatchGlobal(event)) bridge.report(error); } finally { reportingError = false; } };
++    globalThis.__dispatchError = (error,message) => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: message===undefined?String(error?.message ?? error):message, error, cancelable: true }); eventPlatform.trust(event); if (dispatchGlobal(event)) bridge.report(error); } finally { reportingError = false; } };
+     globalThis.postMessage = (data, transfer) => bridge.postMessage(data, transfer);
+     globalThis.close = () => bridge.close();
+     globalThis.importScripts = (...urls) => bridge.importScripts(...urls);
+@@ -352,6 +355,8 @@
+   abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
+   installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
+   dispatchError=vm.runInContext('__dispatchError',context);
++  const performanceErrorText=realm.String;
++  installWorkerPerformance(realm,{context,evaluate,events:eventPlatform,origin:performanceOrigin,signal:lifetime.signal,active:()=>!closed,setTimer:(callback,delay)=>bridge.timer(callback,delay,[],false),clearTimer:bridge.clear,reportError:value=>dispatchError(value,performanceErrorText(value))});
+   vm.runInContext('delete globalThis.__dispatchError',context);
+   emit = vm.runInContext('__emitMessage', context);
+   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);

@@ -1,5 +1,10 @@
+import {captureCDPDocument} from './cdp-node-registry.js';
+import {installModelContext} from './model-context.js';
+import {openHTTPCache} from './http-cache.js';
+import {captureWindowFactoryTask} from './window-task-capture.js';
 import {prepareInitialDocumentParser} from './initial-document-parser.js';
 import {captureDocumentEncoding,decodeHTMLResponse} from './document-encoding.js';
+import{registerURLBlockPage,urlBlockOwnerForPage,urlBlockOwnerForContext,assertURLAllowed,urlBlockedError}from'./url-blocking.js';
 import {installHTMLBaseURLs} from './html-base-urls.js';
 import {installHTMLHandlerSlots} from './html-handler-slots.js';
 import {installFileInputs} from './file-inputs.js';
@@ -46,7 +51,7 @@ import {installFrameActivity} from './frame-activity.js';
 import {installHeapFactories,prepareHeapRealm} from './heap-registry.js';
 import {prepareUtilityPlatform} from './utility-platform.js';
 import {alignMainIDLPrototypes} from './main-idl-prototypes.js';
-import {createInvocationTrampoline} from './invocation.js';
+import {createInvocationTrampoline,notifyInvocationExit} from './invocation.js';
 import {captureWorkerCreator} from './worker-apis.js';
 import {installServiceWorkers} from './service-workers.js';
 import { installDOMLifecycle } from './dom-lifecycle.js';
@@ -179,6 +184,7 @@ export class Browser extends EventEmitter {
     this.syncHTTP = new SyncHTTP();
     this.runtimeBinding = options.runtimeBinding ?? getRuntimeBinding();
     this.collectionsBinding = options.collectionsBinding ?? (defaultCollectionsBinding ??= loadCollectionsBinding());
+    this.httpCache = openHTTPCache(options);
     this.contexts = new Map([['default', { id: 'default', cookies: new CookieJar() }]]);
     registerPermissionContext(this.contexts.get('default'),defaultPermissionOwner(this));
     this.pages = new Map();
@@ -196,7 +202,7 @@ export class Browser extends EventEmitter {
     const context = this.contexts.get(contextId);
     if (!context) throw new Error('Unknown browser context');
     registerJavaScriptDialogContext(this,context);
-    const page = new Page(this, context, {permissionOwner:options?.permissionOwner});
+    const page = new Page(this, context, {permissionOwner:options?.permissionOwner,urlBlockOwner:options?.urlBlockOwner});
     this.pages.set(page.id, page);
     page.once('close', () => { this.pages.delete(page.id); this.emit('targetDestroyed', page); });
     this.emit('targetCreated', page);
@@ -216,14 +222,15 @@ export class Browser extends EventEmitter {
     disposeJavaScriptDialogContext(this,context);
     disposePermissionContext(context);
   }
-  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); closePermissionBrowser(this); for(const context of this.contexts.values())disposeNetworkCapture(context);this.syncHTTP.close(); }
+  close() { for (const page of [...this.pages.values()]) page.close(); disposeJavaScriptDialogs(this); closePermissionBrowser(this); for(const context of this.contexts.values())disposeNetworkCapture(context);this.syncHTTP.close();this.httpCache?.close(); }
 }
 
 export class Page extends EventEmitter {
-  constructor(browser, context, {popup,permissionOwner}={}) {
+  constructor(browser, context, {popup,permissionOwner,urlBlockOwner}={}) {
     super();
     this.browser = browser;
     this.context = context;
+    registerURLBlockPage(this,urlBlockOwner??(popup?urlBlockOwnerForPage(popup.root):urlBlockOwnerForContext(context)));
     registerPermissionPage(this,permissionOwner??(popup?permissionOwnerForPage(popup.root):defaultPermissionOwner(browser)));
     this.id = randomUUID();
     this.frameId = this.id;
@@ -268,7 +275,9 @@ export class Page extends EventEmitter {
     for (const type of ['log', 'info', 'warn', 'error', 'debug']) {
       virtualConsole.on(type, (...args) => this.emit('console', { type, args }));
     }
-    return withLocationFactory(()=>new JSDOM(html, {
+    if(typeof html!=='string')throw new TypeError('Window task capture requires normalized owned HTML text');
+    let finishCapture;
+    const constructionOptions = {
       url: this.url,
       referrer: this.referrerFor(this.url,this.documentReferrer??'') || undefined,
       cookieJar: this.context.cookies,
@@ -277,17 +286,21 @@ export class Page extends EventEmitter {
       virtualConsole,
       pretendToBeVisual: true,
       beforeParse: window => {
+        finishCapture(window);
         // Actual byte-selected metadata is published before parsing or scripts.
         captureDocumentEncoding(window.document)._encoding=encoding;
         prepareInitialDocumentParser(window.document,this.mimeType);
         this.prepareWindow(window, historyState);
       },
-    }));
+    };
+    return captureWindowFactoryTask(finish=>{finishCapture=finish;return withLocationFactory(()=>new JSDOM(html,constructionOptions));});
   }
 
   prepareWindow(window, historyState = null, { main = true } = {}) {
+    captureCDPDocument(this,window);
     captureDocumentEncoding(window.document);
     preparePopupDocument(this,window);
+    const creatorSnapshot=captureWorkerCreator(this,window,{opaqueTopLevelBlank:main&&!isPopupPage(this)});
     captureCookieDocument(this,implForWrapper(window.document));
     if(main)PRINCIPAL_DOCUMENTS.set(this,implForWrapper(window.document));
     captureProtocolRealm(window);
@@ -320,13 +333,13 @@ export class Page extends EventEmitter {
       window.TextDecoder = TextDecoder;
       window.structuredClone = structuredClone;
       installNavigator(this, window);
+      installModelContext(this,window);
       installWebLocks(this, window);
       installCookieStore(this,window);
       installDevicePermissions(this,window);
       installFonts(window);
       installFetch(this, window);
       installWindowEventSource(this,window);
-      const creatorSnapshot=captureWorkerCreator(this,window);
       const secure=creatorSnapshot().secure;
       installPaymentRequest(window,{secure});
       Object.defineProperty(window,'isSecureContext',{get:()=>creatorSnapshot().secure,configurable:true,enumerable:true});
@@ -457,15 +470,16 @@ export class Page extends EventEmitter {
   }
 
   async traverseHistory(index,options={}){return traverseJointHistory(this,index,options);}
-  requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId) {
+  requestFinished(id, url, status, size = 0, headers = {}, type = 'Other', frameId = this.frameId, loaderId = this.loaderId, fromDiskCache = false, responseStatusText) {
     this.activeRequests.delete(id);
     this.lastActivity = Date.now();
-    this.emit('response', { id, url, status, size, headers, type, timestamp: now(), frameId, loaderId });
+    if(fromDiskCache)this.emit('requestServedFromCache',{id});
+    this.emit('response', { id, url, status, size, headers, type, timestamp: now(), frameId, loaderId,...(fromDiskCache?{fromDiskCache:true}:{}),...(responseStatusText!==undefined?{statusText:responseStatusText}:{}) });
   }
   requestFailed(id, error) {
     this.activeRequests.delete(id);
     this.lastActivity = Date.now();
-    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(stoppedNavigationError(error)?{canceled:true}:{}) });
+    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(urlBlockedError(error)?{blockedReason:'inspector'}:{}),...(stoppedNavigationError(error)?{canceled:true}:{}) });
   }
 
   setExtraHTTPHeaders(values) {
@@ -567,8 +581,21 @@ export class Page extends EventEmitter {
       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
       let capture;const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId,body,token=>{capture=token});
       try {
-        const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
-        if (useCookies) for (const cookie of response.headers.getSetCookie()) {
+        assertURLAllowed(this,url);
+        const cache=this.browser.httpCache;
+        if(cache)signal.throwIfAborted();
+        const exchange=cache?.begin(this.context,url,method,headers,{topLevelDocument:type==='Document'&&(!init.frameId||init.frameId===this.frameId)});
+        let fromDiskCache=false,transportStatusText,incomingHeaders;
+        let response=exchange?.fresh?cache.cachedResponse(exchange):null;
+        if(response)fromDiskCache=true;
+        else {
+          response=await fetch(url,{...init,method,body,headers:cache?.requestHeaders(exchange,headers)??headers,signal,redirect:'manual'});
+          incomingHeaders=response.headers;transportStatusText=response.statusText;
+          if(response.status===304){const renewed=cache?.revalidate(exchange,response);if(renewed){response=renewed;fromDiskCache=true}}
+        }
+        // Cookie ingress belongs to the actual HTTP response, including a304.
+        // The cached consumer snapshot intentionally retains its older headers.
+        if (useCookies&&incomingHeaders) for (const cookie of incomingHeaders.getSetCookie()) {
           const accepted=httpResponseCookie(this.context.cookies,cookie,url);
           if(accepted!==null)await this.context.cookies.setCookie(accepted, url, { ignoreError: true });
         }
@@ -625,6 +652,8 @@ export class Page extends EventEmitter {
           if(navigationReader)signal.throwIfAborted();
         }finally{finishNavigationReader(navigationReader)}
         const bytes = Buffer.concat(chunks);
+        if(cache)signal.throwIfAborted();
+        if(!fromDiskCache)cache?.store(exchange,response,bytes);
         if(type!=='Document'){beginNetworkResponse(capture,response.headers);appendNetworkResponse(capture,bytes)}
         finishNetworkResponse(capture);
         const buffered = new Response([101, 204, 205, 304].includes(response.status) || method === 'HEAD' ? null : bytes,
@@ -634,7 +663,7 @@ export class Page extends EventEmitter {
           Object.defineProperty(buffered, key, { value });
         }
 
-        this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId);
+        this.requestFinished(id, url, response.status, bytes.length, Object.fromEntries(response.headers), type, init.frameId, init.loaderId, fromDiskCache, fromDiskCache?(transportStatusText??''):undefined);
         return buffered;
       } catch (error) { this.requestFailed(id, error); throw error; }
     }
@@ -660,13 +689,14 @@ export class Page extends EventEmitter {
     const transfer=beginNavigationTransfer(this,this.navigationAbort);
     try {
       let html;
-      let response;
+      let response,blockedNavigation;
       let mimeType = 'text/html', documentEncoding = 'UTF-8';
       if (target.split('#')[0] === 'about:blank') html = '<!doctype html><html><head></head><body></body></html>';
       else {
         const referrerSource = referrer ?? '';
         const referer = this.referrerFor(target, referrerSource);
         if (referer) requestHeaders.set('referer', referer);
+        try {
         response = await this.fetch(target, { signal: this.navigationAbort.signal, method: requestMethod, body: requestBody, headers: requestHeaders }, 'Document');
         const reader = response.body?.getReader();
         const chunks = [];
@@ -690,6 +720,8 @@ export class Page extends EventEmitter {
         // Inspector bytes remain in the independent transport capture ledger.
         // Parser decoding must not overwrite the captured document bytes.
         this.responseHeaders = [...response.headers].map(([name, value]) => ({ name, value }));
+        }catch(error){if(!urlBlockedError(error))throw error;blockedNavigation=error;html='';}
+
       }
       if (generation !== this.navigationGeneration || this.closed) throw new Error('Navigation superseded');
       this.documentGeneration++;
@@ -700,7 +732,7 @@ export class Page extends EventEmitter {
       this.url = response?.finalUrl ?? target;
       this.documentReferrer = response?.requestHeaders?.referer ?? '';
       this.mimeType = mimeType;
-      this.status = response?.status ?? 200;
+      this.status = blockedNavigation?0:response?.status ?? 200;
       this.executionContextId = this.browser.nextExecutionContext++;
       this.emit('contextsCleared');
       this.documentId = randomUUID();
@@ -746,7 +778,7 @@ export class Page extends EventEmitter {
       }));
       navigationWindow = this.dom.window;
       this.flushFrameEvents();
-      onCommit?.();
+      onCommit?.(blockedNavigation);
       const documentReady = new Promise(resolve => {
         if (this.dom.window.document.readyState !== 'loading') resolve();
         else installListenerOwnership(this.dom.window).add(this.dom.window.document, 'DOMContentLoaded', resolve, { once: true });
@@ -777,7 +809,7 @@ export class Page extends EventEmitter {
       if (selector) await until(() => this.dom.window.document.querySelector(selector), { timeout: remaining() });
       if (script) await until(() => this.evaluate(script), { timeout: remaining() });
       if (waitMs > 0) await delay(waitMs);
-      return { url: this.url, status: this.status };
+      return { url: this.url, status: this.status,...(blockedNavigation?{errorText:blockedNavigation.message}:{}) };
     } catch (error) {
       if (generation === this.navigationGeneration&&!stoppedNavigationError(error)) this.emit('navigationError', error);
       throw error;
@@ -787,14 +819,14 @@ export class Page extends EventEmitter {
   evaluate(expression) {
     if (this.closed) throw new Error('Page is closed');
     try { return vm.runInContext(expression, this.dom.getInternalVMContext(), { timeout: Math.min(this.timeout, 2000), displayErrors: false }); }
-    finally { this.reconcileURL(); }
+    finally { this.reconcileURL();notifyInvocationExit(this.dom.getInternalVMContext()); }
   }
   callFunction(declaration, thisArg, args) {
     if (this.closed) throw new Error('Page is closed');
     try {
       return createInvocationTrampoline(this.dom.getInternalVMContext()).invokeDeclaration(declaration, thisArg, args,
         { timeout: Math.min(this.timeout, 2000), displayErrors: false });
-    } finally { this.reconcileURL(); }
+    } finally { this.reconcileURL();notifyInvocationExit(this.dom.getInternalVMContext()); }
   }
 
   render(format = 'png', options = {}) {

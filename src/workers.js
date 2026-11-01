@@ -1,3 +1,6 @@
+import{workerErrorOrigins}from'./worker-error-origin.js';
+import{implementationForWrapper}from'./dom-event-state.js';
+import{createRequire}from'node:module';
 import {withRequestMetadata} from './request-metadata.js';
 import {fetchWorkerHTTP} from './worker-fetch-policy.js';
 import {installWorkerFetchRealm} from './worker-fetch-realm.js';
@@ -9,6 +12,8 @@ import {createParentEventSources,createWorkerEventSourceClient} from './worker-e
 import {createParentWorkerSockets,createWorkerSocketClient} from './worker-socket-transports.js';
 import { installWebCrypto } from './web-crypto.js';
 import {installScheduler} from './scheduler.js';
+import {installWorkerPerformance} from './worker-performance.js';
+import {performance as workerPerformanceClock} from 'node:perf_hooks';
 import {installWorkerDOMException} from './worker-dom-exception.js';
 import {installWorkerEvents} from './worker-events.js';
 import {installWorkerAbort} from './worker-abort.js';
@@ -45,6 +50,19 @@ import { installStreams } from './streams.js';
 const SYNC_BYTES = 8 * 1024 * 1024;
 export function installWorkers(page, window, { enabled = true } = {}) {
   const creatorSnapshot=captureWorkerCreator(page,window);
+  // This is the real Window path only. Owned Worker boot never loads the
+  // generated Window target graph to create its independent Node backend.
+  const require=createRequire(import.meta.url),dispatchTarget=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype._dispatch;
+  const ErrorEventConstructor=window.ErrorEvent,apply=Reflect.apply;
+  function startupError(target,data,fallbackURL){
+    const implementation=implementationForWrapper(target);
+    const event=new ErrorEventConstructor('error',{message:data.message,filename:data.filename||fallbackURL,cancelable:true});
+    const backend=implementationForWrapper(event);backend.error=undefined;backend.isTrusted=true;
+    apply(dispatchTarget,implementation,[backend]);
+    // Canonical dispatch reports genuine owner-handler throws. The measured
+    // startup producer does not invent a second owner exception when no Worker
+    // handler is installed; actual Worker error dispatch still occurs above.
+  }
   const signal = page.documentAbort?.signal, owned = new Set();
   const messaging = installMessaging(page, window);
   const clone = value => messaging.receive({ data: value, ports: [] }).data;
@@ -104,6 +122,7 @@ export function installWorkers(page, window, { enabled = true } = {}) {
           try { const result=await cacheStoreFor(page).operate(creator.origin,message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,result}); }
           catch(error) {if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}});}
         } else if (message.kind === 'message') messaging.dispatchMessage(this, message);
+        else if(message.kind==='startupError'){startupError(this,message.error,url.href);}
         else if (message.kind === 'error') {
           if(service){page.emit('console',{type:'error',args:[message.error.message]});return;}
           const error = new window.Error(message.error.message); error.name = message.error.name; error.stack = message.error.stack;
@@ -219,10 +238,12 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
   let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient,connectShared;
   let fetchTypeError,fetchRealm;
-  let dispatchError = value => report(value);
+  let dispatchError = value => report(value),dispatchRejection,dispatchHandled;
   const lifetime = new AbortController();
   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
-  const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
+  let reportingStartup=false,localErrorDepth=0,currentOrigin,originRead=false;
+  let origins;
+  const report = value => { if (!closed) parentPort.postMessage({ kind: reportingStartup&&!workerData.shared&&!workerData.service?'startupError':'error', error: error(value) }); };
   const request = (url, init = {}, script = false, signal, resourceType) => new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return; }
     const id = requestId++;
@@ -254,6 +275,10 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
       parentPort.postMessage({ kind: 'close' }); parentPort.close();
     } },
     report,
+    beginError(){if(localErrorDepth)return false;localErrorDepth++;currentOrigin=undefined;originRead=false;return true},
+    endError(){currentOrigin=undefined;originRead=false;localErrorDepth--},
+    errorField(value,key){if(!originRead){currentOrigin=origins.read(value);originRead=true}return currentOrigin?.[key]??(key==='filename'?'':0)},
+    defaultError(value){if(reportingStartup||workerData.shared||workerData.service)report(value)},
     timer(callback, delay, args, repeat) {
       const id = timerId++;
       const fire = () => {
@@ -301,29 +326,40 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
   };
   const sandbox = { __bridge: bridge, __url: workerData.url, __name: workerData.name, __navigator: workerData.navigator,
     URL, URLSearchParams, TextEncoder, TextDecoder, Headers, Request, Response, FormData, Blob, File,
-    AbortController, AbortSignal, DOMException, crypto: globalThis.crypto, performance: globalThis.performance,
+    AbortController, AbortSignal, DOMException, crypto: globalThis.crypto,
     atob, btoa };
+  const performanceOrigin=workerPerformanceClock.now();
   context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
   fetchTypeError=realm.TypeError;
+  origins=workerErrorOrigins(vm.runInContext('Object.prototype',context));
   installWorkerDOMException(realm,{evaluate});
-  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
+  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed,promiseEvents:!workerData.shared&&!workerData.service});
   lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
   context.__eventPlatform=eventPlatform;
   if(workerData.shared)eventPlatform.registerTarget(realm,new EventTarget());
   context.__sharedWorker=Boolean(workerData.shared);
+  context.__dedicatedWorker=!workerData.shared&&!workerData.service;
   vm.runInContext(`(function () {
     'use strict';const eventPlatform=__eventPlatform,bridge=__bridge;
     delete globalThis.__bridge;
     const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
     globalThis.self = globalThis; globalThis.name = __name;
-    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);
-    for(const key of ['onmessage','onmessageerror','onerror']) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
+    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);const dedicated=__dedicatedWorker;delete globalThis.__dedicatedWorker;if(dedicated)eventPlatform.configureGlobalErrorHandler(target);
+    for(const key of ['onmessage','onmessageerror','onerror',...(dedicated?['onunhandledrejection','onrejectionhandled']:[])]) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
     for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = EventTarget.prototype[name].bind(target);
     const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
     globalThis.dispatchEvent = dispatchGlobal;
     let reportingError = false;
-    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); eventPlatform.trust(event); if (dispatchGlobal(event)) bridge.report(error); } finally { reportingError = false; } };
+    const actualString=String,symbolDescription=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,apply=Reflect.apply;
+    const text=value=>typeof value==='symbol'?apply(symbolDescription,value,[])??'':actualString(value);
+    globalThis.__dispatchError = (error,message) => {
+      // Shared/service behavior remains the previously measured producer.
+      if(!dedicated){if(reportingError)return;reportingError=true;try{const event=new ErrorEvent('error',{message:message===undefined?String(error?.message??error):message,error,cancelable:true});eventPlatform.trust(event);if(dispatchGlobal(event))bridge.report(error)}finally{reportingError=false}return}
+      if(!bridge.beginError())return;
+      try{const event=new ErrorEvent('error',{message:message===undefined?text(error):message,filename:bridge.errorField(error,'filename'),lineno:bridge.errorField(error,'lineno'),colno:bridge.errorField(error,'colno'),cancelable:true});eventPlatform.producedError(event,error);eventPlatform.trust(event);if(dispatchGlobal(event))bridge.defaultError(error)}finally{bridge.endError()}
+    };
+    globalThis.__dispatchRejection=(type,promise,reason)=>dispatchGlobal(eventPlatform.rejectionEvent(type,promise,reason));
     globalThis.postMessage = (data, transfer) => bridge.postMessage(data, transfer);
     globalThis.close = () => bridge.close();
     globalThis.importScripts = (...urls) => bridge.importScripts(...urls);
@@ -352,7 +388,12 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
   abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
   installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
   dispatchError=vm.runInContext('__dispatchError',context);
-  vm.runInContext('delete globalThis.__dispatchError',context);
+  const rejectionProducer=vm.runInContext('__dispatchRejection',context);
+  dispatchRejection=(reason,promise)=>rejectionProducer('unhandledrejection',promise,reason);
+  dispatchHandled=promise=>rejectionProducer('rejectionhandled',promise,null);
+  const performanceErrorText=realm.String;
+  installWorkerPerformance(realm,{context,evaluate,events:eventPlatform,origin:performanceOrigin,signal:lifetime.signal,active:()=>!closed,setTimer:(callback,delay)=>bridge.timer(callback,delay,[],false),clearTimer:bridge.clear,reportError:value=>dispatchError(value,performanceErrorText(value))});
+  vm.runInContext('delete globalThis.__dispatchError;delete globalThis.__dispatchRejection',context);
   emit = vm.runInContext('__emitMessage', context);
   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
   const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
@@ -406,13 +447,18 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
       if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
     }
   });
-  const rejection=(value,promise)=>{if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value)};
-  process.on('unhandledRejection',rejection);
-  lifetime.signal.addEventListener('abort',()=>process.off('unhandledRejection',rejection),{once:true});
+  const observedRejections=new WeakSet();
+  const rejection=(value,promise)=>{
+    if(!workerData.shared&&!workerData.service){if(getHeapBinding().sameRealm(promise,realm)){observedRejections.add(promise);dispatchRejection(value,promise)}else report(value);return}
+    if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value);
+  };
+  const handled=promise=>{if(observedRejections.has(promise)){observedRejections.delete(promise);dispatchHandled(promise)}};
+  process.on('unhandledRejection',rejection);if(!workerData.shared&&!workerData.service)process.on('rejectionHandled',handled);
+  lifetime.signal.addEventListener('abort',()=>{process.off('unhandledRejection',rejection);process.off('rejectionHandled',handled)},{once:true});
   parentPort.on('close',()=>bridge.close());
   try {
     const result = await request(workerData.url, {}, true);
-    if (result.status < 200 || result.status >= 300) throw new Error(`Worker load failed (${result.status}): ${workerData.url}`);
+    if (result.status < 200 || result.status >= 300) throw new Error(workerData.shared||workerData.service?`Worker load failed (${result.status}): ${workerData.url}`:'Abort');
     if(!workerData.shared)workerData.url = result.url;
     context.__resolvedURL = workerData.shared?workerData.url:result.url;
     vm.runInContext('globalThis.location = new WorkerLocation(new URL(__resolvedURL)); delete globalThis.__resolvedURL;', context);
@@ -456,15 +502,15 @@ async function runWorker(parentPort=workerThreadPort,workerData=workerThreadData
         validateModule(result);
         const root = compile(source, workerData.url); modules.set(workerData.url, Promise.resolve(root));
         await evaluate(root);
-      } else vm.runInContext(source, context, { filename: workerData.url,
+      } else {vm.runInContext(source, context, { filename: workerData.url,
         importModuleDynamically: (specifier, _script, extra) => dynamicImport(specifier, { identifier: workerData.url }, extra),
-      });
+      });}
     }
     ready = true;
     if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
     for (const message of queued) { if (!closed) { if(message.kind==='sharedConnect'){connectShared(message);continue;} messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
     queued.length = 0;
-  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else dispatchError(failure); }
+  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else{reportingStartup=true;try{dispatchError(failure)}finally{reportingStartup=false}} }
 }
 
 if (!isMainThread && workerThreadData?.redPandaWorker) void runWorker();

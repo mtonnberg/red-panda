@@ -1,0 +1,694 @@
+diff --git a/src/browser.js b/src/browser.js
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,5 +1,6 @@
+ import {prepareInitialDocumentParser} from './initial-document-parser.js';
+ import {captureDocumentEncoding,decodeHTMLResponse} from './document-encoding.js';
++import{registerURLBlockPage,urlBlockOwnerForPage,urlBlockOwnerForContext,assertURLAllowed,urlBlockedError}from'./url-blocking.js';
+ import {installHTMLBaseURLs} from './html-base-urls.js';
+ import {installHTMLHandlerSlots} from './html-handler-slots.js';
+ import {installFileInputs} from './file-inputs.js';
+@@ -196,7 +197,7 @@
+     const context = this.contexts.get(contextId);
+     if (!context) throw new Error('Unknown browser context');
+     registerJavaScriptDialogContext(this,context);
+-    const page = new Page(this, context, {permissionOwner:options?.permissionOwner});
++    const page = new Page(this, context, {permissionOwner:options?.permissionOwner,urlBlockOwner:options?.urlBlockOwner});
+     this.pages.set(page.id, page);
+     page.once('close', () => { this.pages.delete(page.id); this.emit('targetDestroyed', page); });
+     this.emit('targetCreated', page);
+@@ -220,10 +221,11 @@
+ }
+ 
+ export class Page extends EventEmitter {
+-  constructor(browser, context, {popup,permissionOwner}={}) {
++  constructor(browser, context, {popup,permissionOwner,urlBlockOwner}={}) {
+     super();
+     this.browser = browser;
+     this.context = context;
++    registerURLBlockPage(this,urlBlockOwner??(popup?urlBlockOwnerForPage(popup.root):urlBlockOwnerForContext(context)));
+     registerPermissionPage(this,permissionOwner??(popup?permissionOwnerForPage(popup.root):defaultPermissionOwner(browser)));
+     this.id = randomUUID();
+     this.frameId = this.id;
+@@ -465,7 +467,7 @@
+   requestFailed(id, error) {
+     this.activeRequests.delete(id);
+     this.lastActivity = Date.now();
+-    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(stoppedNavigationError(error)?{canceled:true}:{}) });
++    this.emit('requestFailed', { id, message: error.message, timestamp: now(),...(urlBlockedError(error)?{blockedReason:'inspector'}:{}),...(stoppedNavigationError(error)?{canceled:true}:{}) });
+   }
+ 
+   setExtraHTTPHeaders(values) {
+@@ -567,6 +569,7 @@
+       this.cliHTTPHeaders.forEach((value, name) => headers.set(name, value));
+       let capture;const id = this.requestStarted(url, type, method, Object.fromEntries(headers), redirectResponse, init.frameId, init.loaderId,body,token=>{capture=token});
+       try {
++        assertURLAllowed(this,url);
+         const response = await fetch(url, { ...init, method, body, headers, signal, redirect: 'manual' });
+         if (useCookies) for (const cookie of response.headers.getSetCookie()) {
+           const accepted=httpResponseCookie(this.context.cookies,cookie,url);
+@@ -660,13 +663,14 @@
+     const transfer=beginNavigationTransfer(this,this.navigationAbort);
+     try {
+       let html;
+-      let response;
++      let response,blockedNavigation;
+       let mimeType = 'text/html', documentEncoding = 'UTF-8';
+       if (target.split('#')[0] === 'about:blank') html = '<!doctype html><html><head></head><body></body></html>';
+       else {
+         const referrerSource = referrer ?? '';
+         const referer = this.referrerFor(target, referrerSource);
+         if (referer) requestHeaders.set('referer', referer);
++        try {
+         response = await this.fetch(target, { signal: this.navigationAbort.signal, method: requestMethod, body: requestBody, headers: requestHeaders }, 'Document');
+         const reader = response.body?.getReader();
+         const chunks = [];
+@@ -690,6 +694,8 @@
+         // Inspector bytes remain in the independent transport capture ledger.
+         // Parser decoding must not overwrite the captured document bytes.
+         this.responseHeaders = [...response.headers].map(([name, value]) => ({ name, value }));
++        }catch(error){if(!urlBlockedError(error))throw error;blockedNavigation=error;html='';}
++
+       }
+       if (generation !== this.navigationGeneration || this.closed) throw new Error('Navigation superseded');
+       this.documentGeneration++;
+@@ -700,7 +706,7 @@
+       this.url = response?.finalUrl ?? target;
+       this.documentReferrer = response?.requestHeaders?.referer ?? '';
+       this.mimeType = mimeType;
+-      this.status = response?.status ?? 200;
++      this.status = blockedNavigation?0:response?.status ?? 200;
+       this.executionContextId = this.browser.nextExecutionContext++;
+       this.emit('contextsCleared');
+       this.documentId = randomUUID();
+@@ -746,7 +752,7 @@
+       }));
+       navigationWindow = this.dom.window;
+       this.flushFrameEvents();
+-      onCommit?.();
++      onCommit?.(blockedNavigation);
+       const documentReady = new Promise(resolve => {
+         if (this.dom.window.document.readyState !== 'loading') resolve();
+         else installListenerOwnership(this.dom.window).add(this.dom.window.document, 'DOMContentLoaded', resolve, { once: true });
+@@ -777,7 +783,7 @@
+       if (selector) await until(() => this.dom.window.document.querySelector(selector), { timeout: remaining() });
+       if (script) await until(() => this.evaluate(script), { timeout: remaining() });
+       if (waitMs > 0) await delay(waitMs);
+-      return { url: this.url, status: this.status };
++      return { url: this.url, status: this.status,...(blockedNavigation?{errorText:blockedNavigation.message}:{}) };
+     } catch (error) {
+       if (generation === this.navigationGeneration&&!stoppedNavigationError(error)) this.emit('navigationError', error);
+       throw error;
+diff --git a/src/cdp.js b/src/cdp.js
+--- a/src/cdp.js
++++ b/src/cdp.js
+@@ -1,3 +1,4 @@
++import{initializeURLBlockConnection,urlBlockOwnerForConnection,urlBlockOwnerForContext,registerURLBlockContext,markURLBlockPageContext,releaseURLBlockConnection,setBlockedURLs}from'./url-blocking.js';
+ import {supportsFileInput,rememberFileInputContext,forgetFileInputContext,runFileInput} from './cdp-file-input.js';
+ import {dumpMarkdownNode} from './markdown-node.js';
+ import{enableNetworkCapture,disableNetworkCapture,capturedResponseBody,capturedRequestPostData}from'./network-capture.js';
+@@ -209,7 +210,7 @@
+       this.event('Network.loadingFinished', { requestId: response.id, timestamp: response.timestamp, encodedDataLength: response.size });
+     });
+     listen('requestFailed', request => this.event('Network.loadingFailed', {
+-      requestId: request.id, timestamp: request.timestamp, type: 'Document', errorText: request.message, canceled: request.canceled??false,
++      requestId: request.id, timestamp: request.timestamp, type: request.blockedReason?'Ping':'Document', errorText: request.message, canceled: request.canceled??false,...(request.blockedReason?{blockedReason:request.blockedReason}:{}),
+     }));
+     listen('console', ({ type, args, executionContextId = page.executionContextId }) => this.event('Runtime.consoleAPICalled', {
+       type: consoleProtocolType(type), args: args.map(arg => this.remote(arg, false, undefined, executionContextId)),
+@@ -306,6 +307,7 @@
+   }
+   async run(method, params) {
+     const page = this.page;
++    if(method==='Network.setBlockedURLs')return setBlockedURLs(this.connection,page,params,ProtocolError);
+     if (supportsDOM(method)) return runDOM(this, method, params);
+     if (supportsInput(method)) return runInput(this, method, params);
+     if (supportsRuntime(method)) return runRuntime(this, method, params);
+@@ -354,7 +356,7 @@
+         let settled = false;
+         return await new Promise(resolve => {
+           const finish = result => { if (settled) return; settled = true; resolve(result); };
+-          const committed = () => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false });
++          const committed = error => finish({ frameId: page.frameId, loaderId: page.loaderId, isDownload: false,...(error?{errorText:error.message}:{}) });
+           page.navigate(url, { onCommit: committed, referrer: params.referrer }).catch(error => finish({ frameId: page.frameId, loaderId: page.loaderId, errorText: error.message }));
+         });
+       }
+@@ -556,6 +558,7 @@
+     this.socket = socket;
+     this.browser = browser;
+     initializePermissionConnection(this,directPage);
++    initializeURLBlockConnection(this,directPage);
+     this.sessions = new Map();
+     this.discover = false;
+     this.autoAttach = false;
+@@ -620,6 +623,7 @@
+   async run(method, params, parent) {
+     const browser = this.browser;
+     switch (method) {
++      case 'Network.setBlockedURLs': return setBlockedURLs(this,undefined,params,ProtocolError);
+       case 'LP.version': return { version: VERSION };
+       case 'LP.getMarkdown': {
+         const context=selectCDPCookieContext(browser);
+@@ -646,10 +650,11 @@
+         return {};
+       case 'Target.getTargets': return { targetInfos: [...browser.pages.values()].map(targetInfo) };
+       case 'Target.getBrowserContexts': return { browserContextIds: [...browser.contexts.keys()].filter(id => id !== 'default') };
+-      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));rememberFileInputContext(this,browser.contexts.get(id));return {browserContextId:id};}
++      case 'Target.createBrowserContext': {const id=browser.createContext({permissionOwner:permissionOwnerForConnection(this)});markCDPCookieContext(browser,browser.contexts.get(id));registerURLBlockContext(this,browser.contexts.get(id));rememberFileInputContext(this,browser.contexts.get(id));return {browserContextId:id};}
+       case 'Target.disposeBrowserContext': browser.disposeContext(params.browserContextId);forgetFileInputContext(this,params.browserContextId); return {};
+       case 'Target.createTarget': {
+-        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this)});
++        const page = browser.createPage(params.browserContextId,{permissionOwner:permissionOwnerForConnection(this),urlBlockOwner:urlBlockOwnerForContext(browser.contexts.get(params.browserContextId??'default'))??urlBlockOwnerForConnection(this)});
++        markURLBlockPageContext(this,page);
+         rememberFileInputContext(this,page.context);
+         if (params.url && params.url !== 'about:blank') queueMicrotask(() => page.navigate(params.url).catch(() => {}));
+         return { targetId: page.id };
+@@ -706,6 +711,7 @@
+   }
+   close() {
+     releasePermissionConnection(this);
++    releaseURLBlockConnection(this);
+     this.browser.off('targetCreated', this.created);
+     this.browser.off('targetDestroyed', this.destroyed);
+     for (const session of this.sessions.values()) session.close();
+diff --git a/src/fetch.js b/src/fetch.js
+--- a/src/fetch.js
++++ b/src/fetch.js
+@@ -1,3 +1,4 @@
++import{urlBlockedError}from'./url-blocking.js';
+ import {registerPlatformFactory} from './platform-factories.js';
+ import {registerPlatformFactoryKind} from './platform-factory-hooks.js';
+ import {installFetchInterfaceRealm} from './fetch-interface-realms.js';
+@@ -91,6 +92,7 @@
+   const active = () => !disposed && !page.closed && !!window.document && page.documentGeneration === generation && !documentSignal?.aborted;
+   const documentOrigin = () => implForWrapper(mainWindow.document)?._origin ?? mainWindow.location.origin;
+   function realmError(error) {
++    if(urlBlockedError(error))return new TypeError('fetch error');
+     if (types.isProxy(error)) return error;
+     if (error !== null && ['object', 'function'].includes(typeof error) && Object.getPrototypeOf(error) === globalThis.DOMException.prototype) {
+       return new window.DOMException(error.message, error.name);
+diff --git a/src/sync-http.js b/src/sync-http.js
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,3 +1,4 @@
++import{assertURLAllowed}from'./url-blocking.js';
+ import {internalCookieHeader} from './internal-cookie-header.js';
+ import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
+ import {cookieHeaderForSync} from './cookie-site.js';
+@@ -51,6 +52,7 @@
+     const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+     page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),postDataFields:inlinePostData(capture),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+     checkpoint();
++    assertURLAllowed(page,url);
+     const shared=new SharedArrayBuffer(16*1024*1024+1024*1024+12),state=new Int32Array(shared,0,3);
+     this.#ensureWorker().postMessage({id,url,init:{method,headers:[...headers],body},shared,maxBodyBytes});
+     const remaining=deadline-Date.now();
+diff --git a/src/url-blocking.js b/src/url-blocking.js
+new file mode 100644
+--- /dev/null
++++ b/src/url-blocking.js
+@@ -0,0 +1,85 @@
++// Privileged HTTP admission policy. Authorities are captured at real CDP,
++// Context and Page creation; no authored URL/object metadata establishes one.
++const owners=new WeakMap(),connections=new WeakMap(),contexts=new WeakMap(),pages=new WeakMap(),denials=new WeakSet();
++function newOwner(){const owner=Object.create(null);owners.set(owner,{rules:[]});return owner}
++function state(owner){const value=owners.get(owner);if(!value)throw new TypeError('An actual URL policy authority is required');return value}
++// The active connection indexes genuine contexts weakly. Old contexts can stay
++// alive through legitimate retained values without being retained by this index.
++function loadedContexts(connection,record){
++ const live=[];
++ for(const ref of record.loaded){
++  const context=ref.deref();
++  if(!context||connection.browser.contexts.get(context.id)!==context){record.loaded.delete(ref);if(context)record.seen.delete(context)}
++  else live.push(context);
++ }
++ return live;
++}
++function markLoaded(connection,record,context){
++ loadedContexts(connection,record);
++ if(record.seen.has(context))return;
++ const ref=new WeakRef(context);record.seen.set(context,ref);record.loaded.add(ref);
++}
++export function initializeURLBlockConnection(connection,directPage){
++ if(connections.has(connection))return;
++ const owner=directPage?urlBlockOwnerForPage(directPage):newOwner();
++ const record={owner,loaded:new Set(),seen:new WeakMap()};connections.set(connection,record);
++ if(directPage)markLoaded(connection,record,directPage.context);
++}
++export function urlBlockOwnerForConnection(connection){const value=connections.get(connection);if(!value)throw new TypeError('An actual CDP connection is required');return value.owner}
++export function registerURLBlockContext(connection,context){
++ const value=connections.get(connection);if(!value)throw new TypeError('An actual CDP connection is required');
++ if(contexts.has(context)&&contexts.get(context)!==value.owner)throw new TypeError('URL policy context cannot be retargeted');
++ contexts.set(context,value.owner);markLoaded(connection,value,context);
++}
++export const urlBlockOwnerForContext=context=>contexts.get(context);
++export function registerURLBlockPage(page,owner){
++ owner??=newOwner();state(owner);
++ if(pages.has(page)&&pages.get(page)!==owner)throw new TypeError('URL policy Page cannot be retargeted');
++ pages.set(page,owner);
++}
++export function urlBlockOwnerForPage(page){return pages.get(page)??(page.registry?.page!==page&&page.registry?.page?urlBlockOwnerForPage(page.registry.page):undefined)}
++export function markURLBlockPageContext(connection,page){const value=connections.get(connection);if(!value)throw new TypeError('An actual CDP connection is required');markLoaded(connection,value,page.context)}
++export function releaseURLBlockConnection(connection){connections.delete(connection)}
++// Only ASCII case folds. '?' and all punctuation remain literal characters.
++const fold=value=>value.replace(/[A-Z]/g,char=>String.fromCharCode(char.charCodeAt(0)+32));
++function matches(pattern,input){
++ let p=0,i=0,star=-1,resume=0;
++ while(i<input.length){
++  if(pattern[p]==='*'){star=p++;resume=i;continue}
++  if(p<pattern.length&&pattern[p]===input[i]){p++;i++;continue}
++  if(star<0)return false;
++  p=star+1;i=++resume;
++ }
++ while(pattern[p]==='*')p++;
++ return p===pattern.length;
++}
++export function setBlockedURLs(connection,page,params,ProtocolError){
++ const fail=message=>{throw new ProtocolError(message,-31998)};
++ if(!Object.hasOwn(params,'urlPatterns'))fail('MissingField');
++ if(!Array.isArray(params.urlPatterns))fail('UnexpectedToken');
++ // Complete conversion and compilation before replacing the active program.
++ const rules=[];
++ for(const entry of params.urlPatterns){
++  if(entry===null||typeof entry!=='object'||Array.isArray(entry))fail('UnexpectedToken');
++  if(!Object.hasOwn(entry,'urlPattern'))fail('MissingField');
++  if(typeof entry.urlPattern!=='string')fail('UnexpectedToken');
++  if(!Object.hasOwn(entry,'block'))fail('MissingField');
++  if(typeof entry.block!=='boolean')fail('UnexpectedToken');
++  if(entry.urlPattern)rules.push(Object.freeze({pattern:fold(entry.urlPattern),block:entry.block}));
++ }
++ const record=connections.get(connection);
++ if(!record||loadedContexts(connection,record).length===0)fail('BrowserContextNotLoaded');
++ // Commands belong to their actual connection. Attaching an existing foreign
++ // Root target does not retarget its birth authority or mutate its owner's rules.
++ state(record.owner).rules=rules;return{};
++}
++export function assertURLAllowed(page,address){
++ const owner=urlBlockOwnerForPage(page);if(!owner)return;
++ const url=new URL(address);if(!['http:','https:'].includes(url.protocol))return;
++ const input=fold(url.href);
++ for(const rule of state(owner).rules)if(matches(rule.pattern,input)){
++  if(!rule.block)return;
++  const error=new Error('UrlBlocked');denials.add(error);throw error;
++ }
++}
++export const urlBlockedError=error=>denials.has(error);
+diff --git a/src/worker-error-origin.js b/src/worker-error-origin.js
+new file mode 100644
+--- /dev/null
++++ b/src/worker-error-origin.js
+@@ -0,0 +1,6 @@
++import{getRuntimeBinding}from'./native-runtime.js';
++// Captured real VM anchor is the realm authority. SourceURL is engine metadata,
++// never a brand, principal, or allow-list admission criterion.
++export function workerErrorOrigins(anchor){
++ return Object.freeze({read(value){const reader=getRuntimeBinding().errorOrigin;if(typeof reader!=='function')throw new Error('A matching Worker error-origin runtime build is required');return reader(value,anchor)}});
++}
+diff --git a/src/worker-events.js b/src/worker-events.js
+--- a/src/worker-events.js
++++ b/src/worker-events.js
+@@ -1,3 +1,4 @@
++import{types}from'node:util';
+ import {addAbortListener} from 'node:events';
+ // Genuine selected-VM Event/EventTarget frontends over private real Node state.
+ // No Node prototype is grafted onto a public VM constructor or wrapper.
+@@ -11,7 +12,7 @@
+ const add=NativeTarget.prototype.addEventListener,remove=NativeTarget.prototype.removeEventListener,dispatch=NativeTarget.prototype.dispatchEvent;
+ const installed=new WeakMap(),eventStates=new WeakMap(),targetStates=new WeakMap();
+ const slot=fields=>Object.assign(Object.create(null),fields);
+-function factory(g,b){
++function factory(g,b,promiseEvents){
+  const create=g.Object.create,TypeError=g.TypeError,String=g.String,define=g.Object.defineProperty,own=g.Object.getOwnPropertyDescriptor,apply=g.Reflect.apply,Array=g.Array,freeze=g.Object.freeze;
+  const description=own(g.Symbol.prototype,'description').get,text=v=>typeof v==='symbol'?apply(description,v,[])??'':String(v);
+  const invalid=()=>new TypeError('invalid argument'),illegal=()=>new TypeError('Illegal invocation');
+@@ -34,17 +35,23 @@
+   constructor(type,init=undefined){if(!arguments.length)throw invalid();super(type,init);const o=dict(init),colno=o.colno===undefined?0:(+o.colno)>>>0,error=o.error??null,filename=o.filename===undefined?'':text(o.filename),lineno=o.lineno===undefined?0:(+o.lineno)>>>0,message=o.message===undefined?'':text(o.message);b.error(this,message,filename,lineno,colno,error)}
+   get message(){validEvent(this);return b.extra(this,'message')}get filename(){validEvent(this);return b.extra(this,'filename')}get lineno(){validEvent(this);return b.extra(this,'lineno')}get colno(){validEvent(this);return b.extra(this,'colno')}get error(){validEvent(this);return b.extra(this,'error')}
+  }
++ function PromiseRejectionEvent(type,init=undefined){
++  if(!new.target||!arguments.length)throw invalid();type=text(type);const o=dict(init),bubbles=!!o.bubbles,cancelable=!!o.cancelable,composed=!!o.composed;
++  b.eventStore(this,type,bubbles,cancelable,composed);const promise=o.promise??null;if(promise!==null&&!b.promise(promise))throw invalid();const reason=o.reason??null;b.rejection(this,promise,reason);
++ }
++ g.Object.setPrototypeOf(PromiseRejectionEvent,Event);g.Object.setPrototypeOf(PromiseRejectionEvent.prototype,ep);define(PromiseRejectionEvent,'prototype',{writable:false});
++ for(const key of['promise','reason'])define(PromiseRejectionEvent.prototype,key,{get(){validEvent(this);return b.extra(this,key)},enumerable:true,configurable:true});
+  function options(v){if(v==null||typeof v!=='object'&&typeof v!=='function')return{capture:!!v,once:false,passive:false,signal:null};const capture=!!v.capture,once=!!v.once,passive=!!v.passive,signal=v.signal??null;if(signal!==null&&!b.signal(signal))throw invalid();return{capture,once,passive,signal}}
+  function EventTarget(){if(!new.target)throw invalid();b.targetStore(this)}
+  const tp=EventTarget.prototype;delete tp.constructor;define(EventTarget,'prototype',{writable:false});
+  const tm={dispatchEvent(event){validTarget(this);if(!arguments.length||!b.event(event))throw invalid();return b.dispatch(this,event)},addEventListener(type,callback){validTarget(this);if(arguments.length<2)throw invalid();type=text(type);if(callback==null)return;if(typeof callback!=='function'&&typeof callback!=='object')throw invalid();b.add(this,type,callback,options(arguments[2]))},removeEventListener(type,callback){validTarget(this);if(arguments.length<2)throw invalid();type=text(type);const o=arguments[2],capture=typeof o==='object'&&o!==null?!!o.capture:!!o;b.remove(this,type,callback,capture)}};
+  for(const[name,value]of Object.entries(tm))define(tp,name,{value,writable:true,enumerable:true,configurable:true});
+- for(const C of[Event,EventTarget,MessageEvent,ErrorEvent]){const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});if(d.configurable)define(p,key,{...d,enumerable:typeof key==='string'})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true})}
+- return{Event,EventTarget,MessageEvent,ErrorEvent,allocate(prototype){return create(prototype)}};
++ for(const C of[Event,EventTarget,MessageEvent,ErrorEvent,...(promiseEvents?[PromiseRejectionEvent]:[])]){const p=C.prototype;for(const key of g.Reflect.ownKeys(p)){if(key==='constructor')continue;const d=own(p,key);if(d.get)define(d.get,'name',{value:'get '+String(key),configurable:true});if(d.set)define(d.set,'name',{value:'set '+String(key),configurable:true});if(d.configurable)define(p,key,{...d,enumerable:typeof key==='string'})}delete p.constructor;define(p,'constructor',{value:C,writable:true,configurable:true});define(p,g.Symbol.toStringTag,{value:C.name,configurable:true});define(g,C.name,{value:C,writable:true,configurable:true})}
++ return{Event,EventTarget,MessageEvent,ErrorEvent,...(promiseEvents?{PromiseRejectionEvent}:{}),allocate(prototype){return create(prototype)}};
+ }
+-export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true}={}){
++export function installWorkerEvents(realm,{evaluate=source=>realm.eval(source),reportError=()=>{},active=()=>true,promiseEvents=false}={}){
+  if(installed.has(realm))return installed.get(realm);
+- for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget'])registerPlatformFactoryKind(kind);
++ for(const kind of['Event','MessageEvent','ErrorEvent','EventTarget',...(promiseEvents?['PromiseRejectionEvent']:[])])registerPlatformFactoryKind(kind);
+  const nativeEvents=new WeakMap(),nativeTargets=new WeakMap(),live=new Set(),Exception=realm.DOMException,TypeError=realm.TypeError,ArrayType=realm.Array,define=Object.defineProperty;let signalAdapter=value=>null,classes;
+  const receiver=state=>state.receiver??state.publicValue;
+  function eventState(value){const state=eventStates.get(value);if(!state)throw new TypeError('Illegal invocation');return state}
+@@ -66,20 +73,23 @@
+   eventCall(value,name){const s=eventState(value);if(name==='preventDefault'&&s.passive)return;if((name==='stopPropagation'||name==='stopImmediatePropagation')&&!s.inDispatch)s.completed=false;apply(methods[name],s.backend,[])},path(value){eventState(value);return[]},
+   init(value,type,bubbles,cancelable){const s=eventState(value);if(s.inDispatch)return;s.backend=new NativeEvent(type,{bubbles,cancelable,composed:apply(readers.composed,s.backend,[])});s.trusted=false;s.pendingTrust=false;s.completed=false;nativeEvents.set(s.backend,value)},
+   message(value,data,origin,lastEventId,source,ports){const s=eventState(value);s.extra=slot({data,origin,lastEventId,source,ports});registerPlatformFactory(value,{kind:'MessageEvent',implementation:s,globalObject:realm})},
+-  error(value,message,filename,lineno,colno,error){const s=eventState(value);s.extra=slot({message,filename,lineno,colno,error});registerPlatformFactory(value,{kind:'ErrorEvent',implementation:s,globalObject:realm})},extra(v,k){const extra=eventState(v).extra;if(!Object.hasOwn(extra,k))throw new TypeError('Illegal invocation');return extra[k]},
++  error(value,message,filename,lineno,colno,error){const s=eventState(value);s.extra=slot({message,filename,lineno,colno,error});registerPlatformFactory(value,{kind:'ErrorEvent',implementation:s,globalObject:realm})},promise:value=>types.isPromise(value),rejection(value,promise,reason){const s=eventState(value);s.extra=slot({promise,reason});registerPlatformFactory(value,{kind:'PromiseRejectionEvent',implementation:s,globalObject:realm})},extra(v,k){const extra=eventState(v).extra;if(!Object.hasOwn(extra,k))throw new TypeError('Illegal invocation');return extra[k]},
+   targetStore(value){api.registerTarget(value,new NativeTarget())},signal:value=>!!signalAdapter(value),dispatch:dispatchEvent,add:addEntry,remove(value,type,callback,capture){const s=targetState(value);for(const entry of s.listeners)if(entry.type===type&&entry.callback===callback&&entry.capture===capture)removeEntry(s,entry)},
+  };
+  const api={
+-  registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map()});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
++  registerTarget(value,backend,kind='EventTarget'){const state=slot({backend,publicValue:value,receiver:null,listeners:new Set(),handlers:new Map(),globalErrorHandler:false});targetStates.set(value,state);nativeTargets.set(backend,state);live.add(new WeakRef(value));registerPlatformFactory(value,{kind,implementation:state,globalObject:realm});return value},
+   portEvent(type,data,ports){const array=new ArrayType(ports.length);for(let i=0;i<ports.length;i++)Object.defineProperty(array,String(i),{value:ports[i],writable:true,enumerable:true,configurable:true});const event=new classes.MessageEvent(type,{data});eventState(event).extra.ports=array;return api.trust(event)},
+   connectEvent(ports){const event=api.portEvent('connect','',ports);eventState(event).extra.source=ports[0];return event},
+   configureSignals(callback){signalAdapter=callback},nativeTarget:value=>targetState(value).backend,
+   trust(value){const s=eventState(value);s.trusted=true;s.pendingTrust=true;return value},
+   setReceiver(value,receiverValue){targetState(value).receiver=receiverValue},
++  configureGlobalErrorHandler(value){targetState(value).globalErrorHandler=true},
++  rejectionEvent(type,promise,reason){if(!classes.PromiseRejectionEvent)throw new TypeError('Rejection events are not installed');const value=new classes.PromiseRejectionEvent(type,{promise,cancelable:type==='unhandledrejection'});eventState(value).extra.reason=reason;return value},
++  producedError(value,error){const state=eventState(value);if(!Object.hasOwn(state.extra,'error'))throw new TypeError('An actual ErrorEvent is required');state.extra.error=error;return value},
+   getHandler(value,type){return targetState(value).handlers.get(type)?.callback??null},
+-  setHandler(value,type,callback){const s=targetState(value),existing=s.handlers.get(type);callback=typeof callback==='function'?callback:null;if(existing){if(callback){existing.callback=callback;return}removeEntry(s,existing.entry);s.handlers.delete(type);return}if(!callback)return;const h=slot({callback,entry:null}),relay=event=>{const result=apply(h.callback,receiver(s),[event]);if(type==='error'&&result===true)apply(methods.preventDefault,eventState(event).backend,[])};addEntry(value,type,relay,{capture:false,once:false,passive:false,signal:null});h.entry=[...s.listeners].find(e=>e.callback===relay);s.handlers.set(type,h)},
++  setHandler(value,type,callback){const s=targetState(value),existing=s.handlers.get(type);callback=typeof callback==='function'?callback:null;if(existing){if(callback){existing.callback=callback;return}removeEntry(s,existing.entry);s.handlers.delete(type);return}if(!callback)return;const h=slot({callback,entry:null}),relay=event=>{const extra=eventState(event).extra,args=type==='error'&&s.globalErrorHandler&&Object.hasOwn(extra,'error')?[extra.message,extra.filename,extra.lineno,extra.colno,extra.error]:[event];const result=apply(h.callback,receiver(s),args);if(type==='error'&&result===true)apply(methods.preventDefault,eventState(event).backend,[])};addEntry(value,type,relay,{capture:false,once:false,passive:false,signal:null});h.entry=[...s.listeners].find(e=>e.callback===relay);s.handlers.set(type,h)},
+   dispatch:dispatchEvent,
+   dispose(){for(const ref of live){const value=ref.deref();if(!value)continue;const s=targetStates.get(value);for(const e of s.listeners)removeEntry(s,e);s.handlers.clear()}live.clear()},
+  };
+- const made=evaluate(`(${factory.toString()})`)(realm,bridge);classes=Object.freeze(Object.assign(Object.create(null),made));installed.set(realm,api);return api;
++ const made=evaluate(`(${factory.toString()})`)(realm,bridge,promiseEvents);classes=Object.freeze(Object.assign(Object.create(null),made));installed.set(realm,api);return api;
+ }
+diff --git a/src/workers.js b/src/workers.js
+--- a/src/workers.js
++++ b/src/workers.js
+@@ -1,3 +1,6 @@
++import{workerErrorOrigins}from'./worker-error-origin.js';
++import{implementationForWrapper}from'./dom-event-state.js';
++import{createRequire}from'node:module';
+ import {withRequestMetadata} from './request-metadata.js';
+ import {fetchWorkerHTTP} from './worker-fetch-policy.js';
+ import {installWorkerFetchRealm} from './worker-fetch-realm.js';
+@@ -45,6 +48,19 @@
+ const SYNC_BYTES = 8 * 1024 * 1024;
+ export function installWorkers(page, window, { enabled = true } = {}) {
+   const creatorSnapshot=captureWorkerCreator(page,window);
++  // This is the real Window path only. Owned Worker boot never loads the
++  // generated Window target graph to create its independent Node backend.
++  const require=createRequire(import.meta.url),dispatchTarget=require('jsdom/lib/jsdom/living/events/EventTarget-impl.js').implementation.prototype._dispatch;
++  const ErrorEventConstructor=window.ErrorEvent,apply=Reflect.apply;
++  function startupError(target,data,fallbackURL){
++    const implementation=implementationForWrapper(target);
++    const event=new ErrorEventConstructor('error',{message:data.message,filename:data.filename||fallbackURL,cancelable:true});
++    const backend=implementationForWrapper(event);backend.error=undefined;backend.isTrusted=true;
++    apply(dispatchTarget,implementation,[backend]);
++    // Canonical dispatch reports genuine owner-handler throws. The measured
++    // startup producer does not invent a second owner exception when no Worker
++    // handler is installed; actual Worker error dispatch still occurs above.
++  }
+   const signal = page.documentAbort?.signal, owned = new Set();
+   const messaging = installMessaging(page, window);
+   const clone = value => messaging.receive({ data: value, ports: [] }).data;
+@@ -104,6 +120,7 @@
+           try { const result=await cacheStoreFor(page).operate(creator.origin,message.operation,message.args);if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,result}); }
+           catch(error) {if(!this.#terminated&&active())this.#thread.postMessage({kind:'cacheResponse',id:message.id,error:{name:error.name,message:error.message}});}
+         } else if (message.kind === 'message') messaging.dispatchMessage(this, message);
++        else if(message.kind==='startupError'){startupError(this,message.error,url.href);}
+         else if (message.kind === 'error') {
+           if(service){page.emit('console',{type:'error',args:[message.error.message]});return;}
+           const error = new window.Error(message.error.message); error.name = message.error.name; error.stack = message.error.stack;
+@@ -219,10 +236,12 @@
+   const pending = new Map(), cachePending=new Map(), servicePending=new Map(), queued = [];
+   let requestId = 1, ready = false, closed = false, context, emit, messaging, streams, broadcast,serviceRuntime,abortPlatform,eventPlatform,socketClient,eventSourceClient,connectShared;
+   let fetchTypeError,fetchRealm;
+-  let dispatchError = value => report(value);
++  let dispatchError = value => report(value),dispatchRejection,dispatchHandled;
+   const lifetime = new AbortController();
+   const error = value => ({ name: value?.name ?? 'Error', message: String(value?.message ?? value), stack: value?.stack, filename: workerData.url });
+-  const report = value => { if (!closed) parentPort.postMessage({ kind: 'error', error: error(value) }); };
++  let reportingStartup=false,localErrorDepth=0,currentOrigin,originRead=false;
++  let origins;
++  const report = value => { if (!closed) parentPort.postMessage({ kind: reportingStartup&&!workerData.shared&&!workerData.service?'startupError':'error', error: error(value) }); };
+   const request = (url, init = {}, script = false, signal, resourceType) => new Promise((resolve, reject) => {
+     if (signal?.aborted) { reject(signal.reason); return; }
+     const id = requestId++;
+@@ -254,6 +273,10 @@
+       parentPort.postMessage({ kind: 'close' }); parentPort.close();
+     } },
+     report,
++    beginError(){if(localErrorDepth)return false;localErrorDepth++;currentOrigin=undefined;originRead=false;return true},
++    endError(){currentOrigin=undefined;originRead=false;localErrorDepth--},
++    errorField(value,key){if(!originRead){currentOrigin=origins.read(value);originRead=true}return currentOrigin?.[key]??(key==='filename'?'':0)},
++    defaultError(value){if(reportingStartup||workerData.shared||workerData.service)report(value)},
+     timer(callback, delay, args, repeat) {
+       const id = timerId++;
+       const fire = () => {
+@@ -306,24 +329,34 @@
+   context = workerData.shared?createSharedWorkerContext(sandbox):vm.createContext(sandbox);
+   const realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);
+   fetchTypeError=realm.TypeError;
++  origins=workerErrorOrigins(vm.runInContext('Object.prototype',context));
+   installWorkerDOMException(realm,{evaluate});
+-  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed});
++  eventPlatform=installWorkerEvents(realm,{evaluate,reportError:value=>dispatchError(value),active:()=>!closed,promiseEvents:!workerData.shared&&!workerData.service});
+   lifetime.signal.addEventListener('abort',()=>eventPlatform.dispose(),{once:true});
+   context.__eventPlatform=eventPlatform;
+   if(workerData.shared)eventPlatform.registerTarget(realm,new EventTarget());
+   context.__sharedWorker=Boolean(workerData.shared);
++  context.__dedicatedWorker=!workerData.shared&&!workerData.service;
+   vm.runInContext(`(function () {
+     'use strict';const eventPlatform=__eventPlatform,bridge=__bridge;
+     delete globalThis.__bridge;
+     const {Event,EventTarget,MessageEvent,ErrorEvent}=globalThis;
+     globalThis.self = globalThis; globalThis.name = __name;
+-    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);
+-    for(const key of ['onmessage','onmessageerror','onerror']) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
++    const target = __sharedWorker?globalThis:new EventTarget(); eventPlatform.setReceiver(target,globalThis);const dedicated=__dedicatedWorker;delete globalThis.__dedicatedWorker;if(dedicated)eventPlatform.configureGlobalErrorHandler(target);
++    for(const key of ['onmessage','onmessageerror','onerror',...(dedicated?['onunhandledrejection','onrejectionhandled']:[])]) Object.defineProperty(globalThis,key,{get(){return eventPlatform.getHandler(target,key.slice(2))},set(value){eventPlatform.setHandler(target,key.slice(2),value)},configurable:true,enumerable:true});
+     for (const name of ['addEventListener', 'removeEventListener']) globalThis[name] = EventTarget.prototype[name].bind(target);
+     const dispatchGlobal=event=>eventPlatform.dispatch(target,event);
+     globalThis.dispatchEvent = dispatchGlobal;
+     let reportingError = false;
+-    globalThis.__dispatchError = error => { if (reportingError) return; reportingError = true; try { const event = new ErrorEvent('error', { message: String(error?.message ?? error), error, cancelable: true }); eventPlatform.trust(event); if (dispatchGlobal(event)) bridge.report(error); } finally { reportingError = false; } };
++    const actualString=String,symbolDescription=Object.getOwnPropertyDescriptor(Symbol.prototype,'description').get,apply=Reflect.apply;
++    const text=value=>typeof value==='symbol'?apply(symbolDescription,value,[])??'':actualString(value);
++    globalThis.__dispatchError = error => {
++      // Shared/service behavior remains the previously measured producer.
++      if(!dedicated){if(reportingError)return;reportingError=true;try{const event=new ErrorEvent('error',{message:String(error?.message??error),error,cancelable:true});eventPlatform.trust(event);if(dispatchGlobal(event))bridge.report(error)}finally{reportingError=false}return}
++      if(!bridge.beginError())return;
++      try{const event=new ErrorEvent('error',{message:text(error),filename:bridge.errorField(error,'filename'),lineno:bridge.errorField(error,'lineno'),colno:bridge.errorField(error,'colno'),cancelable:true});eventPlatform.producedError(event,error);eventPlatform.trust(event);if(dispatchGlobal(event))bridge.defaultError(error)}finally{bridge.endError()}
++    };
++    globalThis.__dispatchRejection=(type,promise,reason)=>dispatchGlobal(eventPlatform.rejectionEvent(type,promise,reason));
+     globalThis.postMessage = (data, transfer) => bridge.postMessage(data, transfer);
+     globalThis.close = () => bridge.close();
+     globalThis.importScripts = (...urls) => bridge.importScripts(...urls);
+@@ -352,7 +385,10 @@
+   abortPlatform=installWorkerAbort(realm,{evaluate,events:eventPlatform,signal:lifetime.signal,active:()=>!closed});
+   installScheduler({documentAbort:lifetime,timeout:2000},realm,{context,evaluate,workerAbort:abortPlatform,workerEvents:eventPlatform});
+   dispatchError=vm.runInContext('__dispatchError',context);
+-  vm.runInContext('delete globalThis.__dispatchError',context);
++  const rejectionProducer=vm.runInContext('__dispatchRejection',context);
++  dispatchRejection=(reason,promise)=>rejectionProducer('unhandledrejection',promise,reason);
++  dispatchHandled=promise=>rejectionProducer('rejectionhandled',promise,null);
++  vm.runInContext('delete globalThis.__dispatchError;delete globalThis.__dispatchRejection',context);
+   emit = vm.runInContext('__emitMessage', context);
+   const createTrustedMessage = vm.runInContext('__createTrustedMessage', context);
+   const trustWorkerEvent=vm.runInContext('__trustWorkerEvent',context);
+@@ -406,13 +442,18 @@
+       if (!ready) queued.push(message); else { messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); }
+     }
+   });
+-  const rejection=(value,promise)=>{if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value)};
+-  process.on('unhandledRejection',rejection);
+-  lifetime.signal.addEventListener('abort',()=>process.off('unhandledRejection',rejection),{once:true});
++  const observedRejections=new WeakSet();
++  const rejection=(value,promise)=>{
++    if(!workerData.shared&&!workerData.service){if(getHeapBinding().sameRealm(promise,realm)){observedRejections.add(promise);dispatchRejection(value,promise)}else report(value);return}
++    if(!workerData.shared||getHeapBinding().sameRealm(promise,realm))dispatchError(value);
++  };
++  const handled=promise=>{if(observedRejections.has(promise)){observedRejections.delete(promise);dispatchHandled(promise)}};
++  process.on('unhandledRejection',rejection);if(!workerData.shared&&!workerData.service)process.on('rejectionHandled',handled);
++  lifetime.signal.addEventListener('abort',()=>{process.off('unhandledRejection',rejection);process.off('rejectionHandled',handled)},{once:true});
+   parentPort.on('close',()=>bridge.close());
+   try {
+     const result = await request(workerData.url, {}, true);
+-    if (result.status < 200 || result.status >= 300) throw new Error(`Worker load failed (${result.status}): ${workerData.url}`);
++    if (result.status < 200 || result.status >= 300) throw new Error(workerData.shared||workerData.service?`Worker load failed (${result.status}): ${workerData.url}`:'Abort');
+     if(!workerData.shared)workerData.url = result.url;
+     context.__resolvedURL = workerData.shared?workerData.url:result.url;
+     vm.runInContext('globalThis.location = new WorkerLocation(new URL(__resolvedURL)); delete globalThis.__resolvedURL;', context);
+@@ -456,15 +497,15 @@
+         validateModule(result);
+         const root = compile(source, workerData.url); modules.set(workerData.url, Promise.resolve(root));
+         await evaluate(root);
+-      } else vm.runInContext(source, context, { filename: workerData.url,
++      } else {vm.runInContext(source, context, { filename: workerData.url,
+         importModuleDynamically: (specifier, _script, extra) => dynamicImport(specifier, { identifier: workerData.url }, extra),
+-      });
++      });}
+     }
+     ready = true;
+     if(workerData.service)parentPort.postMessage({kind:'serviceReady'});
+     for (const message of queued) { if (!closed) { if(message.kind==='sharedConnect'){connectShared(message);continue;} messaging.deliver(vm.runInContext('globalThis', context), message, ({data,ports})=>emit(data,ports)); } }
+     queued.length = 0;
+-  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else dispatchError(failure); }
++  } catch (failure) { if(workerData.service)parentPort.postMessage({kind:'serviceError',error:error(failure)});else{reportingStartup=true;try{dispatchError(failure)}finally{reportingStartup=false}} }
+ }
+ 
+ if (!isMainThread && workerThreadData?.redPandaWorker) void runWorker();
+diff --git a/test/url-blocking.test.js b/test/url-blocking.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/url-blocking.test.js
+@@ -0,0 +1,80 @@
++import{test}from'node:test';
++import assert from'node:assert/strict';
++import http from'node:http';
++import{once}from'node:events';
++import{Browser}from'../src/browser.js';
++import{serve}from'../src/cdp.js';
++import{WebSocket}from'ws';
++import{initializeURLBlockConnection,registerURLBlockContext,urlBlockOwnerForConnection,registerURLBlockPage,setBlockedURLs,assertURLAllowed,urlBlockedError}from'../src/url-blocking.js';
++class ProtocolError extends Error{constructor(message,code){super(message);this.code=code}}
++function policyFixture(t){const browser=new Browser(),connection={browser};initializeURLBlockConnection(connection);const id=browser.createContext(),context=browser.contexts.get(id);registerURLBlockContext(connection,context);const page=browser.createPage(id,{urlBlockOwner:urlBlockOwnerForConnection(connection)});t.after(()=>browser.close());return{browser,connection,page,set:patterns=>setBlockedURLs(connection,page,{urlPatterns:patterns},ProtocolError)}}
++const blocked=(page,url)=>{try{assertURLAllowed(page,url);return false}catch(error){assert.ok(urlBlockedError(error));assert.equal(error.message,'UrlBlocked');return true}};
++test('URL admission uses anchored ASCII matching, literal punctuation and ordered decisions',t=>{
++ const{page,set}=policyFixture(t),origin='https://heldout.example';
++ for(const[patterns,url,result]of[
++  [[{urlPattern:'*eXample/assets/**A*.jS?rev=*',block:true}],origin+'/assets/sub/AA.js?rev=3',true],
++  [[{urlPattern:origin+'/x?y',block:true}],origin+'/xZy',false],
++  [[{urlPattern:origin+'/exact',block:true}],origin+'/exact-tail',false],
++  [[{urlPattern:'',block:true}],origin+'/',false],
++  [[{urlPattern:'*/safe/*',block:false},{urlPattern:'*',block:true}],origin+'/safe/a',false],
++  [[{urlPattern:'*',block:true},{urlPattern:'*/safe/*',block:false}],origin+'/safe/a',true],
++  [[{urlPattern:'**/*literal*tail',block:true}],origin+'/*literal*tail',true]
++ ]){set(patterns);assert.equal(blocked(page,url),result,url)}
++});
++test('URL program conversion is atomic and genuine denial authority ignores copied data and proxies',t=>{
++ const{page,set,connection}=policyFixture(t);set([{urlPattern:'*/held/*',block:true}]);
++ assert.throws(()=>setBlockedURLs(connection,page,{urlPatterns:[{urlPattern:'*',block:false},{urlPattern:'*',block:2}]},ProtocolError),{message:'UnexpectedToken',code:-31998});assert.equal(blocked(page,'https://actual.example/held/value'),true);
++ assert.throws(()=>setBlockedURLs(connection,page,{},ProtocolError),{message:'MissingField'});
++ let reads=0;const fake=new Proxy({message:'UrlBlocked',blockedReason:'inspector'},{get(){reads++;throw Error('authored')}});assert.equal(urlBlockedError(fake),false);assert.equal(reads,0);
++ set([]);assert.equal(blocked(page,'https://actual.example/held/value'),false);
++});
++test('Connection rules persist through actual context replacement and isolate independent connections',t=>{
++ const{browser,connection,page,set}=policyFixture(t);set([{urlPattern:'*/owned/*',block:true}]);const other={browser};initializeURLBlockConnection(other);const id=browser.createContext(),context=browser.contexts.get(id);registerURLBlockContext(other,context);const independent=browser.createPage(id,{urlBlockOwner:urlBlockOwnerForConnection(other)});
++ assert.equal(blocked(independent,'https://actual.example/owned/a'),false);browser.disposeContext(page.context.id);const next=browser.createContext(),nextContext=browser.contexts.get(next);registerURLBlockContext(connection,nextContext);const replacement=browser.createPage(next,{urlBlockOwner:urlBlockOwnerForConnection(connection)});assert.equal(blocked(replacement,'https://actual.example/owned/a'),true);
++});
++async function fixture(t){
++ const receipts=[],server=http.createServer((req,res)=>{receipts.push(req.url);res.setHeader('cache-control','no-store');if(req.url==='/redirect'){res.writeHead(302,{location:'/denied/destination'});res.end();return}if(req.url.startsWith('/worker.js')){res.setHeader('content-type','text/javascript');res.end('fetch("/denied/worker-fetch").then(r=>r.text()).then(value=>postMessage({ok:true,value}),e=>postMessage({ok:false,name:e.name,message:e.message}));');return}res.setHeader('content-type','text/html');res.end('<!doctype html><p>Actual response 🐼</p>')});
++ t.after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve))});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+server.address().port;
++ const endpoint=await serve({port:0,timeout:1500,loadResources:['worker']});t.after(()=>endpoint.close());const socket=new WebSocket('ws://127.0.0.1:'+endpoint.port+'/');t.after(()=>socket.terminate());await once(socket,'open');let id=0;const pending=new Map(),events=[];socket.on('message',data=>{const value=JSON.parse(data);if(value.id===undefined)events.push(value);else{const entry=pending.get(value.id);if(entry){pending.delete(value.id);clearTimeout(entry.timer);entry.resolve(value)}}});
++ const send=(method,params,sessionId)=>new Promise((resolve,reject)=>{const key=++id,timer=setTimeout(()=>reject(Error('Actual RPC timeout '+method)),2500);pending.set(key,{resolve,timer});socket.send(JSON.stringify({id:key,method,params,...(sessionId?{sessionId}:{})}))});t.after(()=>{for(const value of pending.values())clearTimeout(value.timer)});
++ const context=(await send('Target.createBrowserContext',{})).result.browserContextId,target=(await send('Target.createTarget',{browserContextId:context,url:'about:blank'})).result.targetId,session=(await send('Target.attachToTarget',{targetId:target,flatten:true})).result.sessionId;
++ for(const method of['Page.enable','Runtime.enable','Network.enable'])assert.ok(!(await send(method,{},session)).error);
++ const run=async expression=>{const reply=await send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},session);assert.ok(!reply.error,JSON.stringify(reply));assert.ok(!reply.result.exceptionDetails,JSON.stringify(reply));return reply.result.result.value};
++ await send('Page.navigate',{url:origin+'/'},session);await run('new Promise(r=>document.readyState==="complete"?r(true):addEventListener("load",()=>r(true),{once:true}))');
++ return{endpoint,origin,send,run,session,receipts,events};
++}
++test('Real CDP admission blocks Window fetch and sync XHR before HTTP and preserves VM errors',async t=>{
++ const f=await fixture(t);assert.deepEqual((await f.send('Network.setBlockedURLs',{urlPatterns:[{urlPattern:'*/denied/*',block:true}]},f.session)).result,{});
++ const out=await f.run(`(async()=>{let a,b;try{await fetch('/denied/fetch')}catch(e){a={name:e.name,message:e.message,realm:e instanceof TypeError}}const x=new XMLHttpRequest();x.open('GET','/denied/sync',false);try{x.send()}catch(e){b={name:e.name,message:e.message,status:x.status,realm:e instanceof DOMException}}return{a,b}})()`);
++ assert.deepEqual(out,{a:{name:'TypeError',message:'fetch error',realm:true},b:{name:'NetworkError',message:'A network error occurred',status:0,realm:true}});assert.deepEqual(f.receipts,['/']);const failures=f.events.filter(e=>e.method==='Network.loadingFailed');assert.equal(failures.length,2);for(const event of failures){assert.equal(event.params.errorText,'UrlBlocked');assert.equal(event.params.blockedReason,'inspector');assert.equal(event.params.type,'Ping')}
++});
++test('Actual redirect source reaches HTTP while blocked destination does not; clearing restores bytes',async t=>{
++ const f=await fixture(t);await f.send('Network.setBlockedURLs',{urlPatterns:[{urlPattern:'*/denied/*',block:true}]},f.session);const fail=await f.run('fetch("/redirect").then(()=>"accepted",e=>e.message)');assert.equal(fail,'fetch error');assert.deepEqual(f.receipts,['/','/redirect']);await f.send('Network.setBlockedURLs',{urlPatterns:[]},f.session);assert.equal(await f.run('fetch("/denied/real").then(r=>r.text())'),'<!doctype html><p>Actual response 🐼</p>');assert.deepEqual(f.receipts,['/','/redirect','/denied/real']);
++});
++test('Real dedicated Worker fetch and startup scripts use the same captured admission authority',async t=>{
++ const f=await fixture(t);await f.send('Network.setBlockedURLs',{urlPatterns:[{urlPattern:'*/denied/*',block:true}]},f.session);const out=await f.run('new Promise(r=>{const w=new Worker("/worker.js");w.onmessage=e=>{r(e.data);w.terminate()};w.onerror=e=>{r({startupError:e.message});w.terminate()}})');assert.deepEqual(out,{ok:false,name:'TypeError',message:'fetch error'});assert.deepEqual(f.receipts,['/','/worker.js']);
++ await f.send('Network.setBlockedURLs',{urlPatterns:[{urlPattern:'*/worker.js*',block:true}]},f.session);assert.equal(await f.run('new Promise(r=>{const w=new Worker("/worker.js?blocked");w.onerror=e=>{r(e.message);w.terminate()};w.onmessage=e=>{r("unexpected message");w.terminate()}})'),'UrlBlocked');assert.deepEqual(f.receipts,['/','/worker.js']);
++});
++test('A blocked real document commits a new empty document without manufacturing an HTTP response',async t=>{
++ const f=await fixture(t);await f.send('Network.setBlockedURLs',{urlPatterns:[{urlPattern:'*/denied/*',block:true}]},f.session);await f.run('globalThis.actualOldDocumentMarker=42');const reply=await f.send('Page.navigate',{url:f.origin+'/denied/document'},f.session);assert.equal(reply.result.errorText,'UrlBlocked');const state=await f.run('new Promise(r=>setTimeout(()=>r({url:location.href,ready:document.readyState,text:document.body.textContent,old:typeof actualOldDocumentMarker}),0))');assert.deepEqual(state,{url:f.origin+'/denied/document',ready:'complete',text:'',old:'undefined'});assert.deepEqual(f.receipts,['/']);assert.equal(f.events.some(e=>e.method==='Runtime.exceptionThrown'),false);
++});
++test('Disposed genuine contexts remain usable as retained values but cannot authorize a command',t=>{
++ const{browser,connection,page,set}=policyFixture(t),retained=page.context;
++ set([{urlPattern:'*/retained-policy/*',block:true}]);browser.disposeContext(retained.id);
++ assert.equal(retained.cookies.getCookieStringSync('https://actual.example/'),'');
++ assert.throws(()=>setBlockedURLs(connection,undefined,{urlPatterns:[]},ProtocolError),{message:'BrowserContextNotLoaded',code:-31998});
++ for(let i=0;i<12;i++){
++  const id=browser.createContext(),context=browser.contexts.get(id);registerURLBlockContext(connection,context);
++  const current=browser.createPage(id,{urlBlockOwner:urlBlockOwnerForConnection(connection)});
++  assert.equal(blocked(current,'https://actual.example/retained-policy/check'),true);
++  assert.equal(blocked(current,'https://actual.example/unrelated'),false);
++  browser.disposeContext(id);
++ }
++ assert.throws(()=>setBlockedURLs(connection,undefined,{urlPatterns:[]},ProtocolError),{message:'BrowserContextNotLoaded'});
++});
++test('A foreign target argument never transfers connection command authority',t=>{
++ const{browser,connection,page,set}=policyFixture(t);set([{urlPattern:'*/one/*',block:true}]);
++ const other={browser};initializeURLBlockConnection(other);const id=browser.createContext(),context=browser.contexts.get(id);registerURLBlockContext(other,context);const foreign=browser.createPage(id,{urlBlockOwner:urlBlockOwnerForConnection(other)});
++ setBlockedURLs(connection,foreign,{urlPatterns:[{urlPattern:'*/two/*',block:true}]},ProtocolError);
++ assert.equal(blocked(page,'https://actual.example/two/value'),true);assert.equal(blocked(page,'https://actual.example/one/value'),false);assert.equal(blocked(foreign,'https://actual.example/two/value'),false);
++});
+diff --git a/test/worker-error-origin.test.js b/test/worker-error-origin.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/worker-error-origin.test.js
+@@ -0,0 +1,8 @@
++import{test}from'node:test';import assert from'node:assert/strict';import vm from'node:vm';import{getRuntimeBinding}from'../src/native-runtime.js';import{getHeapBinding}from'../src/native-heap.js';import{workerErrorOrigins}from'../src/worker-error-origin.js';
++const binding=getRuntimeBinding();
++function owned(source,{filename='https://actual.invalid/owned-script.js'}={}){const context=vm.createContext({});const anchor=vm.runInContext('Object.prototype',context),value=vm.runInContext(source,context,{filename});return{context,anchor,value,filename}}
++test('privileged origin reads actual V8 Error source with UTF16 columns and same real VM authority',{timeout:15000},()=>{const source='const actualText="中😀";\nnew RangeError("heldout actual engine source")',f=owned(source),origin=binding.errorOrigin(f.value,f.anchor);assert.deepEqual(origin,{filename:f.filename,lineno:2,colno:1});const heap=getHeapBinding();assert.equal(heap.sameRealm(f.value,f.anchor),true);assert.equal(heap.sameRealm(origin,{}),true);assert.equal(heap.sameRealm(origin,f.anchor),false);const prototype=Object.getPrototypeOf(f.value);Object.setPrototypeOf(f.value,null);try{assert.deepEqual(binding.errorOrigin(f.value,f.anchor),origin);assert.equal(heap.sameRealm(f.value,f.anchor),true);assert.equal(heap.sameRealm(f.value,{}),false)}finally{Object.setPrototypeOf(f.value,prototype)}});
++test('actual Error sourceURL is engine metadata and never physical realm authority',{timeout:15000},()=>{const f=owned('new RangeError("actual sourceURL")\n//# sourceURL=https://not-real.invalid/claimed.js'),other=owned('new RangeError("actual foreign")',{filename:f.filename});assert.deepEqual(binding.errorOrigin(f.value,f.anchor),{filename:'https://not-real.invalid/claimed.js',lineno:1,colno:1});assert.equal(binding.errorOrigin(other.value,f.anchor),null);assert.equal(binding.errorOrigin(new RangeError('Host with same authored fields'),f.anchor),null);assert.equal(binding.errorOrigin(f.value,{}),null)});
++test('copied Error prototypes, proxies and ordinary values never authenticate or invoke authored traps',{timeout:15000},()=>{const f=owned('new Error("actual")'),fake=Object.create(Object.getPrototypeOf(f.value));let traps=0;const proxy=new Proxy(f.value,{get(){traps++;throw Error('get')},getPrototypeOf(){traps++;throw Error('prototype')},getOwnPropertyDescriptor(){traps++;throw Error('descriptor')}});for(const value of[fake,proxy,{},null,undefined,42,'actual',Symbol('actual')])assert.equal(binding.errorOrigin(value,f.anchor),null);assert.equal(traps,0)});
++test('actual stack/accessor/prepareStackTrace poison is not consulted by privileged source reader',{timeout:15000},()=>{const f=owned('globalThis.actualError=new RangeError("actual private trace");actualError');vm.runInContext(`globalThis.reads={stack:0,prepare:0,name:0,message:0};Object.defineProperty(actualError,'stack',{get(){reads.stack++;throw 1},configurable:true});Object.defineProperty(Error,'prepareStackTrace',{get(){reads.prepare++;throw 2},configurable:true});for(const key of['name','message'])Object.defineProperty(actualError,key,{get(){reads[key]++;throw 3},configurable:true})`,f.context);const expectedColumn='globalThis.actualError='.length+1;assert.deepEqual(binding.errorOrigin(f.value,f.anchor),{filename:f.filename,lineno:1,colno:expectedColumn});assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(reads)',f.context)),{stack:0,prepare:0,name:0,message:0})});
++test('missing actual private stack has no invented current-caller source and repeated mutation is observed',{timeout:15000},()=>{const noTrace=owned('Error.stackTraceLimit=0;new Error("actual no trace")');assert.equal(binding.errorOrigin(noTrace.value,noTrace.anchor),null);const f=owned('globalThis.actualError=new Error("actual mutable");actualError'),reader=workerErrorOrigins(f.anchor);assert.ok(reader.read(f.value));vm.runInContext('actualError.stack="AuthoredName: fake\\n    at https://not-real.invalid/forged.js:333:444"',f.context);assert.equal(reader.read(f.value),null);assert.equal(binding.errorOrigin(f.value,f.anchor),null)});
+diff --git a/test/worker-local-event-fronts.test.js b/test/worker-local-event-fronts.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/worker-local-event-fronts.test.js
+@@ -0,0 +1,4 @@
++import{test}from'node:test';import assert from'node:assert/strict';import vm from'node:vm';import{installWorkerDOMException}from'../src/worker-dom-exception.js';import{installWorkerEvents}from'../src/worker-events.js';import{getHeapBinding}from'../src/native-heap.js';import{platformFactoryRecord}from'../src/platform-factories.js';
++function fixture(t){const context=vm.createContext({}),realm=vm.runInContext('globalThis',context),evaluate=source=>vm.runInContext(source,context);installWorkerDOMException(realm,{evaluate});const errors=[],api=installWorkerEvents(realm,{evaluate,reportError:value=>errors.push(value),promiseEvents:true});t.after(()=>api.dispose());return{context,realm,evaluate,api,errors}}
++test('new genuine Worker rejection fronts, constructors, getters and values have actual selected V8 creation context',{timeout:15000},t=>{const{realm,evaluate,api}=fixture(t),heap=getHeapBinding(),anchor=realm.Array.prototype,promise=evaluate('Promise.resolve("actual")'),reason=evaluate('new RangeError("actual private reason")'),event=api.rejectionEvent('unhandledrejection',promise,reason),getter=Object.getOwnPropertyDescriptor(realm.PromiseRejectionEvent.prototype,'reason').get;for(const value of[realm.PromiseRejectionEvent,realm.PromiseRejectionEvent.prototype,getter,event,promise,reason]){assert.equal(heap.sameRealm(value,anchor),true);assert.equal(heap.sameRealm(value,{}),false);const prototype=Object.getPrototypeOf(value);try{Object.setPrototypeOf(value,null);assert.equal(heap.sameRealm(value,anchor),true)}finally{Object.setPrototypeOf(value,prototype)}}assert.equal(event.promise,promise);assert.equal(event.reason,reason);assert.equal(event.isTrusted,false);assert.equal(event.cancelable,true);assert.deepEqual(Reflect.ownKeys(event),['isTrusted']);assert.equal(platformFactoryRecord(event).kind,'PromiseRejectionEvent');let traps=0;const proxy=new Proxy(event,{get(){traps++;throw 1},getPrototypeOf(){traps++;throw 2}}),fake=Object.create(realm.PromiseRejectionEvent.prototype);for(const receiver of[fake,proxy,{},new realm.Event('actual')])assert.throws(()=>getter.call(receiver),error=>error instanceof realm.TypeError);assert.equal(traps,0);const handled=api.rejectionEvent('rejectionhandled',promise,null);assert.equal(handled.promise,promise);assert.equal(handled.reason,null);assert.equal(handled.cancelable,false);assert.equal(handled.isTrusted,false)});
++test('only genuine global ErrorEvent handler policy uses five private fields and actual return cancellation',{timeout:15000},t=>{const{realm,api,errors}=fixture(t),globalTarget=new realm.EventTarget(),ordinaryTarget=new realm.EventTarget(),receiver=realm.Object.create(null),reason=new realm.URIError('actual reason'),events=[];api.setReceiver(globalTarget,receiver);api.configureGlobalErrorHandler(globalTarget);api.setHandler(globalTarget,'error',function(...args){events.push({receiver:this,args});return true});api.setHandler(ordinaryTarget,'error',function(...args){events.push({receiver:this,args})});const actual=new realm.ErrorEvent('error',{message:'actual message',filename:'https://actual.invalid/origin.js',lineno:17,colno:23,error:reason,cancelable:true});let reads=0;Object.defineProperty(actual,'message',{get(){reads++;throw Error('authored getter')}});assert.equal(api.dispatch(globalTarget,actual),false);assert.equal(reads,0);assert.equal(events[0].receiver,receiver);assert.deepEqual(events[0].args,['actual message','https://actual.invalid/origin.js',17,23,reason]);assert.equal(actual.defaultPrevented,true);const ordinary=new realm.ErrorEvent('error',{error:reason});api.dispatch(ordinaryTarget,ordinary);assert.deepEqual(events[1].args,[ordinary]);assert.equal(events[1].receiver,ordinaryTarget);assert.equal(errors.length,0);api.setHandler(globalTarget,'error',null);assert.equal(api.getHandler(globalTarget,'error'),null)});
+diff --git a/test/worker-startup-errors.test.js b/test/worker-startup-errors.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/worker-startup-errors.test.js
+@@ -0,0 +1,8 @@
++import{test}from'node:test';import assert from'node:assert/strict';import http from'node:http';import{Browser}from'../src/browser.js';import{getHeapBinding}from'../src/native-heap.js';import{initializeURLBlockConnection,registerURLBlockContext,urlBlockOwnerForConnection,setBlockedURLs}from'../src/url-blocking.js';
++async function fixture(t){const requests=[],waiters=[];let release;const server=http.createServer((q,s)=>{requests.push(q.url);if(q.url==='/held.js'){release=()=>{if(!s.destroyed){s.setHeader('content-type','text/javascript');s.end('throw Error("late response must not run")')}};for(const resolve of waiters.splice(0))resolve();return}s.setHeader('cache-control','no-store');if(q.url==='/'||q.url==='/page'){s.setHeader('content-type','text/html');s.end('<!doctype html><p>actual owner');return}s.setHeader('content-type','text/javascript');if(q.url.startsWith('/missing.js')){s.statusCode=404;s.end('postMessage("actual404bodyexecution")')}else if(q.url.startsWith('/throws-after-timer.js'))s.end('setTimeout(()=>postMessage("actual-after-error"),0);throw new RangeError("actual no-consumer startup error");');else if(q.url.startsWith('/throws.js'))s.end('throw new RangeError("actual worker startup failure")');else s.end('postMessage("actual worker response")')});let browser;t.after(async()=>{browser?.close();release?.();server.closeAllConnections();await new Promise(r=>server.close(r))});await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+server.address().port;browser=new Browser({timeout:1500,loadResources:['worker']});const connection={browser};initializeURLBlockConnection(connection);const id=browser.createContext(),context=browser.contexts.get(id);registerURLBlockContext(connection,context);const page=browser.createPage(id,{urlBlockOwner:urlBlockOwnerForConnection(connection)}),errors=[];page.on('pageError',e=>errors.push(e));await page.navigate(origin+'/page');setBlockedURLs(connection,page,{urlPatterns:[{urlPattern:'*/denied.js*',block:true}]},class extends Error{});return{page,w:page.dom.window,origin,requests,errors,held:()=>release?Promise.resolve():new Promise(r=>waiters.push(r)),release:()=>release?.()}}
++const snapshot=e=>({message:e.message,error:e.error,trusted:e.isTrusted,cancelable:e.cancelable,line:e.lineno,column:e.colno});
++test('actual consumed startup errors are trusted events with undefined error, without duplicated owner exceptions',async t=>{const f=await fixture(t);for(const[path,message]of[['/denied.js','UrlBlocked'],['/missing.js','Abort'],['/throws.js','actual worker startup failure']])for(const mode of['property','listener','prevent']){const before=f.errors.length,event=await new Promise(resolve=>{const worker=new f.w.Worker(path+'?mode='+mode),read=e=>{const value=snapshot(e);if(mode==='prevent')e.preventDefault();resolve({...value,prevented:e.defaultPrevented});worker.terminate()};if(mode==='listener')worker.addEventListener('error',read,{once:true});else worker.onerror=read});assert.deepEqual(event,{message,error:undefined,trusted:true,cancelable:true,line:0,column:0,prevented:mode==='prevent'});assert.equal(f.errors.length,before)}assert.equal(f.requests.filter(v=>v.startsWith('/denied.js')).length,0);assert.equal(f.requests.filter(v=>v.startsWith('/missing.js')).length,3);assert.equal(f.requests.filter(v=>v.startsWith('/throws.js')).length,3)});
++test('genuine owner-handler exceptions still report once and startup producer ignores replaced public constructor',async t=>{const f=await fixture(t),binding=getHeapBinding(),anchor=new f.w.Array(),ownerEvents=[];f.w.addEventListener('error',e=>ownerEvents.push(e));let reads=0;f.w.ErrorEvent=function(){reads++;throw Error('authored constructor')};const reason=new f.w.RangeError('actual owner handler failure'),event=await new Promise(resolve=>{const worker=new f.w.Worker('/denied.js?handler-throw');worker.onerror=e=>{resolve(e);worker.terminate();throw reason}});assert.equal(reads,0);assert.equal(event.error,undefined);assert.equal(event.isTrusted,true);assert.equal(binding.sameRealm(event,anchor),true);const prototype=Object.getPrototypeOf(event);Object.setPrototypeOf(event,null);assert.equal(binding.sameRealm(event,anchor),true);Object.setPrototypeOf(event,prototype);await new Promise(r=>setImmediate(r));assert.equal(f.errors.length,1);assert.equal(f.errors[0],reason);assert.equal(ownerEvents.length,1);assert.equal(ownerEvents[0].error,reason)});
++test('actual document retirement cancels a held startup request and prevents late Worker error delivery',async t=>{const f=await fixture(t);let delivered=0;const worker=new f.w.Worker('/held.js');worker.onerror=()=>delivered++;await f.held();f.page.close();f.release();await new Promise(r=>setImmediate(r));assert.equal(delivered,0);assert.equal(f.errors.length,0);assert.equal(f.requests.filter(v=>v==='/held.js').length,1)});
++
++test('actual startup throw without a Worker error consumer still delivers its later task without inventing an owner exception',async t=>{const f=await fixture(t),owner=[];f.w.addEventListener('error',e=>owner.push(e));const worker=new f.w.Worker('/throws-after-timer.js');assert.equal(worker.onerror,null);const marker=await new Promise(resolve=>{worker.onmessage=e=>resolve(e.data)});assert.equal(marker,'actual-after-error');worker.terminate();assert.equal(f.errors.length,0);assert.equal(owner.length,0);assert.equal(f.requests.filter(v=>v==='/throws-after-timer.js').length,1)});
+diff --git a/test/workers.test.js b/test/workers.test.js
+--- a/test/workers.test.js
++++ b/test/workers.test.js
+@@ -187,14 +187,26 @@
+   assert.equal(f.requests.filter(request => request.url.endsWith('/dynamic.js')).length, 1); worker.terminate();
+ });
+ 
+-test('worker errors dispatch cancelable ErrorEvents and allow recovery from callback exceptions', async t => {
+-  const f = fixture(t, { 'https://example.test/app/error.js': `onmessage = event => { if (event.data === 'throw') throw new Error('worker boom'); postMessage('recovered'); };` });
+-  const worker = new f.window.Worker('./error.js');
+-  const error = deadline(new Promise(resolve => worker.addEventListener('error', event => { event.preventDefault(); resolve(event); }, { once: true })));
+-  worker.postMessage('throw'); const event = await error;
+-  assert.equal(event.message, 'worker boom'); assert.equal(event.filename, 'https://example.test/app/error.js');
+-  assert.equal(event.error instanceof f.window.Error, true); assert.deepEqual(f.errors, []);
+-  const result = message(worker); worker.postMessage('ok'); assert.equal(await result, 'recovered'); worker.terminate();
++test('worker callback errors remain local and recover after a canceled error event', async t => {
++  const f = fixture(t, { 'https://example.test/app/error.js': `addEventListener('error', event => {
++    const before = event.defaultPrevented; event.preventDefault();
++    postMessage({ kind: 'local-error', message: event.message, filename: event.filename,
++      lineno: event.lineno, colno: event.colno, errorName: event.error.name,
++      errorMessage: event.error.message, errorRealm: event.error instanceof Error,
++      trusted: event.isTrusted, cancelable: event.cancelable, before, after: event.defaultPrevented });
++  }); onmessage = event => { if (event.data === 'throw') throw new Error('worker boom'); postMessage('recovered'); };` });
++  const worker = new f.window.Worker('./error.js'), outerErrors = [];
++  worker.addEventListener('error', event => outerErrors.push(event));
++  const localError = message(worker); worker.postMessage('throw'); const event = await localError;
++  assert.equal(event.kind, 'local-error'); assert.equal(event.message, 'Error: worker boom');
++  assert.equal(event.filename, 'https://example.test/app/error.js');
++  assert.equal(typeof event.lineno, 'number'); assert.equal(event.lineno > 0, true);
++  assert.equal(typeof event.colno, 'number'); assert.equal(event.colno > 0, true);
++  assert.equal(event.errorName, 'Error'); assert.equal(event.errorMessage, 'worker boom');
++  assert.equal(event.errorRealm, true); assert.equal(event.trusted, true); assert.equal(event.cancelable, true);
++  assert.equal(event.before, false); assert.equal(event.after, true);
++  const result = message(worker); worker.postMessage('ok'); assert.equal(await result, 'recovered');
++  assert.deepEqual(outerErrors, []); assert.deepEqual(f.errors, []); worker.terminate();
+ });
+ 
+ test('termination interrupts an infinite worker loop and page abort disposes all owned workers', async t => {

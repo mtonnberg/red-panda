@@ -4,13 +4,16 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current combined checkpoint passes **2,043 JavaScript tests, 129 PureScript
+The current composed checkpoint passes **2,190 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
-pedantic builds with zero warnings or errors. The
-[frozen validation](../proposals/phase26-full-file-element-url/README.md) records
-10,035 unchanged inputs and the exact 38 runtime/test/automation leaves over
-d41fd69. The earlier 1,992/117/13 Markdown and animation checkpoint remains
-[separate evidence](../proposals/phase26-full-accepted/README.md).
+pedantic builds. The strict build reports zero warnings and errors; runtime
+warnings remain in the untruncated logs. [Full validation](../proposals/feature-composition-full-root-r1/README.md)
+records 13,174 unchanged inputs after the exact 51-source/six-artifact application
+over 2342b41. Original assertions, fixtures and budgets are unchanged. This is
+not a new whole-455 census or a full replication claim. The earlier
+[2,043/129/13](../proposals/phase26-full-file-element-url/README.md) and
+[1,992/117/13](../proposals/phase26-full-accepted/README.md) checkpoints remain
+separate evidence.
 
 Disk file selection now reads actual bytes/MIME/stat timestamps, validates the
 whole vector before mutation, preserves canonical FileList identity and dispatches
@@ -463,7 +466,7 @@ Native common option families still needing implementation/conformance:
 | --- | --- |
 | Navigation/history | Same-document URL/context events, push/replace/hash, back/forward/reload, redirects from scripts and location setters, cancellation and concurrent navigations. Parent navigation work is in progress beyond this historical baseline. |
 | DOM/input/accessibility | Full frontend/backend node identity and lifetime, traversal/search, form controls and submission, focus/keyboard/mouse dispatch, trusted event ordering, accessibility names/roles/tree and hidden-content rules. New DOM/input work is not a full-tree conformance result. |
-| HTML/XML/encoding | Native html5ever/parser behavior versus jsdom, fragment contexts, document.write, XML/XHTML errors, charset/BOM handling and malformed inputs. The prototype document decoder is UTF-8 only. |
+| HTML/XML/encoding | Native html5ever/parser behavior versus jsdom, fragment contexts, document.write and broader malformed XML/XHTML/encoding inputs. Canonical BOM/legacy-codec decoding and measured XML factory corrections have bounded R9 evidence below. |
 | JavaScript/realms | Classic/modules/import maps/dynamic import/top-level await, distinct frame and utility worlds, globals/descriptors and object lifetimes, compile/run/await/termination contracts. Utility-world IDs historically share one JS realm. |
 | Networking | Fetch/Request/Response edge cases, streams/binary bodies, XHR, WebSocket/EventSource/beacon, CORS/preflights, credentials/referrer policies, cache, interception/auth, HTTP/TLS/proxy features and accurate request/event/body metadata. |
 | Frames/workers | Nested/cross-origin/srcdoc/data/blob frames; window.open/close and opener; dedicated/shared/service workers and per-context ownership. Presence of a constructor is not execution support. |
@@ -1132,3 +1135,78 @@ Actual R9:126 cases on each of three SDKs (378 passes, no skips), plus23 retaine
 The original lifecycle controller expected64 and stopped despite actual68/68 passes. Its administrative failure is retained. A separate static supplement accounts for64 literal and4 genuine data-driven tests, verifies exact names/guards/process cleanup and accepts the actual68 without rerunning tests or editing assertions/budgets. The imported data-case MJS lacked a direct pre-run hash; the supplement explicitly records its immutable79 committed/current-byte and timestamp evidence instead of inventing a pre-run pin. Original expected Native JSON was pinned.
 
 Every earlier contrary remains archived: R3 serialized xmlns mismatch, R5 tag-query/parsererror mismatches, R6 qualified-name heldout mismatch, rejected unrun R7 generic-class draft, R8 CJS startup failure, and the separate R9 correction. The archive byte-verifies all captured raw evidence, source/controllers and patches. Broader first-Window ownership, original Source96, transport timing, complete conformance/WPT and full independent replication remain incomplete. Last complete2043/129/13 suite remains97bb0ac. Keep Red Panda branding and all original fixtures/assertions/budgets.
+
+### HTTP cache, worker events, author tools and semantic commands
+
+The next composed graph installs 51 source/test/reference leaves and six matching
+runtime binary/metadata leaves. Its first merged gate passes all 82 behavioral
+tests, two integration tests and 46 syntax checks in 39.614 seconds. All 647
+candidate inputs, 520 tool inputs and 16 packet inputs stay unchanged; the
+pre-application Root remains unchanged during that gate. The full Root workflow
+is a separate run; these results do not replace its totals.
+[Composition and application evidence](../proposals/feature-composition-final82-r1/README.md).
+
+The optional SQLite HTTP cache shares completed eligible responses across fetch,
+scripts, dedicated workers and synchronous XHR. Measured contracts cover fresh
+hits, validators and 304 renewal, persistent response bodies, context controls
+and soft capacity limits. URL blocking runs before cache lookup. The integration
+test verifies that cached fetch and synchronous XHR remain blocked without new
+HTTP requests, then resume using the retained body when the policy is cleared.
+Expiry, authorization, concurrent writers, corruption and broader service/shared
+worker behavior remain incomplete. [Cache evidence](../proposals/http-cache-independent-r5/README.md).
+
+Worker errors use their actual local trusted events, cancellation and rejection
+ownership; public V8 error-origin queries identify genuine engine exceptions.
+The new worker performance implementation owns each actor's clock, marks,
+measures and queued observer delivery. Its original upstream performance fixture
+passes within its original budgets with Red Panda identity headers. Separate
+SDK evidence verifies actual creation contexts; public prototype similarity is
+not treated as realm evidence. Resource entries and complete shared/service
+worker performance remain unfinished.
+[Worker events](../proposals/worker-network-local-errors-r5/README.md),
+[performance](../proposals/worker-performance-r3/README.md), and
+[combined native primitives](../proposals/native-worker-webmcp-composition/README.md).
+
+Window ModelContext author tools now have real document-owned callbacks,
+registration/removal, cancellation signals and genuine Promise adoption, with
+WebMCP CDP events and invocation. They remain distinct from the automation MCP
+server. Semantic commands implement the measured `LP.getNodeDetails`,
+`LP.detectForms` and `LP.getInteractiveElements` subset over canonical DOM nodes,
+without authored getter reads. The second integration test invokes an actual
+author callback through synchronous cached XHR, mutates the real DOM and reads
+the resulting semantic details and EventCounts. Broader semantic trees,
+accessibility, queue timing and callback timeout behavior remain incomplete.
+[Author-tool evidence](../proposals/model-context-webmcp-v8/README.md) and
+[semantic evidence](../proposals/semantic-automation-r3/README.md).
+
+Initial blank-frame lifecycle delivery captures the actual Window task and
+Document-to-Window listener record and preserves owner-VM interruption recovery.
+Network-initial Window rewrites, the full original Source96 row and broader
+Window/document creation ownership remain open.
+[Lifecycle evidence](../proposals/blank-frame-initial-lifecycle-r1/README.md).
+
+The independent custom Node provider has linked successfully. Its matching
+addon, C++ controls and browser integration have not yet run; compilation alone
+does not establish browser functionality or performance parity. Red Panda
+branding remains intentional. Full independent replication is still unfinished.
+
+
+### Full validation of the composed feature graph
+
+The actual installed graph passes all 2,190 JavaScript tests (790.509s), all129
+PureScript/Puppeteer checks (11.168s), all13 Native differential groups (22.798s),
+syntax checks (24.503s) and strict/pedantic build (1.517s). There are no skipped,
+cancelled or failing JavaScript cases. All13,174 guarded source, dependency,
+automation, oracle, tool and installed-native inputs match before and after;
+every owned stage process is closed. The original commands, assertions and
+limits remain unchanged. Runtime warnings are preserved; the strict compiler
+reports zero warnings and errors.
+
+[Verified raw evidence](../proposals/feature-composition-full-root-r1/README.md)
+contains the controller, original controller/plan, complete logs, progress and
+actual input maps, with each archive member checked by name, size and SHA256.
+The independent custom Node provider remains linked-only with addon/runtime
+acceptance pending. The historical455 census remains402 passes/50 assertion
+failures/3 load timeouts on its earlier graph; no new score is inferred.
+Full independent replication, broader realm/Window ownership, original Source96,
+complete conformance/WPT and performance equivalence remain unfinished.
