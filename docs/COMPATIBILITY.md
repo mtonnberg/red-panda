@@ -1110,3 +1110,14 @@ The original Root controller stopped after110+4 actual passes because it expecte
 Node24.19 and26.13 each pass9 feature tests and78 physical creation rows. Full Native3 values match on each; full Native4 retains one existing generic Proxy clone-message difference, proved unchanged in the baseline and retained verbatim. No fields are removed to claim equality. Initial Node24.22 firstgate/raw negatives, trusted input/disk comparisons, controllers and frozen patches are preserved in the archive.
 
 This is an eight-leaf change over5adb9b3. It does not establish whole-source, full-suite, broader Performance Timing, WPT or performance equivalence. The latest complete2043/129/13 suite remains the97bb0ac graph. Keep Red Panda branding and every original upstream assertion/budget unchanged. The manifest byte-verifies every archived source/receipt; original paths remain retained.
+
+
+### Managed written-document lifecycle and inline modules
+
+Already-loaded owned documents now complete genuine written-parser lifecycle work synchronously, preserving measured readystatechange/DOMContentLoaded/load reentry and managed-frame delivery. Actual dependency-free inline modules use real V8 linkRequests/instantiate/evaluate and the existing module cache/Promises before lifecycle completion. No source stripping, synthetic readiness or output filtering is used.
+
+Native7 and candidate7 full values match, including real held bytes, inline-module timing and synthetic-versus-genuine event behavior. Five focused tests passed initially, including actual200ms child interruption and real VM module values; child JSON was asserted by the test, not retained as a fabricated separate transcript/PID claim. Node24.19 and26.13 each pass the same5 cases.
+
+Actual Root passes115 combined module/readiness/reset/frame/parser/classic/checkpoint/dispatch-recovery/error/EventCounts/new-feature tests with zero skips/cancellations/failures in33.228s. RemainingSDK phase:5.557s. Both phases use38.785 of the original shared180 active administrative seconds. Only the actual Root regression phase was run; the earlier owned115 controller remains unrun. All605 composed inputs/18 native artifacts and original assertions/budgets remain unchanged.
+
+The five-leaf integration preserves the EventCounts implementation. Bootstrap/fresh-blank/popup producer paths, import-bearing/mixed module graph timing and the full original Source row96 remain incomplete. The last complete2043/129/13 suite remains the97bb0ac graph. Every archived file is verified byte-for-byte; original raw paths/earlier drafts remain retained. Full independent replication is unfinished; keep Red Panda branding.

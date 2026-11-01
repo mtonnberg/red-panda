@@ -1,3 +1,4 @@
+import {registerManagedLifecycle,beginManagedWrittenCycle,completeManagedWrittenEOF,isTrustedLifecycleEvent} from './managed-document-lifecycle.js';
 // Post-load Document resets preserve the existing Window and JavaScript realm.
 import { createRequire } from 'node:module';
 import { createWriteParser } from './write-created-parser.js';
@@ -27,6 +28,7 @@ function eligible(context) {
 }
 function reset(context, args) {
   const { record, document, window, ownership } = context;
+  beginManagedWrittenCycle(context);
   // This path deliberately does not apply to an initial loading/network parse.
   // Parser-script no-op and original XML/custom-element guards remain outside.
   // A fresh blank frame's placeholder close may still be queued. Retire its
@@ -51,7 +53,7 @@ function reset(context, args) {
     treeAdapter: new record.parserOptions.treeAdapter.constructor(document) };
   const parser = context.makeParser(record, options);
   record.parser = parser; record.parserDone = false;
-  const cycle = { kind: 'write', generation: ++context.generation, closedDelivered: false };
+  const cycle = { kind: 'write', generation: ++context.generation, closedDelivered: false, parser };
   const controller = createWriteParser(parser, {
     signal: record.signal,
     active: () => active(context) && context.current === cycle && record.parser === parser,
@@ -104,6 +106,7 @@ function patch() {
       if (cycle.state.status === 'complete') {
         if (cycle.closedDelivered) return;
         cycle.closedDelivered = true;
+        if (completeManagedWrittenEOF(context, cycle)) return;
       }
     }
     return close.apply(this, args);
@@ -117,14 +120,18 @@ export function installDocumentReset(page, window, record, makeParser, finishPar
     open: underlyingOpen, makeParser, finishParser, Exception: window.DOMException,
     loaded: false, disposed: false, generation: 0, current: null, retired: new Set() };
   contexts.set(record.document, context);
+  context.managedLifecycleRegistered = registerManagedLifecycle(context);
   context.ownership.add(window.document, 'DOMContentLoaded', () => {
     if (active(context) && context.current && !page.registry) page.emit?.('domContentLoaded');
   });
-  context.ownership.add(window, 'load', async () => {
+  context.ownership.add(window, 'load', async event => {
+    // Authored synthetic dispatch still reaches authored listeners, but cannot
+    // declare that the real initial browser lifecycle producer completed.
+    if (context.managedLifecycleRegistered && !isTrustedLifecycleEvent(event)) return;
     context.loaded = true;
     const cycle = context.current;
     if (cycle && !page.registry) {
-      await page.moduleReady;
+      if (!cycle.managedLifecycle) await page.moduleReady;
       if (active(context) && context.current === cycle) page.emit?.('load');
     }
   });

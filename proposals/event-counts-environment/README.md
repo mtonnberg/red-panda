@@ -1,0 +1,1 @@
+Current-instance environment receipts at pushed525f9b1: actual owned service identity and prior-stop proof, real PureScript example6855stable, fresh349roots/1732links discovery, saved/read-back draft41. Installer/network/secrets/requirements preserved. Saved draft is not applied/published; fresh restoration unverified. Every raw file/controller is archived byte-exact.

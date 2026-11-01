@@ -6,6 +6,9 @@ import { createInternalMutationObserver } from './mutations.js';
 // resource queue lets module evaluation begin before the real DOMContentLoaded.
 const require = createRequire(import.meta.url);
 const { implForWrapper } = require('jsdom/lib/jsdom/living/generated/utils.js');
+const {domSymbolTree}=require('jsdom/lib/jsdom/living/helpers/internal-constants.js');
+const NodeImplementation=require('jsdom/lib/jsdom/living/nodes/Node-impl.js').implementation;
+const privateTextContent=Object.getOwnPropertyDescriptor(NodeImplementation.prototype,'textContent').get;
 const javascriptMIME = /^(?:text|application)\/(?:javascript|ecmascript|x-javascript)(?:\s*;|$)/i;
 
 // Install in JSDOM.beforeParse; page.dom must be assigned before its queued
@@ -21,7 +24,7 @@ const javascriptMIME = /^(?:text|application)\/(?:javascript|ecmascript|x-javasc
 export function installModuleScripts(page, window) {
   const document = window.document;
   const signal = page.documentAbort?.signal;
-  const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet();
+  const cache = new Map(), metadata = new WeakMap(), evaluating = new WeakMap(), seen = new WeakSet(), writtenPrepared = new WeakMap();
   const imports = new Map(), scopes = new Map();
   const cycles = new Set();
   let parseCycle;
@@ -199,6 +202,7 @@ export function installModuleScripts(page, window) {
   }
   async function evaluate(module) { await link(module); return startEvaluation(module); }
   function prepare(script) {
+    if (writtenPrepared.has(script)) return Promise.resolve(writtenPrepared.get(script));
     const base = document.baseURI;
     if (script.hasAttribute('src')) {
       const src = script.getAttribute('src');
@@ -275,6 +279,38 @@ export function installModuleScripts(page, window) {
       cycle.resolveReady();
     })();
   }
+  // Real written-parser EOF can synchronously instantiate dependency-free
+  // inline graphs using Node24.8+ public VM module APIs. No script text is
+  // rewritten, no Promise is forcibly fulfilled, and ordinary parses retain
+  // the original asynchronous graph/link/fetch path.
+  function startWrittenEOF() {
+    const cycle=parseCycle;
+    if (!active() || page.javascript===false) return begin(cycle);
+    const candidates=[];
+    for (const backend of domSymbolTree.treeIterator(impl)) {
+      if (backend._localName==='script' && backend._namespaceURI==='http://www.w3.org/1999/xhtml') candidates.push([backend,require('jsdom/lib/jsdom/living/generated/utils.js').wrapperForImpl(backend)]);
+    }
+    for (const [backend,script] of candidates) {
+      if (!active() || cycle!==parseCycle) break;
+      if (!script || seen.has(script)) continue;
+      const kind=(backend.getAttributeNS(null,'type')??'').trim().toLowerCase();
+      if (kind==='importmap') { seen.add(script); registerMap(script); continue; }
+      if (kind!=='module' || backend.getAttributeNS(null,'src')!==null) continue;
+      try {
+        let module=writtenPrepared.get(script);
+        if (!module) {
+          const source=Reflect.apply(privateTextContent,backend,[]),url=impl.URL;
+          module=compile(source,url,`${url}#red-panda-inline-module-${++inlineCount}`,impl.baseURLSerialized());
+          writtenPrepared.set(script,module);
+        }
+        if (module.status!=='unlinked' || module.moduleRequests.length!==0) continue;
+        if (typeof module.linkRequests!=='function' || typeof module.instantiate!=='function') throw new Error('Written inline modules require actual synchronous public VM linking');
+        graphStarted=true;
+        module.linkRequests([]);module.instantiate();startEvaluation(module);
+      } catch (error) { seen.add(script); report(error,script); }
+    }
+    return begin(cycle);
+  }
   function startScript(script) {
     if (script.getAttribute('type').trim().toLowerCase() === 'importmap') registerMap(script);
     else { graphStarted = true; execute(script, Promise.resolve().then(() => prepare(script))); }
@@ -293,5 +329,5 @@ export function installModuleScripts(page, window) {
     return cycle.ready;
   }
   beginParseCycle(impl._deferQueue);
-  return { get ready() { return parseCycle.ready; }, start: () => begin(parseCycle), beginParseCycle, dispose };
+  return { get ready() { return parseCycle.ready; }, start: () => begin(parseCycle), startWrittenEOF, beginParseCycle, dispose };
 }

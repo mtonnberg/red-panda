@@ -302,6 +302,11 @@ input and file uploads. Its VM fronts, live iterators and snapshot `forEach` pas
 [Evidence](proposals/performance-event-counts-r3/README.md) retains the existing
 generic Proxy clone-message difference and the exact validation boundaries.
 
+Already-loaded document rewrites use genuine synchronous lifecycle phases and
+real dependency-free inline-module evaluation. [Validation](proposals/managed-written-lifecycle-r2/README.md)
+records seven matching Native scenarios, five checks on each remaining SDK and
+115 Root regressions; initial bootstrap and broader module graph timing remain open.
+
 File uploads use real disk bytes and timestamps, atomic path validation and stable
 canonical FileList objects. PureScript owns the actual Puppeteer nonempty and
 empty upload branches and ElementHandle cleanup. The public and utility worlds
