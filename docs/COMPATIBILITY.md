@@ -37,6 +37,16 @@ The original [createHTMLDocument fixture](../proposals/domimplementation-readine
 also passes after initializing the actual successful backend to complete;
 named-document properties and DOMParser readiness remain separate gaps.
 
+Navigator's 18 measured public getters now use genuine native functions created
+in their owning page context, retaining live metadata and private receiver
+checks. All 18 descriptor objects match the Native reference. The 13 focused
+checks pass on each supported Node version; a separate 17-case Root integration
+check also passes. [Evidence](../proposals/navigator-accessor-publication/root-integration-r2/README.md)
+includes physical creation-context checks and real request header bytes.
+Red Panda branding remains intentional. Plugin result-wrapper allocation and
+broader foreign borrowing remain unverified. The full-suite checkpoint above
+predates this focused change.
+
 The fresh [registered-fixture census](../proposals/conformance-d41/README.md)
 at pushed d41fd69 completed all 455 fixtures under eight registration profiles:
 **402 verified passes, 50 assertion failures and three source-load timeouts**.

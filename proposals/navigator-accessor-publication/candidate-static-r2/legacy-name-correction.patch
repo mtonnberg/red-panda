@@ -1,0 +1,21 @@
+--- a/src/navigator.js
++++ b/src/navigator.js
+@@ -160,7 +160,7 @@
+   if (!worker) Object.assign(values, { cookieEnabled: () => Boolean(get('cookieEnabled') ?? true),
+     maxTouchPoints: () => get('maxTouchPoints') ?? 0, webdriver: () => Boolean(get('webdriver') ?? false), doNotTrack: () => get('doNotTrack') ?? null });
+   for (const [name, getter] of Object.entries(values)) {
+-    const operation = function () { check(navigatorObjects, this); return getter(); };
++    const operation = (0, function () { check(navigatorObjects, this); return getter(); });
+     attribute(prototype, name, navigatorAttribute ? navigatorAttribute(name, operation) : operation);
+   }
+   if (!worker) {
+--- a/test/navigator-accessor-publication.test.js
++++ b/test/navigator-accessor-publication.test.js
+@@ -35,6 +35,6 @@
+ 
+ test('unowned standalone Window navigator installation retains its original bounded JavaScript getter profile',t=>{
+  const dom=new JSDOM('<body>legacy',{runScripts:'outside-only'});t.after(()=>dom.window.close());const w=dom.window,originalPlugins=Object.getOwnPropertyDescriptor(w.Navigator.prototype,'plugins').get,adapter=installNavigator({userAgent:'Legacy/1'},w);t.after(()=>adapter.dispose());const get=Object.getOwnPropertyDescriptor(w.Navigator.prototype,'userAgent').get;
+- assert.equal(w.navigator.userAgent,'Legacy/1');assert.equal(binding.sameRealm(get,{}),true);assert.equal(Object.getOwnPropertyDescriptor(w.Navigator.prototype,'plugins').get,originalPlugins);assert.equal(Function.prototype.toString.call(get).includes('[native code]'),false);
++ assert.equal(w.navigator.userAgent,'Legacy/1');assert.equal(get.name,'');assert.equal(binding.sameRealm(get,{}),true);assert.equal(Object.getOwnPropertyDescriptor(w.Navigator.prototype,'plugins').get,originalPlugins);assert.equal(Function.prototype.toString.call(get).includes('[native code]'),false);
+ });
+ test.after(async()=>{if(process.env.NAVIGATOR_ACCESSOR_REALM_PROOF)await writeFile(process.env.NAVIGATOR_ACCESSOR_REALM_PROOF,JSON.stringify({proofs},null,2)+'\n',{flag:'wx'})});

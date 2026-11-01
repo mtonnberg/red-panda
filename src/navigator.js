@@ -1,3 +1,4 @@
+import {captureIDLMemberFactory} from './public-idl-member.js';
 import { createRequire } from 'node:module';
 import { arch, availableParallelism, totalmem } from 'node:os';
 import {permissionStateProvider} from './permission-control.js';
@@ -22,7 +23,7 @@ export const navigatorProfile = Object.freeze({
  * name is string-coerced and each query returns a new snapshot status.
  */
 export function createNavigatorRealm(realm, {
-  worker = false, get = () => undefined, profile = {}, estimate, active = () => true, permissionState,
+  worker = false, get = () => undefined, profile = {}, estimate, active = () => true, permissionState, navigatorAttribute,
 } = {}) {
   const Object = realm.Object, Array = realm.Array, Promise = realm.Promise, TypeErrorConstructor = realm.TypeError;
   const symbolDescription = Object.getOwnPropertyDescriptor(realm.Symbol.prototype, 'description').get;
@@ -158,7 +159,10 @@ export function createNavigatorRealm(realm, {
   };
   if (!worker) Object.assign(values, { cookieEnabled: () => Boolean(get('cookieEnabled') ?? true),
     maxTouchPoints: () => get('maxTouchPoints') ?? 0, webdriver: () => Boolean(get('webdriver') ?? false), doNotTrack: () => get('doNotTrack') ?? null });
-  for (const [name, getter] of Object.entries(values)) attribute(prototype, name, function () { check(navigatorObjects, this); return getter(); });
+  for (const [name, getter] of Object.entries(values)) {
+    const operation = (0, function () { check(navigatorObjects, this); return getter(); });
+    attribute(prototype, name, navigatorAttribute ? navigatorAttribute(name, operation) : operation);
+  }
   if (!worker) {
     for (const name of ['vendorSub', 'productSub']) if (Object.getOwnPropertyDescriptor(prototype, name)?.configurable) delete prototype[name];
   }
@@ -204,7 +208,23 @@ export function installNavigator(source, realm, options = {}) {
   const active = options.active ?? (() => !source?.closed && (!signal || !signal.aborted) &&
     (generation === undefined || source?.documentGeneration === generation) && (options.worker || !!realm.document));
   const permissionState=options.permissionState??(source?.browser?permissionStateProvider(source):undefined);
-  const result = createNavigatorRealm(realm, { ...options, get, active, permissionState, profile: { ...navigatorProfile, ...options.profile } });
+  let navigatorAttribute;
+  if (source?.browser && !options.worker) {
+    // Trusted owned-Window startup, before authored scripts/preloads. Real V8
+    // entries are born in this VM; the original operations remain private.
+    const member = captureIDLMemberFactory(realm);
+    const names = new Set(['userAgent', 'appName', 'appCodeName', 'appVersion', 'platform',
+      'language', 'languages', 'onLine', 'cookieEnabled', 'hardwareConcurrency',
+      'deviceMemory', 'maxTouchPoints', 'vendor', 'product', 'webdriver', 'doNotTrack',
+      'globalPrivacyControl']);
+    navigatorAttribute = (name, operation) => names.has(name) ? member(name, 'get', operation) : operation;
+    // plugins keeps its genuine generated operation/backend and original cache.
+    const prototype = Object.getPrototypeOf(original);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, 'plugins');
+    if (typeof descriptor?.get !== 'function') throw new TypeError('An original Navigator plugins getter is required');
+    Object.defineProperty(prototype, 'plugins', { ...descriptor, get: member('plugins', 'get', descriptor.get) });
+  }
+  const result = createNavigatorRealm(realm, { ...options, get, active, permissionState, navigatorAttribute, profile: { ...navigatorProfile, ...options.profile } });
   signal?.addEventListener('abort', () => result.dispose(), { once: true });
   INSTALLED.set(realm, result); return result;
 }
