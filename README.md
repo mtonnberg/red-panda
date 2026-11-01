@@ -290,11 +290,17 @@ the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current checkpoint passes 2,043 JavaScript tests, 129 PureScript Puppeteer
+The last complete checkpoint at `97bb0ac` passed 2,043 JavaScript tests, 129 PureScript Puppeteer
 checks and 13 native differential groups, plus syntax and strict/pedantic
 PureScript checks. [Validation](proposals/phase26-full-file-element-url/README.md)
 records all 10,035 unchanged monitored inputs. Earlier failed runs remain
 separate evidence.
+
+`performance.eventCounts` counts real dispatch before listeners, including trusted
+input and file uploads. Its VM fronts, live iterators and snapshot `forEach` pass
+116 selected Root checks; nine feature checks pass on each remaining Node SDK.
+[Evidence](proposals/performance-event-counts-r3/README.md) retains the existing
+generic Proxy clone-message difference and the exact validation boundaries.
 
 File uploads use real disk bytes and timestamps, atomic path validation and stable
 canonical FileList objects. PureScript owns the actual Puppeteer nonempty and

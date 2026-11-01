@@ -1,3 +1,4 @@
+import {installEventCounts} from './event-counts.js';
 import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
 // Independent timing from recorded calls and Page transport/lifecycle events.
 import { createRequire } from 'node:module';
@@ -232,6 +233,7 @@ export function installPerformance(page,window,{navigationType=page.performanceN
   if(installed.has(window))return installed.get(window);
   if(!window?.performance||typeof window.eval!=='function')throw new TypeError('Performance installation requires a document realm');
   const document=window.document,principal=implForWrapper(document),signal=page.documentAbort?.signal,previousClose=window.close;
+  const eventCounts=installEventCounts(window);
   let disposed=false;
   const live=()=>!disposed&&window.document===document;
   const owner=page.registry?.page??page,tracker=trackerFor(owner);
@@ -302,7 +304,7 @@ export function installPerformance(page,window,{navigationType=page.performanceN
   document.addEventListener('readystatechange',interactive);
   document.addEventListener('DOMContentLoaded',contentLoaded);
   window.addEventListener('load',loaded);
-  const dispose=()=>{if(disposed)return;disposed=true;controller.dispose();tracker?.subscribers.delete(receive);
+  const dispose=()=>{if(disposed)return;disposed=true;eventCounts.dispose();controller.dispose();tracker?.subscribers.delete(receive);
     document.removeEventListener('readystatechange',interactive);document.removeEventListener('DOMContentLoaded',contentLoaded);window.removeEventListener('load',loaded);
     signal?.removeEventListener('abort',dispose);page.off?.('close',dispose);window.removeEventListener('unload',dispose);
     if(window.close===close)window.close=previousClose;};

@@ -1,0 +1,3 @@
+Current-instance environment receipts for pushed `5adb9b3`: prior owned service identity checked and stopped, replacement PID766530/start9347684/TTY48327, real PureScript/Puppeteer example passed with6853 guarded inputs unchanged. Fresh discovery:349 Git roots and1721 directory links, zero unknown roots/errors/outside links.
+
+Draft40 was saved and read back with the exact project ref; installer, network policy, secrets and runtime requirements were preserved. It has not been applied or published; restoration is unverified. The archive retains every original receipt, input map and controller byte-for-byte. See manifest.json for digests.

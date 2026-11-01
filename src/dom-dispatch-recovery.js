@@ -1,6 +1,7 @@
 // Host-private interruption recovery for explicitly owned synchronous dispatch
 // cohorts. Original jsdom algorithms/lexical helpers remain pinned and intact.
 import vm from 'node:vm';
+import {countDispatchedEvent} from './event-counts-state.js';
 import {createRequire} from 'node:module';
 import {readFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
@@ -75,7 +76,8 @@ export function withOwnedDispatchRecovery(operation){
  try{return operation()}finally{complete(cohort)}
 }
 const lifecycle={
- start(event){
+ start(event,target){
+  if(canonical.has(target)&&canonical.has(event))countDispatchedEvent(target,event);
   const frame=Object.assign(nil(),{kind:'dispatch',event:weak(event),active:true,ready:false,clearTargets:false,finalTarget:weak(null),finalRelated:weak(null),relatedKnown:true,activation:false});
   // Outside a cohort this is only a local weak ancestor context, not a log.
   const cohort=activeCohort();if(cohort)cohort.tokens.push(frame);return frame;
@@ -116,7 +118,7 @@ export function installDispatchRecovery(){
  const header=source.slice(0,source.indexOf('class EventTargetImpl {')),helpers=source.slice(source.indexOf('// https://dom.spec.whatwg.org/#concept-event-listener-invoke'));
  let body=method.slice(method.indexOf('{')+1,method.lastIndexOf('}')),suffix=helpers;
  const replace=(text,from,to,count=1)=>{if(text.split(from).length-1!==count)throw new Error('Pinned dispatch lifecycle seam changed');return text.replaceAll(from,to)};
- body='\n    const recoveryDispatch = lifecycle.start(eventImpl);'+body;
+ body='\n    const recoveryDispatch = lifecycle.start(eventImpl,this);'+body;
  body=replace(body,'      if (activationTarget !== null && activationTarget._legacyPreActivationBehavior) {','      lifecycle.ready(recoveryDispatch, eventImpl, clearTargets);\n      lifecycle.activation(recoveryDispatch, activationTarget);\n      if (activationTarget !== null && activationTarget._legacyPreActivationBehavior) {');
  for(const phase of ['capturing','bubbling'])body=replace(body,'invokeEventListeners(struct, eventImpl, "'+phase+'");','invokeEventListeners(struct, eventImpl, "'+phase+'", recoveryDispatch);');
  body=replace(body,'    return !eventImpl._canceledFlag;','    lifecycle.end(recoveryDispatch);\n    return !eventImpl._canceledFlag;');
