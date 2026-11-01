@@ -1,4 +1,4 @@
-import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
+import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,readCSSDeclaration,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
 // Scoped CSSOM adaptation. Parsing is token based so strings, comments, URLs and
 // balanced component values do not accidentally become declaration boundaries.
 import { createRequire } from 'node:module';
@@ -417,4 +417,33 @@ export function parseStyleSheet(text,{window,authority,onUnsupported,nested=fals
   sheet.cssRules=new CSSRuleList(rules);return sheet;
 }
 
+// Internal render-program snapshots reuse only private normalized scalar facts.
+// No public rule/declaration/map is shared or materialized for an untouched rule.
+const PROGRAM_DECLARATION_FACTS=new WeakMap();
+function programDeclarationFacts(value){
+ const key='n\0'+value.body;let facts=DECLARATION_FACTS.get(key),parsed;
+ if(!facts){
+  // Use exactly the genuine declaration parser/normalizer and its existing
+  // bounded cache. Uncacheable source still reads its real private backend.
+  parsed=createDeclaration(value.body,{window:value.owner.window,nesting:true});
+  facts=DECLARATION_FACTS.get(key);
+  if(!facts)return Object.freeze(readCSSDeclaration(parsed).map(entry=>Object.freeze(entry)));
+ }
+ let snapshot=PROGRAM_DECLARATION_FACTS.get(facts);
+ if(!snapshot){
+  const priorities=new Map(facts.priorities);
+  snapshot=Object.freeze(facts.values.map(([name,value])=>Object.freeze({name,value,priority:priorities.get(name)??''})));
+  PROGRAM_DECLARATION_FACTS.set(facts,snapshot);
+ }
+ return snapshot;
+}
+// Receiver authority is the existing private list/rule registry, never a public
+// property or a lookalike. Already materialized styles read their actual maps.
+export function canonicalCSSProgramRuleList(list){
+ return readCSSRuleList(list).map(value=>{
+  if(!DEFERRED_RULES.has(value))return readCSSRule(value);
+  if(value.rule)return readCSSRule(value.rule);
+  return{type:1,selector:value.selector,style:value.style,declarations:value.style?readCSSDeclaration(value.style):programDeclarationFacts(value),list:null,media:null,group:null,version:value.owner.version};
+ });
+}
 export function canonicalCSSRuleList(list){return readCSSRuleList(list).map(value=>{if(!DEFERRED_RULES.has(value))return readCSSRule(value);if(value.rule)return readCSSRule(value.rule);return{type:1,selector:value.selector,style:deferredStyle(value),list:null,media:null,group:null,version:value.owner.version}})}

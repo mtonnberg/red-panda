@@ -297,11 +297,12 @@ the browser, CLI transports, cookie files, CDP, DOM/input, modules, navigation,
 MCP, saved scripts and WebDriver, including errors and timeouts.
 The tests start and stop their own services; none require external sites.
 
-The current installed graph passes 2,206 JavaScript tests, 129 PureScript
+The current installed graph passes 2,211 JavaScript tests, 129 PureScript
 Puppeteer checks, 13 native differential groups, syntax and strict/pedantic
-PureScript checks. [Validation](proposals/initial-network-lifecycle-r5/README.md)
-records 13,430 unchanged JavaScript-workflow inputs and 13,451 unchanged inputs
-for the remaining stages. Earlier failed runs and the
+PureScript checks. [Validation](proposals/canonical-style-scalar-r2/README.md)
+records 13,260 unchanged JavaScript-workflow inputs and 13,261 unchanged inputs
+for the remaining stages. The earlier
+[2,206-case lifecycle checkpoint](proposals/initial-network-lifecycle-r5/README.md), failed runs and the
 [2,190-case checkpoint](proposals/feature-composition-full-root-r1/README.md)
 remain separate evidence. This is not a new whole-fixture census or a full
 replication claim.
@@ -341,6 +342,13 @@ animation completion drains actual finished-Promise reactions before trusted
 finish delivery; ordinary 200 ms Promise interruption recovers. External and
 legacy Host Promise hooks retain a measured Node interruption failure. Public
 CSSOM identity and broader Markdown/animation behavior remain incomplete.
+
+Canonical render programs read normalized private declaration facts without
+materializing every public style object in a large stylesheet. Public rule and
+declaration identities remain distinct and lazy. The unchanged external-stylesheet
+fixture passes its original two-second load and fresh two-second assertion limits
+on all three tested Node versions; this focused result does not update the whole
+upstream fixture census.
 
 The implementation includes genuine VM Node/Element/HTMLElement and Document public definitions,
 manual interface functions, real Attr adoption ownership, Native-calibrated CSS

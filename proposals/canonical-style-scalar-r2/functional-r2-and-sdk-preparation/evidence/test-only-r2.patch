@@ -1,0 +1,31 @@
+--- a/test/canonical-style-scalar.test.js
++++ b/test/canonical-style-scalar.test.js
+@@ -6,10 +6,15 @@
+ import{createCanonicalStyleResolver}from'../src/styles.js';
+ import{platformFactoryRecord}from'../src/platform-factories.js';
+ 
+-async function fixture(t,css){
+- const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body><p class=probe>Real text</p>');
+- const w=page.dom.window,d=w.document,style=d.createElement('style');style.textContent=css;d.head.append(style);
+- const sheet=style.sheet,list=readCSSSheet(sheet).list,document=platformFactoryRecord(d).implementation,node=platformFactoryRecord(d.querySelector('.probe')).implementation;
++async function fixture(t,css,{external=false}={}){
++ const browser=new Browser(external?{loadResources:['stylesheet']}:{ });t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body><p class=probe>Real text</p>');
++ const w=page.dom.window,d=w.document;let sheet;
++ if(external){
++  const link=d.createElement('link');link.rel='stylesheet';link.href='data:text/css,'+encodeURIComponent(css);
++  const loaded=new Promise((resolve,reject)=>{link.addEventListener('load',resolve,{once:true});link.addEventListener('error',()=>reject(Error('Actual stylesheet load failed')),{once:true})});
++  d.head.append(link);await loaded;sheet=link.sheet;
++ }else{const style=d.createElement('style');style.textContent=css;d.head.append(style);sheet=style.sheet}
++ const list=readCSSSheet(sheet).list,document=platformFactoryRecord(d).implementation,node=platformFactoryRecord(d.querySelector('.probe')).implementation;
+  return{w,d,sheet,list,node,resolve:()=>createCanonicalStyleResolver(document)(node)};
+ }
+ 
+@@ -33,7 +38,7 @@
+ });
+ 
+ test('canonical compilation keeps unrelated public styles sparse while real matched revision checks stay live',async t=>{
+- const f=await fixture(t,'.unused{color:#abcdef;--token:kept}'.repeat(64)+'.probe{display:none}'),state=flatSheetState(f.sheet,f.list);
++ const f=await fixture(t,'.unused{color:#abcdef;--token:kept}'.repeat(64)+'.probe{display:none}',{external:true}),state=flatSheetState(f.sheet,f.list);
+  assert.equal(state.styled.size,0);assert.equal(f.resolve().display,'none');assert.equal(state.styled.size,0);assert.equal(state.published.size,0);
+  const computed=f.w.getComputedStyle(f.d.querySelector('.probe'));assert.equal(computed.display,'none');assert.equal(state.styled.size,1);
+  const last=f.list[64];last.style.display='block';assert.equal(computed.display,'block');assert.equal(f.resolve().display,'none');

@@ -4,14 +4,16 @@ Full independent replication is the goal. The current implementation is not
 complete. Upstream production engine code is not imported; the upstream binary,
 source documentation, and external test fixtures are references and test oracles.
 
-The current installed workflow passes **2,206 JavaScript tests, 129 PureScript
+The current installed workflow passes **2,211 JavaScript tests, 129 PureScript
 Puppeteer checks and 13 Native differential groups**, plus syntax and strict/
 pedantic builds. The strict build reports zero warnings and errors; runtime
-warnings remain in the complete logs. [Full validation](../proposals/initial-network-lifecycle-r5/README.md)
-records 13,430 unchanged inputs for JavaScript and 13,451 for the remaining
-stages, after the 14-leaf lifecycle change over 3963656. All 18 production native
+warnings remain in the complete logs. [Full validation](../proposals/canonical-style-scalar-r2/README.md)
+records 13,260 unchanged inputs for JavaScript and 13,261 for the remaining
+stages, after the three-leaf canonical-style change over b0217de. All 18 production native
 artifacts remain unchanged. Original assertions, fixtures and budgets are
 preserved. This is not a new whole-455 census or a full replication claim.
+The [2,206-case lifecycle checkpoint](../proposals/initial-network-lifecycle-r5/README.md)
+retains its own 13,430/13,451-input validation and earlier interrupted run.
 The earlier [2,190/129/13 checkpoint](../proposals/feature-composition-full-root-r1/README.md)
 and its 51-source/six-artifact application remain separate evidence, as do the
 [2,043/129/13](../proposals/phase26-full-file-element-url/README.md) and
@@ -1335,7 +1337,7 @@ script IDs are declarations, not five independently counted observations.
 This is a regression check: the same fixture already passed the 917f9bd census.
 The installed PureScript/Puppeteer example passes with 13,187 inputs unchanged.
 
-The complete installed workflow passes 2,206 JavaScript cases in 838.205s,
+The installed654 lifecycle checkpoint passed 2,206 JavaScript cases in 838.205s,
 129 PureScript checks in 10.038s, 13 Native groups in 20.553s, syntax in 24.617s
 and strict/pedantic build in 1.263s. JavaScript reports no failures, skips,
 cancellations or late activity. All 13,430 JavaScript inputs and 13,451 remaining
@@ -1345,6 +1347,29 @@ preserves the earlier installed652 animation timeout at its original 10s limit
 and subsequent interruption. The post-signal cancellation summary is not a
 full-suite total. The corrected installed654 run has its own complete result;
 application journals retain their original validation-unrun labels.
+
+### Large stylesheet canonical programs
+
+Untouched deferred rules now supply immutable normalized scalar declarations to
+the private render program through the existing declaration parser and bounded
+cache. Compiling that program leaves public rules, declarations and backing maps
+lazy. Already materialized styles still read their real private state, and the
+existing sheet revision and canonical snapshot invalidation boundaries remain.
+
+The unchanged `css/external_stylesheet.html` fixture passes at its original 2s
+load plus fresh 2s assertion limits. Node 24.22.1 observed 930ms load and 6ms
+assertions; the separate 24.19.0 and 26.13.0 runs observed 760ms/7ms and 745ms/3ms.
+Five focused cases and 30 existing CSS cases pass on each tested SDK. These are
+separate observed epochs, not a future timing guarantee or a new census score.
+
+The installed655 workflow passes 2,211 JavaScript cases in 857.314s, 129
+PureScript checks in 13.078s, 13 reference groups in 25.851s, syntax in 22.095s
+and strict/pedantic compilation in 1.256s with zero warnings and errors.
+All 13,260/13,261 workflow inputs remain unchanged and all owned jobs close.
+[Evidence](../proposals/canonical-style-scalar-r2/README.md) preserves the earlier
+diagnostic timeout and span-accounting failure, the separate accounting
+supplement, and the first focused run's incorrect inline-test precondition.
+No original fixture, assertion or deadline was relaxed.
 
 ### Experimental public-carrier API prerequisites
 

@@ -1,0 +1,363 @@
+--- a/src/browser.js
++++ b/src/browser.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ import {captureCDPDocument} from './cdp-node-registry.js';
+ import {installModelContext} from './model-context.js';
+ import {openHTTPCache} from './http-cache.js';
+@@ -788,10 +789,10 @@
+         else installListenerOwnership(this.dom.window).add(this.dom.window, 'load', resolve, { once: true });
+       });
+       const canceledRedirect=()=>redirect?.settled&&!redirect.started&&redirect.error?.name==='AbortError'&&this.dom.window===navigationWindow;
+-      documentReady.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('domContentLoaded'); });
++      documentReady.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) {diagMark('page.actualDOMContentLoaded',{pageID:diagID(this),generation});this.emit('domContentLoaded');} });
+       // Module evaluation can await load or continue application work after it.
+       // Keep moduleReady as the explicit evaluation drain, not a load barrier.
+-      loaded.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) this.emit('load'); });
++      loaded.then(() => { if (generation === this.navigationGeneration && (!redirect||canceledRedirect())) {diagMark('page.actualLoad',{pageID:diagID(this),generation});this.emit('load');} });
+       const ready = waitUntil === 'none' ? Promise.resolve() : waitUntil === 'domcontentloaded' ? documentReady : loaded;
+       await withTimeout(Promise.race([ready, requested]), remaining(), 'Page load timed out');
+       if (redirect) {
+--- a/src/classic-scripts.js
++++ b/src/classic-scripts.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
+ import {implementationForWrapper as implForWrapper} from './dom-event-state.js';
+ import{randomUUID}from'node:crypto';
+@@ -107,6 +108,8 @@
+   return request;
+ }
+ function finishParser(record, parser) {
++ const diagnosticSpan=diagEnter('parser.finish',{...diagDocument(record.document),parserID:diagID(parser),parserDone:record.parserDone,stopped:diagPrivateData(parser,'stopped'),paused:diagPrivateData(diagPrivateData(parser,'tokenizer'),'paused'),closeRequestID:diagID(record.closeRequested)});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+   if (!active(record) || record.parser !== parser || parser.tokenizer.paused || !parser.stopped) return;
+   record.parserDone = true; record.blocker = null;
+   if (record.closeRequested) {
+@@ -116,6 +119,7 @@
+       return record.document.close(...arguments_);
+     });
+   }
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ }
+ function hostTask(run) {
+   return new Promise((resolve, reject) => setImmediate(() => {
+@@ -172,6 +176,7 @@
+  for(const name of ['_queue','_deferQueue','_asyncQueue']){
+   const queue=loader[name];overlays[name]=Object.create(queue,{push:{value(request,loaded,failed,...args){
+    const guard=callback=>typeof callback==='function'?(...values)=>{
++    const diagnosticSpan=diagEnter('resource.queueCallback',{documentID:diagID(record.document),queueID:diagID(queue),requestID:diagID(request),callbackID:diagID(callback),url});let diagnosticOutcome='sync-return-point',diagnosticError;try{
+     if(active(record)&&record.resourceDeliveryGeneration===registrationGeneration&&(!delivery||delivery.current())){
+      if(!delivery)return callback(...values);
+      stylesheetDeliveries.set(delivery.element,delivery);let result;
+@@ -179,13 +184,16 @@
+      return Promise.resolve(result).finally(()=>{if(stylesheetDeliveries.get(delivery.element)===delivery)stylesheetDeliveries.delete(delivery.element);});
+     }
+     loader._requestManager.remove(request);return Promise.resolve();
++    }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+    }:callback;
+-   return queue.push(request,guard(loaded),guard(failed),...args);
++   diagMark('resource.queueRegistration',{documentID:diagID(record.document),queueID:diagID(queue),requestID:diagID(request),elementID:diagID(diagPrivateData(options,'element')),url});return queue.push(request,guard(loaded),guard(failed),...args);
+   }}});
+  }
+  return loaderOverlay(loader,overlays,()=>fetch.call(loader,url,options));
+ }
+ function synchronousStylesheet(record,loader,fetch,url,options,delivery){
++ const diagnosticSpan=diagEnter('stylesheet.synchronousProducer',{...diagDocument(record.document),elementID:diagID(delivery.element),url});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+  const page=record.page,owner=page.registry?.page??page,op={complete:false,request:null,local:null};
+  const cancel=()=>{delivery.canceled=true;if(stylesheetRequests.get(delivery.element)===delivery){stylesheetRequests.delete(delivery.element);record.styles.delete(delivery.element);}if(op.request)loader._requestManager.remove(op.request);if(op.local){owner.activeRequests.delete(op.local);op.local=null;}};
+  // A V8 interruption can abandon the Host stack before any finally executes.
+@@ -206,7 +214,7 @@
+   }
+   if(!delivery.current())throw Error('Synchronous stylesheet canceled');
+   if(response.status<200||response.status>299)throw Error('Resource was not loaded. Status: '+response.status);
+-  const metadata={headers:Object.fromEntries(response.headers)};options.onLoad?.(stylesheetParserBytes(response.bytes,metadata,delivery.element));
++  const metadata={headers:Object.fromEntries(response.headers)};diagMark('stylesheet.canonicalCallback.begin',{documentID:diagID(record.document),elementID:diagID(delivery.element),url});options.onLoad?.(stylesheetParserBytes(response.bytes,metadata,delivery.element));diagMark('stylesheet.canonicalCallback.returnPoint',{documentID:diagID(record.document),elementID:diagID(delivery.element),url});
+  }catch(cause){error=cause;if(op.local){const id=op.local;op.local=null;owner.activeRequests.delete(id);owner.requestFailed(id,cause);}}
+  const request=error?Promise.reject(error):Promise.resolve(response.bytes);request.catch(()=>{});op.request=request;
+  const headers=response?Object.fromEntries(response.headers):{};delete headers['set-cookie'];request.response={statusCode:response?.status??0,headers};request.href=response?.url??url;request.abort=cancel;request.getHeader=()=>undefined;
+@@ -215,6 +223,7 @@
+  record.styles.delete(delivery.element);
+  const queued=loaderOverlay(loader,{_resourceLoader:overlay},()=>fetchOwnedResource(record,loader,fetch,url,{...options,onLoad(){},onError:options.onError},delivery));
+  op.complete=true;return queued;
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ }
+ 
+ function patch() {
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
+ // Scoped CSSOM adaptation. Parsing is token based so strings, comments, URLs and
+ // balanced component values do not accidentally become declaration boundaries.
+@@ -289,7 +290,7 @@
+ // Parsed scalar facts may be reused, never a public declaration or its maps.
+ // Bounds apply to both each key and the complete Host-only cache.
+ const DECLARATION_FACTS=new Map();let declarationFactBytes=0;
+-export function createDeclaration(text='', options={}) {
++export function createDeclaration(text='', options={}) {diagCount('createDeclarationCalls');
+   const source=String(text),key=(options.nesting?'n':'d')+'\0'+source,style=enhanceDeclaration(new CSSStyleDeclaration(),options.window),facts=DECLARATION_FACTS.get(key);
+   if(facts){
+     for(const[name,value]of facts.values)style._values.set(name,value);for(const[name,value]of facts.priorities)style._priorities.set(name,value);style._length=facts.names.length;
+@@ -330,7 +331,7 @@
+ const DEFERRED_RULES=new WeakSet(),DEFERRED_LISTS=new WeakMap();
+ function declarationRevision(style){return style&&DECLARATIONS.has(style)?String(MUTATIONS.get(style)??0)+':'+(CHANGES.get(style)??0)+':'+style.length:style?.cssText;}
+ function deferredRules(entries,window,authority){const state={window,authority,sheet:null,parent:null,published:new Set(),styled:new Set(),version:1,groups:null};const definitions=entries.map(entry=>{const value={owner:state,selector:entry.prelude,body:entry.body,rule:null,style:null,styleVersion:null};DEFERRED_RULES.add(value);return value});const list=new CSSRuleList(definitions);state.list=list;DEFERRED_LISTS.set(list,state);return list;}
+-function deferredStyle(value){if(value.rule)return readCSSRule(value.rule).style;if(!value.style){value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);}return value.style;}
++function deferredStyle(value){diagCount('deferredStyleCalls');if(value.rule)return readCSSRule(value.rule).style;if(!value.style){diagCount('deferredStyleMisses');value.style=createDeclaration(value.body,{window:value.owner.window,nesting:true});value.styleVersion=declarationRevision(value.style);value.owner.styled.add(value);diagCount('deferredStyleInitializations');}return value.style;}
+ function materializeRule(value){if(!value||!DEFERRED_RULES.has(value))return value;if(value.rule)return value.rule;const owner=value.owner,rule=new cssom.CSSStyleRule();rule.selectorText=value.selector;rule.style=deferredStyle(value);rule.cssRules=new CSSRuleList();rule.parentStyleSheet=owner.sheet;rule.parentRule=owner.parent;Object.defineProperty(rule.style,'parentRule',{configurable:true,value:rule});Object.defineProperty(rule,'cssText',styleTextDescriptor(owner.window,owner.authority));registerCSSRule(rule,{authority:owner.authority,type:1,selector:value.selector,style:value.style,list:rule.cssRules,media:null});value.rule=rule;value.style=rule.style;value.styleVersion=declarationRevision(rule.style);owner.published.add(value);owner.styled.add(value);return rule;}
+ export function bindDeferredRules(rules,sheet,parent,normalize){const state=DEFERRED_LISTS.get(rules);if(!state)return false;state.sheet=sheet;state.parent=parent;for(const value of LISTS.get(rules)){if(DEFERRED_RULES.has(value)){value.owner=state;if(value.rule)normalize(value.rule);}else normalize(value);}return true;}
+ export function hasStyleImports(rules){return [...(LISTS.get(rules)??rules)].some(value=>!DEFERRED_RULES.has(value)&&value.type===3);}
+@@ -417,4 +418,4 @@
+   sheet.cssRules=new CSSRuleList(rules);return sheet;
+ }
+ 
+-export function canonicalCSSRuleList(list){return readCSSRuleList(list).map(value=>{if(!DEFERRED_RULES.has(value))return readCSSRule(value);if(value.rule)return readCSSRule(value.rule);return{type:1,selector:value.selector,style:deferredStyle(value),list:null,media:null,group:null,version:value.owner.version}})}
++export function canonicalCSSRuleList(list){const values=readCSSRuleList(list);diagCount('canonicalRuleListCalls');const privateEntryCount=diagLength(values),diagnosticSpan=privateEntryCount===0?null:diagEnter('cssom.canonicalRuleList',{listID:diagID(list),privateEntryCount});let diagnosticOutcome='return-point',diagnosticError;try{return values.map(value=>{if(!DEFERRED_RULES.has(value))return readCSSRule(value);if(value.rule)return readCSSRule(value.rule);return{type:1,selector:value.selector,style:deferredStyle(value),list:null,media:null,group:null,version:value.owner.version}})}catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}}
+--- a/src/initial-network-load.js
++++ b/src/initial-network-load.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ // Genuine initial parser/resource producer. The actual canonical close supplies
+ // its requests/queue positions; public Document.load never completes a resource.
+ import{claimInitialNetworkWindowTask}from'./window-task-capture.js';
+@@ -51,7 +52,7 @@
+  // failures, while EOF/resource completion remains a completed queue step.
+  return new Promise(resolve=>{
+   const state={done:false,started:false},recover=()=>{if(!state.done&&state.started){state.done=true;owner.abandoned=true;note(owner,'abandonedMilestone',{milestone:kind});resolve()}};
+-  const complete=()=>{
++  const complete=()=>{const diagnosticSpan=diagEnter('initial.milestoneCallback',{kind,...diagDocument(owner.context.document)});let diagnosticOutcome='return-point',diagnosticError;try{
+    if(state.done)return;state.started=true;
+    apply(schedule,process,[recover]);const participant=beginDispatchRecoveryParticipant(recover);
+    try{
+@@ -61,10 +62,10 @@
+     }
+    }catch(error){reportFailure(owner,error)}
+    finally{state.done=true;completeDispatchRecoveryParticipant(participant);resolve()}
+-  };
++  }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}};
+   const queue=kind==='interactive'?owner.defer:owner.async;
+   const empty=kind==='interactive'?!privateLoadOptionalData(queue,'tail'):apply(owner.asyncCount,queue,[])===0;
+-  note(owner,'realMilestoneWait',{milestone:kind,empty});
++  note(owner,'realMilestoneWait',{milestone:kind,empty});diagMark('initial.milestoneWait',{kind,empty,...diagDocument(owner.context.document)});
+   if(empty)complete();else{apply(kind==='interactive'?owner.deferSetListener:owner.asyncSetListener,queue,[complete]);if(kind==='interactive')apply(owner.deferResume,queue,[])}
+  });
+ }
+@@ -120,7 +121,7 @@
+     const result=apply(base,target,forwarded);
+     note(owner,'realEOFSlot',{slot:slot+1,request:id(values[0]),originalCallback:id(values[1]),ownedCallback:id(forwarded[1]),argumentCount:values.length,result:id(result)});return result;
+    });
+-   const result=apply(original,receiver,args);
++   diagMark('initial.canonicalClose.begin',{...diagDocument(context.document),frame:owner.frame});const result=apply(original,receiver,args);diagMark('initial.canonicalClose.returnPoint',{...diagDocument(context.document),actualSlots:slots.length});
+    if(slots.length!==2)throw privateLoadBoundary('expected actual two canonical EOF slots, observed '+slots.length);
+    owner.eof={parser:context.record.parser??null,requests:slots.map(value=>value[0])};checkpoint.complete=true;return result;
+   }finally{
+--- a/src/inner-text.js
++++ b/src/inner-text.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ // Independent HTMLElement text collection using real DOM/style state. The
+ // measured native profile uses tag-based line breaks, not a full CSS renderer.
+ import { createRequire } from 'node:module';
+@@ -38,6 +39,8 @@
+ const parentElement = node => node.parentElement ?? (node.parentNode?.nodeType === 11 ? node.parentNode.host : null);
+ 
+ function collect(root) {
++ const diagnosticSpan=diagEnter('innerText.collect',{receiverID:diagID(root)});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+   const document = root.ownerDocument, view = document.defaultView;
+   // A disconnected/non-rendered root returns its actual DOM textContent. The
+   // subtree is not recursively visibility-filtered in this branch.
+@@ -89,6 +92,7 @@
+     }
+   }
+   return result;
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ }
+ 
+ function factory(g, bridge) {
+--- /dev/null
++++ b/src/style-load-diagnostic.js
+@@ -0,0 +1,21 @@
++// DIAGNOSTIC ONLY. Host-private monotonic scalars; no browser globals/fronts.
++import{openSync,writeSync}from'node:fs';import{join,isAbsolute}from'node:path';import{threadId}from'node:worker_threads';import{types}from'node:util';
++const directory=process.env.RED_PANDA_STYLE_DIAGNOSTIC_DIR;if(!directory||!isAbsolute(directory))throw Error('Diagnostic requires an explicit owned absolute trace directory');
++const fd=openSync(join(directory,'trace-'+process.pid+'-'+threadId+'.ndjson'),'wx',0o600),clock=process.hrtime.bigint,own=Object.getOwnPropertyDescriptor,setSize=Object.getOwnPropertyDescriptor(Set.prototype,'size').get,typedBytes=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),'byteLength').get,apply=Reflect.apply;
++const ids=new WeakMap(),open=new Map();let nextID=0,nextSpan=0,sequence=0,bytes=0,failed=false;
++const counters={createDeclarationCalls:0,deferredStyleCalls:0,deferredStyleMisses:0,deferredStyleInitializations:0,canonicalRuleListCalls:0};
++const facts=()=>({createDeclarationCalls:counters.createDeclarationCalls,deferredStyleCalls:counters.deferredStyleCalls,deferredStyleMisses:counters.deferredStyleMisses,deferredStyleInitializations:counters.deferredStyleInitializations,canonicalRuleListCalls:counters.canonicalRuleListCalls});
++function emit(value){if(failed)return;try{const row=JSON.stringify({schema:'host-style-clock/v1',pid:process.pid,threadId,sequence:++sequence,monotonicNS:clock().toString(),...value})+'\n';bytes+=Buffer.byteLength(row);if(sequence>3000||bytes>1024*1024)throw Error('Diagnostic output bound reached');writeSync(fd,row)}catch{failed=true;try{writeSync(2,'STYLE_DIAGNOSTIC_WRITER_FAILED\n')}catch{}}}
++export function diagID(value){if(value===null||typeof value!=='object'&&typeof value!=='function')return null;let id=ids.get(value);if(id===undefined){id=++nextID;ids.set(value,id)}return id}
++export function diagCount(name){if(Object.hasOwn(counters,name))counters[name]++}
++export function diagMark(name,values={}){emit({kind:'mark',name,...values})}
++export function diagEnter(name,values={}){const token={span:++nextSpan,name};open.set(token.span,token);emit({kind:'enter',span:token.span,name,...values,counters:facts()});return token}
++export function diagLeave(token,outcome='return-point',error){if(!token||!open.has(token.span))return;open.delete(token.span);emit({kind:'leave',span:token.span,name:token.name,outcome,errorID:diagID(error),counters:facts()})}
++export function diagPrivateData(value,key){if(value===null||typeof value!=='object'&&typeof value!=='function'||types.isProxy(value))return undefined;const descriptor=own(value,key);return descriptor&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined}
++export function diagBytes(value){if(!value||types.isProxy(value))return null;try{return apply(typedBytes,value,[])}catch{return null}}
++export function diagLength(value){const length=diagPrivateData(value,'length');return typeof length==='number'?length:null}
++function size(value){if(!value||types.isProxy(value))return null;try{return apply(setSize,value,[])}catch{return null}}
++function queue(value){const tail=diagPrivateData(value,'tail');return{id:diagID(value),paused:diagPrivateData(value,'paused'),tailID:diagID(tail),previousTailID:diagID(diagPrivateData(tail,'prev')),tailFired:diagPrivateData(tail,'fired'),tailElementID:diagID(diagPrivateData(tail,'element')),tailKeepLast:diagPrivateData(tail,'keepLast')}}
++export function diagDocument(document){const manager=diagPrivateData(document,'_requestManager'),async=diagPrivateData(document,'_asyncQueue');return{documentID:diagID(document),privateReadiness:diagPrivateData(document,'_currentDocumentReadiness'),queue:queue(diagPrivateData(document,'_queue')),defer:queue(diagPrivateData(document,'_deferQueue')),asyncID:diagID(async),asyncItems:size(diagPrivateData(async,'items')),asyncDependents:size(diagPrivateData(async,'dependentItems')),openRequestArrayLength:diagLength(diagPrivateData(manager,'openedRequests'))}}
++process.on('exit',()=>emit({kind:'process-exit-observation',writerFailed:failed,openSpans:[...open.values()],counters:facts()}));
++emit({kind:'logger-start',clock:'Host process.hrtime.bigint only',noFrontendReads:true,perRuleOutput:false});
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ import vm from 'node:vm';
+ import {subscribePlatformFactories} from './platform-factories.js';
+ import {createCSSReadAuthority,registerCSSDeclaration,registerCSSSheet,readCSSSheet,registerCSSRule,readCSSRule,readCSSDeclaration,readCSSMediaList} from './cssom-private.js';
+@@ -221,7 +222,10 @@
+ }
+ 
+ function parse(record, text) {
++ const diagnosticSpan=diagEnter('stylesheet.parse',{documentID:diagID(record.documentImpl),inputCodeUnits:typeof text==='string'?text.length:null});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+   return parseStyleSheet(String(text), { window: record.window, authority:record.cssAuthority, onUnsupported: value => record.unsupported.add(value) });
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ }
+ 
+ const originalExternalCreate=stylesheetBackend.createStylesheet;
+@@ -233,6 +237,8 @@
+  return removeStylesheet(sheet,element);
+ };
+ stylesheetBackend.createStylesheet=function(text,element,baseURL){
++ const diagnosticSpan=diagEnter('stylesheet.install',{elementID:diagID(element),inputCodeUnits:typeof text==='string'?text.length:null});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+  const record=recordFor(wrapperForImpl(element._ownerDocument));
+  if(!record||record.disposed)return originalExternalCreate(text,element,baseURL);
+  if(element._localName!=='link'){const result=originalExternalCreate(text,element,baseURL);if(element.sheet){const sheet=upgradeSheet(record,element.sheet);registerFrameStyleSource(record,element,sheet)}return result;}
+@@ -246,6 +252,7 @@
+  const list=element._ownerDocument.styleSheets._list,index=replacement?.index;
+  if(!list.includes(sheet)){if(index>=0)list.splice(Math.min(index,list.length),0,sheet);else list.push(sheet);}
+  invalidateStyleCache(element);
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ };
+ 
+ function operation(record, sheet, name, args) {
+@@ -851,6 +858,8 @@
+   window.CSSStyleSheet = CSSStyleSheet;
+   for(const element of privateApply(privateTree,domSymbolTree,[record.documentImpl]))if(element.nodeType===1&&['style','link'].includes(element._localName)&&element.sheet){const sheet=upgradeSheet(record,element.sheet);registerFrameStyleSource(record,element,sheet);}
+   window.getComputedStyle = function getComputedStyle(element, pseudo = null) {
++ const diagnosticSpan=diagEnter('getComputedStyle',{receiverID:diagID(element)});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+     if (!ElementInterface.is(element)) throw new window.TypeError('getComputedStyle requires an Element');
+     let key = pseudo == null ? '' : String(pseudo).toLowerCase();
+     if (!key.startsWith(':')) key = '';
+@@ -858,6 +867,7 @@
+     const owner = recordFor(wrapperForImpl(implForWrapper(element)._ownerDocument));
+     if(owner?.canonicalLayout)canonicalStyleProgram(owner);
+     return owner?computedStyle(owner,element,key):!hasActiveStyleContext(element)?computedStyle(record,element,key):record.originalGetComputedStyle.call(window,element);
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+   };
+   const dispose = () => {
+     if (record.disposed) return;
+@@ -925,7 +935,7 @@
+ function cascadeWinners(values){const chosen=new Map();chosen.orderKeys=new Map();for(const[property,candidates]of values){candidates.sort((a,b)=>compare(b.key,a.key));let winner=candidates[0];if(winner.value.toLowerCase()==='revert'||winner.value.toLowerCase()==='revert-layer'){const keyword=winner.value.toLowerCase();winner=candidates.find(candidate=>candidate.origin===0);if(winner&&keyword==='revert'&&winner.revertValue!==undefined)winner={...winner,value:winner.revertValue};}if(winner){chosen.set(property,winner.overflowPart===undefined?winner.value:{value:winner.value,overflowPart:winner.overflowPart});chosen.orderKeys.set(property,winner.key)}}return chosen}
+ 
+ function retireCanonicalStyleSource(record,node){if(record.frameStyleSources.delete(node))record.canonicalDirty=true}
+-function registerFrameStyleSource(record,node,sheet){
++function registerFrameStyleSource(record,node,sheet){diagMark('stylesheet.sourceMembership',{documentID:diagID(record.documentImpl),nodeID:diagID(node),sheetID:diagID(sheet)});
+  if(backendRoot(node)!==record.documentImpl)return;
+  let source=record.frameStyleSources.get(node);
+  if(!source){source={record,node,sheet,materializedList:null};record.frameStyleSources.set(node,source);record.canonicalDirty=true}else{source.sheet=sheet;if(node._localName==='link')record.canonicalDirty=true}
+@@ -940,12 +950,15 @@
+ // do not publish a new compiled program; real source membership and stylesheet
+ // operations do. CSSOM rule materialization is a separate source of rule data.
+ function canonicalStyleProgram(record){
++ const diagnosticSpan=diagEnter('canonicalStyleProgram',{documentID:diagID(record.documentImpl),cachePresent:!!record.canonicalProgram,dirty:record.canonicalDirty});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+  if(record.canonicalProgram&&!record.canonicalDirty)return record.canonicalProgram;
+  const viewport=record.canonicalLayout?.viewport;if(!viewport&&record.documentImpl._defaultView)throw Error('Canonical style requires the actual owning viewport');
+  const media=text=>viewport?evaluateMedia(text,viewport,{emptyMatches:true}):false;
+  const copy=entries=>entries.map(entry=>{const group=entry.group,actual={type:entry.type,selector:entry.selector,declarations:entry.style?readCSSDeclaration(entry.style):null,children:entry.list?copy(canonicalCSSRuleList(entry.list)):[],enabled:entry.type!==4||!!entry.media&&media(readCSSMediaList(entry.media)),group:null};if(group)actual.group={...group,declarations:group.style?readCSSDeclaration(group.style):null,children:group.rules?copy(canonicalCSSRuleList(group.rules)):[],enabled:group.kind!=='media'||media(group.media)};return actual});
+  const sheets=canonicalStyleSources(record).map(source=>copy(canonicalCSSRuleList(source.materializedList??readCSSSheet(source.sheet).list)));
+  const program={sheets,ua:copy(Array.from(UA.cssRules,rule=>readCSSRule(rule)))};record.canonicalProgram=program;record.canonicalDirty=false;return program;
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ }
+ function canonicalDefaultDisplay(node,active){
+  const namespace=node._namespaceURI,name=node._prefix?node._prefix+':'+node._localName:node._localName,html=namespace==='http://www.w3.org/1999/xhtml',svg=namespace==='http://www.w3.org/2000/svg';let display=svg||((html?HTML_INLINE:GENERIC_INLINE).has(name))?'inline':'block';if(!active)return display;
+--- a/src/stylesheet-decoder.js
++++ b/src/stylesheet-decoder.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ // Host-only CSS byte decoding. The real response headers, leading encoding
+ // declaration, owning document and optional link label choose the decoder.
+ // A UTF-8 BOM carries that already-decoded text through jsdom's existing byte
+@@ -6,6 +7,8 @@
+ const require=createRequire(import.meta.url),encoding=require('whatwg-encoding'),MIME=require('whatwg-mimetype');
+ const BOM=Buffer.from([0xef,0xbb,0xbf]);
+ export function stylesheetParserBytes(bytes,response,element){
++ const diagnosticSpan=diagEnter('stylesheet.decode',{elementID:diagID(element),inputBytes:diagBytes(bytes)});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+  const mime=MIME.parse(response?.headers?.['content-type']??''),header=mime?.parameters.get('charset');
+  const declaration=/^@charset "([^"\r\n]*)";/.exec(bytes.subarray(0,1024).toString('latin1'));
+  const fallback=encoding.labelToName(element.getAttributeNS(null,'charset')??'')??element._ownerDocument._encoding??'UTF-8';
+@@ -14,6 +17,7 @@
+  // decoder, or can honor a BOM itself. No round trip is needed in that case.
+  if(encoding.isSupported(fallback)&&(encoding.getBOMEncoding(bytes)!==null||label===fallback))return bytes;
+  return Buffer.concat([BOM,Buffer.from(encoding.decode(bytes,label),'utf8')]);
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ }
+ 
+ // The measured CSS resource cap counts decoded response bytes, including when
+--- a/src/sync-http-thread.js
++++ b/src/sync-http-thread.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ // Owned transport thread: synchronous Window XHR must not depend on the blocked
+ // parent event loop. Cookies, redirects, CORS and tracing stay with its Page.
+ import { parentPort } from 'node:worker_threads';
+@@ -5,14 +6,15 @@
+ parentPort.on('message',async message=>{
+  if(message.cancel){requests.get(message.cancel)?.abort();return}
+  const {id,url,init,shared,maxBodyBytes=16*1024*1024}=message,state=new Int32Array(shared,0,3),output=new Uint8Array(shared,12),controller=new AbortController();
+- requests.set(id,controller);
++ requests.set(id,controller);const diagnosticSpan=diagEnter('syncHTTP.worker',{networkID:id,url,maxBodyBytes});let diagnosticOutcome='return-point',diagnosticError;
+  try {
+   const response=await fetch(url,{...init,headers:new Headers(init.headers),signal:controller.signal,redirect:'manual'});
+   const chunks=[];let size=0;
+   if(response.body)for await(const chunk of response.body){size+=chunk.byteLength;if(size>maxBodyBytes)throw Error(maxBodyBytes===16*1024*1024?'Response exceeds 16 MiB limit':'Response exceeds '+maxBodyBytes+' byte limit');chunks.push(chunk)}
+   const bytes=Buffer.concat(chunks),meta=Buffer.from(JSON.stringify({status:response.status,statusText:response.statusText,headers:[...response.headers],cookies:response.headers.getSetCookie(),url:response.url||url}));
++  diagMark('syncHTTP.worker.bytesReady',{networkID:id,decodedBytes:bytes.length});
+   if(meta.length+bytes.length>output.length)throw Error('Synchronous response exceeds transport limit');
+   output.set(meta);output.set(bytes,meta.length);Atomics.store(state,1,meta.length);Atomics.store(state,2,bytes.length);Atomics.store(state,0,1);
+- }catch(error){const text=Buffer.from(JSON.stringify({error:String(error.message)}));output.set(text.subarray(0,output.length));Atomics.store(state,1,Math.min(text.length,output.length));Atomics.store(state,0,2)}
+- finally{requests.delete(id);Atomics.notify(state,0)}
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;const text=Buffer.from(JSON.stringify({error:String(error.message)}));output.set(text.subarray(0,output.length));Atomics.store(state,1,Math.min(text.length,output.length));Atomics.store(state,0,2)}
++ finally{requests.delete(id);Atomics.notify(state,0);diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+ });
+--- a/src/sync-http.js
++++ b/src/sync-http.js
+@@ -1,3 +1,4 @@
++import{diagID,diagCount,diagMark,diagEnter,diagLeave,diagPrivateData,diagLength,diagBytes,diagDocument}from'./style-load-diagnostic.js';
+ import{assertURLAllowed}from'./url-blocking.js';
+ import {internalCookieHeader} from './internal-cookie-header.js';
+ import{startNetworkCapture,inlinePostData,beginNetworkResponse,appendNetworkResponse,finishNetworkResponse}from'./network-capture.js';
+@@ -25,6 +26,8 @@
+  }
+  close(){if(this.closed)return;this.closed=true;for(const op of this.operations)op.cancel();void this.worker?.terminate()}
+  fetch(page,input,init={}){
++ const diagnosticSpan=diagEnter('syncHTTP.fetch',{pageID:diagID(page),inputType:typeof input});let diagnosticOutcome='return-point',diagnosticError;
++ try{
+   const metadata=requestMetadataPolicy(init);
+   if(this.closed||this.error)throw this.error??Error('Synchronous transport is closed');
+   const resourceType=init.resourceType??'XHR',maxBodyBytes=init.maxBodyBytes??16*1024*1024;if(typeof resourceType!=='string'||!Number.isSafeInteger(maxBodyBytes)||maxBodyBytes<1||maxBodyBytes>16*1024*1024)throw TypeError('Invalid synchronous resource options');
+@@ -49,7 +52,7 @@
+     const cookie=useCookies?cookieHeaderForSync(page.context.cookies,page,url,init.frameId):'';if(cookie)headers.set('cookie',internalCookieHeader(cookie));else headers.delete('cookie');
+     metadata(headers,url);
+     page.extraHTTPHeaders.forEach((value,key)=>headers.set(key,value));page.cliHTTPHeaders.forEach((value,key)=>headers.set(key,value));
+-    const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
++    const id=randomUUID(),capture=startNetworkCapture(page.context,id,body);diagMark('syncHTTP.request',{networkID:id,url,resourceType,maxBodyBytes,pageID:diagID(page)});owned.add(id);page.activeRequests.add(id);page.lastActivity=Date.now();
+     page.emit('request',{id,url,type:resourceType,method,headers:Object.fromEntries(headers),postDataFields:inlinePostData(capture),timestamp:clock(),redirectResponse,frameId:init.frameId??page.frameId,loaderId:init.loaderId??page.loaderId});
+     checkpoint();
+     assertURLAllowed(page,url);
+@@ -96,5 +99,6 @@
+    for(const id of failed)page.requestFailed(id,error);
+    throw error;
+   }
++ }catch(error){diagnosticOutcome='throw-point';diagnosticError=error;throw error}finally{diagLeave(diagnosticSpan,diagnosticOutcome,diagnosticError)}
+  }
+ }

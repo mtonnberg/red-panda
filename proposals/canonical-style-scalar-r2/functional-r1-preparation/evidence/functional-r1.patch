@@ -1,0 +1,126 @@
+--- a/src/cssom.js
++++ b/src/cssom.js
+@@ -1,4 +1,4 @@
+-import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
++import {registerCSSDeclaration,registerCSSRuleList,registerCSSRule,readCSSRule,readCSSDeclaration,replaceCSSRuleData,readCSSRuleList} from './cssom-private.js';
+ // Scoped CSSOM adaptation. Parsing is token based so strings, comments, URLs and
+ // balanced component values do not accidentally become declaration boundaries.
+ import { createRequire } from 'node:module';
+@@ -417,4 +417,33 @@
+   sheet.cssRules=new CSSRuleList(rules);return sheet;
+ }
+ 
++// Internal render-program snapshots reuse only private normalized scalar facts.
++// No public rule/declaration/map is shared or materialized for an untouched rule.
++const PROGRAM_DECLARATION_FACTS=new WeakMap();
++function programDeclarationFacts(value){
++ const key='n\0'+value.body;let facts=DECLARATION_FACTS.get(key),parsed;
++ if(!facts){
++  // Use exactly the genuine declaration parser/normalizer and its existing
++  // bounded cache. Uncacheable source still reads its real private backend.
++  parsed=createDeclaration(value.body,{window:value.owner.window,nesting:true});
++  facts=DECLARATION_FACTS.get(key);
++  if(!facts)return Object.freeze(readCSSDeclaration(parsed).map(entry=>Object.freeze(entry)));
++ }
++ let snapshot=PROGRAM_DECLARATION_FACTS.get(facts);
++ if(!snapshot){
++  const priorities=new Map(facts.priorities);
++  snapshot=Object.freeze(facts.values.map(([name,value])=>Object.freeze({name,value,priority:priorities.get(name)??''})));
++  PROGRAM_DECLARATION_FACTS.set(facts,snapshot);
++ }
++ return snapshot;
++}
++// Receiver authority is the existing private list/rule registry, never a public
++// property or a lookalike. Already materialized styles read their actual maps.
++export function canonicalCSSProgramRuleList(list){
++ return readCSSRuleList(list).map(value=>{
++  if(!DEFERRED_RULES.has(value))return readCSSRule(value);
++  if(value.rule)return readCSSRule(value.rule);
++  return{type:1,selector:value.selector,style:value.style,declarations:value.style?readCSSDeclaration(value.style):programDeclarationFacts(value),list:null,media:null,group:null,version:value.owner.version};
++ });
++}
+ export function canonicalCSSRuleList(list){return readCSSRuleList(list).map(value=>{if(!DEFERRED_RULES.has(value))return readCSSRule(value);if(value.rule)return readCSSRule(value.rule);return{type:1,selector:value.selector,style:deferredStyle(value),list:null,media:null,group:null,version:value.owner.version}})}
+--- a/src/styles.js
++++ b/src/styles.js
+@@ -1,7 +1,7 @@
+ import vm from 'node:vm';
+ import {subscribePlatformFactories} from './platform-factories.js';
+ import {createCSSReadAuthority,registerCSSDeclaration,registerCSSSheet,readCSSSheet,registerCSSRule,readCSSRule,readCSSDeclaration,readCSSMediaList} from './cssom-private.js';
+-import {canonicalCSSRuleList} from './cssom.js';
++import {canonicalCSSProgramRuleList} from './cssom.js';
+ import {matchCanonicalSelector} from './canonical-selector.js';
+ import {captureDocumentMemberFactory} from './document-member-realms.js';
+ import {registerHeapWrapper} from './heap-registry.js';
+@@ -943,8 +943,8 @@
+  if(record.canonicalProgram&&!record.canonicalDirty)return record.canonicalProgram;
+  const viewport=record.canonicalLayout?.viewport;if(!viewport&&record.documentImpl._defaultView)throw Error('Canonical style requires the actual owning viewport');
+  const media=text=>viewport?evaluateMedia(text,viewport,{emptyMatches:true}):false;
+- const copy=entries=>entries.map(entry=>{const group=entry.group,actual={type:entry.type,selector:entry.selector,declarations:entry.style?readCSSDeclaration(entry.style):null,children:entry.list?copy(canonicalCSSRuleList(entry.list)):[],enabled:entry.type!==4||!!entry.media&&media(readCSSMediaList(entry.media)),group:null};if(group)actual.group={...group,declarations:group.style?readCSSDeclaration(group.style):null,children:group.rules?copy(canonicalCSSRuleList(group.rules)):[],enabled:group.kind!=='media'||media(group.media)};return actual});
+- const sheets=canonicalStyleSources(record).map(source=>copy(canonicalCSSRuleList(source.materializedList??readCSSSheet(source.sheet).list)));
++ const copy=entries=>entries.map(entry=>{const group=entry.group,actual={type:entry.type,selector:entry.selector,declarations:entry.declarations??(entry.style?readCSSDeclaration(entry.style):null),children:entry.list?copy(canonicalCSSProgramRuleList(entry.list)):[],enabled:entry.type!==4||!!entry.media&&media(readCSSMediaList(entry.media)),group:null};if(group)actual.group={...group,declarations:group.style?readCSSDeclaration(group.style):null,children:group.rules?copy(canonicalCSSProgramRuleList(group.rules)):[],enabled:group.kind!=='media'||media(group.media)};return actual});
++ const sheets=canonicalStyleSources(record).map(source=>copy(canonicalCSSProgramRuleList(source.materializedList??readCSSSheet(source.sheet).list)));
+  const program={sheets,ua:copy(Array.from(UA.cssRules,rule=>readCSSRule(rule)))};record.canonicalProgram=program;record.canonicalDirty=false;return program;
+ }
+ function canonicalDefaultDisplay(node,active){
+--- /dev/null
++++ b/test/canonical-style-scalar.test.js
+@@ -0,0 +1,59 @@
++import{test}from'node:test';
++import assert from'node:assert/strict';
++import{Browser}from'../src/browser.js';
++import{parseStyleSheet,canonicalCSSProgramRuleList,flatSheetState}from'../src/cssom.js';
++import{readCSSSheet,readCSSDeclaration}from'../src/cssom-private.js';
++import{createCanonicalStyleResolver}from'../src/styles.js';
++import{platformFactoryRecord}from'../src/platform-factories.js';
++
++async function fixture(t,css){
++ const browser=new Browser();t.after(()=>browser.close());const page=browser.createPage();await page.navigate('data:text/html,<body><p class=probe>Real text</p>');
++ const w=page.dom.window,d=w.document,style=d.createElement('style');style.textContent=css;d.head.append(style);
++ const sheet=style.sheet,list=readCSSSheet(sheet).list,document=platformFactoryRecord(d).implementation,node=platformFactoryRecord(d.querySelector('.probe')).implementation;
++ return{w,d,sheet,list,node,resolve:()=>createCanonicalStyleResolver(document)(node)};
++}
++
++test('canonical scalar snapshots retain genuine normalization, shorthand and priority facts without public materialization',()=>{
++ const body='display:none!important;display:block;visibility:hidden;margin:1px 2px;overflow:hidden auto;--Case:Kept;color:rgb(1, 2, 3);padding:bogus';
++ const sheet=parseStyleSheet('.probe{'+body+'}.other{'+body+'}'),list=sheet.cssRules,state=flatSheetState(sheet,list),entries=canonicalCSSProgramRuleList(list);
++ assert.equal(state.styled.size,0);assert.equal(state.published.size,0);
++ const facts=entries[0].declarations,values=new Map(facts.map(v=>[v.name,v]));
++ assert.deepEqual(values.get('display'),{name:'display',value:'none',priority:'important'});assert.equal(values.get('visibility').value,'hidden');
++ assert.equal(values.get('margin-top').value,'1px');assert.equal(values.get('margin-right').value,'2px');assert.equal(values.get('--Case').value,'Kept');assert.equal(values.has('padding'),false);
++ const one=list[0].style,two=list[1].style;assert.deepEqual(facts,readCSSDeclaration(one));assert.deepEqual(facts,readCSSDeclaration(two));
++ assert.notEqual(one,two);assert.equal(list[0].style,one);one.setProperty('--Case','Changed');assert.equal(two.getPropertyValue('--Case'),'Kept');assert.equal(values.get('--Case').value,'Kept');
++ assert.equal(state.styled.size,2);assert.ok(flatSheetState(sheet,list).version>1);
++});
++
++test('uncacheable scalar source still uses the genuine declaration parser and distinct later public state',()=>{
++ const body='--long:'+('x'.repeat(4200))+';display:none!important;display:block;';
++ const sheet=parseStyleSheet('.probe{'+body+'}'),list=sheet.cssRules,state=flatSheetState(sheet,list),entry=canonicalCSSProgramRuleList(list)[0];
++ assert.equal(state.styled.size,0);assert.equal(entry.declarations.find(v=>v.name==='display').value,'none');assert.equal(entry.declarations.find(v=>v.name==='display').priority,'important');
++ assert.deepEqual(entry.declarations,readCSSDeclaration(list[0].style));assert.equal(state.styled.size,1);
++});
++
++test('canonical compilation keeps unrelated public styles sparse while real matched revision checks stay live',async t=>{
++ const f=await fixture(t,'.unused{color:#abcdef;--token:kept}'.repeat(64)+'.probe{display:none}'),state=flatSheetState(f.sheet,f.list);
++ assert.equal(state.styled.size,0);assert.equal(f.resolve().display,'none');assert.equal(state.styled.size,0);assert.equal(state.published.size,0);
++ const computed=f.w.getComputedStyle(f.d.querySelector('.probe'));assert.equal(computed.display,'none');assert.equal(state.styled.size,1);
++ const last=f.list[64];last.style.display='block';assert.equal(computed.display,'block');assert.equal(f.resolve().display,'none');
++ const first=f.list[0],second=f.list[1];assert.notEqual(first.style,second.style);first.style.setProperty('--token','changed');assert.equal(second.style.getPropertyValue('--token'),'kept');
++ assert.ok(flatSheetState(f.sheet,f.list).version>1);assert.equal(state.styled.size,3);
++});
++
++test('real materialized mutations enter the next canonical snapshot only at existing sheet invalidation boundaries',async t=>{
++ const f=await fixture(t,'.probe{display:none}'),first=f.list[0];first.style.display='block';assert.equal(f.resolve().display,'block');
++ first.style.display='none';assert.equal(f.resolve().display,'block');assert.equal(f.w.getComputedStyle(f.d.querySelector('.probe')).display,'none');
++ f.sheet.insertRule('.probe{display:block}',1);assert.equal(f.resolve().display,'block');f.sheet.deleteRule(1);assert.equal(f.resolve().display,'none');assert.equal(f.list[0],first);
++});
++
++test('canonical private snapshots ignore authored CSS getters and reject lookalike lists without proxy traps',async t=>{
++ const f=await fixture(t,'.probe{display:none;visibility:hidden}'),rule=f.list[0],style=rule.style,restores=[];let reads=0,traps=0;
++ const poison=(object,name)=>{const old=Object.getOwnPropertyDescriptor(object,name);restores.push(()=>old?Object.defineProperty(object,name,old):Reflect.deleteProperty(object,name));Object.defineProperty(object,name,{configurable:true,get(){reads++;throw Error('authored '+name)}})};
++ try{
++  for(const[object,names]of[[f.sheet,['cssRules']],[rule,['selectorText','style']],[style,['cssText','length','getPropertyValue','getPropertyPriority']]])for(const name of names)poison(object,name);
++  assert.deepEqual(f.resolve(),{display:'none',visibility:'hidden'});assert.equal(reads,0);
++  for(const fake of[{},Object.create(Object.getPrototypeOf(f.list)),new Proxy(f.list,{get(){traps++;throw Error('trap')},getPrototypeOf(){traps++;throw Error('trap')}})])assert.throws(()=>canonicalCSSProgramRuleList(fake),/genuine CSS rule list producer/);
++  assert.equal(traps,0);assert.equal(reads,0);
++ }finally{for(const restore of restores.reverse())restore()}
++});

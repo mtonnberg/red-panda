@@ -1,0 +1,78 @@
+--- a/harness/scripts/conformance.mjs
++++ b/harness/scripts/conformance.mjs
+@@ -1,3 +1,4 @@
++import{diagMark}from'./diagnostic-clock.mjs';
+ import { parseArgs } from 'node:util';
+ import { readFile, realpath, writeFile } from 'node:fs/promises';
+ import { resolve, relative, isAbsolute, join, sep } from 'node:path';
+@@ -62,9 +63,9 @@
+     const url = `${server.origin}/src/browser/tests/${selection.path.split('/').map(encodeURIComponent).join('/')}`;
+     if(sourceLoadContract)await send('Page.setLifecycleEventsEnabled',{enabled:true});
+     const loadEventOffset=client.events.length;
+-    if(sourceLoadContract){executionPhase='source-load';loadStarted=Date.now();deadline=loadStarted+2000;}
++    if(sourceLoadContract){executionPhase='source-load';loadStarted=Date.now();deadline=loadStarted+2000;diagMark('driver.sourceLoadStart',{path:selection.path,budgetMs:2000});}
+     const navigation = await send('Page.navigate', { url });
+-    if (navigation.errorText) throw new Error(navigation.errorText);
++    diagMark('driver.navigationResponse',{frameId:navigation.frameId??null});if (navigation.errorText) throw new Error(navigation.errorText);
+     if(sourceLoadContract){
+       if(!navigation.frameId)throw new Error('Source load contract requires navigation root frame identity');
+       while(Date.now()<deadline){
+@@ -77,8 +78,8 @@
+         }
+         await sleep(Math.min(20,remaining()));
+       }
+-      if(!loadBarrier)throw new Error('Source load-state-complete 2000ms deadline exceeded before assertOk');
+-      executionPhase='source-assertions';assertionStarted=Date.now();deadline=assertionStarted+timeout;
++      if(!loadBarrier){diagMark('driver.loadBarrierMissing',{path:selection.path});throw new Error('Source load-state-complete 2000ms deadline exceeded before assertOk');}diagMark('driver.loadBarrierObserved',{path:selection.path,durationMs:loadBarrier.durationMs});
++      executionPhase='source-assertions';assertionStarted=Date.now();deadline=assertionStarted+timeout;diagMark('driver.freshAssertionStart',{path:selection.path,budgetMs:timeout});
+     }
+     if (settleMs) {
+       while (Date.now() < deadline && await evaluate('document.readyState') !== 'complete') await sleep(Math.min(20,remaining()));
+@@ -98,7 +99,7 @@
+       if (value.kind !== 'missing') harnessObserved = true;
+       if (value.nativeBranch !== undefined) { nativeHarnessBranch = value.nativeBranch; observedUserAgent = value.userAgent; }
+       if (value.kind === 'wrong-branch') { status = 'unobserved'; error = 'The harness did not enter the required native/external-runner branch'; break; }
+-      if (value.kind === 'passed') { status = 'passed'; break; }
++      if (value.kind === 'passed') { status = 'passed';diagMark('driver.assertOkPassed',{polls});break; }
+       if (value.kind === 'failed') {
+         status = /no test observations|no assertions/.test(value.message) ? 'unobserved' : 'failed'; error = value.message; break;
+       }
+@@ -112,7 +113,7 @@
+   } catch (cause) {
+     status = /timeout|timed out|deadline/i.test(cause.message) ? 'timeout' : 'failed'; error = cause.message;
+   } finally {
+-    if(assertionStarted!==null)assertionFinished=Date.now();
++    if(assertionStarted!==null)assertionFinished=Date.now();diagMark('driver.fixtureFinally',{path:selection.path,status,executionPhase});
+     if (status === 'timeout' && harnessObserved) await send('Runtime.evaluate', {
+       expression:"typeof testing !== 'undefined' && typeof testing.printTimeoutState === 'function' ? (testing.printTimeoutState(),true) : false",
+       returnByValue:true,
+--- /dev/null
++++ b/harness/scripts/diagnostic-clock.mjs
+@@ -0,0 +1,2 @@
++// Diagnostic host client uses the same clock writer in its own real process.
++export{diagMark,diagID}from'../../diagnostic/src/style-load-diagnostic.js';
+--- a/harness/test/cdp-client.js
++++ b/harness/test/cdp-client.js
+@@ -1,3 +1,4 @@
++import{diagMark}from'../scripts/diagnostic-clock.mjs';
+ import { WebSocket } from 'ws';
+ 
+ export async function connect(endpoint, { timeout = 15000 } = {}) {
+@@ -11,7 +12,7 @@
+     pending.clear();
+   });
+   socket.on('message', raw => {
+-    const message = JSON.parse(raw);
++    const message = JSON.parse(raw);diagMark('cdp.message',{id:typeof message.id==='number'?message.id:null,method:typeof message.method==='string'?message.method:null,hasProtocolError:!!message.error});
+     if (!message.id) { events.push(message); return; }
+     const entry = pending.get(message.id);
+     if (entry) { pending.delete(message.id); clearTimeout(entry.timer); message.error ? entry.reject(Object.assign(new Error(message.error.message), message.error)) : entry.resolve(message.result); }
+@@ -22,7 +23,7 @@
+       const requestId = ++id;
+       const timer = setTimeout(() => { pending.delete(requestId); reject(new Error(`CDP timeout: ${method} (request ${requestId})`)); }, options.timeout ?? timeout);
+       pending.set(requestId, { resolve, reject, timer });
+-      socket.send(JSON.stringify({ id: requestId, method, params, ...(sessionId ? { sessionId } : {}) }));
++      diagMark('cdp.send',{id:requestId,method});socket.send(JSON.stringify({ id: requestId, method, params, ...(sessionId ? { sessionId } : {}) }));
+     }),
+     close: async () => {
+       for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('CDP client closed')); }

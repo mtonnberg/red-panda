@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import {subscribePlatformFactories} from './platform-factories.js';
 import {createCSSReadAuthority,registerCSSDeclaration,registerCSSSheet,readCSSSheet,registerCSSRule,readCSSRule,readCSSDeclaration,readCSSMediaList} from './cssom-private.js';
-import {canonicalCSSRuleList} from './cssom.js';
+import {canonicalCSSProgramRuleList} from './cssom.js';
 import {matchCanonicalSelector} from './canonical-selector.js';
 import {captureDocumentMemberFactory} from './document-member-realms.js';
 import {registerHeapWrapper} from './heap-registry.js';
@@ -943,8 +943,8 @@ function canonicalStyleProgram(record){
  if(record.canonicalProgram&&!record.canonicalDirty)return record.canonicalProgram;
  const viewport=record.canonicalLayout?.viewport;if(!viewport&&record.documentImpl._defaultView)throw Error('Canonical style requires the actual owning viewport');
  const media=text=>viewport?evaluateMedia(text,viewport,{emptyMatches:true}):false;
- const copy=entries=>entries.map(entry=>{const group=entry.group,actual={type:entry.type,selector:entry.selector,declarations:entry.style?readCSSDeclaration(entry.style):null,children:entry.list?copy(canonicalCSSRuleList(entry.list)):[],enabled:entry.type!==4||!!entry.media&&media(readCSSMediaList(entry.media)),group:null};if(group)actual.group={...group,declarations:group.style?readCSSDeclaration(group.style):null,children:group.rules?copy(canonicalCSSRuleList(group.rules)):[],enabled:group.kind!=='media'||media(group.media)};return actual});
- const sheets=canonicalStyleSources(record).map(source=>copy(canonicalCSSRuleList(source.materializedList??readCSSSheet(source.sheet).list)));
+ const copy=entries=>entries.map(entry=>{const group=entry.group,actual={type:entry.type,selector:entry.selector,declarations:entry.declarations??(entry.style?readCSSDeclaration(entry.style):null),children:entry.list?copy(canonicalCSSProgramRuleList(entry.list)):[],enabled:entry.type!==4||!!entry.media&&media(readCSSMediaList(entry.media)),group:null};if(group)actual.group={...group,declarations:group.style?readCSSDeclaration(group.style):null,children:group.rules?copy(canonicalCSSProgramRuleList(group.rules)):[],enabled:group.kind!=='media'||media(group.media)};return actual});
+ const sheets=canonicalStyleSources(record).map(source=>copy(canonicalCSSProgramRuleList(source.materializedList??readCSSSheet(source.sheet).list)));
  const program={sheets,ua:copy(Array.from(UA.cssRules,rule=>readCSSRule(rule)))};record.canonicalProgram=program;record.canonicalDirty=false;return program;
 }
 function canonicalDefaultDisplay(node,active){
